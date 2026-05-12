@@ -30,3 +30,4 @@ uuid = { workspace = true }
 mc-data = { path = "../mc-data" }
 mc-net = { path = "../mc-net" }
 mc-world = { path = "../mc-world" }
+tempfile = "3"
