@@ -24,12 +24,39 @@ use mc_data::Identifier;
 use mc_nbt::{ListTag, Tag, tag_type};
 use thiserror::Error;
 
+use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, Heightmap, LIGHT_LAYER_BYTES,
     MIN_SECTION_Y, SECTION_COUNT, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
+
+const REGION_AXIS_CHUNKS: i32 = 32;
+
+/// Serialise a chunk to a [`ChunkPayload`] ready for
+/// [`write_region`](crate::anvil::write_region). Used by the M6.b
+/// persistence flush path: encodes the chunk to NBT, serialises with
+/// `mc_nbt::write_named` (Anvil chunks are stored as an unnamed root,
+/// `name = ""`), and bundles with the chunk's region-local slot
+/// coordinates plus the supplied epoch-seconds timestamp.
+pub fn chunk_to_payload(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    timestamp: u32,
+) -> Result<ChunkPayload, ChunkNbtError> {
+    let nbt = chunk_to_nbt(chunk, registry)?;
+    let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
+    mc_nbt::write_named(&mut buf, "", &nbt)?;
+    let local_x = chunk.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    let local_z = chunk.pos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+    Ok(ChunkPayload {
+        local_x,
+        local_z,
+        timestamp,
+        uncompressed_nbt: buf,
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum ChunkNbtError {
@@ -791,6 +818,80 @@ mod tests {
                 seen_keys,
             );
         }
+    }
+
+    /// M6.a: a chunk is decoded from the real test world, one block is
+    /// mutated via `set_block_and_update`, then `chunk_to_payload` +
+    /// `write_region` + `read_region` round-trips it back through a
+    /// fresh `.mca` file. The mutated cell must read back as the new
+    /// state, every other modelled field plus `extras` must survive.
+    #[test]
+    fn round_trip_modified_chunk_through_disk() {
+        let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !region_path.is_file() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = BlockRegistry::from_report(&report).unwrap();
+        let payloads = region::read_region(&region_path).unwrap();
+
+        let original_payload = payloads
+            .iter()
+            .find(|p| p.local_x == 0 && p.local_z == 0)
+            .expect("test world has chunk (0,0)");
+        let mut cur = Cursor::new(&original_payload.uncompressed_nbt[..]);
+        let (_, root) = mc_nbt::read_named(&mut cur).unwrap();
+        let mut chunk = chunk_from_nbt(&root, &registry).unwrap();
+
+        // Mutation: grass under spawn at (0, -61, 0) → stone.
+        let air = registry
+            .block(&Identifier::parse("minecraft:air").unwrap())
+            .map(|b| b.default)
+            .unwrap();
+        let stone = registry
+            .block(&Identifier::parse("minecraft:stone").unwrap())
+            .map(|b| b.default)
+            .unwrap();
+        let prev = chunk
+            .set_block_and_update(0, -61, 0, stone, air)
+            .expect("y in range");
+        assert_ne!(
+            prev, stone,
+            "test world cell at (0,-61,0) was already stone — pick another"
+        );
+        assert!(chunk.dirty, "set_block_and_update marks chunk dirty");
+
+        // Encode, write a fresh single-chunk region, read it back.
+        let payload = chunk_to_payload(&chunk, &registry, 1_700_000_000).unwrap();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        region::write_region(tmp.path(), &[payload]).unwrap();
+        let reread = region::read_region(tmp.path()).unwrap();
+        let reread_payload = reread
+            .iter()
+            .find(|p| p.local_x == 0 && p.local_z == 0)
+            .expect("written chunk must read back");
+        let mut cur2 = Cursor::new(&reread_payload.uncompressed_nbt[..]);
+        let (_, root2) = mc_nbt::read_named(&mut cur2).unwrap();
+        let chunk2 = chunk_from_nbt(&root2, &registry).unwrap();
+
+        // Mutation survived.
+        assert_eq!(chunk2.get_block(0, -61, 0), Some(stone));
+        // Same chunk position.
+        assert_eq!(chunk2.pos, chunk.pos);
+        // Heightmap is whatever set_block_and_update produced.
+        let hms_before: std::collections::BTreeSet<&String> = chunk.heightmaps.keys().collect();
+        let hms_after: std::collections::BTreeSet<&String> = chunk2.heightmaps.keys().collect();
+        assert_eq!(hms_before, hms_after, "heightmap key set must survive");
+        // Extras (DataVersion / InhabitedTime / …) survived byte-stably.
+        assert_eq!(chunk.extras.len(), chunk2.extras.len(), "extras count");
+        for (e1, e2) in chunk.extras.iter().zip(&chunk2.extras) {
+            assert_eq!(e1.0, e2.0, "extras key order");
+            assert_eq!(e1.1, e2.1, "extras value for {}", e1.0);
+        }
+        // Timestamp survived through the write/read pair.
+        assert_eq!(reread_payload.timestamp, 1_700_000_000);
     }
 
     fn nibble_pattern() -> Vec<i8> {
