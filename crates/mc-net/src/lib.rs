@@ -9,6 +9,7 @@
 //! if the client asked for `Status` — answers a server-list ping. The
 //! Login → Configuration → Play path arrives in M1.d / M1.e / M1.g.
 
+mod configuration;
 mod connection;
 mod error;
 mod login;

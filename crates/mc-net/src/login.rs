@@ -50,17 +50,16 @@ pub fn offline_uuid(name: &str) -> Uuid {
 }
 
 pub(crate) async fn handle<R, W>(
-    mut reader: R,
-    mut writer: W,
-    mut buf: BytesMut,
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut BytesMut,
 ) -> Result<LoggedInProfile, ConnectionError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     let login_start =
-        read_packet::<LoginStart, _>(&mut reader, &mut buf, Compression::Disabled, State::Login)
-            .await?;
+        read_packet::<LoginStart, _>(reader, buf, Compression::Disabled, State::Login).await?;
     // Offline mode: ignore the UUID the client just sent us and stamp our
     // own derived one. This is what vanilla does too — clients always send
     // *some* UUID (since 1.20.2 it is mandatory in LoginStart) but it is
@@ -74,15 +73,11 @@ where
         name: name.clone(),
         properties: Vec::new(),
     };
-    write_packet(&mut writer, &success, Compression::Disabled).await?;
+    write_packet(writer, &success, Compression::Disabled).await?;
 
-    let _ack = read_packet::<LoginAcknowledged, _>(
-        &mut reader,
-        &mut buf,
-        Compression::Disabled,
-        State::Login,
-    )
-    .await?;
+    let _ack =
+        read_packet::<LoginAcknowledged, _>(reader, buf, Compression::Disabled, State::Login)
+            .await?;
 
     Ok(LoggedInProfile { uuid, name })
 }

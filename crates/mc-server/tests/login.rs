@@ -17,6 +17,7 @@ use bytes::{Buf, BytesMut};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
+use mc_protocol::packets::configuration::ClientboundKnownPacks;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::status::{StatusRequest, StatusResponse};
@@ -106,15 +107,16 @@ async fn login_offline_flow_completes() {
     assert_eq!(success.uuid, mc_net::offline_uuid("Notch"));
     assert!(success.properties.is_empty());
 
-    // Acknowledge — this puts us into Configuration state, which the
-    // server does not yet implement. It should close the connection.
+    // Acknowledge — this transitions to Configuration state, where the
+    // server's first packet is `Clientbound Known Packs` (M1.e).
     write_frame(&mut stream, &LoginAcknowledged).await;
-    let mut scratch = [0u8; 8];
-    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch))
-        .await
-        .expect("server did not close on its own within 2s")
-        .unwrap_or(0);
-    assert_eq!(n, 0, "expected close after login acknowledged");
+    let mut frame = read_one_frame(&mut stream).await;
+    assert_eq!(
+        frame.id,
+        ClientboundKnownPacks::ID,
+        "server should advertise Known Packs once Configuration begins"
+    );
+    let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
 }
 
 #[tokio::test]

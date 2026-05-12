@@ -1,0 +1,325 @@
+//! Configuration state — between Login and Play.
+//!
+//! In M1.e we drive only the strict minimum needed for the connection to
+//! traverse the state cleanly:
+//!
+//! ```text
+//! S → C  Known Packs               (0x0E, our list of known data packs)
+//! C → S  Known Packs               (0x07, the subset the client also has)
+//! S → C  Finish Configuration      (0x03, empty)
+//! C → S  Acknowledge Finish Conf.  (0x03, empty)
+//!        → state transitions to Play
+//! ```
+//!
+//! Everything else (Client Information, Plugin Messages, Resource Pack
+//! flows, Registry Data with real entries, Update Tags, …) is deferred —
+//! see `docs/milestones/M1.md` for the full deferral list. The handler in
+//! `mc-net` reads but does not act on any other clientbound-in-Conf
+//! packets the client may send.
+
+use bytes::{Buf, BufMut};
+
+use super::Packet;
+use crate::codec::{Identifier, ReadMc, WriteMc};
+use crate::error::CodecError;
+
+// -----------------------------------------------------------------------
+// Known Packs — both directions share the same struct.
+// -----------------------------------------------------------------------
+
+/// One entry in a Known Packs list. Vanilla uses `{ "minecraft", "core",
+/// <game version> }` to refer to the built-in resource/data pack.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnownPackEntry {
+    pub namespace: String,
+    pub id: String,
+    pub version: String,
+}
+
+fn write_known_pack_array<B: BufMut>(
+    buf: &mut B,
+    entries: &[KnownPackEntry],
+) -> Result<(), CodecError> {
+    buf.write_varint(
+        i32::try_from(entries.len()).map_err(|_| CodecError::StringTooLong {
+            len: entries.len(),
+            max: i32::MAX as usize,
+        })?,
+    );
+    for entry in entries {
+        buf.write_string(&entry.namespace, 32_767)?;
+        buf.write_string(&entry.id, 32_767)?;
+        buf.write_string(&entry.version, 32_767)?;
+    }
+    Ok(())
+}
+
+fn read_known_pack_array<B: Buf>(buf: &mut B) -> Result<Vec<KnownPackEntry>, CodecError> {
+    let count = buf.read_varint()?;
+    if count < 0 {
+        return Err(CodecError::NegativeLength(count));
+    }
+    let mut entries = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let namespace = buf.read_string(32_767)?;
+        let id = buf.read_string(32_767)?;
+        let version = buf.read_string(32_767)?;
+        entries.push(KnownPackEntry {
+            namespace,
+            id,
+            version,
+        });
+    }
+    Ok(entries)
+}
+
+/// Clientbound 0x0E — server advertises the data packs it knows about so
+/// the client can match them against its built-ins and decide which
+/// registry entries it can read from its own bundle vs. needs the server
+/// to send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundKnownPacks {
+    pub packs: Vec<KnownPackEntry>,
+}
+
+impl Packet for ClientboundKnownPacks {
+    const ID: i32 = 0x0E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_known_pack_array(buf, &self.packs)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            packs: read_known_pack_array(buf)?,
+        })
+    }
+}
+
+/// Serverbound 0x07 — client tells the server which of the advertised
+/// known packs it also has bundled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundKnownPacks {
+    pub packs: Vec<KnownPackEntry>,
+}
+
+impl Packet for ServerboundKnownPacks {
+    const ID: i32 = 0x07;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_known_pack_array(buf, &self.packs)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            packs: read_known_pack_array(buf)?,
+        })
+    }
+}
+
+// -----------------------------------------------------------------------
+// Finish Configuration — both directions, both empty bodies.
+// -----------------------------------------------------------------------
+
+/// Clientbound 0x03 — server tells client "I am done sending
+/// Configuration packets, please move to Play state".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FinishConfiguration;
+
+impl Packet for FinishConfiguration {
+    const ID: i32 = 0x03;
+
+    fn encode<B: BufMut>(&self, _buf: &mut B) -> Result<(), CodecError> {
+        Ok(())
+    }
+
+    fn decode<B: Buf>(_buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self)
+    }
+}
+
+/// Serverbound 0x03 — client acks the transition to Play.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AcknowledgeFinishConfiguration;
+
+impl Packet for AcknowledgeFinishConfiguration {
+    const ID: i32 = 0x03;
+
+    fn encode<B: BufMut>(&self, _buf: &mut B) -> Result<(), CodecError> {
+        Ok(())
+    }
+
+    fn decode<B: Buf>(_buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self)
+    }
+}
+
+// -----------------------------------------------------------------------
+// Registry Data (0x07 CB) — defined for completeness but the M1.e handler
+// does not send any. Encoding entries with NBT payloads is deferred to
+// the milestone that actually needs them.
+// -----------------------------------------------------------------------
+
+/// One registry entry. If `has_data` is `false` the client uses its
+/// built-in data for this entry (matched via the Known Packs handshake).
+///
+/// The `nbt_payload` field is intentionally `Vec<u8>`-typed and assumed
+/// to be a pre-serialised, root-less Network-NBT blob. We do not have a
+/// typed NBT codec yet (M1.f); for M1.e all entries we emit have
+/// `has_data = false` and the field is never inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryEntry {
+    pub name: Identifier,
+    pub nbt_payload: Option<Vec<u8>>,
+}
+
+/// Clientbound 0x07 — one packet per registry, sent between Known Packs
+/// and Finish Configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegistryData {
+    pub registry_id: Identifier,
+    pub entries: Vec<RegistryEntry>,
+}
+
+impl Packet for RegistryData {
+    const ID: i32 = 0x07;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_identifier(&self.registry_id);
+        buf.write_varint(i32::try_from(self.entries.len()).map_err(|_| {
+            CodecError::StringTooLong {
+                len: self.entries.len(),
+                max: i32::MAX as usize,
+            }
+        })?);
+        for entry in &self.entries {
+            buf.write_identifier(&entry.name);
+            match &entry.nbt_payload {
+                Some(payload) => {
+                    buf.write_bool(true);
+                    buf.put_slice(payload);
+                }
+                None => buf.write_bool(false),
+            }
+        }
+        Ok(())
+    }
+
+    /// Decoding `RegistryData` with payload entries requires a real NBT
+    /// parser (the payload is self-delimiting, not length-prefixed). We
+    /// only need decoding for tests that confirm we can round-trip the
+    /// "no payloads" shape we actually send.
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let registry_id = buf.read_identifier()?;
+        let count = buf.read_varint()?;
+        if count < 0 {
+            return Err(CodecError::NegativeLength(count));
+        }
+        let mut entries = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            let name = buf.read_identifier()?;
+            let has_data = buf.read_bool()?;
+            if has_data {
+                return Err(CodecError::InvalidIdentifier(
+                    "RegistryData entries with NBT payloads cannot be decoded \
+                     without a Network-NBT parser (deferred to M1.f)"
+                        .to_string(),
+                ));
+            }
+            entries.push(RegistryEntry {
+                name,
+                nbt_payload: None,
+            });
+        }
+        Ok(Self {
+            registry_id,
+            entries,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip<P: Packet + PartialEq + std::fmt::Debug>(p: P) {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        let mut cursor: &[u8] = &buf;
+        let decoded: P = P::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, p);
+        assert!(cursor.is_empty());
+    }
+
+    fn sample_pack() -> KnownPackEntry {
+        KnownPackEntry {
+            namespace: "minecraft".into(),
+            id: "core".into(),
+            version: "26.1.2".into(),
+        }
+    }
+
+    #[test]
+    fn clientbound_known_packs_round_trip() {
+        round_trip(ClientboundKnownPacks {
+            packs: vec![sample_pack()],
+        });
+        round_trip(ClientboundKnownPacks { packs: vec![] });
+    }
+
+    #[test]
+    fn serverbound_known_packs_round_trip() {
+        round_trip(ServerboundKnownPacks {
+            packs: vec![sample_pack(), sample_pack()],
+        });
+    }
+
+    #[test]
+    fn finish_configuration_round_trip() {
+        round_trip(FinishConfiguration);
+    }
+
+    #[test]
+    fn acknowledge_finish_configuration_round_trip() {
+        round_trip(AcknowledgeFinishConfiguration);
+    }
+
+    #[test]
+    fn registry_data_empty_entries_round_trip() {
+        round_trip(RegistryData {
+            registry_id: Identifier::parse("minecraft:dimension_type").unwrap(),
+            entries: vec![],
+        });
+    }
+
+    #[test]
+    fn registry_data_entries_without_payload_round_trip() {
+        round_trip(RegistryData {
+            registry_id: Identifier::parse("minecraft:worldgen/biome").unwrap(),
+            entries: vec![
+                RegistryEntry {
+                    name: Identifier::parse("minecraft:plains").unwrap(),
+                    nbt_payload: None,
+                },
+                RegistryEntry {
+                    name: Identifier::parse("minecraft:desert").unwrap(),
+                    nbt_payload: None,
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn registry_data_decode_refuses_inline_nbt() {
+        // Manually build a wire layout with has_data=true to confirm we
+        // surface the limitation rather than silently mis-parsing.
+        let mut buf = Vec::new();
+        buf.write_identifier(&Identifier::parse("minecraft:foo").unwrap());
+        buf.write_varint(1);
+        buf.write_identifier(&Identifier::parse("minecraft:bar").unwrap());
+        buf.write_bool(true);
+        let mut cursor: &[u8] = &buf;
+        let err = RegistryData::decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, CodecError::InvalidIdentifier(_)));
+    }
+}

@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
-use crate::{login, status};
+use crate::{configuration, login, status};
 
 /// Settings the network layer needs to serve.
 ///
@@ -66,7 +66,7 @@ async fn handle_connection(
     // vanilla uses.
     socket.set_nodelay(true)?;
 
-    let (mut reader, writer) = socket.into_split();
+    let (mut reader, mut writer) = socket.into_split();
     let mut buf = BytesMut::with_capacity(4096);
 
     let handshake = read_packet::<Handshake, _>(
@@ -85,18 +85,15 @@ async fn handle_connection(
     );
 
     match handshake.next_state {
-        NextState::Status => status::handle(reader, writer, buf, config).await,
+        NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
         NextState::Login | NextState::Transfer => {
-            let profile = login::handle(reader, writer, buf).await?;
+            let profile = login::handle(&mut reader, &mut writer, &mut buf).await?;
+            configuration::handle(&mut reader, &mut writer, &mut buf, &profile).await?;
             info!(
                 player = %profile.name,
-                uuid = %profile.uuid,
-                "login complete; configuration state not yet implemented (M1.e), \
-                 dropping connection",
+                "M1.e configuration complete; Play state (M1.g) not yet \
+                 implemented, dropping connection",
             );
-            // Configuration state is M1.e. Until it lands we simply
-            // close: the vanilla client will display the "connection
-            // lost" screen.
             Ok(())
         }
     }

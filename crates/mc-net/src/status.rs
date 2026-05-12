@@ -31,9 +31,9 @@ pub(crate) fn build_status_json(config: &ServerConfig) -> String {
 }
 
 pub(crate) async fn handle<R, W>(
-    mut reader: R,
-    mut writer: W,
-    mut buf: BytesMut,
+    reader: &mut R,
+    writer: &mut W,
+    buf: &mut BytesMut,
     config: &ServerConfig,
 ) -> Result<(), ConnectionError>
 where
@@ -44,24 +44,18 @@ where
     // It's tempting to skip the StatusRequest read and just wait for the
     // ping, but mcstatus-style clients always send the empty status
     // request first.
-    let _ = read_packet::<StatusRequest, _>(
-        &mut reader,
-        &mut buf,
-        Compression::Disabled,
-        State::Status,
-    )
-    .await?;
+    let _ =
+        read_packet::<StatusRequest, _>(reader, buf, Compression::Disabled, State::Status).await?;
 
     let response = StatusResponse {
         json: build_status_json(config),
     };
-    write_packet(&mut writer, &response, Compression::Disabled).await?;
+    write_packet(writer, &response, Compression::Disabled).await?;
 
     let ping =
-        read_packet::<PingRequest, _>(&mut reader, &mut buf, Compression::Disabled, State::Status)
-            .await?;
+        read_packet::<PingRequest, _>(reader, buf, Compression::Disabled, State::Status).await?;
     write_packet(
-        &mut writer,
+        writer,
         &PongResponse {
             payload: ping.payload,
         },
