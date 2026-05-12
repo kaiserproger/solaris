@@ -17,8 +17,10 @@
 
 pub mod codec;
 mod error;
+pub mod frame;
 
 pub use error::CodecError;
+pub use frame::{Compression, FramingError, RawFrame};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
