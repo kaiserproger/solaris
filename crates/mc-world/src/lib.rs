@@ -8,6 +8,7 @@ pub mod anvil;
 pub mod block;
 pub mod chunk;
 pub mod section;
+pub mod storage;
 
 pub use block::{Block, BlockRegistry, BlockState, BlockStateId, RegistryError};
 pub use chunk::{
@@ -15,6 +16,7 @@ pub use chunk::{
     HEIGHTMAP_LEN, Heightmap, MAX_Y, MIN_SECTION_Y, MIN_Y, SECTION_COUNT,
 };
 pub use section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
+pub use storage::{WorldError, WorldStorage};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
