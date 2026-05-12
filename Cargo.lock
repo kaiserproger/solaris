@@ -460,6 +460,12 @@ dependencies = [
 [[package]]
 name = "mc-data"
 version = "0.0.1"
+dependencies = [
+ "mc-protocol",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "mc-entity"
@@ -472,6 +478,11 @@ version = "0.0.1"
 [[package]]
 name = "mc-nbt"
 version = "0.0.1"
+dependencies = [
+ "bytes",
+ "proptest",
+ "thiserror",
+]
 
 [[package]]
 name = "mc-net"

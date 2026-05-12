@@ -1,6 +1,6 @@
 [package]
 name = "mc-data"
-description = "data pack loader, registries, recipes (Solaris)."
+description = "Data pack loader and registry indexing (Solaris)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,9 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-protocol = { path = "../mc-protocol" }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

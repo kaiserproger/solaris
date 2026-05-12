@@ -1,6 +1,6 @@
 [package]
 name = "mc-nbt"
-description = "NBT helpers (Solaris)."
+description = "NBT codec (Solaris)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,8 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
