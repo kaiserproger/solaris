@@ -6,21 +6,20 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M5 complete on `dev/M5-chunk-modification`, awaiting
-`m5` tag. A vanilla 26.1.2 client connecting to Solaris walks the
+**Status:** M6 complete on `dev/M6-persistence-inventory`, awaiting
+`m6` tag. A vanilla 26.1.2 client connecting to Solaris walks the
 full Handshake → Login → Configuration → Play sequence, receives
 the streamed spawn-area chunks lit by `mc_world::light`'s BFS
-engine (M4), and can now **break and place blocks** at runtime:
-the server applies the mutation in-memory via
-`WorldStorage::set_block_at`, refreshes the affected chunk's
-heightmaps, recomputes light over the centre + 4 manhattan
-neighbours, and ships `BlockUpdate` + `LightUpdate` ×5 +
-`BlockChangedAck` per edit. Place always emits `minecraft:stone`
-regardless of held item (no inventory yet). Edits live in the
-world cache for the session and revert on shutdown —
-persistence to `.mca` is M6+. The opaque "extras" channel from
-M5.c makes the eventual write-back path lossless across the
-chunk fields M2 didn't model.
+engine (M4), can **break and place blocks** (M5) — and now those
+edits **persist**. After M6 the server seeds the player's hotbar
+on login with a 4-slot starter kit (stone, dirt, oak planks,
+torch); scrolling the hotbar bumps `ServerboundSetCarriedItem`;
+right-click places the *selected* item (not always stone). Per-
+edit count decrements ship as `ContainerSetSlot`. On Ctrl-C the
+server flushes every dirty chunk back to `r.X.Z.mca` via an
+atomic sibling-tempfile rename — reconnecting after a restart
+shows the edits intact. The extras channel from M5.c keeps the
+round-trip lossless across the chunk fields M2 didn't model.
 
 ## Build
 

@@ -17,7 +17,10 @@ use thiserror::Error;
 
 use mc_data::Identifier;
 
-use crate::anvil::{ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, read_region};
+use crate::anvil::{
+    ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, chunk_to_payload, read_region,
+    write_region,
+};
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos};
 use crate::section::SECTION_DIM;
@@ -201,7 +204,7 @@ impl WorldStorage {
         let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
         let (_, root) = mc_nbt::read_named(&mut cursor)?;
         let chunk = chunk_from_nbt(&root, &self.registry)?;
-        self.insert_chunk(cpos, chunk);
+        self.insert_chunk(cpos, chunk)?;
         Ok(self.cache.get(&cpos))
     }
 
@@ -252,10 +255,19 @@ impl WorldStorage {
         }
     }
 
-    fn insert_chunk(&mut self, cpos: ChunkPos, chunk: Chunk) {
+    fn insert_chunk(&mut self, cpos: ChunkPos, chunk: Chunk) -> Result<(), WorldError> {
         if self.cache.contains_key(&cpos) {
             self.touch(cpos);
-            return;
+            return Ok(());
+        }
+        // M6.b: if eviction would drop a dirty chunk, flush every
+        // dirty chunk to disk first. Spawn-burst loads aren't dirty,
+        // so this only fires after player edits.
+        if self.cache.len() >= self.capacity
+            && let Some(front) = self.lru.front()
+            && self.cache.get(front).is_some_and(|c| c.dirty)
+        {
+            self.flush_dirty()?;
         }
         while self.cache.len() >= self.capacity {
             if let Some(evict) = self.lru.pop_front() {
@@ -266,6 +278,7 @@ impl WorldStorage {
         }
         self.cache.insert(cpos, chunk);
         self.lru.push_back(cpos);
+        Ok(())
     }
 
     fn touch(&mut self, cpos: ChunkPos) {
@@ -287,6 +300,99 @@ impl WorldStorage {
     #[must_use]
     pub fn region_cache_len(&self) -> usize {
         self.regions.len()
+    }
+
+    /// M6.b: write every dirty chunk in the cache back to its
+    /// `.mca` region file. Returns the number of chunks flushed.
+    /// Groups dirty chunks by region so each `r.X.Z.mca` is rewritten
+    /// at most once per call.
+    pub fn flush_dirty(&mut self) -> Result<usize, WorldError> {
+        let dirty_positions: Vec<ChunkPos> = self
+            .cache
+            .iter()
+            .filter_map(|(pos, chunk)| chunk.dirty.then_some(*pos))
+            .collect();
+        if dirty_positions.is_empty() {
+            return Ok(0);
+        }
+        let mut by_region: HashMap<(i32, i32), Vec<ChunkPos>> = HashMap::new();
+        for pos in dirty_positions {
+            by_region.entry(region_of(pos)).or_default().push(pos);
+        }
+        let mut flushed = 0usize;
+        for ((rx, rz), positions) in by_region {
+            flushed += self.flush_region(rx, rz, &positions)?;
+        }
+        Ok(flushed)
+    }
+
+    /// Flush one region: merge the listed dirty chunks (which must
+    /// all live in `(rx, rz)`) with whatever already sits on disk,
+    /// then rewrite the region file atomically via a sibling temp +
+    /// rename. The region cache for this region is dropped on
+    /// success so the next read picks up the fresh bytes.
+    fn flush_region(
+        &mut self,
+        rx: i32,
+        rz: i32,
+        positions: &[ChunkPos],
+    ) -> Result<usize, WorldError> {
+        let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
+        // Load existing payloads (if any) so unmodified slots survive.
+        let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if region_path.is_file() {
+            read_region(&region_path)?
+                .into_iter()
+                .map(|p| ((p.local_x, p.local_z), p))
+                .collect()
+        } else {
+            HashMap::new()
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as u32)
+            .unwrap_or(0);
+
+        for &cpos in positions {
+            let chunk = self
+                .cache
+                .get(&cpos)
+                .expect("dirty position must still be in cache");
+            let payload = chunk_to_payload(chunk, &self.registry, now)?;
+            by_slot.insert((payload.local_x, payload.local_z), payload);
+        }
+
+        let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
+        payloads.sort_by_key(|p| (p.local_z, p.local_x));
+
+        let tmp_path = region_path.with_extension("mca.tmp");
+        write_region(&tmp_path, &payloads)?;
+        std::fs::rename(&tmp_path, &region_path).map_err(|e| {
+            WorldError::Region(RegionError::Io {
+                path: region_path.clone(),
+                source: e,
+            })
+        })?;
+
+        // Mark flushed chunks clean.
+        for &cpos in positions {
+            if let Some(chunk) = self.cache.get_mut(&cpos) {
+                chunk.dirty = false;
+            }
+        }
+        // Drop the region cache for this region so a subsequent read
+        // sees the freshly-written bytes.
+        self.regions.remove(&(rx, rz));
+        self.region_lru.retain(|&k| k != (rx, rz));
+
+        Ok(positions.len())
+    }
+
+    /// Number of dirty chunks currently in the cache. Used by tests
+    /// and the Ctrl-C shutdown log.
+    #[must_use]
+    pub fn dirty_count(&self) -> usize {
+        self.cache.values().filter(|c| c.dirty).count()
     }
 }
 
@@ -450,6 +556,91 @@ mod tests {
         // the one region those chunks live in.
         assert!(world.cache_len() <= 4);
         assert_eq!(world.region_cache_len(), 1);
+    }
+
+    /// M6.b: a dirty chunk in the cache is flushed to its `.mca`
+    /// when `flush_dirty` is called, and the flush survives a fresh
+    /// `WorldStorage::open` (i.e. the next read picks it up from
+    /// disk, not from the in-memory cache).
+    #[test]
+    fn flush_dirty_writes_modified_chunks_to_disk() {
+        use mc_data::Identifier;
+
+        let world_dir = workspace_path(".analysis/test-world");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !world_dir.is_dir() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        // Copy the bundled test world into a temp directory so the
+        // bundled fixture stays clean.
+        let tmp_world = tempfile::tempdir().unwrap();
+        copy_dir_recursive(&world_dir, tmp_world.path());
+
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
+
+        let stone_id = registry
+            .block(&Identifier::parse("minecraft:stone").unwrap())
+            .map(|b| b.default)
+            .unwrap();
+        let edit_pos = BlockPos { x: 3, y: -61, z: 5 };
+        let prev = world.set_block_at(edit_pos, stone_id).unwrap().unwrap();
+        assert_ne!(prev, stone_id, "test world cell must not already be stone");
+        assert_eq!(world.dirty_count(), 1);
+
+        let n_flushed = world.flush_dirty().unwrap();
+        assert_eq!(n_flushed, 1);
+        assert_eq!(world.dirty_count(), 0);
+
+        // Drop the in-memory world and re-open fresh — proves the
+        // edit landed on disk, not just in the LRU.
+        drop(world);
+        let mut world2 =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
+        let after = world2.get_block(edit_pos).unwrap().unwrap();
+        assert_eq!(after, stone_id);
+    }
+
+    /// M6.b: the spawn-burst load path (read 121 chunks) must not
+    /// produce any dirty chunks (chunks decoded from disk start
+    /// clean). This guards against an accidental `dirty = true`
+    /// default that would turn the burst into an I/O storm.
+    #[test]
+    fn spawn_burst_load_does_not_dirty_chunks() {
+        let world_dir = workspace_path(".analysis/test-world");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !world_dir.is_dir() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
+        for cz in 0..=10 {
+            for cx in 0..=10 {
+                let _ = world.get_chunk(ChunkPos { x: cx, z: cz }).unwrap();
+            }
+        }
+        assert_eq!(world.dirty_count(), 0);
+    }
+
+    fn copy_dir_recursive(src: &Path, dst: &Path) {
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let path = entry.path();
+            let target = dst.join(entry.file_name());
+            if path.is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+                copy_dir_recursive(&path, &target);
+            } else {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::copy(&path, &target).unwrap();
+            }
+        }
     }
 
     /// Bench-style coverage of the M3.e load pattern: stream the

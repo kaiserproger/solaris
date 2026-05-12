@@ -32,6 +32,7 @@ use tracing::{debug, trace};
 pub mod block_light;
 pub mod blocks;
 pub mod identifier;
+pub mod items;
 pub mod tags;
 
 pub use identifier::{Identifier, IdentifierError};

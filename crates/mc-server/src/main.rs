@@ -151,8 +151,30 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let items_path = cfg.data.vanilla_dir.join("reports").join("registries.json");
+    let items = match mc_data::items::load_items_report(&items_path) {
+        Ok(report) => {
+            let reg = mc_data::items::ItemRegistry::from_report(&report);
+            tracing::info!(
+                entries = reg.len(),
+                path = %items_path.display(),
+                "item registry loaded",
+            );
+            Arc::new(reg)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %items_path.display(),
+                error = %err,
+                "item registry load failed; M6 place will fall back to stone",
+            );
+            Arc::new(mc_data::items::ItemRegistry::default())
+        }
+    };
+
+    let world_for_shutdown = net_world_clone(&world);
     let net = cfg
-        .to_network(data, blocks, world, tags, block_light)
+        .to_network(data, blocks, world, tags, block_light, items)
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,
@@ -160,7 +182,38 @@ async fn serve(path: &Path) -> Result<()> {
         target = mc_protocol::TARGET_RELEASE,
         "Solaris starting",
     );
-    mc_net::run(net).await.context("network listener")
+
+    // M6.b: race the network listener against a Ctrl-C signal. On
+    // signal, stop the listener, take the world mutex exclusively,
+    // and flush every dirty chunk back to disk before returning.
+    let run_fut = mc_net::run(net);
+    let shutdown = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
+            // Never resolve — let the listener own the lifetime.
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        result = run_fut => {
+            result.context("network listener")
+        }
+        () = shutdown => {
+            tracing::info!("shutdown signal received");
+            if let Some(world) = world_for_shutdown {
+                let mut guard = world.lock().await;
+                match guard.flush_dirty() {
+                    Ok(n) => tracing::info!(flushed = n, "shutdown: flushed dirty chunks"),
+                    Err(err) => tracing::error!(error = %err, "shutdown: flush_dirty failed"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn net_world_clone(world: &Option<mc_net::WorldHandle>) -> Option<mc_net::WorldHandle> {
+    world.as_ref().map(Arc::clone)
 }
 
 fn count_region_files(world_dir: &Path) -> usize {

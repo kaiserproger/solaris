@@ -558,6 +558,7 @@ dependencies = [
  "mc-net",
  "mc-protocol",
  "mc-world",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

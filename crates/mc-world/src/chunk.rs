@@ -211,6 +211,11 @@ pub struct Chunk {
     /// (modulo NBT compound ordering being unspecified — vanilla
     /// reads it back identically either way).
     pub extras: Vec<(String, Tag)>,
+    /// M6.b: set when an edit changes a stored block-state id; cleared
+    /// after the chunk is flushed back to its `.mca`. Decoders default
+    /// this to `false` so loading a fresh region from disk does not
+    /// re-trigger a write.
+    pub dirty: bool,
 }
 
 impl Chunk {
@@ -231,6 +236,7 @@ impl Chunk {
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
             extras: Vec::new(),
+            dirty: false,
         }
     }
 
@@ -274,6 +280,7 @@ impl Chunk {
         if prev == state {
             return Some(prev);
         }
+        self.dirty = true;
         // Heightmap entries store `height + 1`-style values (the Y of
         // the first air cell above the column), matching vanilla's
         // on-disk packing. Recompute the column for every present

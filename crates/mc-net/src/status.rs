@@ -84,6 +84,7 @@ mod tests {
             world: None,
             tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
             block_light: None,
+            items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         };
         let json = build_status_json(&cfg);
         // Parse it back to make sure the value is a well-formed object.
