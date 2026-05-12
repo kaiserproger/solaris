@@ -1,6 +1,6 @@
 [package]
 name = "mc-net"
-description = "connection management, session lifecycle (Solaris)."
+description = "Connection management and session lifecycle (Solaris)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,3 +12,10 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-protocol = { path = "../mc-protocol" }
+bytes = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

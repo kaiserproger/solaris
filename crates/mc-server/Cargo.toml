@@ -19,11 +19,14 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+mc-net = { path = "../mc-net" }
+mc-protocol = { path = "../mc-protocol" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 anyhow = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -31,3 +34,5 @@ tracing-subscriber = { workspace = true }
 assert_cmd = "2"
 tempfile = "3"
 predicates = "3"
+bytes = { workspace = true }
+tokio = { workspace = true }

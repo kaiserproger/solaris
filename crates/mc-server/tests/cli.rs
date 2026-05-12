@@ -1,4 +1,8 @@
-//! Integration test for the `mc-server` binary's M0 CLI.
+//! Integration tests for the `mc-server` binary's CLI surface.
+//!
+//! These cover only the synchronous `--check` path (parse a config, print
+//! it, exit). The end-to-end "actually serve a connection" test lives in
+//! `tests/status.rs` because it needs tokio and a real socket.
 
 use std::io::Write;
 
@@ -17,12 +21,13 @@ port = 30000
 "#;
 
 #[test]
-fn prints_parsed_config_and_exits_zero() {
+fn check_prints_parsed_config_and_exits_zero() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");
 
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")
+        .arg("--check")
         .arg("--config")
         .arg(file.path())
         .assert()
@@ -34,9 +39,10 @@ fn prints_parsed_config_and_exits_zero() {
 }
 
 #[test]
-fn missing_config_exits_nonzero_with_clear_error() {
+fn check_missing_config_exits_nonzero_with_clear_error() {
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")
+        .arg("--check")
         .arg("--config")
         .arg("/definitely/does/not/exist.toml")
         .assert()
@@ -45,13 +51,14 @@ fn missing_config_exits_nonzero_with_clear_error() {
 }
 
 #[test]
-fn malformed_config_exits_nonzero_with_clear_error() {
+fn check_malformed_config_exits_nonzero_with_clear_error() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(b"this is not = valid [toml\n")
         .expect("write");
 
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")
+        .arg("--check")
         .arg("--config")
         .arg(file.path())
         .assert()
