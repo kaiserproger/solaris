@@ -6,15 +6,17 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M3 code-complete on `dev/M3-chunk-streaming`. A vanilla
-26.1.2 client connecting to Solaris now walks Handshake → Login →
-Configuration → Play and receives the view-distance ring of chunks
-around spawn streamed straight out of `WorldStorage` — the M2 world
-model is wired into the Play state and the spawn-area floor renders
-instead of the M1 black void. An automated raw-TCP harness
-(`mc-test-harness::client`) drives the same flow against the bundled
-test world as the CI gate. Lighting is still empty arrays only;
-worldgen is the next milestone.
+**Status:** M3 complete on `dev/M3-chunk-streaming`, awaiting `m3`
+tag. A vanilla 26.1.2 client connecting to Solaris walks Handshake →
+Login → Configuration → Play, receives the full vanilla tag set via
+`Update Tags`, and renders the spawn floor from
+`.analysis/test-world/` streamed straight out of `WorldStorage`. An
+automated raw-TCP harness (`mc-test-harness::client`) drives the same
+flow against the bundled test world as the CI gate; the manual
+acceptance gate has been driven through with a PrismLauncher 26.1.2
+client. Lighting is empty arrays only (next milestone) — surrounding
+chunks render dark while the player's tile gets the client's local
+skylight pass.
 
 ## Build
 
