@@ -1,14 +1,14 @@
 //! Play state — the bulk of the protocol surface.
 //!
 //! M1.g.2 scope: just enough packet types for the M1.g.3 handler to
-//! send `Login (Play)` → `Set Default Spawn Position` →
-//! `Synchronize Player Position`, then run a KeepAlive loop.
+//! send `Login (Play)` → `Synchronize Player Position` → `Game Event`
+//! and run a KeepAlive loop.
 //!
-//! **Packet IDs are placeholders.** They are based on the modern
-//! protocol's general layout and are tagged `TODO(M1.g.4)` until they
-//! can be validated against a wire capture from the bundled vanilla
-//! 26.1.2 server. The on-wire field layouts are believed to be correct
-//! since protocol 770; only the leading discriminator may shift.
+//! Packet IDs and field layouts have been verified against
+//! `net.minecraft.network.protocol.game.GameProtocols` from the
+//! unobfuscated vanilla 26.1.2 jar (per ADR 0002); each
+//! `impl Packet for ... { const ID }` site cites the corresponding
+//! vanilla `PacketType` constant name.
 
 use bytes::{Buf, BufMut};
 
@@ -161,31 +161,42 @@ impl Packet for LoginPlay {
 
 /// `Set Default Spawn Position` (CB). Tells the client where its compass
 /// should point.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// In 26.1.2 the body is vanilla's `LevelData$RespawnData` record:
+/// a `GlobalPos` (= dimension identifier + packed `BlockPos`) plus a
+/// yaw and pitch, mapping onto the structured fields below.
+/// Per ADR 0002, verified against `javap -p` of the unobfuscated jar:
+/// `CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION`.
+#[derive(Debug, Clone, PartialEq)]
 pub struct SetDefaultSpawnPosition {
+    pub dimension: Identifier,
     /// Block position packed into an `i64` per the vanilla
     /// `BlockPos` format: `((x & 0x3FFFFFF) << 38) | ((z & 0x3FFFFFF) << 12) | (y & 0xFFF)`.
-    /// We carry the packed form rather than a struct so the codec is
-    /// trivially round-trippable; helper accessors live alongside in
-    /// `mc-world` when that lands.
     pub position: i64,
-    pub angle: f32,
+    pub yaw: f32,
+    pub pitch: f32,
 }
 
 impl Packet for SetDefaultSpawnPosition {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x5C;
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION sits at game-CB index 96
+    // (skipping `CLIENTBOUND_BUNDLE` at index 0) = wire id 0x61.
+    const ID: i32 = 0x61;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_identifier(&self.dimension);
         buf.write_i64(self.position);
-        buf.write_f32(self.angle);
+        buf.write_f32(self.yaw);
+        buf.write_f32(self.pitch);
         Ok(())
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
+            dimension: buf.read_identifier()?,
             position: buf.read_i64()?,
-            angle: buf.read_f32()?,
+            yaw: buf.read_f32()?,
+            pitch: buf.read_f32()?,
         })
     }
 }
@@ -256,8 +267,9 @@ pub struct ClientboundKeepAlive {
 }
 
 impl Packet for ClientboundKeepAlive {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x27;
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_KEEP_ALIVE at game-CB index 44 = wire id 0x2C.
+    const ID: i32 = 0x2C;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_i64(self.id);
@@ -285,8 +297,9 @@ pub struct PlayDisconnect {
 }
 
 impl Packet for PlayDisconnect {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x1D;
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_DISCONNECT at game-CB index 32 = wire id 0x20.
+    const ID: i32 = 0x20;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.put_slice(&self.reason_nbt);
@@ -348,7 +361,8 @@ pub struct ConfirmTeleportation {
 }
 
 impl Packet for ConfirmTeleportation {
-    // TODO(M1.g.4): verify against wire capture.
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_ACCEPT_TELEPORTATION at game-SB index 0 = wire id 0x00.
     const ID: i32 = 0x00;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
@@ -371,8 +385,9 @@ pub struct ServerboundKeepAlive {
 }
 
 impl Packet for ServerboundKeepAlive {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x1A;
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_KEEP_ALIVE at game-SB index 28 = wire id 0x1C.
+    const ID: i32 = 0x1C;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_i64(self.id);
@@ -466,8 +481,10 @@ mod tests {
     #[test]
     fn set_default_spawn_round_trip() {
         round_trip(SetDefaultSpawnPosition {
+            dimension: sample_identifier("minecraft:overworld"),
             position: 0x0000_0FFF_FFFF_FFFF,
-            angle: 1.5,
+            yaw: 1.5,
+            pitch: -0.25,
         });
     }
 

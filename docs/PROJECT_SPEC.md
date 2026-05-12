@@ -353,8 +353,15 @@ Run daily in CI; regressions > 10% — alert.
 ### 8.1 Legal posture
 
 - We use wiki.vg protocol documentation and Minecraft Wiki for mechanics — public reverse engineering
-- We do not use decompiled Mojang source in our code
-- We do not use Mojmap mappings to inform our code — we write our own, working from documentation
+- We do not translate decompiled Mojang **source** to Rust, and we do
+  not copy algorithmic logic (RNG, worldgen, light propagation, …)
+  out of decompiled classes.
+- We **do** allow reading the **metadata** of the unobfuscated 26.1+
+  vanilla jar (class names, field names, packet ID constants, record
+  layouts) via `javap` and friends as a reference, treating it the
+  same way we treat minecraft.wiki — per
+  [ADR 0002](decisions/0002-vanilla-protocol-metadata-as-reference.md).
+  Solaris' own Rust identifiers stay independent of Mojang's naming.
 - Bundled binary assets (textures, models, sounds, fonts) are original or community-made under permissive licenses
 - **Vanilla *data* files** (the contents of `data/minecraft/**` inside
   the official server jar — registry JSON, tags, loot tables, recipes,
