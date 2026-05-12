@@ -1,0 +1,14 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*.swp
+*.swo
+
+# Vanilla server jar and other oracles kept locally for analysis,
+# not committed to the repo.
+/.analysis/
