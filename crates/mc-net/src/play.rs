@@ -30,7 +30,7 @@ use mc_protocol::packets::play::{
     ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight,
     LightData, LoginPlay, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
-use mc_world::light::compute_chunk_light;
+use mc_world::light::{LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -271,6 +271,10 @@ where
     let mut emitted = 0usize;
     let mut absent = 0usize;
     let mut bytes = 0usize;
+    // One workspace reused for every chunk in the burst — without
+    // this the per-chunk ~4 MB alloc + zero-fill blows the M4.f
+    // harness timeout in debug builds.
+    let mut workspace = block_light.is_some().then(LightWorkspace::new);
 
     for cz in (center_cz - view_distance)..=(center_cz + view_distance) {
         for cx in (center_cx - view_distance)..=(center_cx + view_distance) {
@@ -281,14 +285,21 @@ where
             };
             let neighbours = build_neighbourhood(&staged, cx, cz);
             let centre_ref = centre.as_ref();
-            let packet =
-                match build_chunk_packet(centre_ref, &neighbours, biomes, block_light, cx, cz) {
-                    Ok(p) => p,
-                    Err(err) => {
-                        warn!(cx, cz, error = %err, "chunk encode failed; skipping");
-                        continue;
-                    }
-                };
+            let packet = match build_chunk_packet(
+                centre_ref,
+                &neighbours,
+                biomes,
+                block_light,
+                workspace.as_mut(),
+                cx,
+                cz,
+            ) {
+                Ok(p) => p,
+                Err(err) => {
+                    warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+                    continue;
+                }
+            };
             let n = packet.data.len();
             write_packet(writer, &packet, Compression::Disabled).await?;
             emitted += 1;
@@ -333,6 +344,7 @@ fn build_chunk_packet(
     neighbourhood: &[[Option<Arc<Chunk>>; 3]; 3],
     biomes: &Registry,
     block_light: Option<&BlockLightTable>,
+    workspace: Option<&mut LightWorkspace>,
     cx: i32,
     cz: i32,
 ) -> Result<LevelChunkWithLight, mc_world::wire::WireError> {
@@ -344,9 +356,8 @@ fn build_chunk_packet(
             data: h.data,
         })
         .collect();
-    let light = match block_light {
-        None => LightData::empty(),
-        Some(table) => {
+    let light = match (block_light, workspace) {
+        (Some(table), Some(ws)) => {
             // Centre slot is the chunk we already have a reference to;
             // off-centre slots come from the staged map.
             let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
@@ -356,7 +367,7 @@ fn build_chunk_packet(
                 }
             }
             refs[1][1] = Some(centre);
-            let computed = compute_chunk_light(refs, table);
+            let computed = compute_chunk_light_in(ws, refs, table);
             let wire = encode_chunk_light(&computed);
             LightData {
                 sky_y_mask: wire.sky_y_mask,
@@ -367,6 +378,7 @@ fn build_chunk_packet(
                 block_updates: wire.block_updates,
             }
         }
+        _ => LightData::empty(),
     };
     Ok(LevelChunkWithLight {
         chunk_x: cx,

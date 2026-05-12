@@ -90,12 +90,66 @@ fn chunk_idx(x: usize, local_y: usize, z: usize) -> usize {
     local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
 }
 
+/// Reusable working buffers for the lighting engine. Allocating
+/// ~4 MB on every chunk emit measurably slows the spawn burst in
+/// debug mode (the M3.g/M4.f harness exceeds 60 s without this).
+/// Build one per connection (or one per `emit_chunks_around` call)
+/// and pass it into [`compute_chunk_light`].
+pub struct LightWorkspace {
+    sky: Vec<u8>,
+    block: Vec<u8>,
+    opacity: Vec<u8>,
+    propagates_sky: Vec<bool>,
+    queue: VecDeque<u32>,
+}
+
+impl LightWorkspace {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sky: vec![0; N_VOL],
+            block: vec![0; N_VOL],
+            opacity: vec![0; N_VOL],
+            propagates_sky: vec![true; N_VOL],
+            queue: VecDeque::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.sky.fill(0);
+        self.block.fill(0);
+        self.opacity.fill(0);
+        self.propagates_sky.fill(true);
+        self.queue.clear();
+    }
+}
+
+impl Default for LightWorkspace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Compute sky and block light for the centre chunk of a 3×3
 /// neighbourhood. The centre is `neighbourhood[1][1]` (must be
 /// `Some`); off-centre slots may be `None`, in which case the engine
 /// treats that neighbour as a column of air (opacity 0,
 /// propagates_sky true, emission 0).
+///
+/// Convenience wrapper around [`compute_chunk_light_in`] that
+/// allocates a fresh [`LightWorkspace`] for one call. Hot paths
+/// that compute many chunks should manage the workspace explicitly.
 pub fn compute_chunk_light(
+    neighbourhood: [[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+) -> ChunkLight {
+    let mut ws = LightWorkspace::new();
+    compute_chunk_light_in(&mut ws, neighbourhood, table)
+}
+
+/// Like [`compute_chunk_light`] but reuses caller-owned buffers.
+pub fn compute_chunk_light_in(
+    ws: &mut LightWorkspace,
     neighbourhood: [[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
 ) -> ChunkLight {
@@ -104,27 +158,23 @@ pub fn compute_chunk_light(
         "centre chunk must be present",
     );
 
-    let mut sky = vec![0u8; N_VOL];
-    let mut block = vec![0u8; N_VOL];
-    let mut opacity = vec![0u8; N_VOL];
-    let mut propagates_sky = vec![true; N_VOL];
+    ws.reset();
 
     populate_grids(
         &neighbourhood,
         table,
-        &mut opacity,
-        &mut propagates_sky,
-        &mut block,
+        &mut ws.opacity,
+        &mut ws.propagates_sky,
+        &mut ws.block,
     );
 
-    let mut queue: VecDeque<u32> = VecDeque::new();
-    seed_sky_from_open_columns(&propagates_sky, &mut sky, &mut queue);
-    bfs(&opacity, &mut sky, &mut queue);
+    seed_sky_from_open_columns(&ws.propagates_sky, &mut ws.sky, &mut ws.queue);
+    bfs(&ws.opacity, &mut ws.sky, &mut ws.queue);
 
-    seed_block_from_emission(&block, &mut queue);
-    bfs(&opacity, &mut block, &mut queue);
+    seed_block_from_emission(&ws.block, &mut ws.queue);
+    bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
 
-    extract_centre(&sky, &block)
+    extract_centre(&ws.sky, &ws.block)
 }
 
 fn populate_grids(
