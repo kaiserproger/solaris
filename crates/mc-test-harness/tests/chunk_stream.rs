@@ -48,8 +48,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let storage = mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks))
-        .expect("world storage opens");
+    let storage =
+        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -73,7 +73,10 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         .drive_login(addr, "M3gTester")
         .await
         .expect("drive login");
-    client.drive_configuration().await.expect("drive configuration");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
 
     // Spawn burst, in the order `mc_net::play::handle` emits it.
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
@@ -164,8 +167,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         assert!(
             fresh,
             "duplicate chunk ({}, {}) on the wire",
-            pkt.chunk_x,
-            pkt.chunk_z
+            pkt.chunk_x, pkt.chunk_z
         );
     }
 
