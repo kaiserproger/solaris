@@ -15,13 +15,26 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
-use crate::anvil::{ChunkNbtError, RegionError, chunk_from_nbt, read_region};
+use crate::anvil::{ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, read_region};
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos};
 use crate::section::SECTION_DIM;
 
 const REGION_AXIS_CHUNKS: i32 = 32;
 const DEFAULT_LRU_CAPACITY: usize = 16;
+/// How many decoded regions (`.mca` files with per-chunk payloads
+/// already decompressed) we hold resident at once. Each entry is on
+/// the order of tens of MB for a dense overworld region; four is a
+/// pragmatic default that covers the M3.e view-distance ring around
+/// a single player without growing unboundedly.
+const DEFAULT_REGION_LRU_CAPACITY: usize = 4;
+
+/// A decoded region: per-chunk payload bytes ready for
+/// `mc_nbt::read_named`, keyed by the chunk's local-to-region
+/// coordinates `(local_x, local_z)`. Wrapped in an `Arc` in
+/// [`WorldStorage`] so the per-chunk lookup can clone a handle
+/// without copying the payload bytes.
+type DecodedRegion = HashMap<(u8, u8), ChunkPayload>;
 
 #[derive(Debug, Error)]
 pub enum WorldError {
@@ -45,6 +58,15 @@ pub struct WorldStorage {
     /// the accessed key to the back.
     lru: VecDeque<ChunkPos>,
     capacity: usize,
+    /// LRU of *decoded* region files, keyed by region coordinates.
+    /// Each entry maps `(local_x, local_z)` → already-decompressed
+    /// chunk payload (raw NBT bytes ready for `mc_nbt::read_named`).
+    /// This eliminates the per-chunk re-open + re-decompress of the
+    /// same `.mca` when many chunks in the same region are touched
+    /// in quick succession — the M2 follow-up #1 noted at close-out.
+    regions: HashMap<(i32, i32), Arc<DecodedRegion>>,
+    region_lru: VecDeque<(i32, i32)>,
+    region_capacity: usize,
 }
 
 impl WorldStorage {
@@ -90,6 +112,9 @@ impl WorldStorage {
             cache: HashMap::new(),
             lru: VecDeque::new(),
             capacity: capacity.max(1),
+            regions: HashMap::new(),
+            region_lru: VecDeque::new(),
+            region_capacity: DEFAULT_REGION_LRU_CAPACITY,
         })
     }
 
@@ -132,27 +157,69 @@ impl WorldStorage {
             return Ok(self.cache.get(&cpos));
         }
         let (rx, rz) = region_of(cpos);
-        let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
-        if !region_path.is_file() {
-            return Ok(None);
-        }
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
         let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
-        // TODO(M3 perf): cache parsed regions so we don't re-read the
-        // whole .mca for every cache miss in the same region. For M2,
-        // correctness over throughput.
-        let payloads = read_region(&region_path)?;
-        let Some(payload) = payloads
-            .iter()
-            .find(|p| p.local_x == local_x && p.local_z == local_z)
-        else {
+
+        let Some(region) = self.ensure_region(rx, rz)? else {
             return Ok(None);
         };
+        let Some(payload) = region.get(&(local_x, local_z)).cloned() else {
+            return Ok(None);
+        };
+        drop(region);
+
         let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
         let (_, root) = mc_nbt::read_named(&mut cursor)?;
         let chunk = chunk_from_nbt(&root, &self.registry)?;
         self.insert_chunk(cpos, chunk);
         Ok(self.cache.get(&cpos))
+    }
+
+    /// Bring the region at `(rx, rz)` into the region cache and return
+    /// a shared handle to its per-chunk payload map. Returns `None`
+    /// when the underlying `.mca` file doesn't exist on disk.
+    fn ensure_region(
+        &mut self,
+        rx: i32,
+        rz: i32,
+    ) -> Result<Option<Arc<DecodedRegion>>, WorldError> {
+        let key = (rx, rz);
+        if let Some(region) = self.regions.get(&key) {
+            let region = Arc::clone(region);
+            self.touch_region(key);
+            return Ok(Some(region));
+        }
+        let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
+        if !region_path.is_file() {
+            return Ok(None);
+        }
+        let payloads = read_region(&region_path)?;
+        let map: HashMap<(u8, u8), ChunkPayload> = payloads
+            .into_iter()
+            .map(|p| ((p.local_x, p.local_z), p))
+            .collect();
+        let arc = Arc::new(map);
+        self.insert_region(key, Arc::clone(&arc));
+        Ok(Some(arc))
+    }
+
+    fn insert_region(&mut self, key: (i32, i32), region: Arc<DecodedRegion>) {
+        while self.regions.len() >= self.region_capacity {
+            if let Some(evict) = self.region_lru.pop_front() {
+                self.regions.remove(&evict);
+            } else {
+                break;
+            }
+        }
+        self.regions.insert(key, region);
+        self.region_lru.push_back(key);
+    }
+
+    fn touch_region(&mut self, key: (i32, i32)) {
+        if let Some(pos) = self.region_lru.iter().position(|&p| p == key) {
+            self.region_lru.remove(pos);
+            self.region_lru.push_back(key);
+        }
     }
 
     fn insert_chunk(&mut self, cpos: ChunkPos, chunk: Chunk) {
@@ -183,6 +250,13 @@ impl WorldStorage {
     #[must_use]
     pub fn cache_len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// How many decoded regions are currently resident. Tests and
+    /// the M3.f bench use this to confirm the region cache fires.
+    #[must_use]
+    pub fn region_cache_len(&self) -> usize {
+        self.regions.len()
     }
 }
 
@@ -319,5 +393,79 @@ mod tests {
             let _ = world.get_block(BlockPos { x, y: -64, z: 0 }).unwrap();
         }
         assert!(world.cache_len() <= 4);
+    }
+
+    /// Walking 121 chunks of one region must leave exactly one entry
+    /// in the region cache regardless of chunk-LRU thrash. This is
+    /// the structural M3.f assertion: without the region cache the
+    /// equivalent path re-opened `r.0.0.mca` 121 times.
+    #[test]
+    fn region_cache_holds_one_region_across_quadrant_walk() {
+        let world_dir = workspace_path(".analysis/test-world");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !world_dir.is_dir() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
+
+        for cz in 0..=10 {
+            for cx in 0..=10 {
+                let _ = world.get_chunk(ChunkPos { x: cx, z: cz }).unwrap();
+            }
+        }
+        // Chunk LRU still capped at 4. Region LRU now holds exactly
+        // the one region those chunks live in.
+        assert!(world.cache_len() <= 4);
+        assert_eq!(world.region_cache_len(), 1);
+    }
+
+    /// Bench-style coverage of the M3.e load pattern: stream the
+    /// bottom-right quadrant of the view-distance ring (chunks 0..=10
+    /// in both axes — the slice of vd=10 around spawn that exists in
+    /// the test world's only region file). The point is to measure
+    /// the time-to-stream so the M3.f region-cache lands with a
+    /// before/after number rather than a guess.
+    #[test]
+    fn streams_view_distance_quadrant_within_budget() {
+        let world_dir = workspace_path(".analysis/test-world");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !world_dir.is_dir() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        // Match the production chunk-LRU default. M3.e thrashes this
+        // at vd=10 because the LRU only holds 16 of the 121 hot
+        // chunks; the region cache is what de-amortises it.
+        let mut world = WorldStorage::open(&world_dir, registry).unwrap();
+
+        let started = std::time::Instant::now();
+        let mut hit = 0usize;
+        for cz in 0..=10 {
+            for cx in 0..=10 {
+                let chunk = world.get_chunk(ChunkPos { x: cx, z: cz }).unwrap();
+                assert!(chunk.is_some(), "chunk ({cx}, {cz}) missing from r.0.0.mca");
+                hit += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        eprintln!(
+            "vd-quadrant stream: {hit} chunks in {ms} ms ({per_chunk_us} us/chunk)",
+            ms = elapsed.as_millis(),
+            per_chunk_us = elapsed.as_micros() as f64 / hit as f64,
+        );
+        // Generous ceiling. With no region cache and chunk-LRU=16
+        // this typically sits around 1–2 s; once the M3.f region
+        // cache lands it should drop to tens of ms. Set the cap at
+        // 10 s so the test still fails loudly on a 10× regression
+        // but doesn't flake on a contended CI runner.
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "vd-quadrant stream took {elapsed:?} — suspicious regression",
+        );
     }
 }
