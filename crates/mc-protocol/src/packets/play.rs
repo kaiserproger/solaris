@@ -765,6 +765,107 @@ impl Packet for ServerboundKeepAlive {
 }
 
 // ---------------------------------------------------------------------
+// M5.b — clientbound edit / ack / relight packets
+// ---------------------------------------------------------------------
+
+/// `Clientbound Block Update` (CB). Single-block delta the server
+/// sends in response to any state change at a `BlockPos`. Per
+/// ADR 0002, verified against `javap -p` of the unobfuscated jar:
+/// `ClientboundBlockUpdatePacket(BlockPos pos, BlockState state)`,
+/// the `BlockState` wire form being its global state-id VarInt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockUpdate {
+    /// Block position packed into vanilla's standard `BlockPos`
+    /// `i64`. Use [`pack_block_pos`] / [`unpack_block_pos`].
+    pub position: i64,
+    /// Global block-state id — the same id space `blocks.json` /
+    /// `mc_world::BlockStateId` use.
+    pub state_id: i32,
+}
+
+impl Packet for BlockUpdate {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_BLOCK_UPDATE at game-CB index 8 = wire id 0x08.
+    const ID: i32 = 0x08;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.position);
+        buf.write_varint(self.state_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: buf.read_i64()?,
+            state_id: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Block Changed Ack` (CB). One-VarInt packet that
+/// echoes the `sequence` from a `ServerboundPlayerAction` or
+/// `ServerboundUseItemOn`; without it the vanilla client rolls
+/// back its predicted edit. Per ADR 0002, verified against
+/// `javap -p`: `ClientboundBlockChangedAckPacket(int sequence)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockChangedAck {
+    pub sequence: i32,
+}
+
+impl Packet for BlockChangedAck {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_BLOCK_CHANGED_ACK at game-CB index 4 = wire id 0x04.
+    const ID: i32 = 0x04;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.sequence);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            sequence: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Light Update` (CB). Per-chunk light delta — sent
+/// when block changes alter sky / block light without re-streaming
+/// the full chunk. Per ADR 0002, verified against `javap -p`:
+/// `ClientboundLightUpdatePacket(int x, int z,
+/// ClientboundLightUpdatePacketData lightData)`. The wire body for
+/// the chunk coordinates is a pair of VarInts (matching vanilla's
+/// `STREAM_CODEC`), not raw `i32`s — distinct from
+/// `LevelChunkWithLight` which writes the coordinates as `i32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightUpdate {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+    pub light: LightData,
+}
+
+impl Packet for LightUpdate {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_LIGHT_UPDATE at game-CB index 48 = wire id 0x30.
+    const ID: i32 = 0x30;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.chunk_x);
+        buf.write_varint(self.chunk_z);
+        self.light.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            chunk_x: buf.read_varint()?,
+            chunk_z: buf.read_varint()?,
+            light: LightData::decode(buf)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
 // M5.a — serverbound interaction packets
 // ---------------------------------------------------------------------
 
@@ -1387,5 +1488,57 @@ mod tests {
         assert_eq!(Direction::South.normal(), (0, 0, 1));
         assert_eq!(Direction::West.normal(), (-1, 0, 0));
         assert_eq!(Direction::East.normal(), (1, 0, 0));
+    }
+
+    // ---- M5.b: clientbound edit / ack / relight packets ----
+
+    #[test]
+    fn block_update_round_trip() {
+        round_trip(BlockUpdate {
+            position: pack_block_pos(0, -60, 0),
+            state_id: 1, // stone in our test registry
+        });
+        round_trip(BlockUpdate {
+            position: pack_block_pos(-7, 200, 3),
+            state_id: 29_872,
+        });
+    }
+
+    #[test]
+    fn block_changed_ack_round_trip() {
+        round_trip(BlockChangedAck { sequence: 0 });
+        round_trip(BlockChangedAck { sequence: 1 });
+        round_trip(BlockChangedAck { sequence: i32::MAX });
+    }
+
+    #[test]
+    fn light_update_round_trip_empty() {
+        round_trip(LightUpdate {
+            chunk_x: 0,
+            chunk_z: 0,
+            light: LightData::empty(),
+        });
+    }
+
+    #[test]
+    fn light_update_round_trip_with_layers() {
+        // Use the same shape as the existing LightData non-empty
+        // round-trip test in this module: one full-bright layer per
+        // section + an empty-mask-clearing zero across all 26 slots.
+        let sky_layer = vec![0xFFu8; LightData::LIGHT_LAYER_BYTES];
+        let block_layer = vec![0u8; LightData::LIGHT_LAYER_BYTES];
+        let light = LightData {
+            sky_y_mask: vec![(1 << 26) - 1],
+            block_y_mask: vec![(1 << 26) - 1],
+            empty_sky_y_mask: vec![0],
+            empty_block_y_mask: vec![0],
+            sky_updates: vec![sky_layer; 26],
+            block_updates: vec![block_layer; 26],
+        };
+        round_trip(LightUpdate {
+            chunk_x: -3,
+            chunk_z: 7,
+            light,
+        });
     }
 }
