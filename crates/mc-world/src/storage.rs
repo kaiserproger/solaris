@@ -15,6 +15,8 @@ use std::sync::Arc;
 
 use thiserror::Error;
 
+use mc_data::Identifier;
+
 use crate::anvil::{ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, read_region};
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkPos};
@@ -149,6 +151,34 @@ impl WorldStorage {
     pub fn get_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
         self.ensure_chunk(cpos)?;
         Ok(self.cache.get(&cpos))
+    }
+
+    /// Apply a block change at world-space `pos`, refreshing every
+    /// heightmap currently attached to the affected chunk. Returns
+    /// the previous state, or `None` if the chunk is genuinely
+    /// absent (no region file, or the slot is empty in the `.mca`).
+    /// Used by the M5.d / M5.e interaction handlers.
+    pub fn set_block_at(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+    ) -> Result<Option<BlockStateId>, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(None);
+        }
+        let air = self
+            .registry
+            .block(&Identifier::parse("minecraft:air").expect("static identifier"))
+            .map(|b| b.default)
+            .unwrap_or(BlockStateId(0));
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(chunk.set_block_and_update(local_x, pos.y, local_z, state, air))
     }
 
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
