@@ -47,6 +47,12 @@ const SPAWN_X: f64 = 0.5;
 const SPAWN_Y: f64 = 64.0;
 const SPAWN_Z: f64 = 0.5;
 
+/// Chunk radius around spawn the server flushes before the keepalive
+/// loop starts. Currently matches `LoginPlay.view_distance` so the
+/// client renders right up to the announced render distance; tuning
+/// is M3.e/M3.f work.
+const SPAWN_VIEW_DISTANCE: i32 = 10;
+
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
 /// Currently used only by tests but kept here for the eventual
 /// re-introduction of `SetDefaultSpawnPosition` and other block-pos
@@ -76,10 +82,10 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    // `blocks` rides along on the config; M3.d uses `world` below for
-    // the single-chunk emission, M3.e will fan out to a view-distance
-    // window. `blocks` is unused for the moment because the chunk
-    // encoder takes its palette IDs straight from the chunk.
+    // `blocks` rides along on the config — currently unused by the
+    // Play handler because the chunk encoder reads palette IDs straight
+    // from the chunk; it'll matter once we synthesise placeholder
+    // chunks or do block-update packets.
     let _ = &config.blocks;
     let data: &VanillaData = &config.data;
     let (dim_id, dim_name, dim_names) = spawn_dimension(data).ok_or_else(|| {
@@ -162,9 +168,9 @@ where
     )
     .await?;
 
-    // 5. Set Center Chunk + single-chunk experiment (M3.d). View
-    //    distance expansion is M3.e. Spawn is at (SPAWN_X, SPAWN_Z);
-    //    the chunk anchor is the chunk that contains it.
+    // 5. Set Center Chunk + view-distance window. Spawn is at
+    //    (SPAWN_X, SPAWN_Z); the chunk anchor is the chunk that
+    //    contains it, and we stream ±SPAWN_VIEW_DISTANCE around it.
     let (spawn_cx, spawn_cz) = spawn_chunk_pos();
     write_packet(
         writer,
@@ -177,7 +183,7 @@ where
     .await?;
 
     if let Some(world) = config.world.as_ref() {
-        emit_chunk(writer, world, data, spawn_cx, spawn_cz).await?;
+        emit_chunks_around(writer, world, data, spawn_cx, spawn_cz, SPAWN_VIEW_DISTANCE).await?;
     }
 
     // 6. Keepalive loop. Runs until the connection drops or the client
@@ -194,17 +200,23 @@ fn spawn_chunk_pos() -> (i32, i32) {
     (cx, cz)
 }
 
-/// Emit a single chunk via `LevelChunkWithLight`. Silently skips when
-/// the chunk is absent (test world doesn't cover the requested coord)
-/// or when the biome registry / chunk read / encode produces an error
-/// we can attribute to the world side — kicking the client over a
-/// missing chunk would mask the real failure.
-async fn emit_chunk<W>(
+/// Stream every chunk in the `(center ± view_distance)` window. Order
+/// is row-major (z outer, x inner) — vanilla uses a spiral so the
+/// player's spawn tile renders first, but for a static spawn this
+/// distinction is invisible. Switch to spiral if a client visibly
+/// hitches.
+///
+/// Per-chunk failure (missing region file, decode error, encode error)
+/// is logged and skipped rather than killing the connection: the same
+/// posture as the M3.d single-chunk path. The final summary log
+/// records how many chunks made it onto the wire.
+async fn emit_chunks_around<W>(
     writer: &mut W,
     world: &WorldHandle,
     data: &VanillaData,
-    cx: i32,
-    cz: i32,
+    center_cx: i32,
+    center_cz: i32,
+    view_distance: i32,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -214,32 +226,77 @@ where
         return Ok(());
     };
 
+    let started = Instant::now();
+    let mut emitted = 0usize;
+    let mut absent = 0usize;
+    let mut bytes = 0usize;
+
+    for cz in (center_cz - view_distance)..=(center_cz + view_distance) {
+        for cx in (center_cx - view_distance)..=(center_cx + view_distance) {
+            match emit_one_chunk(writer, world, biomes, cx, cz).await? {
+                Some(n) => {
+                    emitted += 1;
+                    bytes += n;
+                }
+                None => absent += 1,
+            }
+        }
+    }
+
+    info!(
+        center_cx,
+        center_cz,
+        view_distance,
+        emitted,
+        absent,
+        bytes,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "view-distance window flushed",
+    );
+    Ok(())
+}
+
+/// Try to emit one chunk. Returns `Some(payload_bytes)` on success,
+/// `None` when the chunk is genuinely absent (no region file or no
+/// payload at that slot) or when any soft failure caused us to skip
+/// it. Hard write errors propagate as `Err` so the connection task
+/// can shut down cleanly.
+async fn emit_one_chunk<W>(
+    writer: &mut W,
+    world: &WorldHandle,
+    biomes: &Registry,
+    cx: i32,
+    cz: i32,
+) -> Result<Option<usize>, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let chunk = {
         let mut storage = world.lock().await;
         match storage.get_chunk(ChunkPos { x: cx, z: cz }) {
             Ok(Some(c)) => c.clone(),
             Ok(None) => {
-                debug!(cx, cz, "no chunk in storage at spawn position");
-                return Ok(());
+                debug!(cx, cz, "no chunk in storage");
+                return Ok(None);
             }
             Err(err) => {
-                warn!(cx, cz, error = %err, "chunk read failed; skipping emission");
-                return Ok(());
+                warn!(cx, cz, error = %err, "chunk read failed; skipping");
+                return Ok(None);
             }
         }
     };
 
-    let packet = build_chunk_packet(&chunk, biomes, cx, cz);
-    let packet = match packet {
+    let packet = match build_chunk_packet(&chunk, biomes, cx, cz) {
         Ok(p) => p,
         Err(err) => {
-            warn!(cx, cz, error = %err, "chunk encode failed; skipping emission");
-            return Ok(());
+            warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+            return Ok(None);
         }
     };
 
-    info!(cx, cz, bytes = packet.data.len(), "emitting spawn chunk");
-    write_packet(writer, &packet, Compression::Disabled).await
+    let bytes = packet.data.len();
+    write_packet(writer, &packet, Compression::Disabled).await?;
+    Ok(Some(bytes))
 }
 
 fn build_chunk_packet(
