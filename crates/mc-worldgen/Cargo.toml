@@ -12,3 +12,5 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-data = { path = "../mc-data" }
+mc-world = { path = "../mc-world" }
