@@ -56,8 +56,10 @@ pub struct LoginPlay {
 }
 
 impl Packet for LoginPlay {
-    // TODO(M1.g.4): verify against wire capture from .analysis/server.jar.
-    const ID: i32 = 0x2C;
+    // Verified against vanilla 26.1.2 wire capture via `wire-probe`:
+    // server-bound LoginPlay arrives as id 0x31, body 108 bytes,
+    // matching our field layout exactly.
+    const ID: i32 = 0x31;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_i32(self.entity_id);
@@ -211,8 +213,10 @@ pub struct SynchronizePlayerPosition {
 }
 
 impl Packet for SynchronizePlayerPosition {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x42;
+    // Verified against vanilla 26.1.2 wire capture: id 0x48, body 61
+    // bytes — varint teleport_id + 6×f64 (xyz + delta) + 2×f32 (yaw,
+    // pitch) + i32 relative_flags. Matches our field layout exactly.
+    const ID: i32 = 0x48;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_varint(self.teleport_id);
@@ -313,8 +317,9 @@ impl GameEvent {
 }
 
 impl Packet for GameEvent {
-    // TODO(M1.g.4): verify against wire capture.
-    const ID: i32 = 0x23;
+    // Verified against vanilla 26.1.2 wire capture: id 0x26, body
+    // `0d 00 00 00 00` = event 13 (start_waiting_for_chunks), value 0.0.
+    const ID: i32 = 0x26;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_u8(self.event);

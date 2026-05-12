@@ -25,7 +25,7 @@ use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{MissedTickBehavior, interval};
@@ -45,6 +45,10 @@ const SPAWN_Y: f64 = 64.0;
 const SPAWN_Z: f64 = 0.5;
 
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
+/// Currently used only by tests but kept here for the eventual
+/// re-introduction of `SetDefaultSpawnPosition` and other block-pos
+/// carrying clientbound packets.
+#[allow(dead_code)]
 fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
     (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
 }
@@ -129,16 +133,13 @@ where
     )
     .await?;
 
-    // 3. Set Default Spawn Position — what the compass points at.
-    write_packet(
-        writer,
-        &SetDefaultSpawnPosition {
-            position: pack_block_pos(0, SPAWN_Y as i32, 0),
-            angle: 0.0,
-        },
-        Compression::Disabled,
-    )
-    .await?;
+    // 3. Set Default Spawn Position — was historically sent here to set
+    //    the compass anchor. Skipped in M1.g: in the 26.1.2 wire capture
+    //    the matching 8-byte clientbound packet looks like its layout
+    //    changed (no `angle` field), and its ID is uncertain. The
+    //    client renders without a configured compass target — minor
+    //    cosmetic regression, not a protocol error. Re-introduce once
+    //    the new shape is verified.
 
     // 4. Game Event: start waiting for chunks. Tells the client to
     //    drop the loading screen even though no chunks are coming.

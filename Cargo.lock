@@ -544,6 +544,17 @@ dependencies = [
 [[package]]
 name = "mc-test-harness"
 version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "clap",
+ "mc-nbt",
+ "mc-protocol",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
 
 [[package]]
 name = "mc-world"

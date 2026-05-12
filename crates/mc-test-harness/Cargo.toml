@@ -1,6 +1,6 @@
 [package]
 name = "mc-test-harness"
-description = "diff testing infrastructure (Solaris)."
+description = "Differential / wire-capture testing infrastructure (Solaris)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,17 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[[bin]]
+name = "wire-probe"
+path = "src/bin/wire_probe.rs"
+
 [dependencies]
+mc-protocol = { path = "../mc-protocol" }
+mc-nbt = { path = "../mc-nbt" }
+bytes = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }

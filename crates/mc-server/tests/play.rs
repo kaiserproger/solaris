@@ -30,7 +30,7 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -151,14 +151,6 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert!(sync.y.is_sign_positive());
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
-    assert_eq!(
-        frame.id,
-        SetDefaultSpawnPosition::ID,
-        "expected Set Default Spawn Position"
-    );
-    let _ = SetDefaultSpawnPosition::decode(&mut frame.body).unwrap();
-
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, GameEvent::ID, "expected Game Event");
     let event = GameEvent::decode(&mut frame.body).unwrap();
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
@@ -203,7 +195,9 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
     // Drain spawn burst.
-    for _ in 0..4 {
+    // Spawn burst is 3 frames after M1.g.4: LoginPlay, SynchronizePlayerPosition,
+    // GameEvent. SetDefaultSpawnPosition was removed (wire-uncertain).
+    for _ in 0..3 {
         let _ = read_one_frame(&mut stream, &mut rbuf).await;
     }
 
