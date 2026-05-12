@@ -460,35 +460,36 @@ where
     // harness timeout in debug builds.
     let mut workspace = block_light.is_some().then(LightWorkspace::new);
 
-    for cz in (center_cz - view_distance)..=(center_cz + view_distance) {
-        for cx in (center_cx - view_distance)..=(center_cx + view_distance) {
-            let Some(centre) = staged.get(&(cx, cz)) else {
-                absent += 1;
-                debug!(cx, cz, "no chunk in storage");
+    // M8.b: spiral from the centre outwards so the player's chunk
+    // renders first and the rings fill in behind. Same coverage as
+    // the previous row-major loop.
+    for (cx, cz) in spiral_chunks(center_cx, center_cz, view_distance) {
+        let Some(centre) = staged.get(&(cx, cz)) else {
+            absent += 1;
+            debug!(cx, cz, "no chunk in storage");
+            continue;
+        };
+        let neighbours = build_neighbourhood(&staged, cx, cz);
+        let centre_ref = centre.as_ref();
+        let packet = match build_chunk_packet(
+            centre_ref,
+            &neighbours,
+            biomes,
+            block_light,
+            workspace.as_mut(),
+            cx,
+            cz,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(cx, cz, error = %err, "chunk encode failed; skipping");
                 continue;
-            };
-            let neighbours = build_neighbourhood(&staged, cx, cz);
-            let centre_ref = centre.as_ref();
-            let packet = match build_chunk_packet(
-                centre_ref,
-                &neighbours,
-                biomes,
-                block_light,
-                workspace.as_mut(),
-                cx,
-                cz,
-            ) {
-                Ok(p) => p,
-                Err(err) => {
-                    warn!(cx, cz, error = %err, "chunk encode failed; skipping");
-                    continue;
-                }
-            };
-            let n = packet.data.len();
-            write_packet(writer, &packet, Compression::Disabled).await?;
-            emitted += 1;
-            bytes += n;
-        }
+            }
+        };
+        let n = packet.data.len();
+        write_packet(writer, &packet, Compression::Disabled).await?;
+        emitted += 1;
+        bytes += n;
     }
 
     info!(
@@ -504,6 +505,34 @@ where
         "view-distance window flushed",
     );
     Ok(())
+}
+
+/// Iterate chunk positions around `(center_x, center_z)` outwards
+/// to `view_distance` in chebyshev-ring order. The first cell is the
+/// centre; subsequent yields are every cell on ring `r = 1`, then
+/// every cell on ring `r = 2`, etc. Within a ring the order is
+/// row-major over the bounding square — perceptually this still
+/// "spreads" because each ring fills before the next starts.
+/// Coverage is identical to a row-major scan: `(2*view_distance +
+/// 1)²` cells total, each yielded exactly once.
+fn spiral_chunks(
+    center_x: i32,
+    center_z: i32,
+    view_distance: i32,
+) -> impl Iterator<Item = (i32, i32)> {
+    let vd = view_distance.max(0);
+    let mut out = Vec::with_capacity(((2 * vd + 1).pow(2)) as usize);
+    out.push((center_x, center_z));
+    for r in 1..=vd {
+        for dz in -r..=r {
+            for dx in -r..=r {
+                if dx.abs().max(dz.abs()) == r {
+                    out.push((center_x + dx, center_z + dz));
+                }
+            }
+        }
+    }
+    out.into_iter()
 }
 
 /// Build the 3×3 neighbourhood centred on `(cx, cz)`. The centre is
@@ -1015,6 +1044,50 @@ mod tests {
     fn spawn_chunk_pos_matches_origin() {
         // SPAWN_(X,Z) = (0.5, 0.5); the containing chunk is (0, 0).
         assert_eq!(spawn_chunk_pos(), (0, 0));
+    }
+
+    #[test]
+    fn spiral_chunks_starts_at_centre() {
+        let mut iter = spiral_chunks(3, -7, 2);
+        assert_eq!(iter.next(), Some((3, -7)));
+    }
+
+    #[test]
+    fn spiral_chunks_covers_every_cell_in_window() {
+        for vd in 0..=4 {
+            let collected: std::collections::HashSet<(i32, i32)> =
+                spiral_chunks(0, 0, vd).collect();
+            let expected_count = ((2 * vd + 1) as usize).pow(2);
+            assert_eq!(
+                collected.len(),
+                expected_count,
+                "vd={vd}: spiral should yield {expected_count} unique cells",
+            );
+            for dz in -vd..=vd {
+                for dx in -vd..=vd {
+                    assert!(
+                        collected.contains(&(dx, dz)),
+                        "vd={vd}: missing cell ({dx},{dz})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spiral_chunks_ring_order_monotonic() {
+        // Within the iteration, the chebyshev distance must be
+        // non-decreasing. That's the property that makes the
+        // perceptual spread feel like a spiral rather than a scan.
+        let mut last_ring = -1i32;
+        for (dx, dz) in spiral_chunks(0, 0, 3) {
+            let r = dx.abs().max(dz.abs());
+            assert!(
+                r >= last_ring,
+                "non-monotonic ring sequence at cell ({dx},{dz}): r={r} < last={last_ring}"
+            );
+            last_ring = r;
+        }
     }
 
     #[test]
