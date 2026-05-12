@@ -20,6 +20,7 @@ use crate::error::CodecError;
 pub mod configuration;
 pub mod handshake;
 pub mod login;
+pub mod play;
 pub mod status;
 
 /// Direction a packet travels: serverbound (client → server) or
