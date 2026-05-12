@@ -18,7 +18,7 @@ mod status;
 
 pub use error::ConnectionError;
 pub use login::offline_uuid;
-pub use server::{ServerConfig, run};
+pub use server::{BoundServer, ServerConfig, bind, run};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

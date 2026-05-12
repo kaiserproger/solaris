@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-data = { path = "../mc-data" }
 mc-protocol = { path = "../mc-protocol" }
 bytes = { workspace = true }
 tokio = { workspace = true }

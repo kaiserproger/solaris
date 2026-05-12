@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -39,8 +40,22 @@ fn check_config(path: &Path) -> Result<()> {
 
 async fn serve(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
+
+    let data = mc_data::load(&cfg.data.vanilla_dir).with_context(|| {
+        format!(
+            "loading vanilla data sidecar from {}",
+            cfg.data.vanilla_dir.display()
+        )
+    })?;
+    tracing::info!(
+        registries = data.registry_count(),
+        entries = data.entry_count(),
+        path = %cfg.data.vanilla_dir.display(),
+        "vanilla data loaded",
+    );
+
     let net = cfg
-        .to_network()
+        .to_network(Arc::new(data))
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,

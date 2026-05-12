@@ -11,7 +11,6 @@
 //! - the listener stays up for parallel clients.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use mc_protocol::PROTOCOL_VERSION;
@@ -22,33 +21,22 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::status::{StatusRequest, StatusResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
-async fn pick_ephemeral_port() -> SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
-}
-
 async fn start_server() -> SocketAddr {
-    let addr = pick_ephemeral_port().await;
     let cfg = mc_net::ServerConfig {
-        bind_address: addr,
+        bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.d login".into(),
         max_players: 8,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
     };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
-        let _ = mc_net::run(cfg).await;
+        let _ = bound.serve().await;
     });
-    for _ in 0..50 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return addr;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("server did not start listening on {addr}");
+    addr
 }
 
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
@@ -58,13 +46,12 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream) -> mc_protocol::RawFrame {
-    let mut buf = BytesMut::with_capacity(4096);
+async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(&mut buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
             return frame;
         }
-        let read = stream.read_buf(&mut buf).await.unwrap();
+        let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
 }
@@ -73,6 +60,7 @@ async fn read_one_frame(stream: &mut TcpStream) -> mc_protocol::RawFrame {
 async fn login_offline_flow_completes() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
 
     // Handshake with next_state = Login.
     write_frame(
@@ -99,7 +87,7 @@ async fn login_offline_flow_completes() {
     .await;
 
     // Expect LoginSuccess.
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, LoginSuccess::ID, "should be login success");
     let success = LoginSuccess::decode(&mut frame.body).unwrap();
     assert_eq!(frame.body.remaining(), 0);
@@ -110,7 +98,7 @@ async fn login_offline_flow_completes() {
     // Acknowledge — this transitions to Configuration state, where the
     // server's first packet is `Clientbound Known Packs` (M1.e).
     write_frame(&mut stream, &LoginAcknowledged).await;
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(
         frame.id,
         ClientboundKnownPacks::ID,
@@ -139,6 +127,7 @@ async fn login_does_not_break_concurrent_status() {
 
     // A second client should still be able to ping concurrently.
     let mut pinger = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
     write_frame(
         &mut pinger,
         &Handshake {
@@ -150,7 +139,7 @@ async fn login_does_not_break_concurrent_status() {
     )
     .await;
     write_frame(&mut pinger, &StatusRequest).await;
-    let mut frame = read_one_frame(&mut pinger).await;
+    let mut frame = read_one_frame(&mut pinger, &mut rbuf).await;
     assert_eq!(frame.id, StatusResponse::ID);
     let _ = StatusResponse::decode(&mut frame.body).unwrap();
 

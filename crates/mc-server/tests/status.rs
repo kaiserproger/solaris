@@ -17,37 +17,25 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::status::{PingRequest, PongResponse, StatusRequest, StatusResponse};
 use mc_protocol::{PROTOCOL_VERSION, TARGET_RELEASE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 
 /// Bind to port 0, read back the assigned port, then start the server on
 /// the freshly-known address. We can't ask `mc_net::run` for the port
 /// after the fact because it owns the listener internally; instead we
 /// peek the address before launching the server with the real config.
-async fn pick_ephemeral_port() -> SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
-}
-
 async fn start_server(motd: &str) -> SocketAddr {
-    let addr = pick_ephemeral_port().await;
     let cfg = mc_net::ServerConfig {
-        bind_address: addr,
+        bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: motd.to_string(),
         max_players: 17,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
     };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
-        let _ = mc_net::run(cfg).await;
+        let _ = bound.serve().await;
     });
-    // Spin until the listener is up. The race window is tiny but real.
-    for _ in 0..50 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return addr;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    panic!("server did not start listening on {addr}");
+    addr
 }
 
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
@@ -57,13 +45,12 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream) -> mc_protocol::RawFrame {
-    let mut buf = BytesMut::with_capacity(4096);
+async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(&mut buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
             return frame;
         }
-        let read = stream.read_buf(&mut buf).await.unwrap();
+        let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
 }
@@ -72,6 +59,7 @@ async fn read_one_frame(stream: &mut TcpStream) -> mc_protocol::RawFrame {
 async fn handshake_status_ping_round_trip() {
     let addr = start_server("Hello from Solaris").await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
 
     // 1. Handshake (next_state = Status).
     write_frame(
@@ -89,7 +77,7 @@ async fn handshake_status_ping_round_trip() {
     write_frame(&mut stream, &StatusRequest).await;
 
     // 3. Read status response, decode JSON.
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, StatusResponse::ID);
     let response = StatusResponse::decode(&mut frame.body).unwrap();
     assert!(frame.body.remaining() == 0);
@@ -107,7 +95,7 @@ async fn handshake_status_ping_round_trip() {
         },
     )
     .await;
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, PongResponse::ID);
     let pong = PongResponse::decode(&mut frame.body).unwrap();
     assert_eq!(pong.payload, 0xDEAD_BEEF);

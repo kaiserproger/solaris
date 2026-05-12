@@ -5,7 +5,10 @@
 //! Part of the Solaris engine.
 
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use mc_data::VanillaData;
 use serde::{Deserialize, Serialize};
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -16,6 +19,8 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub struct ServerConfig {
     pub server: ServerSection,
     pub network: NetworkSection,
+    #[serde(default)]
+    pub data: DataSection,
 }
 
 /// Identity-level server settings.
@@ -34,22 +39,45 @@ pub struct NetworkSection {
     pub port: u16,
 }
 
+/// Where the vanilla data sidecar lives on disk. Defaults to
+/// `./data/vanilla` relative to the working directory the server is
+/// launched from, which matches the layout `tools/extract-vanilla-data.sh`
+/// produces.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DataSection {
+    #[serde(default = "default_vanilla_dir")]
+    pub vanilla_dir: PathBuf,
+}
+
+impl Default for DataSection {
+    fn default() -> Self {
+        Self {
+            vanilla_dir: default_vanilla_dir(),
+        }
+    }
+}
+
 fn default_max_players() -> u32 {
     20
 }
 
+fn default_vanilla_dir() -> PathBuf {
+    PathBuf::from("data/vanilla")
+}
+
 impl ServerConfig {
-    /// Convert a parsed TOML config into the network-layer [`mc_net::ServerConfig`].
-    ///
-    /// Returns an error if `bind_address` is not a valid IP literal — we
-    /// do not do hostname resolution at startup, which keeps boot
-    /// deterministic.
-    pub fn to_network(&self) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
+    /// Convert a parsed TOML config into the network-layer
+    /// [`mc_net::ServerConfig`], using the pre-loaded vanilla data.
+    pub fn to_network(
+        &self,
+        data: Arc<VanillaData>,
+    ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
         Ok(mc_net::ServerConfig {
             bind_address: SocketAddr::new(ip, self.network.port),
             motd: self.server.motd.clone(),
             max_players: self.server.max_players,
+            data,
         })
     }
 }
@@ -73,6 +101,7 @@ mod tests {
         assert_eq!(cfg.server.name, "S");
         assert_eq!(cfg.server.max_players, 20);
         assert_eq!(cfg.network.port, 25565);
+        assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
     }
 
     #[test]
@@ -86,12 +115,17 @@ mod tests {
             [network]
             bind_address = "127.0.0.1"
             port = 25000
+
+            [data]
+            vanilla_dir = "/tmp/vanilla"
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
-        let net = cfg.to_network().unwrap();
+        let data = Arc::new(mc_data::testing::stub());
+        let net = cfg.to_network(data).unwrap();
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
         assert_eq!(net.bind_address.port(), 25000);
+        assert_eq!(cfg.data.vanilla_dir, PathBuf::from("/tmp/vanilla"));
     }
 
     #[test]
@@ -106,6 +140,7 @@ mod tests {
             port = 25565
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
-        assert!(cfg.to_network().is_err());
+        let data = Arc::new(mc_data::testing::stub());
+        assert!(cfg.to_network(data).is_err());
     }
 }

@@ -489,6 +489,7 @@ name = "mc-net"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "mc-data",
  "mc-protocol",
  "md-5",
  "serde",
@@ -526,6 +527,7 @@ dependencies = [
  "assert_cmd",
  "bytes",
  "clap",
+ "mc-data",
  "mc-net",
  "mc-protocol",
  "predicates",

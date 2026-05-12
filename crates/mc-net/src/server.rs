@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use mc_data::VanillaData;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
@@ -19,43 +20,79 @@ use crate::{configuration, login, status};
 ///
 /// Constructed by the caller (`mc-server`) from the user-facing TOML
 /// config so the network layer does not depend on the binary's config
-/// types.
+/// types. `data` is the in-memory index of vanilla registries the
+/// Configuration state hands back to clients.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
     pub motd: String,
     pub max_players: u32,
+    pub data: Arc<VanillaData>,
 }
 
-/// Bind to `config.bind_address` and run the accept loop until cancelled.
+/// A listener that has been successfully bound but is not yet serving.
 ///
-/// Each accepted connection is spawned as its own task; an error inside
-/// a connection is logged but does not stop the listener.
-pub async fn run(config: ServerConfig) -> std::io::Result<()> {
-    let listener = TcpListener::bind(config.bind_address).await?;
-    let actual = listener.local_addr()?;
-    info!(addr = %actual, "Solaris is listening");
+/// Holding the listener and the accept loop in two distinct steps lets
+/// callers (including the integration tests) learn the assigned port
+/// when binding to `0.0.0.0:0` *without* a probe/drop/rebind dance that
+/// races against the OS reusing the same ephemeral port.
+pub struct BoundServer {
+    listener: TcpListener,
+    config: Arc<ServerConfig>,
+}
 
-    let config = Arc::new(config);
-    loop {
-        let (socket, peer) = listener.accept().await?;
-        debug!(%peer, "accepted connection");
-        let config = config.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(socket, &config).await {
-                match err {
-                    ConnectionError::Eof => {
-                        debug!(%peer, "client closed before completing");
-                    }
-                    other => {
-                        warn!(%peer, error = %other, "connection terminated");
-                    }
-                }
-            } else {
-                debug!(%peer, "connection finished");
-            }
-        });
+impl BoundServer {
+    /// The socket address the listener is bound to.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
     }
+
+    /// Accept connections forever, spawning a per-connection task each
+    /// time. An error inside a connection task is logged but does not
+    /// stop the listener.
+    pub async fn serve(self) -> std::io::Result<()> {
+        info!(
+            addr = %self.local_addr()?,
+            registries = self.config.data.registry_count(),
+            entries = self.config.data.entry_count(),
+            "Solaris is listening"
+        );
+        let config = self.config;
+        loop {
+            let (socket, peer) = self.listener.accept().await?;
+            debug!(%peer, "accepted connection");
+            let config = config.clone();
+            tokio::spawn(async move {
+                if let Err(err) = handle_connection(socket, &config).await {
+                    match err {
+                        ConnectionError::Eof => {
+                            debug!(%peer, "client closed before completing");
+                        }
+                        other => {
+                            warn!(%peer, error = %other, "connection terminated");
+                        }
+                    }
+                } else {
+                    debug!(%peer, "connection finished");
+                }
+            });
+        }
+    }
+}
+
+/// Bind to `config.bind_address` and return a [`BoundServer`] ready to
+/// `.serve()`.
+pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
+    let listener = TcpListener::bind(config.bind_address).await?;
+    Ok(BoundServer {
+        listener,
+        config: Arc::new(config),
+    })
+}
+
+/// Convenience for the binary: `bind` followed by `serve`.
+pub async fn run(config: ServerConfig) -> std::io::Result<()> {
+    bind(config).await?.serve().await
 }
 
 async fn handle_connection(
@@ -88,7 +125,8 @@ async fn handle_connection(
         NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
         NextState::Login | NextState::Transfer => {
             let profile = login::handle(&mut reader, &mut writer, &mut buf).await?;
-            configuration::handle(&mut reader, &mut writer, &mut buf, &profile).await?;
+            configuration::handle(&mut reader, &mut writer, &mut buf, &profile, &config.data)
+                .await?;
             info!(
                 player = %profile.name,
                 "M1.e configuration complete; Play state (M1.g) not yet \

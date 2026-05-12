@@ -77,6 +77,7 @@ mod tests {
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25565),
             motd: "Solaris test".into(),
             max_players: 20,
+            data: std::sync::Arc::new(mc_data::testing::stub()),
         };
         let json = build_status_json(&cfg);
         // Parse it back to make sure the value is a well-formed object.

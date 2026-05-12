@@ -109,8 +109,8 @@ pub struct VanillaData {
 }
 
 impl VanillaData {
-    /// Path the registries were loaded from. Useful for log messages
-    /// and error reporting.
+    /// Path the registries were loaded from. Empty for in-memory
+    /// constructions (e.g. test stubs).
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -139,6 +139,49 @@ impl VanillaData {
     #[must_use]
     pub fn entry_count(&self) -> usize {
         self.registries.values().map(|r| r.entries.len()).sum()
+    }
+
+    /// Build a `VanillaData` from in-memory registries. Used by tests
+    /// that don't want to stage a filesystem layout and by future code
+    /// that loads from somewhere other than disk. `root` is recorded
+    /// only for diagnostic purposes.
+    #[must_use]
+    pub fn from_registries(root: impl Into<PathBuf>, registries: Vec<Registry>) -> Self {
+        let map = registries
+            .into_iter()
+            .map(|r| (r.id.path().to_string(), r))
+            .collect();
+        Self {
+            root: root.into(),
+            registries: map,
+        }
+    }
+}
+
+/// Helpers used only from tests. Public so integration tests in other
+/// crates can build a `VanillaData` without staging a filesystem layout.
+#[doc(hidden)]
+pub mod testing {
+    use super::{Identifier, KNOWN_REGISTRIES, Registry, VanillaData};
+
+    /// A minimal `VanillaData` with every known registry populated with
+    /// two placeholder entries. Useful as a stub for tests that exercise
+    /// the network handler without caring about specific entry contents.
+    #[must_use]
+    pub fn stub() -> VanillaData {
+        let registries = KNOWN_REGISTRIES
+            .iter()
+            .map(|(path, _)| {
+                let id = Identifier::parse(format!("minecraft:{path}"))
+                    .expect("KNOWN_REGISTRIES paths are valid identifiers");
+                let entries = vec![
+                    Identifier::parse("minecraft:alpha").unwrap(),
+                    Identifier::parse("minecraft:beta").unwrap(),
+                ];
+                Registry { id, entries }
+            })
+            .collect();
+        VanillaData::from_registries("", registries)
     }
 }
 

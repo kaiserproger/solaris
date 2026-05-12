@@ -15,38 +15,27 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    ServerboundKnownPacks,
+    RegistryData, ServerboundKnownPacks,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use uuid::Uuid;
 
-async fn pick_ephemeral_port() -> SocketAddr {
-    let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = probe.local_addr().unwrap();
-    drop(probe);
-    addr
-}
-
 async fn start_server() -> SocketAddr {
-    let addr = pick_ephemeral_port().await;
     let cfg = mc_net::ServerConfig {
-        bind_address: addr,
+        bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.e config".into(),
         max_players: 8,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
     };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
     tokio::spawn(async move {
-        let _ = mc_net::run(cfg).await;
+        let _ = bound.serve().await;
     });
-    for _ in 0..50 {
-        if TcpStream::connect(addr).await.is_ok() {
-            return addr;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("server did not start listening on {addr}");
+    addr
 }
 
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
@@ -56,20 +45,24 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream) -> mc_protocol::RawFrame {
-    let mut buf = BytesMut::with_capacity(4096);
+async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(&mut buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
             return frame;
         }
-        let read = stream.read_buf(&mut buf).await.unwrap();
+        let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
 }
 
 /// Walk the protocol up to (and including) `LoginAcknowledged`, leaving
 /// the client sitting in Configuration state.
-async fn run_through_login_ack(stream: &mut TcpStream, addr: SocketAddr, name: &str) {
+async fn run_through_login_ack(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    addr: SocketAddr,
+    name: &str,
+) {
     write_frame(
         stream,
         &Handshake {
@@ -88,7 +81,7 @@ async fn run_through_login_ack(stream: &mut TcpStream, addr: SocketAddr, name: &
         },
     )
     .await;
-    let mut frame = read_one_frame(stream).await;
+    let mut frame = read_one_frame(stream, buf).await;
     assert_eq!(frame.id, LoginSuccess::ID);
     let _ = LoginSuccess::decode(&mut frame.body).unwrap();
     write_frame(stream, &LoginAcknowledged).await;
@@ -98,10 +91,11 @@ async fn run_through_login_ack(stream: &mut TcpStream, addr: SocketAddr, name: &
 async fn configuration_known_packs_and_finish_complete() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    run_through_login_ack(&mut stream, addr, "Notch").await;
+    let mut rbuf = BytesMut::with_capacity(4096);
+    run_through_login_ack(&mut stream, &mut rbuf, addr, "Notch").await;
 
     // First Configuration packet from the server: Known Packs.
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(
         frame.id,
         ClientboundKnownPacks::ID,
@@ -124,13 +118,50 @@ async fn configuration_known_packs_and_finish_complete() {
     )
     .await;
 
-    // Server should now send Finish Configuration directly (we don't
-    // emit Registry Data in M1.e).
-    let mut frame = read_one_frame(&mut stream).await;
+    // Server now sends Registry Data — one packet per registry. With
+    // the test stub each registry has 2 entries with has_data=false.
+    let stub_registry_count = mc_data::KNOWN_REGISTRIES.len();
+    let mut seen_dimension_type = false;
+    for _ in 0..stub_registry_count {
+        let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+        assert_eq!(
+            frame.id,
+            RegistryData::ID,
+            "expected Registry Data, got {:#04x}",
+            frame.id
+        );
+        let registry = RegistryData::decode(&mut frame.body).unwrap();
+        assert_eq!(frame.body.remaining(), 0);
+        assert_eq!(
+            registry.entries.len(),
+            2,
+            "stub registry {} should have 2 entries",
+            registry.registry_id
+        );
+        // Every entry must declare `has_data = false` — the protocol
+        // path that needs NBT payload encoding is intentionally not
+        // exercised yet.
+        for entry in &registry.entries {
+            assert!(
+                entry.nbt_payload.is_none(),
+                "stub should emit only has_data=false entries"
+            );
+        }
+        if registry.registry_id.as_str() == "minecraft:dimension_type" {
+            seen_dimension_type = true;
+        }
+    }
+    assert!(
+        seen_dimension_type,
+        "expected a Registry Data packet for minecraft:dimension_type"
+    );
+
+    // Then Finish Configuration.
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(
         frame.id,
         FinishConfiguration::ID,
-        "expected Finish Configuration"
+        "expected Finish Configuration after registries"
     );
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 
@@ -157,10 +188,11 @@ async fn configuration_skips_unexpected_packets() {
     // expected response.
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    run_through_login_ack(&mut stream, addr, "Steve").await;
+    let mut rbuf = BytesMut::with_capacity(4096);
+    run_through_login_ack(&mut stream, &mut rbuf, addr, "Steve").await;
 
     // Consume the server's Known Packs.
-    let mut frame = read_one_frame(&mut stream).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
 
@@ -182,8 +214,14 @@ async fn configuration_skips_unexpected_packets() {
     )
     .await;
 
-    // Expect Finish Configuration to follow.
-    let mut frame = read_one_frame(&mut stream).await;
+    // Drain Registry Data packets, one per stub registry, then expect
+    // Finish Configuration.
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+        assert_eq!(frame.id, RegistryData::ID);
+        let _ = RegistryData::decode(&mut frame.body).unwrap();
+    }
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 

@@ -19,6 +19,7 @@ path = "src/main.rs"
 path = "src/lib.rs"
 
 [dependencies]
+mc-data = { path = "../mc-data" }
 mc-net = { path = "../mc-net" }
 mc-protocol = { path = "../mc-protocol" }
 clap = { workspace = true }
@@ -37,3 +38,4 @@ predicates = "3"
 bytes = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
+mc-data = { path = "../mc-data" }
