@@ -532,6 +532,7 @@ dependencies = [
  "mc-data",
  "mc-net",
  "mc-protocol",
+ "mc-world",
  "predicates",
  "serde",
  "serde_json",
