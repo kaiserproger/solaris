@@ -535,6 +535,7 @@ dependencies = [
  "mc-net",
  "mc-protocol",
  "mc-world",
+ "mc-worldgen",
  "predicates",
  "serde",
  "serde_json",
@@ -558,6 +559,7 @@ dependencies = [
  "mc-net",
  "mc-protocol",
  "mc-world",
+ "mc-worldgen",
  "tempfile",
  "tokio",
  "tracing",
@@ -579,6 +581,10 @@ dependencies = [
 [[package]]
 name = "mc-worldgen"
 version = "0.0.1"
+dependencies = [
+ "mc-data",
+ "mc-world",
+]
 
 [[package]]
 name = "md-5"

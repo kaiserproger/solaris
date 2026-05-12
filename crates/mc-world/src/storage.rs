@@ -22,7 +22,7 @@ use crate::anvil::{
     write_region,
 };
 use crate::block::{BlockRegistry, BlockStateId};
-use crate::chunk::{BlockPos, Chunk, ChunkPos};
+use crate::chunk::{BlockPos, Chunk, ChunkGenerator, ChunkPos};
 use crate::section::SECTION_DIM;
 
 const REGION_AXIS_CHUNKS: i32 = 32;
@@ -72,6 +72,11 @@ pub struct WorldStorage {
     regions: HashMap<(i32, i32), Arc<DecodedRegion>>,
     region_lru: VecDeque<(i32, i32)>,
     region_capacity: usize,
+    /// M7: optional fallback that materialises chunks for positions
+    /// not covered by an `.mca` slot. Generated chunks come back
+    /// dirty so the M6 flush pipeline persists them; subsequent
+    /// reads hit the region file, not the generator.
+    generator: Option<Arc<dyn ChunkGenerator>>,
 }
 
 impl WorldStorage {
@@ -120,7 +125,27 @@ impl WorldStorage {
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: DEFAULT_REGION_LRU_CAPACITY,
+            generator: None,
         })
+    }
+
+    /// Builder: attach a chunk generator. Slots not present on disk
+    /// will now resolve to a freshly-generated chunk instead of
+    /// `None`. Generated chunks are inserted as dirty so the M6
+    /// flush path persists them before the cache evicts them.
+    #[must_use]
+    pub fn with_generator(mut self, generator: Arc<dyn ChunkGenerator>) -> Self {
+        self.generator = Some(generator);
+        self
+    }
+
+    /// Convenience for the `mc-server` startup path: swap a generator
+    /// in after the fact. Returns the previous generator (if any).
+    pub fn set_generator(
+        &mut self,
+        generator: Option<Arc<dyn ChunkGenerator>>,
+    ) -> Option<Arc<dyn ChunkGenerator>> {
+        std::mem::replace(&mut self.generator, generator)
     }
 
     #[must_use]
@@ -193,19 +218,25 @@ impl WorldStorage {
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
         let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
 
-        let Some(region) = self.ensure_region(rx, rz)? else {
-            return Ok(None);
-        };
-        let Some(payload) = region.get(&(local_x, local_z)).cloned() else {
-            return Ok(None);
-        };
-        drop(region);
+        let region = self.ensure_region(rx, rz)?;
+        let payload = region.and_then(|r| r.get(&(local_x, local_z)).cloned());
 
-        let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
-        let (_, root) = mc_nbt::read_named(&mut cursor)?;
-        let chunk = chunk_from_nbt(&root, &self.registry)?;
-        self.insert_chunk(cpos, chunk)?;
-        Ok(self.cache.get(&cpos))
+        if let Some(payload) = payload {
+            let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
+            let (_, root) = mc_nbt::read_named(&mut cursor)?;
+            let chunk = chunk_from_nbt(&root, &self.registry)?;
+            self.insert_chunk(cpos, chunk)?;
+            return Ok(self.cache.get(&cpos));
+        }
+
+        // M7: no on-disk chunk → ask the generator (if any).
+        if let Some(generator) = self.generator.as_ref().map(Arc::clone) {
+            let mut chunk = generator.generate(cpos);
+            chunk.dirty = true; // belt-and-braces; generator already sets this
+            self.insert_chunk(cpos, chunk)?;
+            return Ok(self.cache.get(&cpos));
+        }
+        Ok(None)
     }
 
     /// Bring the region at `(rx, rz)` into the region cache and return
@@ -625,6 +656,56 @@ mod tests {
             }
         }
         assert_eq!(world.dirty_count(), 0);
+    }
+
+    /// M7.c: a `WorldStorage` opened on a path *without* region
+    /// files but with a generator attached resolves every chunk
+    /// position to a non-empty `Chunk`.
+    #[test]
+    fn worldgen_fallback_fills_missing_chunks() {
+        use crate::chunk::ChunkGenerator;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Create the expected directory layout without populating it.
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+
+        // Stub generator: every chunk is a single grass block at the
+        // origin column. Enough to assert "we hit the generator".
+        struct StubGen;
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let mut c = Chunk::empty(
+                    pos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                );
+                c.set_block(0, 0, 0, BlockStateId(42));
+                c.dirty = true;
+                c
+            }
+        }
+
+        // The stub registry has only "air" but generator emits
+        // BlockStateId(42) directly; the registry isn't consulted on
+        // the read path for raw state ids.
+        let report = vec![mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4)
+            .unwrap()
+            .with_generator(Arc::new(StubGen));
+
+        let cpos = ChunkPos { x: 999, z: -999 };
+        let chunk = world.get_chunk(cpos).unwrap().expect("generator ran");
+        assert_eq!(chunk.get_block(0, 0, 0), Some(BlockStateId(42)));
+        assert!(chunk.dirty);
     }
 
     fn copy_dir_recursive(src: &Path, dst: &Path) {
