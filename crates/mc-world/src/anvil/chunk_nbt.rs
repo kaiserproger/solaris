@@ -138,8 +138,34 @@ pub fn chunk_from_nbt(nbt: &Tag, registry: &BlockRegistry) -> Result<Chunk, Chun
         }
     }
 
+    // M5.c.2: capture every other root-level field verbatim so a
+    // load → save round-trip preserves the unmodelled subset
+    // (PostProcessing, block_ticks, fluid_ticks, structures,
+    // InhabitedTime, LastUpdate, DataVersion, ...). Order is the
+    // original compound's insertion order — vanilla doesn't require
+    // any particular ordering, but stable ordering keeps byte-diff
+    // workflows clean.
+    for (key, value) in root {
+        if !MODELLED_ROOT_KEYS.contains(&key.as_str()) {
+            chunk.extras.push((key.clone(), value.clone()));
+        }
+    }
+
     Ok(chunk)
 }
+
+/// Root-level NBT keys `chunk_from_nbt` decodes into typed fields.
+/// Anything outside this set ends up on `Chunk.extras` so the
+/// codec round-trips byte-stably on the unmodelled subset.
+const MODELLED_ROOT_KEYS: &[&str] = &[
+    "xPos",
+    "zPos",
+    "yPos",
+    "Status",
+    "sections",
+    "Heightmaps",
+    "block_entities",
+];
 
 fn decode_block_section(
     nbt: &[(String, Tag)],
@@ -353,6 +379,15 @@ pub fn chunk_to_nbt(chunk: &Chunk, registry: &BlockRegistry) -> Result<Tag, Chun
             elements: be_list,
         }),
     ));
+
+    // M5.c.2: re-emit every root-level field decode kept in
+    // `extras` (PostProcessing, block_ticks, fluid_ticks,
+    // structures, InhabitedTime, LastUpdate, DataVersion, etc.).
+    // Order is the decode-time insertion order so the round-trip
+    // stays stable.
+    for (key, value) in &chunk.extras {
+        root.push((key.clone(), value.clone()));
+    }
 
     Ok(Tag::Compound(root))
 }
@@ -699,10 +734,63 @@ mod tests {
                 chunk1.pos
             );
 
+            // M5.c.2: extras must round-trip key-and-value.
+            assert_eq!(
+                chunk1.extras.len(),
+                chunk2.extras.len(),
+                "extras count in {:?}",
+                chunk1.pos,
+            );
+            for (e1, e2) in chunk1.extras.iter().zip(&chunk2.extras) {
+                assert_eq!(e1.0, e2.0, "extras key order in {:?}", chunk1.pos);
+                assert_eq!(e1.1, e2.1, "extras value for {} in {:?}", e1.0, chunk1.pos);
+            }
+
             probed += 1;
         }
         assert!(probed > 0, "test region must have at least one chunk");
         eprintln!("round-tripped {probed} chunks");
+    }
+
+    #[test]
+    fn real_test_world_carries_dropped_root_fields_in_extras() {
+        let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !region_path.is_file() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = BlockRegistry::from_report(&report).unwrap();
+        let payloads = region::read_region(&region_path).unwrap();
+
+        let mut chunks_with_extras = 0usize;
+        let mut seen_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for payload in &payloads {
+            let mut cur = Cursor::new(&payload.uncompressed_nbt[..]);
+            let (_, root) = mc_nbt::read_named(&mut cur).unwrap();
+            let chunk = chunk_from_nbt(&root, &registry).unwrap();
+            if !chunk.extras.is_empty() {
+                chunks_with_extras += 1;
+                for (k, _) in &chunk.extras {
+                    seen_keys.insert(k.clone());
+                }
+            }
+        }
+
+        // Every real chunk has at least DataVersion + InhabitedTime
+        // + LastUpdate (vanilla writes them on every save).
+        assert!(
+            chunks_with_extras > 0,
+            "expected ≥1 chunk with unmodelled root fields",
+        );
+        for required in &["DataVersion", "InhabitedTime", "LastUpdate"] {
+            assert!(
+                seen_keys.contains(*required),
+                "extras key set should contain {required}; got {:?}",
+                seen_keys,
+            );
+        }
     }
 
     fn nibble_pattern() -> Vec<i8> {

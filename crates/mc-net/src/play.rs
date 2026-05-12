@@ -27,8 +27,10 @@ use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight,
-    LightData, LoginPlay, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
+    BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation,
+    GameEvent, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, PlayerActionKind,
+    ServerboundKeepAlive, ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk,
+    SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
@@ -206,8 +208,28 @@ where
     }
 
     // 6. Keepalive loop. Runs until the connection drops or the client
-    //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`.
-    keepalive_loop(reader, writer, buf).await
+    //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
+    //    interaction state passes the M5.d/M5.e break/place
+    //    handlers everything they need to mutate the world and emit
+    //    relight packets back to the client.
+    let mut interaction = config.world.as_ref().map(|world| InteractionState {
+        world: Arc::clone(world),
+        blocks: Arc::clone(&config.blocks),
+        block_light: config.block_light.as_ref().map(Arc::clone),
+        workspace: LightWorkspace::new(),
+    });
+    keepalive_loop(reader, writer, buf, interaction.as_mut()).await
+}
+
+/// Per-connection state the M5.d / M5.e interaction handlers carry.
+struct InteractionState {
+    world: WorldHandle,
+    blocks: Arc<mc_world::BlockRegistry>,
+    block_light: Option<Arc<BlockLightTable>>,
+    /// Reused across all interaction-driven relight computes for
+    /// the lifetime of the connection (same amortisation pattern
+    /// as `emit_chunks_around`).
+    workspace: LightWorkspace,
 }
 
 /// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
@@ -396,10 +418,294 @@ fn build_chunk_packet(
     })
 }
 
+/// M5.d: handle a serverbound `PlayerAction`. Acts on
+/// `START_DESTROY_BLOCK` / `STOP_DESTROY_BLOCK` (creative-style
+/// instant break — survival mining timing arrives with a future
+/// inventory milestone) by setting the target cell to air,
+/// recomputing light over the affected 1+4 chunks, and emitting
+/// the resulting wire packets back to the client. Every action
+/// regardless of kind gets an ack so the client's prediction
+/// state doesn't hang.
+async fn handle_player_action<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    action: ServerboundPlayerAction,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let is_destroy = matches!(
+        action.action,
+        PlayerActionKind::StartDestroyBlock | PlayerActionKind::StopDestroyBlock
+    );
+    if !is_destroy {
+        // DROP_*, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND, STAB —
+        // all out of scope for M5. Ack so the client doesn't hang
+        // on a prediction.
+        debug!(
+            action = ?action.action,
+            sequence = action.sequence,
+            "non-destroy player action ignored"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let (x, y, z) = unpack_block_pos(action.position);
+    let air = air_state_id(&state.blocks);
+
+    apply_block_edit(state, writer, action.sequence, x, y, z, air).await
+}
+
+/// Shared back-half of the break / place flows: mutates the world
+/// at `(x, y, z)` to `new_state`, broadcasts `BlockUpdate` +
+/// recomputed `LightUpdate`s + `BlockChangedAck` to the connected
+/// client. The actual edit is applied via
+/// `WorldStorage::set_block_at` so heightmap recompute lands in
+/// the same atomic step.
+async fn apply_block_edit<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+    new_state: mc_world::BlockStateId,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let pos = mc_world::BlockPos { x, y, z };
+
+    // 1. Apply the mutation. Drop the lock as soon as it's done so
+    //    the light-recompute path can re-acquire it for the
+    //    neighbourhood read without deadlocking.
+    let prev = {
+        let mut storage = state.world.lock().await;
+        match storage.set_block_at(pos, new_state) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(error = %err, x, y, z, "set_block_at failed; skipping edit");
+                write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+                return Ok(());
+            }
+        }
+    };
+
+    // Absent chunk or no-op edit: ack the sequence so the client
+    // doesn't roll back forever, but skip the BlockUpdate /
+    // LightUpdate ripple.
+    let Some(prev) = prev else {
+        write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+        return Ok(());
+    };
+    if prev == new_state {
+        write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+        return Ok(());
+    }
+
+    // 2. Tell the client about the new block.
+    write_packet(
+        writer,
+        &BlockUpdate {
+            position: mc_protocol::packets::play::pack_block_pos(x, y, z),
+            state_id: new_state.0 as i32,
+        },
+        Compression::Disabled,
+    )
+    .await?;
+
+    // 3. Recompute light over the affected 1+4 chunks if we have
+    //    the table. Without it we'd be emitting LightData::empty()
+    //    which is the M3 fallback — useless for an edit because
+    //    the client would re-render the chunk dark from the
+    //    fallback.
+    let table = state.block_light.as_ref().map(Arc::clone);
+    if let Some(table) = table {
+        let cx = x.div_euclid(16);
+        let cz = z.div_euclid(16);
+        send_relight_around(state, writer, &table, cx, cz).await?;
+    }
+
+    // 4. Ack last — vanilla expects update-before-ack so the
+    //    prediction reconciles against a known state.
+    write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+    Ok(())
+}
+
+/// Fetch the 5×5 chunk window centred on `(cx, cz)`, recompute
+/// light for the centre + 4 manhattan neighbours, and write a
+/// `LightUpdate` for each. Conservative: emits 5 packets even if
+/// some chunks weren't visibly affected — incremental relight is
+/// M6+.
+async fn send_relight_around<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    table: &BlockLightTable,
+    cx: i32,
+    cz: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+    {
+        let mut storage = state.world.lock().await;
+        for dcz in -2i32..=2 {
+            for dcx in -2i32..=2 {
+                let pos = ChunkPos {
+                    x: cx + dcx,
+                    z: cz + dcz,
+                };
+                match storage.get_chunk(pos) {
+                    Ok(Some(c)) => {
+                        chunks.insert((cx + dcx, cz + dcz), Arc::new(c.clone()));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, cx = pos.x, cz = pos.z, "relight neighbour read failed");
+                    }
+                }
+            }
+        }
+    }
+
+    let affected: [(i32, i32); 5] = [
+        (cx, cz),
+        (cx - 1, cz),
+        (cx + 1, cz),
+        (cx, cz - 1),
+        (cx, cz + 1),
+    ];
+    for (ncx, ncz) in affected {
+        let Some(centre) = chunks.get(&(ncx, ncz)) else {
+            continue;
+        };
+        let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                refs[(dz + 1) as usize][(dx + 1) as usize] =
+                    chunks.get(&(ncx + dx, ncz + dz)).map(|a| a.as_ref());
+            }
+        }
+        refs[1][1] = Some(centre.as_ref());
+        let light = compute_chunk_light_in(&mut state.workspace, refs, table);
+        let wire = encode_chunk_light(&light);
+        let light_data = LightData {
+            sky_y_mask: wire.sky_y_mask,
+            block_y_mask: wire.block_y_mask,
+            empty_sky_y_mask: wire.empty_sky_y_mask,
+            empty_block_y_mask: wire.empty_block_y_mask,
+            sky_updates: wire.sky_updates,
+            block_updates: wire.block_updates,
+        };
+        write_packet(
+            writer,
+            &LightUpdate {
+                chunk_x: ncx,
+                chunk_z: ncz,
+                light: light_data,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
+    let air_id = mc_data::Identifier::parse("minecraft:air").expect("static identifier");
+    registry
+        .block(&air_id)
+        .map(|b| b.default)
+        .unwrap_or(mc_world::BlockStateId(0))
+}
+
+/// Stone's default state id from the registry. M5.e's place-block
+/// handler always places stone regardless of what the client thinks
+/// it's holding — inventory + item-stack handling is its own
+/// milestone. Falls back to `BlockStateId(1)` (vanilla 26.1.2's
+/// stone default) when the registry doesn't expose `minecraft:stone`
+/// for some reason; the test world has it.
+fn stone_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
+    let stone_id = mc_data::Identifier::parse("minecraft:stone").expect("static identifier");
+    registry
+        .block(&stone_id)
+        .map(|b| b.default)
+        .unwrap_or(mc_world::BlockStateId(1))
+}
+
+/// M5.e: handle a serverbound `UseItemOn`. Always places stone at
+/// `clicked_pos + direction.normal` regardless of what the client
+/// thinks it's holding (no inventory model yet). If the target
+/// cell is already non-air we drop the placement silently and ack
+/// the sequence so the client doesn't roll back forever.
+async fn handle_use_item_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    action: ServerboundUseItemOn,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (cx, cy, cz) = unpack_block_pos(action.position);
+    let (dx, dy, dz) = action.direction.normal();
+    let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
+
+    let air = air_state_id(&state.blocks);
+    let stone = stone_state_id(&state.blocks);
+
+    // Validate: target cell must currently be air. We can borrow
+    // the world briefly to peek; if the cell is non-air or absent,
+    // skip the edit but still ack.
+    let target_is_air = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(mc_world::BlockPos {
+            x: tx,
+            y: ty,
+            z: tz,
+        }) {
+            Ok(Some(current)) => current == air,
+            Ok(None) => false,
+            Err(err) => {
+                warn!(error = %err, x = tx, y = ty, z = tz, "UseItemOn target read failed");
+                false
+            }
+        }
+    };
+    if !target_is_air {
+        debug!(
+            x = tx,
+            y = ty,
+            z = tz,
+            "UseItemOn target not air; skipping placement"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    apply_block_edit(state, writer, action.sequence, tx, ty, tz, stone).await
+}
+
 async fn keepalive_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    mut interaction: Option<&mut InteractionState>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -455,6 +761,29 @@ where
                     let mut body = frame.body;
                     let confirm = ConfirmTeleportation::decode(&mut body)?;
                     debug!(teleport_id = confirm.teleport_id, "teleport confirmed");
+                } else if frame.id == ServerboundPlayerAction::ID {
+                    let mut body = frame.body;
+                    let action = ServerboundPlayerAction::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_player_action(state, writer, action).await?;
+                    } else {
+                        debug!(
+                            action = ?action.action,
+                            sequence = action.sequence,
+                            "PlayerAction ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundUseItemOn::ID {
+                    let mut body = frame.body;
+                    let use_on = ServerboundUseItemOn::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_use_item_on(state, writer, use_on).await?;
+                    } else {
+                        debug!(
+                            sequence = use_on.sequence,
+                            "UseItemOn ignored — no world configured"
+                        );
+                    }
                 } else {
                     debug!(
                         id = format!("{:#04x}", frame.id),

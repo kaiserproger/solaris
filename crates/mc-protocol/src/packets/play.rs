@@ -764,6 +764,369 @@ impl Packet for ServerboundKeepAlive {
     }
 }
 
+// ---------------------------------------------------------------------
+// M5.b — clientbound edit / ack / relight packets
+// ---------------------------------------------------------------------
+
+/// `Clientbound Block Update` (CB). Single-block delta the server
+/// sends in response to any state change at a `BlockPos`. Per
+/// ADR 0002, verified against `javap -p` of the unobfuscated jar:
+/// `ClientboundBlockUpdatePacket(BlockPos pos, BlockState state)`,
+/// the `BlockState` wire form being its global state-id VarInt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockUpdate {
+    /// Block position packed into vanilla's standard `BlockPos`
+    /// `i64`. Use [`pack_block_pos`] / [`unpack_block_pos`].
+    pub position: i64,
+    /// Global block-state id — the same id space `blocks.json` /
+    /// `mc_world::BlockStateId` use.
+    pub state_id: i32,
+}
+
+impl Packet for BlockUpdate {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_BLOCK_UPDATE at game-CB index 8 = wire id 0x08.
+    const ID: i32 = 0x08;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.position);
+        buf.write_varint(self.state_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: buf.read_i64()?,
+            state_id: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Block Changed Ack` (CB). One-VarInt packet that
+/// echoes the `sequence` from a `ServerboundPlayerAction` or
+/// `ServerboundUseItemOn`; without it the vanilla client rolls
+/// back its predicted edit. Per ADR 0002, verified against
+/// `javap -p`: `ClientboundBlockChangedAckPacket(int sequence)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockChangedAck {
+    pub sequence: i32,
+}
+
+impl Packet for BlockChangedAck {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_BLOCK_CHANGED_ACK at game-CB index 4 = wire id 0x04.
+    const ID: i32 = 0x04;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.sequence);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            sequence: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Light Update` (CB). Per-chunk light delta — sent
+/// when block changes alter sky / block light without re-streaming
+/// the full chunk. Per ADR 0002, verified against `javap -p`:
+/// `ClientboundLightUpdatePacket(int x, int z,
+/// ClientboundLightUpdatePacketData lightData)`. The wire body for
+/// the chunk coordinates is a pair of VarInts (matching vanilla's
+/// `STREAM_CODEC`), not raw `i32`s — distinct from
+/// `LevelChunkWithLight` which writes the coordinates as `i32`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightUpdate {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+    pub light: LightData,
+}
+
+impl Packet for LightUpdate {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_LIGHT_UPDATE at game-CB index 48 = wire id 0x30.
+    const ID: i32 = 0x30;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.chunk_x);
+        buf.write_varint(self.chunk_z);
+        self.light.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            chunk_x: buf.read_varint()?,
+            chunk_z: buf.read_varint()?,
+            light: LightData::decode(buf)?,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------
+// M5.a — serverbound interaction packets
+// ---------------------------------------------------------------------
+
+/// One of the eight actions vanilla packs into
+/// `ServerboundPlayerAction`. Enum discriminants match the wire
+/// VarInt: the order is the vanilla source's declaration order
+/// (`ServerboundPlayerActionPacket$Action`), verified against
+/// `javap -p` on the unobfuscated jar.
+///
+/// M5's break-block path only acts on `StartDestroyBlock` and
+/// `StopDestroyBlock`. The other variants are decoded so the
+/// handler can log-and-ignore them without breaking the connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerActionKind {
+    StartDestroyBlock = 0,
+    AbortDestroyBlock = 1,
+    StopDestroyBlock = 2,
+    DropAllItems = 3,
+    DropItem = 4,
+    ReleaseUseItem = 5,
+    SwapItemWithOffhand = 6,
+    Stab = 7,
+}
+
+impl PlayerActionKind {
+    fn from_wire(v: i32) -> Result<Self, CodecError> {
+        Ok(match v {
+            0 => Self::StartDestroyBlock,
+            1 => Self::AbortDestroyBlock,
+            2 => Self::StopDestroyBlock,
+            3 => Self::DropAllItems,
+            4 => Self::DropItem,
+            5 => Self::ReleaseUseItem,
+            6 => Self::SwapItemWithOffhand,
+            7 => Self::Stab,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 7,
+                });
+            }
+        })
+    }
+}
+
+/// Direction of a `BlockPos` face — six values matching
+/// `net.minecraft.core.Direction` ordinals (`DOWN, UP, NORTH,
+/// SOUTH, WEST, EAST`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Down = 0,
+    Up = 1,
+    North = 2,
+    South = 3,
+    West = 4,
+    East = 5,
+}
+
+impl Direction {
+    fn from_wire(v: i32) -> Result<Self, CodecError> {
+        Ok(match v {
+            0 => Self::Down,
+            1 => Self::Up,
+            2 => Self::North,
+            3 => Self::South,
+            4 => Self::West,
+            5 => Self::East,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 5,
+                });
+            }
+        })
+    }
+
+    /// `(dx, dy, dz)` unit normal of the face. Used by the
+    /// place-block handler to compute the target cell from the
+    /// clicked face.
+    #[must_use]
+    pub fn normal(self) -> (i32, i32, i32) {
+        match self {
+            Self::Down => (0, -1, 0),
+            Self::Up => (0, 1, 0),
+            Self::North => (0, 0, -1),
+            Self::South => (0, 0, 1),
+            Self::West => (-1, 0, 0),
+            Self::East => (1, 0, 0),
+        }
+    }
+}
+
+/// `Serverbound Player Action` (SB). Carries break-start /
+/// break-abort / break-stop, plus item-drop and a few miscellaneous
+/// actions. Per ADR 0002, verified against `javap -p` of the
+/// unobfuscated jar: `ServerboundPlayerActionPacket(action, pos,
+/// direction, sequence)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundPlayerAction {
+    pub action: PlayerActionKind,
+    /// Block position packed into an `i64` per the vanilla
+    /// `BlockPos.toLong` format used elsewhere in this module
+    /// (`SetDefaultSpawnPosition`, `BlockUpdate`).
+    pub position: i64,
+    pub direction: Direction,
+    pub sequence: i32,
+}
+
+impl Packet for ServerboundPlayerAction {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_PLAYER_ACTION sits at game-SB index 41 = wire id 0x29.
+    const ID: i32 = 0x29;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.action as i32);
+        buf.write_i64(self.position);
+        buf.write_varint(self.direction as i32);
+        buf.write_varint(self.sequence);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let action = PlayerActionKind::from_wire(buf.read_varint()?)?;
+        let position = buf.read_i64()?;
+        let direction = Direction::from_wire(buf.read_varint()?)?;
+        let sequence = buf.read_varint()?;
+        Ok(Self {
+            action,
+            position,
+            direction,
+            sequence,
+        })
+    }
+}
+
+/// Which hand was used. Vanilla VarInt: 0 = main, 1 = off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionHand {
+    MainHand = 0,
+    OffHand = 1,
+}
+
+impl InteractionHand {
+    fn from_wire(v: i32) -> Result<Self, CodecError> {
+        Ok(match v {
+            0 => Self::MainHand,
+            1 => Self::OffHand,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 1,
+                });
+            }
+        })
+    }
+}
+
+/// `Serverbound Use Item On` (SB) — the place-block / right-click
+/// packet. Per ADR 0002, verified against `javap -p`:
+/// `ServerboundUseItemOnPacket(BlockHitResult blockHit,
+/// InteractionHand hand, int sequence)`.
+///
+/// The wire order, per the unobfuscated jar's stream codec, is
+/// `hand` (VarInt) first, then the `BlockHitResult` body, then
+/// `sequence`. `BlockHitResult` on the wire is *not* the in-memory
+/// shape — it ships as
+/// `(BlockPos pos, Direction direction, Vec3 cursor, bool inside,
+/// bool world_border_hit)` (`pos` packed as the standard `i64`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundUseItemOn {
+    pub hand: InteractionHand,
+    pub position: i64,
+    pub direction: Direction,
+    pub cursor_x: f32,
+    pub cursor_y: f32,
+    pub cursor_z: f32,
+    pub inside: bool,
+    pub world_border_hit: bool,
+    pub sequence: i32,
+}
+
+impl Packet for ServerboundUseItemOn {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_USE_ITEM_ON sits at game-SB index 66 = wire id 0x42.
+    const ID: i32 = 0x42;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.hand as i32);
+        buf.write_i64(self.position);
+        buf.write_varint(self.direction as i32);
+        buf.write_f32(self.cursor_x);
+        buf.write_f32(self.cursor_y);
+        buf.write_f32(self.cursor_z);
+        buf.write_bool(self.inside);
+        buf.write_bool(self.world_border_hit);
+        buf.write_varint(self.sequence);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let hand = InteractionHand::from_wire(buf.read_varint()?)?;
+        let position = buf.read_i64()?;
+        let direction = Direction::from_wire(buf.read_varint()?)?;
+        let cursor_x = buf.read_f32()?;
+        let cursor_y = buf.read_f32()?;
+        let cursor_z = buf.read_f32()?;
+        let inside = buf.read_bool()?;
+        let world_border_hit = buf.read_bool()?;
+        let sequence = buf.read_varint()?;
+        Ok(Self {
+            hand,
+            position,
+            direction,
+            cursor_x,
+            cursor_y,
+            cursor_z,
+            inside,
+            world_border_hit,
+            sequence,
+        })
+    }
+}
+
+/// Pack `(x, y, z)` world coordinates into vanilla's `BlockPos`
+/// `i64`. `x` and `z` are 26-bit signed; `y` is 12-bit signed.
+/// Used by every packet in this module that carries a `BlockPos`.
+#[must_use]
+pub fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
+    let x = (x as i64) & 0x3FF_FFFF;
+    let z = (z as i64) & 0x3FF_FFFF;
+    let y = (y as i64) & 0xFFF;
+    (x << 38) | (z << 12) | y
+}
+
+/// Inverse of [`pack_block_pos`]. Sign-extends each field from its
+/// declared bit width (26 bits for x/z, 12 bits for y).
+#[must_use]
+pub fn unpack_block_pos(packed: i64) -> (i32, i32, i32) {
+    let p = packed as u64;
+    let x_raw = ((p >> 38) & 0x3FF_FFFF) as i32;
+    let z_raw = ((p >> 12) & 0x3FF_FFFF) as i32;
+    let y_raw = (p & 0xFFF) as i32;
+    (
+        sign_extend_26(x_raw),
+        sign_extend_12(y_raw),
+        sign_extend_26(z_raw),
+    )
+}
+
+fn sign_extend_26(v: i32) -> i32 {
+    if v & 0x200_0000 != 0 {
+        v | !0x3FF_FFFF
+    } else {
+        v
+    }
+}
+
+fn sign_extend_12(v: i32) -> i32 {
+    if v & 0x800 != 0 { v | !0xFFF } else { v }
+}
+
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
@@ -1038,5 +1401,144 @@ mod tests {
         let mut cursor: &[u8] = &buf;
         let err = LevelChunkWithLight::decode(&mut cursor).unwrap_err();
         assert!(matches!(err, CodecError::StringTooLong { .. }));
+    }
+
+    // ---- M5.a: serverbound interaction packets ----
+
+    #[test]
+    fn block_pos_pack_round_trips_positive_and_negative_coords() {
+        for &(x, y, z) in &[
+            (0, 0, 0),
+            (1, 2, 3),
+            (-1, -1, -1),
+            (100, 64, -100),
+            (i32::MAX >> 6, 2047, i32::MIN >> 6), // edges of 26-bit signed
+            (0, -2048, 0),                        // edge of 12-bit signed
+        ] {
+            let packed = pack_block_pos(x, y, z);
+            let (rx, ry, rz) = unpack_block_pos(packed);
+            assert_eq!(
+                (rx, ry, rz),
+                (x, y, z),
+                "round trip failed for ({x}, {y}, {z})"
+            );
+        }
+    }
+
+    #[test]
+    fn serverbound_player_action_round_trip() {
+        round_trip(ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(10, -60, -7),
+            direction: Direction::Up,
+            sequence: 1,
+        });
+        round_trip(ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: pack_block_pos(0, 200, 0),
+            direction: Direction::North,
+            sequence: 12345,
+        });
+    }
+
+    #[test]
+    fn serverbound_player_action_rejects_out_of_range_action() {
+        // VarInt(8) — one past the last variant.
+        let mut buf = Vec::new();
+        buf.write_varint(8);
+        buf.write_i64(0);
+        buf.write_varint(0);
+        buf.write_varint(0);
+        let mut cursor: &[u8] = &buf;
+        let err = ServerboundPlayerAction::decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, CodecError::StringTooLong { .. }));
+    }
+
+    #[test]
+    fn serverbound_use_item_on_round_trip() {
+        round_trip(ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(3, -60, 4),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.25,
+            inside: false,
+            world_border_hit: false,
+            sequence: 7,
+        });
+        round_trip(ServerboundUseItemOn {
+            hand: InteractionHand::OffHand,
+            position: pack_block_pos(-1, 70, -1),
+            direction: Direction::East,
+            cursor_x: 0.0,
+            cursor_y: 0.0,
+            cursor_z: 0.0,
+            inside: true,
+            world_border_hit: true,
+            sequence: 99,
+        });
+    }
+
+    #[test]
+    fn direction_normal_matches_vanilla_axes() {
+        assert_eq!(Direction::Down.normal(), (0, -1, 0));
+        assert_eq!(Direction::Up.normal(), (0, 1, 0));
+        assert_eq!(Direction::North.normal(), (0, 0, -1));
+        assert_eq!(Direction::South.normal(), (0, 0, 1));
+        assert_eq!(Direction::West.normal(), (-1, 0, 0));
+        assert_eq!(Direction::East.normal(), (1, 0, 0));
+    }
+
+    // ---- M5.b: clientbound edit / ack / relight packets ----
+
+    #[test]
+    fn block_update_round_trip() {
+        round_trip(BlockUpdate {
+            position: pack_block_pos(0, -60, 0),
+            state_id: 1, // stone in our test registry
+        });
+        round_trip(BlockUpdate {
+            position: pack_block_pos(-7, 200, 3),
+            state_id: 29_872,
+        });
+    }
+
+    #[test]
+    fn block_changed_ack_round_trip() {
+        round_trip(BlockChangedAck { sequence: 0 });
+        round_trip(BlockChangedAck { sequence: 1 });
+        round_trip(BlockChangedAck { sequence: i32::MAX });
+    }
+
+    #[test]
+    fn light_update_round_trip_empty() {
+        round_trip(LightUpdate {
+            chunk_x: 0,
+            chunk_z: 0,
+            light: LightData::empty(),
+        });
+    }
+
+    #[test]
+    fn light_update_round_trip_with_layers() {
+        // Use the same shape as the existing LightData non-empty
+        // round-trip test in this module: one full-bright layer per
+        // section + an empty-mask-clearing zero across all 26 slots.
+        let sky_layer = vec![0xFFu8; LightData::LIGHT_LAYER_BYTES];
+        let block_layer = vec![0u8; LightData::LIGHT_LAYER_BYTES];
+        let light = LightData {
+            sky_y_mask: vec![(1 << 26) - 1],
+            block_y_mask: vec![(1 << 26) - 1],
+            empty_sky_y_mask: vec![0],
+            empty_block_y_mask: vec![0],
+            sky_updates: vec![sky_layer; 26],
+            block_updates: vec![block_layer; 26],
+        };
+        round_trip(LightUpdate {
+            chunk_x: -3,
+            chunk_z: 7,
+            light,
+        });
     }
 }
