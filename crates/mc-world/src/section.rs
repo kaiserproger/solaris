@@ -123,6 +123,40 @@ impl ChunkSection {
         prev
     }
 
+    /// Build a section directly from a palette + index array. The
+    /// codec uses this when loading vanilla `.mca` files. Caller must
+    /// supply a `PackedBitArray` of length `SECTION_VOLUME` whose
+    /// every entry is < `palette.len()`. `non_air_count` is computed
+    /// by walking the indices once.
+    #[must_use]
+    pub fn from_indirect(
+        palette: Vec<BlockStateId>,
+        indices: PackedBitArray,
+        air: BlockStateId,
+    ) -> Self {
+        assert_eq!(indices.len(), SECTION_VOLUME);
+        let non_air_count = (0..SECTION_VOLUME)
+            .filter(|&i| {
+                let p = indices.get(i) as usize;
+                palette[p] != air
+            })
+            .count() as u16;
+        Self {
+            storage: BlockStorage::Indirect { palette, indices },
+            non_air_count,
+            air,
+        }
+    }
+
+    /// Access the raw packed indices, for the Anvil writer.
+    #[must_use]
+    pub fn indices(&self) -> Option<&PackedBitArray> {
+        match &self.storage {
+            BlockStorage::Single(_) => None,
+            BlockStorage::Indirect { indices, .. } => Some(indices),
+        }
+    }
+
     #[must_use]
     pub fn non_air_count(&self) -> u16 {
         self.non_air_count
@@ -199,6 +233,20 @@ impl PackedBitArray {
             bits_per_entry,
             len,
             data: vec![0; words],
+        }
+    }
+
+    /// Build an array from a pre-packed word slice. Used when loading
+    /// data from disk: the words are already in the vanilla layout.
+    #[must_use]
+    pub fn from_words(bits_per_entry: u8, len: usize, words: Vec<u64>) -> Self {
+        assert!((1..=32).contains(&bits_per_entry));
+        let epw = entries_per_word(bits_per_entry);
+        assert_eq!(words.len(), len.div_ceil(epw));
+        Self {
+            bits_per_entry,
+            len,
+            data: words,
         }
     }
 

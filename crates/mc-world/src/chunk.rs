@@ -71,6 +71,14 @@ impl BiomeSection {
         BiomeSection::Single(biome)
     }
 
+    /// Build directly from a palette + packed indices, as the Anvil
+    /// codec gets them from disk.
+    #[must_use]
+    pub fn from_indirect(palette: Vec<Identifier>, indices: PackedBitArray) -> Self {
+        assert_eq!(indices.len(), BIOME_VOLUME);
+        BiomeSection::Indirect { palette, indices }
+    }
+
     /// Read a biome cell at the section-local 4×4×4 coordinate.
     #[must_use]
     pub fn get(&self, x: u8, y: u8, z: u8) -> &Identifier {
@@ -84,6 +92,14 @@ impl BiomeSection {
                 let p = indices.get(idx) as usize;
                 &palette[p]
             }
+        }
+    }
+
+    #[must_use]
+    pub fn palette(&self) -> &[Identifier] {
+        match self {
+            BiomeSection::Single(id) => std::slice::from_ref(id),
+            BiomeSection::Indirect { palette, .. } => palette,
         }
     }
 }
@@ -105,6 +121,22 @@ impl Heightmap {
         Self {
             data: PackedBitArray::zeroed(HEIGHTMAP_BITS, HEIGHTMAP_LEN),
         }
+    }
+
+    /// Build a heightmap directly from the packed `i64[]` Anvil stores
+    /// on disk (a single NBT `LongArray` per heightmap kind).
+    #[must_use]
+    pub fn from_long_array(longs: &[i64]) -> Self {
+        let words: Vec<u64> = longs.iter().map(|&l| l as u64).collect();
+        Self {
+            data: PackedBitArray::from_words(HEIGHTMAP_BITS, HEIGHTMAP_LEN, words),
+        }
+    }
+
+    /// Raw long-array form for emission back to NBT.
+    #[must_use]
+    pub fn to_long_array(&self) -> Vec<i64> {
+        self.data.words().iter().map(|&w| w as i64).collect()
     }
 
     #[must_use]
