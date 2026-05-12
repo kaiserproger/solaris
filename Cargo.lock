@@ -461,7 +461,6 @@ dependencies = [
 name = "mc-data"
 version = "0.0.1"
 dependencies = [
- "mc-protocol",
  "tempfile",
  "thiserror",
  "tracing",
@@ -510,6 +509,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "flate2",
+ "mc-data",
  "proptest",
  "thiserror",
  "uuid",

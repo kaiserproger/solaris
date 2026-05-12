@@ -217,7 +217,7 @@ pub trait ReadMc: Buf {
     /// validates its shape.
     fn read_identifier(&mut self) -> Result<Identifier, CodecError> {
         let s = self.read_string(DEFAULT_MAX_STRING_LEN)?;
-        Identifier::parse(s)
+        Identifier::parse(s).map_err(|e| CodecError::InvalidIdentifier(e.0))
     }
 
     /// 128-bit big-endian UUID.
@@ -368,77 +368,10 @@ pub trait WriteMc: BufMut {
 impl<T: BufMut + ?Sized> WriteMc for T {}
 
 // -----------------------------------------------------------------------
-// Identifier
+// Identifier — re-exported from mc-data, where the type now lives.
 // -----------------------------------------------------------------------
 
-/// A validated `namespace:path` identifier as used pervasively by the
-/// Minecraft protocol and data packs (block IDs, sound events, tags, …).
-///
-/// Stored as a single owned string and an index pointing at the colon.
-/// We don't intern here; if interning turns out to matter for the
-/// data-pack loader we'll revisit (PROJECT_SPEC §3.2 leaves room).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Identifier {
-    full: String,
-    colon: usize,
-}
-
-impl Identifier {
-    /// Parse a `namespace:path` (or bare `path`, which defaults to the
-    /// `minecraft` namespace, as the vanilla protocol does).
-    pub fn parse(input: impl Into<String>) -> Result<Self, CodecError> {
-        let input = input.into();
-        let (namespace, path) = match input.find(':') {
-            Some(idx) => (&input[..idx], &input[idx + 1..]),
-            None => ("minecraft", input.as_str()),
-        };
-        if !is_valid_namespace(namespace) || !is_valid_path(path) {
-            return Err(CodecError::InvalidIdentifier(input));
-        }
-        if input.contains(':') {
-            let colon = input.find(':').unwrap();
-            Ok(Self { full: input, colon })
-        } else {
-            let full = format!("minecraft:{input}");
-            let colon = "minecraft".len();
-            Ok(Self { full, colon })
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.full
-    }
-
-    #[must_use]
-    pub fn namespace(&self) -> &str {
-        &self.full[..self.colon]
-    }
-
-    #[must_use]
-    pub fn path(&self) -> &str {
-        &self.full[self.colon + 1..]
-    }
-}
-
-impl std::fmt::Display for Identifier {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.full)
-    }
-}
-
-fn is_valid_namespace(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.'))
-}
-
-fn is_valid_path(s: &str) -> bool {
-    !s.is_empty()
-        && s.chars().all(|c| {
-            c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '_' | '-' | '.' | '/')
-        })
-}
+pub use mc_data::Identifier;
 
 // -----------------------------------------------------------------------
 // Tests

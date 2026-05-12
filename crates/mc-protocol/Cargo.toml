@@ -12,6 +12,7 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
+mc-data = { path = "../mc-data" }
 bytes = { workspace = true }
 flate2 = { workspace = true }
 thiserror = { workspace = true }

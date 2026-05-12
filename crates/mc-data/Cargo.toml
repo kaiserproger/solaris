@@ -12,7 +12,6 @@ repository.workspace = true
 workspace = true
 
 [dependencies]
-mc-protocol = { path = "../mc-protocol" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 

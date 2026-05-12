@@ -26,9 +26,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use mc_protocol::codec::Identifier;
 use thiserror::Error;
 use tracing::{debug, trace};
+
+pub mod identifier;
+
+pub use identifier::{Identifier, IdentifierError};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
