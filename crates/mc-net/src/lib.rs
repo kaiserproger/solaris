@@ -13,6 +13,7 @@ mod configuration;
 mod connection;
 mod error;
 mod login;
+mod play;
 mod server;
 mod status;
 

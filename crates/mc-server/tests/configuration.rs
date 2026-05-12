@@ -19,6 +19,7 @@ use mc_protocol::packets::configuration::{
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::play::LoginPlay;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -165,17 +166,22 @@ async fn configuration_known_packs_and_finish_complete() {
     );
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 
-    // Acknowledge — that transitions us into Play, which the server
-    // does not implement, so it should close.
+    // Acknowledge — that transitions us into Play. Verify the
+    // transition by reading the next clientbound packet and confirming
+    // it is Login (Play). Full coverage of the Play spawn burst is in
+    // tests/play.rs.
     write_frame(&mut stream, &AcknowledgeFinishConfiguration).await;
-    let mut scratch = [0u8; 8];
-    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch))
-        .await
-        .expect("server did not close on its own within 2s")
-        .unwrap_or(0);
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_one_frame(&mut stream, &mut rbuf),
+    )
+    .await
+    .expect("server did not advance to Play within 2s");
     assert_eq!(
-        n, 0,
-        "expected close after Acknowledge Finish Configuration"
+        frame.id,
+        LoginPlay::ID,
+        "after AcknowledgeFinishConfiguration the server should emit \
+         Login (Play) as the first Play-state packet"
     );
 }
 
@@ -231,10 +237,13 @@ async fn configuration_skips_unexpected_packets() {
     stream.write_all(&junk).await.unwrap();
 
     write_frame(&mut stream, &AcknowledgeFinishConfiguration).await;
-    let mut scratch = [0u8; 8];
-    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut scratch))
-        .await
-        .expect("server did not close on its own within 2s")
-        .unwrap_or(0);
-    assert_eq!(n, 0);
+    // Same as above: verify the state transition by waiting for the
+    // first Play-state packet.
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_one_frame(&mut stream, &mut rbuf),
+    )
+    .await
+    .expect("server did not advance to Play within 2s");
+    assert_eq!(frame.id, LoginPlay::ID);
 }

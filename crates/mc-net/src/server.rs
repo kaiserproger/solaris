@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
-use crate::{configuration, login, status};
+use crate::{configuration, login, play, status};
 
 /// Settings the network layer needs to serve.
 ///
@@ -127,12 +127,7 @@ async fn handle_connection(
             let profile = login::handle(&mut reader, &mut writer, &mut buf).await?;
             configuration::handle(&mut reader, &mut writer, &mut buf, &profile, &config.data)
                 .await?;
-            info!(
-                player = %profile.name,
-                "M1.e configuration complete; Play state (M1.g) not yet \
-                 implemented, dropping connection",
-            );
-            Ok(())
+            play::handle(&mut reader, &mut writer, &mut buf, &profile, &config.data).await
         }
     }
 }
