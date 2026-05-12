@@ -29,8 +29,8 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation,
     GameEvent, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, PlayerActionKind,
-    ServerboundKeepAlive, ServerboundPlayerAction, SetCenterChunk, SynchronizePlayerPosition,
-    unpack_block_pos,
+    ServerboundKeepAlive, ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk,
+    SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
@@ -628,6 +628,79 @@ fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
         .unwrap_or(mc_world::BlockStateId(0))
 }
 
+/// Stone's default state id from the registry. M5.e's place-block
+/// handler always places stone regardless of what the client thinks
+/// it's holding — inventory + item-stack handling is its own
+/// milestone. Falls back to `BlockStateId(1)` (vanilla 26.1.2's
+/// stone default) when the registry doesn't expose `minecraft:stone`
+/// for some reason; the test world has it.
+fn stone_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
+    let stone_id = mc_data::Identifier::parse("minecraft:stone").expect("static identifier");
+    registry
+        .block(&stone_id)
+        .map(|b| b.default)
+        .unwrap_or(mc_world::BlockStateId(1))
+}
+
+/// M5.e: handle a serverbound `UseItemOn`. Always places stone at
+/// `clicked_pos + direction.normal` regardless of what the client
+/// thinks it's holding (no inventory model yet). If the target
+/// cell is already non-air we drop the placement silently and ack
+/// the sequence so the client doesn't roll back forever.
+async fn handle_use_item_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    action: ServerboundUseItemOn,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (cx, cy, cz) = unpack_block_pos(action.position);
+    let (dx, dy, dz) = action.direction.normal();
+    let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
+
+    let air = air_state_id(&state.blocks);
+    let stone = stone_state_id(&state.blocks);
+
+    // Validate: target cell must currently be air. We can borrow
+    // the world briefly to peek; if the cell is non-air or absent,
+    // skip the edit but still ack.
+    let target_is_air = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(mc_world::BlockPos {
+            x: tx,
+            y: ty,
+            z: tz,
+        }) {
+            Ok(Some(current)) => current == air,
+            Ok(None) => false,
+            Err(err) => {
+                warn!(error = %err, x = tx, y = ty, z = tz, "UseItemOn target read failed");
+                false
+            }
+        }
+    };
+    if !target_is_air {
+        debug!(
+            x = tx,
+            y = ty,
+            z = tz,
+            "UseItemOn target not air; skipping placement"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    apply_block_edit(state, writer, action.sequence, tx, ty, tz, stone).await
+}
+
 async fn keepalive_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -698,6 +771,17 @@ where
                             action = ?action.action,
                             sequence = action.sequence,
                             "PlayerAction ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundUseItemOn::ID {
+                    let mut body = frame.body;
+                    let use_on = ServerboundUseItemOn::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_use_item_on(state, writer, use_on).await?;
+                    } else {
+                        debug!(
+                            sequence = use_on.sequence,
+                            "UseItemOn ignored — no world configured"
                         );
                     }
                 } else {
