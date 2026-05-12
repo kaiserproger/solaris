@@ -6,10 +6,13 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M1 — network + handshake. A vanilla 26.1.2 client should be
-able to list the server in its server browser, log in (offline mode),
-walk through Configuration, and reach Play state with a black world.
-Chunk data and gameplay are M2+.
+**Status:** M2 code-complete on `dev/M2-world-representation`. The
+world model — block registry, palette-based chunk sections,
+Anvil-compatible `.mca` codec, lazy `WorldStorage` façade — is in
+place and round-trips real vanilla 26.1.2 chunks end-to-end. The
+network layer (M1) still does not stream chunks; M3 will wire
+`WorldStorage` into the Play state so connecting clients actually
+see a world.
 
 ## Build
 
