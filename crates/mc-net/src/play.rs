@@ -19,14 +19,16 @@
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
-use mc_data::VanillaData;
+use mc_data::{Registry, VanillaData};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SynchronizePlayerPosition,
+    ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight,
+    LightData, LoginPlay, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
+use mc_world::ChunkPos;
+use mc_world::wire::{client_heightmaps, encode_chunk_data};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
@@ -34,7 +36,7 @@ use tracing::{debug, info, warn};
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
-use crate::server::ServerConfig;
+use crate::server::{ServerConfig, WorldHandle};
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
@@ -74,11 +76,11 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    // `world` and `blocks` ride along on the config but are not yet
-    // consumed — M3.d wires them into a Set-Center-Chunk + single-
-    // chunk emission, M3.e expands to the view-distance window. The
-    // M1 spawn-burst behaviour below is unchanged.
-    let _ = (&config.blocks, &config.world);
+    // `blocks` rides along on the config; M3.d uses `world` below for
+    // the single-chunk emission, M3.e will fan out to a view-distance
+    // window. `blocks` is unused for the moment because the chunk
+    // encoder takes its palette IDs straight from the chunk.
+    let _ = &config.blocks;
     let data: &VanillaData = &config.data;
     let (dim_id, dim_name, dim_names) = spawn_dimension(data).ok_or_else(|| {
         ConnectionError::Codec(mc_protocol::CodecError::InvalidIdentifier(
@@ -160,9 +162,108 @@ where
     )
     .await?;
 
-    // 5. Keepalive loop. Runs until the connection drops or the client
+    // 5. Set Center Chunk + single-chunk experiment (M3.d). View
+    //    distance expansion is M3.e. Spawn is at (SPAWN_X, SPAWN_Z);
+    //    the chunk anchor is the chunk that contains it.
+    let (spawn_cx, spawn_cz) = spawn_chunk_pos();
+    write_packet(
+        writer,
+        &SetCenterChunk {
+            chunk_x: spawn_cx,
+            chunk_z: spawn_cz,
+        },
+        Compression::Disabled,
+    )
+    .await?;
+
+    if let Some(world) = config.world.as_ref() {
+        emit_chunk(writer, world, data, spawn_cx, spawn_cz).await?;
+    }
+
+    // 6. Keepalive loop. Runs until the connection drops or the client
     //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`.
     keepalive_loop(reader, writer, buf).await
+}
+
+/// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
+/// fn rather than inlined so the math is unit-testable and so M3.e can
+/// share the formula when it computes the view-distance ring.
+fn spawn_chunk_pos() -> (i32, i32) {
+    let cx = (SPAWN_X.floor() as i32).div_euclid(16);
+    let cz = (SPAWN_Z.floor() as i32).div_euclid(16);
+    (cx, cz)
+}
+
+/// Emit a single chunk via `LevelChunkWithLight`. Silently skips when
+/// the chunk is absent (test world doesn't cover the requested coord)
+/// or when the biome registry / chunk read / encode produces an error
+/// we can attribute to the world side — kicking the client over a
+/// missing chunk would mask the real failure.
+async fn emit_chunk<W>(
+    writer: &mut W,
+    world: &WorldHandle,
+    data: &VanillaData,
+    cx: i32,
+    cz: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(biomes) = data.registry("worldgen/biome") else {
+        warn!("worldgen/biome registry missing; skipping chunk emission");
+        return Ok(());
+    };
+
+    let chunk = {
+        let mut storage = world.lock().await;
+        match storage.get_chunk(ChunkPos { x: cx, z: cz }) {
+            Ok(Some(c)) => c.clone(),
+            Ok(None) => {
+                debug!(cx, cz, "no chunk in storage at spawn position");
+                return Ok(());
+            }
+            Err(err) => {
+                warn!(cx, cz, error = %err, "chunk read failed; skipping emission");
+                return Ok(());
+            }
+        }
+    };
+
+    let packet = build_chunk_packet(&chunk, biomes, cx, cz);
+    let packet = match packet {
+        Ok(p) => p,
+        Err(err) => {
+            warn!(cx, cz, error = %err, "chunk encode failed; skipping emission");
+            return Ok(());
+        }
+    };
+
+    info!(cx, cz, bytes = packet.data.len(), "emitting spawn chunk");
+    write_packet(writer, &packet, Compression::Disabled).await
+}
+
+fn build_chunk_packet(
+    chunk: &mc_world::Chunk,
+    biomes: &Registry,
+    cx: i32,
+    cz: i32,
+) -> Result<LevelChunkWithLight, mc_world::wire::WireError> {
+    let data = encode_chunk_data(chunk, biomes)?;
+    let heightmaps = client_heightmaps(chunk)
+        .into_iter()
+        .map(|h| ChunkHeightmap {
+            type_id: h.type_id,
+            data: h.data,
+        })
+        .collect();
+    Ok(LevelChunkWithLight {
+        chunk_x: cx,
+        chunk_z: cz,
+        heightmaps,
+        data,
+        block_entities: Vec::new(),
+        light: LightData::empty(),
+    })
 }
 
 async fn keepalive_loop<R, W>(
@@ -248,6 +349,12 @@ mod tests {
         assert_ne!(pack_block_pos(1, 0, 0), 0);
         assert_ne!(pack_block_pos(0, 1, 0), 0);
         assert_ne!(pack_block_pos(0, 0, 1), 0);
+    }
+
+    #[test]
+    fn spawn_chunk_pos_matches_origin() {
+        // SPAWN_(X,Z) = (0.5, 0.5); the containing chunk is (0, 0).
+        assert_eq!(spawn_chunk_pos(), (0, 0));
     }
 
     #[test]

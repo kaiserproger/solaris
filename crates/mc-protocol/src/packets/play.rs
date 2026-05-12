@@ -676,6 +676,41 @@ impl Packet for LevelChunkWithLight {
     }
 }
 
+/// `Set Center Chunk` (CB). Tells the client which chunk is the center
+/// of its view-distance window — the chunk it is "looking from". Every
+/// `LevelChunkWithLight` packet that follows is rendered relative to
+/// this anchor; if the center is wrong the client will silently
+/// discard chunks that fall outside its (anchored, but still
+/// vd-bounded) loaded ring.
+///
+/// Wire layout per `javap -p -c` of
+/// `ClientboundSetChunkCacheCenterPacket.write` (ADR 0002): two
+/// VarInts, `x` then `z`, in chunk coordinates (= `floor(world / 16)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetCenterChunk {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+}
+
+impl Packet for SetCenterChunk {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_SET_CHUNK_CACHE_CENTER at game-CB index 94 = 0x5E.
+    const ID: i32 = 0x5E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.chunk_x);
+        buf.write_varint(self.chunk_z);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            chunk_x: buf.read_varint()?,
+            chunk_z: buf.read_varint()?,
+        })
+    }
+}
+
 // -----------------------------------------------------------------------
 // Serverbound
 // -----------------------------------------------------------------------
@@ -860,6 +895,23 @@ mod tests {
             event: GameEvent::EVENT_START_WAITING_FOR_CHUNKS,
             value: 0.0,
         });
+    }
+
+    // ---- SetCenterChunk ----
+
+    #[test]
+    fn set_center_chunk_id_matches_javap() {
+        assert_eq!(SetCenterChunk::ID, 0x5E);
+    }
+
+    #[test]
+    fn set_center_chunk_round_trips() {
+        for (x, z) in [(0, 0), (1, -1), (-100_000, 100_000), (i32::MIN, i32::MAX)] {
+            round_trip(SetCenterChunk {
+                chunk_x: x,
+                chunk_z: z,
+            });
+        }
     }
 
     // ---- LevelChunkWithLight ----

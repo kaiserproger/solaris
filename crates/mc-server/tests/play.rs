@@ -30,7 +30,7 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SynchronizePlayerPosition,
+    SetCenterChunk, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -159,6 +159,14 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let event = GameEvent::decode(&mut frame.body).unwrap();
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
 
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    assert_eq!(frame.id, SetCenterChunk::ID, "expected Set Center Chunk");
+    let center = SetCenterChunk::decode(&mut frame.body).unwrap();
+    // SPAWN_(X,Z) = (0.5, 0.5) → chunk (0, 0).
+    assert_eq!((center.chunk_x, center.chunk_z), (0, 0));
+    // With world = None in this test the chunk packet is intentionally
+    // not emitted; M3.e's view-distance test exercises the chunk path.
+
     // Be polite: ack the teleport.
     write_frame(
         &mut stream,
@@ -199,9 +207,11 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
     // Drain spawn burst.
-    // Spawn burst is 3 frames after M1.g.4: LoginPlay, SynchronizePlayerPosition,
-    // GameEvent. SetDefaultSpawnPosition was removed (wire-uncertain).
-    for _ in 0..3 {
+    // After M3.d the burst is 4 frames: LoginPlay,
+    // SynchronizePlayerPosition, GameEvent, SetCenterChunk. With
+    // world = None the chunk packet itself is intentionally not
+    // emitted.
+    for _ in 0..4 {
         let _ = read_one_frame(&mut stream, &mut rbuf).await;
     }
 
