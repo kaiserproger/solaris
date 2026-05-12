@@ -7,6 +7,7 @@
 pub mod anvil;
 pub mod block;
 pub mod chunk;
+pub mod light;
 pub mod section;
 pub mod storage;
 pub mod wire;
