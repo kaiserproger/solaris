@@ -512,6 +512,7 @@ dependencies = [
  "bytes",
  "flate2",
  "mc-data",
+ "mc-nbt",
  "proptest",
  "thiserror",
  "uuid",
