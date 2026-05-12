@@ -4,10 +4,10 @@ This directory is the local-only sidecar Solaris reads at runtime to
 populate the registries the protocol mandates we send to connecting
 clients.
 
-**Nothing under `data/vanilla/data/` or `data/vanilla/version.json` is
-committed to git.** Those paths are `.gitignore`d. Only this README
-(and any future schema/tooling docs you put alongside it) lives in
-version control.
+**Nothing under `data/vanilla/data/`, `data/vanilla/reports/`, or
+`data/vanilla/version.json` is committed to git.** Those paths are
+`.gitignore`d. Only this README (and any future schema/tooling docs
+you put alongside it) lives in version control.
 
 Files are populated locally by running
 [`tools/extract-vanilla-data.sh`](../../tools/extract-vanilla-data.sh)
@@ -44,11 +44,26 @@ tools/extract-vanilla-data.sh
 ```
 
 The script pulls a deterministic subset from `.analysis/server.jar`:
-the top-level registry directories the Configuration state references,
-all biome JSONs under `worldgen/biome`, and the entire `tags/` tree.
+
+- `data/minecraft/<registry>/` — the top-level registry directories
+  the Configuration state's `RegistryData` packet references.
+- `data/minecraft/worldgen/biome/` — biome JSONs.
+- `data/minecraft/tags/` — the entire tags tree (used by the
+  `UpdateTags` packet from M2 onward).
+- `reports/blocks.json`, `reports/registries.json`, `reports/packets.json`
+  — produced by running the server's own `--reports` data generator.
+  `blocks.json` is the canonical block-state-id mapping `mc-world`
+  loads at startup (M2.b); the other two are kept as cross-check
+  oracles for the protocol layer.
+
 Everything else (recipes, loot tables, advancements, full worldgen,
 structures) is left out by default — add to the `REGISTRIES` list in
 the script when a later milestone needs it.
+
+Generating reports invokes the bundled server's own data generator,
+which requires Java matching `version.json`'s `java_version` field
+(25 for 26.1.x). Override the JDK path with `JAVA=…` if your default
+`java` is on a different major.
 
 ## Versioning
 
