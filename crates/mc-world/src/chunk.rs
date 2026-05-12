@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use mc_data::Identifier;
+use mc_nbt::Tag;
 
 use crate::block::BlockStateId;
 use crate::section::{ChunkSection, PackedBitArray, SECTION_DIM};
@@ -200,6 +201,16 @@ pub struct Chunk {
     /// source of truth or fall back to recomputed light — see
     /// `mc_world::light`.
     pub section_lights: Vec<SectionLight>,
+    /// Root-level NBT fields M5.c keeps for byte-stable round-trip
+    /// through the Anvil codec without modelling them yet. Covers
+    /// what M2 dropped on decode: structures, `block_ticks`,
+    /// `fluid_ticks`, `PostProcessing`, `InhabitedTime`,
+    /// `LastUpdate`, `DataVersion`, plus any future field whose key
+    /// isn't in our modelled set. Order preserved from the original
+    /// compound so a load-then-save produces a stable byte stream
+    /// (modulo NBT compound ordering being unspecified — vanilla
+    /// reads it back identically either way).
+    pub extras: Vec<(String, Tag)>,
 }
 
 impl Chunk {
@@ -219,6 +230,7 @@ impl Chunk {
             block_entities: HashMap::new(),
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
+            extras: Vec::new(),
         }
     }
 
