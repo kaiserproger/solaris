@@ -61,6 +61,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         blocks,
         world,
         tags,
+        block_light: None,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

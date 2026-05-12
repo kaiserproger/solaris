@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use mc_data::VanillaData;
+use mc_data::block_light::BlockLightTable;
 use mc_data::tags::TagsData;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
@@ -54,6 +55,14 @@ pub struct ServerConfig {
     /// empty default when the sidecar lacks tag JSON; the vanilla
     /// client then complains during registry freeze.
     pub tags: Arc<TagsData>,
+    /// Per-block-state light metadata (emission / opacity /
+    /// sky-propagation). Loaded from
+    /// `data/vanilla/reports/block_light.json` at startup; the
+    /// chunk-streaming path uses it to compute light when the Anvil
+    /// nibbles are missing. `None` keeps M1/M3 behaviour (the
+    /// chunk-stream path falls back to `LightData::empty()` until
+    /// M4.e wires the engine in).
+    pub block_light: Option<Arc<BlockLightTable>>,
 }
 
 /// A listener that has been successfully bound but is not yet serving.
