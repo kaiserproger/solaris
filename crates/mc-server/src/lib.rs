@@ -43,16 +43,25 @@ pub struct NetworkSection {
 /// `./data/vanilla` relative to the working directory the server is
 /// launched from, which matches the layout `tools/extract-vanilla-data.sh`
 /// produces.
+///
+/// `world_dir` is the on-disk world save the server reads chunks from
+/// at runtime. `None` (or the default) means "no world wired up yet";
+/// the server will start and log a warning, and chunk queries will
+/// resolve to `None` everywhere. Plumbing the world into the network
+/// layer happens in M3.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DataSection {
     #[serde(default = "default_vanilla_dir")]
     pub vanilla_dir: PathBuf,
+    #[serde(default)]
+    pub world_dir: Option<PathBuf>,
 }
 
 impl Default for DataSection {
     fn default() -> Self {
         Self {
             vanilla_dir: default_vanilla_dir(),
+            world_dir: None,
         }
     }
 }

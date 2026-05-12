@@ -22,6 +22,7 @@ path = "src/lib.rs"
 mc-data = { path = "../mc-data" }
 mc-net = { path = "../mc-net" }
 mc-protocol = { path = "../mc-protocol" }
+mc-world = { path = "../mc-world" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
