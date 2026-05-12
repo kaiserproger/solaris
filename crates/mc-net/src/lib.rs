@@ -11,10 +11,12 @@
 
 mod connection;
 mod error;
+mod login;
 mod server;
 mod status;
 
 pub use error::ConnectionError;
+pub use login::offline_uuid;
 pub use server::{ServerConfig, run};
 
 /// Crate version, exposed so other crates and the binary can report it.

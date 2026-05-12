@@ -13,7 +13,7 @@ use tracing::{debug, info, warn};
 
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
-use crate::status;
+use crate::{login, status};
 
 /// Settings the network layer needs to serve.
 ///
@@ -87,15 +87,16 @@ async fn handle_connection(
     match handshake.next_state {
         NextState::Status => status::handle(reader, writer, buf, config).await,
         NextState::Login | NextState::Transfer => {
+            let profile = login::handle(reader, writer, buf).await?;
             info!(
-                next = ?handshake.next_state,
-                "login path not yet implemented (M1.d); closing connection",
+                player = %profile.name,
+                uuid = %profile.uuid,
+                "login complete; configuration state not yet implemented (M1.e), \
+                 dropping connection",
             );
-            // For now we just drop the writer/reader — vanilla shows a
-            // generic "connection lost" message. M1.d wires the proper
-            // login Disconnect packet here.
-            drop(writer);
-            drop(reader);
+            // Configuration state is M1.e. Until it lands we simply
+            // close: the vanilla client will display the "connection
+            // lost" screen.
             Ok(())
         }
     }

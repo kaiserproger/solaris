@@ -18,6 +18,7 @@ use bytes::{Buf, BufMut};
 use crate::error::CodecError;
 
 pub mod handshake;
+pub mod login;
 pub mod status;
 
 /// Direction a packet travels: serverbound (client → server) or
