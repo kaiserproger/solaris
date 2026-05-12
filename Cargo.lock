@@ -535,6 +535,7 @@ dependencies = [
  "mc-net",
  "mc-protocol",
  "mc-world",
+ "mc-worldgen",
  "predicates",
  "serde",
  "serde_json",

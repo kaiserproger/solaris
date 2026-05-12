@@ -78,11 +78,20 @@ async fn serve(path: &Path) -> Result<()> {
         match mc_world::WorldStorage::open(world_dir, Arc::clone(&blocks)) {
             Ok(storage) => {
                 let region_count = count_region_files(world_dir);
+                // M7: attach the terrain generator. Chunks missing
+                // from disk get materialised on demand; the M6 flush
+                // path then persists them so this only runs once per
+                // chunk per fresh world.
+                let generator: Arc<dyn mc_world::ChunkGenerator> = Arc::new(
+                    mc_worldgen::TerrainGenerator::new(cfg.data.seed, Arc::clone(&blocks)),
+                );
+                let storage = storage.with_generator(generator);
                 tracing::info!(
                     path = %world_dir.display(),
                     block_count = storage.registry().len(),
                     region_files = region_count,
-                    "world storage opened",
+                    seed = cfg.data.seed,
+                    "world storage opened with worldgen baseline",
                 );
                 Some(Arc::new(tokio::sync::Mutex::new(storage)))
             }

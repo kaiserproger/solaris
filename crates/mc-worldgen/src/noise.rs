@@ -110,7 +110,7 @@ mod tests {
         for x in -50..=50 {
             for z in -50..=50 {
                 let v = value_noise_2d(x as f64 * 0.37, z as f64 * 0.41, 7);
-                assert!(v >= -1.0 && v <= 1.0, "value out of [-1,1]: {v}");
+                assert!((-1.0..=1.0).contains(&v), "value out of [-1,1]: {v}");
             }
         }
     }
@@ -142,7 +142,7 @@ mod tests {
         for x in -20..=20 {
             for z in -20..=20 {
                 let v = fbm_2d(x as f64 * 0.1, z as f64 * 0.1, 13, 4, 0.5);
-                assert!(v >= -1.0 && v <= 1.0, "fbm out of [-1,1]: {v}");
+                assert!((-1.0..=1.0).contains(&v), "fbm out of [-1,1]: {v}");
             }
         }
     }

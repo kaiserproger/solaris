@@ -59,6 +59,13 @@ pub struct DataSection {
     pub vanilla_dir: PathBuf,
     #[serde(default)]
     pub world_dir: Option<PathBuf>,
+    /// World seed for the M7 terrain generator. Defaults to `0` —
+    /// every run starts on the same terrain unless this is overridden.
+    /// Operators bumping this between runs will see fresh terrain in
+    /// previously-unflushed chunks; chunks already written to `.mca`
+    /// keep their old contents (the on-disk slot wins).
+    #[serde(default)]
+    pub seed: i64,
 }
 
 impl Default for DataSection {
@@ -66,6 +73,7 @@ impl Default for DataSection {
         Self {
             vanilla_dir: default_vanilla_dir(),
             world_dir: None,
+            seed: 0,
         }
     }
 }
