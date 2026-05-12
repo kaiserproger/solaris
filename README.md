@@ -6,18 +6,21 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M4 complete on `dev/M4-lighting`, awaiting `m4` tag. A
-vanilla 26.1.2 client connecting to Solaris walks Handshake → Login →
-Configuration → Play, receives the full vanilla tag set via
-`Update Tags`, renders the spawn floor from `.analysis/test-world/`
-streamed straight out of `WorldStorage`, and now also receives
-real sky / block light: every `LevelChunkWithLight` packet carries
-nibble layers from `mc_world::light`'s BFS propagation engine
-(seeded by an extracted per-block-state emission / opacity /
-sky-propagation table from `tools/extract-block-light.sh`). The
-manual gate has been re-driven through with a PrismLauncher 26.1.2
-client: terrain loads, spawn drops the player on grass, the world
-renders lit through the view-distance window.
+**Status:** M5 complete on `dev/M5-chunk-modification`, awaiting
+`m5` tag. A vanilla 26.1.2 client connecting to Solaris walks the
+full Handshake → Login → Configuration → Play sequence, receives
+the streamed spawn-area chunks lit by `mc_world::light`'s BFS
+engine (M4), and can now **break and place blocks** at runtime:
+the server applies the mutation in-memory via
+`WorldStorage::set_block_at`, refreshes the affected chunk's
+heightmaps, recomputes light over the centre + 4 manhattan
+neighbours, and ships `BlockUpdate` + `LightUpdate` ×5 +
+`BlockChangedAck` per edit. Place always emits `minecraft:stone`
+regardless of held item (no inventory yet). Edits live in the
+world cache for the session and revert on shutdown —
+persistence to `.mca` is M6+. The opaque "extras" channel from
+M5.c makes the eventual write-back path lossless across the
+chunk fields M2 didn't model.
 
 ## Build
 
