@@ -79,6 +79,7 @@ REGISTRIES=(
   cow_sound_variant
   cow_variant
   damage_type
+  dialog
   dimension_type
   enchantment
   enchantment_provider
@@ -88,10 +89,14 @@ REGISTRIES=(
   painting_variant
   pig_sound_variant
   pig_variant
+  timeline
+  trade_set
   trim_material
   trim_pattern
+  villager_trade
   wolf_sound_variant
   wolf_variant
+  world_clock
   zombie_nautilus_variant
 )
 

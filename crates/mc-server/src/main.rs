@@ -102,8 +102,31 @@ async fn serve(path: &Path) -> Result<()> {
         None
     };
 
+    let data = Arc::new(data);
+    let tags = match mc_data::tags::load(&cfg.data.vanilla_dir, &data) {
+        Ok(t) => {
+            tracing::info!(
+                registries = t.registries.len(),
+                tags = t.total_tags(),
+                entries = t.total_entries(),
+                path = %cfg.data.vanilla_dir.display(),
+                "tag set loaded",
+            );
+            Arc::new(t)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %cfg.data.vanilla_dir.display(),
+                error = %err,
+                "tag set load failed; the configuration handler will ship an empty Update Tags \
+                 packet and the vanilla client will reject login at registry freeze",
+            );
+            Arc::new(mc_data::tags::TagsData::default())
+        }
+    };
+
     let net = cfg
-        .to_network(Arc::new(data), blocks, world)
+        .to_network(data, blocks, world, tags)
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,

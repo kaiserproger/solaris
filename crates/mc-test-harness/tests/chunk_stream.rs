@@ -51,6 +51,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let storage = mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks))
         .expect("world storage opens");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -59,6 +60,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         data,
         blocks,
         world,
+        tags,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

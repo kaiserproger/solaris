@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mc_data::VanillaData;
+use mc_data::tags::TagsData;
 use mc_net::WorldHandle;
 use mc_world::BlockRegistry;
 use serde::{Deserialize, Serialize};
@@ -85,6 +86,7 @@ impl ServerConfig {
         data: Arc<VanillaData>,
         blocks: Arc<BlockRegistry>,
         world: Option<WorldHandle>,
+        tags: Arc<TagsData>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
         Ok(mc_net::ServerConfig {
@@ -94,6 +96,7 @@ impl ServerConfig {
             data,
             blocks,
             world,
+            tags,
         })
     }
 }
@@ -124,6 +127,10 @@ mod tests {
         Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"))
     }
 
+    fn stub_tags() -> Arc<TagsData> {
+        Arc::new(TagsData::default())
+    }
+
     #[test]
     fn translates_to_network_config() {
         let toml_src = r#"
@@ -141,7 +148,9 @@ mod tests {
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
-        let net = cfg.to_network(data, stub_blocks(), None).unwrap();
+        let net = cfg
+            .to_network(data, stub_blocks(), None, stub_tags())
+            .unwrap();
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
         assert_eq!(net.bind_address.port(), 25000);
@@ -162,6 +171,9 @@ mod tests {
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
-        assert!(cfg.to_network(data, stub_blocks(), None).is_err());
+        assert!(
+            cfg.to_network(data, stub_blocks(), None, stub_tags())
+                .is_err()
+        );
     }
 }

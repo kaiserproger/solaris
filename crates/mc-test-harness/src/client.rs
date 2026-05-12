@@ -19,7 +19,7 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks,
+    ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
@@ -156,6 +156,10 @@ impl Client {
             let frame = self.read_frame().await?;
             if frame.id == RegistryData::ID {
                 let _ = RegistryData::decode(&mut frame.body.clone())?;
+                continue;
+            }
+            if frame.id == UpdateTags::ID {
+                let _ = UpdateTags::decode(&mut frame.body.clone())?;
                 continue;
             }
             if frame.id == FinishConfiguration::ID {

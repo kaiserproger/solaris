@@ -15,7 +15,7 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, ServerboundKnownPacks,
+    RegistryData, ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
@@ -34,6 +34,7 @@ async fn start_server() -> SocketAddr {
             mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
         ),
         world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -161,6 +162,23 @@ async fn configuration_known_packs_and_finish_complete() {
         "expected a Registry Data packet for minecraft:dimension_type"
     );
 
+    // M3.i: server emits Update Tags between the last Registry Data
+    // and Finish Configuration. The test stub has an empty tag set so
+    // the packet is byte-minimal (one VarInt(0)) but it must still
+    // appear on the wire.
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    assert_eq!(
+        frame.id,
+        UpdateTags::ID,
+        "expected Update Tags before Finish Configuration"
+    );
+    let update_tags = UpdateTags::decode(&mut frame.body).unwrap();
+    assert!(
+        update_tags.registries.is_empty(),
+        "stub TagsData should produce an empty Update Tags packet"
+    );
+    assert_eq!(frame.body.remaining(), 0);
+
     // Then Finish Configuration.
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(
@@ -224,13 +242,16 @@ async fn configuration_skips_unexpected_packets() {
     )
     .await;
 
-    // Drain Registry Data packets, one per stub registry, then expect
-    // Finish Configuration.
+    // Drain Registry Data packets, one per stub registry, then drain
+    // the M3.i Update Tags packet, then expect Finish Configuration.
     for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
         let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
         assert_eq!(frame.id, RegistryData::ID);
         let _ = RegistryData::decode(&mut frame.body).unwrap();
     }
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();

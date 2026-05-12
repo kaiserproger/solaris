@@ -34,6 +34,7 @@ async fn start_server() -> SocketAddr {
             mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
         ),
         world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

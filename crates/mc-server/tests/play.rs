@@ -24,7 +24,7 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks,
+    ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
@@ -46,6 +46,7 @@ async fn start_server() -> SocketAddr {
             mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
         ),
         world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -116,6 +117,12 @@ async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketA
         assert_eq!(frame.id, RegistryData::ID);
         let _ = RegistryData::decode(&mut frame.body).unwrap();
     }
+    // M3.i: Update Tags arrives between the last RegistryData and
+    // FinishConfiguration. The stub `tags` here is empty; the packet
+    // is still required on the wire.
+    let mut frame = read_one_frame(stream, buf).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();

@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use mc_data::VanillaData;
+use mc_data::tags::TagsData;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
@@ -48,6 +49,11 @@ pub struct ServerConfig {
     pub data: Arc<VanillaData>,
     pub blocks: Arc<BlockRegistry>,
     pub world: Option<WorldHandle>,
+    /// Tag set the Configuration handler ships in `UpdateTags` between
+    /// the last `RegistryData` and `FinishConfiguration`. May be the
+    /// empty default when the sidecar lacks tag JSON; the vanilla
+    /// client then complains during registry freeze.
+    pub tags: Arc<TagsData>,
 }
 
 /// A listener that has been successfully bound but is not yet serving.
@@ -145,8 +151,15 @@ async fn handle_connection(
         NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
         NextState::Login | NextState::Transfer => {
             let profile = login::handle(&mut reader, &mut writer, &mut buf).await?;
-            configuration::handle(&mut reader, &mut writer, &mut buf, &profile, &config.data)
-                .await?;
+            configuration::handle(
+                &mut reader,
+                &mut writer,
+                &mut buf,
+                &profile,
+                &config.data,
+                &config.tags,
+            )
+            .await?;
             play::handle(&mut reader, &mut writer, &mut buf, &profile, config).await
         }
     }
