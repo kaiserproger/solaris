@@ -7,6 +7,7 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use mc_data::VanillaData;
 use mc_data::block_light::BlockLightTable;
+use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
@@ -63,6 +64,12 @@ pub struct ServerConfig {
     /// chunk-stream path falls back to `LightData::empty()` until
     /// M4.e wires the engine in).
     pub block_light: Option<Arc<BlockLightTable>>,
+    /// Item registry (M6.c) loaded from
+    /// `data/vanilla/reports/registries.json`. Drives the M6
+    /// place-from-held-item lookup. May be empty when running tests
+    /// that don't care about inventory; the M6 place flow degrades
+    /// gracefully (no item → no placement).
+    pub items: Arc<ItemRegistry>,
 }
 
 /// A listener that has been successfully bound but is not yet serving.

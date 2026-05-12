@@ -85,6 +85,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         world,
         tags,
         block_light,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

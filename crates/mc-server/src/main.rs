@@ -151,9 +151,30 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let items_path = cfg.data.vanilla_dir.join("reports").join("registries.json");
+    let items = match mc_data::items::load_items_report(&items_path) {
+        Ok(report) => {
+            let reg = mc_data::items::ItemRegistry::from_report(&report);
+            tracing::info!(
+                entries = reg.len(),
+                path = %items_path.display(),
+                "item registry loaded",
+            );
+            Arc::new(reg)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %items_path.display(),
+                error = %err,
+                "item registry load failed; M6 place will fall back to stone",
+            );
+            Arc::new(mc_data::items::ItemRegistry::default())
+        }
+    };
+
     let world_for_shutdown = net_world_clone(&world);
     let net = cfg
-        .to_network(data, blocks, world, tags, block_light)
+        .to_network(data, blocks, world, tags, block_light, items)
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,

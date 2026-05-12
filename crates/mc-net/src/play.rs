@@ -22,15 +22,18 @@ use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use mc_data::block_light::BlockLightTable;
+use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation,
-    GameEvent, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, PlayerActionKind,
-    ServerboundKeepAlive, ServerboundPlayerAction, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, unpack_block_pos,
+    BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
+    ConfirmTeleportation, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
+    LoginPlay, PlayerActionKind, ServerboundKeepAlive, ServerboundPlayerAction,
+    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    unpack_block_pos,
 };
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
@@ -207,21 +210,53 @@ where
         .await?;
     }
 
-    // 6. Keepalive loop. Runs until the connection drops or the client
+    // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
+    //    ContainerSetContent with the starter kit. Doing this even
+    //    when there's no world configured so the hotbar UI fills in
+    //    on connect-without-world (the M6 manual gate uses a world,
+    //    but tests / chunk-less debug runs should still display the
+    //    kit). When the item registry is empty (test stubs) the
+    //    starter inventory is mostly empty stacks — packets ship
+    //    anyway, just with `count == 0` slots.
+    let starter = build_starter_inventory(&config.items);
+    write_packet(
+        writer,
+        &ClientboundSetHeldSlot { slot: 0 },
+        Compression::Disabled,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: 0,
+            state_id: 1,
+            items: starter.as_wire_list(),
+            carried_item: ItemStack::EMPTY,
+        },
+        Compression::Disabled,
+    )
+    .await?;
+
+    // 7. Keepalive loop. Runs until the connection drops or the client
     //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
-    //    interaction state passes the M5.d/M5.e break/place
+    //    interaction state passes the M5.d/M5.e/M6.f break/place
     //    handlers everything they need to mutate the world and emit
-    //    relight packets back to the client.
+    //    relight + container packets back to the client.
     let mut interaction = config.world.as_ref().map(|world| InteractionState {
         world: Arc::clone(world),
         blocks: Arc::clone(&config.blocks),
         block_light: config.block_light.as_ref().map(Arc::clone),
         workspace: LightWorkspace::new(),
+        selected_hotbar_slot: 0,
+        inventory: starter,
+        inventory_state_id: 1,
+        item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
     });
     keepalive_loop(reader, writer, buf, interaction.as_mut()).await
 }
 
-/// Per-connection state the M5.d / M5.e interaction handlers carry.
+/// Per-connection state the M5.d / M5.e / M6 interaction handlers
+/// carry.
 struct InteractionState {
     world: WorldHandle,
     blocks: Arc<mc_world::BlockRegistry>,
@@ -230,6 +265,127 @@ struct InteractionState {
     /// the lifetime of the connection (same amortisation pattern
     /// as `emit_chunks_around`).
     workspace: LightWorkspace,
+    /// M6.d: which item the player is currently holding. Bumped by
+    /// `ServerboundSetCarriedItem` (0..=8) and consulted by
+    /// `handle_use_item_on` to resolve the placed block.
+    selected_hotbar_slot: u8,
+    /// M6.e: a 46-slot window-0 inventory. Indices follow vanilla's
+    /// numbering: 0..4 crafting (output + 2×2 input), 5..8 armor,
+    /// 9..35 main rows, 36..44 hotbar, 45 offhand.
+    inventory: PlayerInventory,
+    /// M6.e: per-vanilla, the server bumps this counter on every
+    /// inventory mutation it ships to the client; the client uses
+    /// it to detect desyncs. Starts at 1 (after the seed
+    /// ContainerSetContent on login).
+    inventory_state_id: i32,
+    /// M6.f: hard-coded item→block resolver for the M6 starter
+    /// kit. Resolved once from the block registry at construction
+    /// time; lookups are an `if`-ladder on the item id.
+    item_to_block: ItemToBlockTable,
+}
+
+/// 46-slot player inventory (window 0).
+///
+/// Layout (vanilla wire numbering):
+///   0       crafting result
+///   1..=4   crafting 2×2 input
+///   5..=8   armor (head, chest, legs, feet)
+///   9..=35  main inventory rows
+///   36..=44 hotbar
+///   45      offhand
+#[derive(Debug, Clone)]
+struct PlayerInventory {
+    slots: [ItemStack; 46],
+}
+
+impl PlayerInventory {
+    /// Slot index where the hotbar begins on the wire.
+    const HOTBAR_BASE: usize = 36;
+
+    fn empty() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ItemStack::EMPTY),
+        }
+    }
+
+    fn held(&self, hotbar_slot: u8) -> &ItemStack {
+        &self.slots[Self::HOTBAR_BASE + hotbar_slot as usize]
+    }
+
+    fn held_mut(&mut self, hotbar_slot: u8) -> &mut ItemStack {
+        &mut self.slots[Self::HOTBAR_BASE + hotbar_slot as usize]
+    }
+
+    fn as_wire_list(&self) -> Vec<ItemStack> {
+        self.slots.to_vec()
+    }
+}
+
+/// Hard-coded item→default-block-state lookup for the M6 starter
+/// kit. Resolved once at connection setup from the block registry.
+#[derive(Debug, Clone, Default)]
+struct ItemToBlockTable {
+    /// `(item_id, BlockStateId)` pairs. Stays tiny — full coverage
+    /// is M9+ work.
+    entries: Vec<(u32, mc_world::BlockStateId)>,
+}
+
+impl ItemToBlockTable {
+    fn build(items: &ItemRegistry, blocks: &mc_world::BlockRegistry) -> Self {
+        let starter_pairs = &[
+            ("minecraft:stone", "minecraft:stone"),
+            ("minecraft:dirt", "minecraft:dirt"),
+            ("minecraft:oak_planks", "minecraft:oak_planks"),
+            ("minecraft:torch", "minecraft:torch"),
+        ];
+        let mut entries = Vec::with_capacity(starter_pairs.len());
+        for (item_name, block_name) in starter_pairs {
+            let item_id = match mc_data::Identifier::parse(*item_name) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let block_id = match mc_data::Identifier::parse(*block_name) {
+                Ok(id) => id,
+                Err(_) => continue,
+            };
+            let Some(item_pid) = items.id_of(&item_id) else {
+                continue;
+            };
+            let Some(block) = blocks.block(&block_id) else {
+                continue;
+            };
+            entries.push((item_pid, block.default));
+        }
+        Self { entries }
+    }
+
+    fn resolve(&self, item_id: u32) -> Option<mc_world::BlockStateId> {
+        self.entries
+            .iter()
+            .find_map(|(id, state)| (*id == item_id).then_some(*state))
+    }
+}
+
+/// Build a starter-kit inventory: hotbar 0..=3 = stone, dirt, oak
+/// planks, torch; everything else empty. Items the registry doesn't
+/// resolve (test stubs without the real `items.json`) are quietly
+/// dropped — the slot stays empty.
+fn build_starter_inventory(items: &ItemRegistry) -> PlayerInventory {
+    let mut inv = PlayerInventory::empty();
+    let starter_kit: [(&str, i32); 4] = [
+        ("minecraft:stone", 64),
+        ("minecraft:dirt", 64),
+        ("minecraft:oak_planks", 64),
+        ("minecraft:torch", 64),
+    ];
+    for (i, (name, count)) in starter_kit.iter().enumerate() {
+        if let Ok(id) = mc_data::Identifier::parse(*name)
+            && let Some(item_id) = items.id_of(&id)
+        {
+            inv.slots[PlayerInventory::HOTBAR_BASE + i] = ItemStack::new(item_id, *count);
+        }
+    }
+    inv
 }
 
 /// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
@@ -628,25 +784,13 @@ fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
         .unwrap_or(mc_world::BlockStateId(0))
 }
 
-/// Stone's default state id from the registry. M5.e's place-block
-/// handler always places stone regardless of what the client thinks
-/// it's holding — inventory + item-stack handling is its own
-/// milestone. Falls back to `BlockStateId(1)` (vanilla 26.1.2's
-/// stone default) when the registry doesn't expose `minecraft:stone`
-/// for some reason; the test world has it.
-fn stone_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
-    let stone_id = mc_data::Identifier::parse("minecraft:stone").expect("static identifier");
-    registry
-        .block(&stone_id)
-        .map(|b| b.default)
-        .unwrap_or(mc_world::BlockStateId(1))
-}
-
-/// M5.e: handle a serverbound `UseItemOn`. Always places stone at
-/// `clicked_pos + direction.normal` regardless of what the client
-/// thinks it's holding (no inventory model yet). If the target
-/// cell is already non-air we drop the placement silently and ack
-/// the sequence so the client doesn't roll back forever.
+/// M6.f: handle a serverbound `UseItemOn`. Resolves the placed
+/// block via the player's currently-held hotbar slot through the
+/// item→block table. Drops the placement silently (still acking) if
+/// the held stack is empty, if the held item has no block mapping
+/// (e.g. food, tool), or if the target cell is non-air. On a
+/// successful placement decrements the held stack's count and emits
+/// `ContainerSetSlot` so the client sees the new count.
 async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -660,7 +804,32 @@ where
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
 
     let air = air_state_id(&state.blocks);
-    let stone = stone_state_id(&state.blocks);
+
+    // M6.f: resolve the placed block from the held item.
+    let held_slot = state.selected_hotbar_slot;
+    let held = state.inventory.held(held_slot).clone();
+    let placed_state = if held.is_empty() {
+        None
+    } else {
+        state.item_to_block.resolve(held.item_id)
+    };
+    let Some(placed_state) = placed_state else {
+        debug!(
+            sequence = action.sequence,
+            held_item = held.item_id,
+            held_count = held.count,
+            "UseItemOn: held item is empty or not placeable; skipping"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+        return Ok(());
+    };
 
     // Validate: target cell must currently be air. We can borrow
     // the world briefly to peek; if the cell is non-air or absent,
@@ -698,7 +867,31 @@ where
         return Ok(());
     }
 
-    apply_block_edit(state, writer, action.sequence, tx, ty, tz, stone).await
+    apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
+
+    // M6.f: decrement the held stack's count + tell the client the
+    // new slot contents. Empty stacks ship as `count == 0`.
+    {
+        let held = state.inventory.held_mut(held_slot);
+        held.count = held.count.saturating_sub(1);
+        if held.count <= 0 {
+            *held = ItemStack::EMPTY;
+        }
+    }
+    state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+    let new_slot_value = state.inventory.held(held_slot).clone();
+    write_packet(
+        writer,
+        &ClientboundContainerSetSlot {
+            container_id: 0,
+            state_id: state.inventory_state_id,
+            slot: (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i32,
+            item_stack: new_slot_value,
+        },
+        Compression::Disabled,
+    )
+    .await?;
+    Ok(())
 }
 
 async fn keepalive_loop<R, W>(
@@ -783,6 +976,14 @@ where
                             sequence = use_on.sequence,
                             "UseItemOn ignored — no world configured"
                         );
+                    }
+                } else if frame.id == ServerboundSetCarriedItem::ID {
+                    let mut body = frame.body;
+                    let pick = ServerboundSetCarriedItem::decode(&mut body)?;
+                    let slot = pick.slot.clamp(0, 8) as u8;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        state.selected_hotbar_slot = slot;
+                        debug!(slot, "hotbar selection updated");
                     }
                 } else {
                     debug!(
