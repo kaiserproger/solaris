@@ -236,6 +236,65 @@ impl Chunk {
         let (idx, sy) = world_y_to_section(y)?;
         Some(self.sections[idx].set(x, sy, z, state))
     }
+
+    /// Set a block *and* refresh every heightmap currently attached
+    /// to this chunk so the new top-non-air-column matches reality.
+    /// Returns the previous state (or `None` if `y` is outside the
+    /// chunk). `air` is the registry's default air state — the
+    /// heightmap predicate is `state != air`, matching vanilla's
+    /// `MOTION_BLOCKING` / `WORLD_SURFACE` / `OCEAN_FLOOR`
+    /// definitions closely enough for M5's flat-preset world.
+    ///
+    /// Recomputes *every* heightmap currently present on the chunk,
+    /// not a hardcoded set — different vanilla generators produce
+    /// different subsets (e.g. mid-generation `*_WG` variants), so
+    /// touching only known names would silently leave stale values
+    /// on partial chunks.
+    pub fn set_block_and_update(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+        air: BlockStateId,
+    ) -> Option<BlockStateId> {
+        let prev = self.set_block(x, y, z, state)?;
+        if prev == state {
+            return Some(prev);
+        }
+        // Heightmap entries store `height + 1`-style values (the Y of
+        // the first air cell above the column), matching vanilla's
+        // on-disk packing. Recompute the column for every present
+        // heightmap. Cheap: one walk down per heightmap per edit.
+        let names: Vec<String> = self.heightmaps.keys().cloned().collect();
+        for name in names {
+            let new_top = top_non_air_column(self, x, z, air);
+            if let Some(hm) = self.heightmaps.get_mut(&name) {
+                hm.set(x, z, new_top);
+            }
+        }
+        Some(prev)
+    }
+}
+
+/// Walk column `(x, z)` from `MAX_Y - 1` down to `MIN_Y` and return
+/// the heightmap value vanilla stores: `top_y + 1 - MIN_Y` (the Y
+/// of the first air cell above the topmost non-air block, expressed
+/// as an offset from the bottom of the world). For an entirely-air
+/// column the value is `0`, matching vanilla's "empty column"
+/// convention.
+fn top_non_air_column(chunk: &Chunk, x: u8, z: u8, air: BlockStateId) -> u32 {
+    for y in (MIN_Y..MAX_Y).rev() {
+        if chunk.get_block(x, y, z) != Some(air) {
+            // vanilla packs heightmap values as `height - MIN_Y + 1`
+            // so a top block at world Y=64 stores as `64 - (-64) + 1`
+            // = 129. The +1 makes "the lowest cell above the top
+            // block" the value, matching the meaning vanilla uses
+            // for chunk-spawning and skylight shortcuts.
+            return (y - MIN_Y + 1) as u32;
+        }
+    }
+    0
 }
 
 fn world_y_to_section(y: i32) -> Option<(usize, u8)> {
@@ -322,5 +381,59 @@ mod tests {
     fn min_section_y_constant_is_correct() {
         assert_eq!(MIN_SECTION_Y, -4);
         assert_eq!(MIN_SECTION_Y + SECTION_COUNT as i32, 20);
+    }
+
+    #[test]
+    fn set_block_and_update_recomputes_present_heightmaps() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        // Pre-existing heightmap (e.g. surface-Y from generation):
+        // empty column → value 0. Insert it explicitly so the helper
+        // has something to recompute.
+        c.heightmaps
+            .insert("MOTION_BLOCKING".into(), Heightmap::zeroed());
+        c.heightmaps
+            .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
+
+        // Drop a stone at world Y=64. The heightmap value is
+        // (Y - MIN_Y + 1) = 64 - (-64) + 1 = 129.
+        let prev = c.set_block_and_update(3, 64, 7, stone(), air()).unwrap();
+        assert_eq!(prev, air());
+        assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 129);
+        assert_eq!(c.heightmaps.get("WORLD_SURFACE").unwrap().get(3, 7), 129);
+
+        // Other columns stay at 0.
+        assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(0, 0), 0);
+
+        // Break it back to air — heightmap returns to 0.
+        c.set_block_and_update(3, 64, 7, air(), air()).unwrap();
+        assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 0);
+    }
+
+    #[test]
+    fn set_block_and_update_picks_next_lower_top_after_break() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        c.heightmaps
+            .insert("MOTION_BLOCKING".into(), Heightmap::zeroed());
+        // Stack two blocks at Y=63 and Y=64; heightmap should track
+        // the higher one and fall back to the lower on break.
+        c.set_block_and_update(3, 63, 7, stone(), air()).unwrap();
+        c.set_block_and_update(3, 64, 7, stone(), air()).unwrap();
+        assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 129);
+
+        c.set_block_and_update(3, 64, 7, air(), air()).unwrap();
+        assert_eq!(c.heightmaps.get("MOTION_BLOCKING").unwrap().get(3, 7), 128);
+    }
+
+    #[test]
+    fn set_block_and_update_with_no_heightmaps_is_a_noop_for_them() {
+        // Some chunks (Status: empty / structure_starts in our test
+        // world) ship no heightmaps. The helper must not panic and
+        // must still mutate the underlying block.
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        assert!(c.heightmaps.is_empty());
+        let prev = c.set_block_and_update(0, 0, 0, stone(), air()).unwrap();
+        assert_eq!(prev, air());
+        assert_eq!(c.get_block(0, 0, 0), Some(stone()));
+        assert!(c.heightmaps.is_empty());
     }
 }
