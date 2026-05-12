@@ -6,7 +6,10 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M0 — project bootstrap. Nothing playable yet.
+**Status:** M1 — network + handshake. A vanilla 26.1.2 client should be
+able to list the server in its server browser, log in (offline mode),
+walk through Configuration, and reach Play state with a black world.
+Chunk data and gameplay are M2+.
 
 ## Build
 
@@ -14,13 +17,32 @@ plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 cargo build --release
 ```
 
+## Prerequisite: vanilla data sidecar
+
+Solaris reads its registry data from a local sidecar populated from the
+official Mojang server jar. Drop a `server.jar` (any 26.1.x release)
+into `.analysis/` and run:
+
+```sh
+tools/extract-vanilla-data.sh
+```
+
+This populates `data/vanilla/` (gitignored — Mojang bytes never enter
+this repo). See [ADR 0001](docs/decisions/0001-vanilla-data-as-runtime-input.md)
+and [`data/vanilla/README.md`](data/vanilla/README.md) for the why.
+
+The server fails fast with a clear error pointing at this script if
+the sidecar is missing.
+
 ## Run
 
 ```sh
+# Just validate the config:
+cargo run --bin mc-server -- --check --config example.toml
+
+# Actually serve:
 cargo run --bin mc-server -- --config example.toml
 ```
-
-In M0 this only parses the config and prints it. Networking comes in M1.
 
 ## Test
 
