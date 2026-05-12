@@ -16,9 +16,12 @@
 //! No chunk data is sent — the client renders a black world. That is the
 //! M1.g bar; chunk streaming is M2-M3 territory.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
+use mc_data::block_light::BlockLightTable;
 use mc_data::{Registry, VanillaData};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::Compression;
@@ -27,8 +30,9 @@ use mc_protocol::packets::play::{
     ChunkHeightmap, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight,
     LightData, LoginPlay, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
-use mc_world::ChunkPos;
-use mc_world::wire::{client_heightmaps, encode_chunk_data};
+use mc_world::light::compute_chunk_light;
+use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
+use mc_world::{Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
@@ -183,7 +187,16 @@ where
     .await?;
 
     if let Some(world) = config.world.as_ref() {
-        emit_chunks_around(writer, world, data, spawn_cx, spawn_cz, SPAWN_VIEW_DISTANCE).await?;
+        emit_chunks_around(
+            writer,
+            world,
+            data,
+            config.block_light.as_deref(),
+            spawn_cx,
+            spawn_cz,
+            SPAWN_VIEW_DISTANCE,
+        )
+        .await?;
     }
 
     // 6. Keepalive loop. Runs until the connection drops or the client
@@ -214,6 +227,7 @@ async fn emit_chunks_around<W>(
     writer: &mut W,
     world: &WorldHandle,
     data: &VanillaData,
+    block_light: Option<&BlockLightTable>,
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
@@ -227,19 +241,58 @@ where
     };
 
     let started = Instant::now();
+
+    // Pre-fetch every chunk in the (view_distance + 1) ring so each
+    // emit_one_chunk can build its 3×3 neighbourhood from local
+    // memory without re-locking the storage. The +1 captures the
+    // outer neighbour ring needed to feed the lighting engine for
+    // the cells at the edge of the view-distance window.
+    let mut staged: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+    let pre_fetch_radius = view_distance + 1;
+    {
+        let mut storage = world.lock().await;
+        for cz in (center_cz - pre_fetch_radius)..=(center_cz + pre_fetch_radius) {
+            for cx in (center_cx - pre_fetch_radius)..=(center_cx + pre_fetch_radius) {
+                match storage.get_chunk(ChunkPos { x: cx, z: cz }) {
+                    Ok(Some(c)) => {
+                        staged.insert((cx, cz), Arc::new(c.clone()));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(cx, cz, error = %err, "chunk read failed; skipping");
+                    }
+                }
+            }
+        }
+    }
+    let staged_count = staged.len();
+    let fetch_ms = started.elapsed().as_millis() as u64;
+
     let mut emitted = 0usize;
     let mut absent = 0usize;
     let mut bytes = 0usize;
 
     for cz in (center_cz - view_distance)..=(center_cz + view_distance) {
         for cx in (center_cx - view_distance)..=(center_cx + view_distance) {
-            match emit_one_chunk(writer, world, biomes, cx, cz).await? {
-                Some(n) => {
-                    emitted += 1;
-                    bytes += n;
-                }
-                None => absent += 1,
-            }
+            let Some(centre) = staged.get(&(cx, cz)) else {
+                absent += 1;
+                debug!(cx, cz, "no chunk in storage");
+                continue;
+            };
+            let neighbours = build_neighbourhood(&staged, cx, cz);
+            let centre_ref = centre.as_ref();
+            let packet =
+                match build_chunk_packet(centre_ref, &neighbours, biomes, block_light, cx, cz) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+                        continue;
+                    }
+                };
+            let n = packet.data.len();
+            write_packet(writer, &packet, Compression::Disabled).await?;
+            emitted += 1;
+            bytes += n;
         }
     }
 
@@ -247,79 +300,81 @@ where
         center_cx,
         center_cz,
         view_distance,
+        staged = staged_count,
         emitted,
         absent,
         bytes,
+        fetch_ms,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "view-distance window flushed",
     );
     Ok(())
 }
 
-/// Try to emit one chunk. Returns `Some(payload_bytes)` on success,
-/// `None` when the chunk is genuinely absent (no region file or no
-/// payload at that slot) or when any soft failure caused us to skip
-/// it. Hard write errors propagate as `Err` so the connection task
-/// can shut down cleanly.
-async fn emit_one_chunk<W>(
-    writer: &mut W,
-    world: &WorldHandle,
-    biomes: &Registry,
+/// Build the 3×3 neighbourhood centred on `(cx, cz)`. The centre is
+/// not populated here — the caller already has it as `centre_ref` and
+/// passes it through `build_chunk_packet` separately.
+fn build_neighbourhood(
+    staged: &HashMap<(i32, i32), Arc<Chunk>>,
     cx: i32,
     cz: i32,
-) -> Result<Option<usize>, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let chunk = {
-        let mut storage = world.lock().await;
-        match storage.get_chunk(ChunkPos { x: cx, z: cz }) {
-            Ok(Some(c)) => c.clone(),
-            Ok(None) => {
-                debug!(cx, cz, "no chunk in storage");
-                return Ok(None);
-            }
-            Err(err) => {
-                warn!(cx, cz, error = %err, "chunk read failed; skipping");
-                return Ok(None);
-            }
-        }
-    };
-
-    let packet = match build_chunk_packet(&chunk, biomes, cx, cz) {
-        Ok(p) => p,
-        Err(err) => {
-            warn!(cx, cz, error = %err, "chunk encode failed; skipping");
-            return Ok(None);
-        }
-    };
-
-    let bytes = packet.data.len();
-    write_packet(writer, &packet, Compression::Disabled).await?;
-    Ok(Some(bytes))
+) -> [[Option<Arc<Chunk>>; 3]; 3] {
+    std::array::from_fn(|dz| {
+        std::array::from_fn(|dx| {
+            let nx = cx + (dx as i32 - 1);
+            let nz = cz + (dz as i32 - 1);
+            staged.get(&(nx, nz)).cloned()
+        })
+    })
 }
 
 fn build_chunk_packet(
-    chunk: &mc_world::Chunk,
+    centre: &Chunk,
+    neighbourhood: &[[Option<Arc<Chunk>>; 3]; 3],
     biomes: &Registry,
+    block_light: Option<&BlockLightTable>,
     cx: i32,
     cz: i32,
 ) -> Result<LevelChunkWithLight, mc_world::wire::WireError> {
-    let data = encode_chunk_data(chunk, biomes)?;
-    let heightmaps = client_heightmaps(chunk)
+    let data = encode_chunk_data(centre, biomes)?;
+    let heightmaps = client_heightmaps(centre)
         .into_iter()
         .map(|h| ChunkHeightmap {
             type_id: h.type_id,
             data: h.data,
         })
         .collect();
+    let light = match block_light {
+        None => LightData::empty(),
+        Some(table) => {
+            // Centre slot is the chunk we already have a reference to;
+            // off-centre slots come from the staged map.
+            let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+            for (dz, row) in neighbourhood.iter().enumerate() {
+                for (dx, slot) in row.iter().enumerate() {
+                    refs[dz][dx] = slot.as_deref();
+                }
+            }
+            refs[1][1] = Some(centre);
+            let computed = compute_chunk_light(refs, table);
+            let wire = encode_chunk_light(&computed);
+            LightData {
+                sky_y_mask: wire.sky_y_mask,
+                block_y_mask: wire.block_y_mask,
+                empty_sky_y_mask: wire.empty_sky_y_mask,
+                empty_block_y_mask: wire.empty_block_y_mask,
+                sky_updates: wire.sky_updates,
+                block_updates: wire.block_updates,
+            }
+        }
+    };
     Ok(LevelChunkWithLight {
         chunk_x: cx,
         chunk_z: cz,
         heightmaps,
         data,
         block_entities: Vec::new(),
-        light: LightData::empty(),
+        light,
     })
 }
 
