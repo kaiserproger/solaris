@@ -58,7 +58,19 @@ use thiserror::Error;
 
 use crate::chunk::{BIOME_VOLUME, BiomeSection, Chunk, LIGHT_LAYER_BYTES, SECTION_COUNT};
 use crate::light::ChunkLight;
-use crate::section::{ChunkSection, SECTION_DIM, SECTION_VOLUME};
+use crate::section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
+
+/// Bits per entry vanilla 26.1.2 expects in `GlobalPalette` (direct)
+/// mode for the block-state container. Sized to comfortably hold the
+/// 29 873 states the bundled jar enumerates
+/// (`ceil(log2(29 873)) = 15`); when the registry grows in a future
+/// patch the encoder uses the wider of this constant and the actual
+/// ceiling computed from the registry size.
+const DIRECT_BITS: u8 = 15;
+/// Above this bit-width the wire switches from the LinearPalette /
+/// HashMapPalette indirect formats to GlobalPalette (direct). Matches
+/// vanilla's threshold (`Strategy.getConfigurationForBitCount`).
+const DIRECT_BITS_THRESHOLD: u8 = 9;
 
 /// Heightmap type ids — the ordinals of `Heightmap$Types` in the
 /// vanilla source, verified via `javap -p -c` (ADR 0002). Only the
@@ -154,19 +166,47 @@ fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
             // No bit-storage longs.
         }
         (Some(palette), Some(indices)) => {
-            buf.push(indices.bits_per_entry());
-            write_varint(
-                buf,
-                i32::try_from(palette.len()).expect("palette len < i32::MAX"),
-            );
-            for state in palette {
-                write_varint(buf, i32::try_from(state.0).expect("state id < i32::MAX"));
-            }
-            for &word in indices.words() {
-                buf.extend_from_slice(&(word as i64).to_be_bytes());
+            if indices.bits_per_entry() >= DIRECT_BITS_THRESHOLD {
+                encode_block_direct(buf, palette, indices);
+            } else {
+                buf.push(indices.bits_per_entry());
+                write_varint(
+                    buf,
+                    i32::try_from(palette.len()).expect("palette len < i32::MAX"),
+                );
+                for state in palette {
+                    write_varint(buf, i32::try_from(state.0).expect("state id < i32::MAX"));
+                }
+                for &word in indices.words() {
+                    buf.extend_from_slice(&(word as i64).to_be_bytes());
+                }
             }
         }
         (Some(_), None) => unreachable!("indirect sections always have indices"),
+    }
+}
+
+/// Emit a section's block container in vanilla's `GlobalPalette`
+/// (direct) shape: a single `bits_per_entry` byte, *no* palette
+/// section, then a packed long array containing every cell's raw
+/// global state-id at [`DIRECT_BITS`] per entry. Triggered when our
+/// internal palette has grown past the indirect threshold
+/// (~256 entries → ≥ 9 bits per palette index).
+fn encode_block_direct(
+    buf: &mut Vec<u8>,
+    palette: &[crate::block::BlockStateId],
+    indices: &PackedBitArray,
+) {
+    let bits = DIRECT_BITS.max(indices.bits_per_entry());
+    let mut direct = PackedBitArray::zeroed(bits, SECTION_VOLUME);
+    for cell in 0..SECTION_VOLUME {
+        let p = indices.get(cell) as usize;
+        direct.set(cell, palette[p].0);
+    }
+    buf.push(bits);
+    // GlobalPalette: no palette VarInts.
+    for &word in direct.words() {
+        buf.extend_from_slice(&(word as i64).to_be_bytes());
     }
 }
 
@@ -661,5 +701,56 @@ mod tests {
         assert_eq!(layer[68], 0x0F);
         let nonzero_bytes: usize = layer.iter().filter(|&&b| b != 0).count();
         assert_eq!(nonzero_bytes, 1, "only one cell lit");
+    }
+
+    #[test]
+    fn block_palette_switches_to_direct_mode_past_256_entries() {
+        // M5.c.3: build a section with 260 distinct synthetic states
+        // and ensure the wire encoder emits the GlobalPalette
+        // (direct) shape — bits_per_entry first byte = DIRECT_BITS,
+        // VarInt palette length absent, raw packed long array follows.
+        use crate::section::ChunkSection;
+        let mut section = ChunkSection::filled(AIR, AIR);
+        for i in 1..=260u32 {
+            let cell = i - 1;
+            let x = (cell & 0x0F) as u8;
+            let y = ((cell >> 4) & 0x0F) as u8;
+            let z = ((cell >> 8) & 0x0F) as u8;
+            section.set(x, y, z, BlockStateId(i));
+        }
+
+        let mut buf = Vec::new();
+        super::encode_block_palette(&mut buf, &section);
+
+        assert_eq!(buf[0], super::DIRECT_BITS, "first byte = direct bits");
+        // No VarInt palette length: the next bytes are the packed
+        // long array. Compute the expected long count.
+        let bits = super::DIRECT_BITS as usize;
+        let epw = 64 / bits;
+        let expected_longs = SECTION_VOLUME.div_ceil(epw);
+        assert_eq!(
+            buf.len() - 1,
+            expected_longs * 8,
+            "direct-mode body = {expected_longs} longs (no palette section)"
+        );
+    }
+
+    #[test]
+    fn block_palette_stays_indirect_for_small_palettes() {
+        // Sanity check that the M3.b indirect path didn't regress —
+        // a 3-state section still uses the LinearPalette / 4-bit form.
+        use crate::section::ChunkSection;
+        let mut section = ChunkSection::filled(AIR, AIR);
+        section.set(0, 0, 0, BlockStateId(1));
+        section.set(1, 0, 0, BlockStateId(2));
+
+        let mut buf = Vec::new();
+        super::encode_block_palette(&mut buf, &section);
+
+        assert!(
+            buf[0] < super::DIRECT_BITS_THRESHOLD,
+            "small palette uses indirect bpe; got {}",
+            buf[0],
+        );
     }
 }

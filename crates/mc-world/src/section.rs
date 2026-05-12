@@ -6,16 +6,20 @@
 //! - **Single** — the whole section is one state. No index array, no
 //!   palette overhead. Common for the void above the build height and
 //!   for the stone-only mid-overworld layers.
-//! - **Indirect** — a small `Vec<BlockStateId>` palette and a packed
-//!   bit-array of indices, `bits_per_entry` in 4..=8 (vanilla
-//!   minimum; below 4 the wire format still uses 4 bits).
+//! - **Indirect** — a `Vec<BlockStateId>` palette and a packed
+//!   bit-array of indices. `bits_per_entry` grows naturally with
+//!   palette size, minimum 4 (vanilla's pad-to-4 convention for
+//!   the on-wire LinearPalette format). M5.c.3 removed the
+//!   256-entry cap; sections with more than 256 distinct states
+//!   stay indirect on disk but the wire encoder converts to the
+//!   direct format described below at emit time.
 //!
-//! A third mode — **Direct**, where the array holds raw global state
-//! ids at `ceil(log2(num_global_states))` bits — is what Anvil emits
-//! when the palette exceeds the indirect cap (typically > 256
-//! distinct states in one section, rare outside lab worlds). M2.c
-//! deliberately does not implement Direct; it'll be added in M2.e
-//! when the Anvil round-trip needs it.
+//! On the wire (`mc_world::wire::encode_chunk_data`), sections with
+//! `bits_per_entry >= 9` switch to the **GlobalPalette / Direct**
+//! shape: no palette section is emitted, and the per-cell indices
+//! are widened to raw global-state ids at
+//! `ceil(log2(num_global_states))` bits. The disk codec keeps the
+//! palette+indices shape vanilla writes regardless of palette size.
 //!
 //! Packing follows vanilla's "entries do not cross i64 boundaries"
 //! convention: `entries_per_word = 64 / bits_per_entry` and the high
@@ -28,7 +32,6 @@ pub const SECTION_DIM: usize = 16;
 pub const SECTION_VOLUME: usize = SECTION_DIM * SECTION_DIM * SECTION_DIM;
 
 const MIN_INDIRECT_BITS: u8 = 4;
-const MAX_INDIRECT_BITS: u8 = 8;
 
 /// A 16×16×16 cube of block states.
 ///
@@ -201,7 +204,7 @@ fn bits_for_palette(palette_len: usize) -> u8 {
         return MIN_INDIRECT_BITS;
     }
     let bits = (palette_len - 1).ilog2() as u8 + 1;
-    bits.clamp(MIN_INDIRECT_BITS, MAX_INDIRECT_BITS)
+    bits.max(MIN_INDIRECT_BITS)
 }
 
 // ---------------------------------------------------------------------
@@ -447,6 +450,42 @@ mod tests {
         assert_eq!(s.get(0, 15, 0), BlockStateId(40));
         assert_eq!(s.get(0, 0, 15), BlockStateId(50));
         assert_eq!(s.non_air_count(), 5);
+    }
+
+    #[test]
+    fn palette_grows_past_256_entries_without_panicking() {
+        // M5.c.3: removed the MAX_INDIRECT_BITS = 8 cap. Inserting
+        // 260 distinct synthetic state ids into one section must
+        // produce a palette of length ≥ 260 and a packed bit-width
+        // wide enough to address it (≥ 9 bits).
+        let mut s = ChunkSection::filled(AIR, AIR);
+        for i in 1..=260u32 {
+            // Walk (x, y) so every set hits a distinct cell.
+            let cell = i - 1;
+            let x = (cell & 0x0F) as u8;
+            let y = ((cell >> 4) & 0x0F) as u8;
+            let z = ((cell >> 8) & 0x0F) as u8;
+            s.set(x, y, z, BlockStateId(i));
+        }
+        let palette = s.palette().unwrap();
+        assert!(
+            palette.len() >= 260,
+            "expected ≥ 260 palette entries, got {}",
+            palette.len(),
+        );
+        let bits = s.indices().unwrap().bits_per_entry();
+        assert!(
+            bits >= 9,
+            "expected ≥ 9 bits per entry past the 256-state threshold, got {bits}",
+        );
+        // Spot-check that all 260 distinct cells round-trip.
+        for i in 1..=260u32 {
+            let cell = i - 1;
+            let x = (cell & 0x0F) as u8;
+            let y = ((cell >> 4) & 0x0F) as u8;
+            let z = ((cell >> 8) & 0x0F) as u8;
+            assert_eq!(s.get(x, y, z), BlockStateId(i));
+        }
     }
 
     /// Random sequence of sets — `non_air_count` must match a linear
