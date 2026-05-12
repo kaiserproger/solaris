@@ -1,0 +1,172 @@
+//! In-process client driver for raw-TCP integration tests.
+//!
+//! Walks Handshake → Login → Configuration exactly as a vanilla client
+//! does, then hands the caller a typed, frame-by-frame view of the Play
+//! state. Used by `tests/chunk_stream.rs` to assert M3.e's view-
+//! distance chunk burst against a live `mc_net::run` server.
+//!
+//! Layered intentionally above the binary `wire-probe`'s loose,
+//! print-and-go style: every step is a fallible async fn and the
+//! caller decides what to assert.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use anyhow::{Context, Result, bail};
+use bytes::BytesMut;
+use mc_protocol::codec::ReadMc;
+use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
+use mc_protocol::packets::Packet;
+use mc_protocol::packets::configuration::{
+    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
+    ServerboundKnownPacks,
+};
+use mc_protocol::packets::handshake::{Handshake, NextState};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::{PROTOCOL_VERSION, RawFrame};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use uuid::Uuid;
+
+/// Login-state `SetCompression` packet id. Hard-coded here (rather than
+/// re-exported from `mc-protocol`) because the server never sends it
+/// today; the heuristic only exists so this client survives a future
+/// `mc-net::login` flip without a test rewrite.
+const LOGIN_SET_COMPRESSION_ID: i32 = 0x03;
+
+/// Minimal raw-TCP client. Speaks the wire protocol our server speaks
+/// (no encryption, optional compression). The `compression` field flips
+/// when we observe a Login-state `SetCompression` packet.
+pub struct Client {
+    stream: TcpStream,
+    rbuf: BytesMut,
+    compression: Compression,
+}
+
+impl Client {
+    pub async fn connect(addr: SocketAddr) -> Result<Self> {
+        let stream = TcpStream::connect(addr)
+            .await
+            .with_context(|| format!("connect to {addr}"))?;
+        stream.set_nodelay(true)?;
+        Ok(Self {
+            stream,
+            rbuf: BytesMut::with_capacity(8192),
+            compression: Compression::Disabled,
+        })
+    }
+
+    pub fn compression(&self) -> Compression {
+        self.compression
+    }
+
+    pub async fn write_packet<P: Packet>(&mut self, packet: &P) -> Result<()> {
+        let mut body = BytesMut::new();
+        packet.encode(&mut body)?;
+        let framed = encode_frame(P::ID, &body, self.compression)?;
+        self.stream.write_all(&framed).await?;
+        Ok(())
+    }
+
+    /// Read until exactly one frame can be parsed off the buffer.
+    pub async fn read_frame(&mut self) -> Result<RawFrame> {
+        loop {
+            if let Some(frame) = try_decode_frame(&mut self.rbuf, self.compression)? {
+                return Ok(frame);
+            }
+            let n = self.stream.read_buf(&mut self.rbuf).await?;
+            if n == 0 {
+                bail!("peer closed");
+            }
+        }
+    }
+
+    pub async fn read_frame_with_timeout(&mut self, dur: Duration) -> Result<RawFrame> {
+        match tokio::time::timeout(dur, self.read_frame()).await {
+            Ok(r) => r,
+            Err(_) => bail!("timed out after {:?} waiting for a frame", dur),
+        }
+    }
+
+    /// Read the next frame and decode it as `P`. Errors if the frame
+    /// id does not match `P::ID` or if there are trailing bytes after
+    /// the decode.
+    pub async fn read_typed<P: Packet>(&mut self) -> Result<P> {
+        let mut frame = self.read_frame().await?;
+        if frame.id != P::ID {
+            bail!(
+                "unexpected packet id: want 0x{:02X}, got 0x{:02X}",
+                P::ID,
+                frame.id
+            );
+        }
+        let packet = P::decode(&mut frame.body)?;
+        Ok(packet)
+    }
+
+    /// Send Handshake (NextState::Login) and LoginStart, walk login
+    /// frames (auto-enabling compression on `SetCompression`), then
+    /// send `LoginAcknowledged` and return the decoded `LoginSuccess`.
+    pub async fn drive_login(&mut self, addr: SocketAddr, name: &str) -> Result<LoginSuccess> {
+        self.write_packet(&Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            server_address: "127.0.0.1".into(),
+            server_port: addr.port(),
+            next_state: NextState::Login,
+        })
+        .await?;
+        self.write_packet(&LoginStart {
+            name: name.into(),
+            player_uuid: Uuid::nil(),
+        })
+        .await?;
+
+        loop {
+            let frame = self.read_frame().await?;
+            // Heuristic: small body on the SetCompression id ⇒ flip
+            // codec and keep reading. Same shape as `wire-probe`.
+            if frame.id == LOGIN_SET_COMPRESSION_ID && frame.body.len() <= 5 {
+                let mut body = frame.body.clone();
+                if let Ok(threshold) = body.read_varint() {
+                    self.compression = if threshold < 0 {
+                        Compression::Disabled
+                    } else {
+                        Compression::Threshold(threshold as usize)
+                    };
+                    continue;
+                }
+            }
+            if frame.id == LoginSuccess::ID {
+                let mut body = frame.body.clone();
+                let success = LoginSuccess::decode(&mut body)?;
+                self.write_packet(&LoginAcknowledged).await?;
+                return Ok(success);
+            }
+            bail!("unexpected login frame id=0x{:02X}", frame.id);
+        }
+    }
+
+    /// Walk Configuration: echo `ClientboundKnownPacks` back, drain
+    /// `RegistryData` until `FinishConfiguration`, then send the ack.
+    pub async fn drive_configuration(&mut self) -> Result<()> {
+        let known = self.read_typed::<ClientboundKnownPacks>().await?;
+        self.write_packet(&ServerboundKnownPacks { packs: known.packs })
+            .await?;
+        loop {
+            let frame = self.read_frame().await?;
+            if frame.id == RegistryData::ID {
+                let _ = RegistryData::decode(&mut frame.body.clone())?;
+                continue;
+            }
+            if frame.id == FinishConfiguration::ID {
+                self.write_packet(&AcknowledgeFinishConfiguration).await?;
+                return Ok(());
+            }
+            bail!(
+                "unexpected configuration frame id=0x{:02X} body_len={}",
+                frame.id,
+                frame.body.len()
+            );
+        }
+    }
+}
