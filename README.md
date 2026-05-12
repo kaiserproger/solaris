@@ -6,20 +6,19 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M6 complete on `dev/M6-persistence-inventory`, awaiting
-`m6` tag. A vanilla 26.1.2 client connecting to Solaris walks the
+**Status:** M7 complete on `dev/M7-worldgen-baseline`, awaiting
+`m7` tag. A vanilla 26.1.2 client connecting to Solaris walks the
 full Handshake → Login → Configuration → Play sequence, receives
 the streamed spawn-area chunks lit by `mc_world::light`'s BFS
-engine (M4), can **break and place blocks** (M5) — and now those
-edits **persist**. After M6 the server seeds the player's hotbar
-on login with a 4-slot starter kit (stone, dirt, oak planks,
-torch); scrolling the hotbar bumps `ServerboundSetCarriedItem`;
-right-click places the *selected* item (not always stone). Per-
-edit count decrements ship as `ContainerSetSlot`. On Ctrl-C the
-server flushes every dirty chunk back to `r.X.Z.mca` via an
-atomic sibling-tempfile rename — reconnecting after a restart
-shows the edits intact. The extras channel from M5.c keeps the
-round-trip lossless across the chunk fields M2 didn't model.
+engine (M4), can **break and place blocks** (M5), sees those
+edits **persist** across restarts (M6) — and now the world is
+**infinite**: M7 ships a baseline hill-noise terrain generator
+(Solaris's own — no vanilla algorithm) so missing-on-disk chunks
+materialise on demand. Generated chunks are dirty so the M6
+flush path persists them once and the generator never runs
+twice. Single plains biome, no caves / ores / structures — the
+baseline is intentionally minimal so the player can walk in any
+direction and find solid ground.
 
 ## Build
 
