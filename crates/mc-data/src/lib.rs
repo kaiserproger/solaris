@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, trace};
 
+pub mod blocks;
 pub mod identifier;
 
 pub use identifier::{Identifier, IdentifierError};

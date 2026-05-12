@@ -461,6 +461,8 @@ dependencies = [
 name = "mc-data"
 version = "0.0.1"
 dependencies = [
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tracing",
@@ -559,6 +561,10 @@ dependencies = [
 [[package]]
 name = "mc-world"
 version = "0.0.1"
+dependencies = [
+ "mc-data",
+ "thiserror",
+]
 
 [[package]]
 name = "mc-worldgen"
