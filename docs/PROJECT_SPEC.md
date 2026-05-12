@@ -355,7 +355,13 @@ Run daily in CI; regressions > 10% — alert.
 - We use wiki.vg protocol documentation and Minecraft Wiki for mechanics — public reverse engineering
 - We do not use decompiled Mojang source in our code
 - We do not use Mojmap mappings to inform our code — we write our own, working from documentation
-- All assets (textures, models, sounds) are original or community-made under permissive licenses
+- Bundled binary assets (textures, models, sounds, fonts) are original or community-made under permissive licenses
+- **Vanilla *data* files** (the contents of `data/minecraft/**` inside
+  the official server jar — registry JSON, tags, loot tables, recipes,
+  worldgen JSON, structure NBT) **are permitted as build/runtime input**.
+  See [ADR 0001](decisions/0001-vanilla-data-as-runtime-input.md) for
+  the reasoning. They live under `data/vanilla/` and are reproduced by
+  `tools/extract-vanilla-data.sh` from `.analysis/server.jar`.
 - Players require a legitimate Minecraft license (connect via Mojang auth, like any server)
 
 ---

@@ -9,6 +9,14 @@
 *.swp
 *.swo
 
-# Vanilla server jar and other oracles kept locally for analysis,
-# not committed to the repo.
-/.analysis/
+# Local oracle/scratch dir. Everything inside is local-only by default;
+# only Markdown files (engineering notes, observations) are tracked.
+/.analysis/*
+!/.analysis/*.md
+
+# Vanilla Mojang data files (per ADR 0001) are not redistributed via git.
+# They are repopulated locally from .analysis/server.jar by
+# tools/extract-vanilla-data.sh. The README and any future schema docs
+# stay tracked.
+/data/vanilla/data/
+/data/vanilla/version.json

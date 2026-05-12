@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# Extract the vanilla 26.1.x data files Solaris depends on (per ADR 0001)
+# out of the bundled Mojang server jar.
+#
+# Usage:
+#   tools/extract-vanilla-data.sh [path/to/server.jar]
+#
+# Default source: .analysis/server.jar (the bundle JAR — this script
+# walks past the bundler layer to the embedded version-specific jar).
+#
+# Output: populates data/vanilla/ with a tracked subset:
+#   - All top-level registry directories that the Configuration state's
+#     Registry Data packet covers (dimension_type, damage_type, …).
+#   - worldgen/biome (for the biome registry).
+#   - tags/ (for the UpdateTags packet, M2+).
+#   - version.json (for sanity-pinning).
+#
+# Re-runnable; safe to delete data/vanilla/ first if you want a clean slate.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+BUNDLE_JAR="${1:-$REPO_ROOT/.analysis/server.jar}"
+OUT_DIR="$REPO_ROOT/data/vanilla"
+
+if [[ ! -f "$BUNDLE_JAR" ]]; then
+  echo "error: bundle jar not found at $BUNDLE_JAR" >&2
+  exit 1
+fi
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+echo "[1/4] Unpacking bundle JAR…"
+mkdir -p "$TMP/bundle"
+unzip -q -o "$BUNDLE_JAR" -d "$TMP/bundle"
+
+INNER_JAR="$(find "$TMP/bundle/META-INF/versions" -name 'server-*.jar' | head -n1)"
+if [[ -z "$INNER_JAR" ]]; then
+  echo "error: could not locate inner server-<version>.jar inside the bundle" >&2
+  exit 1
+fi
+echo "    inner jar: $(basename "$INNER_JAR")"
+
+echo "[2/4] Reading version metadata…"
+unzip -p "$BUNDLE_JAR" version.json > "$TMP/version.json"
+VERSION_ID="$(grep -m1 '"id"' "$TMP/version.json" | sed 's/.*"id": *"\([^"]*\)".*/\1/')"
+PROTOCOL="$(grep -m1 '"protocol_version"' "$TMP/version.json" | sed 's/.*: *\([0-9]*\).*/\1/')"
+echo "    version=$VERSION_ID protocol=$PROTOCOL"
+
+echo "[3/4] Extracting data subset to $OUT_DIR …"
+rm -rf "$OUT_DIR"
+mkdir -p "$OUT_DIR"
+cp "$TMP/version.json" "$OUT_DIR/version.json"
+
+# Top-level registry folders we want. Keep this list in sync with the
+# registries the Configuration state expects in 26.1.
+REGISTRIES=(
+  banner_pattern
+  cat_sound_variant
+  cat_variant
+  chat_type
+  chicken_sound_variant
+  chicken_variant
+  cow_sound_variant
+  cow_variant
+  damage_type
+  dimension_type
+  enchantment
+  enchantment_provider
+  frog_variant
+  instrument
+  jukebox_song
+  painting_variant
+  pig_sound_variant
+  pig_variant
+  trim_material
+  trim_pattern
+  wolf_sound_variant
+  wolf_variant
+  zombie_nautilus_variant
+)
+
+mkdir -p "$TMP/extract"
+unzip -q -o "$INNER_JAR" 'data/minecraft/*' -d "$TMP/extract"
+
+mkdir -p "$OUT_DIR/data/minecraft"
+for reg in "${REGISTRIES[@]}"; do
+  if [[ -d "$TMP/extract/data/minecraft/$reg" ]]; then
+    cp -r "$TMP/extract/data/minecraft/$reg" "$OUT_DIR/data/minecraft/$reg"
+  else
+    echo "    warning: registry $reg not found in this version" >&2
+  fi
+done
+
+mkdir -p "$OUT_DIR/data/minecraft/worldgen"
+cp -r "$TMP/extract/data/minecraft/worldgen/biome" "$OUT_DIR/data/minecraft/worldgen/biome"
+
+cp -r "$TMP/extract/data/minecraft/tags" "$OUT_DIR/data/minecraft/tags"
+
+echo "[4/4] Done."
+file_count=$(find "$OUT_DIR" -type f | wc -l)
+total_bytes=$(du -sb "$OUT_DIR" | awk '{print $1}')
+echo "    extracted $file_count files, $total_bytes bytes ($(du -sh "$OUT_DIR" | awk '{print $1}'))"
