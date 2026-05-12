@@ -6,13 +6,15 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M2 code-complete on `dev/M2-world-representation`. The
-world model — block registry, palette-based chunk sections,
-Anvil-compatible `.mca` codec, lazy `WorldStorage` façade — is in
-place and round-trips real vanilla 26.1.2 chunks end-to-end. The
-network layer (M1) still does not stream chunks; M3 will wire
-`WorldStorage` into the Play state so connecting clients actually
-see a world.
+**Status:** M3 code-complete on `dev/M3-chunk-streaming`. A vanilla
+26.1.2 client connecting to Solaris now walks Handshake → Login →
+Configuration → Play and receives the view-distance ring of chunks
+around spawn streamed straight out of `WorldStorage` — the M2 world
+model is wired into the Play state and the spawn-area floor renders
+instead of the M1 black void. An automated raw-TCP harness
+(`mc-test-harness::client`) drives the same flow against the bundled
+test world as the CI gate. Lighting is still empty arrays only;
+worldgen is the next milestone.
 
 ## Build
 
