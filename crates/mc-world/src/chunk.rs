@@ -38,6 +38,8 @@ pub const HEIGHTMAP_LEN: usize = SECTION_DIM * SECTION_DIM;
 /// block resolution.
 pub const BIOME_DIM: usize = 4;
 pub const BIOME_VOLUME: usize = BIOME_DIM * BIOME_DIM * BIOME_DIM;
+/// Bytes per per-section light layer: `16³` cells × 4 bits per cell.
+pub const LIGHT_LAYER_BYTES: usize = SECTION_DIM * SECTION_DIM * SECTION_DIM / 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkPos {
@@ -159,6 +161,21 @@ impl Heightmap {
     }
 }
 
+/// Per-section 4-bit-per-cell light arrays. Both layers are `None`
+/// when Anvil didn't write them — vanilla omits the array when the
+/// section is uniformly default (sky-15 above terrain, block-0
+/// everywhere), and our test world is mostly in pre-`light`
+/// generation status so most sections come back as `None`.
+///
+/// When present, the buffer holds `LIGHT_LAYER_BYTES` (2048) bytes
+/// in the same `(y, z, x)` linear order the section block-state
+/// container uses, two cells packed per byte (low nibble first).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SectionLight {
+    pub block: Option<Vec<u8>>,
+    pub sky: Option<Vec<u8>>,
+}
+
 /// A 16×384×16 column.
 #[derive(Debug, Clone)]
 pub struct Chunk {
@@ -176,6 +193,13 @@ pub struct Chunk {
     pub block_entities: HashMap<BlockPos, Vec<u8>>,
     /// Vanilla generation status (`"full"`, `"biomes"`, `"structure_starts"`, …).
     pub status: String,
+    /// Baked light arrays read from Anvil, one entry per
+    /// `sections[i]`. Decoded by `anvil::chunk_nbt` when present;
+    /// `Chunk::empty` initialises everything to `None` (sections
+    /// have no baked light). The wire encoder may use these as the
+    /// source of truth or fall back to recomputed light — see
+    /// `mc_world::light`.
+    pub section_lights: Vec<SectionLight>,
 }
 
 impl Chunk {
@@ -194,6 +218,7 @@ impl Chunk {
             heightmaps: HashMap::new(),
             block_entities: HashMap::new(),
             status: "full".to_string(),
+            section_lights: vec![SectionLight::default(); SECTION_COUNT],
         }
     }
 
