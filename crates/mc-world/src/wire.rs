@@ -56,8 +56,9 @@
 use mc_data::{Identifier, Registry};
 use thiserror::Error;
 
-use crate::chunk::{BIOME_VOLUME, BiomeSection, Chunk, SECTION_COUNT};
-use crate::section::ChunkSection;
+use crate::chunk::{BIOME_VOLUME, BiomeSection, Chunk, LIGHT_LAYER_BYTES, SECTION_COUNT};
+use crate::light::ChunkLight;
+use crate::section::{ChunkSection, SECTION_DIM, SECTION_VOLUME};
 
 /// Heightmap type ids — the ordinals of `Heightmap$Types` in the
 /// vanilla source, verified via `javap -p -c` (ADR 0002). Only the
@@ -205,6 +206,115 @@ fn registry_index_of(registry: &Registry, biome: &Identifier) -> Result<i32, Wir
         .position(|e| e == biome)
         .map(|p| p as i32)
         .ok_or_else(|| WireError::UnknownBiome(biome.clone()))
+}
+
+// ---------------------------------------------------------------------
+// Light wire encoding (M4.d)
+// ---------------------------------------------------------------------
+
+/// Wire-ready light payload for one chunk. Mirrors the shape of
+/// `mc_protocol::packets::play::LightData` so `mc-net::play` can lift
+/// fields straight through without translation. Held here (and not in
+/// `mc-protocol`) so the conversion from `ChunkLight` doesn't drag
+/// world-model types into the protocol crate, matching the same
+/// posture `encode_chunk_data` / `client_heightmaps` already establish.
+///
+/// Y-slot indexing: 26 slots covering section-Y `-5..=20` (one slab
+/// below the bottom of the world, 24 in-world sections, one slab
+/// above the top). Slot 0 = `Y=-5`, slot 25 = `Y=20`. Slot `i`
+/// corresponds to in-world chunk section index `i - 1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LightWire {
+    pub sky_y_mask: Vec<i64>,
+    pub block_y_mask: Vec<i64>,
+    pub empty_sky_y_mask: Vec<i64>,
+    pub empty_block_y_mask: Vec<i64>,
+    pub sky_updates: Vec<Vec<u8>>,
+    pub block_updates: Vec<Vec<u8>>,
+}
+
+/// Total number of wire light slots (one below + 24 in-world + one
+/// above).
+pub const WIRE_LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
+
+/// Pack a per-chunk computed [`ChunkLight`] into the wire payload
+/// `LevelChunkWithLight` expects. Always emits all 26 slots: each
+/// section is either listed in the `*_y_mask` with its 2048-byte
+/// nibble layer, or in the `empty_*_y_mask`. The below-world slab is
+/// emitted empty for both channels; the above-world slab is emitted
+/// as `sky=15` (open sky) and `block=0` (empty for block channel).
+#[must_use]
+pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
+    let mut sky_mask: u64 = 0;
+    let mut block_mask: u64 = 0;
+    let mut empty_sky_mask: u64 = 0;
+    let mut empty_block_mask: u64 = 0;
+    let mut sky_updates: Vec<Vec<u8>> = Vec::new();
+    let mut block_updates: Vec<Vec<u8>> = Vec::new();
+
+    // Slot 0 (Y=-5, below world): empty for both channels.
+    empty_sky_mask |= 1 << 0;
+    empty_block_mask |= 1 << 0;
+
+    // Slots 1..=24 — in-world sections 0..=23 of the ChunkLight.
+    for section_idx in 0..SECTION_COUNT {
+        let slot = section_idx + 1;
+        let sky_layer = pack_section_layer(&light.sky, section_idx);
+        let block_layer = pack_section_layer(&light.block, section_idx);
+        if sky_layer.iter().any(|&b| b != 0) {
+            sky_mask |= 1 << slot;
+            sky_updates.push(sky_layer);
+        } else {
+            empty_sky_mask |= 1 << slot;
+        }
+        if block_layer.iter().any(|&b| b != 0) {
+            block_mask |= 1 << slot;
+            block_updates.push(block_layer);
+        } else {
+            empty_block_mask |= 1 << slot;
+        }
+    }
+
+    // Slot 25 (Y=20, above world): sky=15 (open sky), block empty.
+    sky_mask |= 1 << 25;
+    sky_updates.push(vec![0xFF; LIGHT_LAYER_BYTES]);
+    empty_block_mask |= 1 << 25;
+
+    LightWire {
+        sky_y_mask: vec![sky_mask as i64],
+        block_y_mask: vec![block_mask as i64],
+        empty_sky_y_mask: vec![empty_sky_mask as i64],
+        empty_block_y_mask: vec![empty_block_mask as i64],
+        sky_updates,
+        block_updates,
+    }
+}
+
+/// Pack one section's 4096 per-cell `u8` values (0..=15 each) into
+/// the 2048-byte nibble layer vanilla expects: cells are paired by
+/// the linear `(y, z, x)` index, low nibble first.
+fn pack_section_layer(channel: &[u8], section_idx: usize) -> Vec<u8> {
+    debug_assert!(section_idx < SECTION_COUNT);
+    let base = section_idx * SECTION_VOLUME;
+    let mut layer = vec![0u8; LIGHT_LAYER_BYTES];
+    // section-local cell index = (sub_y * 256) + (z * 16) + x, sub_y in 0..16.
+    for cell in 0..SECTION_VOLUME {
+        let sub_y = cell / (SECTION_DIM * SECTION_DIM);
+        let rem = cell % (SECTION_DIM * SECTION_DIM);
+        let z = rem / SECTION_DIM;
+        let x = rem % SECTION_DIM;
+        // ChunkLight indexes by absolute y_local first, so reconstruct
+        // the source index: (section_base_y + sub_y) * 256 + z * 16 + x.
+        let world_local_y = section_idx * SECTION_DIM + sub_y;
+        let src = world_local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x;
+        debug_assert!(src >= base);
+        debug_assert!(src < base + SECTION_VOLUME);
+        let value = channel[src] & 0x0F;
+        let byte_idx = cell / 2;
+        let shift = (cell & 1) * 4;
+        layer[byte_idx] |= value << shift;
+    }
+    layer
 }
 
 fn write_varint(buf: &mut Vec<u8>, value: i32) {
@@ -462,5 +572,94 @@ mod tests {
             first_count > 0,
             "section 0 of the flat preset should have non-air blocks"
         );
+    }
+
+    fn chunk_light_idx(x: usize, local_y: usize, z: usize) -> usize {
+        local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
+    }
+
+    #[test]
+    fn encodes_zero_chunk_as_all_empty_with_open_top() {
+        let light = ChunkLight::zeroed();
+        let wire = encode_chunk_light(&light);
+
+        // Slot 25 (above world) is the only present sky slot;
+        // everything else is empty in the sky channel.
+        assert_eq!(wire.sky_y_mask.len(), 1);
+        assert_eq!(wire.sky_y_mask[0], 1 << 25);
+        assert_eq!(wire.sky_updates.len(), 1);
+        assert!(wire.sky_updates[0].iter().all(|&b| b == 0xFF));
+        assert_eq!(wire.empty_sky_y_mask.len(), 1);
+        // All 26 slots except slot 25 are empty.
+        let expected_empty_sky = ((1u64 << WIRE_LIGHT_SECTIONS) - 1) & !(1 << 25);
+        assert_eq!(wire.empty_sky_y_mask[0], expected_empty_sky as i64);
+
+        // Block channel: all 26 slots empty, no layers shipped.
+        assert!(wire.block_updates.is_empty());
+        assert_eq!(wire.block_y_mask[0], 0);
+        let expected_empty_block = (1u64 << WIRE_LIGHT_SECTIONS) - 1;
+        assert_eq!(wire.empty_block_y_mask[0], expected_empty_block as i64);
+    }
+
+    #[test]
+    fn nibble_packing_round_trips_low_first() {
+        // Build a ChunkLight whose section 0 has cell index 0 = 1,
+        // cell index 1 = 2, both in the layer's first byte. Then
+        // verify pack_section_layer puts them at low (0x01) and
+        // high (0x20) nibbles → 0x21 in byte 0.
+        let mut light = ChunkLight::zeroed();
+        // cell 0 in section 0 = (sub_y=0, z=0, x=0) → chunk-light idx 0.
+        light.sky[chunk_light_idx(0, 0, 0)] = 1;
+        // cell 1 in section 0 = (sub_y=0, z=0, x=1).
+        light.sky[chunk_light_idx(1, 0, 0)] = 2;
+        let layer = pack_section_layer(&light.sky, 0);
+        assert_eq!(layer[0], 0x21);
+        // Other bytes are untouched.
+        assert!(layer[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn pack_layer_sees_each_section_independently() {
+        // Place value 15 at the very last cell of section 0
+        // (sub_y=15, z=15, x=15) and value 7 at the very first cell
+        // of section 1 (sub_y=0, z=0, x=0). pack_section_layer(_, 0)
+        // must see only the 15; pack_section_layer(_, 1) only the 7.
+        let mut light = ChunkLight::zeroed();
+        // Section 0, sub_y=15 → chunk-light local_y = 15.
+        light.sky[chunk_light_idx(15, 15, 15)] = 15;
+        // Section 1, sub_y=0 → chunk-light local_y = 16.
+        light.sky[chunk_light_idx(0, 16, 0)] = 7;
+
+        let s0 = pack_section_layer(&light.sky, 0);
+        let s1 = pack_section_layer(&light.sky, 1);
+        // Section 0: last cell is index 4095 in the section, byte 2047,
+        // high nibble.
+        assert_eq!(s0[2047], 0xF0);
+        let zeros_in_s0: usize = s0[..2047].iter().filter(|&&b| b == 0).count();
+        assert_eq!(zeros_in_s0, 2047);
+        // Section 1: first cell is index 0, byte 0, low nibble = 7.
+        assert_eq!(s1[0], 0x07);
+        assert!(s1[1..].iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn encodes_non_empty_block_section_into_present_mask() {
+        // Drop a single glowstone-equivalent cell into section 4
+        // (around world Y=0). Expect: section 4 + 1 = wire slot 5 in
+        // the present mask; slot 0 + slots 1..=4 + slots 6..=24 +
+        // slot 25 in the empty mask; one layer in block_updates.
+        let mut light = ChunkLight::zeroed();
+        light.block[chunk_light_idx(8, 64, 8)] = 15; // section idx = 64/16 = 4
+        let wire = encode_chunk_light(&light);
+
+        assert_eq!(wire.block_updates.len(), 1, "single non-zero section");
+        assert_eq!(wire.block_y_mask[0], 1 << 5);
+
+        let layer = &wire.block_updates[0];
+        // Cell index within section 4: sub_y=0, z=8, x=8 →
+        // 0 * 256 + 8 * 16 + 8 = 136. Byte 68, low nibble (136 even).
+        assert_eq!(layer[68], 0x0F);
+        let nonzero_bytes: usize = layer.iter().filter(|&&b| b != 0).count();
+        assert_eq!(nonzero_bytes, 1, "only one cell lit");
     }
 }
