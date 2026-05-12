@@ -1,21 +1,21 @@
 //! Configuration state — between Login and Play.
 //!
-//! In M1.e we drive only the strict minimum needed for the connection to
-//! traverse the state cleanly:
+//! At M3.i the choreography is:
 //!
 //! ```text
 //! S → C  Known Packs               (0x0E, our list of known data packs)
 //! C → S  Known Packs               (0x07, the subset the client also has)
+//! S → C  Registry Data × N         (0x07, one per built-in registry)
+//! S → C  Update Tags               (0x0D, the full tag set in one packet)
 //! S → C  Finish Configuration      (0x03, empty)
 //! C → S  Acknowledge Finish Conf.  (0x03, empty)
 //!        → state transitions to Play
 //! ```
 //!
-//! Everything else (Client Information, Plugin Messages, Resource Pack
-//! flows, Registry Data with real entries, Update Tags, …) is deferred —
-//! see `docs/milestones/M1.md` for the full deferral list. The handler in
-//! `mc-net` reads but does not act on any other clientbound-in-Conf
-//! packets the client may send.
+//! Resource Pack push/pop, Client Information, Plugin Messages, and
+//! Cookie storage are still deferred — see `docs/milestones/M1.md` for
+//! the full deferral list. The handler in `mc-net` reads but does not
+//! act on any other clientbound-in-Conf packets the client may send.
 
 use bytes::{Buf, BufMut};
 
@@ -238,6 +238,123 @@ impl Packet for RegistryData {
     }
 }
 
+// -----------------------------------------------------------------------
+// Update Tags (0x0D CB).
+//
+// Wire shape per `ClientboundUpdateTagsPacket` +
+// `TagNetworkSerialization$NetworkPayload.write()` in the unobfuscated
+// vanilla 26.1.2 jar (ADR 0002 javap): a `Map<ResourceKey<Registry>,
+// NetworkPayload>` written as
+//
+// ```text
+// VarInt num_registries
+// per registry:
+//     Identifier registry_id     (e.g. "minecraft:item")
+//     VarInt num_tags
+//     per tag:
+//         Identifier tag_name     (e.g. "minecraft:enchantable/melee_weapon")
+//         VarInt num_entries
+//         VarInt[num_entries] entry_ids
+// ```
+//
+// `entry_ids` are the *client-side* indices into the matching registry:
+// for built-in registries (item, block, entity_type, fluid, …) those
+// are the `protocol_id`s from Mojang's `reports/registries.json`; for
+// data-driven registries we ship via `RegistryData` (enchantment,
+// damage_type, …) they are the *position in the entries vec we sent*.
+// `mc_data::tags` produces the right numbers for both flavours.
+// -----------------------------------------------------------------------
+
+/// One tag mapping inside [`UpdateTags`]: the tag identifier plus the
+/// numeric ids of the registry entries it covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTagsEntry {
+    pub tag: Identifier,
+    pub entries: Vec<i32>,
+}
+
+/// One registry's tag block inside [`UpdateTags`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateTagsRegistry {
+    pub registry: Identifier,
+    pub tags: Vec<UpdateTagsEntry>,
+}
+
+/// Clientbound 0x0D — the full tag set for every registry the client
+/// is about to load. Sent once between the last `RegistryData` and
+/// `FinishConfiguration`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UpdateTags {
+    pub registries: Vec<UpdateTagsRegistry>,
+}
+
+impl Packet for UpdateTags {
+    // Verified via `javap` of vanilla 26.1.2's ConfigurationProtocols:
+    // CLIENTBOUND_UPDATE_TAGS at configuration-CB index 13 = wire id 0x0D.
+    const ID: i32 = 0x0D;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(i32::try_from(self.registries.len()).map_err(|_| {
+            CodecError::StringTooLong {
+                len: self.registries.len(),
+                max: i32::MAX as usize,
+            }
+        })?);
+        for reg in &self.registries {
+            buf.write_identifier(&reg.registry);
+            buf.write_varint(i32::try_from(reg.tags.len()).map_err(|_| {
+                CodecError::StringTooLong {
+                    len: reg.tags.len(),
+                    max: i32::MAX as usize,
+                }
+            })?);
+            for tag in &reg.tags {
+                buf.write_identifier(&tag.tag);
+                buf.write_varint(i32::try_from(tag.entries.len()).map_err(|_| {
+                    CodecError::StringTooLong {
+                        len: tag.entries.len(),
+                        max: i32::MAX as usize,
+                    }
+                })?);
+                for &id in &tag.entries {
+                    buf.write_varint(id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let reg_count = buf.read_varint()?;
+        if reg_count < 0 {
+            return Err(CodecError::NegativeLength(reg_count));
+        }
+        let mut registries = Vec::with_capacity(reg_count as usize);
+        for _ in 0..reg_count {
+            let registry = buf.read_identifier()?;
+            let tag_count = buf.read_varint()?;
+            if tag_count < 0 {
+                return Err(CodecError::NegativeLength(tag_count));
+            }
+            let mut tags = Vec::with_capacity(tag_count as usize);
+            for _ in 0..tag_count {
+                let tag = buf.read_identifier()?;
+                let entry_count = buf.read_varint()?;
+                if entry_count < 0 {
+                    return Err(CodecError::NegativeLength(entry_count));
+                }
+                let mut entries = Vec::with_capacity(entry_count as usize);
+                for _ in 0..entry_count {
+                    entries.push(buf.read_varint()?);
+                }
+                tags.push(UpdateTagsEntry { tag, entries });
+            }
+            registries.push(UpdateTagsRegistry { registry, tags });
+        }
+        Ok(Self { registries })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +424,52 @@ mod tests {
                 },
             ],
         });
+    }
+
+    #[test]
+    fn update_tags_id_matches_javap() {
+        assert_eq!(UpdateTags::ID, 0x0D);
+    }
+
+    #[test]
+    fn update_tags_empty_round_trips() {
+        round_trip(UpdateTags::default());
+    }
+
+    #[test]
+    fn update_tags_with_entries_round_trips() {
+        round_trip(UpdateTags {
+            registries: vec![
+                UpdateTagsRegistry {
+                    registry: Identifier::parse("minecraft:item").unwrap(),
+                    tags: vec![
+                        UpdateTagsEntry {
+                            tag: Identifier::parse("minecraft:enchantable/melee_weapon").unwrap(),
+                            entries: vec![7, 42, 1024],
+                        },
+                        UpdateTagsEntry {
+                            tag: Identifier::parse("minecraft:arrows").unwrap(),
+                            entries: vec![],
+                        },
+                    ],
+                },
+                UpdateTagsRegistry {
+                    registry: Identifier::parse("minecraft:enchantment").unwrap(),
+                    tags: vec![UpdateTagsEntry {
+                        tag: Identifier::parse("minecraft:exclusive_set/armor").unwrap(),
+                        entries: vec![0, 1, 2, 3],
+                    }],
+                },
+            ],
+        });
+    }
+
+    #[test]
+    fn update_tags_byte_layout_minimum() {
+        // Empty payload = a single VarInt(0).
+        let mut buf = Vec::new();
+        UpdateTags::default().encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0]);
     }
 
     #[test]

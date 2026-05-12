@@ -78,6 +78,11 @@ mod tests {
             motd: "Solaris test".into(),
             max_players: 20,
             data: std::sync::Arc::new(mc_data::testing::stub()),
+            blocks: std::sync::Arc::new(
+                mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+            ),
+            world: None,
+            tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         };
         let json = build_status_json(&cfg);
         // Parse it back to make sure the value is a well-formed object.

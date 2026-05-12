@@ -1,5 +1,6 @@
 //! Errors produced by the codec and framing layers.
 
+use mc_nbt::NbtError;
 use thiserror::Error;
 
 /// All errors that the encode/decode layer can produce.
@@ -57,4 +58,9 @@ pub enum CodecError {
     /// echoed back for debugging.
     #[error("invalid identifier: {0:?}")]
     InvalidIdentifier(String),
+
+    /// An NBT field embedded in a packet could not be encoded or decoded.
+    /// `mc-nbt`'s own error variant is preserved.
+    #[error("nbt error: {0}")]
+    Nbt(#[from] NbtError),
 }

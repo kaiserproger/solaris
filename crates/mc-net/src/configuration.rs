@@ -20,12 +20,14 @@
 
 use bytes::BytesMut;
 use mc_data::VanillaData;
+use mc_data::tags::TagsData;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, RegistryEntry, ServerboundKnownPacks,
+    RegistryData, RegistryEntry, ServerboundKnownPacks, UpdateTags, UpdateTagsEntry,
+    UpdateTagsRegistry,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
@@ -51,6 +53,7 @@ pub(crate) async fn handle<R, W>(
     buf: &mut BytesMut,
     profile: &LoggedInProfile,
     data: &VanillaData,
+    tags: &TagsData,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -128,6 +131,37 @@ where
         registries = data.registry_count(),
         entries = data.entry_count(),
         "sent Registry Data"
+    );
+
+    // Step 3.5: ship the tag set. Mojang's built-in datapack contains
+    // enchantment definitions etc. that reference `#minecraft:item`,
+    // `#minecraft:entity_type` and `#minecraft:block` tags; without
+    // this packet the client kicks itself on `FinishConfiguration`
+    // with "Unbound tags" because nothing populated those references.
+    let tag_packet = UpdateTags {
+        registries: tags
+            .registries
+            .iter()
+            .map(|(registry, tag_map)| UpdateTagsRegistry {
+                registry: registry.clone(),
+                tags: tag_map
+                    .iter()
+                    .map(|(tag_id, entries)| UpdateTagsEntry {
+                        tag: tag_id.clone(),
+                        entries: entries.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
+    let tag_count = tags.total_tags();
+    let tag_entries = tags.total_entries();
+    write_packet(writer, &tag_packet, Compression::Disabled).await?;
+    debug!(
+        registries = tag_packet.registries.len(),
+        tags = tag_count,
+        entries = tag_entries,
+        "sent Update Tags",
     );
 
     // Step 4: tell the client we are done configuring.

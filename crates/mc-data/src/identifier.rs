@@ -13,7 +13,7 @@ use thiserror::Error;
 /// Stored as a single owned string and an index pointing at the colon.
 /// We don't intern here; if interning turns out to matter for the
 /// data-pack loader we'll revisit (PROJECT_SPEC §3.2 leaves room).
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Identifier {
     full: String,
     colon: usize,

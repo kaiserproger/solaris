@@ -9,6 +9,7 @@ pub mod block;
 pub mod chunk;
 pub mod section;
 pub mod storage;
+pub mod wire;
 
 pub use block::{Block, BlockRegistry, BlockState, BlockStateId, RegistryError};
 pub use chunk::{

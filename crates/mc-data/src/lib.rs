@@ -31,6 +31,7 @@ use tracing::{debug, trace};
 
 pub mod blocks;
 pub mod identifier;
+pub mod tags;
 
 pub use identifier::{Identifier, IdentifierError};
 
@@ -53,6 +54,7 @@ pub const KNOWN_REGISTRIES: &[(&str, &str)] = &[
     ("cow_sound_variant", "cow_sound_variant"),
     ("cow_variant", "cow_variant"),
     ("damage_type", "damage_type"),
+    ("dialog", "dialog"),
     ("dimension_type", "dimension_type"),
     ("enchantment", "enchantment"),
     ("enchantment_provider", "enchantment_provider"),
@@ -62,10 +64,14 @@ pub const KNOWN_REGISTRIES: &[(&str, &str)] = &[
     ("painting_variant", "painting_variant"),
     ("pig_sound_variant", "pig_sound_variant"),
     ("pig_variant", "pig_variant"),
+    ("timeline", "timeline"),
+    ("trade_set", "trade_set"),
     ("trim_material", "trim_material"),
     ("trim_pattern", "trim_pattern"),
+    ("villager_trade", "villager_trade"),
     ("wolf_sound_variant", "wolf_sound_variant"),
     ("wolf_variant", "wolf_variant"),
+    ("world_clock", "world_clock"),
     ("worldgen/biome", "worldgen/biome"),
     ("zombie_nautilus_variant", "zombie_nautilus_variant"),
 ];

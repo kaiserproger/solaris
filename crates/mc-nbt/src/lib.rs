@@ -121,7 +121,7 @@ impl ListTag {
 /// a malicious peer cannot make us allocate gigabytes.
 pub const MAX_NBT_LENGTH: usize = 16 * 1024 * 1024;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum NbtError {
     #[error("ran out of NBT bytes (needed {needed} more, had {available})")]
     Underflow { needed: usize, available: usize },

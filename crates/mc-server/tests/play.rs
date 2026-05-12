@@ -24,13 +24,13 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks,
+    ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SynchronizePlayerPosition,
+    SetCenterChunk, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -42,6 +42,11 @@ async fn start_server() -> SocketAddr {
         motd: "M1.g play".into(),
         max_players: 8,
         data: std::sync::Arc::new(mc_data::testing::stub()),
+        blocks: std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -112,6 +117,12 @@ async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketA
         assert_eq!(frame.id, RegistryData::ID);
         let _ = RegistryData::decode(&mut frame.body).unwrap();
     }
+    // M3.i: Update Tags arrives between the last RegistryData and
+    // FinishConfiguration. The stub `tags` here is empty; the packet
+    // is still required on the wire.
+    let mut frame = read_one_frame(stream, buf).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
@@ -155,6 +166,14 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let event = GameEvent::decode(&mut frame.body).unwrap();
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
 
+    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    assert_eq!(frame.id, SetCenterChunk::ID, "expected Set Center Chunk");
+    let center = SetCenterChunk::decode(&mut frame.body).unwrap();
+    // SPAWN_(X,Z) = (0.5, 0.5) → chunk (0, 0).
+    assert_eq!((center.chunk_x, center.chunk_z), (0, 0));
+    // With world = None in this test the chunk packet is intentionally
+    // not emitted; M3.e's view-distance test exercises the chunk path.
+
     // Be polite: ack the teleport.
     write_frame(
         &mut stream,
@@ -195,9 +214,11 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
     // Drain spawn burst.
-    // Spawn burst is 3 frames after M1.g.4: LoginPlay, SynchronizePlayerPosition,
-    // GameEvent. SetDefaultSpawnPosition was removed (wire-uncertain).
-    for _ in 0..3 {
+    // After M3.d the burst is 4 frames: LoginPlay,
+    // SynchronizePlayerPosition, GameEvent, SetCenterChunk. With
+    // world = None the chunk packet itself is intentionally not
+    // emitted.
+    for _ in 0..4 {
         let _ = read_one_frame(&mut stream, &mut rbuf).await;
     }
 

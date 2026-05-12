@@ -11,10 +11,53 @@
 //! vanilla `PacketType` constant name.
 
 use bytes::{Buf, BufMut};
+use mc_nbt::Tag;
 
 use super::Packet;
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
+
+/// Vanilla's ceiling on the chunk-data payload (`TWO_MEGABYTES` in
+/// `ClientboundLevelChunkPacketData`). Decoding rejects buffers larger
+/// than this on the read side.
+const MAX_CHUNK_DATA_LEN: usize = 2 * 1024 * 1024;
+
+/// Sanity ceiling on length-prefixed `i64[]` fields: BitSet payloads
+/// (one long per 64 sections, vanilla has 26) and heightmap data
+/// (~37 longs for a 9-bits-per-entry 256-entry packing). 4 KiB worth
+/// of longs is more than two orders of magnitude headroom.
+const MAX_LONG_ARRAY_LEN: usize = 4096;
+
+fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
+    let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
+        len: longs.len(),
+        max: i32::MAX as usize,
+    })?;
+    buf.write_varint(len);
+    for &v in longs {
+        buf.write_i64(v);
+    }
+    Ok(())
+}
+
+fn read_long_array<B: Buf>(buf: &mut B) -> Result<Vec<i64>, CodecError> {
+    let len_signed = buf.read_varint()?;
+    if len_signed < 0 {
+        return Err(CodecError::NegativeLength(len_signed));
+    }
+    let len = len_signed as usize;
+    if len > MAX_LONG_ARRAY_LEN {
+        return Err(CodecError::StringTooLong {
+            len,
+            max: MAX_LONG_ARRAY_LEN,
+        });
+    }
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        out.push(buf.read_i64()?);
+    }
+    Ok(out)
+}
 
 // -----------------------------------------------------------------------
 // Clientbound
@@ -348,6 +391,326 @@ impl Packet for GameEvent {
     }
 }
 
+/// A single heightmap entry inside [`LevelChunkWithLight`].
+///
+/// In 26.1 the heightmaps field on the wire is *no longer* an NBT
+/// compound (it was, pre-1.20). It is a `Map<Heightmap$Types, long[]>`
+/// encoded via `ByteBufCodecs.map(EnumMap, Heightmap$Types.STREAM_CODEC,
+/// LONG_ARRAY)` — count, then `VarInt typeId` + `long[]` per entry.
+///
+/// `type_id` is the ordinal of the entry in `Heightmap$Types`
+/// (verified by `javap -p -c` of the unobfuscated jar, per ADR 0002).
+/// Only the three entries with `Usage.CLIENT` are sent:
+/// `WORLD_SURFACE = 1`, `MOTION_BLOCKING = 4`,
+/// `MOTION_BLOCKING_NO_LEAVES = 5`. The packed `long[]` is the same
+/// 9-bits-per-entry, non-crossing-i64 packing the on-disk heightmap
+/// uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkHeightmap {
+    pub type_id: i32,
+    pub data: Vec<i64>,
+}
+
+impl ChunkHeightmap {
+    pub const WORLD_SURFACE: i32 = 1;
+    pub const MOTION_BLOCKING: i32 = 4;
+    pub const MOTION_BLOCKING_NO_LEAVES: i32 = 5;
+}
+
+/// One block-entity sidecar entry carried inside [`LevelChunkWithLight`].
+///
+/// Verified via `javap -p -c` of
+/// `ClientboundLevelChunkPacketData$BlockEntityInfo.write` (ADR 0002):
+/// `u8 packedXZ`, `i16 y`, `VarInt typeId` (id into
+/// `minecraft:block_entity_type` registry), then network-NBT
+/// (unnamed-root) compound tag.
+///
+/// `packed_xz` is `(x << 4) | z` with `x`, `z` both 4-bit
+/// section-relative; vanilla never emits chunk-relative coords here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEntityInfo {
+    pub packed_xz: u8,
+    pub y: i16,
+    pub type_id: i32,
+    pub nbt: Tag,
+}
+
+impl BlockEntityInfo {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_u8(self.packed_xz);
+        buf.write_i16(self.y);
+        buf.write_varint(self.type_id);
+        mc_nbt::write_network(buf, &self.nbt)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            packed_xz: buf.read_u8()?,
+            y: buf.read_i16()?,
+            type_id: buf.read_varint()?,
+            nbt: mc_nbt::read_network(buf)?,
+        })
+    }
+}
+
+/// Sky and block light payload inlined into [`LevelChunkWithLight`].
+///
+/// Verified via `javap -p -c` of
+/// `ClientboundLightUpdatePacketData.write` (ADR 0002): four BitSets
+/// (`writeBitSet` = `writeLongArray(bs.toLongArray())`) followed by
+/// two `Collection<byte[]>` lists, each entry a 2048-byte light layer
+/// (4 bits per block × 16³ blocks = 2048 bytes).
+///
+/// Bit `i` set in `sky_y_mask` (resp. `block_y_mask`) means section
+/// `i` has explicit sky-light (resp. block-light) data in
+/// `sky_updates` (resp. `block_updates`). Bit `i` set in
+/// `empty_sky_y_mask` (resp. `empty_block_y_mask`) means section `i`
+/// has no light data — the client uses its own default. Section
+/// indexing extends by one entry on each side of the world Y range,
+/// so for a 24-section column there are 26 indexable sections
+/// (`-1..=24`); vanilla packs this in a single i64 per bitset.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LightData {
+    pub sky_y_mask: Vec<i64>,
+    pub block_y_mask: Vec<i64>,
+    pub empty_sky_y_mask: Vec<i64>,
+    pub empty_block_y_mask: Vec<i64>,
+    pub sky_updates: Vec<Vec<u8>>,
+    pub block_updates: Vec<Vec<u8>>,
+}
+
+impl LightData {
+    /// Length of one light-data layer in bytes (`16³ / 2`, since vanilla
+    /// packs 4 bits per block).
+    pub const LIGHT_LAYER_BYTES: usize = 2048;
+
+    /// "No lighting data" payload: all masks empty, both update lists
+    /// empty. Legal on the wire; the client uses its own defaults.
+    /// Six VarInt(0) bytes total.
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_long_array(buf, &self.sky_y_mask)?;
+        write_long_array(buf, &self.block_y_mask)?;
+        write_long_array(buf, &self.empty_sky_y_mask)?;
+        write_long_array(buf, &self.empty_block_y_mask)?;
+        Self::encode_light_list(buf, &self.sky_updates)?;
+        Self::encode_light_list(buf, &self.block_updates)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let sky_y_mask = read_long_array(buf)?;
+        let block_y_mask = read_long_array(buf)?;
+        let empty_sky_y_mask = read_long_array(buf)?;
+        let empty_block_y_mask = read_long_array(buf)?;
+        let sky_updates = Self::decode_light_list(buf)?;
+        let block_updates = Self::decode_light_list(buf)?;
+        Ok(Self {
+            sky_y_mask,
+            block_y_mask,
+            empty_sky_y_mask,
+            empty_block_y_mask,
+            sky_updates,
+            block_updates,
+        })
+    }
+
+    fn encode_light_list<B: BufMut>(buf: &mut B, layers: &[Vec<u8>]) -> Result<(), CodecError> {
+        let len = i32::try_from(layers.len()).map_err(|_| CodecError::StringTooLong {
+            len: layers.len(),
+            max: i32::MAX as usize,
+        })?;
+        buf.write_varint(len);
+        for layer in layers {
+            buf.write_byte_array(layer);
+        }
+        Ok(())
+    }
+
+    fn decode_light_list<B: Buf>(buf: &mut B) -> Result<Vec<Vec<u8>>, CodecError> {
+        let len_signed = buf.read_varint()?;
+        if len_signed < 0 {
+            return Err(CodecError::NegativeLength(len_signed));
+        }
+        let len = len_signed as usize;
+        // Each layer is at most LIGHT_LAYER_BYTES; cap collection length
+        // at one entry per Y section in a 1024-block-tall column (huge
+        // overshoot for vanilla's 26).
+        if len > 1024 {
+            return Err(CodecError::StringTooLong { len, max: 1024 });
+        }
+        let mut layers = Vec::with_capacity(len);
+        for _ in 0..len {
+            layers.push(buf.read_byte_array(Self::LIGHT_LAYER_BYTES)?);
+        }
+        Ok(layers)
+    }
+}
+
+/// `Level Chunk With Light` (CB). The packet that finally puts blocks
+/// in front of the client. Wraps the bodies of vanilla's
+/// `ClientboundLevelChunkPacketData` and `ClientboundLightUpdatePacketData`
+/// behind the chunk coordinates.
+///
+/// `data` is the paletted-container chunk body: section-by-section
+/// (`i16 block_count`, paletted block-state container, paletted biome
+/// container) concatenated. M3.a defines the outer packet only —
+/// constructing `data` from a `mc_world::Chunk` is M3.b's job, so the
+/// field is exposed as raw bytes here and a `Vec<u8>` round-trips
+/// through `encode` / `decode` unchanged.
+///
+/// The leading `i32 chunk_x` / `i32 chunk_z` are raw `int`s on the
+/// wire (not VarInts), per
+/// `ClientboundLevelChunkWithLightPacket.STREAM_CODEC` in the
+/// unobfuscated jar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LevelChunkWithLight {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+    pub heightmaps: Vec<ChunkHeightmap>,
+    pub data: Vec<u8>,
+    pub block_entities: Vec<BlockEntityInfo>,
+    pub light: LightData,
+}
+
+impl Packet for LevelChunkWithLight {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT at game-CB index 45 = 0x2D.
+    const ID: i32 = 0x2D;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i32(self.chunk_x);
+        buf.write_i32(self.chunk_z);
+
+        let hm_count =
+            i32::try_from(self.heightmaps.len()).map_err(|_| CodecError::StringTooLong {
+                len: self.heightmaps.len(),
+                max: i32::MAX as usize,
+            })?;
+        buf.write_varint(hm_count);
+        for hm in &self.heightmaps {
+            buf.write_varint(hm.type_id);
+            write_long_array(buf, &hm.data)?;
+        }
+
+        if self.data.len() > MAX_CHUNK_DATA_LEN {
+            return Err(CodecError::StringTooLong {
+                len: self.data.len(),
+                max: MAX_CHUNK_DATA_LEN,
+            });
+        }
+        buf.write_byte_array(&self.data);
+
+        let be_count =
+            i32::try_from(self.block_entities.len()).map_err(|_| CodecError::StringTooLong {
+                len: self.block_entities.len(),
+                max: i32::MAX as usize,
+            })?;
+        buf.write_varint(be_count);
+        for be in &self.block_entities {
+            be.encode(buf)?;
+        }
+
+        self.light.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let chunk_x = buf.read_i32()?;
+        let chunk_z = buf.read_i32()?;
+
+        let hm_count_signed = buf.read_varint()?;
+        if hm_count_signed < 0 {
+            return Err(CodecError::NegativeLength(hm_count_signed));
+        }
+        let hm_count = hm_count_signed as usize;
+        // Six entries in Heightmap$Types; cap at 16 to leave room.
+        if hm_count > 16 {
+            return Err(CodecError::StringTooLong {
+                len: hm_count,
+                max: 16,
+            });
+        }
+        let mut heightmaps = Vec::with_capacity(hm_count);
+        for _ in 0..hm_count {
+            heightmaps.push(ChunkHeightmap {
+                type_id: buf.read_varint()?,
+                data: read_long_array(buf)?,
+            });
+        }
+
+        let data = buf.read_byte_array(MAX_CHUNK_DATA_LEN)?;
+
+        let be_count_signed = buf.read_varint()?;
+        if be_count_signed < 0 {
+            return Err(CodecError::NegativeLength(be_count_signed));
+        }
+        let be_count = be_count_signed as usize;
+        // One block entity per block in a 16³ section × 24 sections =
+        // 98 304; cap one order of magnitude higher than that.
+        if be_count > 1_000_000 {
+            return Err(CodecError::StringTooLong {
+                len: be_count,
+                max: 1_000_000,
+            });
+        }
+        let mut block_entities = Vec::with_capacity(be_count);
+        for _ in 0..be_count {
+            block_entities.push(BlockEntityInfo::decode(buf)?);
+        }
+
+        let light = LightData::decode(buf)?;
+
+        Ok(Self {
+            chunk_x,
+            chunk_z,
+            heightmaps,
+            data,
+            block_entities,
+            light,
+        })
+    }
+}
+
+/// `Set Center Chunk` (CB). Tells the client which chunk is the center
+/// of its view-distance window — the chunk it is "looking from". Every
+/// `LevelChunkWithLight` packet that follows is rendered relative to
+/// this anchor; if the center is wrong the client will silently
+/// discard chunks that fall outside its (anchored, but still
+/// vd-bounded) loaded ring.
+///
+/// Wire layout per `javap -p -c` of
+/// `ClientboundSetChunkCacheCenterPacket.write` (ADR 0002): two
+/// VarInts, `x` then `z`, in chunk coordinates (= `floor(world / 16)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetCenterChunk {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+}
+
+impl Packet for SetCenterChunk {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_SET_CHUNK_CACHE_CENTER at game-CB index 94 = 0x5E.
+    const ID: i32 = 0x5E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.chunk_x);
+        buf.write_varint(self.chunk_z);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            chunk_x: buf.read_varint()?,
+            chunk_z: buf.read_varint()?,
+        })
+    }
+}
+
 // -----------------------------------------------------------------------
 // Serverbound
 // -----------------------------------------------------------------------
@@ -532,5 +895,148 @@ mod tests {
             event: GameEvent::EVENT_START_WAITING_FOR_CHUNKS,
             value: 0.0,
         });
+    }
+
+    // ---- SetCenterChunk ----
+
+    #[test]
+    fn set_center_chunk_id_matches_javap() {
+        assert_eq!(SetCenterChunk::ID, 0x5E);
+    }
+
+    #[test]
+    fn set_center_chunk_round_trips() {
+        for (x, z) in [(0, 0), (1, -1), (-100_000, 100_000), (i32::MIN, i32::MAX)] {
+            round_trip(SetCenterChunk {
+                chunk_x: x,
+                chunk_z: z,
+            });
+        }
+    }
+
+    // ---- LevelChunkWithLight ----
+
+    fn minimal_chunk_packet() -> LevelChunkWithLight {
+        LevelChunkWithLight {
+            chunk_x: 0,
+            chunk_z: 0,
+            heightmaps: Vec::new(),
+            data: Vec::new(),
+            block_entities: Vec::new(),
+            light: LightData::empty(),
+        }
+    }
+
+    #[test]
+    fn level_chunk_with_light_id_matches_javap() {
+        // 0x2D = game-CB index 45 (CLIENTBOUND_LEVEL_CHUNK_WITH_LIGHT).
+        assert_eq!(LevelChunkWithLight::ID, 0x2D);
+    }
+
+    #[test]
+    fn level_chunk_with_light_empty_byte_layout() {
+        // The all-empty form: i32 x, i32 z, six VarInt(0)s for
+        // (heightmap-count, data-len, block-entity-count, four BitSets),
+        // two VarInt(0)s for the sky/block update lists.
+        // Total: 4 + 4 + 9*1 = 17 bytes.
+        let mut buf = Vec::new();
+        minimal_chunk_packet().encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0, 0, 0, 0, // chunk_x = 0
+                0, 0, 0, 0, // chunk_z = 0
+                0, // heightmap count = 0
+                0, // chunk data length = 0
+                0, // block entity count = 0
+                0, // sky_y_mask longs = 0
+                0, // block_y_mask longs = 0
+                0, // empty_sky_y_mask longs = 0
+                0, // empty_block_y_mask longs = 0
+                0, // sky_updates count = 0
+                0, // block_updates count = 0
+            ]
+        );
+    }
+
+    #[test]
+    fn level_chunk_with_light_round_trips_empty() {
+        round_trip(minimal_chunk_packet());
+    }
+
+    #[test]
+    fn level_chunk_with_light_round_trips_with_heightmaps_and_data() {
+        round_trip(LevelChunkWithLight {
+            chunk_x: -3,
+            chunk_z: 7,
+            heightmaps: vec![
+                ChunkHeightmap {
+                    type_id: ChunkHeightmap::MOTION_BLOCKING,
+                    data: vec![0x0123_4567_89AB_CDEF, 0],
+                },
+                ChunkHeightmap {
+                    type_id: ChunkHeightmap::WORLD_SURFACE,
+                    data: vec![-1; 4],
+                },
+            ],
+            data: (0..512).map(|i| (i & 0xFF) as u8).collect(),
+            block_entities: Vec::new(),
+            light: LightData::empty(),
+        });
+    }
+
+    #[test]
+    fn level_chunk_with_light_round_trips_with_non_empty_light_masks() {
+        round_trip(LevelChunkWithLight {
+            chunk_x: 0,
+            chunk_z: 0,
+            heightmaps: Vec::new(),
+            data: Vec::new(),
+            block_entities: Vec::new(),
+            light: LightData {
+                // All 26 indexable Y sections marked "has data".
+                sky_y_mask: vec![(1i64 << 26) - 1],
+                block_y_mask: vec![(1i64 << 26) - 1],
+                empty_sky_y_mask: Vec::new(),
+                empty_block_y_mask: Vec::new(),
+                sky_updates: vec![vec![0xFFu8; LightData::LIGHT_LAYER_BYTES]; 26],
+                block_updates: vec![vec![0u8; LightData::LIGHT_LAYER_BYTES]; 26],
+            },
+        });
+    }
+
+    #[test]
+    fn level_chunk_with_light_round_trips_with_block_entities() {
+        // Network-NBT compound with one byte tag inside, modelling a
+        // (toy) block entity payload.
+        let nbt = mc_nbt::Tag::Compound(vec![("k".to_string(), mc_nbt::Tag::Byte(42))]);
+        round_trip(LevelChunkWithLight {
+            chunk_x: 4,
+            chunk_z: -8,
+            heightmaps: Vec::new(),
+            data: Vec::new(),
+            block_entities: vec![BlockEntityInfo {
+                packed_xz: (3 << 4) | 9,
+                y: 64,
+                type_id: 7,
+                nbt,
+            }],
+            light: LightData::empty(),
+        });
+    }
+
+    #[test]
+    fn level_chunk_with_light_rejects_oversized_chunk_data_on_decode() {
+        // Hand-encode an i32(0), i32(0), heightmap-count VarInt(0), then
+        // a VarInt declaring (MAX_CHUNK_DATA_LEN + 1) bytes of chunk
+        // data. Decode should reject before allocating.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&0i32.to_be_bytes());
+        buf.extend_from_slice(&0i32.to_be_bytes());
+        buf.write_varint(0);
+        buf.write_varint((MAX_CHUNK_DATA_LEN + 1) as i32);
+        let mut cursor: &[u8] = &buf;
+        let err = LevelChunkWithLight::decode(&mut cursor).unwrap_err();
+        assert!(matches!(err, CodecError::StringTooLong { .. }));
     }
 }
