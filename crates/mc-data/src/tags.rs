@@ -154,7 +154,9 @@ fn entry_id_for(
     ours: &VanillaData,
     vanilla_ids: &BTreeMap<String, BTreeMap<String, i32>>,
 ) -> Option<i32> {
-    let path = registry_id.strip_prefix("minecraft:").unwrap_or(registry_id);
+    let path = registry_id
+        .strip_prefix("minecraft:")
+        .unwrap_or(registry_id);
     if let Some(reg) = ours.registry(path)
         && let Some(pos) = reg.entries.iter().position(|e| e.as_str() == entry_id)
     {
@@ -322,8 +324,8 @@ pub fn load(vanilla_dir: &Path, ours: &VanillaData) -> Result<TagsData, TagError
             &mut seen,
         );
 
-        let registry_ident = Identifier::parse(registry_id.clone())
-            .expect("TAG_ROOTS provides valid identifiers");
+        let registry_ident =
+            Identifier::parse(registry_id.clone()).expect("TAG_ROOTS provides valid identifiers");
         let tag_ident = Identifier::parse(format!("minecraft:{tag_path}"))
             .expect("tag path is a valid identifier");
         registries

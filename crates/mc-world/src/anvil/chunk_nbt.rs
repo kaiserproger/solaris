@@ -2,10 +2,9 @@
 //!
 //! Decodes the chunk NBT compound vanilla 26.1 writes into a `Chunk`,
 //! and emits the same shape back. The translation is **lossy**: fields
-//! we don't model in M2 (structures, block/fluid ticks, PostProcessing,
-//! per-section sky/block light, InhabitedTime, LastUpdate, DataVersion)
-//! are dropped on decode and not re-emitted. Acceptance round-trip is
-//! evaluated on the modelled subset:
+//! we don't model (structures, block/fluid ticks, PostProcessing,
+//! InhabitedTime, LastUpdate, DataVersion) are dropped on decode and
+//! not re-emitted. The modelled subset round-trips losslessly:
 //!
 //! - block states (palette + packed indices)
 //! - biomes (palette + packed indices)
@@ -13,6 +12,11 @@
 //! - block entities (re-encoded as opaque network NBT and stored in
 //!   the chunk's `block_entities` map, byte-identical on round-trip)
 //! - Status string, xPos / zPos
+//! - per-section `BlockLight` / `SkyLight` nibble arrays (decoded
+//!   into `Chunk::section_lights`; **not** re-emitted by
+//!   `chunk_to_nbt` — the on-disk light is informative for the wire
+//!   path, not load-bearing, so the encoder stays light-less to keep
+//!   the existing round-trip oracle scoped to block/biome data)
 
 use std::io::Cursor;
 
@@ -22,7 +26,8 @@ use thiserror::Error;
 
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
-    BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, Heightmap, MIN_SECTION_Y, SECTION_COUNT,
+    BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, Heightmap, LIGHT_LAYER_BYTES,
+    MIN_SECTION_Y, SECTION_COUNT, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
@@ -51,6 +56,12 @@ pub enum ChunkNbtError {
     SectionOutOfRange(i32),
     #[error("packed bit-array length mismatch: expected {expected} words, got {got}")]
     PackedWordMismatch { expected: usize, got: usize },
+    #[error("{field} has wrong byte length: expected {expected}, got {got}")]
+    LightLengthMismatch {
+        field: &'static str,
+        expected: usize,
+        got: usize,
+    },
 }
 
 // ---------------------------------------------------------------------
@@ -85,6 +96,7 @@ pub fn chunk_from_nbt(nbt: &Tag, registry: &BlockRegistry) -> Result<Chunk, Chun
             chunk.sections[idx] = decode_block_section(bs, registry, air)?;
             let bi = get_compound(cmp, "biomes")?;
             chunk.biomes[idx] = decode_biome_section(bi)?;
+            chunk.section_lights[idx] = decode_section_light(cmp)?;
         }
     }
 
@@ -226,6 +238,39 @@ fn decode_biome_section(nbt: &[(String, Tag)]) -> Result<BiomeSection, ChunkNbtE
             let indices = PackedBitArray::from_words(bits, BIOME_VOLUME, words);
             Ok(BiomeSection::from_indirect(palette, indices))
         }
+    }
+}
+
+fn decode_section_light(cmp: &[(String, Tag)]) -> Result<SectionLight, ChunkNbtError> {
+    Ok(SectionLight {
+        block: decode_light_layer(cmp, "BlockLight")?,
+        sky: decode_light_layer(cmp, "SkyLight")?,
+    })
+}
+
+fn decode_light_layer(
+    cmp: &[(String, Tag)],
+    field: &'static str,
+) -> Result<Option<Vec<u8>>, ChunkNbtError> {
+    let Some(tag) = cmp.iter().find(|(k, _)| k == field).map(|(_, v)| v) else {
+        return Ok(None);
+    };
+    match tag {
+        Tag::ByteArray(bytes) => {
+            if bytes.len() != LIGHT_LAYER_BYTES {
+                return Err(ChunkNbtError::LightLengthMismatch {
+                    field,
+                    expected: LIGHT_LAYER_BYTES,
+                    got: bytes.len(),
+                });
+            }
+            Ok(Some(bytes.iter().map(|&b| b as u8).collect()))
+        }
+        other => Err(ChunkNbtError::WrongType {
+            field,
+            expected: "ByteArray",
+            got: other.type_id(),
+        }),
     }
 }
 
@@ -658,5 +703,239 @@ mod tests {
         }
         assert!(probed > 0, "test region must have at least one chunk");
         eprintln!("round-tripped {probed} chunks");
+    }
+
+    fn nibble_pattern() -> Vec<i8> {
+        // Distinct values per byte so we can pin the byte order.
+        // Cast through u8 so the literal 0..=255 wraps cleanly into
+        // i8's -128..=127 range.
+        (0..LIGHT_LAYER_BYTES)
+            .map(|i| (i & 0xFF) as u8 as i8)
+            .collect()
+    }
+
+    fn build_section_with_light(
+        y: i8,
+        block_light: Option<Vec<i8>>,
+        sky_light: Option<Vec<i8>>,
+    ) -> Tag {
+        let mut s: Vec<(String, Tag)> = vec![
+            ("Y".into(), Tag::Byte(y)),
+            (
+                "block_states".into(),
+                Tag::Compound(vec![(
+                    "palette".into(),
+                    Tag::List(ListTag {
+                        element_type: tag_type::COMPOUND,
+                        elements: vec![Tag::Compound(vec![(
+                            "Name".into(),
+                            Tag::String("minecraft:air".into()),
+                        )])],
+                    }),
+                )]),
+            ),
+            (
+                "biomes".into(),
+                Tag::Compound(vec![(
+                    "palette".into(),
+                    Tag::List(ListTag {
+                        element_type: tag_type::STRING,
+                        elements: vec![Tag::String("minecraft:plains".into())],
+                    }),
+                )]),
+            ),
+        ];
+        if let Some(bl) = block_light {
+            s.push(("BlockLight".into(), Tag::ByteArray(bl)));
+        }
+        if let Some(sl) = sky_light {
+            s.push(("SkyLight".into(), Tag::ByteArray(sl)));
+        }
+        Tag::Compound(s)
+    }
+
+    fn build_chunk_root_with_sections(sections: Vec<Tag>) -> Tag {
+        Tag::Compound(vec![
+            ("xPos".into(), Tag::Int(0)),
+            ("zPos".into(), Tag::Int(0)),
+            ("yPos".into(), Tag::Int(MIN_SECTION_Y)),
+            ("Status".into(), Tag::String("minecraft:full".into())),
+            (
+                "sections".into(),
+                Tag::List(ListTag {
+                    element_type: tag_type::COMPOUND,
+                    elements: sections,
+                }),
+            ),
+        ])
+    }
+
+    fn tiny_registry() -> BlockRegistry {
+        // Two blocks suffice for the M4.a tests: air and stone, each
+        // with a single default state. Built inline so the test
+        // doesn't depend on the full vanilla report being on disk.
+        use std::collections::BTreeMap;
+        let report = vec![
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+        ];
+        BlockRegistry::from_report(&report).unwrap()
+    }
+
+    #[test]
+    fn decodes_per_section_light_arrays_when_present() {
+        let pattern = nibble_pattern();
+        let root = build_chunk_root_with_sections(vec![
+            build_section_with_light(-4, Some(pattern.clone()), Some(pattern.clone())),
+            build_section_with_light(0, None, Some(pattern.clone())),
+        ]);
+        let chunk = chunk_from_nbt(&root, &tiny_registry()).expect("decode");
+
+        let expected: Vec<u8> = pattern.iter().map(|&b| b as u8).collect();
+
+        // Section Y=-4 → idx 0: both layers present.
+        assert_eq!(
+            chunk.section_lights[0].block.as_deref(),
+            Some(&expected[..])
+        );
+        assert_eq!(chunk.section_lights[0].sky.as_deref(), Some(&expected[..]));
+
+        // Section Y=0 → idx 4: only sky present.
+        assert_eq!(chunk.section_lights[4].block, None);
+        assert_eq!(chunk.section_lights[4].sky.as_deref(), Some(&expected[..]));
+
+        // Untouched sections keep the default (no light).
+        assert_eq!(chunk.section_lights[1], SectionLight::default());
+        assert_eq!(chunk.section_lights[23], SectionLight::default());
+
+        // Layer is exactly LIGHT_LAYER_BYTES bytes; sanity-check the
+        // i8 → u8 reinterpretation didn't shift anything.
+        let sky = chunk.section_lights[0].sky.as_deref().unwrap();
+        assert_eq!(sky.len(), LIGHT_LAYER_BYTES);
+        assert_eq!(sky[0x00], 0x00);
+        assert_eq!(sky[0x7F], 0x7F);
+        assert_eq!(sky[0x80], 0x80);
+        assert_eq!(sky[0xFF], 0xFF);
+    }
+
+    #[test]
+    fn rejects_wrong_length_light_array() {
+        let truncated: Vec<i8> = vec![0; LIGHT_LAYER_BYTES - 1];
+        let root = build_chunk_root_with_sections(vec![build_section_with_light(
+            0,
+            Some(truncated),
+            None,
+        )]);
+        match chunk_from_nbt(&root, &tiny_registry()) {
+            Err(ChunkNbtError::LightLengthMismatch {
+                field,
+                expected,
+                got,
+            }) => {
+                assert_eq!(field, "BlockLight");
+                assert_eq!(expected, LIGHT_LAYER_BYTES);
+                assert_eq!(got, LIGHT_LAYER_BYTES - 1);
+            }
+            other => panic!("expected LightLengthMismatch, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rejects_wrong_type_light_field() {
+        let root = build_chunk_root_with_sections(vec![Tag::Compound(vec![
+            ("Y".into(), Tag::Byte(0)),
+            (
+                "block_states".into(),
+                Tag::Compound(vec![(
+                    "palette".into(),
+                    Tag::List(ListTag {
+                        element_type: tag_type::COMPOUND,
+                        elements: vec![Tag::Compound(vec![(
+                            "Name".into(),
+                            Tag::String("minecraft:air".into()),
+                        )])],
+                    }),
+                )]),
+            ),
+            (
+                "biomes".into(),
+                Tag::Compound(vec![(
+                    "palette".into(),
+                    Tag::List(ListTag {
+                        element_type: tag_type::STRING,
+                        elements: vec![Tag::String("minecraft:plains".into())],
+                    }),
+                )]),
+            ),
+            ("SkyLight".into(), Tag::Int(0)),
+        ])]);
+        match chunk_from_nbt(&root, &tiny_registry()) {
+            Err(ChunkNbtError::WrongType { field, .. }) => assert_eq!(field, "SkyLight"),
+            other => panic!("expected WrongType for SkyLight, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn real_test_world_carries_some_baked_skylight() {
+        let region_path = workspace_path(".analysis/test-world/region/r.0.0.mca");
+        let blocks_path = workspace_path("data/vanilla/reports/blocks.json");
+        if !region_path.is_file() || !blocks_path.is_file() {
+            eprintln!("skipping: prerequisites missing");
+            return;
+        }
+        let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
+        let registry = BlockRegistry::from_report(&report).unwrap();
+        let payloads = region::read_region(&region_path).unwrap();
+
+        let mut chunks_with_sky = 0usize;
+        let mut sections_with_sky = 0usize;
+        for payload in &payloads {
+            let mut cur = Cursor::new(&payload.uncompressed_nbt[..]);
+            let (_, root) = mc_nbt::read_named(&mut cur).unwrap();
+            let chunk = chunk_from_nbt(&root, &registry).expect("decode");
+
+            let chunk_has_sky = chunk.section_lights.iter().any(|sl| sl.sky.is_some());
+            if chunk_has_sky {
+                chunks_with_sky += 1;
+            }
+            for sl in &chunk.section_lights {
+                if let Some(layer) = &sl.sky {
+                    assert_eq!(layer.len(), LIGHT_LAYER_BYTES);
+                    sections_with_sky += 1;
+                }
+                if let Some(layer) = &sl.block {
+                    assert_eq!(layer.len(), LIGHT_LAYER_BYTES);
+                }
+            }
+        }
+
+        // The bundled test world has at least one `minecraft:full`
+        // chunk with baked sky-light on at least one section. This
+        // pins the decode path against real bytes; loosen the bound
+        // when the test world is regenerated.
+        assert!(
+            chunks_with_sky >= 1,
+            "expected ≥1 chunk with baked SkyLight, got {chunks_with_sky}",
+        );
+        assert!(
+            sections_with_sky >= 1,
+            "expected ≥1 section with baked SkyLight, got {sections_with_sky}",
+        );
     }
 }

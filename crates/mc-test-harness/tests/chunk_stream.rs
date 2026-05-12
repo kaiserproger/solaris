@@ -1,4 +1,5 @@
-//! M3.g — raw-TCP integration test for the chunk-streaming spawn burst.
+//! M3.g / M4.f — raw-TCP integration test for the chunk-streaming
+//! spawn burst.
 //!
 //! Boots `mc_net::run` on an ephemeral port with a real
 //! `WorldStorage` opened on `.analysis/test-world/`, walks
@@ -7,6 +8,12 @@
 //! spawn arrives as `LevelChunkWithLight` packets — each with the
 //! expected coordinates, non-empty client-usage heightmaps, and a
 //! non-empty chunk-data blob.
+//!
+//! M4.f extends the assertions to the bundled `LightData` payload:
+//! when `block_light.json` is present, every chunk's sky / block
+//! masks must cover all 26 wire slots between the present and empty
+//! channels, the layer counts must match the mask popcount, and the
+//! spawn chunk's above-world slot must ship 0xFF nibbles (open sky).
 //!
 //! Skipped silently when the test-world or `blocks.json` is missing,
 //! matching the M2 round-trip oracle's pattern.
@@ -48,10 +55,26 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let storage = mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks))
-        .expect("world storage opens");
+    let storage =
+        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+
+    // block_light.json is optional — when missing, the M4.f assertions
+    // are skipped but the M3.g shape assertions still run. This keeps
+    // CI green on a fresh checkout that hasn't run extract-block-light.sh.
+    let block_light_path = vanilla_dir.join("reports/block_light.json");
+    let block_light = match mc_data::block_light::load(&block_light_path) {
+        Ok(table) => Some(Arc::new(table)),
+        Err(err) => {
+            eprintln!(
+                "M4.f light assertions skipped: {} ({err})",
+                block_light_path.display()
+            );
+            None
+        }
+    };
+    let assert_light = block_light.is_some();
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -61,6 +84,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         blocks,
         world,
         tags,
+        block_light,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -73,7 +97,10 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         .drive_login(addr, "M3gTester")
         .await
         .expect("drive login");
-    client.drive_configuration().await.expect("drive configuration");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
 
     // Spawn burst, in the order `mc_net::play::handle` emits it.
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
@@ -113,7 +140,11 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     // assert its heightmaps explicitly after the loop.
     let mut chunks_with_heightmaps = 0usize;
     let mut spawn_heightmaps_seen = 0usize;
-    let timeout = Duration::from_secs(60);
+    // 180 s gives the M4.f light-bearing burst comfortable margin in
+    // debug builds; the M3.g shape-only burst finishes in ~5 s, M4.f's
+    // BFS-per-chunk run brings that up to ~30-40 s in isolation and
+    // ~50-70 s when other workspace tests run in parallel.
+    let timeout = Duration::from_secs(180);
     let deadline = tokio::time::Instant::now() + timeout;
     while seen.len() < expected_count {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -160,12 +191,14 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         if (pkt.chunk_x, pkt.chunk_z) == (0, 0) {
             spawn_heightmaps_seen = pkt.heightmaps.len();
         }
+        if assert_light {
+            assert_light_invariants(&pkt);
+        }
         let fresh = seen.insert((pkt.chunk_x, pkt.chunk_z));
         assert!(
             fresh,
             "duplicate chunk ({}, {}) on the wire",
-            pkt.chunk_x,
-            pkt.chunk_z
+            pkt.chunk_x, pkt.chunk_z
         );
     }
 
@@ -202,4 +235,111 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         "no chunk in the ring carried client-usage heightmaps — \
          encode_chunk_data is probably dropping them"
     );
+}
+
+/// M4.f: every streamed chunk must carry a wire LightData whose
+/// present + empty masks cover all 26 sections, with the present
+/// layer count matching the mask popcount. The above-world slot
+/// (bit 25) must always be present in the sky mask and carry an
+/// all-0xFF nibble layer (open sky).
+fn assert_light_invariants(pkt: &LevelChunkWithLight) {
+    let light = &pkt.light;
+    let sky_mask = mask_to_u64(&light.sky_y_mask);
+    let empty_sky_mask = mask_to_u64(&light.empty_sky_y_mask);
+    let block_mask = mask_to_u64(&light.block_y_mask);
+    let empty_block_mask = mask_to_u64(&light.empty_block_y_mask);
+
+    const ALL_26: u64 = (1 << 26) - 1;
+    assert_eq!(
+        sky_mask | empty_sky_mask,
+        ALL_26,
+        "sky present+empty must cover slots 0..=25 for chunk ({}, {}); \
+         got present={sky_mask:#X} empty={empty_sky_mask:#X}",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+    assert_eq!(
+        sky_mask & empty_sky_mask,
+        0,
+        "sky present/empty masks must be disjoint for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+    assert_eq!(
+        light.sky_updates.len(),
+        sky_mask.count_ones() as usize,
+        "sky_updates count must match popcount of sky mask for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+
+    assert_eq!(
+        block_mask | empty_block_mask,
+        ALL_26,
+        "block present+empty must cover slots 0..=25 for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+    assert_eq!(
+        block_mask & empty_block_mask,
+        0,
+        "block present/empty masks must be disjoint for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+    assert_eq!(
+        light.block_updates.len(),
+        block_mask.count_ones() as usize,
+        "block_updates count must match popcount of block mask for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+
+    // Slot 25 (Y=20, the above-world slab) is open sky — always
+    // present in the sky channel as all-0xFF.
+    assert!(
+        sky_mask & (1 << 25) != 0,
+        "slot 25 (above-world) must be present in sky mask for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+    // The above-world layer is the *last* one we emit (M4.d emits in
+    // ascending slot order, slot 25 last).
+    let last_sky = light
+        .sky_updates
+        .last()
+        .expect("sky_updates non-empty when slot 25 is present");
+    assert!(
+        last_sky.iter().all(|&b| b == 0xFF),
+        "above-world sky slab must be all-0xFF nibbles for chunk ({}, {})",
+        pkt.chunk_x,
+        pkt.chunk_z,
+    );
+
+    // Every present layer must be exactly 2048 bytes (one section of
+    // 4-bit nibbles).
+    for (slot_idx, layer) in light.sky_updates.iter().enumerate() {
+        assert_eq!(
+            layer.len(),
+            2048,
+            "sky layer {slot_idx} has {} bytes (expected 2048) on chunk ({}, {})",
+            layer.len(),
+            pkt.chunk_x,
+            pkt.chunk_z,
+        );
+    }
+    for (slot_idx, layer) in light.block_updates.iter().enumerate() {
+        assert_eq!(
+            layer.len(),
+            2048,
+            "block layer {slot_idx} has {} bytes (expected 2048) on chunk ({}, {})",
+            layer.len(),
+            pkt.chunk_x,
+            pkt.chunk_z,
+        );
+    }
+}
+
+fn mask_to_u64(longs: &[i64]) -> u64 {
+    longs.first().copied().unwrap_or(0) as u64
 }

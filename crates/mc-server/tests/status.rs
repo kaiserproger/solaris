@@ -34,6 +34,7 @@ async fn start_server(motd: &str) -> SocketAddr {
         ),
         world: None,
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
+        block_light: None,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

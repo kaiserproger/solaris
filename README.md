@@ -6,17 +6,18 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M3 complete on `dev/M3-chunk-streaming`, awaiting `m3`
-tag. A vanilla 26.1.2 client connecting to Solaris walks Handshake →
-Login → Configuration → Play, receives the full vanilla tag set via
-`Update Tags`, and renders the spawn floor from
-`.analysis/test-world/` streamed straight out of `WorldStorage`. An
-automated raw-TCP harness (`mc-test-harness::client`) drives the same
-flow against the bundled test world as the CI gate; the manual
-acceptance gate has been driven through with a PrismLauncher 26.1.2
-client. Lighting is empty arrays only (next milestone) — surrounding
-chunks render dark while the player's tile gets the client's local
-skylight pass.
+**Status:** M4 complete on `dev/M4-lighting`, awaiting `m4` tag. A
+vanilla 26.1.2 client connecting to Solaris walks Handshake → Login →
+Configuration → Play, receives the full vanilla tag set via
+`Update Tags`, renders the spawn floor from `.analysis/test-world/`
+streamed straight out of `WorldStorage`, and now also receives
+real sky / block light: every `LevelChunkWithLight` packet carries
+nibble layers from `mc_world::light`'s BFS propagation engine
+(seeded by an extracted per-block-state emission / opacity /
+sky-propagation table from `tools/extract-block-light.sh`). The
+manual gate has been re-driven through with a PrismLauncher 26.1.2
+client: terrain loads, spawn drops the player on grass, the world
+renders lit through the view-distance window.
 
 ## Build
 

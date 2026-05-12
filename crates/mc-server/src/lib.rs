@@ -87,6 +87,7 @@ impl ServerConfig {
         blocks: Arc<BlockRegistry>,
         world: Option<WorldHandle>,
         tags: Arc<TagsData>,
+        block_light: Option<Arc<mc_data::block_light::BlockLightTable>>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
         Ok(mc_net::ServerConfig {
@@ -97,6 +98,7 @@ impl ServerConfig {
             blocks,
             world,
             tags,
+            block_light,
         })
     }
 }
@@ -149,7 +151,7 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
         let net = cfg
-            .to_network(data, stub_blocks(), None, stub_tags())
+            .to_network(data, stub_blocks(), None, stub_tags(), None)
             .unwrap();
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
@@ -172,7 +174,7 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
         assert!(
-            cfg.to_network(data, stub_blocks(), None, stub_tags())
+            cfg.to_network(data, stub_blocks(), None, stub_tags(), None)
                 .is_err()
         );
     }

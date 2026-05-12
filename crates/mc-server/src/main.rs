@@ -125,8 +125,34 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let block_light_path = cfg
+        .data
+        .vanilla_dir
+        .join("reports")
+        .join("block_light.json");
+    let block_light = match mc_data::block_light::load(&block_light_path) {
+        Ok(table) => {
+            tracing::info!(
+                version = %table.version,
+                states = table.len(),
+                path = %block_light_path.display(),
+                "block-light table loaded",
+            );
+            Some(Arc::new(table))
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %block_light_path.display(),
+                error = %err,
+                "block-light table load failed; chunk streaming will keep emitting \
+                 LightData::empty() until tools/extract-block-light.sh is run",
+            );
+            None
+        }
+    };
+
     let net = cfg
-        .to_network(data, blocks, world, tags)
+        .to_network(data, blocks, world, tags, block_light)
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,

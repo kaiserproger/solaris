@@ -21,3 +21,7 @@
 /data/vanilla/data/
 /data/vanilla/version.json
 /data/vanilla/reports/
+
+# Side-effect of running vanilla-server-derived helpers (Bootstrap
+# initialises a log4j root logger that writes here). Local-only.
+/logs/
