@@ -13,4 +13,9 @@ workspace = true
 
 [dependencies]
 mc-data = { path = "../mc-data" }
+mc-nbt = { path = "../mc-nbt" }
+flate2 = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -4,6 +4,7 @@
 //!
 //! Part of the Solaris engine.
 
+pub mod anvil;
 pub mod block;
 pub mod chunk;
 pub mod section;
