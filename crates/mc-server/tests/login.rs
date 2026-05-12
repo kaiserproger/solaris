@@ -30,6 +30,10 @@ async fn start_server() -> SocketAddr {
         motd: "M1.d login".into(),
         max_players: 8,
         data: std::sync::Arc::new(mc_data::testing::stub()),
+        blocks: std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        world: None,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

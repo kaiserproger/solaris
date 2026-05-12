@@ -34,6 +34,7 @@ use tracing::{debug, info, warn};
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
+use crate::server::ServerConfig;
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
@@ -67,12 +68,18 @@ pub(crate) async fn handle<R, W>(
     writer: &mut W,
     buf: &mut BytesMut,
     profile: &LoggedInProfile,
-    data: &VanillaData,
+    config: &ServerConfig,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
+    // `world` and `blocks` ride along on the config but are not yet
+    // consumed — M3.d wires them into a Set-Center-Chunk + single-
+    // chunk emission, M3.e expands to the view-distance window. The
+    // M1 spawn-burst behaviour below is unchanged.
+    let _ = (&config.blocks, &config.world);
+    let data: &VanillaData = &config.data;
     let (dim_id, dim_name, dim_names) = spawn_dimension(data).ok_or_else(|| {
         ConnectionError::Codec(mc_protocol::CodecError::InvalidIdentifier(
             "no dimension_type entries available".into(),

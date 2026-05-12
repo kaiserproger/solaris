@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mc_data::VanillaData;
+use mc_net::WorldHandle;
+use mc_world::BlockRegistry;
 use serde::{Deserialize, Serialize};
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -76,10 +78,13 @@ fn default_vanilla_dir() -> PathBuf {
 
 impl ServerConfig {
     /// Convert a parsed TOML config into the network-layer
-    /// [`mc_net::ServerConfig`], using the pre-loaded vanilla data.
+    /// [`mc_net::ServerConfig`], using the pre-loaded vanilla data,
+    /// block registry, and (optionally) a shared world handle.
     pub fn to_network(
         &self,
         data: Arc<VanillaData>,
+        blocks: Arc<BlockRegistry>,
+        world: Option<WorldHandle>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
         Ok(mc_net::ServerConfig {
@@ -87,6 +92,8 @@ impl ServerConfig {
             motd: self.server.motd.clone(),
             max_players: self.server.max_players,
             data,
+            blocks,
+            world,
         })
     }
 }
@@ -113,6 +120,10 @@ mod tests {
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
     }
 
+    fn stub_blocks() -> Arc<BlockRegistry> {
+        Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"))
+    }
+
     #[test]
     fn translates_to_network_config() {
         let toml_src = r#"
@@ -130,10 +141,11 @@ mod tests {
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
-        let net = cfg.to_network(data).unwrap();
+        let net = cfg.to_network(data, stub_blocks(), None).unwrap();
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
         assert_eq!(net.bind_address.port(), 25000);
+        assert!(net.world.is_none());
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("/tmp/vanilla"));
     }
 
@@ -150,6 +162,6 @@ mod tests {
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
-        assert!(cfg.to_network(data).is_err());
+        assert!(cfg.to_network(data, stub_blocks(), None).is_err());
     }
 }

@@ -492,6 +492,7 @@ dependencies = [
  "bytes",
  "mc-data",
  "mc-protocol",
+ "mc-world",
  "md-5",
  "serde",
  "serde_json",

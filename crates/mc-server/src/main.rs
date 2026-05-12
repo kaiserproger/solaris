@@ -63,6 +63,10 @@ async fn serve(path: &Path) -> Result<()> {
         )
     })?;
     let block_states: usize = blocks_report.iter().map(|b| b.states.len()).sum();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&blocks_report)
+            .context("building block-state registry from blocks.json")?,
+    );
     tracing::info!(
         blocks = blocks_report.len(),
         states = block_states,
@@ -70,16 +74,17 @@ async fn serve(path: &Path) -> Result<()> {
         "block registry source loaded",
     );
 
-    if let Some(world_dir) = &cfg.data.world_dir {
-        match mc_world::WorldStorage::open(world_dir, &blocks_report) {
-            Ok(world) => {
+    let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
+        match mc_world::WorldStorage::open(world_dir, Arc::clone(&blocks)) {
+            Ok(storage) => {
                 let region_count = count_region_files(world_dir);
                 tracing::info!(
                     path = %world_dir.display(),
-                    block_count = world.registry().len(),
+                    block_count = storage.registry().len(),
                     region_files = region_count,
                     "world storage opened",
                 );
+                Some(Arc::new(tokio::sync::Mutex::new(storage)))
             }
             Err(err) => {
                 tracing::warn!(
@@ -87,16 +92,18 @@ async fn serve(path: &Path) -> Result<()> {
                     error = %err,
                     "world directory not usable; starting without world (chunk queries will return None)",
                 );
+                None
             }
         }
     } else {
         tracing::warn!(
-            "no [data].world_dir configured; chunk queries will return None until M3 wires the world into the network layer",
+            "no [data].world_dir configured; chunks will not stream until one is wired up",
         );
-    }
+        None
+    };
 
     let net = cfg
-        .to_network(Arc::new(data))
+        .to_network(Arc::new(data), blocks, world)
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,

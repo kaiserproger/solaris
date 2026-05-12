@@ -431,8 +431,11 @@ mod tests {
             return;
         }
         let report = mc_data::blocks::load_blocks_report(&report_path).expect("blocks.json loads");
+        let registry = std::sync::Arc::new(
+            crate::BlockRegistry::from_report(&report).expect("block registry builds"),
+        );
 
-        let mut storage = WorldStorage::open(&world_dir, &report).expect("test world opens");
+        let mut storage = WorldStorage::open(&world_dir, registry).expect("test world opens");
         let chunk = storage
             .get_chunk(ChunkPos { x: 0, z: 0 })
             .expect("chunk (0,0) reads without error")

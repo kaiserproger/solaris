@@ -11,8 +11,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use mc_data::blocks::BlockReport;
 use thiserror::Error;
 
 use crate::anvil::{ChunkNbtError, RegionError, chunk_from_nbt, read_region};
@@ -38,7 +38,7 @@ pub enum WorldError {
 /// Read-only handle to a world's chunk data.
 pub struct WorldStorage {
     region_root: PathBuf,
-    registry: BlockRegistry,
+    registry: Arc<BlockRegistry>,
     /// LRU of fully decoded chunks, keyed by chunk position.
     cache: HashMap<ChunkPos, Chunk>,
     /// MRU at the back, LRU at the front. On `get_chunk` we move
@@ -50,19 +50,20 @@ pub struct WorldStorage {
 impl WorldStorage {
     /// Open a world directory. Tries the 1.20+ layout
     /// (`dimensions/minecraft/overworld/region/`) first, falls back
-    /// to the pre-1.20 flat layout (`region/`). Loads the block
-    /// registry from `blocks_report` so block queries can resolve
-    /// palette entries.
+    /// to the pre-1.20 flat layout (`region/`). The caller supplies
+    /// the block registry by `Arc` so the same registry can be shared
+    /// with the rest of the runtime without re-parsing `blocks.json`
+    /// for each subsystem.
     pub fn open(
         world_dir: impl AsRef<Path>,
-        blocks_report: &[BlockReport],
+        registry: Arc<BlockRegistry>,
     ) -> Result<Self, WorldError> {
-        Self::open_with_capacity(world_dir, blocks_report, DEFAULT_LRU_CAPACITY)
+        Self::open_with_capacity(world_dir, registry, DEFAULT_LRU_CAPACITY)
     }
 
     pub fn open_with_capacity(
         world_dir: impl AsRef<Path>,
-        blocks_report: &[BlockReport],
+        registry: Arc<BlockRegistry>,
         capacity: usize,
     ) -> Result<Self, WorldError> {
         let dir = world_dir.as_ref();
@@ -83,8 +84,6 @@ impl WorldStorage {
             return Err(WorldError::Missing(candidate_modern));
         };
 
-        let registry = BlockRegistry::from_report(blocks_report).expect("registry must build");
-
         Ok(Self {
             region_root,
             registry,
@@ -97,6 +96,14 @@ impl WorldStorage {
     #[must_use]
     pub fn registry(&self) -> &BlockRegistry {
         &self.registry
+    }
+
+    /// Hand out a shared handle to the block registry so callers
+    /// outside `mc-world` can keep it alive (and look up palettes)
+    /// without holding the `WorldStorage` itself.
+    #[must_use]
+    pub fn registry_arc(&self) -> Arc<BlockRegistry> {
+        Arc::clone(&self.registry)
     }
 
     /// Look up the block at an absolute world position. Returns
@@ -254,7 +261,8 @@ mod tests {
             return;
         }
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
-        let mut world = WorldStorage::open_with_capacity(&world_dir, &report, 4).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
 
         let resolve = |w: &WorldStorage, id: BlockStateId| {
             w.registry()
