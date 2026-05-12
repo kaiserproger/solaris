@@ -19,21 +19,9 @@ use std::sync::Arc;
 
 use mc_data::Identifier;
 use mc_world::chunk::{Chunk, ChunkPos, Heightmap, MIN_Y};
-use mc_world::{BlockRegistry, BlockStateId};
+use mc_world::{BlockRegistry, BlockStateId, ChunkGenerator};
 
 use crate::noise::fbm_2d;
-
-/// Production interface every generator implements.
-///
-/// `Send + Sync` because the world handle that owns the generator is
-/// shared across the network listener's connection tasks via
-/// `Arc<Mutex<WorldStorage>>`.
-pub trait ChunkGenerator: Send + Sync {
-    /// Build a brand-new `Chunk` for the given position. The
-    /// returned chunk is "fresh" — `dirty` is set so the M6 flush
-    /// path persists it to disk before the cache evicts it.
-    fn generate(&self, pos: ChunkPos) -> Chunk;
-}
 
 /// Default terrain centre. Chosen so the player spawns on top of
 /// the surface without needing to fall.

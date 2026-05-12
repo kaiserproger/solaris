@@ -218,6 +218,23 @@ pub struct Chunk {
     pub dirty: bool,
 }
 
+/// M7: production interface every chunk generator implements. Lives
+/// in `mc-world` rather than `mc-worldgen` so `WorldStorage` can hold
+/// an `Arc<dyn ChunkGenerator>` without taking a dep cycle. The
+/// concrete implementation (`mc_worldgen::TerrainGenerator`) is
+/// supplied by the binary at startup.
+///
+/// `Send + Sync` because the world is shared across the network
+/// listener's connection tasks via `Arc<Mutex<WorldStorage>>`.
+pub trait ChunkGenerator: Send + Sync {
+    /// Build a brand-new `Chunk` for the given position. Generated
+    /// chunks must come back with `dirty = true` so the M6 flush
+    /// pipeline persists them before the cache evicts them — re-
+    /// running the generator on every miss would be a perf
+    /// regression on a world the player has already touched.
+    fn generate(&self, pos: ChunkPos) -> Chunk;
+}
+
 impl Chunk {
     /// A column filled with `air` blocks and `biome` everywhere, no
     /// block entities, no heightmaps, status `"full"`.
