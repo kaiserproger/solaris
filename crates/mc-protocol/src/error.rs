@@ -63,4 +63,10 @@ pub enum CodecError {
     /// `mc-nbt`'s own error variant is preserved.
     #[error("nbt error: {0}")]
     Nbt(#[from] NbtError),
+
+    /// The decoder met a wire shape it is not equipped to handle in the
+    /// current milestone scope (e.g. an ItemStack with DataComponentPatch
+    /// entries before M7+ wires that path).
+    #[error("not supported: {0}")]
+    NotSupported(&'static str),
 }

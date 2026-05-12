@@ -1127,6 +1127,222 @@ fn sign_extend_12(v: i32) -> i32 {
     if v & 0x800 != 0 { v | !0xFFF } else { v }
 }
 
+// ---------------------------------------------------------------------
+// M6 — Inventory packets
+// ---------------------------------------------------------------------
+
+/// One slot of a vanilla container. The modern wire format encodes an
+/// empty stack as a single zero-byte `count` VarInt; a non-empty stack
+/// is `(count, item_id, components_to_add, components_to_remove,
+/// [DataComponentPatch entries…])`. M6 only emits stacks with zero
+/// component patches, so the encoder writes two trailing zero VarInts;
+/// the decoder reads them back and refuses non-zero patch counts —
+/// full DataComponentPatch handling is M7+.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ItemStack {
+    /// `0` ⇒ empty slot; `count > 0` ⇒ `count` copies of `item_id`.
+    pub count: i32,
+    /// Item-registry id (the protocol_id from
+    /// `data/vanilla/reports/registries.json:minecraft:item`).
+    pub item_id: u32,
+}
+
+impl ItemStack {
+    /// An empty slot.
+    pub const EMPTY: ItemStack = ItemStack {
+        count: 0,
+        item_id: 0,
+    };
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count <= 0
+    }
+
+    #[must_use]
+    pub fn new(item_id: u32, count: i32) -> Self {
+        Self { count, item_id }
+    }
+
+    pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.is_empty() {
+            buf.write_varint(0);
+            return Ok(());
+        }
+        buf.write_varint(self.count);
+        buf.write_varint(self.item_id as i32);
+        // No component patches in M6.
+        buf.write_varint(0);
+        buf.write_varint(0);
+        Ok(())
+    }
+
+    pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = buf.read_varint()?;
+        if count <= 0 {
+            return Ok(Self::EMPTY);
+        }
+        let item_id = buf.read_varint()? as u32;
+        let n_add = buf.read_varint()?;
+        let n_remove = buf.read_varint()?;
+        if n_add != 0 || n_remove != 0 {
+            return Err(CodecError::NotSupported(
+                "ItemStack with DataComponentPatch (M7+)",
+            ));
+        }
+        Ok(Self { count, item_id })
+    }
+}
+
+/// `Clientbound Set Held Slot` (CB). Tells the client which hotbar
+/// slot the server believes is selected. Server emits this on login
+/// to seed the cursor. Per ADR 0002, verified against `javap -p`:
+/// `ClientboundSetHeldSlotPacket(int slot)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundSetHeldSlot {
+    pub slot: i32,
+}
+
+impl Packet for ClientboundSetHeldSlot {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_SET_HELD_SLOT at game-CB index 105 = wire id 0x69.
+    const ID: i32 = 0x69;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.slot);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            slot: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Container Set Content` (CB). Replaces every slot of a
+/// container in one packet. M6 uses it on login to seed window 0
+/// (player inventory) with the starter kit. Per ADR 0002, verified
+/// against `javap -p`:
+/// `ClientboundContainerSetContentPacket(int containerId, int stateId,
+/// List<ItemStack> items, ItemStack carriedItem)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundContainerSetContent {
+    pub container_id: i32,
+    pub state_id: i32,
+    pub items: Vec<ItemStack>,
+    pub carried_item: ItemStack,
+}
+
+impl Packet for ClientboundContainerSetContent {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_CONTAINER_SET_CONTENT at game-CB index 18 = wire id 0x12.
+    const ID: i32 = 0x12;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.state_id);
+        let len = i32::try_from(self.items.len()).map_err(|_| CodecError::StringTooLong {
+            len: self.items.len(),
+            max: i32::MAX as usize,
+        })?;
+        buf.write_varint(len);
+        for item in &self.items {
+            item.encode(buf)?;
+        }
+        self.carried_item.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let container_id = buf.read_varint()?;
+        let state_id = buf.read_varint()?;
+        let len_signed = buf.read_varint()?;
+        if len_signed < 0 {
+            return Err(CodecError::NegativeLength(len_signed));
+        }
+        // A vanilla player inventory is 46 slots; allow up to 256 as
+        // a soft cap so future container types still fit.
+        let len = len_signed as usize;
+        if len > 256 {
+            return Err(CodecError::StringTooLong { len, max: 256 });
+        }
+        let mut items = Vec::with_capacity(len);
+        for _ in 0..len {
+            items.push(ItemStack::decode(buf)?);
+        }
+        let carried_item = ItemStack::decode(buf)?;
+        Ok(Self {
+            container_id,
+            state_id,
+            items,
+            carried_item,
+        })
+    }
+}
+
+/// `Clientbound Container Set Slot` (CB). Single-slot update inside a
+/// container. M6 emits one of these after a place mutation to
+/// decrement the held stack's count. Per ADR 0002, verified against
+/// `javap -p`:
+/// `ClientboundContainerSetSlotPacket(int containerId, int stateId,
+/// int slot, ItemStack itemStack)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundContainerSetSlot {
+    pub container_id: i32,
+    pub state_id: i32,
+    pub slot: i32,
+    pub item_stack: ItemStack,
+}
+
+impl Packet for ClientboundContainerSetSlot {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_CONTAINER_SET_SLOT at game-CB index 20 = wire id 0x14.
+    const ID: i32 = 0x14;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.state_id);
+        buf.write_varint(self.slot);
+        self.item_stack.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+            state_id: buf.read_varint()?,
+            slot: buf.read_varint()?,
+            item_stack: ItemStack::decode(buf)?,
+        })
+    }
+}
+
+/// `Serverbound Set Carried Item` (SB). Sent when the client scrolls
+/// the hotbar — `slot` ∈ `0..=8`. Per ADR 0002, verified against
+/// `javap -p`: `ServerboundSetCarriedItemPacket(short slot)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundSetCarriedItem {
+    pub slot: i16,
+}
+
+impl Packet for ServerboundSetCarriedItem {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // SERVERBOUND_SET_CARRIED_ITEM at game-SB index 53 = wire id 0x35.
+    const ID: i32 = 0x35;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i16(self.slot);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            slot: buf.read_i16()?,
+        })
+    }
+}
+
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------
@@ -1540,5 +1756,79 @@ mod tests {
             chunk_z: 7,
             light,
         });
+    }
+
+    #[test]
+    fn item_stack_empty_round_trips_as_single_zero_byte() {
+        let mut buf = Vec::new();
+        ItemStack::EMPTY.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0u8]);
+        let mut cur: &[u8] = &buf;
+        assert_eq!(ItemStack::decode(&mut cur).unwrap(), ItemStack::EMPTY);
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn item_stack_non_empty_round_trips() {
+        let stone = ItemStack::new(1, 64);
+        let mut buf = Vec::new();
+        stone.encode(&mut buf).unwrap();
+        // count=64 (0x40), item_id=1, n_add=0, n_remove=0.
+        assert_eq!(buf, vec![0x40, 0x01, 0x00, 0x00]);
+        let mut cur: &[u8] = &buf;
+        assert_eq!(ItemStack::decode(&mut cur).unwrap(), stone);
+    }
+
+    #[test]
+    fn item_stack_decoder_refuses_component_patches() {
+        // count=1, item_id=1, n_add=1 (unsupported), …
+        let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00];
+        let mut cur: &[u8] = &bytes;
+        let err = ItemStack::decode(&mut cur).unwrap_err();
+        assert!(matches!(err, CodecError::NotSupported(_)));
+    }
+
+    #[test]
+    fn set_held_slot_round_trip() {
+        round_trip(ClientboundSetHeldSlot { slot: 0 });
+        round_trip(ClientboundSetHeldSlot { slot: 3 });
+    }
+
+    #[test]
+    fn container_set_content_round_trip_starter_kit() {
+        let mut items = vec![ItemStack::EMPTY; 46];
+        // Slot 36 = hotbar slot 0.
+        items[36] = ItemStack::new(1, 64); // stone
+        items[37] = ItemStack::new(28, 64); // dirt
+        items[38] = ItemStack::new(36, 64); // oak_planks
+        items[39] = ItemStack::new(323, 64); // torch
+        round_trip(ClientboundContainerSetContent {
+            container_id: 0,
+            state_id: 1,
+            items,
+            carried_item: ItemStack::EMPTY,
+        });
+    }
+
+    #[test]
+    fn container_set_slot_round_trip() {
+        round_trip(ClientboundContainerSetSlot {
+            container_id: 0,
+            state_id: 5,
+            slot: 36,
+            item_stack: ItemStack::new(28, 63),
+        });
+        round_trip(ClientboundContainerSetSlot {
+            container_id: 0,
+            state_id: 6,
+            slot: 36,
+            item_stack: ItemStack::EMPTY,
+        });
+    }
+
+    #[test]
+    fn set_carried_item_round_trip() {
+        round_trip(ServerboundSetCarriedItem { slot: 0 });
+        round_trip(ServerboundSetCarriedItem { slot: 8 });
     }
 }
