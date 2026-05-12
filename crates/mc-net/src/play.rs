@@ -48,7 +48,13 @@ pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SPAWN_X: f64 = 0.5;
-const SPAWN_Y: f64 = 64.0;
+// The bundled test world uses vanilla's flat-preset surface: bedrock
+// at Y=-64, dirt at Y=-63..-62, grass at Y=-61. Spawn one block
+// above the grass so the client lands cleanly without freefall.
+// (M3's old SPAWN_Y=64 worked only because the chunk burst was fast
+// enough to land before the client picked up physics; M4's slower
+// debug-mode burst exposed the latent bug.)
+const SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
 
 /// Chunk radius around spawn the server flushes before the keepalive

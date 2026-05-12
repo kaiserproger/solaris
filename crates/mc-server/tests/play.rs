@@ -160,7 +160,10 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     );
     let sync = SynchronizePlayerPosition::decode(&mut frame.body).unwrap();
     assert_eq!(sync.teleport_id, 1);
-    assert!(sync.y.is_sign_positive());
+    // Spawn Y sits just above the flat-preset grass surface
+    // (Y=-61); see SPAWN_Y in mc_net::play. Bound the assertion to
+    // a sane window rather than re-importing the constant.
+    assert!(sync.y > -65.0 && sync.y < 0.0, "unexpected spawn y={}", sync.y);
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, GameEvent::ID, "expected Game Event");

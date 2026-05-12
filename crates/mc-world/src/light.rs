@@ -158,6 +158,20 @@ pub fn compute_chunk_light_in(
         "centre chunk must be present",
     );
 
+    // Fast path: if every chunk in the 3×3 neighbourhood is fully
+    // air (single-state air sections, no biome variation needed for
+    // lighting), the output is sky=15 everywhere, block=0 — no BFS.
+    // Our test-world has ~400 of its 441 spawn-window chunks in
+    // Status: structure_starts which have no terrain at all, so
+    // skipping their BFS turns the spawn burst from ~30 s to a few
+    // seconds in debug builds.
+    if is_all_air_neighbourhood(&neighbourhood) {
+        return ChunkLight {
+            sky: vec![15; CHUNK_LIGHT_LEN],
+            block: vec![0; CHUNK_LIGHT_LEN],
+        };
+    }
+
     ws.reset();
 
     populate_grids(
@@ -175,6 +189,31 @@ pub fn compute_chunk_light_in(
     bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
 
     extract_centre(&ws.sky, &ws.block)
+}
+
+fn is_all_air_neighbourhood(neighbourhood: &[[Option<&Chunk>; 3]; 3]) -> bool {
+    let air = BlockStateId(0);
+    for row in neighbourhood {
+        for slot in row {
+            let Some(chunk) = *slot else {
+                continue; // missing neighbour = treated as air, trivially passes
+            };
+            for section in &chunk.sections {
+                if !section_is_only(section, air) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn section_is_only(section: &crate::section::ChunkSection, state: BlockStateId) -> bool {
+    // Single-state sections expose `palette() == None` and
+    // `get(0,0,0)` reports the held state. Indirect-mode sections
+    // are non-trivial by construction (the codec only switches to
+    // indirect when more than one state appears).
+    section.palette().is_none() && section.get(0, 0, 0) == state
 }
 
 fn populate_grids(
@@ -214,27 +253,70 @@ fn populate_grids(
 }
 
 fn seed_sky_from_open_columns(propagates_sky: &[bool], sky: &mut [u8], queue: &mut VecDeque<u32>) {
-    // Walk each column top-down. Cells above the first opaque cell
-    // get sky=15 directly; the column below that first opacity is
-    // seeded by BFS from the boundary cell at sky=15. Every sky=15
-    // cell is queued so lateral propagation finds the right cells —
-    // the BFS visits each cell at most once per value-update, so the
-    // overhead of queueing every interior sky=15 cell is bounded
-    // (each one immediately fails the "candidate > current" check
-    // for its sky=15 neighbours).
+    // Two-pass seed. Pass 1: walk each column top-down, marking
+    // every cell as `sky=15` while `propagates_sky` holds. Don't
+    // touch the queue yet — pushing every interior open-sky cell
+    // would queue ~884k entries on a flat world and dominate the
+    // BFS runtime (each interior cell's six neighbours are also
+    // sky=15, so the BFS does no work but the pop/push churn does).
+    //
+    // Pass 2: push only "boundary" sky=15 cells — those with at
+    // least one neighbour that is *not* sky=15. These are the
+    // cells where BFS will actually drive an update.
     for gx in 0..N_X {
         for gz in 0..N_Z {
             for ly in (0..WORLD_HEIGHT).rev() {
                 let idx = grid_idx(gx, ly, gz);
                 if propagates_sky[idx] {
                     sky[idx] = 15;
-                    queue.push_back(idx as u32);
                 } else {
                     break;
                 }
             }
         }
     }
+    for ly in 0..WORLD_HEIGHT {
+        for gz in 0..N_Z {
+            for gx in 0..N_X {
+                let idx = grid_idx(gx, ly, gz);
+                if sky[idx] != 15 {
+                    continue;
+                }
+                if has_dark_neighbour(sky, gx, ly, gz) {
+                    queue.push_back(idx as u32);
+                }
+            }
+        }
+    }
+}
+
+fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize) -> bool {
+    const NEIGHBOURS: [(isize, isize, isize); 6] = [
+        (-1, 0, 0),
+        (1, 0, 0),
+        (0, -1, 0),
+        (0, 1, 0),
+        (0, 0, -1),
+        (0, 0, 1),
+    ];
+    for (dx, dy, dz) in NEIGHBOURS {
+        let nx = gx as isize + dx;
+        let ny = ly as isize + dy;
+        let nz = gz as isize + dz;
+        if nx < 0 || nx >= N_X as isize {
+            continue;
+        }
+        if ny < 0 || ny >= WORLD_HEIGHT as isize {
+            continue;
+        }
+        if nz < 0 || nz >= N_Z as isize {
+            continue;
+        }
+        if sky[grid_idx(nx as usize, ny as usize, nz as usize)] != 15 {
+            return true;
+        }
+    }
+    false
 }
 
 fn seed_block_from_emission(block: &[u8], queue: &mut VecDeque<u32>) {
