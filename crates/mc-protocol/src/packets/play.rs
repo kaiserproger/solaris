@@ -556,6 +556,35 @@ pub struct ClientboundPlayerAbilities {
     pub walking_speed: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientboundSetHealth {
+    pub health: f32,
+    pub food: i32,
+    pub saturation: f32,
+}
+
+impl Packet for ClientboundSetHealth {
+    // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_HEALTH is
+    // game-CB index 104 = wire id 0x68. `javap -p -c
+    // ClientboundSetHealthPacket` shows f32 health, VarInt food, f32 saturation.
+    const ID: i32 = 0x68;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f32(self.health);
+        buf.write_varint(self.food);
+        buf.write_f32(self.saturation);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            health: buf.read_f32()?,
+            food: buf.read_varint()?,
+            saturation: buf.read_f32()?,
+        })
+    }
+}
+
 impl Packet for ClientboundPlayerAbilities {
     // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_PLAYER_ABILITIES
     // is game-CB index 64 = wire id 0x40. `javap -p -c
@@ -2849,6 +2878,25 @@ mod tests {
             ClientboundPlayerAbilities::decode(&mut cursor).unwrap(),
             packet
         );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn set_health_id_and_wire_layout_match_javap() {
+        assert_eq!(ClientboundSetHealth::ID, 0x68);
+        let packet = ClientboundSetHealth {
+            health: 20.0,
+            food: 20,
+            saturation: 5.0,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(&buf[0..4], &20.0_f32.to_be_bytes());
+        assert_eq!(buf[4], 20);
+        assert_eq!(&buf[5..9], &5.0_f32.to_be_bytes());
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ClientboundSetHealth::decode(&mut cursor).unwrap(), packet);
         assert!(cursor.is_empty());
     }
 

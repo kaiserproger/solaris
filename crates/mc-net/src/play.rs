@@ -32,12 +32,12 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundPlayerAbilities,
-    ClientboundSetHeldSlot, ConfirmTeleportation, EntityAnimation, EntityAnimationAction,
-    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ItemStack,
-    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags,
-    PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
-    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundKeepAlive,
+    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, EntityAnimation,
+    EntityAnimationAction, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
+    ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
+    MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove,
+    PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange,
+    SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundKeepAlive,
     ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
     ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSetCarriedItem,
     ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
@@ -154,6 +154,29 @@ struct ServerEntityMove {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CommandPermissions {
     op: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SurvivalState {
+    health: f32,
+    food: i32,
+    saturation: f32,
+}
+
+impl SurvivalState {
+    const FULL: Self = Self {
+        health: 20.0,
+        food: 20,
+        saturation: 5.0,
+    };
+
+    const fn as_packet(self) -> ClientboundSetHealth {
+        ClientboundSetHealth {
+            health: self.health,
+            food: self.food,
+            saturation: self.saturation,
+        }
+    }
 }
 
 impl CommandPermissions {
@@ -1142,6 +1165,7 @@ where
         //    anyway, just with `count == 0` slots.
         let starter = build_starter_inventory(&config.items);
         write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
+        write_packet(writer, &SurvivalState::FULL.as_packet(), compression).await?;
         write_packet(
             writer,
             &ClientboundContainerSetContent {
@@ -3323,6 +3347,18 @@ mod tests {
 
         let adventure = player_abilities_for_mode(GameMode::Adventure);
         assert_eq!(survival, adventure);
+    }
+
+    #[test]
+    fn full_survival_state_maps_to_health_packet() {
+        assert_eq!(
+            SurvivalState::FULL.as_packet(),
+            ClientboundSetHealth {
+                health: 20.0,
+                food: 20,
+                saturation: 5.0,
+            }
+        );
     }
 
     #[test]
