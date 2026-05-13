@@ -25,7 +25,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
 use mc_protocol::codec::Identifier;
-use mc_protocol::frame::Compression;
+use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
@@ -76,6 +76,31 @@ struct BlockDelta {
     y: i32,
     z: i32,
     state_id: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ChunkBuildTiming {
+    chunk_data_ms: u64,
+    heightmap_ms: u64,
+    light_compute_ms: u64,
+    light_encode_ms: u64,
+}
+
+impl ChunkBuildTiming {
+    fn add(&mut self, other: ChunkBuildTiming) {
+        self.chunk_data_ms += other.chunk_data_ms;
+        self.heightmap_ms += other.heightmap_ms;
+        self.light_compute_ms += other.light_compute_ms;
+        self.light_encode_ms += other.light_encode_ms;
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ChunkWriteTiming {
+    packet_encode_ms: u64,
+    frame_ms: u64,
+    socket_write_ms: u64,
+    framed_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,9 +507,15 @@ where
     // the wire as soon as its immediate light inputs exist.
     let mut staged: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
     let mut fetch_ms = 0u64;
-    let mut build_ms = 0u64;
-    let mut write_ms = 0u64;
+    let mut build_timing = ChunkBuildTiming::default();
+    let mut packet_encode_ms = 0u64;
+    let mut frame_ms = 0u64;
+    let mut socket_write_ms = 0u64;
+    let mut framed_bytes = 0usize;
     let mut first_chunk_ms: Option<u64> = None;
+    let mut ring1_complete_ms: Option<u64> = None;
+    let mut ring2_complete_ms: Option<u64> = None;
+    let mut ring_emitted = vec![0usize; (view_distance.max(0) + 1) as usize];
 
     let mut emitted = 0usize;
     let mut absent = 0usize;
@@ -527,8 +558,7 @@ where
         };
         let neighbours = build_neighbourhood(&staged, cx, cz);
         let centre_ref = centre.as_ref();
-        let build_started = Instant::now();
-        let packet = match build_chunk_packet(
+        let (packet, timing) = match build_chunk_packet(
             centre_ref,
             &neighbours,
             biomes,
@@ -544,13 +574,28 @@ where
                 continue;
             }
         };
-        build_ms += build_started.elapsed().as_millis() as u64;
+        build_timing.add(timing);
         let n = packet.data.len();
-        let write_started = Instant::now();
-        write_packet(writer, &packet, compression).await?;
-        write_ms += write_started.elapsed().as_millis() as u64;
+        let write_timing = write_chunk_packet(writer, &packet, compression).await?;
+        packet_encode_ms += write_timing.packet_encode_ms;
+        frame_ms += write_timing.frame_ms;
+        socket_write_ms += write_timing.socket_write_ms;
+        framed_bytes += write_timing.framed_bytes;
         emitted += 1;
         first_chunk_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
+        let ring = (cx - center_cx).abs().max((cz - center_cz).abs()) as usize;
+        if let Some(count) = ring_emitted.get_mut(ring) {
+            *count += 1;
+            let needed = if ring == 0 { 1 } else { ring * 8 };
+            if *count == needed {
+                let elapsed = started.elapsed().as_millis() as u64;
+                if ring == 1 {
+                    ring1_complete_ms.get_or_insert(elapsed);
+                } else if ring == 2 {
+                    ring2_complete_ms.get_or_insert(elapsed);
+                }
+            }
+        }
         bytes += n;
     }
 
@@ -562,10 +607,18 @@ where
         emitted,
         absent,
         bytes,
+        framed_bytes,
         fetch_ms,
-        build_ms,
-        write_ms,
+        chunk_data_ms = build_timing.chunk_data_ms,
+        heightmap_ms = build_timing.heightmap_ms,
+        light_compute_ms = build_timing.light_compute_ms,
+        light_encode_ms = build_timing.light_encode_ms,
+        packet_encode_ms,
+        frame_ms,
+        socket_write_ms,
         first_chunk_ms,
+        ring1_complete_ms,
+        ring2_complete_ms,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "view-distance window flushed",
     );
@@ -627,8 +680,14 @@ fn build_chunk_packet(
     light_cache: Option<&mut LightCache>,
     cx: i32,
     cz: i32,
-) -> Result<LevelChunkWithLight, mc_world::wire::WireError> {
+) -> Result<(LevelChunkWithLight, ChunkBuildTiming), mc_world::wire::WireError> {
+    let mut timing = ChunkBuildTiming::default();
+
+    let chunk_data_started = Instant::now();
     let data = encode_chunk_data(centre, biomes)?;
+    timing.chunk_data_ms = chunk_data_started.elapsed().as_millis() as u64;
+
+    let heightmap_started = Instant::now();
     let heightmaps = client_heightmaps(centre)
         .into_iter()
         .map(|h| ChunkHeightmap {
@@ -636,6 +695,8 @@ fn build_chunk_packet(
             data: h.data,
         })
         .collect();
+    timing.heightmap_ms = heightmap_started.elapsed().as_millis() as u64;
+
     let light = match (block_light, workspace) {
         (Some(table), Some(ws)) => {
             // Centre slot is the chunk we already have a reference to;
@@ -647,8 +708,14 @@ fn build_chunk_packet(
                 }
             }
             refs[1][1] = Some(centre);
+
+            let light_compute_started = Instant::now();
             let computed = compute_chunk_light_in(ws, refs, table);
+            timing.light_compute_ms = light_compute_started.elapsed().as_millis() as u64;
+
+            let light_encode_started = Instant::now();
             let wire = encode_chunk_light(&computed);
+            timing.light_encode_ms = light_encode_started.elapsed().as_millis() as u64;
             // M9.a: stash the computed light in the per-connection
             // cache so subsequent edits hit the incremental path.
             if let Some(cache) = light_cache {
@@ -665,14 +732,44 @@ fn build_chunk_packet(
         }
         _ => LightData::empty(),
     };
-    Ok(LevelChunkWithLight {
-        chunk_x: cx,
-        chunk_z: cz,
-        heightmaps,
-        data,
-        block_entities: Vec::new(),
-        light,
-    })
+    Ok((
+        LevelChunkWithLight {
+            chunk_x: cx,
+            chunk_z: cz,
+            heightmaps,
+            data,
+            block_entities: Vec::new(),
+            light,
+        },
+        timing,
+    ))
+}
+
+async fn write_chunk_packet<W>(
+    writer: &mut W,
+    packet: &LevelChunkWithLight,
+    compression: Compression,
+) -> Result<ChunkWriteTiming, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut timing = ChunkWriteTiming::default();
+
+    let packet_encode_started = Instant::now();
+    let mut body = BytesMut::new();
+    packet.encode(&mut body)?;
+    timing.packet_encode_ms = packet_encode_started.elapsed().as_millis() as u64;
+
+    let frame_started = Instant::now();
+    let framed = encode_frame(LevelChunkWithLight::ID, &body, compression)?;
+    timing.frame_ms = frame_started.elapsed().as_millis() as u64;
+    timing.framed_bytes = framed.len();
+
+    let socket_write_started = Instant::now();
+    writer.write_all(&framed).await?;
+    timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
+
+    Ok(timing)
 }
 
 /// M5.d: handle a serverbound `PlayerAction`. Acts on
