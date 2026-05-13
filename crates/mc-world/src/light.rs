@@ -43,51 +43,159 @@ use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
 /// World-height span in blocks (24 sections × 16 blocks).
 pub const WORLD_HEIGHT: usize = SECTION_COUNT * SECTION_DIM;
-/// Per-chunk cell count, one u8 per cell (used as the output buffer
-/// size in `ChunkLight`).
+/// Per-chunk cell count for one light channel.
 pub const CHUNK_LIGHT_LEN: usize = SECTION_VOLUME * SECTION_COUNT;
 
 const N_X: usize = SECTION_DIM * 3;
 const N_Z: usize = SECTION_DIM * 3;
 const N_VOL: usize = N_X * WORLD_HEIGHT * N_Z;
 
-/// One chunk's worth of computed light, per-cell `u8` in `0..=15`,
-/// indexed by `y * (16 * 16) + z * 16 + x` with `y` in `0..384`
-/// (world Y = `y + MIN_Y`, so y=0 is world Y=-64). The wire encoder
-/// converts this into the 4-bit-packed nibble arrays
-/// `LightData::sky_updates` / `block_updates` expect.
+/// One light channel for a chunk, stored as lazy per-section nibble
+/// arrays. Missing sections are all-zero; present sections are already
+/// in the 2048-byte vanilla nibble layout, low nibble first.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ChunkLight {
-    pub sky: Vec<u8>,
-    pub block: Vec<u8>,
+pub struct LightLayer {
+    sections: [Option<Box<[u8; crate::chunk::LIGHT_LAYER_BYTES]>>; SECTION_COUNT],
+    nonzero_nibbles: [u16; SECTION_COUNT],
 }
 
-impl ChunkLight {
-    /// Fresh buffers, all zero. Useful for direct unit-testing
-    /// without invoking the engine.
+impl LightLayer {
     #[must_use]
     pub fn zeroed() -> Self {
         Self {
-            sky: vec![0; CHUNK_LIGHT_LEN],
-            block: vec![0; CHUNK_LIGHT_LEN],
+            sections: std::array::from_fn(|_| None),
+            nonzero_nibbles: [0; SECTION_COUNT],
+        }
+    }
+
+    #[must_use]
+    pub fn filled(value: u8) -> Self {
+        debug_assert!(value <= 15);
+        if value == 0 {
+            return Self::zeroed();
+        }
+        let packed = value | (value << 4);
+        Self {
+            sections: std::array::from_fn(|_| {
+                Some(Box::new([packed; crate::chunk::LIGHT_LAYER_BYTES]))
+            }),
+            nonzero_nibbles: [SECTION_VOLUME as u16; SECTION_COUNT],
+        }
+    }
+
+    #[must_use]
+    pub fn get(&self, x: usize, local_y: usize, z: usize) -> u8 {
+        debug_assert!(x < SECTION_DIM);
+        debug_assert!(local_y < WORLD_HEIGHT);
+        debug_assert!(z < SECTION_DIM);
+        let section_idx = local_y / SECTION_DIM;
+        let Some(layer) = self.sections[section_idx].as_ref() else {
+            return 0;
+        };
+        get_nibble(layer, section_cell_idx(x, local_y % SECTION_DIM, z))
+    }
+
+    pub fn set(&mut self, x: usize, local_y: usize, z: usize, value: u8) {
+        debug_assert!(x < SECTION_DIM);
+        debug_assert!(local_y < WORLD_HEIGHT);
+        debug_assert!(z < SECTION_DIM);
+        debug_assert!(value <= 15);
+        let section_idx = local_y / SECTION_DIM;
+        if value == 0 && self.sections[section_idx].is_none() {
+            return;
+        }
+        let layer = self.sections[section_idx]
+            .get_or_insert_with(|| Box::new([0; crate::chunk::LIGHT_LAYER_BYTES]));
+        let cell = section_cell_idx(x, local_y % SECTION_DIM, z);
+        let old = get_nibble(layer, cell);
+        if old == value {
+            return;
+        }
+        set_nibble(layer, cell, value);
+        if old == 0 && value != 0 {
+            self.nonzero_nibbles[section_idx] += 1;
+        } else if old != 0 && value == 0 {
+            self.nonzero_nibbles[section_idx] -= 1;
+        }
+        if self.nonzero_nibbles[section_idx] == 0 {
+            self.sections[section_idx] = None;
+        }
+    }
+
+    #[must_use]
+    pub fn section(&self, section_idx: usize) -> Option<&[u8; crate::chunk::LIGHT_LAYER_BYTES]> {
+        debug_assert!(section_idx < SECTION_COUNT);
+        self.sections[section_idx].as_deref()
+    }
+}
+
+/// One chunk's worth of computed light.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChunkLight {
+    pub sky: LightLayer,
+    pub block: LightLayer,
+}
+
+impl ChunkLight {
+    /// Fresh light, all zero. Useful for direct unit-testing without
+    /// invoking the engine.
+    #[must_use]
+    pub fn zeroed() -> Self {
+        Self {
+            sky: LightLayer::zeroed(),
+            block: LightLayer::zeroed(),
+        }
+    }
+
+    #[must_use]
+    pub fn filled(sky: u8, block: u8) -> Self {
+        Self {
+            sky: LightLayer::filled(sky),
+            block: LightLayer::filled(block),
         }
     }
 
     #[must_use]
     pub fn sky_at(&self, x: u8, y: i32, z: u8) -> u8 {
         let local_y = (y - MIN_Y) as usize;
-        self.sky[chunk_idx(x as usize, local_y, z as usize)]
+        self.sky.get(x as usize, local_y, z as usize)
     }
 
     #[must_use]
     pub fn block_at(&self, x: u8, y: i32, z: u8) -> u8 {
         let local_y = (y - MIN_Y) as usize;
-        self.block[chunk_idx(x as usize, local_y, z as usize)]
+        self.block.get(x as usize, local_y, z as usize)
+    }
+
+    pub fn set_sky_local(&mut self, x: usize, local_y: usize, z: usize, value: u8) {
+        self.sky.set(x, local_y, z, value);
+    }
+
+    pub fn set_block_local(&mut self, x: usize, local_y: usize, z: usize, value: u8) {
+        self.block.set(x, local_y, z, value);
     }
 }
 
-fn chunk_idx(x: usize, local_y: usize, z: usize) -> usize {
-    local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
+fn section_cell_idx(x: usize, section_y: usize, z: usize) -> usize {
+    section_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
+}
+
+fn get_nibble(layer: &[u8; crate::chunk::LIGHT_LAYER_BYTES], cell: usize) -> u8 {
+    let byte = layer[cell / 2];
+    if cell & 1 == 0 {
+        byte & 0x0F
+    } else {
+        byte >> 4
+    }
+}
+
+fn set_nibble(layer: &mut [u8; crate::chunk::LIGHT_LAYER_BYTES], cell: usize, value: u8) {
+    let byte = &mut layer[cell / 2];
+    if cell & 1 == 0 {
+        *byte = (*byte & 0xF0) | value;
+    } else {
+        *byte = (*byte & 0x0F) | (value << 4);
+    }
 }
 
 /// Reusable working buffers for the lighting engine. Allocating
@@ -415,7 +523,7 @@ fn block_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
     window[dz][dx]
         .as_ref()
-        .map(|c| c.block[chunk_idx(lx, ly, lz)])
+        .map(|c| c.block.get(lx, ly, lz))
         .unwrap_or(0)
 }
 
@@ -424,7 +532,7 @@ fn sky_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
     window[dz][dx]
         .as_ref()
-        .map(|c| c.sky[chunk_idx(lx, ly, lz)])
+        .map(|c| c.sky.get(lx, ly, lz))
         .unwrap_or(0)
 }
 
@@ -436,12 +544,11 @@ fn set_block_light(
     v: u8,
 ) {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
-    if let Some(c) = window[dz][dx].as_mut() {
-        let idx = chunk_idx(lx, ly, lz);
-        if c.block[idx] != v {
-            c.block[idx] = v;
-            changed[dz][dx] = true;
-        }
+    if let Some(c) = window[dz][dx].as_mut()
+        && c.block.get(lx, ly, lz) != v
+    {
+        c.block.set(lx, ly, lz, v);
+        changed[dz][dx] = true;
     }
 }
 
@@ -453,12 +560,11 @@ fn set_sky_light(
     v: u8,
 ) {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
-    if let Some(c) = window[dz][dx].as_mut() {
-        let idx = chunk_idx(lx, ly, lz);
-        if c.sky[idx] != v {
-            c.sky[idx] = v;
-            changed[dz][dx] = true;
-        }
+    if let Some(c) = window[dz][dx].as_mut()
+        && c.sky.get(lx, ly, lz) != v
+    {
+        c.sky.set(lx, ly, lz, v);
+        changed[dz][dx] = true;
     }
 }
 
@@ -783,10 +889,7 @@ pub fn compute_chunk_light_in(
     // skipping their BFS turns the spawn burst from ~30 s to a few
     // seconds in debug builds.
     if is_all_air_neighbourhood(&neighbourhood) {
-        return ChunkLight {
-            sky: vec![15; CHUNK_LIGHT_LEN],
-            block: vec![0; CHUNK_LIGHT_LEN],
-        };
+        return ChunkLight::filled(15, 0);
     }
 
     ws.reset();
@@ -1004,9 +1107,8 @@ fn extract_centre(sky: &[u8], block: &[u8]) -> ChunkLight {
                 let gx = SECTION_DIM + lx;
                 let gz = SECTION_DIM + lz;
                 let src = grid_idx(gx, ly, gz);
-                let dst = chunk_idx(lx, ly, lz);
-                out.sky[dst] = sky[src];
-                out.block[dst] = block[src];
+                out.set_sky_local(lx, ly, lz, sky[src]);
+                out.set_block_local(lx, ly, lz, block[src]);
             }
         }
     }
@@ -1078,9 +1180,8 @@ mod tests {
         for ly in 0..WORLD_HEIGHT {
             for lz in 0..SECTION_DIM {
                 for lx in 0..SECTION_DIM {
-                    let idx = chunk_idx(lx, ly, lz);
-                    assert_eq!(out.sky[idx], 15, "sky at ({lx},{ly},{lz})");
-                    assert_eq!(out.block[idx], 0, "block at ({lx},{ly},{lz})");
+                    assert_eq!(out.sky.get(lx, ly, lz), 15, "sky at ({lx},{ly},{lz})");
+                    assert_eq!(out.block.get(lx, ly, lz), 0, "block at ({lx},{ly},{lz})");
                 }
             }
         }
@@ -1284,16 +1385,19 @@ mod tests {
         for ly in 0..WORLD_HEIGHT {
             for lz in 0..SECTION_DIM {
                 for lx in 0..SECTION_DIM {
-                    let idx = chunk_idx(lx, ly, lz);
+                    let actual_sky = actual.sky.get(lx, ly, lz);
+                    let expected_sky = expected.sky.get(lx, ly, lz);
                     assert_eq!(
-                        actual.sky[idx], expected.sky[idx],
+                        actual_sky, expected_sky,
                         "{tag}: sky mismatch at ({lx},{ly},{lz}): inc={} full={}",
-                        actual.sky[idx], expected.sky[idx],
+                        actual_sky, expected_sky,
                     );
+                    let actual_block = actual.block.get(lx, ly, lz);
+                    let expected_block = expected.block.get(lx, ly, lz);
                     assert_eq!(
-                        actual.block[idx], expected.block[idx],
+                        actual_block, expected_block,
                         "{tag}: block mismatch at ({lx},{ly},{lz}): inc={} full={}",
-                        actual.block[idx], expected.block[idx],
+                        actual_block, expected_block,
                     );
                 }
             }

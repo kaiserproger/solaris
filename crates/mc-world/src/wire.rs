@@ -57,8 +57,8 @@ use mc_data::{Identifier, Registry};
 use thiserror::Error;
 
 use crate::chunk::{BIOME_VOLUME, BiomeSection, Chunk, LIGHT_LAYER_BYTES, SECTION_COUNT};
-use crate::light::ChunkLight;
-use crate::section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
+use crate::light::{ChunkLight, LightLayer};
+use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
 /// Bits per entry vanilla 26.1.2 expects in `GlobalPalette` (direct)
 /// mode for the block-state container. Sized to comfortably hold the
@@ -301,13 +301,13 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
         let slot = section_idx + 1;
         let sky_layer = pack_section_layer(&light.sky, section_idx);
         let block_layer = pack_section_layer(&light.block, section_idx);
-        if sky_layer.iter().any(|&b| b != 0) {
+        if let Some(sky_layer) = sky_layer {
             sky_mask |= 1 << slot;
             sky_updates.push(sky_layer);
         } else {
             empty_sky_mask |= 1 << slot;
         }
-        if block_layer.iter().any(|&b| b != 0) {
+        if let Some(block_layer) = block_layer {
             block_mask |= 1 << slot;
             block_updates.push(block_layer);
         } else {
@@ -330,31 +330,13 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
     }
 }
 
-/// Pack one section's 4096 per-cell `u8` values (0..=15 each) into
-/// the 2048-byte nibble layer vanilla expects: cells are paired by
-/// the linear `(y, z, x)` index, low nibble first.
-fn pack_section_layer(channel: &[u8], section_idx: usize) -> Vec<u8> {
+/// Copy one section's 2048-byte nibble layer if it contains non-zero
+/// light. Missing lazy sections are all-zero and omitted from the wire
+/// present mask.
+fn pack_section_layer(channel: &LightLayer, section_idx: usize) -> Option<Vec<u8>> {
     debug_assert!(section_idx < SECTION_COUNT);
-    let base = section_idx * SECTION_VOLUME;
-    let mut layer = vec![0u8; LIGHT_LAYER_BYTES];
-    // section-local cell index = (sub_y * 256) + (z * 16) + x, sub_y in 0..16.
-    for cell in 0..SECTION_VOLUME {
-        let sub_y = cell / (SECTION_DIM * SECTION_DIM);
-        let rem = cell % (SECTION_DIM * SECTION_DIM);
-        let z = rem / SECTION_DIM;
-        let x = rem % SECTION_DIM;
-        // ChunkLight indexes by absolute y_local first, so reconstruct
-        // the source index: (section_base_y + sub_y) * 256 + z * 16 + x.
-        let world_local_y = section_idx * SECTION_DIM + sub_y;
-        let src = world_local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x;
-        debug_assert!(src >= base);
-        debug_assert!(src < base + SECTION_VOLUME);
-        let value = channel[src] & 0x0F;
-        let byte_idx = cell / 2;
-        let shift = (cell & 1) * 4;
-        layer[byte_idx] |= value << shift;
-    }
-    layer
+    let layer = channel.section(section_idx)?;
+    Some(layer.to_vec())
 }
 
 fn write_varint(buf: &mut Vec<u8>, value: i32) {
@@ -614,10 +596,6 @@ mod tests {
         );
     }
 
-    fn chunk_light_idx(x: usize, local_y: usize, z: usize) -> usize {
-        local_y * (SECTION_DIM * SECTION_DIM) + z * SECTION_DIM + x
-    }
-
     #[test]
     fn encodes_zero_chunk_as_all_empty_with_open_top() {
         let light = ChunkLight::zeroed();
@@ -648,11 +626,11 @@ mod tests {
         // verify pack_section_layer puts them at low (0x01) and
         // high (0x20) nibbles → 0x21 in byte 0.
         let mut light = ChunkLight::zeroed();
-        // cell 0 in section 0 = (sub_y=0, z=0, x=0) → chunk-light idx 0.
-        light.sky[chunk_light_idx(0, 0, 0)] = 1;
+        // cell 0 in section 0 = (sub_y=0, z=0, x=0).
+        light.set_sky_local(0, 0, 0, 1);
         // cell 1 in section 0 = (sub_y=0, z=0, x=1).
-        light.sky[chunk_light_idx(1, 0, 0)] = 2;
-        let layer = pack_section_layer(&light.sky, 0);
+        light.set_sky_local(1, 0, 0, 2);
+        let layer = pack_section_layer(&light.sky, 0).unwrap();
         assert_eq!(layer[0], 0x21);
         // Other bytes are untouched.
         assert!(layer[1..].iter().all(|&b| b == 0));
@@ -666,12 +644,12 @@ mod tests {
         // must see only the 15; pack_section_layer(_, 1) only the 7.
         let mut light = ChunkLight::zeroed();
         // Section 0, sub_y=15 → chunk-light local_y = 15.
-        light.sky[chunk_light_idx(15, 15, 15)] = 15;
+        light.set_sky_local(15, 15, 15, 15);
         // Section 1, sub_y=0 → chunk-light local_y = 16.
-        light.sky[chunk_light_idx(0, 16, 0)] = 7;
+        light.set_sky_local(0, 16, 0, 7);
 
-        let s0 = pack_section_layer(&light.sky, 0);
-        let s1 = pack_section_layer(&light.sky, 1);
+        let s0 = pack_section_layer(&light.sky, 0).unwrap();
+        let s1 = pack_section_layer(&light.sky, 1).unwrap();
         // Section 0: last cell is index 4095 in the section, byte 2047,
         // high nibble.
         assert_eq!(s0[2047], 0xF0);
@@ -689,7 +667,7 @@ mod tests {
         // the present mask; slot 0 + slots 1..=4 + slots 6..=24 +
         // slot 25 in the empty mask; one layer in block_updates.
         let mut light = ChunkLight::zeroed();
-        light.block[chunk_light_idx(8, 64, 8)] = 15; // section idx = 64/16 = 4
+        light.set_block_local(8, 64, 8, 15); // section idx = 64/16 = 4
         let wire = encode_chunk_light(&light);
 
         assert_eq!(wire.block_updates.len(), 1, "single non-zero section");
