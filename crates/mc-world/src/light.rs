@@ -300,9 +300,9 @@ pub fn apply_block_change_to_light(
     touched
 }
 
-/// Window-coordinate triple: `(dx, dz)` index into the 3×3 window
-/// (0..=2) plus local block coords inside that chunk (lx, ly, lz).
-type WCoord = (usize, usize, usize, usize, usize);
+/// Window-local coordinate inside the 48×384×48 incremental relight
+/// volume: `(gx, ly, gz)` where gx/gz include the 3×3 chunk offset.
+type WCoord = (usize, usize, usize);
 
 #[inline]
 fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WCoord> {
@@ -319,54 +319,100 @@ fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WC
     let lx = wx.rem_euclid(SECTION_DIM as i32) as usize;
     let lz = wz.rem_euclid(SECTION_DIM as i32) as usize;
     let ly = (wy - MIN_Y) as usize;
-    Some(((dx + 1) as usize, (dz + 1) as usize, lx, ly, lz))
+    let gx = (dx + 1) as usize * SECTION_DIM + lx;
+    let gz = (dz + 1) as usize * SECTION_DIM + lz;
+    Some((gx, ly, gz))
 }
 
 #[inline]
-fn opacity_at_world(
+fn pack_light_queue_entry(coord: WCoord, level: u8) -> u64 {
+    let (gx, ly, gz) = coord;
+    debug_assert!(gx < N_X);
+    debug_assert!(ly < WORLD_HEIGHT);
+    debug_assert!(gz < N_Z);
+    debug_assert!(level <= 15);
+
+    (gx as u64) | ((gz as u64) << 6) | ((ly as u64) << 12) | ((level as u64) << 21)
+}
+
+#[inline]
+fn unpack_light_queue_entry(packed: u64) -> (WCoord, u8) {
+    let gx = (packed & 0x3f) as usize;
+    let gz = ((packed >> 6) & 0x3f) as usize;
+    let ly = ((packed >> 12) & 0x01ff) as usize;
+    let level = ((packed >> 21) & 0x0f) as u8;
+    ((gx, ly, gz), level)
+}
+
+#[inline]
+fn neighbour_coord(coord: WCoord, delta: (i32, i32, i32)) -> Option<WCoord> {
+    let (gx, ly, gz) = coord;
+    let nx = gx as i32 + delta.0;
+    let ny = ly as i32 + delta.1;
+    let nz = gz as i32 + delta.2;
+    if nx < 0
+        || nx >= N_X as i32
+        || ny < 0
+        || ny >= WORLD_HEIGHT as i32
+        || nz < 0
+        || nz >= N_Z as i32
+    {
+        return None;
+    }
+    Some((nx as usize, ny as usize, nz as usize))
+}
+
+#[inline]
+fn coord_parts(coord: WCoord) -> (usize, usize, usize, usize, usize) {
+    let (gx, ly, gz) = coord;
+    let dx = gx / SECTION_DIM;
+    let dz = gz / SECTION_DIM;
+    let lx = gx % SECTION_DIM;
+    let lz = gz % SECTION_DIM;
+    (dx, dz, lx, ly, lz)
+}
+
+#[inline]
+fn window_slot_is_some(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> bool {
+    let (dx, dz, _, _, _) = coord_parts(coord);
+    window[dz][dx].is_some()
+}
+
+#[inline]
+fn opacity_at_coord(
     chunks: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
-    centre_pos: ChunkPos,
-    wx: i32,
-    wy: i32,
-    wz: i32,
+    coord: WCoord,
 ) -> u8 {
-    let Some((dx, dz, lx, _ly, lz)) = world_to_window(centre_pos, wx, wy, wz) else {
-        return 0;
-    };
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     let Some(chunk) = chunks[dz][dx] else {
         return 0;
     };
     let state = chunk
-        .get_block(lx as u8, wy, lz as u8)
+        .get_block(lx as u8, MIN_Y + ly as i32, lz as u8)
         .unwrap_or(BlockStateId(0));
     table.opacity(state.0).unwrap_or(0)
 }
 
 #[inline]
-fn propagates_sky_at_world(
+fn propagates_sky_at_coord(
     chunks: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
-    centre_pos: ChunkPos,
-    wx: i32,
-    wy: i32,
-    wz: i32,
+    coord: WCoord,
 ) -> bool {
-    let Some((dx, dz, lx, _ly, lz)) = world_to_window(centre_pos, wx, wy, wz) else {
-        return true;
-    };
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     let Some(chunk) = chunks[dz][dx] else {
         return true;
     };
     let state = chunk
-        .get_block(lx as u8, wy, lz as u8)
+        .get_block(lx as u8, MIN_Y + ly as i32, lz as u8)
         .unwrap_or(BlockStateId(0));
     table.propagates_sky(state.0).unwrap_or(true)
 }
 
 #[inline]
 fn block_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
-    let (dx, dz, lx, ly, lz) = coord;
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     window[dz][dx]
         .as_ref()
         .map(|c| c.block[chunk_idx(lx, ly, lz)])
@@ -375,7 +421,7 @@ fn block_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
 
 #[inline]
 fn sky_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
-    let (dx, dz, lx, ly, lz) = coord;
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     window[dz][dx]
         .as_ref()
         .map(|c| c.sky[chunk_idx(lx, ly, lz)])
@@ -389,7 +435,7 @@ fn set_block_light(
     coord: WCoord,
     v: u8,
 ) {
-    let (dx, dz, lx, ly, lz) = coord;
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     if let Some(c) = window[dz][dx].as_mut() {
         let idx = chunk_idx(lx, ly, lz);
         if c.block[idx] != v {
@@ -406,7 +452,7 @@ fn set_sky_light(
     coord: WCoord,
     v: u8,
 ) {
-    let (dx, dz, lx, ly, lz) = coord;
+    let (dx, dz, lx, ly, lz) = coord_parts(coord);
     if let Some(c) = window[dz][dx].as_mut() {
         let idx = chunk_idx(lx, ly, lz);
         if c.sky[idx] != v {
@@ -436,40 +482,40 @@ fn incremental_block_light(
         Some(c) => c,
         None => return,
     };
-    if window[edit_coord.1][edit_coord.0].is_none() {
+    if !window_slot_is_some(window, edit_coord) {
         return;
     }
 
-    let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
-    let mut relight: VecDeque<(i32, i32, i32)> = VecDeque::new();
+    let mut removal: VecDeque<u64> = VecDeque::new();
+    let mut relight: VecDeque<u64> = VecDeque::new();
 
     let old_self = block_light_at(window, edit_coord);
     set_block_light(window, changed, edit_coord, new_emit);
     if old_self > new_emit {
-        removal.push_back((world_x, world_y, world_z, old_self));
+        removal.push_back(pack_light_queue_entry(edit_coord, old_self));
     }
     if new_emit > 0 {
-        relight.push_back((world_x, world_y, world_z));
+        relight.push_back(pack_light_queue_entry(edit_coord, new_emit));
     }
     // Edit-cell neighbours are always candidate relight seeds: light
     // propagating *through* the edit cell may now be wrong if opacity
     // changed.
-    for (dx, dy, dz) in NEIGHBOURS {
-        relight.push_back((world_x + dx, world_y + dy, world_z + dz));
+    for delta in NEIGHBOURS {
+        if let Some(coord) = neighbour_coord(edit_coord, delta) {
+            relight.push_back(pack_light_queue_entry(coord, 0));
+        }
     }
 
-    while let Some((cx, cy, cz, prev_val)) = removal.pop_front() {
-        for (dx, dy, dz) in NEIGHBOURS {
-            let nx = cx + dx;
-            let ny = cy + dy;
-            let nz = cz + dz;
-            let Some(coord) = world_to_window(centre_pos, nx, ny, nz) else {
+    while let Some(packed) = removal.pop_front() {
+        let (coord, prev_val) = unpack_light_queue_entry(packed);
+        for delta in NEIGHBOURS {
+            let Some(ncoord) = neighbour_coord(coord, delta) else {
                 continue;
             };
-            if window[coord.1][coord.0].is_none() {
+            if !window_slot_is_some(window, ncoord) {
                 continue;
             }
-            let n_val = block_light_at(window, coord);
+            let n_val = block_light_at(window, ncoord);
             if n_val == 0 {
                 continue;
             }
@@ -477,27 +523,25 @@ fn incremental_block_light(
             // opacity is already accounted for via `new_op`, but we
             // already overwrote its light to `new_emit`, so skip it
             // (treating it as an independent source).
-            if (nx, ny, nz) == (world_x, world_y, world_z) {
-                relight.push_back((nx, ny, nz));
+            if ncoord == edit_coord {
+                relight.push_back(pack_light_queue_entry(ncoord, n_val));
                 continue;
             }
-            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let n_op = opacity_at_coord(chunks, table, ncoord);
             let cost = n_op.max(1);
             if n_val == prev_val.saturating_sub(cost) {
-                set_block_light(window, changed, coord, 0);
-                removal.push_back((nx, ny, nz, n_val));
+                set_block_light(window, changed, ncoord, 0);
+                removal.push_back(pack_light_queue_entry(ncoord, n_val));
             } else {
-                relight.push_back((nx, ny, nz));
+                relight.push_back(pack_light_queue_entry(ncoord, n_val));
             }
         }
     }
 
     let _ = new_op; // opacity drives BFS via cost; explicit to silence unused
-    while let Some((cx, cy, cz)) = relight.pop_front() {
-        let Some(coord) = world_to_window(centre_pos, cx, cy, cz) else {
-            continue;
-        };
-        if window[coord.1][coord.0].is_none() {
+    while let Some(packed) = relight.pop_front() {
+        let (coord, _queued_level) = unpack_light_queue_entry(packed);
+        if !window_slot_is_some(window, coord) {
             continue;
         }
         let cur = block_light_at(window, coord);
@@ -505,14 +549,11 @@ fn incremental_block_light(
             continue;
         }
         let best_propagated = cur - 1;
-        for (dx, dy, dz) in NEIGHBOURS {
-            let nx = cx + dx;
-            let ny = cy + dy;
-            let nz = cz + dz;
-            let Some(ncoord) = world_to_window(centre_pos, nx, ny, nz) else {
+        for delta in NEIGHBOURS {
+            let Some(ncoord) = neighbour_coord(coord, delta) else {
                 continue;
             };
-            if window[ncoord.1][ncoord.0].is_none() {
+            if !window_slot_is_some(window, ncoord) {
                 continue;
             }
             // M9.f early-skip: skip the opacity lookup if the neighbour
@@ -520,12 +561,12 @@ fn incremental_block_light(
             if block_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
-            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let n_op = opacity_at_coord(chunks, table, ncoord);
             let cost = n_op.max(1);
             let propagated = cur.saturating_sub(cost);
             if propagated > block_light_at(window, ncoord) {
                 set_block_light(window, changed, ncoord, propagated);
-                relight.push_back((nx, ny, nz));
+                relight.push_back(pack_light_queue_entry(ncoord, propagated));
             }
         }
     }
@@ -558,12 +599,12 @@ fn incremental_sky_light(
         Some(c) => c,
         None => return,
     };
-    if window[edit_coord.1][edit_coord.0].is_none() {
+    if !window_slot_is_some(window, edit_coord) {
         return;
     }
 
-    let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
-    let mut relight: VecDeque<(i32, i32, i32)> = VecDeque::new();
+    let mut removal: VecDeque<u64> = VecDeque::new();
+    let mut relight: VecDeque<u64> = VecDeque::new();
 
     // What's the new "ceiling" sky value at the edit cell?
     // = 15 if propagates_sky now AND every cell directly above
@@ -571,8 +612,10 @@ fn incremental_sky_light(
     //   neighbours).
     let new_self = if new_sky_pass {
         let mut all_open = true;
-        for y in (world_y + 1)..MAX_Y {
-            if !propagates_sky_at_world(chunks, table, centre_pos, world_x, y, world_z) {
+        let (gx, edit_ly, gz) = edit_coord;
+        for ly in edit_ly + 1..WORLD_HEIGHT {
+            let coord = (gx, ly, gz);
+            if !propagates_sky_at_coord(chunks, table, coord) {
                 all_open = false;
                 break;
             }
@@ -585,10 +628,10 @@ fn incremental_sky_light(
     let old_self = sky_light_at(window, edit_coord);
     set_sky_light(window, changed, edit_coord, new_self);
     if old_self > new_self {
-        removal.push_back((world_x, world_y, world_z, old_self));
+        removal.push_back(pack_light_queue_entry(edit_coord, old_self));
     }
     if new_self > 0 {
-        relight.push_back((world_x, world_y, world_z));
+        relight.push_back(pack_light_queue_entry(edit_coord, new_self));
     }
 
     // Column propagation: if propagates_sky flipped at the edit cell,
@@ -601,15 +644,13 @@ fn incremental_sky_light(
     // old.
     if prev_sky_pass != new_sky_pass {
         let column_open_above_self = new_self == 15;
-        for y in (MIN_Y..world_y).rev() {
-            let Some(coord) = world_to_window(centre_pos, world_x, y, world_z) else {
-                break;
-            };
-            if window[coord.1][coord.0].is_none() {
+        let (gx, edit_ly, gz) = edit_coord;
+        for ly in (0..edit_ly).rev() {
+            let coord = (gx, ly, gz);
+            if !window_slot_is_some(window, coord) {
                 break;
             }
-            let cell_passes =
-                propagates_sky_at_world(chunks, table, centre_pos, world_x, y, world_z);
+            let cell_passes = propagates_sky_at_coord(chunks, table, coord);
             if !cell_passes {
                 break;
             }
@@ -628,36 +669,36 @@ fn incremental_sky_light(
             }
             set_sky_light(window, changed, coord, new_val);
             if old > new_val {
-                removal.push_back((world_x, y, world_z, old));
+                removal.push_back(pack_light_queue_entry(coord, old));
             }
             if new_val > 0 {
-                relight.push_back((world_x, y, world_z));
+                relight.push_back(pack_light_queue_entry(coord, new_val));
             }
         }
     }
 
     // Edit-cell neighbours always candidate seeds — sky pushed
     // through the edit cell may now be wrong.
-    for (dx, dy, dz) in NEIGHBOURS {
-        relight.push_back((world_x + dx, world_y + dy, world_z + dz));
+    for delta in NEIGHBOURS {
+        if let Some(coord) = neighbour_coord(edit_coord, delta) {
+            relight.push_back(pack_light_queue_entry(coord, 0));
+        }
     }
 
-    while let Some((cx, cy, cz, prev_val)) = removal.pop_front() {
-        for (dx, dy, dz) in NEIGHBOURS {
-            let nx = cx + dx;
-            let ny = cy + dy;
-            let nz = cz + dz;
-            let Some(coord) = world_to_window(centre_pos, nx, ny, nz) else {
+    while let Some(packed) = removal.pop_front() {
+        let (coord, prev_val) = unpack_light_queue_entry(packed);
+        for delta in NEIGHBOURS {
+            let Some(ncoord) = neighbour_coord(coord, delta) else {
                 continue;
             };
-            if window[coord.1][coord.0].is_none() {
+            if !window_slot_is_some(window, ncoord) {
                 continue;
             }
-            let n_val = sky_light_at(window, coord);
+            let n_val = sky_light_at(window, ncoord);
             if n_val == 0 {
                 continue;
             }
-            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let n_op = opacity_at_coord(chunks, table, ncoord);
             let cost = n_op.max(1);
             // Sky vertical-down cost is 0 when the source was at 15
             // and the neighbour passes sky — that's the "direct sky
@@ -666,20 +707,18 @@ fn incremental_sky_light(
             // re-seed above is what handles the 15-passes-through
             // case explicitly. So removal here uses the same cost.
             if n_val == prev_val.saturating_sub(cost) {
-                set_sky_light(window, changed, coord, 0);
-                removal.push_back((nx, ny, nz, n_val));
+                set_sky_light(window, changed, ncoord, 0);
+                removal.push_back(pack_light_queue_entry(ncoord, n_val));
             } else {
-                relight.push_back((nx, ny, nz));
+                relight.push_back(pack_light_queue_entry(ncoord, n_val));
             }
         }
     }
 
     let _ = new_op;
-    while let Some((cx, cy, cz)) = relight.pop_front() {
-        let Some(coord) = world_to_window(centre_pos, cx, cy, cz) else {
-            continue;
-        };
-        if window[coord.1][coord.0].is_none() {
+    while let Some(packed) = relight.pop_front() {
+        let (coord, _queued_level) = unpack_light_queue_entry(packed);
+        if !window_slot_is_some(window, coord) {
             continue;
         }
         let cur = sky_light_at(window, coord);
@@ -687,25 +726,22 @@ fn incremental_sky_light(
             continue;
         }
         let best_propagated = cur - 1;
-        for (dx, dy, dz) in NEIGHBOURS {
-            let nx = cx + dx;
-            let ny = cy + dy;
-            let nz = cz + dz;
-            let Some(ncoord) = world_to_window(centre_pos, nx, ny, nz) else {
+        for delta in NEIGHBOURS {
+            let Some(ncoord) = neighbour_coord(coord, delta) else {
                 continue;
             };
-            if window[ncoord.1][ncoord.0].is_none() {
+            if !window_slot_is_some(window, ncoord) {
                 continue;
             }
             if sky_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
-            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let n_op = opacity_at_coord(chunks, table, ncoord);
             let cost = n_op.max(1);
             let propagated = cur.saturating_sub(cost);
             if propagated > sky_light_at(window, ncoord) {
                 set_sky_light(window, changed, ncoord, propagated);
-                relight.push_back((nx, ny, nz));
+                relight.push_back(pack_light_queue_entry(ncoord, propagated));
             }
         }
     }
