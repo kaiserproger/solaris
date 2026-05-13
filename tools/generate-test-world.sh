@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Generate a small vanilla 26.1.2 flat world by briefly running the
-# bundled server. Output lands in .analysis/test-world/ (gitignored)
-# for use as the round-trip oracle in M2.e Anvil tests.
+# bundled server. Output lands in .analysis/test-world/ by default
+# (gitignored) for use as the round-trip oracle in Anvil tests.
 #
 # Usage:
 #   tools/generate-test-world.sh
@@ -10,6 +10,8 @@
 # the script exits early. Delete .analysis/test-world/ to force a
 # regeneration.
 #
+# Override OUT_DIR=... to write another local oracle world, and
+# REGION_FILE_COMPRESSION=... to set vanilla's region-file-compression.
 # Requires Java matching the bundled server's java_version (25 for
 # 26.1.x); override with JAVA=…. Same JDK as
 # tools/extract-vanilla-data.sh.
@@ -18,7 +20,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE_JAR="${1:-$REPO_ROOT/.analysis/server.jar}"
-OUT_DIR="$REPO_ROOT/.analysis/test-world"
+OUT_DIR="${OUT_DIR:-$REPO_ROOT/.analysis/test-world}"
 JAVA="${JAVA:-/home/user/.sdkman/candidates/java/25.0.2-graalce/bin/java}"
 
 if [[ -f "$OUT_DIR/region/r.0.0.mca" ]]; then
@@ -58,6 +60,9 @@ difficulty=peaceful
 server-port=0
 sync-chunk-writes=true
 EOF
+if [[ -n "${REGION_FILE_COMPRESSION:-}" ]]; then
+  printf 'region-file-compression=%s\n' "$REGION_FILE_COMPRESSION" >> "$RUN_DIR/server.properties"
+fi
 
 echo "[2/4] Starting server, waiting for save → SIGINT → kill …"
 LOG="$RUN_DIR/server.log"

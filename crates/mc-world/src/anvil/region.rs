@@ -34,6 +34,10 @@ pub const CHUNKS_PER_REGION_AXIS: usize = 32;
 const REGION_CHUNK_COUNT: usize = CHUNKS_PER_REGION_AXIS * CHUNKS_PER_REGION_AXIS;
 const SECTOR_SIZE: usize = 4096;
 const HEADER_SECTORS: usize = 2; // locations + timestamps
+const LZ4_BLOCK_MAGIC: &[u8; 8] = b"LZ4Block";
+const LZ4_BLOCK_HEADER_LEN: usize = 21;
+const LZ4_BLOCK_METHOD_RAW: u8 = 0x10;
+const LZ4_BLOCK_METHOD_COMPRESSED: u8 = 0x20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -104,8 +108,6 @@ pub enum RegionError {
     UnknownCompression(u8),
     #[error("oversized chunks (.mcc sidecars) are not supported")]
     Oversized,
-    #[error("LZ4-compressed chunks are not supported in M2.e")]
-    Lz4Unsupported,
     #[error("decompression failed for chunk ({cx},{cz}): {source}")]
     Decompress {
         cx: u8,
@@ -290,7 +292,85 @@ fn decompress(comp: CompressionType, payload: &[u8]) -> Result<Vec<u8>, std::io:
             GzDecoder::new(payload).read_to_end(&mut out)?;
             Ok(out)
         }
-        CompressionType::Lz4 => Err(std::io::Error::other("LZ4 not supported in M2.e")),
+        CompressionType::Lz4 => decompress_lz4_block_stream(payload),
+    }
+}
+
+fn decompress_lz4_block_stream(payload: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    let mut pos = 0;
+    let mut out = Vec::with_capacity(payload.len() * 4);
+    loop {
+        if payload.len() - pos < LZ4_BLOCK_HEADER_LEN {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated LZ4 block header",
+            ));
+        }
+        if &payload[pos..pos + LZ4_BLOCK_MAGIC.len()] != LZ4_BLOCK_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing LZ4Block magic",
+            ));
+        }
+
+        let token = payload[pos + 8];
+        let method = token & 0xF0;
+        let compressed_len =
+            u32::from_le_bytes(payload[pos + 9..pos + 13].try_into().expect("4-byte slice"))
+                as usize;
+        let decompressed_len = u32::from_le_bytes(
+            payload[pos + 13..pos + 17]
+                .try_into()
+                .expect("4-byte slice"),
+        ) as usize;
+        pos += LZ4_BLOCK_HEADER_LEN;
+
+        if compressed_len == 0 && decompressed_len == 0 {
+            if pos != payload.len() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "trailing bytes after LZ4 end marker",
+                ));
+            }
+            return Ok(out);
+        }
+        if payload.len() - pos < compressed_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "truncated LZ4 block payload",
+            ));
+        }
+
+        let block = &payload[pos..pos + compressed_len];
+        match method {
+            LZ4_BLOCK_METHOD_RAW => {
+                if compressed_len != decompressed_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "raw LZ4 block length mismatch",
+                    ));
+                }
+                out.extend_from_slice(block);
+            }
+            LZ4_BLOCK_METHOD_COMPRESSED => {
+                let decompressed = lz4_flex::block::decompress(block, decompressed_len)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                if decompressed.len() != decompressed_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "LZ4 block decompressed length mismatch",
+                    ));
+                }
+                out.extend_from_slice(&decompressed);
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown LZ4 block token {token:#04x}"),
+                ));
+            }
+        }
+        pos += compressed_len;
     }
 }
 
@@ -305,6 +385,29 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join(rel)
+    }
+
+    fn first_populated_chunk(path: &Path) -> Option<(u8, Vec<u8>)> {
+        let bytes = std::fs::read(path).unwrap();
+        for slot in 0..REGION_CHUNK_COUNT {
+            let loc_off = slot * 4;
+            let loc = u32::from_be_bytes(
+                bytes[loc_off..loc_off + 4]
+                    .try_into()
+                    .expect("4-byte slice"),
+            );
+            if loc == 0 {
+                continue;
+            }
+            let sector = loc >> 8;
+            let start = sector as usize * SECTOR_SIZE;
+            let len = u32::from_be_bytes(bytes[start..start + 4].try_into().expect("4-byte slice"))
+                as usize;
+            let compression = bytes[start + 4];
+            let payload = bytes[start + 5..start + 4 + len].to_vec();
+            return Some((compression, payload));
+        }
+        None
     }
 
     #[test]
@@ -389,5 +492,52 @@ mod tests {
                 orig.local_x, orig.local_z
             );
         }
+    }
+
+    /// Prove the local vanilla oracle was actually written with
+    /// compression byte 4 before exercising the Anvil reader. Skipped
+    /// when the LZ4 oracle world hasn't been generated.
+    #[test]
+    fn reads_real_vanilla_lz4_region() {
+        let path = workspace_path(".analysis/test-world-lz4/region/r.0.0.mca");
+        if !path.is_file() {
+            eprintln!(
+                "skipping: {} not present (run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh)",
+                path.display()
+            );
+            return;
+        }
+
+        let (compression, payload) = first_populated_chunk(&path).unwrap();
+        assert_eq!(compression, CompressionType::Lz4 as u8);
+        assert_eq!(&payload[..LZ4_BLOCK_MAGIC.len()], LZ4_BLOCK_MAGIC);
+
+        let chunks = read_region(&path).unwrap();
+        assert!(!chunks.is_empty(), "spawn region should have chunks");
+        for c in &chunks {
+            assert!(c.uncompressed_nbt.len() > 100, "NBT should be non-trivial");
+            assert_eq!(c.uncompressed_nbt[0], 0x0A, "root tag must be Compound");
+        }
+    }
+
+    #[test]
+    fn lz4_block_api_matches_real_vanilla_lz4_payload() {
+        let path = workspace_path(".analysis/test-world-lz4/region/r.0.0.mca");
+        if !path.is_file() {
+            eprintln!(
+                "skipping: {} not present (run OUT_DIR=.analysis/test-world-lz4 REGION_FILE_COMPRESSION=lz4 tools/generate-test-world.sh)",
+                path.display()
+            );
+            return;
+        }
+
+        let (compression, payload) = first_populated_chunk(&path).unwrap();
+        assert_eq!(compression, CompressionType::Lz4 as u8);
+        let nbt = decompress_lz4_block_stream(&payload).unwrap();
+        assert_eq!(nbt[0], 0x0A);
+
+        let mut frame = lz4_flex::frame::FrameDecoder::new(payload.as_slice());
+        let mut frame_out = Vec::new();
+        assert!(frame.read_to_end(&mut frame_out).is_err());
     }
 }

@@ -15,6 +15,7 @@ workspace = true
 mc-data = { path = "../mc-data" }
 mc-nbt = { path = "../mc-nbt" }
 flate2 = { workspace = true }
+lz4_flex = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
