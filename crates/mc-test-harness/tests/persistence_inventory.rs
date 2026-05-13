@@ -28,9 +28,10 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundSetHeldSlot, ConfirmTeleportation, Direction, GameEvent, LevelChunkWithLight,
-    LoginPlay, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    ClientboundKeepAlive, ClientboundSetHeldSlot, ConfirmTeleportation, Direction, GameEvent,
+    LevelChunkWithLight, LoginPlay, ServerboundKeepAlive, ServerboundSetCarriedItem,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use std::collections::HashSet;
@@ -162,6 +163,13 @@ async fn place_dirt_persists_through_flush_to_disk() {
             let mut body = frame.body;
             let pkt = LevelChunkWithLight::decode(&mut body).expect("decode");
             chunks_seen.insert((pkt.chunk_x, pkt.chunk_z));
+        } else if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
         } else if frame.id == ClientboundSetHeldSlot::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetHeldSlot::decode(&mut body).expect("decode SetHeldSlot");
@@ -194,9 +202,12 @@ async fn place_dirt_persists_through_flush_to_disk() {
         .await
         .expect("send SetCarriedItem");
 
-    // 2. Right-click the grass cell at (0, -61, 0) with direction Up
-    //    — places at (0, -60, 0). Sequence = 1.
-    let target_pos = pack_block_pos(0, -61, 0);
+    // 2. Right-click the top block under spawn with direction Up.
+    //    The old flat oracle used (-61 -> -60); Solaris-generated
+    //    worlds choose spawn Y adaptively as `top + 2`.
+    let target_y = sync.y.floor() as i32 - 2;
+    let placed_y = target_y + 1;
+    let target_pos = pack_block_pos(0, target_y, 0);
     let sequence: i32 = 1;
     client
         .write_packet(&ServerboundUseItemOn {
@@ -236,7 +247,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
             let (px, py, pz) = unpack_block_pos(pkt.position);
             assert_eq!(
                 (px, py, pz),
-                (0, -60, 0),
+                (0, placed_y, 0),
                 "BlockUpdate position must match the placement target",
             );
             assert_eq!(
@@ -275,7 +286,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
     }
 
     // 3. Flush the world to disk and re-open from scratch. The placed
-    //    dirt block at (0, -60, 0) must survive the round-trip.
+    //    dirt block must survive the round-trip.
     {
         let mut guard = world_handle.lock().await;
         let n = guard.flush_dirty().expect("flush_dirty");
@@ -286,7 +297,11 @@ async fn place_dirt_persists_through_flush_to_disk() {
     let mut fresh =
         mc_world::WorldStorage::open(tmp_world.path(), Arc::clone(&blocks)).expect("reopen");
     let landed = fresh
-        .get_block(mc_world::BlockPos { x: 0, y: -60, z: 0 })
+        .get_block(mc_world::BlockPos {
+            x: 0,
+            y: placed_y,
+            z: 0,
+        })
         .unwrap()
         .expect("placed cell present");
     let resolved = blocks.by_id(landed).expect("state id resolves");

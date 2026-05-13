@@ -23,9 +23,9 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ConfirmTeleportation, Direction, GameEvent, LevelChunkWithLight,
-    LightUpdate, LoginPlay, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos,
+    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
+    LevelChunkWithLight, LightUpdate, LoginPlay, ServerboundKeepAlive, ServerboundSetCarriedItem,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
@@ -139,19 +139,36 @@ async fn incremental_relight_wire_matches_full_recompute() {
             let mut body = frame.body;
             let pkt = LevelChunkWithLight::decode(&mut body).expect("decode");
             chunks_seen.insert((pkt.chunk_x, pkt.chunk_z));
+        } else if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
         }
     }
 
-    // Select dirt (hotbar slot 1) and place at (8, -60, 8). The
-    // grass cell at (8, -61, 8) is the click target; direction=Up
-    // shifts the placement one cell above. (8, 8) is far enough
-    // from every chunk seam (lx in 1..=14) that all light
-    // propagation stays inside chunk (0, 0).
+    // Select dirt (hotbar slot 1) and place one block above the
+    // top block at local (8, 8). That column is far enough from every
+    // chunk seam (lx/lz in 1..=14) that light propagation stays inside
+    // chunk (0, 0).
+    let target_y = {
+        let mut guard = world_handle.lock().await;
+        let chunk = guard
+            .get_chunk_mut(ChunkPos { x: 0, z: 0 })
+            .expect("chunk read")
+            .expect("origin chunk present");
+        chunk.rebuild_highest_opaque(&block_light);
+        chunk
+            .highest_opaque_y(8, 8)
+            .expect("origin local column has terrain")
+    };
     client
         .write_packet(&ServerboundSetCarriedItem { slot: 1 })
         .await
         .expect("send SetCarriedItem");
-    let target_pos = pack_block_pos(8, -61, 8);
+    let target_pos = pack_block_pos(8, target_y, 8);
     let sequence: i32 = 1;
     client
         .write_packet(&ServerboundUseItemOn {

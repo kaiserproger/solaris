@@ -113,7 +113,6 @@ struct ChunkStreamState<'a> {
     world: &'a WorldHandle,
     biomes: &'a Registry,
     block_light: Option<&'a BlockLightTable>,
-    light_cache: &'a mut LightCache,
     compression: Compression,
     center_cx: i32,
     center_cz: i32,
@@ -297,19 +296,26 @@ where
     .await?;
 
     let mut light_cache = LightCache::new();
-    if let Some(world) = config.world.as_ref() {
-        emit_chunks_around(
-            writer,
+    let mut chunk_stream = config.world.as_ref().and_then(|world| {
+        let biomes = data.registry("worldgen/biome")?;
+        Some(ChunkStreamState::new(
             world,
-            data,
+            biomes,
             config.block_light.as_deref(),
-            &mut light_cache,
             compression,
             spawn_cx,
             spawn_cz,
             SPAWN_VIEW_DISTANCE,
-        )
-        .await?;
+        ))
+    });
+    if config.world.is_some() && chunk_stream.is_none() {
+        warn!("worldgen/biome registry missing; skipping chunk emission");
+    }
+    if let Some(stream) = chunk_stream.as_mut()
+        && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
+    {
+        stream.log_summary();
+        chunk_stream = None;
     }
 
     // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
@@ -334,7 +340,7 @@ where
     )
     .await?;
 
-    // 7. Keepalive loop. Runs until the connection drops or the client
+    // 7. Play loop. Runs until the connection drops or the client
     //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
     //    interaction state passes the M5.d/M5.e/M6.f break/place
     //    handlers everything they need to mutate the world and emit
@@ -351,7 +357,15 @@ where
         inventory_state_id: 1,
         item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
     });
-    keepalive_loop(reader, writer, buf, compression, interaction.as_mut()).await
+    play_loop(
+        reader,
+        writer,
+        buf,
+        compression,
+        interaction.as_mut(),
+        chunk_stream,
+    )
+    .await
 }
 
 /// Per-connection state the M5.d / M5.e / M6 interaction handlers
@@ -503,54 +517,12 @@ fn spawn_chunk_pos() -> (i32, i32) {
     (cx, cz)
 }
 
-/// Stream every chunk in the `(center ± view_distance)` window in
-/// centre-out spiral order so the player's spawn tile renders first.
-///
-/// Per-chunk failure (missing region file, decode error, encode error)
-/// is logged and skipped rather than killing the connection: the same
-/// posture as the M3.d single-chunk path. The final summary log
-/// records how many chunks made it onto the wire.
-#[allow(clippy::too_many_arguments)]
-async fn emit_chunks_around<W>(
-    writer: &mut W,
-    world: &WorldHandle,
-    data: &VanillaData,
-    block_light: Option<&BlockLightTable>,
-    light_cache: &mut LightCache,
-    compression: Compression,
-    center_cx: i32,
-    center_cz: i32,
-    view_distance: i32,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let Some(biomes) = data.registry("worldgen/biome") else {
-        warn!("worldgen/biome registry missing; skipping chunk emission");
-        return Ok(());
-    };
-
-    let mut stream = ChunkStreamState::new(
-        world,
-        biomes,
-        block_light,
-        light_cache,
-        compression,
-        center_cx,
-        center_cz,
-        view_distance,
-    );
-    stream.drain_to_completion(writer).await?;
-    Ok(())
-}
-
 impl<'a> ChunkStreamState<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
         world: &'a WorldHandle,
         biomes: &'a Registry,
         block_light: Option<&'a BlockLightTable>,
-        light_cache: &'a mut LightCache,
         compression: Compression,
         center_cx: i32,
         center_cz: i32,
@@ -561,7 +533,6 @@ impl<'a> ChunkStreamState<'a> {
             world,
             biomes,
             block_light,
-            light_cache,
             compression,
             center_cx,
             center_cz,
@@ -587,16 +558,15 @@ impl<'a> ChunkStreamState<'a> {
         }
     }
 
-    async fn drain_to_completion<W>(&mut self, writer: &mut W) -> Result<(), ConnectionError>
-    where
-        W: AsyncWriteExt + Unpin,
-    {
-        while self.step(writer).await? != ChunkStreamStep::Complete {}
-        self.log_summary();
-        Ok(())
+    fn is_complete(&self) -> bool {
+        self.next_index >= self.queue.len()
     }
 
-    async fn step<W>(&mut self, writer: &mut W) -> Result<ChunkStreamStep, ConnectionError>
+    async fn step<W>(
+        &mut self,
+        writer: &mut W,
+        light_cache: &mut LightCache,
+    ) -> Result<ChunkStreamStep, ConnectionError>
     where
         W: AsyncWriteExt + Unpin,
     {
@@ -620,7 +590,7 @@ impl<'a> ChunkStreamState<'a> {
             self.biomes,
             self.block_light,
             self.workspace.as_mut(),
-            Some(&mut *self.light_cache),
+            Some(light_cache),
             cx,
             cz,
         ) {
@@ -1331,12 +1301,13 @@ where
     Ok(())
 }
 
-async fn keepalive_loop<R, W>(
+async fn play_loop<'a, R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
     compression: Compression,
     mut interaction: Option<&mut InteractionState>,
+    mut chunk_stream: Option<ChunkStreamState<'a>>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -1345,8 +1316,8 @@ where
     let mut ticker = interval(KEEPALIVE_PERIOD);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     // The first `tick()` resolves immediately; drop it so we don't
-    // race-send a keepalive before the client has finished processing
-    // the spawn burst.
+    // race-send a keepalive before the client has processed initial
+    // Play packets and the first chunk.
     ticker.tick().await;
 
     let mut next_id: i64 = 0;
@@ -1354,6 +1325,25 @@ where
     let mut pending_id: Option<i64> = None;
 
     loop {
+        let mut stream_finished = false;
+        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut()) {
+            match stream.step(writer, &mut state.light_cache).await? {
+                ChunkStreamStep::Progress => {
+                    stream_finished = stream.is_complete();
+                    tokio::task::yield_now().await;
+                }
+                ChunkStreamStep::Complete => {
+                    stream_finished = true;
+                }
+            }
+        }
+        if stream_finished {
+            if let Some(stream) = chunk_stream.as_ref() {
+                stream.log_summary();
+            }
+            chunk_stream = None;
+        }
+
         tokio::select! {
             biased;
             _ = ticker.tick() => {
@@ -1430,6 +1420,7 @@ where
                     );
                 }
             }
+            _ = tokio::time::sleep(Duration::from_millis(1)), if chunk_stream.is_some() => {}
         }
     }
 }

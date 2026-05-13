@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ConfirmTeleportation, Direction, GameEvent, LevelChunkWithLight,
-    LightUpdate, LoginPlay, PlayerActionKind, ServerboundPlayerAction, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
+    LevelChunkWithLight, LightUpdate, LoginPlay, PlayerActionKind, ServerboundKeepAlive,
+    ServerboundPlayerAction, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -126,13 +127,23 @@ async fn break_block_round_trips_update_ack_relight() {
             let mut body = frame.body;
             let pkt = LevelChunkWithLight::decode(&mut body).expect("decode");
             chunks_seen.insert((pkt.chunk_x, pkt.chunk_z));
+        } else if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
         }
         // Stray packets between chunks (keepalive, etc.) ignored.
     }
 
-    // Send the break action: grass at world (0, -61, 0). Sequence
+    // Send the break action against the top block under spawn. For the
+    // old flat oracle this is Y=-61; for Solaris-generated worlds the
+    // Play position is adaptive (`top + 2`). Sequence
     // = 1 — fresh per-connection counter from the client side.
-    let target_pos = pack_block_pos(0, -61, 0);
+    let target_y = sync.y.floor() as i32 - 2;
+    let target_pos = pack_block_pos(0, target_y, 0);
     let sequence: i32 = 1;
     client
         .write_packet(&ServerboundPlayerAction {
@@ -168,7 +179,7 @@ async fn break_block_round_trips_update_ack_relight() {
             let (px, py, pz) = unpack_block_pos(pkt.position);
             assert_eq!(
                 (px, py, pz),
-                (0, -61, 0),
+                (0, target_y, 0),
                 "BlockUpdate position must match the broken cell",
             );
             assert_eq!(

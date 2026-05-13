@@ -22,6 +22,7 @@ use mc_protocol::packets::configuration::{
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::play::{ClientboundKeepAlive, ServerboundKeepAlive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -112,6 +113,12 @@ impl Probe {
                         frame.body.len(),
                         hexdump_short(&frame.body, 48)
                     );
+                    if label == "PLAY" && frame.id == ClientboundKeepAlive::ID {
+                        let mut body = frame.body.clone();
+                        let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                        self.write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                            .await?;
+                    }
                     // If a Set Compression packet is implied (very small
                     // body, id matching login.0x03), enable compression
                     // for subsequent frames. We don't try to be smart

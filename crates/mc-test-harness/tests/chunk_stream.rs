@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ConfirmTeleportation, GameEvent, LevelChunkWithLight, LoginPlay, SetCenterChunk,
-    SynchronizePlayerPosition,
+    ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight, LoginPlay,
+    ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -158,6 +158,15 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
                 seen.len(),
             ),
         };
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
         if frame.id != LevelChunkWithLight::ID {
             continue;
         }
