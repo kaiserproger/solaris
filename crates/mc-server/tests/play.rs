@@ -30,8 +30,8 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
     ClientboundContainerSetContent, ClientboundKeepAlive, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
-    SetCenterChunk, SynchronizePlayerPosition,
+    ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundChatCommand,
+    ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -297,4 +297,34 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     // referenced by docstrings only — the test wire format uses the
     // serverbound counterpart.
     let _ = std::mem::size_of::<ClientboundKeepAlive>();
+}
+
+#[tokio::test]
+async fn play_state_survival_damage_command_updates_health() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "DamageCmd").await;
+
+    for _ in 0..7 {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: "damage 7.5".to_string(),
+        },
+        compression,
+    )
+    .await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
+    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
+    assert_eq!(health.health, 12.5);
+    assert_eq!(health.food, 20);
+    assert_eq!(health.saturation, 5.0);
+
+    drop(stream);
 }
