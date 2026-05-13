@@ -18,7 +18,7 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::ClientboundKnownPacks;
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::status::{StatusRequest, StatusResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -46,16 +46,20 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
-async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
+async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
-    let framed = encode_frame(P::ID, &body, Compression::Disabled).unwrap();
+    let framed = encode_frame(P::ID, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
+async fn read_one_frame(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, compression).unwrap() {
             return frame;
         }
         let read = stream.read_buf(buf).await.unwrap();
@@ -78,6 +82,7 @@ async fn login_offline_flow_completes() {
             server_port: addr.port(),
             next_state: NextState::Login,
         },
+        Compression::Disabled,
     )
     .await;
 
@@ -90,11 +95,22 @@ async fn login_offline_flow_completes() {
             name: "Notch".into(),
             player_uuid: Uuid::from_u128(0xDEADBEEF),
         },
+        Compression::Disabled,
     )
     .await;
 
-    // Expect LoginSuccess.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(
+        frame.id,
+        SetCompression::ID,
+        "should negotiate compression first"
+    );
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    assert_eq!(set_compression.threshold, 256);
+    let compression = Compression::Threshold(set_compression.threshold as usize);
+
+    // Expect LoginSuccess after the compression boundary.
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, LoginSuccess::ID, "should be login success");
     let success = LoginSuccess::decode(&mut frame.body).unwrap();
     assert_eq!(frame.body.remaining(), 0);
@@ -104,8 +120,8 @@ async fn login_offline_flow_completes() {
 
     // Acknowledge — this transitions to Configuration state, where the
     // server's first packet is `Clientbound Known Packs` (M1.e).
-    write_frame(&mut stream, &LoginAcknowledged).await;
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    write_frame(&mut stream, &LoginAcknowledged, compression).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
         ClientboundKnownPacks::ID,
@@ -129,6 +145,7 @@ async fn login_does_not_break_concurrent_status() {
             server_port: addr.port(),
             next_state: NextState::Login,
         },
+        Compression::Disabled,
     )
     .await;
 
@@ -143,10 +160,11 @@ async fn login_does_not_break_concurrent_status() {
             server_port: addr.port(),
             next_state: NextState::Status,
         },
+        Compression::Disabled,
     )
     .await;
-    write_frame(&mut pinger, &StatusRequest).await;
-    let mut frame = read_one_frame(&mut pinger, &mut rbuf).await;
+    write_frame(&mut pinger, &StatusRequest, Compression::Disabled).await;
+    let mut frame = read_one_frame(&mut pinger, &mut rbuf, Compression::Disabled).await;
     assert_eq!(frame.id, StatusResponse::ID);
     let _ = StatusResponse::decode(&mut frame.body).unwrap();
 

@@ -51,6 +51,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    compression: Compression,
     profile: &LoggedInProfile,
     data: &VanillaData,
     tags: &TagsData,
@@ -68,13 +69,13 @@ where
         &ClientboundKnownPacks {
             packs: vec![our_pack.clone()],
         },
-        Compression::Disabled,
+        compression,
     )
     .await?;
 
     // Step 2: read frames until we see the client's KnownPacks response.
     let client_packs = loop {
-        let frame = read_frame(reader, buf, Compression::Disabled).await?;
+        let frame = read_frame(reader, buf, compression).await?;
         if frame.id == ServerboundKnownPacks::ID {
             let mut body = frame.body;
             let parsed = ServerboundKnownPacks::decode(&mut body)?;
@@ -123,7 +124,7 @@ where
                 registry_id: registry.id.clone(),
                 entries,
             },
-            Compression::Disabled,
+            compression,
         )
         .await?;
     }
@@ -156,7 +157,7 @@ where
     };
     let tag_count = tags.total_tags();
     let tag_entries = tags.total_entries();
-    write_packet(writer, &tag_packet, Compression::Disabled).await?;
+    write_packet(writer, &tag_packet, compression).await?;
     debug!(
         registries = tag_packet.registries.len(),
         tags = tag_count,
@@ -165,12 +166,12 @@ where
     );
 
     // Step 4: tell the client we are done configuring.
-    write_packet(writer, &FinishConfiguration, Compression::Disabled).await?;
+    write_packet(writer, &FinishConfiguration, compression).await?;
 
     // Step 5: wait for AcknowledgeFinishConfiguration, ignoring
     // anything else.
     loop {
-        let frame = read_frame(reader, buf, Compression::Disabled).await?;
+        let frame = read_frame(reader, buf, compression).await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
             break;
         }

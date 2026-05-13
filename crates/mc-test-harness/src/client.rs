@@ -22,17 +22,11 @@ use mc_protocol::packets::configuration::{
     ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::{PROTOCOL_VERSION, RawFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
-
-/// Login-state `SetCompression` packet id. Hard-coded here (rather than
-/// re-exported from `mc-protocol`) because the server never sends it
-/// today; the heuristic only exists so this client survives a future
-/// `mc-net::login` flip without a test rewrite.
-const LOGIN_SET_COMPRESSION_ID: i32 = 0x03;
 
 /// Minimal raw-TCP client. Speaks the wire protocol our server speaks
 /// (no encryption, optional compression). The `compression` field flips
@@ -125,7 +119,7 @@ impl Client {
             let frame = self.read_frame().await?;
             // Heuristic: small body on the SetCompression id ⇒ flip
             // codec and keep reading. Same shape as `wire-probe`.
-            if frame.id == LOGIN_SET_COMPRESSION_ID && frame.body.len() <= 5 {
+            if frame.id == SetCompression::ID && frame.body.len() <= 5 {
                 let mut body = frame.body.clone();
                 if let Ok(threshold) = body.read_varint() {
                     self.compression = if threshold < 0 {

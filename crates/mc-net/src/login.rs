@@ -12,7 +12,7 @@
 use bytes::BytesMut;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use md5::{Digest, Md5};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 use crate::connection::{read_packet, write_packet};
 use crate::error::ConnectionError;
+
+pub(crate) const LOGIN_COMPRESSION_THRESHOLD: i32 = 256;
 
 /// Outcome of a successful login. Returned so the caller (`server.rs`)
 /// has the information it needs to proceed into the Configuration state
@@ -53,6 +55,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    compression: &mut Compression,
 ) -> Result<LoggedInProfile, ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -68,16 +71,24 @@ where
     let name = login_start.name;
     info!(player = %name, %uuid, "offline login");
 
+    write_packet(
+        writer,
+        &SetCompression {
+            threshold: LOGIN_COMPRESSION_THRESHOLD,
+        },
+        Compression::Disabled,
+    )
+    .await?;
+    *compression = Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize);
+
     let success = LoginSuccess {
         uuid,
         name: name.clone(),
         properties: Vec::new(),
     };
-    write_packet(writer, &success, Compression::Disabled).await?;
+    write_packet(writer, &success, *compression).await?;
 
-    let _ack =
-        read_packet::<LoginAcknowledged, _>(reader, buf, Compression::Disabled, State::Login)
-            .await?;
+    let _ack = read_packet::<LoginAcknowledged, _>(reader, buf, *compression, State::Login).await?;
 
     Ok(LoggedInProfile { uuid, name })
 }

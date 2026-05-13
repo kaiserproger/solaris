@@ -10,10 +10,9 @@
 //!        → connection transitions into Configuration state
 //! ```
 //!
-//! Compression negotiation via `SetCompression (0x03 clientbound)` is
-//! defined here but not driven by the server in M1.d — offline play
-//! does not strictly need it and skipping the round trip keeps the
-//! login path observable as plaintext.
+//! Compression negotiation uses `SetCompression (0x03 clientbound)`.
+//! The packet itself is still plaintext; every following frame uses the
+//! compressed framing layout described in [`crate::frame`].
 //!
 //! Online-mode (`EncryptionRequest`/`EncryptionResponse`) is a deliberate
 //! follow-up milestone and lives outside M1.
@@ -177,9 +176,8 @@ impl Packet for LoginSuccess {
     }
 }
 
-/// `SetCompression` — defined for completeness; not driven by the M1.d
-/// server. Once sent, every subsequent frame on the wire uses the
-/// compressed layout described in [`crate::frame`].
+/// `SetCompression` — once sent, every subsequent frame on the wire
+/// uses the compressed layout described in [`crate::frame`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetCompression {
     pub threshold: i32,

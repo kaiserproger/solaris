@@ -107,6 +107,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    compression: Compression,
     profile: &LoggedInProfile,
     config: &ServerConfig,
 ) -> Result<(), ConnectionError>
@@ -158,7 +159,7 @@ where
         sea_level: 63,
         enforces_secure_chat: false,
     };
-    write_packet(writer, &login, Compression::Disabled).await?;
+    write_packet(writer, &login, compression).await?;
 
     // 2. Synchronize Player Position. teleport_id=1; we'll watch for
     //    `ConfirmTeleportation(1)` in the loop below but don't block
@@ -178,7 +179,7 @@ where
             pitch: 0.0,
             relative_flags: 0,
         },
-        Compression::Disabled,
+        compression,
     )
     .await?;
 
@@ -198,7 +199,7 @@ where
             event: GameEvent::EVENT_START_WAITING_FOR_CHUNKS,
             value: 0.0,
         },
-        Compression::Disabled,
+        compression,
     )
     .await?;
 
@@ -212,7 +213,7 @@ where
             chunk_x: spawn_cx,
             chunk_z: spawn_cz,
         },
-        Compression::Disabled,
+        compression,
     )
     .await?;
 
@@ -224,6 +225,7 @@ where
             data,
             config.block_light.as_deref(),
             &mut light_cache,
+            compression,
             spawn_cx,
             spawn_cz,
             SPAWN_VIEW_DISTANCE,
@@ -240,12 +242,7 @@ where
     //    starter inventory is mostly empty stacks — packets ship
     //    anyway, just with `count == 0` slots.
     let starter = build_starter_inventory(&config.items);
-    write_packet(
-        writer,
-        &ClientboundSetHeldSlot { slot: 0 },
-        Compression::Disabled,
-    )
-    .await?;
+    write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
     write_packet(
         writer,
         &ClientboundContainerSetContent {
@@ -254,7 +251,7 @@ where
             items: starter.as_wire_list(),
             carried_item: ItemStack::EMPTY,
         },
-        Compression::Disabled,
+        compression,
     )
     .await?;
 
@@ -269,12 +266,13 @@ where
         block_light: config.block_light.as_ref().map(Arc::clone),
         workspace: LightWorkspace::new(),
         light_cache: std::mem::take(&mut light_cache),
+        compression,
         selected_hotbar_slot: 0,
         inventory: starter,
         inventory_state_id: 1,
         item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
     });
-    keepalive_loop(reader, writer, buf, interaction.as_mut()).await
+    keepalive_loop(reader, writer, buf, compression, interaction.as_mut()).await
 }
 
 /// Per-connection state the M5.d / M5.e / M6 interaction handlers
@@ -293,6 +291,7 @@ struct InteractionState {
     /// the full 3×3 neighbourhood for each affected chunk on every
     /// break/place.
     light_cache: LightCache,
+    compression: Compression,
     /// M6.d: which item the player is currently holding. Bumped by
     /// `ServerboundSetCarriedItem` (0..=8) and consulted by
     /// `handle_use_item_on` to resolve the placed block.
@@ -442,6 +441,7 @@ async fn emit_chunks_around<W>(
     data: &VanillaData,
     block_light: Option<&BlockLightTable>,
     light_cache: &mut LightCache,
+    compression: Compression,
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
@@ -518,7 +518,7 @@ where
             }
         };
         let n = packet.data.len();
-        write_packet(writer, &packet, Compression::Disabled).await?;
+        write_packet(writer, &packet, compression).await?;
         emitted += 1;
         bytes += n;
     }
@@ -675,7 +675,7 @@ where
             &BlockChangedAck {
                 sequence: action.sequence,
             },
-            Compression::Disabled,
+            state.compression,
         )
         .await?;
         return Ok(());
@@ -725,7 +725,7 @@ where
             }
             Err(err) => {
                 warn!(error = %err, x, y, z, "set_block_at failed; skipping edit");
-                write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+                write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
                 return Ok(());
             }
         }
@@ -735,11 +735,11 @@ where
     // doesn't roll back forever, but skip the BlockUpdate /
     // LightUpdate ripple.
     let Some(prev) = prev else {
-        write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
         return Ok(());
     };
     if prev == new_state {
-        write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
         return Ok(());
     }
 
@@ -750,7 +750,7 @@ where
             position: mc_protocol::packets::play::pack_block_pos(x, y, z),
             state_id: new_state.0 as i32,
         },
-        Compression::Disabled,
+        state.compression,
     )
     .await?;
 
@@ -767,7 +767,7 @@ where
 
     // 4. Ack last — vanilla expects update-before-ack so the
     //    prediction reconciles against a known state.
-    write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
+    write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
     Ok(())
 }
 
@@ -886,7 +886,7 @@ where
                 chunk_z: pos.z,
                 light: light_data,
             },
-            Compression::Disabled,
+            state.compression,
         )
         .await?;
     }
@@ -942,7 +942,7 @@ where
             &BlockChangedAck {
                 sequence: action.sequence,
             },
-            Compression::Disabled,
+            state.compression,
         )
         .await?;
         return Ok(());
@@ -978,7 +978,7 @@ where
             &BlockChangedAck {
                 sequence: action.sequence,
             },
-            Compression::Disabled,
+            state.compression,
         )
         .await?;
         return Ok(());
@@ -1005,7 +1005,7 @@ where
             slot: (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
             item_stack: new_slot_value,
         },
-        Compression::Disabled,
+        state.compression,
     )
     .await?;
     Ok(())
@@ -1015,6 +1015,7 @@ async fn keepalive_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    compression: Compression,
     mut interaction: Option<&mut InteractionState>,
 ) -> Result<(), ConnectionError>
 where
@@ -1048,11 +1049,11 @@ where
                 write_packet(
                     writer,
                     &ClientboundKeepAlive { id: next_id },
-                    Compression::Disabled,
+                    compression,
                 )
                 .await?;
             }
-            result = read_frame(reader, buf, Compression::Disabled) => {
+            result = read_frame(reader, buf, compression) => {
                 let frame = result?;
                 if frame.id == ServerboundKeepAlive::ID {
                     let mut body = frame.body;

@@ -18,7 +18,7 @@ use mc_protocol::packets::configuration::{
     RegistryData, ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::LoginPlay;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -46,16 +46,20 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
-async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
+async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
-    let framed = encode_frame(P::ID, &body, Compression::Disabled).unwrap();
+    let framed = encode_frame(P::ID, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
+async fn read_one_frame(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, compression).unwrap() {
             return frame;
         }
         let read = stream.read_buf(buf).await.unwrap();
@@ -70,7 +74,7 @@ async fn run_through_login_ack(
     buf: &mut BytesMut,
     addr: SocketAddr,
     name: &str,
-) {
+) -> Compression {
     write_frame(
         stream,
         &Handshake {
@@ -79,6 +83,7 @@ async fn run_through_login_ack(
             server_port: addr.port(),
             next_state: NextState::Login,
         },
+        Compression::Disabled,
     )
     .await;
     write_frame(
@@ -87,12 +92,18 @@ async fn run_through_login_ack(
             name: name.into(),
             player_uuid: Uuid::nil(),
         },
+        Compression::Disabled,
     )
     .await;
-    let mut frame = read_one_frame(stream, buf).await;
+    let mut frame = read_one_frame(stream, buf, Compression::Disabled).await;
+    assert_eq!(frame.id, SetCompression::ID);
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    let compression = Compression::Threshold(set_compression.threshold as usize);
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, LoginSuccess::ID);
     let _ = LoginSuccess::decode(&mut frame.body).unwrap();
-    write_frame(stream, &LoginAcknowledged).await;
+    write_frame(stream, &LoginAcknowledged, compression).await;
+    compression
 }
 
 #[tokio::test]
@@ -100,10 +111,10 @@ async fn configuration_known_packs_and_finish_complete() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(4096);
-    run_through_login_ack(&mut stream, &mut rbuf, addr, "Notch").await;
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Notch").await;
 
     // First Configuration packet from the server: Known Packs.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
         ClientboundKnownPacks::ID,
@@ -123,6 +134,7 @@ async fn configuration_known_packs_and_finish_complete() {
         &ServerboundKnownPacks {
             packs: known.packs.clone(),
         },
+        compression,
     )
     .await;
 
@@ -131,7 +143,7 @@ async fn configuration_known_packs_and_finish_complete() {
     let stub_registry_count = mc_data::KNOWN_REGISTRIES.len();
     let mut seen_dimension_type = false;
     for _ in 0..stub_registry_count {
-        let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
         assert_eq!(
             frame.id,
             RegistryData::ID,
@@ -168,7 +180,7 @@ async fn configuration_known_packs_and_finish_complete() {
     // and Finish Configuration. The test stub has an empty tag set so
     // the packet is byte-minimal (one VarInt(0)) but it must still
     // appear on the wire.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
         UpdateTags::ID,
@@ -182,7 +194,7 @@ async fn configuration_known_packs_and_finish_complete() {
     assert_eq!(frame.body.remaining(), 0);
 
     // Then Finish Configuration.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
         FinishConfiguration::ID,
@@ -194,10 +206,10 @@ async fn configuration_known_packs_and_finish_complete() {
     // transition by reading the next clientbound packet and confirming
     // it is Login (Play). Full coverage of the Play spawn burst is in
     // tests/play.rs.
-    write_frame(&mut stream, &AcknowledgeFinishConfiguration).await;
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
     let frame = tokio::time::timeout(
         Duration::from_secs(2),
-        read_one_frame(&mut stream, &mut rbuf),
+        read_one_frame(&mut stream, &mut rbuf, compression),
     )
     .await
     .expect("server did not advance to Play within 2s");
@@ -219,16 +231,16 @@ async fn configuration_skips_unexpected_packets() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(4096);
-    run_through_login_ack(&mut stream, &mut rbuf, addr, "Steve").await;
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Steve").await;
 
     // Consume the server's Known Packs.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
 
     // Send a "Client Information"-shaped junk frame with serverbound id
     // 0x00 in Configuration. The handler should ignore it.
-    let junk = encode_frame(0x00, &[0u8; 4], Compression::Disabled).unwrap();
+    let junk = encode_frame(0x00, &[0u8; 4], compression).unwrap();
     stream.write_all(&junk).await.unwrap();
 
     // Now send the real Known Packs response.
@@ -241,34 +253,35 @@ async fn configuration_skips_unexpected_packets() {
                 version: TARGET_RELEASE.into(),
             }],
         },
+        compression,
     )
     .await;
 
     // Drain Registry Data packets, one per stub registry, then drain
     // the M3.i Update Tags packet, then expect Finish Configuration.
     for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
-        let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
         assert_eq!(frame.id, RegistryData::ID);
         let _ = RegistryData::decode(&mut frame.body).unwrap();
     }
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 
     // Send another junk frame before the ack — handler should ignore it
     // too while waiting for AcknowledgeFinishConfiguration.
-    let junk = encode_frame(0x02, &[1, 2, 3], Compression::Disabled).unwrap();
+    let junk = encode_frame(0x02, &[1, 2, 3], compression).unwrap();
     stream.write_all(&junk).await.unwrap();
 
-    write_frame(&mut stream, &AcknowledgeFinishConfiguration).await;
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
     // Same as above: verify the state transition by waiting for the
     // first Play-state packet.
     let frame = tokio::time::timeout(
         Duration::from_secs(2),
-        read_one_frame(&mut stream, &mut rbuf),
+        read_one_frame(&mut stream, &mut rbuf, compression),
     )
     .await
     .expect("server did not advance to Play within 2s");

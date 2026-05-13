@@ -27,7 +27,7 @@ use mc_protocol::packets::configuration::{
     ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
+use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
     SetCenterChunk, SynchronizePlayerPosition,
@@ -58,16 +58,20 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
-async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P) {
+async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
-    let framed = encode_frame(P::ID, &body, Compression::Disabled).unwrap();
+    let framed = encode_frame(P::ID, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
 }
 
-async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protocol::RawFrame {
+async fn read_one_frame(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> mc_protocol::RawFrame {
     loop {
-        if let Some(frame) = try_decode_frame(buf, Compression::Disabled).unwrap() {
+        if let Some(frame) = try_decode_frame(buf, compression).unwrap() {
             return frame;
         }
         let read = stream.read_buf(buf).await.unwrap();
@@ -78,7 +82,12 @@ async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protoc
 /// Walk the full protocol up to and including
 /// `AcknowledgeFinishConfiguration`. After this the connection is in
 /// Play state on the server side.
-async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketAddr, name: &str) {
+async fn drive_to_play(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    addr: SocketAddr,
+    name: &str,
+) -> Compression {
     // Handshake → Login Start → expect Login Success → Acknowledged.
     write_frame(
         stream,
@@ -88,6 +97,7 @@ async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketA
             server_port: addr.port(),
             next_state: NextState::Login,
         },
+        Compression::Disabled,
     )
     .await;
     write_frame(
@@ -96,15 +106,20 @@ async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketA
             name: name.into(),
             player_uuid: Uuid::nil(),
         },
+        Compression::Disabled,
     )
     .await;
-    let mut frame = read_one_frame(stream, buf).await;
+    let mut frame = read_one_frame(stream, buf, Compression::Disabled).await;
+    assert_eq!(frame.id, SetCompression::ID);
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    let compression = Compression::Threshold(set_compression.threshold as usize);
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, LoginSuccess::ID);
     let _ = LoginSuccess::decode(&mut frame.body).unwrap();
-    write_frame(stream, &LoginAcknowledged).await;
+    write_frame(stream, &LoginAcknowledged, compression).await;
 
     // Configuration: KnownPacks round trip, drain registries, ack.
-    let mut frame = read_one_frame(stream, buf).await;
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let cb_packs = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
     write_frame(
@@ -112,23 +127,25 @@ async fn drive_to_play(stream: &mut TcpStream, buf: &mut BytesMut, addr: SocketA
         &ServerboundKnownPacks {
             packs: cb_packs.packs,
         },
+        compression,
     )
     .await;
     for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
-        let mut frame = read_one_frame(stream, buf).await;
+        let mut frame = read_one_frame(stream, buf, compression).await;
         assert_eq!(frame.id, RegistryData::ID);
         let _ = RegistryData::decode(&mut frame.body).unwrap();
     }
     // M3.i: Update Tags arrives between the last RegistryData and
     // FinishConfiguration. The stub `tags` here is empty; the packet
     // is still required on the wire.
-    let mut frame = read_one_frame(stream, buf).await;
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, UpdateTags::ID);
     let _ = UpdateTags::decode(&mut frame.body).unwrap();
-    let mut frame = read_one_frame(stream, buf).await;
+    let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
-    write_frame(stream, &AcknowledgeFinishConfiguration).await;
+    write_frame(stream, &AcknowledgeFinishConfiguration, compression).await;
+    compression
 }
 
 #[tokio::test]
@@ -136,12 +153,12 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
-    drive_to_play(&mut stream, &mut rbuf, addr, "PlayTester").await;
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayTester").await;
 
     // The handler emits four packets back-to-back. Order matters: Login
     // (Play) first because the client needs the world setup before it
     // can interpret anything else.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, LoginPlay::ID, "expected Login (Play) first");
     let login = LoginPlay::decode(&mut frame.body).unwrap();
     assert_eq!(frame.body.remaining(), 0);
@@ -153,7 +170,7 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!(login.game_mode, 0); // survival
     assert!(login.is_flat, "M1.g world is intentionally flat/empty");
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
         SynchronizePlayerPosition::ID,
@@ -170,12 +187,12 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
         sync.y
     );
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, GameEvent::ID, "expected Game Event");
     let event = GameEvent::decode(&mut frame.body).unwrap();
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, SetCenterChunk::ID, "expected Set Center Chunk");
     let center = SetCenterChunk::decode(&mut frame.body).unwrap();
     // SPAWN_(X,Z) = (0.5, 0.5) → chunk (0, 0).
@@ -189,6 +206,7 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
         &ConfirmTeleportation {
             teleport_id: sync.teleport_id,
         },
+        compression,
     )
     .await;
 
@@ -220,7 +238,7 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(8192);
-    drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
     // Drain spawn burst.
     // After M3.d the burst is 4 frames: LoginPlay,
@@ -228,10 +246,15 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     // world = None the chunk packet itself is intentionally not
     // emitted.
     for _ in 0..4 {
-        let _ = read_one_frame(&mut stream, &mut rbuf).await;
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 
-    write_frame(&mut stream, &ServerboundKeepAlive { id: 0xDEAD_BEEF }).await;
+    write_frame(
+        &mut stream,
+        &ServerboundKeepAlive { id: 0xDEAD_BEEF },
+        compression,
+    )
+    .await;
 
     // Confirm the connection is still alive — the server should log a
     // mismatch warning but not close.

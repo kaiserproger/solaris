@@ -147,6 +147,7 @@ async fn handle_connection(
 
     let (mut reader, mut writer) = socket.into_split();
     let mut buf = BytesMut::with_capacity(4096);
+    let mut compression = Compression::Disabled;
 
     let handshake = read_packet::<Handshake, _>(
         &mut reader,
@@ -166,17 +167,27 @@ async fn handle_connection(
     match handshake.next_state {
         NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
         NextState::Login | NextState::Transfer => {
-            let profile = login::handle(&mut reader, &mut writer, &mut buf).await?;
+            let profile =
+                login::handle(&mut reader, &mut writer, &mut buf, &mut compression).await?;
             configuration::handle(
                 &mut reader,
                 &mut writer,
                 &mut buf,
+                compression,
                 &profile,
                 &config.data,
                 &config.tags,
             )
             .await?;
-            play::handle(&mut reader, &mut writer, &mut buf, &profile, config).await
+            play::handle(
+                &mut reader,
+                &mut writer,
+                &mut buf,
+                compression,
+                &profile,
+                config,
+            )
+            .await
         }
     }
 }
