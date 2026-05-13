@@ -936,6 +936,20 @@ pub fn compute_chunk_light_in(
         return ChunkLight::filled(15, 0);
     }
 
+    if let Some(light) = compute_columnar_no_emitter_light(&neighbourhood, table) {
+        return light;
+    }
+
+    compute_chunk_light_slow_in(ws, neighbourhood, table)
+}
+
+fn compute_chunk_light_slow_in(
+    ws: &mut LightWorkspace,
+    neighbourhood: [[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+) -> ChunkLight {
+    debug_assert!(neighbourhood[1][1].is_some());
+
     ws.reset();
 
     populate_grids(
@@ -953,6 +967,119 @@ pub fn compute_chunk_light_in(
     bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
 
     extract_centre(&ws.sky, &ws.block)
+}
+
+fn compute_columnar_no_emitter_light(
+    neighbourhood: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+) -> Option<ChunkLight> {
+    if !neighbourhood_is_columnar_without_emitters(neighbourhood, table) {
+        return None;
+    }
+
+    let centre = neighbourhood[1][1]?;
+    let air = BlockStateId(0);
+    let mut out = ChunkLight::zeroed();
+    for lz in 0..SECTION_DIM {
+        for lx in 0..SECTION_DIM {
+            if let Some(top_y) = columnar_top_hint(centre, lx as u8, lz as u8) {
+                for ly in ((top_y + 1 - MIN_Y) as usize)..WORLD_HEIGHT {
+                    out.set_sky_local(lx, ly, lz, 15);
+                }
+            } else {
+                for ly in (0..WORLD_HEIGHT).rev() {
+                    let world_y = MIN_Y + ly as i32;
+                    let state = centre.get_block(lx as u8, world_y, lz as u8).unwrap_or(air);
+                    if table.propagates_sky(state.0).unwrap_or(true) {
+                        out.set_sky_local(lx, ly, lz, 15);
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+fn neighbourhood_is_columnar_without_emitters(
+    neighbourhood: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+) -> bool {
+    let air = BlockStateId(0);
+    for row in neighbourhood {
+        for slot in row {
+            let Some(chunk) = *slot else {
+                continue;
+            };
+            for lz in 0..SECTION_DIM {
+                for lx in 0..SECTION_DIM {
+                    if let Some(top_y) = columnar_top_hint(chunk, lx as u8, lz as u8) {
+                        if !hinted_column_is_columnar_without_emitters(
+                            chunk, table, lx as u8, lz as u8, top_y,
+                        ) {
+                            return false;
+                        }
+                        continue;
+                    }
+
+                    let mut blocked = false;
+                    for ly in (0..WORLD_HEIGHT).rev() {
+                        let world_y = MIN_Y + ly as i32;
+                        let state = chunk.get_block(lx as u8, world_y, lz as u8).unwrap_or(air);
+                        if table.emission(state.0).unwrap_or(0) > 0 {
+                            return false;
+                        }
+                        let propagates_sky = table.propagates_sky(state.0).unwrap_or(true);
+                        if !propagates_sky && table.opacity(state.0).unwrap_or(0) < 15 {
+                            return false;
+                        }
+                        if !blocked {
+                            if !propagates_sky {
+                                blocked = true;
+                            }
+                        } else if propagates_sky {
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
+fn columnar_top_hint(chunk: &Chunk, x: u8, z: u8) -> Option<i32> {
+    chunk.highest_opaque_y(x, z).or_else(|| {
+        chunk
+            .heightmaps
+            .get("MOTION_BLOCKING")
+            .or_else(|| chunk.heightmaps.get("WORLD_SURFACE"))
+            .and_then(|hm| heightmap_value_to_world_y(hm.get(x, z)))
+    })
+}
+
+fn hinted_column_is_columnar_without_emitters(
+    chunk: &Chunk,
+    table: &BlockLightTable,
+    x: u8,
+    z: u8,
+    top_y: i32,
+) -> bool {
+    let air = BlockStateId(0);
+    for y in MIN_Y..=top_y {
+        let state = chunk.get_block(x, y, z).unwrap_or(air);
+        if table.emission(state.0).unwrap_or(0) > 0 {
+            return false;
+        }
+        if table.propagates_sky(state.0).unwrap_or(true) {
+            return false;
+        }
+        if table.opacity(state.0).unwrap_or(0) < 15 {
+            return false;
+        }
+    }
+    true
 }
 
 fn is_all_air_neighbourhood(neighbourhood: &[[Option<&Chunk>; 3]; 3]) -> bool {
@@ -1278,6 +1405,53 @@ mod tests {
             14,
             "sky leaks into the well floor from adjacent open columns",
         );
+    }
+
+    #[test]
+    fn columnar_fast_path_matches_slow_bfs() {
+        let table = tiny_table();
+        let mut chunk = air_chunk();
+        for lz in 0..SECTION_DIM {
+            for lx in 0..SECTION_DIM {
+                let top = 48 + ((lx + lz) % 5) as i32;
+                for y in MIN_Y..=top {
+                    chunk.set_block(lx as u8, y, lz as u8, BlockStateId(1));
+                }
+            }
+        }
+        let input = solo(chunk);
+        let borrowed = borrow(&input);
+        let fast = compute_columnar_no_emitter_light(&borrowed, &table)
+            .expect("columnar terrain should use fast path");
+        let mut ws = LightWorkspace::new();
+        let slow = compute_chunk_light_slow_in(&mut ws, borrowed, &table);
+        assert_eq!(fast, slow);
+    }
+
+    #[test]
+    fn columnar_fast_path_rejects_emitters_and_caves() {
+        let table = tiny_table();
+
+        let mut emitter = air_chunk();
+        emitter.set_block(8, 64, 8, BlockStateId(3));
+        let input = solo(emitter);
+        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
+
+        let mut cave = air_chunk();
+        for y in MIN_Y..=64 {
+            cave.set_block(8, y, 8, BlockStateId(1));
+        }
+        cave.set_block(8, 0, 8, BlockStateId(0));
+        let input = solo(cave);
+        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
+
+        let mut soft_blocker = air_chunk();
+        for y in MIN_Y..64 {
+            soft_blocker.set_block(8, y, 8, BlockStateId(1));
+        }
+        soft_blocker.set_block(8, 64, 8, BlockStateId(4));
+        let input = solo(soft_blocker);
+        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
     }
 
     #[test]
