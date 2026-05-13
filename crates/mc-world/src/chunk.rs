@@ -17,6 +17,7 @@
 use std::collections::HashMap;
 
 use mc_data::Identifier;
+use mc_data::block_light::BlockLightTable;
 use mc_nbt::Tag;
 
 use crate::block::BlockStateId;
@@ -188,6 +189,11 @@ pub struct Chunk {
     /// plus the worldgen-time `*_WG` variants. We don't enforce the
     /// set here — the Anvil codec stores whatever it reads.
     pub heightmaps: HashMap<String, Heightmap>,
+    /// Derived highest sky-blocking cell per column, stored as the
+    /// same `top + 1 - MIN_Y` offset as vanilla heightmaps. This is not
+    /// serialized as an Anvil heightmap; it is maintained from the
+    /// light table for spawn picking and sky-relight shortcuts.
+    pub highest_opaque: Heightmap,
     /// Block-entity NBT, keyed by absolute world position. Stored
     /// opaque (raw Java-standard NBT bytes) until M3 needs typed
     /// access.
@@ -249,6 +255,7 @@ impl Chunk {
                 .map(|_| BiomeSection::filled(biome.clone()))
                 .collect(),
             heightmaps: HashMap::new(),
+            highest_opaque: Heightmap::zeroed(),
             block_entities: HashMap::new(),
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
@@ -311,6 +318,24 @@ impl Chunk {
         }
         Some(prev)
     }
+
+    pub fn rebuild_highest_opaque(&mut self, table: &BlockLightTable) {
+        for z in 0..SECTION_DIM as u8 {
+            for x in 0..SECTION_DIM as u8 {
+                self.update_highest_opaque_column(x, z, table);
+            }
+        }
+    }
+
+    pub fn update_highest_opaque_column(&mut self, x: u8, z: u8, table: &BlockLightTable) {
+        let top = top_opaque_column(self, x, z, table);
+        self.highest_opaque.set(x, z, top);
+    }
+
+    #[must_use]
+    pub fn highest_opaque_y(&self, x: u8, z: u8) -> Option<i32> {
+        heightmap_value_to_world_y(self.highest_opaque.get(x, z))
+    }
 }
 
 /// Walk column `(x, z)` from `MAX_Y - 1` down to `MIN_Y` and return
@@ -331,6 +356,27 @@ fn top_non_air_column(chunk: &Chunk, x: u8, z: u8, air: BlockStateId) -> u32 {
         }
     }
     0
+}
+
+pub fn top_opaque_column(chunk: &Chunk, x: u8, z: u8, table: &BlockLightTable) -> u32 {
+    for y in (MIN_Y..MAX_Y).rev() {
+        let Some(state) = chunk.get_block(x, y, z) else {
+            continue;
+        };
+        if !table.propagates_sky(state.0).unwrap_or(true) {
+            return (y - MIN_Y + 1) as u32;
+        }
+    }
+    0
+}
+
+#[must_use]
+pub fn heightmap_value_to_world_y(value: u32) -> Option<i32> {
+    if value == 0 {
+        None
+    } else {
+        Some(MIN_Y + value as i32 - 1)
+    }
 }
 
 fn world_y_to_section(y: i32) -> Option<(usize, u8)> {
@@ -471,5 +517,26 @@ mod tests {
         assert_eq!(prev, air());
         assert_eq!(c.get_block(0, 0, 0), Some(stone()));
         assert!(c.heightmaps.is_empty());
+    }
+
+    #[test]
+    fn highest_opaque_uses_light_table_sky_predicate() {
+        let table = BlockLightTable::from_arrays(
+            "test",
+            vec![0, 0, 0],
+            vec![0, 15, 0],
+            vec![true, false, true],
+        );
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let glass = BlockStateId(2);
+
+        c.set_block(3, 80, 7, glass);
+        c.set_block(3, 64, 7, stone());
+        c.rebuild_highest_opaque(&table);
+        assert_eq!(c.highest_opaque_y(3, 7), Some(64));
+
+        c.set_block(3, 64, 7, air());
+        c.update_highest_opaque_column(3, 7, &table);
+        assert_eq!(c.highest_opaque_y(3, 7), None);
     }
 }

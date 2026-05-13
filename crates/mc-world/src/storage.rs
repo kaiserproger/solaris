@@ -16,6 +16,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use mc_data::Identifier;
+use mc_data::block_light::BlockLightTable;
 
 use crate::anvil::{
     ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, chunk_to_payload, read_region,
@@ -207,6 +208,33 @@ impl WorldStorage {
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
         Ok(chunk.set_block_and_update(local_x, pos.y, local_z, state, air))
+    }
+
+    pub fn update_highest_opaque_at(
+        &mut self,
+        pos: BlockPos,
+        table: &BlockLightTable,
+    ) -> Result<(), WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(());
+        }
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        chunk.update_highest_opaque_column(local_x, local_z, table);
+        Ok(())
+    }
+
+    pub fn get_chunk_mut(&mut self, cpos: ChunkPos) -> Result<Option<&mut Chunk>, WorldError> {
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(None);
+        }
+        self.touch(cpos);
+        Ok(self.cache.get_mut(&cpos))
     }
 
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {

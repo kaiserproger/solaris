@@ -38,7 +38,9 @@ use std::collections::{HashMap, VecDeque};
 use mc_data::block_light::BlockLightTable;
 
 use crate::block::BlockStateId;
-use crate::chunk::{Chunk, ChunkPos, MAX_Y, MIN_Y, SECTION_COUNT};
+use crate::chunk::{
+    Chunk, ChunkPos, MAX_Y, MIN_Y, SECTION_COUNT, heightmap_value_to_world_y, top_opaque_column,
+};
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
 /// World-height span in blocks (24 sections × 16 blocks).
@@ -362,6 +364,9 @@ pub fn apply_block_change_to_light(
 
     let world_x = centre_pos.x * SECTION_DIM as i32 + local_x as i32;
     let world_z = centre_pos.z * SECTION_DIM as i32 + local_z as i32;
+    let Some(edit_coord) = world_to_window(centre_pos, world_x, world_y, world_z) else {
+        return Vec::new();
+    };
 
     incremental_block_light(
         &mut window,
@@ -376,19 +381,30 @@ pub fn apply_block_change_to_light(
         new_emit,
     );
 
-    incremental_sky_light(
-        &mut window,
-        &mut changed,
-        chunks,
-        table,
-        centre_pos,
-        world_x,
-        world_y,
-        world_z,
-        prev_sky_pass,
-        new_sky_pass,
-        new_op,
-    );
+    if prev_op != new_op || prev_sky_pass != new_sky_pass {
+        let reseed_column = highest_opaque_changed(
+            chunks,
+            table,
+            edit_coord,
+            world_y,
+            prev_sky_pass,
+            new_sky_pass,
+        );
+        incremental_sky_light(
+            &mut window,
+            &mut changed,
+            chunks,
+            table,
+            centre_pos,
+            world_x,
+            world_y,
+            world_z,
+            prev_sky_pass,
+            new_sky_pass,
+            new_op,
+            reseed_column,
+        );
+    }
 
     let mut touched = Vec::new();
     for dz in 0..3 {
@@ -568,6 +584,33 @@ fn set_sky_light(
     }
 }
 
+fn highest_opaque_changed(
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    edit_coord: WCoord,
+    world_y: i32,
+    prev_sky_pass: bool,
+    new_sky_pass: bool,
+) -> bool {
+    if prev_sky_pass == new_sky_pass {
+        return false;
+    }
+
+    let (dx, dz, lx, _ly, lz) = coord_parts(edit_coord);
+    let post_top = chunks[dz][dx].and_then(|chunk| {
+        heightmap_value_to_world_y(top_opaque_column(chunk, lx as u8, lz as u8, table))
+    });
+
+    match (!prev_sky_pass, !new_sky_pass) {
+        (false, true) => post_top == Some(world_y),
+        (true, false) => match post_top {
+            Some(top) => top < world_y,
+            None => true,
+        },
+        _ => false,
+    }
+}
+
 /// Removal+addition BFS for block-light around a single edit cell.
 /// `world_x/y/z` is the edit cell in world coords; `new_op` and
 /// `new_emit` are post-edit opacity and emission for that cell.
@@ -697,9 +740,10 @@ fn incremental_sky_light(
     world_x: i32,
     world_y: i32,
     world_z: i32,
-    prev_sky_pass: bool,
+    _prev_sky_pass: bool,
     new_sky_pass: bool,
     new_op: u8,
+    reseed_column: bool,
 ) {
     let edit_coord = match world_to_window(centre_pos, world_x, world_y, world_z) {
         Some(c) => c,
@@ -748,7 +792,7 @@ fn incremental_sky_light(
     // closed; queue removal/relight accordingly. Stop at the first
     // opaque cell or once we hit any cell whose new value matches its
     // old.
-    if prev_sky_pass != new_sky_pass {
+    if reseed_column {
         let column_open_above_self = new_self == 15;
         let (gx, edit_ly, gz) = edit_coord;
         for ly in (0..edit_ly).rev() {

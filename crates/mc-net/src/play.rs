@@ -61,7 +61,7 @@ const SPAWN_X: f64 = 0.5;
 // (M3's old SPAWN_Y=64 worked only because the chunk burst was fast
 // enough to land before the client picked up physics; M4's slower
 // debug-mode burst exposed the latent bug.)
-const SPAWN_Y: f64 = -59.0;
+const DEFAULT_SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
 
 /// Chunk radius around spawn the server flushes before the keepalive
@@ -86,6 +86,21 @@ fn spawn_dimension(data: &VanillaData) -> Option<(i32, &Identifier, &[Identifier
     let registry = data.registry("dimension_type")?;
     let first = registry.entries.first()?;
     Some((0, first, registry.entries.as_slice()))
+}
+
+async fn spawn_position(config: &ServerConfig) -> (f64, f64, f64) {
+    let y = adaptive_spawn_y(config).await.unwrap_or(DEFAULT_SPAWN_Y);
+    (SPAWN_X, y, SPAWN_Z)
+}
+
+async fn adaptive_spawn_y(config: &ServerConfig) -> Option<f64> {
+    let world = config.world.as_ref()?;
+    let table = config.block_light.as_deref()?;
+    let mut storage = world.lock().await;
+    let chunk = storage.get_chunk_mut(ChunkPos { x: 0, z: 0 }).ok()??;
+    chunk.rebuild_highest_opaque(table);
+    let top = chunk.highest_opaque_y(0, 0)?;
+    Some((top + 2) as f64)
 }
 
 pub(crate) async fn handle<R, W>(
@@ -117,6 +132,8 @@ where
         spawn_dimension = %dim_name,
         "entering Play state"
     );
+
+    let (spawn_x, spawn_y, spawn_z) = spawn_position(config).await;
 
     // 1. Login (Play).
     let login = LoginPlay {
@@ -151,9 +168,9 @@ where
         writer,
         &SynchronizePlayerPosition {
             teleport_id: 1,
-            x: SPAWN_X,
-            y: SPAWN_Y,
-            z: SPAWN_Z,
+            x: spawn_x,
+            y: spawn_y,
+            z: spawn_z,
             dx: 0.0,
             dy: 0.0,
             dz: 0.0,
@@ -689,6 +706,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let pos = mc_world::BlockPos { x, y, z };
+    let table = state.block_light.as_ref().map(Arc::clone);
 
     // 1. Apply the mutation. Drop the lock as soon as it's done so
     //    the light-recompute path can re-acquire it for the
@@ -696,7 +714,15 @@ where
     let prev = {
         let mut storage = state.world.lock().await;
         match storage.set_block_at(pos, new_state) {
-            Ok(p) => p,
+            Ok(p) => {
+                if let (Some(prev), Some(table)) = (p, table.as_deref())
+                    && prev != new_state
+                    && let Err(err) = storage.update_highest_opaque_at(pos, table)
+                {
+                    warn!(error = %err, x, y, z, "highest-opaque heightmap update failed");
+                }
+                p
+            }
             Err(err) => {
                 warn!(error = %err, x, y, z, "set_block_at failed; skipping edit");
                 write_packet(writer, &BlockChangedAck { sequence }, Compression::Disabled).await?;
@@ -733,7 +759,6 @@ where
     //    chunk whose stored arrays actually changed. Falls back to
     //    no-op if the cache is empty (e.g. edits before the spawn
     //    burst populated it) or the block-light table isn't loaded.
-    let table = state.block_light.as_ref().map(Arc::clone);
     if let Some(table) = table {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);

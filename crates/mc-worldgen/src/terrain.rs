@@ -141,6 +141,7 @@ impl ChunkGenerator for TerrainGenerator {
                 if let Some(ws) = chunk.heightmaps.get_mut("WORLD_SURFACE") {
                     ws.set(lx, lz, hm);
                 }
+                chunk.highest_opaque.set(lx, lz, hm);
             }
         }
         chunk.status = "minecraft:full".into();
@@ -224,6 +225,7 @@ mod tests {
         // Heightmap value matches the height field.
         let hm = chunk.heightmaps.get("WORLD_SURFACE").unwrap();
         assert_eq!(hm.get(8, 8), (height + 1 - MIN_Y) as u32);
+        assert_eq!(chunk.highest_opaque_y(8, 8), Some(height));
 
         // Dirty flag set so M6 flush picks it up.
         assert!(chunk.dirty);
