@@ -103,6 +103,41 @@ struct ChunkWriteTiming {
     framed_bytes: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkStreamStep {
+    Progress,
+    Complete,
+}
+
+struct ChunkStreamState<'a> {
+    world: &'a WorldHandle,
+    biomes: &'a Registry,
+    block_light: Option<&'a BlockLightTable>,
+    light_cache: &'a mut LightCache,
+    compression: Compression,
+    center_cx: i32,
+    center_cz: i32,
+    view_distance: i32,
+    queue: Vec<(i32, i32)>,
+    next_index: usize,
+    staged: HashMap<(i32, i32), Arc<Chunk>>,
+    workspace: Option<LightWorkspace>,
+    started: Instant,
+    fetch_ms: u64,
+    build_timing: ChunkBuildTiming,
+    packet_encode_ms: u64,
+    frame_ms: u64,
+    socket_write_ms: u64,
+    framed_bytes: usize,
+    first_chunk_ms: Option<u64>,
+    ring1_complete_ms: Option<u64>,
+    ring2_complete_ms: Option<u64>,
+    ring_emitted: Vec<usize>,
+    emitted: usize,
+    absent: usize,
+    bytes: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum BlockDeltaPacket {
     Single(BlockDelta),
@@ -468,11 +503,8 @@ fn spawn_chunk_pos() -> (i32, i32) {
     (cx, cz)
 }
 
-/// Stream every chunk in the `(center ± view_distance)` window. Order
-/// is row-major (z outer, x inner) — vanilla uses a spiral so the
-/// player's spawn tile renders first, but for a static spawn this
-/// distinction is invisible. Switch to spiral if a client visibly
-/// hitches.
+/// Stream every chunk in the `(center ± view_distance)` window in
+/// centre-out spiral order so the player's spawn tile renders first.
 ///
 /// Per-chunk failure (missing region file, decode error, encode error)
 /// is logged and skipped rather than killing the connection: the same
@@ -498,48 +530,126 @@ where
         return Ok(());
     };
 
-    let started = Instant::now();
+    let mut stream = ChunkStreamState::new(
+        world,
+        biomes,
+        block_light,
+        light_cache,
+        compression,
+        center_cx,
+        center_cz,
+        view_distance,
+    );
+    stream.drain_to_completion(writer).await?;
+    Ok(())
+}
 
-    // Stage chunks lazily in spiral order. A fresh worldgen-only world
-    // has to materialise hundreds of chunks; prefetching the whole
-    // radius before the first write makes the vanilla client time out.
-    // Loading each centre's 3×3 neighbourhood gets the spawn chunk onto
-    // the wire as soon as its immediate light inputs exist.
-    let mut staged: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
-    let mut fetch_ms = 0u64;
-    let mut build_timing = ChunkBuildTiming::default();
-    let mut packet_encode_ms = 0u64;
-    let mut frame_ms = 0u64;
-    let mut socket_write_ms = 0u64;
-    let mut framed_bytes = 0usize;
-    let mut first_chunk_ms: Option<u64> = None;
-    let mut ring1_complete_ms: Option<u64> = None;
-    let mut ring2_complete_ms: Option<u64> = None;
-    let mut ring_emitted = vec![0usize; (view_distance.max(0) + 1) as usize];
+impl<'a> ChunkStreamState<'a> {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        world: &'a WorldHandle,
+        biomes: &'a Registry,
+        block_light: Option<&'a BlockLightTable>,
+        light_cache: &'a mut LightCache,
+        compression: Compression,
+        center_cx: i32,
+        center_cz: i32,
+        view_distance: i32,
+    ) -> Self {
+        let vd = view_distance.max(0);
+        Self {
+            world,
+            biomes,
+            block_light,
+            light_cache,
+            compression,
+            center_cx,
+            center_cz,
+            view_distance,
+            queue: spiral_chunks(center_cx, center_cz, view_distance).collect(),
+            next_index: 0,
+            staged: HashMap::new(),
+            workspace: block_light.is_some().then(LightWorkspace::new),
+            started: Instant::now(),
+            fetch_ms: 0,
+            build_timing: ChunkBuildTiming::default(),
+            packet_encode_ms: 0,
+            frame_ms: 0,
+            socket_write_ms: 0,
+            framed_bytes: 0,
+            first_chunk_ms: None,
+            ring1_complete_ms: None,
+            ring2_complete_ms: None,
+            ring_emitted: vec![0; (vd + 1) as usize],
+            emitted: 0,
+            absent: 0,
+            bytes: 0,
+        }
+    }
 
-    let mut emitted = 0usize;
-    let mut absent = 0usize;
-    let mut bytes = 0usize;
-    // One workspace reused for every chunk in the burst — without
-    // this the per-chunk ~4 MB alloc + zero-fill blows the M4.f
-    // harness timeout in debug builds.
-    let mut workspace = block_light.is_some().then(LightWorkspace::new);
+    async fn drain_to_completion<W>(&mut self, writer: &mut W) -> Result<(), ConnectionError>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        while self.step(writer).await? != ChunkStreamStep::Complete {}
+        self.log_summary();
+        Ok(())
+    }
 
-    // M8.b: spiral from the centre outwards so the player's chunk
-    // renders first and the rings fill in behind. Same coverage as
-    // the previous row-major loop.
-    for (cx, cz) in spiral_chunks(center_cx, center_cz, view_distance) {
+    async fn step<W>(&mut self, writer: &mut W) -> Result<ChunkStreamStep, ConnectionError>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        let Some(&(cx, cz)) = self.queue.get(self.next_index) else {
+            return Ok(ChunkStreamStep::Complete);
+        };
+        self.next_index += 1;
+
+        self.stage_neighbourhood(cx, cz).await;
+
+        let Some(centre) = self.staged.get(&(cx, cz)).cloned() else {
+            self.absent += 1;
+            debug!(cx, cz, "no chunk in storage");
+            return Ok(ChunkStreamStep::Progress);
+        };
+
+        let neighbours = build_neighbourhood(&self.staged, cx, cz);
+        let (packet, timing) = match build_chunk_packet(
+            centre.as_ref(),
+            &neighbours,
+            self.biomes,
+            self.block_light,
+            self.workspace.as_mut(),
+            Some(&mut *self.light_cache),
+            cx,
+            cz,
+        ) {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+                return Ok(ChunkStreamStep::Progress);
+            }
+        };
+
+        self.build_timing.add(timing);
+        let data_len = packet.data.len();
+        let write_timing = write_chunk_packet(writer, &packet, self.compression).await?;
+        self.record_emitted(cx, cz, data_len, write_timing);
+        Ok(ChunkStreamStep::Progress)
+    }
+
+    async fn stage_neighbourhood(&mut self, cx: i32, cz: i32) {
         let fetch_started = Instant::now();
         {
-            let mut storage = world.lock().await;
+            let mut storage = self.world.lock().await;
             for ncz in (cz - 1)..=(cz + 1) {
                 for ncx in (cx - 1)..=(cx + 1) {
-                    if staged.contains_key(&(ncx, ncz)) {
+                    if self.staged.contains_key(&(ncx, ncz)) {
                         continue;
                     }
                     match storage.get_chunk(ChunkPos { x: ncx, z: ncz }) {
                         Ok(Some(c)) => {
-                            staged.insert((ncx, ncz), Arc::new(c.clone()));
+                            self.staged.insert((ncx, ncz), Arc::new(c.clone()));
                         }
                         Ok(None) => {}
                         Err(err) => {
@@ -549,80 +659,68 @@ where
                 }
             }
         }
-        fetch_ms += fetch_started.elapsed().as_millis() as u64;
+        self.fetch_ms += fetch_started.elapsed().as_millis() as u64;
+    }
 
-        let Some(centre) = staged.get(&(cx, cz)) else {
-            absent += 1;
-            debug!(cx, cz, "no chunk in storage");
-            continue;
-        };
-        let neighbours = build_neighbourhood(&staged, cx, cz);
-        let centre_ref = centre.as_ref();
-        let (packet, timing) = match build_chunk_packet(
-            centre_ref,
-            &neighbours,
-            biomes,
-            block_light,
-            workspace.as_mut(),
-            Some(light_cache),
-            cx,
-            cz,
-        ) {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(cx, cz, error = %err, "chunk encode failed; skipping");
-                continue;
-            }
-        };
-        build_timing.add(timing);
-        let n = packet.data.len();
-        let write_timing = write_chunk_packet(writer, &packet, compression).await?;
-        packet_encode_ms += write_timing.packet_encode_ms;
-        frame_ms += write_timing.frame_ms;
-        socket_write_ms += write_timing.socket_write_ms;
-        framed_bytes += write_timing.framed_bytes;
-        emitted += 1;
-        first_chunk_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
-        let ring = (cx - center_cx).abs().max((cz - center_cz).abs()) as usize;
-        if let Some(count) = ring_emitted.get_mut(ring) {
+    fn record_emitted(
+        &mut self,
+        cx: i32,
+        cz: i32,
+        packet_data_len: usize,
+        write_timing: ChunkWriteTiming,
+    ) {
+        self.packet_encode_ms += write_timing.packet_encode_ms;
+        self.frame_ms += write_timing.frame_ms;
+        self.socket_write_ms += write_timing.socket_write_ms;
+        self.framed_bytes += write_timing.framed_bytes;
+        self.emitted += 1;
+        self.first_chunk_ms
+            .get_or_insert_with(|| self.started.elapsed().as_millis() as u64);
+        self.record_ring_progress(cx, cz);
+        self.bytes += packet_data_len;
+    }
+
+    fn record_ring_progress(&mut self, cx: i32, cz: i32) {
+        let ring = (cx - self.center_cx).abs().max((cz - self.center_cz).abs()) as usize;
+        if let Some(count) = self.ring_emitted.get_mut(ring) {
             *count += 1;
             let needed = if ring == 0 { 1 } else { ring * 8 };
             if *count == needed {
-                let elapsed = started.elapsed().as_millis() as u64;
+                let elapsed = self.started.elapsed().as_millis() as u64;
                 if ring == 1 {
-                    ring1_complete_ms.get_or_insert(elapsed);
+                    self.ring1_complete_ms.get_or_insert(elapsed);
                 } else if ring == 2 {
-                    ring2_complete_ms.get_or_insert(elapsed);
+                    self.ring2_complete_ms.get_or_insert(elapsed);
                 }
             }
         }
-        bytes += n;
     }
 
-    info!(
-        center_cx,
-        center_cz,
-        view_distance,
-        staged = staged.len(),
-        emitted,
-        absent,
-        bytes,
-        framed_bytes,
-        fetch_ms,
-        chunk_data_ms = build_timing.chunk_data_ms,
-        heightmap_ms = build_timing.heightmap_ms,
-        light_compute_ms = build_timing.light_compute_ms,
-        light_encode_ms = build_timing.light_encode_ms,
-        packet_encode_ms,
-        frame_ms,
-        socket_write_ms,
-        first_chunk_ms,
-        ring1_complete_ms,
-        ring2_complete_ms,
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        "view-distance window flushed",
-    );
-    Ok(())
+    fn log_summary(&self) {
+        info!(
+            center_cx = self.center_cx,
+            center_cz = self.center_cz,
+            view_distance = self.view_distance,
+            staged = self.staged.len(),
+            emitted = self.emitted,
+            absent = self.absent,
+            bytes = self.bytes,
+            framed_bytes = self.framed_bytes,
+            fetch_ms = self.fetch_ms,
+            chunk_data_ms = self.build_timing.chunk_data_ms,
+            heightmap_ms = self.build_timing.heightmap_ms,
+            light_compute_ms = self.build_timing.light_compute_ms,
+            light_encode_ms = self.build_timing.light_encode_ms,
+            packet_encode_ms = self.packet_encode_ms,
+            frame_ms = self.frame_ms,
+            socket_write_ms = self.socket_write_ms,
+            first_chunk_ms = self.first_chunk_ms,
+            ring1_complete_ms = self.ring1_complete_ms,
+            ring2_complete_ms = self.ring2_complete_ms,
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            "view-distance window flushed",
+        );
+    }
 }
 
 /// Iterate chunk positions around `(center_x, center_z)` outwards
