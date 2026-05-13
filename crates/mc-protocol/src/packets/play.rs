@@ -33,6 +33,7 @@ const MAX_LONG_ARRAY_LEN: usize = 4096;
 const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
 const MAX_PLAYER_INFO_ENTRIES: usize = 1024;
 const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
+const MAX_COMMAND_LEN: usize = 32_767;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
@@ -1394,6 +1395,83 @@ impl Packet for SetCenterChunk {
 // Serverbound
 // -----------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GameMode {
+    Survival,
+    Creative,
+    Adventure,
+    Spectator,
+}
+
+impl GameMode {
+    #[must_use]
+    pub const fn id(self) -> i32 {
+        match self {
+            Self::Survival => 0,
+            Self::Creative => 1,
+            Self::Adventure => 2,
+            Self::Spectator => 3,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_id(id: i32) -> Self {
+        match id {
+            1 => Self::Creative,
+            2 => Self::Adventure,
+            3 => Self::Spectator,
+            _ => Self::Survival,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundChangeGameMode {
+    pub mode: GameMode,
+}
+
+impl Packet for ServerboundChangeGameMode {
+    // Verified from `.analysis/protocol-dump.txt`: SERVERBOUND_CHANGE_GAME_MODE
+    // is game-SB index 5 = wire id 0x05. `javap -p -c
+    // ServerboundChangeGameModePacket` shows the body is GameType.STREAM_CODEC;
+    // `javap GameType` shows ids survival=0, creative=1, adventure=2,
+    // spectator=3 via ByteBufCodecs.idMapper.
+    const ID: i32 = 0x05;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.mode.id());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            mode: GameMode::from_id(buf.read_varint()?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundChatCommand {
+    pub command: String,
+}
+
+impl Packet for ServerboundChatCommand {
+    // Verified from `.analysis/protocol-dump.txt`: SERVERBOUND_CHAT_COMMAND is
+    // game-SB index 7 = wire id 0x07. `javap -p -c
+    // ServerboundChatCommandPacket` shows a single FriendlyByteBuf UTF string.
+    const ID: i32 = 0x07;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_string(&self.command, MAX_COMMAND_LEN)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            command: buf.read_string(MAX_COMMAND_LEN)?,
+        })
+    }
+}
+
 /// `Confirm Teleportation` (SB). Client echoes our
 /// `SynchronizePlayerPosition.teleport_id` back to confirm it accepted
 /// the snap. If we don't see this we may need to resend the position.
@@ -2661,6 +2739,39 @@ mod tests {
         assert!((decoded.movement.x - packet.movement.x).abs() < 0.000_1);
         assert!((decoded.movement.y - packet.movement.y).abs() < 0.000_1);
         assert!((decoded.movement.z - packet.movement.z).abs() < 0.000_1);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_change_game_mode_id_and_layout_match_javap() {
+        assert_eq!(ServerboundChangeGameMode::ID, 0x05);
+        let packet = ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x01]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundChangeGameMode::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_chat_command_id_and_layout_match_javap() {
+        assert_eq!(ServerboundChatCommand::ID, 0x07);
+        let packet = ServerboundChatCommand {
+            command: "gamemode creative".to_string(),
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf[0], 17);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ServerboundChatCommand::decode(&mut cursor).unwrap(), packet);
         assert!(cursor.is_empty());
     }
 
