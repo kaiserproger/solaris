@@ -6,8 +6,8 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M9 complete on `dev/M9-incremental-relight`, awaiting
-`m9` tag. A vanilla 26.1.2 client connecting to Solaris walks the
+**Status:** M10 complete on `dev/M10-light-perf-geometry`, awaiting
+owner review, merge, and `m10` tag. A vanilla 26.1.2 client connecting to Solaris walks the
 full Handshake → Login → Configuration → Play sequence, receives
 the streamed spawn-area chunks lit by `mc_world::light`'s BFS
 engine (M4), can **break and place blocks** (M5), sees those
@@ -21,10 +21,14 @@ the `LightUpdate` packets for chunks whose arrays actually
 changed — wire-byte-identical to a fresh full recompute. The
 BFS uses Starlight's early-skip shortcut (skip the opacity
 lookup when the neighbour is already at the best propagatable
-level), cutting block-state reads roughly 5–6× in dense
-regions. Single plains biome, no caves / ores / structures;
-per-section nibble storage, heightmap-driven sky reseed, Set
-Compression and LZ4 chunk read remain M10+ polish items.
+level), cutting block-state reads roughly 5–6× in dense regions.
+M10 adds a light-engine bench harness, packed window-local queues
+for incremental BFS, lazy per-section nibble storage for cached
+light, and a light-table-driven highest-opaque heightmap used for
+adaptive spawn Y and sky-column reseed guarding. Single plains
+biome, no caves / ores / structures; Set Compression, LZ4 chunk
+read, light persistence, and survival validation remain M11+
+polish items.
 
 ## Build
 
