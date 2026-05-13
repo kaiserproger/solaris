@@ -187,8 +187,14 @@ async fn handle_connection(
     match handshake.next_state {
         NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
         NextState::Login | NextState::Transfer => {
-            let profile =
-                login::handle(&mut reader, &mut writer, &mut buf, &mut compression).await?;
+            let profile = login::handle(
+                &mut reader,
+                &mut writer,
+                &mut buf,
+                &mut compression,
+                config.chunk_pipeline.compression_level,
+            )
+            .await?;
             configuration::handle(
                 &mut reader,
                 &mut writer,

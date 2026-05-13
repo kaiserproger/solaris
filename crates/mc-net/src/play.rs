@@ -835,6 +835,7 @@ impl ChunkStreamState {
             chunk_io_threads = self.policy.chunk_io_threads,
             chunk_worker_threads = self.policy.chunk_worker_threads,
             chunk_result_queue_size = self.policy.chunk_result_queue_size,
+            compression_level = ?self.policy.compression_level,
             dispatch_turns = self.dispatch_turns,
             yielded_turns = self.yielded_turns,
             dispatched = self.dispatched,

@@ -18,6 +18,7 @@ pub struct ChunkPipelinePolicy {
     pub chunk_worker_threads: usize,
     pub chunk_result_queue_size: usize,
     pub region_cache_size: usize,
+    pub compression_level: Option<u32>,
 }
 
 impl Default for ChunkPipelinePolicy {
@@ -32,6 +33,7 @@ impl Default for ChunkPipelinePolicy {
             chunk_worker_threads: default_worker_threads(),
             chunk_result_queue_size: 64,
             region_cache_size: 4,
+            compression_level: None,
         }
     }
 }

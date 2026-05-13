@@ -72,6 +72,9 @@ pub enum Compression {
     /// transmitted as a `data_length = 0` plaintext frame; bodies at or
     /// above the threshold are zlib-compressed.
     Threshold(usize),
+    /// Same wire shape as [`Compression::Threshold`], with an explicit
+    /// zlib level for server-side frame encoding.
+    ThresholdWithLevel { threshold: usize, level: u32 },
 }
 
 impl Compression {
@@ -79,7 +82,27 @@ impl Compression {
     /// every frame.
     #[must_use]
     pub const fn header_present(self) -> bool {
-        matches!(self, Self::Threshold(_))
+        matches!(self, Self::Threshold(_) | Self::ThresholdWithLevel { .. })
+    }
+
+    #[must_use]
+    pub const fn threshold(self) -> Option<usize> {
+        match self {
+            Self::Disabled => None,
+            Self::Threshold(threshold) | Self::ThresholdWithLevel { threshold, .. } => {
+                Some(threshold)
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn with_level(self, level: u32) -> Self {
+        match self {
+            Self::Disabled => Self::Disabled,
+            Self::Threshold(threshold) | Self::ThresholdWithLevel { threshold, .. } => {
+                Self::ThresholdWithLevel { threshold, level }
+            }
+        }
     }
 }
 
@@ -156,7 +179,7 @@ pub fn try_decode_frame(
             let id = body.read_varint()?;
             RawFrame { id, body }
         }
-        Compression::Threshold(threshold) => {
+        Compression::Threshold(threshold) | Compression::ThresholdWithLevel { threshold, .. } => {
             let data_length_signed = body.read_varint()?;
             if data_length_signed < 0 {
                 return Err(FramingError::NegativeLength(data_length_signed));
@@ -231,7 +254,7 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
             out.put_slice(body);
             Ok(out.freeze())
         }
-        Compression::Threshold(threshold) => {
+        Compression::Threshold(threshold) | Compression::ThresholdWithLevel { threshold, .. } => {
             if uncompressed_len < threshold {
                 // data_length = 0 sentinel; transmit plaintext.
                 let inner_len = 1 /* data_length zero */ + uncompressed_len;
@@ -255,7 +278,12 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
                 let mut plain = Vec::with_capacity(uncompressed_len);
                 plain.write_varint(id);
                 plain.extend_from_slice(body);
-                let mut encoder = ZlibEncoder::new(Vec::new(), ZlibLevel::fast());
+                let level = match compression {
+                    Compression::Threshold(_) => ZlibLevel::fast(),
+                    Compression::ThresholdWithLevel { level, .. } => ZlibLevel::new(level.min(9)),
+                    Compression::Disabled => unreachable!("compression branch already matched"),
+                };
+                let mut encoder = ZlibEncoder::new(Vec::new(), level);
                 encoder.write_all(&plain)?;
                 let compressed = encoder.finish()?;
 
@@ -335,6 +363,12 @@ mod tests {
         // A repetitive body so zlib actually shrinks it.
         let body: Vec<u8> = std::iter::repeat_n(b'x', 4096).collect();
         round_trip(0x20, &body, Compression::Threshold(256));
+    }
+
+    #[test]
+    fn compressed_explicit_level_round_trip() {
+        let body: Vec<u8> = std::iter::repeat_n(b'x', 4096).collect();
+        round_trip(0x20, &body, Compression::Threshold(256).with_level(6));
     }
 
     #[test]

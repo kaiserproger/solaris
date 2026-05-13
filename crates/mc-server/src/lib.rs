@@ -93,6 +93,8 @@ pub struct ChunkPipelineSection {
     pub chunk_result_queue_size: usize,
     #[serde(default = "default_region_cache_size")]
     pub region_cache_size: usize,
+    #[serde(default)]
+    pub compression_level: Option<u32>,
 }
 
 impl Default for ChunkPipelineSection {
@@ -108,6 +110,7 @@ impl Default for ChunkPipelineSection {
             chunk_worker_threads: policy.chunk_worker_threads,
             chunk_result_queue_size: policy.chunk_result_queue_size,
             region_cache_size: policy.region_cache_size,
+            compression_level: policy.compression_level,
         }
     }
 }
@@ -125,6 +128,7 @@ impl ChunkPipelineSection {
             chunk_worker_threads: self.chunk_worker_threads.max(1),
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
+            compression_level: self.compression_level.map(|level| level.min(9)),
         }
     }
 }
@@ -254,6 +258,7 @@ mod tests {
             chunk_worker_threads = 3
             chunk_result_queue_size = 9
             region_cache_size = 7
+            compression_level = 6
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
         assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 12);
@@ -265,6 +270,7 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads, 3);
         assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
         assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
+        assert_eq!(cfg.chunk_pipeline.compression_level, Some(6));
     }
 
     #[test]
@@ -279,6 +285,7 @@ mod tests {
             chunk_worker_threads: 0,
             chunk_result_queue_size: 0,
             region_cache_size: 0,
+            compression_level: Some(99),
         };
         let policy = section.to_network();
         assert_eq!(policy.chunk_send_rate, 1);
@@ -289,6 +296,7 @@ mod tests {
         assert_eq!(policy.chunk_worker_threads, 1);
         assert_eq!(policy.chunk_result_queue_size, 1);
         assert_eq!(policy.region_cache_size, 1);
+        assert_eq!(policy.compression_level, Some(9));
     }
 
     fn stub_blocks() -> Arc<BlockRegistry> {

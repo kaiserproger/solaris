@@ -28,3 +28,6 @@ chunk_io_threads = 2
 chunk_worker_threads = 4
 chunk_result_queue_size = 64
 region_cache_size = 4
+# Optional zlib level for compressed protocol frames. Omit for flate2's
+# fast default; values above 9 are clamped.
+# compression_level = 1

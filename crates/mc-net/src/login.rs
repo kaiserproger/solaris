@@ -56,6 +56,7 @@ pub(crate) async fn handle<R, W>(
     writer: &mut W,
     buf: &mut BytesMut,
     compression: &mut Compression,
+    compression_level: Option<u32>,
 ) -> Result<LoggedInProfile, ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -79,7 +80,12 @@ where
         Compression::Disabled,
     )
     .await?;
-    *compression = Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize);
+    *compression = match compression_level {
+        Some(level) => {
+            Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize).with_level(level)
+        }
+        None => Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize),
+    };
 
     let success = LoginSuccess {
         uuid,
