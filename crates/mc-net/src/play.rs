@@ -31,9 +31,11 @@ use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
     ConfirmTeleportation, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, PlayerActionKind, SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive,
-    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    LoginPlay, MovePlayerFlags, PlayerActionKind, SectionBlockChange, SectionBlocksUpdate,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
+    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
+    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -82,6 +84,33 @@ struct BlockDelta {
     state_id: mc_world::BlockStateId,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PlayerPose {
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw: f32,
+    pitch: f32,
+    flags: MovePlayerFlags,
+}
+
+impl PlayerPose {
+    fn new(x: f64, y: f64, z: f64) -> Self {
+        Self {
+            x,
+            y,
+            z,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(false, false),
+        }
+    }
+
+    fn chunk_pos(self) -> (i32, i32) {
+        chunk_pos_from_coords(self.x, self.z)
+    }
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 struct ChunkBuildTiming {
     chunk_data_ms: u64,
@@ -125,7 +154,6 @@ struct ChunkStreamState {
     ready: BTreeMap<u32, ChunkPrepareResult>,
     policy: ChunkPipelinePolicy,
     result_queue_size: usize,
-    next_emit_sequence: u32,
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
@@ -151,6 +179,7 @@ struct ChunkStreamState {
     max_in_flight: usize,
     max_ready: usize,
     last_stop_reason: ChunkPipelineStopReason,
+    wait_for_first_chunk: bool,
 }
 
 struct PreparedChunkFrame {
@@ -353,7 +382,6 @@ where
         && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
     {
         stream.log_summary();
-        chunk_stream = None;
     }
 
     // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
@@ -402,6 +430,7 @@ where
         compression,
         interaction.as_mut(),
         chunk_stream,
+        PlayerPose::new(spawn_x, spawn_y, spawn_z),
     )
     .await
 }
@@ -550,9 +579,14 @@ fn build_starter_inventory(items: &ItemRegistry) -> PlayerInventory {
 /// fn rather than inlined so the math is unit-testable and so M3.e can
 /// share the formula when it computes the view-distance ring.
 fn spawn_chunk_pos() -> (i32, i32) {
-    let cx = (SPAWN_X.floor() as i32).div_euclid(16);
-    let cz = (SPAWN_Z.floor() as i32).div_euclid(16);
-    (cx, cz)
+    chunk_pos_from_coords(SPAWN_X, SPAWN_Z)
+}
+
+fn chunk_pos_from_coords(x: f64, z: f64) -> (i32, i32) {
+    (
+        (x.floor() as i32).div_euclid(16),
+        (z.floor() as i32).div_euclid(16),
+    )
 }
 
 impl ChunkStreamState {
@@ -581,24 +615,10 @@ impl ChunkStreamState {
             ready: BTreeMap::new(),
             policy,
             result_queue_size: policy.chunk_result_queue_size,
-            next_emit_sequence: 0,
             center_cx,
             center_cz,
             view_distance,
-            scheduler: ChunkScheduler::new(
-                spiral_chunks(center_cx, center_cz, view_distance)
-                    .enumerate()
-                    .map(|(sequence, (cx, cz))| {
-                        (
-                            cx,
-                            cz,
-                            ChunkPriority {
-                                ring: (cx - center_cx).abs().max((cz - center_cz).abs()) as u32,
-                                sequence: sequence as u32,
-                            },
-                        )
-                    }),
-            ),
+            scheduler: ChunkScheduler::new(prioritized_spiral(center_cx, center_cz, view_distance)),
             staged: HashSet::new(),
             started: Instant::now(),
             fetch_ms: 0,
@@ -620,11 +640,50 @@ impl ChunkStreamState {
             max_in_flight: 0,
             max_ready: 0,
             last_stop_reason: ChunkPipelineStopReason::QueueEmpty,
+            wait_for_first_chunk: true,
         }
     }
 
     fn is_complete(&self) -> bool {
         self.scheduler.is_complete()
+    }
+
+    fn replan_center(&mut self, center_cx: i32, center_cz: i32) -> bool {
+        if (self.center_cx, self.center_cz) == (center_cx, center_cz) {
+            return false;
+        }
+        self.center_cx = center_cx;
+        self.center_cz = center_cz;
+        self.ready.clear();
+        self.scheduler
+            .replace_view(prioritized_spiral(center_cx, center_cz, self.view_distance));
+        self.reset_window_metrics();
+        true
+    }
+
+    fn reset_window_metrics(&mut self) {
+        self.staged.clear();
+        self.started = Instant::now();
+        self.fetch_ms = 0;
+        self.build_timing = ChunkBuildTiming::default();
+        self.packet_encode_ms = 0;
+        self.frame_ms = 0;
+        self.socket_write_ms = 0;
+        self.framed_bytes = 0;
+        self.first_chunk_ms = None;
+        self.ring1_complete_ms = None;
+        self.ring2_complete_ms = None;
+        self.ring_emitted = vec![0; (self.view_distance.max(0) + 1) as usize];
+        self.emitted = 0;
+        self.absent = 0;
+        self.bytes = 0;
+        self.dispatch_turns = 0;
+        self.yielded_turns = 0;
+        self.dispatched = 0;
+        self.max_in_flight = 0;
+        self.max_ready = 0;
+        self.last_stop_reason = ChunkPipelineStopReason::QueueEmpty;
+        self.wait_for_first_chunk = false;
     }
 
     async fn step<W>(
@@ -635,7 +694,8 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let wait_for_first_chunk = self.emitted == 0 && self.absent == 0;
+        let wait_for_first_chunk =
+            self.wait_for_first_chunk && self.emitted == 0 && self.absent == 0;
         self.dispatch_available();
         self.drain_ready();
 
@@ -652,6 +712,9 @@ impl ChunkStreamState {
                     break;
                 }
             }
+        }
+        if made_send_progress || self.emitted > 0 || self.absent > 0 {
+            self.wait_for_first_chunk = false;
         }
 
         if self.scheduler.is_complete() {
@@ -742,7 +805,7 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let Some(result) = self.ready.remove(&self.next_emit_sequence) else {
+        let Some((_, result)) = self.ready.pop_first() else {
             return Ok(false);
         };
         let request = result.request;
@@ -771,7 +834,6 @@ impl ChunkStreamState {
         }
 
         self.scheduler.mark_finished(request);
-        self.next_emit_sequence = self.next_emit_sequence.wrapping_add(1);
         Ok(true)
     }
 
@@ -879,6 +941,25 @@ fn spiral_chunks(
         }
     }
     out.into_iter()
+}
+
+fn prioritized_spiral(
+    center_x: i32,
+    center_z: i32,
+    view_distance: i32,
+) -> impl Iterator<Item = (i32, i32, ChunkPriority)> {
+    spiral_chunks(center_x, center_z, view_distance)
+        .enumerate()
+        .map(move |(sequence, (cx, cz))| {
+            (
+                cx,
+                cz,
+                ChunkPriority {
+                    ring: (cx - center_x).abs().max((cz - center_z).abs()) as u32,
+                    sequence: sequence as u32,
+                },
+            )
+        })
 }
 
 async fn prepare_chunk_request(
@@ -1585,6 +1666,41 @@ where
     Ok(())
 }
 
+async fn replan_after_movement<W>(
+    writer: &mut W,
+    compression: Compression,
+    chunk_stream: &mut Option<ChunkStreamState>,
+    old_center: (i32, i32),
+    new_center: (i32, i32),
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if old_center == new_center {
+        return Ok(());
+    }
+    write_packet(
+        writer,
+        &SetCenterChunk {
+            chunk_x: new_center.0,
+            chunk_z: new_center.1,
+        },
+        compression,
+    )
+    .await?;
+    if let Some(stream) = chunk_stream.as_mut() {
+        stream.replan_center(new_center.0, new_center.1);
+    }
+    debug!(
+        old_cx = old_center.0,
+        old_cz = old_center.1,
+        new_cx = new_center.0,
+        new_cz = new_center.1,
+        "chunk view center updated from movement"
+    );
+    Ok(())
+}
+
 async fn play_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1592,6 +1708,7 @@ async fn play_loop<R, W>(
     compression: Compression,
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
+    mut player_pose: PlayerPose,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -1610,7 +1727,9 @@ where
 
     loop {
         let mut stream_finished = false;
-        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut()) {
+        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
+            && !stream.is_complete()
+        {
             match stream.step(writer, &mut state.light_cache).await? {
                 ChunkStreamStep::Progress => {
                     stream_finished = stream.is_complete();
@@ -1625,14 +1744,13 @@ where
             if let Some(stream) = chunk_stream.as_ref() {
                 stream.log_summary();
             }
-            chunk_stream = None;
             last_response_at = Instant::now();
             pending_id = None;
         }
 
         tokio::select! {
             biased;
-            _ = ticker.tick(), if chunk_stream.is_none() => {
+            _ = ticker.tick(), if chunk_stream.as_ref().is_none_or(ChunkStreamState::is_complete) => {
                 if last_response_at.elapsed() > KEEPALIVE_TIMEOUT {
                     warn!(
                         elapsed_ms = last_response_at.elapsed().as_millis() as u64,
@@ -1668,6 +1786,38 @@ where
                     let mut body = frame.body;
                     let confirm = ConfirmTeleportation::decode(&mut body)?;
                     debug!(teleport_id = confirm.teleport_id, "teleport confirmed");
+                } else if frame.id == ServerboundMovePlayerPos::ID {
+                    let mut body = frame.body;
+                    let movement = ServerboundMovePlayerPos::decode(&mut body)?;
+                    let old_center = player_pose.chunk_pos();
+                    player_pose.x = movement.x;
+                    player_pose.y = movement.y;
+                    player_pose.z = movement.z;
+                    player_pose.flags = movement.flags;
+                    let new_center = player_pose.chunk_pos();
+                    replan_after_movement(writer, compression, &mut chunk_stream, old_center, new_center).await?;
+                } else if frame.id == ServerboundMovePlayerPosRot::ID {
+                    let mut body = frame.body;
+                    let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
+                    let old_center = player_pose.chunk_pos();
+                    player_pose.x = movement.x;
+                    player_pose.y = movement.y;
+                    player_pose.z = movement.z;
+                    player_pose.yaw = movement.yaw;
+                    player_pose.pitch = movement.pitch;
+                    player_pose.flags = movement.flags;
+                    let new_center = player_pose.chunk_pos();
+                    replan_after_movement(writer, compression, &mut chunk_stream, old_center, new_center).await?;
+                } else if frame.id == ServerboundMovePlayerRot::ID {
+                    let mut body = frame.body;
+                    let movement = ServerboundMovePlayerRot::decode(&mut body)?;
+                    player_pose.yaw = movement.yaw;
+                    player_pose.pitch = movement.pitch;
+                    player_pose.flags = movement.flags;
+                } else if frame.id == ServerboundMovePlayerStatusOnly::ID {
+                    let mut body = frame.body;
+                    let movement = ServerboundMovePlayerStatusOnly::decode(&mut body)?;
+                    player_pose.flags = movement.flags;
                 } else if frame.id == ServerboundPlayerAction::ID {
                     let mut body = frame.body;
                     let action = ServerboundPlayerAction::decode(&mut body)?;
@@ -1706,7 +1856,7 @@ where
                     );
                 }
             }
-            _ = tokio::time::sleep(Duration::from_millis(1)), if chunk_stream.is_some() => {}
+            _ = tokio::time::sleep(Duration::from_millis(1)), if chunk_stream.as_ref().is_some_and(|stream| !stream.is_complete()) => {}
         }
     }
 }
@@ -1730,6 +1880,15 @@ mod tests {
     fn spawn_chunk_pos_matches_origin() {
         // SPAWN_(X,Z) = (0.5, 0.5); the containing chunk is (0, 0).
         assert_eq!(spawn_chunk_pos(), (0, 0));
+    }
+
+    #[test]
+    fn chunk_pos_from_coords_uses_floor_division() {
+        assert_eq!(chunk_pos_from_coords(0.0, 0.0), (0, 0));
+        assert_eq!(chunk_pos_from_coords(15.999, 15.999), (0, 0));
+        assert_eq!(chunk_pos_from_coords(16.0, -0.001), (1, -1));
+        assert_eq!(chunk_pos_from_coords(-0.001, -16.0), (-1, -1));
+        assert_eq!(chunk_pos_from_coords(-16.001, 32.0), (-2, 2));
     }
 
     #[test]

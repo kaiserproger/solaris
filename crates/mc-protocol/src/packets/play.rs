@@ -767,6 +767,164 @@ impl Packet for ServerboundKeepAlive {
     }
 }
 
+/// Flags shared by vanilla's four `ServerboundMovePlayerPacket` variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MovePlayerFlags {
+    pub on_ground: bool,
+    pub horizontal_collision: bool,
+}
+
+impl MovePlayerFlags {
+    #[must_use]
+    pub fn new(on_ground: bool, horizontal_collision: bool) -> Self {
+        Self {
+            on_ground,
+            horizontal_collision,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Self {
+        Self {
+            on_ground: byte & 0x01 != 0,
+            horizontal_collision: byte & 0x02 != 0,
+        }
+    }
+
+    fn to_byte(self) -> u8 {
+        u8::from(self.on_ground) | (u8::from(self.horizontal_collision) << 1)
+    }
+}
+
+/// `ServerboundMovePlayerPacket$Pos` (SB). Carries position plus
+/// movement flags. Per ADR 0002, verified against javap of vanilla
+/// 26.1.2: `SERVERBOUND_MOVE_PLAYER_POS`, stream order
+/// `double x, double y, double z, unsigned byte flags`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundMovePlayerPos {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub flags: MovePlayerFlags,
+}
+
+impl Packet for ServerboundMovePlayerPos {
+    // GameProtocols serverbound index 30 = wire id 0x1E.
+    const ID: i32 = 0x1E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f64(self.x);
+        buf.write_f64(self.y);
+        buf.write_f64(self.z);
+        buf.write_u8(self.flags.to_byte());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            x: buf.read_f64()?,
+            y: buf.read_f64()?,
+            z: buf.read_f64()?,
+            flags: MovePlayerFlags::from_byte(buf.read_u8()?),
+        })
+    }
+}
+
+/// `ServerboundMovePlayerPacket$PosRot` (SB). Carries position,
+/// rotation, and movement flags. Per ADR 0002, verified against javap
+/// of vanilla 26.1.2: `SERVERBOUND_MOVE_PLAYER_POS_ROT`, stream order
+/// `double x, double y, double z, float yRot, float xRot, unsigned byte flags`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundMovePlayerPosRot {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub yaw: f32,
+    pub pitch: f32,
+    pub flags: MovePlayerFlags,
+}
+
+impl Packet for ServerboundMovePlayerPosRot {
+    // GameProtocols serverbound index 31 = wire id 0x1F.
+    const ID: i32 = 0x1F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f64(self.x);
+        buf.write_f64(self.y);
+        buf.write_f64(self.z);
+        buf.write_f32(self.yaw);
+        buf.write_f32(self.pitch);
+        buf.write_u8(self.flags.to_byte());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            x: buf.read_f64()?,
+            y: buf.read_f64()?,
+            z: buf.read_f64()?,
+            yaw: buf.read_f32()?,
+            pitch: buf.read_f32()?,
+            flags: MovePlayerFlags::from_byte(buf.read_u8()?),
+        })
+    }
+}
+
+/// `ServerboundMovePlayerPacket$Rot` (SB). Carries rotation plus
+/// movement flags. Per ADR 0002, verified against javap of vanilla
+/// 26.1.2: `SERVERBOUND_MOVE_PLAYER_ROT`, stream order
+/// `float yRot, float xRot, unsigned byte flags`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundMovePlayerRot {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub flags: MovePlayerFlags,
+}
+
+impl Packet for ServerboundMovePlayerRot {
+    // GameProtocols serverbound index 32 = wire id 0x20.
+    const ID: i32 = 0x20;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f32(self.yaw);
+        buf.write_f32(self.pitch);
+        buf.write_u8(self.flags.to_byte());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            yaw: buf.read_f32()?,
+            pitch: buf.read_f32()?,
+            flags: MovePlayerFlags::from_byte(buf.read_u8()?),
+        })
+    }
+}
+
+/// `ServerboundMovePlayerPacket$StatusOnly` (SB). Carries movement
+/// flags without position or rotation. Per ADR 0002, verified against
+/// javap of vanilla 26.1.2: `SERVERBOUND_MOVE_PLAYER_STATUS_ONLY`,
+/// stream order `unsigned byte flags`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundMovePlayerStatusOnly {
+    pub flags: MovePlayerFlags,
+}
+
+impl Packet for ServerboundMovePlayerStatusOnly {
+    // GameProtocols serverbound index 33 = wire id 0x21.
+    const ID: i32 = 0x21;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_u8(self.flags.to_byte());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            flags: MovePlayerFlags::from_byte(buf.read_u8()?),
+        })
+    }
+}
+
 // ---------------------------------------------------------------------
 // M5.b — clientbound edit / ack / relight packets
 // ---------------------------------------------------------------------
@@ -1558,6 +1716,53 @@ mod tests {
         });
         round_trip(ServerboundKeepAlive { id: i64::MIN });
         round_trip(ServerboundKeepAlive { id: 0 });
+    }
+
+    #[test]
+    fn move_player_ids_match_javap() {
+        assert_eq!(ServerboundMovePlayerPos::ID, 0x1E);
+        assert_eq!(ServerboundMovePlayerPosRot::ID, 0x1F);
+        assert_eq!(ServerboundMovePlayerRot::ID, 0x20);
+        assert_eq!(ServerboundMovePlayerStatusOnly::ID, 0x21);
+    }
+
+    #[test]
+    fn move_player_packets_round_trip() {
+        let flags = MovePlayerFlags::new(true, true);
+        round_trip(ServerboundMovePlayerPos {
+            x: 16.5,
+            y: -58.0,
+            z: -0.25,
+            flags,
+        });
+        round_trip(ServerboundMovePlayerPosRot {
+            x: -16.5,
+            y: 70.0,
+            z: 32.25,
+            yaw: 180.0,
+            pitch: -20.0,
+            flags,
+        });
+        round_trip(ServerboundMovePlayerRot {
+            yaw: 45.0,
+            pitch: 10.0,
+            flags,
+        });
+        round_trip(ServerboundMovePlayerStatusOnly { flags });
+    }
+
+    #[test]
+    fn move_player_flags_use_low_two_bits() {
+        let packet = ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, true),
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x03]);
+
+        let mut cursor: &[u8] = &[0x02];
+        let decoded = ServerboundMovePlayerStatusOnly::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.flags, MovePlayerFlags::new(false, true));
     }
 
     #[test]

@@ -26,7 +26,8 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight, LoginPlay,
-    ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
+    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -246,6 +247,130 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         "no chunk in the ring carried client-usage heightmaps — \
          encode_chunk_data is probably dropping them"
     );
+}
+
+#[tokio::test]
+async fn movement_across_chunk_boundary_replans_view_subscription() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let world_dir = manifest.join("../../.analysis/test-world");
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    if !world_dir.exists() || !blocks_json.exists() {
+        eprintln!(
+            "skipping: {} or {} missing — run tools/generate-test-world.sh \
+             and tools/extract-vanilla-data.sh --reports",
+            world_dir.display(),
+            blocks_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let storage =
+        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let block_light_path = vanilla_dir.join("reports/block_light.json");
+    let block_light = mc_data::block_light::load(&block_light_path)
+        .ok()
+        .map(Arc::new);
+    let policy = mc_net::ChunkPipelinePolicy {
+        chunk_prepare_batch_size: 1,
+        chunk_result_queue_size: 1,
+        ..mc_net::ChunkPipelinePolicy::default()
+    };
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M14 movement chunk stream".into(),
+        max_players: 8,
+        data,
+        blocks,
+        world,
+        tags,
+        block_light,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        chunk_pipeline: policy,
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "M14MoveTester")
+        .await
+        .expect("drive login");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
+
+    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: GameEvent = client.read_typed().await.expect("GameEvent");
+    let center: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
+    assert_eq!((center.chunk_x, center.chunk_z), (0, 0));
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 16.5,
+            y: sync.y,
+            z: 0.5,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("send movement");
+
+    let timeout = Duration::from_secs(180);
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut saw_new_center = false;
+    let mut saw_new_strip_chunk = false;
+    while !saw_new_strip_chunk {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("movement replan frames");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id == SetCenterChunk::ID {
+            let mut body = frame.body;
+            let center = SetCenterChunk::decode(&mut body).expect("decode SetCenterChunk");
+            if (center.chunk_x, center.chunk_z) == (1, 0) {
+                saw_new_center = true;
+            }
+            continue;
+        }
+        if frame.id != LevelChunkWithLight::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
+        if (pkt.chunk_x, pkt.chunk_z) == (VIEW_DISTANCE + 1, 0) {
+            saw_new_strip_chunk = true;
+        }
+    }
+
+    assert!(saw_new_center, "movement must send SetCenterChunk(1, 0)");
 }
 
 /// M4.f: every streamed chunk must carry a wire LightData whose
