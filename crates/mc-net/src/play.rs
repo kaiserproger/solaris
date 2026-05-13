@@ -48,6 +48,7 @@ use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
 use crate::server::{ServerConfig, WorldHandle};
+use crate::{ChunkPriority, ChunkScheduler};
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
@@ -117,8 +118,7 @@ struct ChunkStreamState<'a> {
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
-    queue: Vec<(i32, i32)>,
-    next_index: usize,
+    scheduler: ChunkScheduler,
     staged: HashMap<(i32, i32), Arc<Chunk>>,
     workspace: Option<LightWorkspace>,
     started: Instant,
@@ -537,8 +537,20 @@ impl<'a> ChunkStreamState<'a> {
             center_cx,
             center_cz,
             view_distance,
-            queue: spiral_chunks(center_cx, center_cz, view_distance).collect(),
-            next_index: 0,
+            scheduler: ChunkScheduler::new(
+                spiral_chunks(center_cx, center_cz, view_distance)
+                    .enumerate()
+                    .map(|(sequence, (cx, cz))| {
+                        (
+                            cx,
+                            cz,
+                            ChunkPriority {
+                                ring: (cx - center_cx).abs().max((cz - center_cz).abs()) as u32,
+                                sequence: sequence as u32,
+                            },
+                        )
+                    }),
+            ),
             staged: HashMap::new(),
             workspace: block_light.is_some().then(LightWorkspace::new),
             started: Instant::now(),
@@ -559,7 +571,7 @@ impl<'a> ChunkStreamState<'a> {
     }
 
     fn is_complete(&self) -> bool {
-        self.next_index >= self.queue.len()
+        self.scheduler.is_complete()
     }
 
     async fn step<W>(
@@ -570,16 +582,18 @@ impl<'a> ChunkStreamState<'a> {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let Some(&(cx, cz)) = self.queue.get(self.next_index) else {
+        let Some(request) = self.scheduler.poll_next() else {
             return Ok(ChunkStreamStep::Complete);
         };
-        self.next_index += 1;
+        let cx = request.chunk_x;
+        let cz = request.chunk_z;
 
         self.stage_neighbourhood(cx, cz).await;
 
         let Some(centre) = self.staged.get(&(cx, cz)).cloned() else {
             self.absent += 1;
             debug!(cx, cz, "no chunk in storage");
+            self.scheduler.mark_finished(request);
             return Ok(ChunkStreamStep::Progress);
         };
 
@@ -597,6 +611,7 @@ impl<'a> ChunkStreamState<'a> {
             Ok(p) => p,
             Err(err) => {
                 warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+                self.scheduler.mark_finished(request);
                 return Ok(ChunkStreamStep::Progress);
             }
         };
@@ -605,6 +620,7 @@ impl<'a> ChunkStreamState<'a> {
         let data_len = packet.data.len();
         let write_timing = write_chunk_packet(writer, &packet, self.compression).await?;
         self.record_emitted(cx, cz, data_len, write_timing);
+        self.scheduler.mark_finished(request);
         Ok(ChunkStreamStep::Progress)
     }
 

@@ -20,7 +20,7 @@ mod status;
 
 pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineStopReason,
-    ChunkPriority, ChunkRequest, PreparedChunk,
+    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk,
 };
 pub use error::ConnectionError;
 pub use login::offline_uuid;
