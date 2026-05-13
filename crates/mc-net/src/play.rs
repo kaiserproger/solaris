@@ -114,6 +114,7 @@ struct SessionRegistryInner {
     next_id: SessionId,
     sessions: HashMap<SessionId, PlaySession>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
+    prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
 }
 
 #[derive(Debug, Default)]
@@ -173,7 +174,9 @@ impl SessionRegistry {
         let desired_len = session.desired.len();
         let loaded_len = session.loaded.len();
         for chunk in session.desired {
-            remove_ticket(&mut inner.tickets, chunk, id);
+            if remove_ticket(&mut inner.tickets, chunk, id) {
+                inner.prepared.remove(&chunk);
+            }
         }
         debug!(
             session_id = id,
@@ -209,7 +212,9 @@ impl SessionRegistry {
         };
 
         for chunk in released {
-            remove_ticket(&mut inner.tickets, chunk, id);
+            if remove_ticket(&mut inner.tickets, chunk, id) {
+                inner.prepared.remove(&chunk);
+            }
         }
         for chunk in acquired {
             inner.tickets.entry(chunk).or_default().insert(id);
@@ -267,19 +272,43 @@ impl SessionRegistry {
             })
             .collect()
     }
+
+    fn prepared_chunk(&self, chunk: (i32, i32)) -> Option<Arc<PreparedChunkFrame>> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner.prepared.get(&chunk).cloned()
+    }
+
+    fn cache_prepared_chunk(&self, chunk: (i32, i32), prepared: Arc<PreparedChunkFrame>) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if inner.tickets.contains_key(&chunk) {
+            inner.prepared.entry(chunk).or_insert(prepared);
+        }
+    }
+
+    fn invalidate_prepared_chunks(&self, chunks: &HashSet<(i32, i32)>) {
+        if chunks.is_empty() {
+            return;
+        }
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        for chunk in chunks {
+            inner.prepared.remove(chunk);
+        }
+    }
 }
 
 fn remove_ticket(
     tickets: &mut HashMap<(i32, i32), HashSet<SessionId>>,
     chunk: (i32, i32),
     id: SessionId,
-) {
+) -> bool {
     if let Some(subscribers) = tickets.get_mut(&chunk) {
         subscribers.remove(&id);
         if subscribers.is_empty() {
             tickets.remove(&chunk);
+            return true;
         }
     }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +420,7 @@ struct ChunkStreamState {
     wait_for_first_chunk: bool,
 }
 
+#[derive(Debug, Clone)]
 struct PreparedChunkFrame {
     frame: Bytes,
     light: Option<ChunkLight>,
@@ -1029,6 +1059,20 @@ impl ChunkStreamState {
                 };
                 break;
             };
+            if let Some(prepared) = self
+                .sessions
+                .prepared_chunk((request.chunk_x, request.chunk_z))
+            {
+                self.accept_result(ChunkPrepareResult {
+                    request,
+                    fetch_ms: 0,
+                    staged: Vec::new(),
+                    outcome: ChunkPrepareOutcome::Ready(Box::new((*prepared).clone())),
+                });
+                dispatched_this_turn += 1;
+                self.dispatched += 1;
+                continue;
+            }
             let world = Arc::clone(&self.world);
             let biomes = Arc::clone(&self.biomes);
             let block_light = self.block_light.as_ref().map(Arc::clone);
@@ -1090,13 +1134,15 @@ impl ChunkStreamState {
 
         match result.outcome {
             ChunkPrepareOutcome::Ready(prepared) => {
-                if let Some(light) = prepared.light {
+                if let Some(light) = prepared.light.clone() {
                     light_cache.insert(ChunkPos { x: cx, z: cz }, light);
                 }
                 let mut write_timing = prepared.write_timing;
                 write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
                 self.loaded.insert((cx, cz));
                 self.sessions.mark_loaded(self.session_id, (cx, cz));
+                self.sessions
+                    .cache_prepared_chunk((cx, cz), Arc::new((*prepared).clone()));
                 self.build_timing.add(prepared.build_timing);
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
@@ -1765,6 +1811,7 @@ where
     };
     let edit_chunk = (x.div_euclid(16), z.div_euclid(16));
     let edit_chunks = HashSet::from([edit_chunk]);
+    state.sessions.invalidate_prepared_chunks(&edit_chunks);
 
     // 2. Tell subscribed clients about the new block. Single edits stay on the
     //    historical BlockUpdate wire shape; only true batches use the
@@ -1791,6 +1838,11 @@ where
             new_state,
         )
         .await?;
+        let light_chunks: HashSet<_> = light_updates
+            .iter()
+            .map(|update| (update.pos.x, update.pos.z))
+            .collect();
+        state.sessions.invalidate_prepared_chunks(&light_chunks);
         broadcast_light_updates(state, &light_updates);
     }
 
@@ -2295,6 +2347,32 @@ mod tests {
         assert_eq!(chunk_pos_from_coords(16.0, -0.001), (1, -1));
         assert_eq!(chunk_pos_from_coords(-0.001, -16.0), (-1, -1));
         assert_eq!(chunk_pos_from_coords(-16.001, 32.0), (-2, 2));
+    }
+
+    #[test]
+    fn session_registry_drops_prepared_cache_with_last_ticket() {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "tester".to_string(),
+        };
+        let id = registry.register(&profile, (0, 0), 0, HashSet::from([(0, 0)]), tx);
+        registry.cache_prepared_chunk(
+            (0, 0),
+            Arc::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"chunk-frame"),
+                light: None,
+                packet_data_len: 0,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            }),
+        );
+        assert!(registry.prepared_chunk((0, 0)).is_some());
+
+        registry.unregister(id);
+
+        assert!(registry.prepared_chunk((0, 0)).is_none());
     }
 
     #[test]
