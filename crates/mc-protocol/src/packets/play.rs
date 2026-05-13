@@ -28,6 +28,9 @@ const MAX_CHUNK_DATA_LEN: usize = 2 * 1024 * 1024;
 /// of longs is more than two orders of magnitude headroom.
 const MAX_LONG_ARRAY_LEN: usize = 4096;
 
+/// A section contains at most 16^3 block changes.
+const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
+
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
         len: longs.len(),
@@ -800,6 +803,103 @@ impl Packet for BlockUpdate {
             state_id: buf.read_varint()?,
         })
     }
+}
+
+/// One entry inside [`SectionBlocksUpdate`]. `relative_pos` is the
+/// section-local 12-bit coordinate value produced by
+/// [`pack_section_relative_pos`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SectionBlockChange {
+    pub relative_pos: u16,
+    pub state_id: i32,
+}
+
+/// `Clientbound Section Blocks Update` (CB). Multi-block delta for one
+/// chunk section. Per ADR 0002, verified against `javap -p`:
+/// `ClientboundSectionBlocksUpdatePacket(SectionPos sectionPos,
+/// short[] positions, BlockState[] states)`. Vanilla's stream codec writes
+/// the raw `SectionPos.asLong`, then a VarInt count, then each entry as a
+/// VarLong `(state_id << 12) | (section_relative_pos & 0xFFF)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectionBlocksUpdate {
+    /// Raw vanilla `SectionPos.asLong`. Use [`pack_section_pos`].
+    pub section_pos: i64,
+    pub changes: Vec<SectionBlockChange>,
+}
+
+impl Packet for SectionBlocksUpdate {
+    // Verified via `javap` of vanilla 26.1.2's GameProtocols:
+    // CLIENTBOUND_SECTION_BLOCKS_UPDATE at game-CB index 84 = wire id 0x54.
+    const ID: i32 = 0x54;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.section_pos);
+        if self.changes.len() > MAX_SECTION_BLOCK_UPDATE_ENTRIES {
+            return Err(CodecError::StringTooLong {
+                len: self.changes.len(),
+                max: MAX_SECTION_BLOCK_UPDATE_ENTRIES,
+            });
+        }
+        let count = i32::try_from(self.changes.len()).map_err(|_| CodecError::StringTooLong {
+            len: self.changes.len(),
+            max: i32::MAX as usize,
+        })?;
+        buf.write_varint(count);
+        for change in &self.changes {
+            buf.write_varlong(pack_section_block_update_value(
+                change.state_id,
+                change.relative_pos,
+            ));
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let section_pos = buf.read_i64()?;
+        let count_signed = buf.read_varint()?;
+        if count_signed < 0 {
+            return Err(CodecError::NegativeLength(count_signed));
+        }
+        let count = count_signed as usize;
+        if count > MAX_SECTION_BLOCK_UPDATE_ENTRIES {
+            return Err(CodecError::StringTooLong {
+                len: count,
+                max: MAX_SECTION_BLOCK_UPDATE_ENTRIES,
+            });
+        }
+        let mut changes = Vec::with_capacity(count);
+        for _ in 0..count {
+            let value = buf.read_varlong()?;
+            changes.push(SectionBlockChange {
+                relative_pos: (value & 0xFFF) as u16,
+                state_id: (value >> 12) as i32,
+            });
+        }
+        Ok(Self {
+            section_pos,
+            changes,
+        })
+    }
+}
+
+/// Pack vanilla's `SectionPos.asLong` representation:
+/// `((x & 0x3FFFFF)<<42) | ((z & 0x3FFFFF)<<20) | (y & 0xFFFFF)`.
+#[must_use]
+pub fn pack_section_pos(x: i32, y: i32, z: i32) -> i64 {
+    (((x as i64) & 0x3F_FFFF) << 42) | (((z as i64) & 0x3F_FFFF) << 20) | ((y as i64) & 0xF_FFFF)
+}
+
+/// Pack vanilla's section-relative block coordinate:
+/// `(x&15)<<8 | (z&15)<<4 | (y&15)`.
+#[must_use]
+pub fn pack_section_relative_pos(x: i32, y: i32, z: i32) -> u16 {
+    (((x as u16) & 15) << 8) | (((z as u16) & 15) << 4) | ((y as u16) & 15)
+}
+
+/// Pack one repeated SectionBlocksUpdate VarLong value.
+#[must_use]
+pub fn pack_section_block_update_value(state_id: i32, relative_pos: u16) -> i64 {
+    ((state_id as i64) << 12) | i64::from(relative_pos & 0x0FFF)
 }
 
 /// `Clientbound Block Changed Ack` (CB). One-VarInt packet that
@@ -1722,6 +1822,71 @@ mod tests {
         round_trip(BlockUpdate {
             position: pack_block_pos(-7, 200, 3),
             state_id: 29_872,
+        });
+    }
+
+    #[test]
+    fn section_blocks_update_id_matches_javap() {
+        assert_eq!(SectionBlocksUpdate::ID, 0x54);
+    }
+
+    #[test]
+    fn section_pos_packs_negative_coords_like_vanilla() {
+        let packed = pack_section_pos(-1, -2, 3);
+        assert_eq!(packed, -4_398_042_316_802);
+        assert_eq!(
+            packed.to_be_bytes(),
+            [0xFF, 0xFF, 0xFC, 0, 0, 0x3F, 0xFF, 0xFE]
+        );
+    }
+
+    #[test]
+    fn section_relative_pos_uses_xzy_nibbles() {
+        assert_eq!(pack_section_relative_pos(0, 0, 0), 0);
+        assert_eq!(pack_section_relative_pos(1, 2, 3), 0x0132);
+        assert_eq!(pack_section_relative_pos(-1, -2, -3), 0x0FDE);
+    }
+
+    #[test]
+    fn section_blocks_update_wire_layout() {
+        let packet = SectionBlocksUpdate {
+            section_pos: pack_section_pos(-1, -2, 3),
+            changes: vec![SectionBlockChange {
+                relative_pos: pack_section_relative_pos(1, 2, 3),
+                state_id: 1,
+            }],
+        };
+
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0xFF, 0xFF, 0xFC, 0, 0, 0x3F, 0xFF, 0xFE, // SectionPos.asLong
+                0x01, // count
+                0xB2, 0x22, // VarLong((1 << 12) | 0x132)
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(SectionBlocksUpdate::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn section_blocks_update_round_trip_multiple_entries() {
+        round_trip(SectionBlocksUpdate {
+            section_pos: pack_section_pos(12, -4, -9),
+            changes: vec![
+                SectionBlockChange {
+                    relative_pos: pack_section_relative_pos(0, 0, 0),
+                    state_id: 0,
+                },
+                SectionBlockChange {
+                    relative_pos: pack_section_relative_pos(15, 15, 15),
+                    state_id: 29_872,
+                },
+            ],
         });
     }
 
