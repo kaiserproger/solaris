@@ -33,12 +33,12 @@
 //! pathological setups (lava lakes one chunk over) and we accept
 //! the slight darkening.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use mc_data::block_light::BlockLightTable;
 
 use crate::block::BlockStateId;
-use crate::chunk::{Chunk, MIN_Y, SECTION_COUNT};
+use crate::chunk::{Chunk, ChunkPos, MIN_Y, SECTION_COUNT};
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
 /// World-height span in blocks (24 sections × 16 blocks).
@@ -127,6 +127,59 @@ impl LightWorkspace {
 impl Default for LightWorkspace {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-connection cache of computed [`ChunkLight`] keyed by
+/// [`ChunkPos`]. Owned by `mc-net::play::InteractionState`, populated
+/// during the spawn-window emit (so each chunk's lighting is computed
+/// exactly once at login), and — from M9.b onwards — mutated in
+/// place by the incremental relight BFS on subsequent edits.
+///
+/// Memory: ~200 KB per cached chunk × the spawn view-window. With
+/// view distance 10 and a ~21×21 emit, the upper bound is ~17 MB per
+/// connection. Chunks the all-air fast path returned for are *not*
+/// cached (their light is reconstructable on demand) so a fresh-world
+/// connection sits well below that.
+#[derive(Debug, Default, Clone)]
+pub struct LightCache {
+    chunks: HashMap<ChunkPos, ChunkLight>,
+}
+
+impl LightCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, pos: ChunkPos, light: ChunkLight) {
+        self.chunks.insert(pos, light);
+    }
+
+    #[must_use]
+    pub fn get(&self, pos: ChunkPos) -> Option<&ChunkLight> {
+        self.chunks.get(&pos)
+    }
+
+    #[must_use]
+    pub fn contains(&self, pos: ChunkPos) -> bool {
+        self.chunks.contains_key(&pos)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn remove(&mut self, pos: ChunkPos) -> Option<ChunkLight> {
+        self.chunks.remove(&pos)
     }
 }
 

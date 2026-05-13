@@ -35,7 +35,7 @@ use mc_protocol::packets::play::{
     ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
     unpack_block_pos,
 };
-use mc_world::light::{LightWorkspace, compute_chunk_light_in};
+use mc_world::light::{LightCache, LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -197,12 +197,14 @@ where
     )
     .await?;
 
+    let mut light_cache = LightCache::new();
     if let Some(world) = config.world.as_ref() {
         emit_chunks_around(
             writer,
             world,
             data,
             config.block_light.as_deref(),
+            &mut light_cache,
             spawn_cx,
             spawn_cz,
             SPAWN_VIEW_DISTANCE,
@@ -247,6 +249,7 @@ where
         blocks: Arc::clone(&config.blocks),
         block_light: config.block_light.as_ref().map(Arc::clone),
         workspace: LightWorkspace::new(),
+        light_cache: std::mem::take(&mut light_cache),
         selected_hotbar_slot: 0,
         inventory: starter,
         inventory_state_id: 1,
@@ -265,6 +268,14 @@ struct InteractionState {
     /// the lifetime of the connection (same amortisation pattern
     /// as `emit_chunks_around`).
     workspace: LightWorkspace,
+    /// M9.a: per-chunk computed light, populated during the spawn
+    /// burst and (from M9.c onwards) mutated in place on every
+    /// edit. Replaces the M5-era pattern of recomputing the full
+    /// 3×3 neighbourhood for each affected chunk on every break/
+    /// place. Field is wired up here so the spawn-burst seed can
+    /// flow into it without touching this struct again next commit.
+    #[allow(dead_code)]
+    light_cache: LightCache,
     /// M6.d: which item the player is currently holding. Bumped by
     /// `ServerboundSetCarriedItem` (0..=8) and consulted by
     /// `handle_use_item_on` to resolve the placed block.
@@ -407,11 +418,13 @@ fn spawn_chunk_pos() -> (i32, i32) {
 /// is logged and skipped rather than killing the connection: the same
 /// posture as the M3.d single-chunk path. The final summary log
 /// records how many chunks made it onto the wire.
+#[allow(clippy::too_many_arguments)]
 async fn emit_chunks_around<W>(
     writer: &mut W,
     world: &WorldHandle,
     data: &VanillaData,
     block_light: Option<&BlockLightTable>,
+    light_cache: &mut LightCache,
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
@@ -477,6 +490,7 @@ where
             biomes,
             block_light,
             workspace.as_mut(),
+            Some(light_cache),
             cx,
             cz,
         ) {
@@ -552,12 +566,14 @@ fn build_neighbourhood(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_chunk_packet(
     centre: &Chunk,
     neighbourhood: &[[Option<Arc<Chunk>>; 3]; 3],
     biomes: &Registry,
     block_light: Option<&BlockLightTable>,
     workspace: Option<&mut LightWorkspace>,
+    light_cache: Option<&mut LightCache>,
     cx: i32,
     cz: i32,
 ) -> Result<LevelChunkWithLight, mc_world::wire::WireError> {
@@ -582,6 +598,11 @@ fn build_chunk_packet(
             refs[1][1] = Some(centre);
             let computed = compute_chunk_light_in(ws, refs, table);
             let wire = encode_chunk_light(&computed);
+            // M9.a: stash the computed light in the per-connection
+            // cache so subsequent edits hit the incremental path.
+            if let Some(cache) = light_cache {
+                cache.insert(ChunkPos { x: cx, z: cz }, computed);
+            }
             LightData {
                 sky_y_mask: wire.sky_y_mask,
                 block_y_mask: wire.block_y_mask,
