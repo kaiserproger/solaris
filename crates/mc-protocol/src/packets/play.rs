@@ -814,6 +814,153 @@ impl Packet for AddEntity {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityAnimationAction {
+    SwingMainHand,
+    WakeUp,
+    SwingOffHand,
+    CriticalHit,
+    MagicCriticalHit,
+    Raw(u8),
+}
+
+impl EntityAnimationAction {
+    #[must_use]
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::SwingMainHand => 0,
+            Self::WakeUp => 2,
+            Self::SwingOffHand => 3,
+            Self::CriticalHit => 4,
+            Self::MagicCriticalHit => 5,
+            Self::Raw(value) => value,
+        }
+    }
+
+    #[must_use]
+    pub const fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Self::SwingMainHand,
+            2 => Self::WakeUp,
+            3 => Self::SwingOffHand,
+            4 => Self::CriticalHit,
+            5 => Self::MagicCriticalHit,
+            other => Self::Raw(other),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityAnimation {
+    pub entity_id: i32,
+    pub action: EntityAnimationAction,
+}
+
+impl Packet for EntityAnimation {
+    // Verified via inner `.analysis/server.jar` 26.1.2 server jar:
+    // CLIENTBOUND_ANIMATE is game-CB index 2 = wire id 0x02.
+    // `javap -p -c ClientboundAnimatePacket` shows VarInt entity id
+    // followed by one unsigned byte action.
+    const ID: i32 = 0x02;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_u8(self.action.as_u8());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            action: EntityAnimationAction::from_u8(buf.read_u8()?),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityEvent {
+    pub entity_id: i32,
+    pub event_id: i8,
+}
+
+impl Packet for EntityEvent {
+    // Verified via inner `.analysis/server.jar` 26.1.2 server jar:
+    // CLIENTBOUND_ENTITY_EVENT is game-CB index 34 = wire id 0x22.
+    // `javap -p -c ClientboundEntityEventPacket` shows i32 entity id
+    // followed by one signed byte event id.
+    const ID: i32 = 0x22;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i32(self.entity_id);
+        buf.write_i8(self.event_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_i32()?,
+            event_id: buf.read_i8()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveEntityPosRot {
+    pub entity_id: i32,
+    pub delta_x: i16,
+    pub delta_y: i16,
+    pub delta_z: i16,
+    pub yaw: u8,
+    pub pitch: u8,
+    pub on_ground: bool,
+}
+
+impl MoveEntityPosRot {
+    #[must_use]
+    pub fn delta_to_short(delta: f64) -> i16 {
+        (delta * 4096.0)
+            .round()
+            .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+    }
+
+    #[must_use]
+    pub fn pack_degrees(degrees: f32) -> u8 {
+        pack_degrees(degrees)
+    }
+}
+
+impl Packet for MoveEntityPosRot {
+    // Verified via inner `.analysis/server.jar` 26.1.2 server jar:
+    // CLIENTBOUND_MOVE_ENTITY_POS_ROT is game-CB index 54 = wire id 0x36.
+    // `javap -p -c ClientboundMoveEntityPacket$PosRot` shows VarInt id,
+    // three i16 relative deltas, packed yRot byte, packed xRot byte,
+    // then onGround bool.
+    const ID: i32 = 0x36;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_i16(self.delta_x);
+        buf.write_i16(self.delta_y);
+        buf.write_i16(self.delta_z);
+        buf.write_u8(self.yaw);
+        buf.write_u8(self.pitch);
+        buf.write_bool(self.on_ground);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            delta_x: buf.read_i16()?,
+            delta_y: buf.read_i16()?,
+            delta_z: buf.read_i16()?,
+            yaw: buf.read_u8()?,
+            pitch: buf.read_u8()?,
+            on_ground: buf.read_bool()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityPositionSync {
     pub entity_id: i32,
@@ -839,6 +986,33 @@ impl Packet for EntityPositionSync {
             entity_id: buf.read_varint()?,
             values: PositionMoveRotation::decode(buf)?,
             on_ground: buf.read_bool()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SetEntityMotion {
+    pub entity_id: i32,
+    pub movement: EntityVec3,
+}
+
+impl Packet for SetEntityMotion {
+    // Verified via inner `.analysis/server.jar` 26.1.2 server jar:
+    // CLIENTBOUND_SET_ENTITY_MOTION is game-CB index 101 = wire id 0x65.
+    // `javap -p -c ClientboundSetEntityMotionPacket` shows VarInt id plus
+    // `Vec3.LP_STREAM_CODEC` movement.
+    const ID: i32 = 0x65;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        write_lp_vec3(buf, self.movement);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            movement: read_lp_vec3(buf)?,
         })
     }
 }
@@ -2386,6 +2560,108 @@ mod tests {
             },
             on_ground: true,
         });
+    }
+
+    #[test]
+    fn entity_animation_id_and_wire_layout_match_server_javap() {
+        assert_eq!(EntityAnimation::ID, 0x02);
+        let packet = EntityAnimation {
+            entity_id: 300,
+            action: EntityAnimationAction::SwingMainHand,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0xAC, 0x02, 0x00]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(EntityAnimation::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn entity_event_id_and_wire_layout_match_server_javap() {
+        assert_eq!(EntityEvent::ID, 0x22);
+        let packet = EntityEvent {
+            entity_id: 0x0102_0304,
+            event_id: -1,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x01, 0x02, 0x03, 0x04, 0xFF]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(EntityEvent::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn move_entity_pos_rot_id_and_wire_layout_match_server_javap() {
+        assert_eq!(MoveEntityPosRot::ID, 0x36);
+        let packet = MoveEntityPosRot {
+            entity_id: 300,
+            delta_x: 4,
+            delta_y: -8,
+            delta_z: 12,
+            yaw: 64,
+            pitch: 250,
+            on_ground: true,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0xAC, 0x02, 0x00, 0x04, 0xFF, 0xF8, 0x00, 0x0C, 0x40, 0xFA, 0x01
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(MoveEntityPosRot::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn move_entity_delta_scales_to_vanilla_short_units() {
+        assert_eq!(MoveEntityPosRot::delta_to_short(1.0 / 4096.0), 1);
+        assert_eq!(MoveEntityPosRot::delta_to_short(-0.5), -2048);
+        assert_eq!(MoveEntityPosRot::pack_degrees(90.0), 64);
+    }
+
+    #[test]
+    fn set_entity_motion_id_and_zero_motion_layout_match_server_javap() {
+        assert_eq!(SetEntityMotion::ID, 0x65);
+        let packet = SetEntityMotion {
+            entity_id: 5,
+            movement: EntityVec3::ZERO,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x05, 0x00]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(SetEntityMotion::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn set_entity_motion_round_trips_non_zero_lp_vec3() {
+        let packet = SetEntityMotion {
+            entity_id: 42,
+            movement: EntityVec3 {
+                x: 0.1,
+                y: -0.2,
+                z: 0.3,
+            },
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        let mut cursor: &[u8] = &buf;
+        let decoded = SetEntityMotion::decode(&mut cursor).unwrap();
+        assert_eq!(decoded.entity_id, packet.entity_id);
+        assert!((decoded.movement.x - packet.movement.x).abs() < 0.000_1);
+        assert!((decoded.movement.y - packet.movement.y).abs() < 0.000_1);
+        assert!((decoded.movement.z - packet.movement.z).abs() < 0.000_1);
+        assert!(cursor.is_empty());
     }
 
     #[test]

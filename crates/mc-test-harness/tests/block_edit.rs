@@ -22,10 +22,10 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
-    LevelChunkWithLight, LightUpdate, LoginPlay, PlayerActionKind, ServerboundKeepAlive,
-    ServerboundPlayerAction, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
-    unpack_block_pos,
+    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction,
+    EntityAnimation, EntityAnimationAction, GameEvent, LevelChunkWithLight, LightUpdate, LoginPlay,
+    PlayerActionKind, ServerboundKeepAlive, ServerboundPlayerAction, SetCenterChunk,
+    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -355,9 +355,10 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
     }
 
     let mut observer_saw_update = false;
+    let mut observer_saw_animation = false;
     let mut observer_saw_ack = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !observer_saw_update {
+    while !(observer_saw_update && observer_saw_animation) {
         let frame = observer
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -376,6 +377,12 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
             observer_saw_update = true;
         } else if frame.id == BlockChangedAck::ID {
             observer_saw_ack = true;
+        } else if frame.id == EntityAnimation::ID {
+            let mut body = frame.body;
+            let pkt = EntityAnimation::decode(&mut body).expect("decode observer animation");
+            if pkt.action == EntityAnimationAction::SwingMainHand {
+                observer_saw_animation = true;
+            }
         }
     }
     assert!(!observer_saw_ack, "observer must not receive actor ack");

@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 mc-data = { path = "../mc-data" }
+mc-entity = { path = "../mc-entity" }
 mc-protocol = { path = "../mc-protocol" }
 mc-world = { path = "../mc-world" }
 bytes = { workspace = true }

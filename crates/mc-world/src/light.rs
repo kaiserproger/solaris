@@ -1502,8 +1502,8 @@ mod tests {
     /// aren't pinned (vanilla's algorithm differs in iteration
     /// quirks, and the M3 status appendix already documented that
     /// our world has almost no baked light to compare against), but
-    /// invariants are checked: sky=15 on the very top, block=0 in a
-    /// no-light chunk.
+    /// invariants are checked: sky=15 on the very top, and block-light
+    /// stays dark only when the sampled chunk has no emitters.
     #[test]
     fn engine_runs_on_real_spawn_chunk_when_data_present() {
         let workspace = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1540,6 +1540,17 @@ mod tests {
             return;
         };
 
+        let has_emitter = (0..WORLD_HEIGHT).any(|ly| {
+            let world_y = MIN_Y + ly as i32;
+            (0..16u8).any(|lz| {
+                (0..16u8).any(|lx| {
+                    chunk
+                        .get_block(lx, world_y, lz)
+                        .is_some_and(|state| table.emission(state.0).unwrap_or(0) > 0)
+                })
+            })
+        });
+
         let input = [
             [None, None, None],
             [None, Some(chunk), None],
@@ -1550,17 +1561,24 @@ mod tests {
         // The top of the world should always be open sky.
         assert_eq!(out.sky_at(0, MAX_Y - 1, 0), 15);
         assert_eq!(out.sky_at(15, MAX_Y - 1, 15), 15);
-        // No emitter in a fully-grass chunk → block-light is 0 throughout.
-        for ly in 0..WORLD_HEIGHT {
-            for lz in 0..16u8 {
-                for lx in 0..16u8 {
-                    let world_y = MIN_Y + ly as i32;
-                    assert_eq!(
-                        out.block_at(lx, world_y, lz),
-                        0,
-                        "expected no block-light in the spawn chunk; got non-zero at \
-                         ({lx}, {world_y}, {lz})",
-                    );
+        if has_emitter {
+            let has_block_light = (0..WORLD_HEIGHT).any(|ly| {
+                let world_y = MIN_Y + ly as i32;
+                (0..16u8).any(|lz| (0..16u8).any(|lx| out.block_at(lx, world_y, lz) > 0))
+            });
+            assert!(has_block_light, "emitting chunk produced no block-light");
+        } else {
+            for ly in 0..WORLD_HEIGHT {
+                for lz in 0..16u8 {
+                    for lx in 0..16u8 {
+                        let world_y = MIN_Y + ly as i32;
+                        assert_eq!(
+                            out.block_at(lx, world_y, lz),
+                            0,
+                            "expected no block-light in the spawn chunk; got non-zero at \
+                             ({lx}, {world_y}, {lz})",
+                        );
+                    }
                 }
             }
         }

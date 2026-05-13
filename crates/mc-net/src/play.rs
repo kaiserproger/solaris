@@ -25,20 +25,22 @@ use bytes::{Bytes, BytesMut};
 use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
+use mc_entity::{EntityId, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
-    ConfirmTeleportation, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, ItemStack,
-    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind,
-    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation,
-    RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
-    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSetCarriedItem,
-    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_section_pos,
-    pack_section_relative_pos, unpack_block_pos,
+    ConfirmTeleportation, EntityAnimation, EntityAnimationAction, EntityPositionSync, EntityVec3,
+    ForgetLevelChunk, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
+    PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
+    SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -77,6 +79,11 @@ const SPAWN_X: f64 = 0.5;
 const DEFAULT_SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;
+const COW_ENTITY_TYPE_ID: i32 = 30;
+const SERVER_ENTITY_ID_START: i32 = 1_000_000;
+pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
+const ENTITY_TICK_DELTA_SECONDS: f64 = 0.05;
+const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -90,6 +97,10 @@ enum OutboundCommand {
     SpawnPlayer(PlayerEntitySnapshot),
     MovePlayer(PlayerEntitySnapshot),
     DespawnPlayer(PlayerEntitySnapshot),
+    SpawnEntity(ServerEntitySnapshot),
+    MoveEntityRelative(ServerEntityMove),
+    DespawnEntity(ServerEntitySnapshot),
+    AnimatePlayer { entity_id: i32 },
 }
 
 #[derive(Debug, Clone)]
@@ -120,6 +131,26 @@ struct PlayerEntitySnapshot {
     pose: PlayerPose,
 }
 
+#[derive(Debug, Clone)]
+struct ServerEntitySnapshot {
+    id: EntityId,
+    uuid: uuid::Uuid,
+    type_id: i32,
+    type_name: String,
+    position: Vec3,
+    rotation: mc_entity::Rotation,
+    velocity: Vec3,
+    on_ground: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ServerEntityMove {
+    id: EntityId,
+    delta: Vec3,
+    rotation: mc_entity::Rotation,
+    on_ground: bool,
+}
+
 #[derive(Debug)]
 struct PlaySession {
     name: String,
@@ -131,15 +162,33 @@ struct PlaySession {
     desired: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
     visible_players: HashSet<SessionId>,
+    visible_entities: HashSet<EntityId>,
     tx: mpsc::Sender<OutboundCommand>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct SessionRegistryInner {
     next_id: SessionId,
     sessions: HashMap<SessionId, PlaySession>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
     prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
+    entities: EntityStore,
+    last_sent_entity_positions: HashMap<EntityId, Vec3>,
+    demo_entities_ready: bool,
+}
+
+impl Default for SessionRegistryInner {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            sessions: HashMap::new(),
+            tickets: HashMap::new(),
+            prepared: HashMap::new(),
+            entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
+            last_sent_entity_positions: HashMap::new(),
+            demo_entities_ready: false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -181,6 +230,7 @@ impl SessionRegistry {
                 desired,
                 loaded: HashSet::new(),
                 visible_players: HashSet::new(),
+                visible_entities: HashSet::new(),
                 tx,
             },
         );
@@ -337,6 +387,140 @@ impl SessionRegistry {
         dispatches
     }
 
+    fn broadcast_player_animation(&self, id: SessionId) -> Vec<VisibilityDispatch> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        let Some(session) = inner.sessions.get(&id) else {
+            return Vec::new();
+        };
+        let entity_id = session.entity_id;
+        visible_observers_locked(&inner, id)
+            .into_iter()
+            .filter_map(|observer_id| {
+                let observer = inner.sessions.get(&observer_id)?;
+                Some(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::AnimatePlayer { entity_id },
+                })
+            })
+            .collect()
+    }
+
+    fn ensure_demo_entities(&self, spawn_y: f64) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if !inner.demo_entities_ready {
+            let position = Vec3::new(SPAWN_X + 4.0, spawn_y, SPAWN_Z);
+            let mut cow = SpawnEntity::new(COW_ENTITY_TYPE_ID, "minecraft:cow", position);
+            cow.goal = GoalState::Wander {
+                speed: 0.8,
+                period_ticks: 80,
+            };
+            let id = inner.entities.spawn(cow);
+            inner.last_sent_entity_positions.insert(id, position);
+            inner.demo_entities_ready = true;
+            debug!(entity_id = id.0, "spawned demo vanilla cow entity");
+        }
+        refresh_visibility_locked(&mut inner)
+    }
+
+    pub(crate) fn tick_entities_and_collect_ground_queries(
+        &self,
+        tick: u64,
+    ) -> Vec<(EntityId, f64, f64)> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if inner.entities.is_empty() {
+            return Vec::new();
+        }
+        inner.entities.tick_goals(tick);
+        inner.entities.tick_positions(ENTITY_TICK_DELTA_SECONDS);
+        inner
+            .entities
+            .snapshots()
+            .map(|entity| (entity.id, entity.position.x, entity.position.z))
+            .collect()
+    }
+
+    pub(crate) fn apply_entity_ground_levels_and_dispatch(
+        &self,
+        tick: u64,
+        levels: &[(EntityId, f64)],
+    ) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if inner.entities.is_empty() {
+            return;
+        }
+        let old_visible: HashMap<_, _> = inner
+            .entities
+            .snapshots()
+            .map(|entity| {
+                (
+                    entity.id,
+                    visible_entity_observers_locked(&inner, entity.id),
+                )
+            })
+            .collect();
+        for &(id, y) in levels {
+            if let Some(mut entity) = inner.entities.snapshot(id) {
+                entity.position.y = y;
+                let _ = inner.entities.set_position(id, entity.position);
+            }
+        }
+        let mut dispatches = refresh_visibility_locked(&mut inner);
+        if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
+            drop(inner);
+            dispatch_visibility_commands(dispatches);
+            return;
+        }
+
+        let snapshots: Vec<_> = inner.entities.snapshots().collect();
+        for entity in snapshots {
+            let snapshot = server_entity_snapshot_from(entity);
+            let Some(old_position) = inner.last_sent_entity_positions.get(&snapshot.id).copied()
+            else {
+                inner
+                    .last_sent_entity_positions
+                    .insert(snapshot.id, snapshot.position);
+                continue;
+            };
+            let delta = Vec3 {
+                x: snapshot.position.x - old_position.x,
+                y: snapshot.position.y - old_position.y,
+                z: snapshot.position.z - old_position.z,
+            };
+            if delta.x == 0.0 && delta.y == 0.0 && delta.z == 0.0 {
+                continue;
+            }
+            let new_visible = visible_entity_observers_locked(&inner, snapshot.id);
+            for observer_id in old_visible
+                .get(&snapshot.id)
+                .into_iter()
+                .flat_map(|observers| observers.intersection(&new_visible))
+            {
+                if let Some(observer) = inner.sessions.get(observer_id) {
+                    dispatches.push(VisibilityDispatch {
+                        recipient: SessionRecipient {
+                            id: *observer_id,
+                            tx: observer.tx.clone(),
+                        },
+                        command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
+                            id: snapshot.id,
+                            delta,
+                            rotation: snapshot.rotation,
+                            on_ground: snapshot.on_ground,
+                        }),
+                    });
+                }
+            }
+            inner
+                .last_sent_entity_positions
+                .insert(snapshot.id, snapshot.position);
+        }
+        drop(inner);
+        dispatch_visibility_commands(dispatches);
+    }
+
     fn loaded_recipients_for_chunks(
         &self,
         chunks: &HashSet<(i32, i32)>,
@@ -396,6 +580,23 @@ fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEntitySnapsho
     }
 }
 
+fn server_entity_snapshot_from(entity: mc_entity::EntitySnapshot) -> ServerEntitySnapshot {
+    ServerEntitySnapshot {
+        id: entity.id,
+        uuid: entity.uuid,
+        type_id: entity.type_id,
+        type_name: entity.type_name,
+        position: entity.position,
+        rotation: entity.rotation,
+        velocity: entity.velocity,
+        on_ground: entity.on_ground,
+    }
+}
+
+fn server_entity_chunk_pos(entity: &ServerEntitySnapshot) -> (i32, i32) {
+    chunk_pos_from_coords(entity.position.x, entity.position.z)
+}
+
 fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {
     inner
         .sessions
@@ -409,12 +610,37 @@ fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> 
         .collect()
 }
 
+fn visible_entity_observers_locked(
+    inner: &SessionRegistryInner,
+    target: EntityId,
+) -> HashSet<SessionId> {
+    inner
+        .sessions
+        .iter()
+        .filter_map(|(&observer_id, observer)| {
+            observer
+                .visible_entities
+                .contains(&target)
+                .then_some(observer_id)
+        })
+        .collect()
+}
+
 fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
     let ids: Vec<_> = inner.sessions.keys().copied().collect();
     let snapshots: HashMap<_, _> = inner
         .sessions
         .iter()
         .map(|(&id, session)| (id, session_snapshot(id, session)))
+        .collect();
+    let entity_snapshots: HashMap<_, _> = inner
+        .entities
+        .snapshots()
+        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .map(|entity| {
+            let snapshot = server_entity_snapshot_from(entity);
+            (snapshot.id, snapshot)
+        })
         .collect();
     let desired_by_observer: HashMap<_, HashSet<_>> = ids
         .iter()
@@ -428,6 +654,22 @@ fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<Visibility
                         && snapshots.get(target_id).is_some_and(|target| {
                             observer.loaded.contains(&target.pose.chunk_pos())
                         })
+                })
+                .collect();
+            Some((*observer_id, desired))
+        })
+        .collect();
+    let desired_entities_by_observer: HashMap<_, HashSet<_>> = ids
+        .iter()
+        .filter_map(|observer_id| {
+            let observer = inner.sessions.get(observer_id)?;
+            let desired = entity_snapshots
+                .iter()
+                .filter_map(|(&entity_id, entity)| {
+                    observer
+                        .loaded
+                        .contains(&server_entity_chunk_pos(entity))
+                        .then_some(entity_id)
                 })
                 .collect();
             Some((*observer_id, desired))
@@ -466,6 +708,34 @@ fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<Visibility
             }
         }
         observer.visible_players = desired;
+
+        let desired_entities = desired_entities_by_observer
+            .get(&observer_id)
+            .cloned()
+            .unwrap_or_default();
+        for entity_id in desired_entities.difference(&observer.visible_entities) {
+            if let Some(snapshot) = entity_snapshots.get(entity_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::SpawnEntity(snapshot.clone()),
+                });
+            }
+        }
+        for entity_id in observer.visible_entities.difference(&desired_entities) {
+            if let Some(snapshot) = entity_snapshots.get(entity_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
+                });
+            }
+        }
+        observer.visible_entities = desired_entities;
     }
     dispatches
 }
@@ -705,6 +975,7 @@ where
     );
 
     let (spawn_x, spawn_y, spawn_z) = spawn_position(config).await;
+    dispatch_visibility_commands(sessions.ensure_demo_entities(spawn_y));
 
     let (spawn_cx, spawn_cz) = spawn_chunk_pos();
     let (outbound_tx, outbound_rx) =
@@ -1776,6 +2047,7 @@ where
     let (x, y, z) = unpack_block_pos(action.position);
     let air = air_state_id(&state.blocks);
 
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
     apply_block_edit(state, writer, action.sequence, x, y, z, air).await
 }
 
@@ -2265,6 +2537,7 @@ where
     }
 
     apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
 
     // M6.f: decrement the held stack's count + tell the client the
     // new slot contents. Empty stacks ship as `count == 0`.
@@ -2359,6 +2632,23 @@ fn player_position(player: &PlayerEntitySnapshot) -> PositionMoveRotation {
         delta_movement: EntityVec3::ZERO,
         yaw: player.pose.yaw,
         pitch: player.pose.pitch,
+    }
+}
+
+fn entity_position(entity: &ServerEntitySnapshot) -> PositionMoveRotation {
+    PositionMoveRotation {
+        position: EntityVec3 {
+            x: entity.position.x,
+            y: entity.position.y,
+            z: entity.position.z,
+        },
+        delta_movement: EntityVec3 {
+            x: entity.velocity.x,
+            y: entity.velocity.y,
+            z: entity.velocity.z,
+        },
+        yaw: entity.rotation.yaw,
+        pitch: entity.rotation.pitch,
     }
 }
 
@@ -2469,6 +2759,162 @@ where
     Ok(())
 }
 
+async fn send_entity_spawn<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(
+        entity_id = entity.id.0,
+        entity_type = %entity.type_name,
+        "spawning visible server entity"
+    );
+    write_packet(
+        writer,
+        &AddEntity {
+            entity_id: entity.id.0,
+            uuid: entity.uuid,
+            entity_type_id: entity.type_id,
+            x: entity.position.x,
+            y: entity.position.y,
+            z: entity.position.z,
+            movement: EntityVec3 {
+                x: entity.velocity.x,
+                y: entity.velocity.y,
+                z: entity.velocity.z,
+            },
+            pitch: entity.rotation.pitch,
+            yaw: entity.rotation.yaw,
+            head_yaw: entity.rotation.head_yaw,
+            data: 0,
+        },
+        compression,
+    )
+    .await?;
+    send_entity_move(writer, compression, entity).await
+}
+
+async fn send_entity_move<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &EntityPositionSync {
+            entity_id: entity.id.0,
+            values: entity_position(entity),
+            on_ground: entity.on_ground,
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &SetEntityMotion {
+            entity_id: entity.id.0,
+            movement: EntityVec3 {
+                x: entity.velocity.x,
+                y: entity.velocity.y,
+                z: entity.velocity.z,
+            },
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &RotateHead {
+            entity_id: entity.id.0,
+            head_yaw: entity.rotation.head_yaw,
+        },
+        compression,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_entity_relative_move<W>(
+    writer: &mut W,
+    compression: Compression,
+    movement: &ServerEntityMove,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &MoveEntityPosRot {
+            entity_id: movement.id.0,
+            delta_x: MoveEntityPosRot::delta_to_short(movement.delta.x),
+            delta_y: MoveEntityPosRot::delta_to_short(movement.delta.y),
+            delta_z: MoveEntityPosRot::delta_to_short(movement.delta.z),
+            yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
+            pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
+            on_ground: movement.on_ground,
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &RotateHead {
+            entity_id: movement.id.0,
+            head_yaw: movement.rotation.head_yaw,
+        },
+        compression,
+    )
+    .await
+}
+
+async fn send_entity_despawn<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(
+        entity_id = entity.id.0,
+        entity_type = %entity.type_name,
+        "despawning visible server entity"
+    );
+    write_packet(
+        writer,
+        &RemoveEntities {
+            entity_ids: vec![entity.id.0],
+        },
+        compression,
+    )
+    .await
+}
+
+async fn send_player_animation<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity_id: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &EntityAnimation {
+            entity_id,
+            action: EntityAnimationAction::SwingMainHand,
+        },
+        compression,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
@@ -2540,6 +2986,18 @@ where
                     }
                     Some(OutboundCommand::DespawnPlayer(player)) => {
                         send_player_despawn(writer, compression, &player).await?;
+                    }
+                    Some(OutboundCommand::SpawnEntity(entity)) => {
+                        send_entity_spawn(writer, compression, &entity).await?;
+                    }
+                    Some(OutboundCommand::MoveEntityRelative(movement)) => {
+                        send_entity_relative_move(writer, compression, &movement).await?;
+                    }
+                    Some(OutboundCommand::DespawnEntity(entity)) => {
+                        send_entity_despawn(writer, compression, &entity).await?;
+                    }
+                    Some(OutboundCommand::AnimatePlayer { entity_id }) => {
+                        send_player_animation(writer, compression, entity_id).await?;
                     }
                     None => {}
                 }
@@ -2662,6 +3120,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn entity_tick_cadence_matches_vanilla_cow_tracking() {
+        assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
+        assert_eq!(ENTITY_TICK_DELTA_SECONDS, 0.05);
+        assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
+    }
 
     #[test]
     fn pack_block_pos_round_trip() {

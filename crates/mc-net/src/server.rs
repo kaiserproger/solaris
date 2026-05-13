@@ -6,14 +6,17 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::BytesMut;
+use mc_data::Identifier;
 use mc_data::VanillaData;
 use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
+use mc_entity::EntityId;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_world::{BlockRegistry, WorldStorage};
+use mc_world::chunk::{MAX_Y, MIN_Y};
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -22,6 +25,8 @@ use crate::ChunkPipelinePolicy;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
+
+const COW_HALF_WIDTH: f64 = 0.46;
 
 /// Shared, mutably-accessible handle to the world.
 ///
@@ -109,6 +114,20 @@ impl BoundServer {
         );
         let config = self.config;
         let sessions = self.sessions;
+        let entity_sessions = Arc::clone(&sessions);
+        let entity_config = Arc::clone(&config);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut tick = 0_u64;
+            loop {
+                ticker.tick().await;
+                tick = tick.wrapping_add(1);
+                let queries = entity_sessions.tick_entities_and_collect_ground_queries(tick);
+                let levels = entity_ground_levels(&entity_config, &queries).await;
+                entity_sessions.apply_entity_ground_levels_and_dispatch(tick, &levels);
+            }
+        });
         loop {
             let (socket, peer) = self.listener.accept().await?;
             debug!(%peer, "accepted connection");
@@ -130,6 +149,61 @@ impl BoundServer {
             });
         }
     }
+}
+
+async fn entity_ground_levels(
+    config: &ServerConfig,
+    queries: &[(EntityId, f64, f64)],
+) -> Vec<(EntityId, f64)> {
+    let Some(world) = config.world.as_ref() else {
+        return Vec::new();
+    };
+    if queries.is_empty() {
+        return Vec::new();
+    }
+    let air = config
+        .blocks
+        .block(&Identifier::parse("minecraft:air").expect("static identifier"))
+        .map(|block| block.default)
+        .unwrap_or(BlockStateId(0));
+    let mut storage = world.lock().await;
+    queries
+        .iter()
+        .filter_map(|&(id, x, z)| {
+            ground_y_for_bbox(&mut storage, air, x, z, COW_HALF_WIDTH)
+                .map(|ground_y| (id, f64::from(ground_y) + 1.0))
+        })
+        .collect()
+}
+
+fn ground_y_for_bbox(
+    storage: &mut WorldStorage,
+    air: BlockStateId,
+    x: f64,
+    z: f64,
+    half_width: f64,
+) -> Option<i32> {
+    let probes = [
+        (x - half_width, z - half_width),
+        (x - half_width, z + half_width),
+        (x + half_width, z - half_width),
+        (x + half_width, z + half_width),
+    ];
+    probes
+        .into_iter()
+        .filter_map(|(px, pz)| ground_y_at(storage, air, px.floor() as i32, pz.floor() as i32))
+        .max()
+}
+
+fn ground_y_at(storage: &mut WorldStorage, air: BlockStateId, x: i32, z: i32) -> Option<i32> {
+    for y in (MIN_Y..MAX_Y).rev() {
+        match storage.get_block(BlockPos { x, y, z }) {
+            Ok(Some(state)) if state != air => return Some(y),
+            Ok(_) => {}
+            Err(_) => return None,
+        }
+    }
+    None
 }
 
 fn is_client_disconnect(err: &ConnectionError) -> bool {

@@ -629,6 +629,9 @@ dependencies = [
 [[package]]
 name = "mc-entity"
 version = "0.0.1"
+dependencies = [
+ "uuid",
+]
 
 [[package]]
 name = "mc-extension"
@@ -649,6 +652,7 @@ version = "0.0.1"
 dependencies = [
  "bytes",
  "mc-data",
+ "mc-entity",
  "mc-protocol",
  "mc-world",
  "md-5",
