@@ -16,7 +16,7 @@
 //! No chunk data is sent — the client renders a black world. That is the
 //! M1.g bar; chunk streaming is M2-M3 territory.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,9 +31,9 @@ use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
     ConfirmTeleportation, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, PlayerActionKind, ServerboundKeepAlive, ServerboundPlayerAction,
-    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
-    unpack_block_pos,
+    LoginPlay, PlayerActionKind, SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive,
+    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
+    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -69,6 +69,25 @@ const SPAWN_Z: f64 = 0.5;
 /// client renders right up to the announced render distance; tuning
 /// is M3.e/M3.f work.
 const SPAWN_VIEW_DISTANCE: i32 = 10;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockDelta {
+    x: i32,
+    y: i32,
+    z: i32,
+    state_id: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BlockDeltaPacket {
+    Single(BlockDelta),
+    Section {
+        section_x: i32,
+        section_y: i32,
+        section_z: i32,
+        changes: Vec<BlockDelta>,
+    },
+}
 
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
 /// Currently used only by tests but kept here for the eventual
@@ -687,8 +706,95 @@ where
     apply_block_edit(state, writer, action.sequence, x, y, z, air).await
 }
 
+async fn send_block_deltas<W>(
+    writer: &mut W,
+    compression: Compression,
+    deltas: &[BlockDelta],
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for packet in plan_block_delta_packets(deltas) {
+        match packet {
+            BlockDeltaPacket::Single(delta) => {
+                write_packet(
+                    writer,
+                    &BlockUpdate {
+                        position: mc_protocol::packets::play::pack_block_pos(
+                            delta.x, delta.y, delta.z,
+                        ),
+                        state_id: delta.state_id.0 as i32,
+                    },
+                    compression,
+                )
+                .await?;
+            }
+            BlockDeltaPacket::Section {
+                section_x,
+                section_y,
+                section_z,
+                changes,
+            } => {
+                write_packet(
+                    writer,
+                    &SectionBlocksUpdate {
+                        section_pos: pack_section_pos(section_x, section_y, section_z),
+                        changes: changes
+                            .into_iter()
+                            .map(|delta| SectionBlockChange {
+                                relative_pos: pack_section_relative_pos(delta.x, delta.y, delta.z),
+                                state_id: delta.state_id.0 as i32,
+                            })
+                            .collect(),
+                    },
+                    compression,
+                )
+                .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaPacket> {
+    if deltas.len() <= 1 {
+        return deltas
+            .iter()
+            .copied()
+            .map(BlockDeltaPacket::Single)
+            .collect();
+    }
+
+    let mut by_section: BTreeMap<(i32, i32, i32), Vec<BlockDelta>> = BTreeMap::new();
+    for &delta in deltas {
+        by_section
+            .entry((
+                delta.x.div_euclid(16),
+                delta.y.div_euclid(16),
+                delta.z.div_euclid(16),
+            ))
+            .or_default()
+            .push(delta);
+    }
+
+    let mut packets = Vec::new();
+    for ((section_x, section_y, section_z), changes) in by_section {
+        if changes.len() == 1 {
+            packets.push(BlockDeltaPacket::Single(changes[0]));
+        } else {
+            packets.push(BlockDeltaPacket::Section {
+                section_x,
+                section_y,
+                section_z,
+                changes,
+            });
+        }
+    }
+    packets
+}
+
 /// Shared back-half of the break / place flows: mutates the world
-/// at `(x, y, z)` to `new_state`, broadcasts `BlockUpdate` +
+/// at `(x, y, z)` to `new_state`, broadcasts the block delta +
 /// recomputed `LightUpdate`s + `BlockChangedAck` to the connected
 /// client. The actual edit is applied via
 /// `WorldStorage::set_block_at` so heightmap recompute lands in
@@ -743,14 +849,18 @@ where
         return Ok(());
     }
 
-    // 2. Tell the client about the new block.
-    write_packet(
+    // 2. Tell the client about the new block. Single edits stay on the
+    //    historical BlockUpdate wire shape; only true batches use the
+    //    section packet helper.
+    send_block_deltas(
         writer,
-        &BlockUpdate {
-            position: mc_protocol::packets::play::pack_block_pos(x, y, z),
-            state_id: new_state.0 as i32,
-        },
         state.compression,
+        &[BlockDelta {
+            x,
+            y,
+            z,
+            state_id: new_state,
+        }],
     )
     .await?;
 
@@ -1186,5 +1296,70 @@ mod tests {
         assert_eq!(id, 0);
         assert_eq!(name.as_str(), "minecraft:alpha");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn block_delta_plan_keeps_single_edit_as_block_update() {
+        let delta = BlockDelta {
+            x: 1,
+            y: -60,
+            z: 2,
+            state_id: mc_world::BlockStateId(1),
+        };
+
+        assert_eq!(
+            plan_block_delta_packets(&[delta]),
+            vec![BlockDeltaPacket::Single(delta)]
+        );
+    }
+
+    #[test]
+    fn block_delta_plan_groups_multiple_changes_in_same_section() {
+        let first = BlockDelta {
+            x: -1,
+            y: -60,
+            z: 2,
+            state_id: mc_world::BlockStateId(1),
+        };
+        let second = BlockDelta {
+            x: -2,
+            y: -61,
+            z: 3,
+            state_id: mc_world::BlockStateId(2),
+        };
+
+        assert_eq!(
+            plan_block_delta_packets(&[first, second]),
+            vec![BlockDeltaPacket::Section {
+                section_x: -1,
+                section_y: -4,
+                section_z: 0,
+                changes: vec![first, second],
+            }]
+        );
+    }
+
+    #[test]
+    fn block_delta_plan_does_not_section_pack_singletons() {
+        let first = BlockDelta {
+            x: 0,
+            y: 0,
+            z: 0,
+            state_id: mc_world::BlockStateId(1),
+        };
+        let second = BlockDelta {
+            x: 16,
+            y: 0,
+            z: 0,
+            state_id: mc_world::BlockStateId(2),
+        };
+
+        assert_eq!(
+            plan_block_delta_packets(&[first, second]),
+            vec![
+                BlockDeltaPacket::Single(first),
+                BlockDeltaPacket::Single(second)
+            ]
+        );
     }
 }
