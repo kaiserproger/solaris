@@ -18,9 +18,13 @@ Edits now also drive an **incremental relight** (M9): a single
 break/place runs a bounded BFS over a 3×3-chunk window instead
 of recomputing the full 5-chunk neighbourhood, and emits only
 the `LightUpdate` packets for chunks whose arrays actually
-changed — wire-byte-identical to a fresh full recompute. Single
-plains biome, no caves / ores / structures; Set Compression and
-LZ4 chunk read remain M10+ polish items.
+changed — wire-byte-identical to a fresh full recompute. The
+BFS uses Starlight's early-skip shortcut (skip the opacity
+lookup when the neighbour is already at the best propagatable
+level), cutting block-state reads roughly 5–6× in dense
+regions. Single plains biome, no caves / ores / structures;
+per-section nibble storage, heightmap-driven sky reseed, Set
+Compression and LZ4 chunk read remain M10+ polish items.
 
 ## Build
 
