@@ -49,7 +49,9 @@ use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
 use crate::server::{ServerConfig, WorldHandle};
-use crate::{ChunkPipelinePolicy, ChunkPriority, ChunkRequest, ChunkScheduler};
+use crate::{
+    ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
+};
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
@@ -121,6 +123,7 @@ struct ChunkStreamState {
     result_tx: mpsc::Sender<ChunkPrepareResult>,
     result_rx: mpsc::Receiver<ChunkPrepareResult>,
     ready: BTreeMap<u32, ChunkPrepareResult>,
+    policy: ChunkPipelinePolicy,
     result_queue_size: usize,
     next_emit_sequence: u32,
     center_cx: i32,
@@ -142,6 +145,12 @@ struct ChunkStreamState {
     emitted: usize,
     absent: usize,
     bytes: usize,
+    dispatch_turns: usize,
+    yielded_turns: usize,
+    dispatched: usize,
+    max_in_flight: usize,
+    max_ready: usize,
+    last_stop_reason: ChunkPipelineStopReason,
 }
 
 struct PreparedChunkFrame {
@@ -570,6 +579,7 @@ impl ChunkStreamState {
             result_tx,
             result_rx,
             ready: BTreeMap::new(),
+            policy,
             result_queue_size: policy.chunk_result_queue_size,
             next_emit_sequence: 0,
             center_cx,
@@ -604,6 +614,12 @@ impl ChunkStreamState {
             emitted: 0,
             absent: 0,
             bytes: 0,
+            dispatch_turns: 0,
+            yielded_turns: 0,
+            dispatched: 0,
+            max_in_flight: 0,
+            max_ready: 0,
+            last_stop_reason: ChunkPipelineStopReason::QueueEmpty,
         }
     }
 
@@ -623,7 +639,8 @@ impl ChunkStreamState {
         self.dispatch_available();
         self.drain_ready();
 
-        if !self.emit_next_ready(writer, light_cache).await? && wait_for_first_chunk {
+        let mut made_send_progress = self.emit_next_ready(writer, light_cache).await?;
+        if !made_send_progress && wait_for_first_chunk {
             while !self.scheduler.is_complete() {
                 let Some(result) = self.result_rx.recv().await else {
                     break;
@@ -631,21 +648,48 @@ impl ChunkStreamState {
                 self.accept_result(result);
                 self.drain_ready();
                 if self.emit_next_ready(writer, light_cache).await? {
+                    made_send_progress = true;
                     break;
                 }
             }
         }
 
         if self.scheduler.is_complete() {
+            self.last_stop_reason = ChunkPipelineStopReason::Complete;
             return Ok(ChunkStreamStep::Complete);
+        }
+        if !made_send_progress {
+            self.yielded_turns += 1;
         }
 
         Ok(ChunkStreamStep::Progress)
     }
 
     fn dispatch_available(&mut self) {
-        while self.scheduler.in_flight_len() < self.result_queue_size {
+        self.dispatch_turns += 1;
+        let started = Instant::now();
+        let mut dispatched_this_turn = 0usize;
+        loop {
+            if self.scheduler.in_flight_len() >= self.result_queue_size {
+                self.last_stop_reason = ChunkPipelineStopReason::QueueFull;
+                break;
+            }
+            if dispatched_this_turn >= self.policy.chunk_prepare_batch_size {
+                self.last_stop_reason = ChunkPipelineStopReason::BatchLimit;
+                break;
+            }
+            if self.policy.chunk_prepare_budget_ms > 0
+                && started.elapsed().as_millis() as u64 >= self.policy.chunk_prepare_budget_ms
+            {
+                self.last_stop_reason = ChunkPipelineStopReason::TimeBudget;
+                break;
+            }
             let Some(request) = self.scheduler.poll_next() else {
+                self.last_stop_reason = if self.scheduler.in_flight_len() == 0 {
+                    ChunkPipelineStopReason::Complete
+                } else {
+                    ChunkPipelineStopReason::QueueEmpty
+                };
                 break;
             };
             let world = Arc::clone(&self.world);
@@ -668,7 +712,10 @@ impl ChunkStreamState {
                 .await;
                 let _ = tx.send(result).await;
             });
+            dispatched_this_turn += 1;
+            self.dispatched += 1;
         }
+        self.max_in_flight = self.max_in_flight.max(self.scheduler.in_flight_len());
     }
 
     fn drain_ready(&mut self) {
@@ -684,6 +731,7 @@ impl ChunkStreamState {
         self.ready
             .entry(result.request.priority.sequence)
             .or_insert(result);
+        self.max_ready = self.max_ready.max(self.ready.len());
     }
 
     async fn emit_next_ready<W>(
@@ -779,6 +827,22 @@ impl ChunkStreamState {
             packet_encode_ms = self.packet_encode_ms,
             frame_ms = self.frame_ms,
             socket_write_ms = self.socket_write_ms,
+            chunk_send_rate = self.policy.chunk_send_rate,
+            chunk_load_rate = self.policy.chunk_load_rate,
+            chunk_generate_rate = self.policy.chunk_generate_rate,
+            chunk_prepare_budget_ms = self.policy.chunk_prepare_budget_ms,
+            chunk_prepare_batch_size = self.policy.chunk_prepare_batch_size,
+            chunk_io_threads = self.policy.chunk_io_threads,
+            chunk_worker_threads = self.policy.chunk_worker_threads,
+            chunk_result_queue_size = self.policy.chunk_result_queue_size,
+            dispatch_turns = self.dispatch_turns,
+            yielded_turns = self.yielded_turns,
+            dispatched = self.dispatched,
+            in_flight = self.scheduler.in_flight_len(),
+            max_in_flight = self.max_in_flight,
+            ready = self.ready.len(),
+            max_ready = self.max_ready,
+            stop_reason = ?self.last_stop_reason,
             first_chunk_ms = self.first_chunk_ms,
             ring1_complete_ms = self.ring1_complete_ms,
             ring2_complete_ms = self.ring2_complete_ms,

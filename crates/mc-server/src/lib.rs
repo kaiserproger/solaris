@@ -229,7 +229,7 @@ mod tests {
         assert_eq!(cfg.server.max_players, 20);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
-        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 1);
+        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 64);
         assert!(cfg.chunk_pipeline.chunk_worker_threads >= 1);
     }
 

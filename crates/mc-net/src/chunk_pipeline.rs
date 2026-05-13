@@ -27,7 +27,7 @@ impl Default for ChunkPipelinePolicy {
             chunk_load_rate: 64,
             chunk_generate_rate: 32,
             chunk_prepare_budget_ms: 0,
-            chunk_prepare_batch_size: 1,
+            chunk_prepare_batch_size: 64,
             chunk_io_threads: 2,
             chunk_worker_threads: default_worker_threads(),
             chunk_result_queue_size: 64,
