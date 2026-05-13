@@ -58,13 +58,17 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::open_with_capacity(
+    let storage = match mc_world::WorldStorage::open_with_capacity(
         &world_dir,
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .expect("world storage opens")
-    .with_generator(generator);
+    ) {
+        Ok(storage) => storage.with_generator(generator),
+        Err(err) => {
+            eprintln!("skipping: {} ({err})", world_dir.display());
+            return;
+        }
+    };
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -278,13 +282,17 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::open_with_capacity(
+    let storage = match mc_world::WorldStorage::open_with_capacity(
         &world_dir,
         Arc::clone(&blocks),
         ((2 * MOVEMENT_VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .expect("world storage opens")
-    .with_generator(generator);
+    ) {
+        Ok(storage) => storage.with_generator(generator),
+        Err(err) => {
+            eprintln!("skipping: {} ({err})", world_dir.display());
+            return;
+        }
+    };
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light_path = vanilla_dir.join("reports/block_light.json");

@@ -12,6 +12,7 @@
 
 use bytes::{Buf, BufMut};
 use mc_nbt::Tag;
+use uuid::Uuid;
 
 use super::Packet;
 use crate::codec::{Identifier, ReadMc, WriteMc};
@@ -30,6 +31,8 @@ const MAX_LONG_ARRAY_LEN: usize = 4096;
 
 /// A section contains at most 16^3 block changes.
 const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
+const MAX_PLAYER_INFO_ENTRIES: usize = 1024;
+const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
@@ -60,6 +63,114 @@ fn read_long_array<B: Buf>(buf: &mut B) -> Result<Vec<i64>, CodecError> {
         out.push(buf.read_i64()?);
     }
     Ok(out)
+}
+
+fn read_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, CodecError> {
+    let count = buf.read_varint()?;
+    if count < 0 {
+        return Err(CodecError::NegativeLength(count));
+    }
+    let count = count as usize;
+    if count > max {
+        return Err(CodecError::StringTooLong { len: count, max });
+    }
+    Ok(count)
+}
+
+fn write_count<B: BufMut>(buf: &mut B, len: usize) -> Result<(), CodecError> {
+    let len = i32::try_from(len).map_err(|_| CodecError::StringTooLong {
+        len,
+        max: i32::MAX as usize,
+    })?;
+    buf.write_varint(len);
+    Ok(())
+}
+
+fn pack_degrees(degrees: f32) -> u8 {
+    (degrees.mul_add(256.0, 0.0) / 360.0).floor() as i32 as u8
+}
+
+fn unpack_degrees(packed: u8) -> f32 {
+    (packed as i8 as i32 * 360) as f32 / 256.0
+}
+
+fn write_vec3<B: BufMut>(buf: &mut B, v: EntityVec3) {
+    buf.write_f64(v.x);
+    buf.write_f64(v.y);
+    buf.write_f64(v.z);
+}
+
+fn read_vec3<B: Buf>(buf: &mut B) -> Result<EntityVec3, CodecError> {
+    Ok(EntityVec3 {
+        x: buf.read_f64()?,
+        y: buf.read_f64()?,
+        z: buf.read_f64()?,
+    })
+}
+
+fn write_lp_vec3<B: BufMut>(buf: &mut B, v: EntityVec3) {
+    let x = sanitize_lp_vec(v.x);
+    let y = sanitize_lp_vec(v.y);
+    let z = sanitize_lp_vec(v.z);
+    let abs_max = x.abs().max(y.abs()).max(z.abs());
+    if abs_max < 3.051944088384301E-5 {
+        buf.write_u8(0);
+        return;
+    }
+
+    let scale = abs_max.ceil() as u64;
+    let has_continuation = (scale & 3) != scale;
+    let scale_bits = if has_continuation {
+        (scale & 3) | 4
+    } else {
+        scale
+    };
+    let packed = scale_bits
+        | (pack_lp_component(x / scale as f64) << 3)
+        | (pack_lp_component(y / scale as f64) << 18)
+        | (pack_lp_component(z / scale as f64) << 33);
+    buf.write_u8(packed as u8);
+    buf.write_u8((packed >> 8) as u8);
+    buf.write_u32((packed >> 16) as u32);
+    if has_continuation {
+        buf.write_varint((scale >> 2) as i32);
+    }
+}
+
+fn read_lp_vec3<B: Buf>(buf: &mut B) -> Result<EntityVec3, CodecError> {
+    let first = buf.read_u8()?;
+    if first == 0 {
+        return Ok(EntityVec3::ZERO);
+    }
+    let second = buf.read_u8()?;
+    let rest = buf.read_u32()?;
+    let packed = ((rest as u64) << 16) | ((second as u64) << 8) | first as u64;
+    let mut scale = (first & 3) as u64;
+    if first & 4 == 4 {
+        scale |= ((buf.read_varint()? as u32 as u64) & 0xffff_ffff) << 2;
+    }
+    let scale = scale as f64;
+    Ok(EntityVec3 {
+        x: unpack_lp_component(packed >> 3) * scale,
+        y: unpack_lp_component(packed >> 18) * scale,
+        z: unpack_lp_component(packed >> 33) * scale,
+    })
+}
+
+fn sanitize_lp_vec(v: f64) -> f64 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(-1.7179869183E10, 1.7179869183E10)
+    }
+}
+
+fn pack_lp_component(v: f64) -> u64 {
+    ((v * 0.5 + 0.5) * 32766.0).round() as u64
+}
+
+fn unpack_lp_component(v: u64) -> f64 {
+    (((v & 32767) as f64).min(32766.0) * 2.0 / 32766.0) - 1.0
 }
 
 // -----------------------------------------------------------------------
@@ -429,6 +540,358 @@ impl Packet for GameEvent {
         Ok(Self {
             event: buf.read_u8()?,
             value: buf.read_f32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityVec3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl EntityVec3 {
+    pub const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionMoveRotation {
+    pub position: EntityVec3,
+    pub delta_movement: EntityVec3,
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
+impl PositionMoveRotation {
+    fn encode<B: BufMut>(&self, buf: &mut B) {
+        write_vec3(buf, self.position);
+        write_vec3(buf, self.delta_movement);
+        buf.write_f32(self.yaw);
+        buf.write_f32(self.pitch);
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: read_vec3(buf)?,
+            delta_movement: read_vec3(buf)?,
+            yaw: buf.read_f32()?,
+            pitch: buf.read_f32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerInfoActions(u8);
+
+impl PlayerInfoActions {
+    pub const ADD_PLAYER: Self = Self(1 << 0);
+    pub const INITIALIZE_CHAT: Self = Self(1 << 1);
+    pub const UPDATE_GAME_MODE: Self = Self(1 << 2);
+    pub const UPDATE_LISTED: Self = Self(1 << 3);
+    pub const UPDATE_LATENCY: Self = Self(1 << 4);
+    pub const UPDATE_DISPLAY_NAME: Self = Self(1 << 5);
+    pub const UPDATE_LIST_ORDER: Self = Self(1 << 6);
+    pub const UPDATE_HAT: Self = Self(1 << 7);
+
+    pub const fn minimal_add_player() -> Self {
+        Self(
+            Self::ADD_PLAYER.0
+                | Self::UPDATE_GAME_MODE.0
+                | Self::UPDATE_LISTED.0
+                | Self::UPDATE_LATENCY.0
+                | Self::UPDATE_DISPLAY_NAME.0
+                | Self::UPDATE_LIST_ORDER.0
+                | Self::UPDATE_HAT.0,
+        )
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerInfoEntry {
+    pub profile_id: Uuid,
+    pub name: String,
+    pub listed: bool,
+    pub latency: i32,
+    pub game_mode: i32,
+    pub list_order: i32,
+    pub show_hat: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerInfoUpdate {
+    pub actions: PlayerInfoActions,
+    pub entries: Vec<PlayerInfoEntry>,
+}
+
+impl Packet for PlayerInfoUpdate {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_PLAYER_INFO_UPDATE
+    // sits at game-CB index 70 = wire id 0x46. `javap` shows an 8-bit fixed
+    // EnumSet, then a VarInt-counted entry list keyed by profile UUID.
+    const ID: i32 = 0x46;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_u8(self.actions.0);
+        write_count(buf, self.entries.len())?;
+        for entry in &self.entries {
+            buf.write_uuid(entry.profile_id);
+            if self.actions.contains(PlayerInfoActions::ADD_PLAYER) {
+                buf.write_string(&entry.name, 16)?;
+                buf.write_varint(0);
+            }
+            if self.actions.contains(PlayerInfoActions::INITIALIZE_CHAT) {
+                return Err(CodecError::NotSupported("player chat session data"));
+            }
+            if self.actions.contains(PlayerInfoActions::UPDATE_GAME_MODE) {
+                buf.write_varint(entry.game_mode);
+            }
+            if self.actions.contains(PlayerInfoActions::UPDATE_LISTED) {
+                buf.write_bool(entry.listed);
+            }
+            if self.actions.contains(PlayerInfoActions::UPDATE_LATENCY) {
+                buf.write_varint(entry.latency);
+            }
+            if self
+                .actions
+                .contains(PlayerInfoActions::UPDATE_DISPLAY_NAME)
+            {
+                buf.write_bool(false);
+            }
+            if self.actions.contains(PlayerInfoActions::UPDATE_LIST_ORDER) {
+                buf.write_varint(entry.list_order);
+            }
+            if self.actions.contains(PlayerInfoActions::UPDATE_HAT) {
+                buf.write_bool(entry.show_hat);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let actions = PlayerInfoActions(buf.read_u8()?);
+        let count = read_count(buf, MAX_PLAYER_INFO_ENTRIES)?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            let profile_id = buf.read_uuid()?;
+            let mut name = String::new();
+            let mut listed = false;
+            let mut latency = 0;
+            let mut game_mode = 0;
+            let mut list_order = 0;
+            let mut show_hat = false;
+            if actions.contains(PlayerInfoActions::ADD_PLAYER) {
+                name = buf.read_string(16)?;
+                let property_count = read_count(buf, 16)?;
+                if property_count != 0 {
+                    return Err(CodecError::NotSupported("game profile properties"));
+                }
+            }
+            if actions.contains(PlayerInfoActions::INITIALIZE_CHAT) {
+                return Err(CodecError::NotSupported("player chat session data"));
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_GAME_MODE) {
+                game_mode = buf.read_varint()?;
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_LISTED) {
+                listed = buf.read_bool()?;
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_LATENCY) {
+                latency = buf.read_varint()?;
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_DISPLAY_NAME) {
+                let has_display_name = buf.read_bool()?;
+                if has_display_name {
+                    return Err(CodecError::NotSupported("player display name component"));
+                }
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_LIST_ORDER) {
+                list_order = buf.read_varint()?;
+            }
+            if actions.contains(PlayerInfoActions::UPDATE_HAT) {
+                show_hat = buf.read_bool()?;
+            }
+            entries.push(PlayerInfoEntry {
+                profile_id,
+                name,
+                listed,
+                latency,
+                game_mode,
+                list_order,
+                show_hat,
+            });
+        }
+        Ok(Self { actions, entries })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerInfoRemove {
+    pub profile_ids: Vec<Uuid>,
+}
+
+impl Packet for PlayerInfoRemove {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_PLAYER_INFO_REMOVE
+    // sits at game-CB index 69 = wire id 0x45. Body is a VarInt-counted UUID list.
+    const ID: i32 = 0x45;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_count(buf, self.profile_ids.len())?;
+        for id in &self.profile_ids {
+            buf.write_uuid(*id);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = read_count(buf, MAX_PLAYER_INFO_ENTRIES)?;
+        let mut profile_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            profile_ids.push(buf.read_uuid()?);
+        }
+        Ok(Self { profile_ids })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AddEntity {
+    pub entity_id: i32,
+    pub uuid: Uuid,
+    pub entity_type_id: i32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub movement: EntityVec3,
+    pub pitch: f32,
+    pub yaw: f32,
+    pub head_yaw: f32,
+    pub data: i32,
+}
+
+impl Packet for AddEntity {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_ADD_ENTITY is
+    // game-CB index 1 = wire id 0x01. `javap` shows VarInt id, UUID,
+    // registry entity type id, xyz doubles, `Vec3.LP_STREAM_CODEC`, packed
+    // x/y/head rotations, then VarInt data.
+    const ID: i32 = 0x01;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_uuid(self.uuid);
+        buf.write_varint(self.entity_type_id);
+        buf.write_f64(self.x);
+        buf.write_f64(self.y);
+        buf.write_f64(self.z);
+        write_lp_vec3(buf, self.movement);
+        buf.write_u8(pack_degrees(self.pitch));
+        buf.write_u8(pack_degrees(self.yaw));
+        buf.write_u8(pack_degrees(self.head_yaw));
+        buf.write_varint(self.data);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            uuid: buf.read_uuid()?,
+            entity_type_id: buf.read_varint()?,
+            x: buf.read_f64()?,
+            y: buf.read_f64()?,
+            z: buf.read_f64()?,
+            movement: read_lp_vec3(buf)?,
+            pitch: unpack_degrees(buf.read_u8()?),
+            yaw: unpack_degrees(buf.read_u8()?),
+            head_yaw: unpack_degrees(buf.read_u8()?),
+            data: buf.read_varint()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityPositionSync {
+    pub entity_id: i32,
+    pub values: PositionMoveRotation,
+    pub on_ground: bool,
+}
+
+impl Packet for EntityPositionSync {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_ENTITY_POSITION_SYNC
+    // is game-CB index 35 = wire id 0x23. Body is VarInt id,
+    // `PositionMoveRotation.STREAM_CODEC`, then onGround bool.
+    const ID: i32 = 0x23;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        self.values.encode(buf);
+        buf.write_bool(self.on_ground);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            values: PositionMoveRotation::decode(buf)?,
+            on_ground: buf.read_bool()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoveEntities {
+    pub entity_ids: Vec<i32>,
+}
+
+impl Packet for RemoveEntities {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_REMOVE_ENTITIES
+    // is game-CB index 77 = wire id 0x4D. Body is FriendlyByteBuf.writeIntIdList.
+    const ID: i32 = 0x4D;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_count(buf, self.entity_ids.len())?;
+        for id in &self.entity_ids {
+            buf.write_varint(*id);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = read_count(buf, MAX_ENTITY_ID_LIST_LEN)?;
+        let mut entity_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            entity_ids.push(buf.read_varint()?);
+        }
+        Ok(Self { entity_ids })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RotateHead {
+    pub entity_id: i32,
+    pub head_yaw: f32,
+}
+
+impl Packet for RotateHead {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_ROTATE_HEAD is
+    // game-CB index 83 = wire id 0x53. Body is VarInt entity id and packed yaw.
+    const ID: i32 = 0x53;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_u8(pack_degrees(self.head_yaw));
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            head_yaw: unpack_degrees(buf.read_u8()?),
         })
     }
 }
@@ -1849,6 +2312,99 @@ mod tests {
             event: GameEvent::EVENT_START_WAITING_FOR_CHUNKS,
             value: 0.0,
         });
+    }
+
+    #[test]
+    fn player_visible_packet_ids_match_javap() {
+        assert_eq!(AddEntity::ID, 0x01);
+        assert_eq!(EntityPositionSync::ID, 0x23);
+        assert_eq!(PlayerInfoRemove::ID, 0x45);
+        assert_eq!(PlayerInfoUpdate::ID, 0x46);
+        assert_eq!(RemoveEntities::ID, 0x4D);
+        assert_eq!(RotateHead::ID, 0x53);
+    }
+
+    #[test]
+    fn player_info_update_minimal_add_player_wire_layout() {
+        let uuid = Uuid::from_u128(0x00112233445566778899aabbccddeeff);
+        let packet = PlayerInfoUpdate {
+            actions: PlayerInfoActions::minimal_add_player(),
+            entries: vec![PlayerInfoEntry {
+                profile_id: uuid,
+                name: "Steve".to_string(),
+                listed: true,
+                latency: 0,
+                game_mode: 0,
+                list_order: 0,
+                show_hat: true,
+            }],
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf[0], 0xFD);
+        assert_eq!(buf[1], 0x01);
+        assert_eq!(&buf[2..18], uuid.as_bytes());
+        assert_eq!(&buf[18..24], &[5, b'S', b't', b'e', b'v', b'e']);
+        assert_eq!(&buf[24..], &[0, 0, 1, 0, 0, 0, 1]);
+
+        let mut cursor: &[u8] = &buf;
+        let decoded = PlayerInfoUpdate::decode(&mut cursor).unwrap();
+        assert_eq!(decoded, packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn add_player_entity_zero_motion_round_trips() {
+        round_trip(AddEntity {
+            entity_id: 42,
+            uuid: Uuid::from_u128(0x00112233445566778899aabbccddeeff),
+            entity_type_id: 155,
+            x: 0.5,
+            y: -59.0,
+            z: 0.5,
+            movement: EntityVec3::ZERO,
+            pitch: 0.0,
+            yaw: 0.0,
+            head_yaw: 0.0,
+            data: 0,
+        });
+    }
+
+    #[test]
+    fn entity_position_sync_round_trips() {
+        round_trip(EntityPositionSync {
+            entity_id: 42,
+            values: PositionMoveRotation {
+                position: EntityVec3 {
+                    x: 1.0,
+                    y: 2.0,
+                    z: 3.0,
+                },
+                delta_movement: EntityVec3::ZERO,
+                yaw: 90.0,
+                pitch: -15.0,
+            },
+            on_ground: true,
+        });
+    }
+
+    #[test]
+    fn remove_player_packets_round_trip() {
+        let uuid = Uuid::from_u128(0x00112233445566778899aabbccddeeff);
+        round_trip(RemoveEntities {
+            entity_ids: vec![42, 43],
+        });
+        round_trip(PlayerInfoRemove {
+            profile_ids: vec![uuid],
+        });
+        let mut buf = Vec::new();
+        RotateHead {
+            entity_id: 42,
+            head_yaw: 90.0,
+        }
+        .encode(&mut buf)
+        .unwrap();
+        assert_eq!(buf, vec![42, 64]);
     }
 
     // ---- SetCenterChunk ----

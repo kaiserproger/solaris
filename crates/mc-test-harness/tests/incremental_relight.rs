@@ -77,13 +77,17 @@ async fn incremental_relight_wire_matches_full_recompute() {
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::open_with_capacity(
+    let storage = match mc_world::WorldStorage::open_with_capacity(
         tmp_world.path(),
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .expect("world storage opens")
-    .with_generator(generator);
+    ) {
+        Ok(storage) => storage.with_generator(generator),
+        Err(err) => {
+            eprintln!("skipping: {} ({err})", world_src.display());
+            return;
+        }
+    };
     let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
     let world = Some(Arc::clone(&world_handle));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));

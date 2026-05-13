@@ -29,14 +29,16 @@ use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
+    AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
-    ConfirmTeleportation, ForgetLevelChunk, GameEvent, ItemStack, LevelChunkWithLight, LightData,
-    LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind, SectionBlockChange,
-    SectionBlocksUpdate, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ConfirmTeleportation, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, ItemStack,
+    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind,
+    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation,
+    RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSetCarriedItem,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -74,6 +76,7 @@ const SPAWN_X: f64 = 0.5;
 // debug-mode burst exposed the latent bug.)
 const DEFAULT_SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
+const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -84,6 +87,9 @@ type SessionId = u64;
 enum OutboundCommand {
     BlockDeltas(Vec<BlockDelta>),
     LightUpdates(Vec<OutboundLightUpdate>),
+    SpawnPlayer(PlayerEntitySnapshot),
+    MovePlayer(PlayerEntitySnapshot),
+    DespawnPlayer(PlayerEntitySnapshot),
 }
 
 #[derive(Debug, Clone)]
@@ -99,13 +105,32 @@ struct SessionRecipient {
     tx: mpsc::Sender<OutboundCommand>,
 }
 
+#[derive(Debug, Clone)]
+struct VisibilityDispatch {
+    recipient: SessionRecipient,
+    command: OutboundCommand,
+}
+
+#[derive(Debug, Clone)]
+struct PlayerEntitySnapshot {
+    session_id: SessionId,
+    entity_id: i32,
+    uuid: uuid::Uuid,
+    name: String,
+    pose: PlayerPose,
+}
+
 #[derive(Debug)]
 struct PlaySession {
     name: String,
+    uuid: uuid::Uuid,
+    entity_id: i32,
+    pose: PlayerPose,
     center: (i32, i32),
     view_distance: i32,
     desired: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
+    visible_players: HashSet<SessionId>,
     tx: mpsc::Sender<OutboundCommand>,
 }
 
@@ -135,10 +160,12 @@ impl SessionRegistry {
         view_distance: i32,
         desired: HashSet<(i32, i32)>,
         tx: mpsc::Sender<OutboundCommand>,
-    ) -> SessionId {
+        pose: PlayerPose,
+    ) -> (SessionId, Vec<VisibilityDispatch>) {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
         let id = inner.next_id;
+        let entity_id = i32::try_from(id).unwrap_or(i32::MAX);
         for &chunk in &desired {
             inner.tickets.entry(chunk).or_default().insert(id);
         }
@@ -146,15 +173,21 @@ impl SessionRegistry {
             id,
             PlaySession {
                 name: profile.name.clone(),
+                uuid: profile.uuid,
+                entity_id,
+                pose,
                 center,
                 view_distance,
                 desired,
                 loaded: HashSet::new(),
+                visible_players: HashSet::new(),
                 tx,
             },
         );
+        let dispatches = refresh_visibility_locked(&mut inner);
         debug!(
             session_id = id,
+            entity_id,
             player = %profile.name,
             center_cx = center.0,
             center_cz = center.1,
@@ -163,14 +196,27 @@ impl SessionRegistry {
             tickets = inner.tickets.len(),
             "play session registered"
         );
-        id
+        (id, dispatches)
     }
 
-    fn unregister(&self, id: SessionId) {
+    fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         let Some(session) = inner.sessions.remove(&id) else {
-            return;
+            return Vec::new();
         };
+        let snapshot = session_snapshot(id, &session);
+        let mut dispatches = Vec::new();
+        for (&observer_id, observer) in &mut inner.sessions {
+            if observer.visible_players.remove(&id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::DespawnPlayer(snapshot.clone()),
+                });
+            }
+        }
         let desired_len = session.desired.len();
         let loaded_len = session.loaded.len();
         for chunk in session.desired {
@@ -187,13 +233,19 @@ impl SessionRegistry {
             tickets = inner.tickets.len(),
             "play session unregistered"
         );
+        dispatches
     }
 
-    fn replace_view(&self, id: SessionId, center: (i32, i32), desired: HashSet<(i32, i32)>) {
+    fn replace_view(
+        &self,
+        id: SessionId,
+        center: (i32, i32),
+        desired: HashSet<(i32, i32)>,
+    ) -> Vec<VisibilityDispatch> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         let (released, acquired, desired_len, view_distance) = {
             let Some(session) = inner.sessions.get_mut(&id) else {
-                return;
+                return Vec::new();
             };
             let old = std::mem::replace(&mut session.desired, desired);
             session.center = center;
@@ -219,6 +271,7 @@ impl SessionRegistry {
         for chunk in acquired {
             inner.tickets.entry(chunk).or_default().insert(id);
         }
+        let dispatches = refresh_visibility_locked(&mut inner);
         debug!(
             session_id = id,
             center_cx = center.0,
@@ -229,22 +282,59 @@ impl SessionRegistry {
             shared_tickets = inner.tickets.values().filter(|s| s.len() > 1).count(),
             "play session view tickets replaced"
         );
+        dispatches
     }
 
-    fn mark_loaded(&self, id: SessionId, chunk: (i32, i32)) {
+    fn mark_loaded(&self, id: SessionId, chunk: (i32, i32)) -> Vec<VisibilityDispatch> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         if let Some(session) = inner.sessions.get_mut(&id) {
             session.loaded.insert(chunk);
+            refresh_visibility_locked(&mut inner)
+        } else {
+            Vec::new()
         }
     }
 
-    fn mark_unloaded(&self, id: SessionId, chunks: &[(i32, i32)]) {
+    fn mark_unloaded(&self, id: SessionId, chunks: &[(i32, i32)]) -> Vec<VisibilityDispatch> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         if let Some(session) = inner.sessions.get_mut(&id) {
             for chunk in chunks {
                 session.loaded.remove(chunk);
             }
+            refresh_visibility_locked(&mut inner)
+        } else {
+            Vec::new()
         }
+    }
+
+    fn update_pose(&self, id: SessionId, pose: PlayerPose) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let old_observers = visible_observers_locked(&inner, id);
+        let Some(session) = inner.sessions.get_mut(&id) else {
+            return Vec::new();
+        };
+        session.pose = pose;
+        let mut dispatches = refresh_visibility_locked(&mut inner);
+        let new_observers = visible_observers_locked(&inner, id);
+        let Some(snapshot) = inner
+            .sessions
+            .get(&id)
+            .map(|session| session_snapshot(id, session))
+        else {
+            return dispatches;
+        };
+        for observer_id in old_observers.intersection(&new_observers) {
+            if let Some(observer) = inner.sessions.get(observer_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: *observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::MovePlayer(snapshot.clone()),
+                });
+            }
+        }
+        dispatches
     }
 
     fn loaded_recipients_for_chunks(
@@ -292,6 +382,102 @@ impl SessionRegistry {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         for chunk in chunks {
             inner.prepared.remove(chunk);
+        }
+    }
+}
+
+fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEntitySnapshot {
+    PlayerEntitySnapshot {
+        session_id: id,
+        entity_id: session.entity_id,
+        uuid: session.uuid,
+        name: session.name.clone(),
+        pose: session.pose,
+    }
+}
+
+fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {
+    inner
+        .sessions
+        .iter()
+        .filter_map(|(&observer_id, observer)| {
+            observer
+                .visible_players
+                .contains(&target)
+                .then_some(observer_id)
+        })
+        .collect()
+}
+
+fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
+    let ids: Vec<_> = inner.sessions.keys().copied().collect();
+    let snapshots: HashMap<_, _> = inner
+        .sessions
+        .iter()
+        .map(|(&id, session)| (id, session_snapshot(id, session)))
+        .collect();
+    let desired_by_observer: HashMap<_, HashSet<_>> = ids
+        .iter()
+        .filter_map(|observer_id| {
+            let observer = inner.sessions.get(observer_id)?;
+            let desired = ids
+                .iter()
+                .copied()
+                .filter(|target_id| {
+                    target_id != observer_id
+                        && snapshots.get(target_id).is_some_and(|target| {
+                            observer.loaded.contains(&target.pose.chunk_pos())
+                        })
+                })
+                .collect();
+            Some((*observer_id, desired))
+        })
+        .collect();
+
+    let mut dispatches = Vec::new();
+    for observer_id in ids {
+        let Some(observer) = inner.sessions.get_mut(&observer_id) else {
+            continue;
+        };
+        let desired = desired_by_observer
+            .get(&observer_id)
+            .cloned()
+            .unwrap_or_default();
+        for target_id in desired.difference(&observer.visible_players) {
+            if let Some(snapshot) = snapshots.get(target_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::SpawnPlayer(snapshot.clone()),
+                });
+            }
+        }
+        for target_id in observer.visible_players.difference(&desired) {
+            if let Some(snapshot) = snapshots.get(target_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::DespawnPlayer(snapshot.clone()),
+                });
+            }
+        }
+        observer.visible_players = desired;
+    }
+    dispatches
+}
+
+fn dispatch_visibility_commands(dispatches: Vec<VisibilityDispatch>) {
+    for dispatch in dispatches {
+        if let Err(err) = dispatch.recipient.tx.try_send(dispatch.command) {
+            debug!(
+                recipient = dispatch.recipient.id,
+                error = %err,
+                "dropping player visibility command"
+            );
         }
     }
 }
@@ -520,9 +706,27 @@ where
 
     let (spawn_x, spawn_y, spawn_z) = spawn_position(config).await;
 
+    let (spawn_cx, spawn_cz) = spawn_chunk_pos();
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel(config.chunk_pipeline.chunk_result_queue_size.max(16));
+    let initial_desired = if config.world.is_some() {
+        desired_chunk_set(spawn_cx, spawn_cz, config.view_distance)
+    } else {
+        HashSet::new()
+    };
+    let initial_pose = PlayerPose::new(spawn_x, spawn_y, spawn_z);
+    let (session_id, visibility) = sessions.register(
+        profile,
+        (spawn_cx, spawn_cz),
+        config.view_distance,
+        initial_desired,
+        outbound_tx,
+        initial_pose,
+    );
+
     // 1. Login (Play).
     let login = LoginPlay {
-        entity_id: 1,
+        entity_id: i32::try_from(session_id).unwrap_or(i32::MAX),
         is_hardcore: false,
         dimension_names: dim_names.to_vec(),
         max_players: 20,
@@ -544,6 +748,7 @@ where
         enforces_secure_chat: false,
     };
     write_packet(writer, &login, compression).await?;
+    dispatch_visibility_commands(visibility);
 
     // 2. Synchronize Player Position. teleport_id=1; we'll watch for
     //    `ConfirmTeleportation(1)` in the loop below but don't block
@@ -590,7 +795,6 @@ where
     // 5. Set Center Chunk + view-distance window. Spawn is at
     //    (SPAWN_X, SPAWN_Z); the chunk anchor is the chunk that
     //    contains it, and we stream ±view_distance around it.
-    let (spawn_cx, spawn_cz) = spawn_chunk_pos();
     write_packet(
         writer,
         &SetCenterChunk {
@@ -600,21 +804,6 @@ where
         compression,
     )
     .await?;
-
-    let (outbound_tx, outbound_rx) =
-        mpsc::channel(config.chunk_pipeline.chunk_result_queue_size.max(16));
-    let initial_desired = if config.world.is_some() {
-        desired_chunk_set(spawn_cx, spawn_cz, config.view_distance)
-    } else {
-        HashSet::new()
-    };
-    let session_id = sessions.register(
-        profile,
-        (spawn_cx, spawn_cz),
-        config.view_distance,
-        initial_desired,
-        outbound_tx,
-    );
 
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
@@ -690,14 +879,16 @@ where
             compression,
             interaction.as_mut(),
             chunk_stream,
-            PlayerPose::new(spawn_x, spawn_y, spawn_z),
+            Arc::clone(&sessions),
+            session_id,
+            initial_pose,
             outbound_rx,
         )
         .await
     }
     .await;
 
-    sessions.unregister(session_id);
+    dispatch_visibility_commands(sessions.unregister(session_id));
     result
 }
 
@@ -934,9 +1125,11 @@ impl ChunkStreamState {
         for chunk in &unloads {
             self.loaded.remove(chunk);
         }
-        self.sessions
-            .replace_view(self.session_id, (center_cx, center_cz), desired);
-        self.sessions.mark_unloaded(self.session_id, &unloads);
+        let mut visibility =
+            self.sessions
+                .replace_view(self.session_id, (center_cx, center_cz), desired);
+        visibility.extend(self.sessions.mark_unloaded(self.session_id, &unloads));
+        dispatch_visibility_commands(visibility);
         self.center_cx = center_cx;
         self.center_cz = center_cz;
         self.ready.clear();
@@ -1140,7 +1333,7 @@ impl ChunkStreamState {
                 let mut write_timing = prepared.write_timing;
                 write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
                 self.loaded.insert((cx, cz));
-                self.sessions.mark_loaded(self.session_id, (cx, cz));
+                dispatch_visibility_commands(self.sessions.mark_loaded(self.session_id, (cx, cz)));
                 self.sessions
                     .cache_prepared_chunk((cx, cz), Arc::new((*prepared).clone()));
                 self.build_timing.add(prepared.build_timing);
@@ -2144,6 +2337,138 @@ where
     Ok(())
 }
 
+fn player_info_entry(player: &PlayerEntitySnapshot) -> PlayerInfoEntry {
+    PlayerInfoEntry {
+        profile_id: player.uuid,
+        name: player.name.clone(),
+        listed: true,
+        latency: 0,
+        game_mode: 0,
+        list_order: player.entity_id,
+        show_hat: true,
+    }
+}
+
+fn player_position(player: &PlayerEntitySnapshot) -> PositionMoveRotation {
+    PositionMoveRotation {
+        position: EntityVec3 {
+            x: player.pose.x,
+            y: player.pose.y,
+            z: player.pose.z,
+        },
+        delta_movement: EntityVec3::ZERO,
+        yaw: player.pose.yaw,
+        pitch: player.pose.pitch,
+    }
+}
+
+async fn send_player_spawn<W>(
+    writer: &mut W,
+    compression: Compression,
+    player: &PlayerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(
+        target_session = player.session_id,
+        entity_id = player.entity_id,
+        player = %player.name,
+        "spawning visible player"
+    );
+    write_packet(
+        writer,
+        &PlayerInfoUpdate {
+            actions: PlayerInfoActions::minimal_add_player(),
+            entries: vec![player_info_entry(player)],
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &AddEntity {
+            entity_id: player.entity_id,
+            uuid: player.uuid,
+            entity_type_id: PLAYER_ENTITY_TYPE_ID,
+            x: player.pose.x,
+            y: player.pose.y,
+            z: player.pose.z,
+            movement: EntityVec3::ZERO,
+            pitch: player.pose.pitch,
+            yaw: player.pose.yaw,
+            head_yaw: player.pose.yaw,
+            data: 0,
+        },
+        compression,
+    )
+    .await?;
+    send_player_move(writer, compression, player).await
+}
+
+async fn send_player_move<W>(
+    writer: &mut W,
+    compression: Compression,
+    player: &PlayerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &EntityPositionSync {
+            entity_id: player.entity_id,
+            values: player_position(player),
+            on_ground: player.pose.flags.on_ground,
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &RotateHead {
+            entity_id: player.entity_id,
+            head_yaw: player.pose.yaw,
+        },
+        compression,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn send_player_despawn<W>(
+    writer: &mut W,
+    compression: Compression,
+    player: &PlayerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(
+        target_session = player.session_id,
+        entity_id = player.entity_id,
+        player = %player.name,
+        "despawning visible player"
+    );
+    write_packet(
+        writer,
+        &RemoveEntities {
+            entity_ids: vec![player.entity_id],
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &PlayerInfoRemove {
+            profile_ids: vec![player.uuid],
+        },
+        compression,
+    )
+    .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
@@ -2152,6 +2477,8 @@ async fn play_loop<R, W>(
     compression: Compression,
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
+    sessions: Arc<SessionRegistry>,
+    session_id: SessionId,
     mut player_pose: PlayerPose,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
 ) -> Result<(), ConnectionError>
@@ -2205,6 +2532,15 @@ where
                             send_light_updates(state, writer, &updates).await?;
                         }
                     }
+                    Some(OutboundCommand::SpawnPlayer(player)) => {
+                        send_player_spawn(writer, compression, &player).await?;
+                    }
+                    Some(OutboundCommand::MovePlayer(player)) => {
+                        send_player_move(writer, compression, &player).await?;
+                    }
+                    Some(OutboundCommand::DespawnPlayer(player)) => {
+                        send_player_despawn(writer, compression, &player).await?;
+                    }
                     None => {}
                 }
             }
@@ -2253,6 +2589,7 @@ where
                     player_pose.z = movement.z;
                     player_pose.flags = movement.flags;
                     let new_center = player_pose.chunk_pos();
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                     replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
                     let mut body = frame.body;
@@ -2265,6 +2602,7 @@ where
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
                     let new_center = player_pose.chunk_pos();
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                     replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
                     let mut body = frame.body;
@@ -2272,10 +2610,12 @@ where
                     player_pose.yaw = movement.yaw;
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundMovePlayerStatusOnly::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerStatusOnly::decode(&mut body)?;
                     player_pose.flags = movement.flags;
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundPlayerAction::ID {
                     let mut body = frame.body;
                     let action = ServerboundPlayerAction::decode(&mut body)?;
@@ -2357,7 +2697,14 @@ mod tests {
             uuid: uuid::Uuid::nil(),
             name: "tester".to_string(),
         };
-        let id = registry.register(&profile, (0, 0), 0, HashSet::from([(0, 0)]), tx);
+        let (id, _) = registry.register(
+            &profile,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
         registry.cache_prepared_chunk(
             (0, 0),
             Arc::new(PreparedChunkFrame {
@@ -2370,9 +2717,122 @@ mod tests {
         );
         assert!(registry.prepared_chunk((0, 0)).is_some());
 
-        registry.unregister(id);
+        let _ = registry.unregister(id);
 
         assert!(registry.prepared_chunk((0, 0)).is_none());
+    }
+
+    #[test]
+    fn session_registry_spawns_and_despawns_visible_players() {
+        let registry = SessionRegistry::new();
+        let (alice_tx, _alice_rx) = mpsc::channel(8);
+        let (bob_tx, _bob_rx) = mpsc::channel(8);
+        let alice = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "Alice".to_string(),
+        };
+        let bob = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(2),
+            name: "Bob".to_string(),
+        };
+
+        let (alice_id, _) = registry.register(
+            &alice,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            alice_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        assert!(registry.mark_loaded(alice_id, (0, 0)).is_empty());
+
+        let (bob_id, dispatches) = registry.register(
+            &bob,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            bob_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        assert!(dispatches.iter().any(|dispatch| {
+            dispatch.recipient.id == alice_id
+                && matches!(
+                    &dispatch.command,
+                    OutboundCommand::SpawnPlayer(player)
+                        if player.session_id == bob_id && player.name == "Bob"
+                )
+        }));
+
+        let dispatches = registry.mark_loaded(bob_id, (0, 0));
+        assert!(dispatches.iter().any(|dispatch| {
+            dispatch.recipient.id == bob_id
+                && matches!(
+                    &dispatch.command,
+                    OutboundCommand::SpawnPlayer(player)
+                        if player.session_id == alice_id && player.name == "Alice"
+                )
+        }));
+
+        let dispatches = registry.update_pose(
+            bob_id,
+            PlayerPose {
+                x: 48.5,
+                y: DEFAULT_SPAWN_Y,
+                z: 0.5,
+                yaw: 0.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+        );
+        assert!(dispatches.iter().any(|dispatch| {
+            dispatch.recipient.id == alice_id
+                && matches!(
+                    &dispatch.command,
+                    OutboundCommand::DespawnPlayer(player) if player.session_id == bob_id
+                )
+        }));
+    }
+
+    #[test]
+    fn session_registry_unregister_removes_visible_player() {
+        let registry = SessionRegistry::new();
+        let (alice_tx, _alice_rx) = mpsc::channel(8);
+        let (bob_tx, _bob_rx) = mpsc::channel(8);
+        let alice = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "Alice".to_string(),
+        };
+        let bob = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(2),
+            name: "Bob".to_string(),
+        };
+
+        let (alice_id, _) = registry.register(
+            &alice,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            alice_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let _ = registry.mark_loaded(alice_id, (0, 0));
+        let (bob_id, _) = registry.register(
+            &bob,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            bob_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+
+        let dispatches = registry.unregister(bob_id);
+        assert!(dispatches.iter().any(|dispatch| {
+            dispatch.recipient.id == alice_id
+                && matches!(
+                    &dispatch.command,
+                    OutboundCommand::DespawnPlayer(player) if player.session_id == bob_id
+                )
+        }));
     }
 
     #[test]
