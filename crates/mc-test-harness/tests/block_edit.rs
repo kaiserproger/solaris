@@ -111,18 +111,23 @@ async fn break_block_round_trips_update_ack_relight() {
         .await
         .expect("ack teleport");
 
-    // Drain the 441 chunk packets that follow. We don't validate
-    // them here — M4.f already does. We just need to consume them
-    // before the break flow's packets start arriving.
-    let expected_chunks = (2 * 10 + 1u32).pow(2) as usize;
+    // Wait only for the spawn chunk, then send the edit while the rest
+    // of the view-distance window is still streaming. This is the M12
+    // responsiveness gate: inbound edits must not sit behind all 441
+    // chunks.
     let mut chunks_seen: HashSet<(i32, i32)> = HashSet::new();
-    let burst_deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    while chunks_seen.len() < expected_chunks {
+    let burst_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !chunks_seen.contains(&(0, 0)) {
         let remaining = burst_deadline.saturating_duration_since(tokio::time::Instant::now());
         let frame = client
             .read_frame_with_timeout(remaining)
             .await
-            .unwrap_or_else(|e| panic!("burst stalled after {} chunks: {e}", chunks_seen.len()));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "spawn chunk stalled after {} chunks: {e}",
+                    chunks_seen.len()
+                )
+            });
         if frame.id == LevelChunkWithLight::ID {
             let mut body = frame.body;
             let pkt = LevelChunkWithLight::decode(&mut body).expect("decode");
