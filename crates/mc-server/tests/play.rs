@@ -29,7 +29,8 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
+    ClientboundContainerSetContent, ClientboundKeepAlive, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundKeepAlive,
     SetCenterChunk, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,8 +158,8 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayTester").await;
 
-    // The handler emits four packets back-to-back. Order matters: Login
-    // (Play) first because the client needs the world setup before it
+    // The handler emits the Play entry burst back-to-back. Order matters:
+    // Login (Play) first because the client needs the world setup before it
     // can interpret anything else.
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, LoginPlay::ID, "expected Login (Play) first");
@@ -202,6 +203,33 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     // With world = None in this test the chunk packet is intentionally
     // not emitted; M3.e's view-distance test exercises the chunk path.
 
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundSetHeldSlot::ID,
+        "expected Set Held Slot"
+    );
+    let held = ClientboundSetHeldSlot::decode(&mut frame.body).unwrap();
+    assert_eq!(held.slot, 0);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundContainerSetContent::ID,
+        "expected Container Set Content"
+    );
+    let inventory = ClientboundContainerSetContent::decode(&mut frame.body).unwrap();
+    assert_eq!(inventory.container_id, 0);
+    assert_eq!(inventory.state_id, 1);
+    assert_eq!(inventory.items.len(), 46);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
+    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
+    assert_eq!(health.health, 20.0);
+    assert_eq!(health.food, 20);
+    assert_eq!(health.saturation, 5.0);
+
     // Be polite: ack the teleport.
     write_frame(
         &mut stream,
@@ -242,12 +270,9 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
-    // Drain spawn burst.
-    // After M3.d the burst is 4 frames: LoginPlay,
-    // SynchronizePlayerPosition, GameEvent, SetCenterChunk. With
-    // world = None the chunk packet itself is intentionally not
-    // emitted.
-    for _ in 0..4 {
+    // Drain Play entry burst. With world = None the chunk packet itself
+    // is intentionally not emitted.
+    for _ in 0..7 {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 

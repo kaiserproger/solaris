@@ -161,13 +161,19 @@ struct SurvivalState {
     health: f32,
     food: i32,
     saturation: f32,
+    exhaustion: f32,
 }
 
 impl SurvivalState {
+    const MAX_HEALTH: f32 = 20.0;
+    const MAX_FOOD: i32 = 20;
+    const EXHAUSTION_STEP: f32 = 4.0;
+
     const FULL: Self = Self {
-        health: 20.0,
-        food: 20,
+        health: Self::MAX_HEALTH,
+        food: Self::MAX_FOOD,
         saturation: 5.0,
+        exhaustion: 0.0,
     };
 
     const fn as_packet(self) -> ClientboundSetHealth {
@@ -175,6 +181,35 @@ impl SurvivalState {
             health: self.health,
             food: self.food,
             saturation: self.saturation,
+        }
+    }
+
+    fn apply_damage(&mut self, amount: f32) {
+        self.health = (self.health - amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+    }
+
+    fn heal(&mut self, amount: f32) {
+        self.health = (self.health + amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+    }
+
+    fn is_dead(self) -> bool {
+        self.health <= 0.0
+    }
+
+    fn add_food(&mut self, food: i32, saturation: f32) {
+        self.food = (self.food + food).clamp(0, Self::MAX_FOOD);
+        self.saturation = (self.saturation + saturation.max(0.0)).clamp(0.0, self.food as f32);
+    }
+
+    fn add_exhaustion(&mut self, amount: f32) {
+        self.exhaustion = (self.exhaustion + amount.max(0.0)).max(0.0);
+        while self.exhaustion >= Self::EXHAUSTION_STEP {
+            self.exhaustion -= Self::EXHAUSTION_STEP;
+            if self.saturation > 0.0 {
+                self.saturation = (self.saturation - 1.0).max(0.0);
+            } else if self.food > 0 {
+                self.food -= 1;
+            }
         }
     }
 }
@@ -1165,7 +1200,6 @@ where
         //    anyway, just with `count == 0` slots.
         let starter = build_starter_inventory(&config.items);
         write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
-        write_packet(writer, &SurvivalState::FULL.as_packet(), compression).await?;
         write_packet(
             writer,
             &ClientboundContainerSetContent {
@@ -1208,6 +1242,7 @@ where
             session_id,
             initial_pose,
             CommandPermissions::for_local_dev_profile(profile),
+            SurvivalState::FULL,
             outbound_rx,
         )
         .await
@@ -2982,6 +3017,7 @@ async fn play_loop<R, W>(
     session_id: SessionId,
     mut player_pose: PlayerPose,
     permissions: CommandPermissions,
+    mut survival_state: SurvivalState,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
 ) -> Result<(), ConnectionError>
 where
@@ -2999,6 +3035,7 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut game_mode = GameMode::Survival;
+    write_packet(writer, &survival_state.as_packet(), compression).await?;
 
     loop {
         let mut stream_finished = false;
@@ -3167,6 +3204,8 @@ where
                     let command = ServerboundChatCommand::decode(&mut body)?;
                     if let Some(mode) = parse_gamemode_command(&command.command) {
                         apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
+                    } else if let Some(command) = parse_survival_command(&command.command) {
+                        apply_survival_command(writer, compression, &mut survival_state, command, permissions).await?;
                     } else {
                         debug!(command = %command.command, "unsupported command ignored");
                     }
@@ -3207,6 +3246,77 @@ fn parse_game_mode(mode: &str) -> Option<GameMode> {
         "3" | "spectator" | "sp" => Some(GameMode::Spectator),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SurvivalCommand {
+    Damage(f32),
+    Heal(f32),
+    Feed { food: i32, saturation: f32 },
+    Exhaust(f32),
+}
+
+fn parse_survival_command(command: &str) -> Option<SurvivalCommand> {
+    let mut parts = command.split_whitespace();
+    let name = parts.next()?;
+    match name {
+        "damage" => {
+            let amount = parts.next()?.parse().ok()?;
+            parts
+                .next()
+                .is_none()
+                .then_some(SurvivalCommand::Damage(amount))
+        }
+        "heal" => {
+            let amount = parts.next().unwrap_or("20").parse().ok()?;
+            parts
+                .next()
+                .is_none()
+                .then_some(SurvivalCommand::Heal(amount))
+        }
+        "feed" => {
+            let food = parts.next().unwrap_or("20").parse().ok()?;
+            let saturation = parts.next().unwrap_or("5").parse().ok()?;
+            parts
+                .next()
+                .is_none()
+                .then_some(SurvivalCommand::Feed { food, saturation })
+        }
+        "exhaust" => {
+            let amount = parts.next()?.parse().ok()?;
+            parts
+                .next()
+                .is_none()
+                .then_some(SurvivalCommand::Exhaust(amount))
+        }
+        _ => None,
+    }
+}
+
+async fn apply_survival_command<W>(
+    writer: &mut W,
+    compression: Compression,
+    state: &mut SurvivalState,
+    command: SurvivalCommand,
+    permissions: CommandPermissions,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if !permissions.op {
+        debug!(command = ?command, "survival command denied for non-op player");
+        return Ok(());
+    }
+    match command {
+        SurvivalCommand::Damage(amount) => state.apply_damage(amount),
+        SurvivalCommand::Heal(amount) => state.heal(amount),
+        SurvivalCommand::Feed { food, saturation } => state.add_food(food, saturation),
+        SurvivalCommand::Exhaust(amount) => state.add_exhaustion(amount),
+    }
+    if state.is_dead() {
+        debug!("player survival state reached death threshold");
+    }
+    write_packet(writer, &state.as_packet(), compression).await
 }
 
 async fn apply_game_mode<W>(
@@ -3311,6 +3421,30 @@ mod tests {
     }
 
     #[test]
+    fn survival_commands_parse_damage_heal_feed_and_exhaustion() {
+        assert_eq!(
+            parse_survival_command("damage 7.5"),
+            Some(SurvivalCommand::Damage(7.5))
+        );
+        assert_eq!(
+            parse_survival_command("heal"),
+            Some(SurvivalCommand::Heal(20.0))
+        );
+        assert_eq!(
+            parse_survival_command("feed 2 0.5"),
+            Some(SurvivalCommand::Feed {
+                food: 2,
+                saturation: 0.5
+            })
+        );
+        assert_eq!(
+            parse_survival_command("exhaust 4"),
+            Some(SurvivalCommand::Exhaust(4.0))
+        );
+        assert_eq!(parse_survival_command("damage bad"), None);
+    }
+
+    #[test]
     fn local_dev_profiles_are_op_capable_for_now() {
         let profile = LoggedInProfile {
             uuid: uuid::Uuid::nil(),
@@ -3359,6 +3493,56 @@ mod tests {
                 saturation: 5.0,
             }
         );
+    }
+
+    #[test]
+    fn survival_damage_heal_and_death_are_clamped() {
+        let mut state = SurvivalState::FULL;
+
+        state.apply_damage(7.5);
+        assert_eq!(state.health, 12.5);
+        assert!(!state.is_dead());
+
+        state.heal(100.0);
+        assert_eq!(state.health, SurvivalState::MAX_HEALTH);
+
+        state.apply_damage(100.0);
+        assert_eq!(state.health, 0.0);
+        assert!(state.is_dead());
+    }
+
+    #[test]
+    fn survival_exhaustion_drains_saturation_before_food() {
+        let mut state = SurvivalState {
+            health: 20.0,
+            food: 20,
+            saturation: 1.0,
+            exhaustion: 0.0,
+        };
+
+        state.add_exhaustion(4.0);
+        assert_eq!(state.saturation, 0.0);
+        assert_eq!(state.food, 20);
+        assert_eq!(state.exhaustion, 0.0);
+
+        state.add_exhaustion(8.0);
+        assert_eq!(state.food, 18);
+        assert_eq!(state.saturation, 0.0);
+    }
+
+    #[test]
+    fn survival_food_addition_clamps_to_food_level() {
+        let mut state = SurvivalState {
+            health: 20.0,
+            food: 18,
+            saturation: 1.0,
+            exhaustion: 0.0,
+        };
+
+        state.add_food(10, 30.0);
+
+        assert_eq!(state.food, 20);
+        assert_eq!(state.saturation, 20.0);
     }
 
     #[test]
