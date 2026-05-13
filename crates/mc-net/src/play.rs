@@ -16,11 +16,11 @@
 //! No chunk data is sent — the client renders a black world. That is the
 //! M1.g bar; chunk streaming is M2-M3 territory.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
@@ -36,11 +36,12 @@ use mc_protocol::packets::play::{
     SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
-    LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
+    ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
 };
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
@@ -48,7 +49,7 @@ use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
 use crate::server::{ServerConfig, WorldHandle};
-use crate::{ChunkPriority, ChunkScheduler};
+use crate::{ChunkPipelinePolicy, ChunkPriority, ChunkRequest, ChunkScheduler};
 
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
@@ -110,17 +111,23 @@ enum ChunkStreamStep {
     Complete,
 }
 
-struct ChunkStreamState<'a> {
-    world: &'a WorldHandle,
-    biomes: &'a Registry,
-    block_light: Option<&'a BlockLightTable>,
+struct ChunkStreamState {
+    world: WorldHandle,
+    biomes: Arc<Registry>,
+    block_light: Option<Arc<BlockLightTable>>,
     compression: Compression,
+    io_permits: Arc<Semaphore>,
+    cpu_permits: Arc<Semaphore>,
+    result_tx: mpsc::Sender<ChunkPrepareResult>,
+    result_rx: mpsc::Receiver<ChunkPrepareResult>,
+    ready: BTreeMap<u32, ChunkPrepareResult>,
+    result_queue_size: usize,
+    next_emit_sequence: u32,
     center_cx: i32,
     center_cz: i32,
     view_distance: i32,
     scheduler: ChunkScheduler,
-    staged: HashMap<(i32, i32), Arc<Chunk>>,
-    workspace: Option<LightWorkspace>,
+    staged: HashSet<(i32, i32)>,
     started: Instant,
     fetch_ms: u64,
     build_timing: ChunkBuildTiming,
@@ -135,6 +142,27 @@ struct ChunkStreamState<'a> {
     emitted: usize,
     absent: usize,
     bytes: usize,
+}
+
+struct PreparedChunkFrame {
+    frame: Bytes,
+    light: Option<ChunkLight>,
+    packet_data_len: usize,
+    build_timing: ChunkBuildTiming,
+    write_timing: ChunkWriteTiming,
+}
+
+enum ChunkPrepareOutcome {
+    Ready(Box<PreparedChunkFrame>),
+    Absent,
+    Failed(String),
+}
+
+struct ChunkPrepareResult {
+    request: crate::ChunkRequest,
+    fetch_ms: u64,
+    staged: Vec<(i32, i32)>,
+    outcome: ChunkPrepareOutcome,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,13 +327,14 @@ where
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
         Some(ChunkStreamState::new(
-            world,
-            biomes,
-            config.block_light.as_deref(),
+            Arc::clone(world),
+            Arc::new(biomes.clone()),
+            config.block_light.as_ref().map(Arc::clone),
             compression,
             spawn_cx,
             spawn_cz,
             SPAWN_VIEW_DISTANCE,
+            config.chunk_pipeline,
         ))
     });
     if config.world.is_some() && chunk_stream.is_none() {
@@ -517,23 +546,32 @@ fn spawn_chunk_pos() -> (i32, i32) {
     (cx, cz)
 }
 
-impl<'a> ChunkStreamState<'a> {
+impl ChunkStreamState {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        world: &'a WorldHandle,
-        biomes: &'a Registry,
-        block_light: Option<&'a BlockLightTable>,
+        world: WorldHandle,
+        biomes: Arc<Registry>,
+        block_light: Option<Arc<BlockLightTable>>,
         compression: Compression,
         center_cx: i32,
         center_cz: i32,
         view_distance: i32,
+        policy: ChunkPipelinePolicy,
     ) -> Self {
         let vd = view_distance.max(0);
+        let (result_tx, result_rx) = mpsc::channel(policy.chunk_result_queue_size);
         Self {
             world,
             biomes,
             block_light,
             compression,
+            io_permits: Arc::new(Semaphore::new(policy.chunk_io_threads)),
+            cpu_permits: Arc::new(Semaphore::new(policy.chunk_worker_threads)),
+            result_tx,
+            result_rx,
+            ready: BTreeMap::new(),
+            result_queue_size: policy.chunk_result_queue_size,
+            next_emit_sequence: 0,
             center_cx,
             center_cz,
             view_distance,
@@ -551,8 +589,7 @@ impl<'a> ChunkStreamState<'a> {
                         )
                     }),
             ),
-            staged: HashMap::new(),
-            workspace: block_light.is_some().then(LightWorkspace::new),
+            staged: HashSet::new(),
             started: Instant::now(),
             fetch_ms: 0,
             build_timing: ChunkBuildTiming::default(),
@@ -582,70 +619,112 @@ impl<'a> ChunkStreamState<'a> {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let Some(request) = self.scheduler.poll_next() else {
-            return Ok(ChunkStreamStep::Complete);
-        };
-        let cx = request.chunk_x;
-        let cz = request.chunk_z;
+        let wait_for_first_chunk = self.emitted == 0 && self.absent == 0;
+        self.dispatch_available();
+        self.drain_ready();
 
-        self.stage_neighbourhood(cx, cz).await;
-
-        let Some(centre) = self.staged.get(&(cx, cz)).cloned() else {
-            self.absent += 1;
-            debug!(cx, cz, "no chunk in storage");
-            self.scheduler.mark_finished(request);
-            return Ok(ChunkStreamStep::Progress);
-        };
-
-        let neighbours = build_neighbourhood(&self.staged, cx, cz);
-        let (packet, timing) = match build_chunk_packet(
-            centre.as_ref(),
-            &neighbours,
-            self.biomes,
-            self.block_light,
-            self.workspace.as_mut(),
-            Some(light_cache),
-            cx,
-            cz,
-        ) {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(cx, cz, error = %err, "chunk encode failed; skipping");
-                self.scheduler.mark_finished(request);
-                return Ok(ChunkStreamStep::Progress);
-            }
-        };
-
-        self.build_timing.add(timing);
-        let data_len = packet.data.len();
-        let write_timing = write_chunk_packet(writer, &packet, self.compression).await?;
-        self.record_emitted(cx, cz, data_len, write_timing);
-        self.scheduler.mark_finished(request);
-        Ok(ChunkStreamStep::Progress)
-    }
-
-    async fn stage_neighbourhood(&mut self, cx: i32, cz: i32) {
-        let fetch_started = Instant::now();
-        {
-            let mut storage = self.world.lock().await;
-            for ncz in (cz - 1)..=(cz + 1) {
-                for ncx in (cx - 1)..=(cx + 1) {
-                    if self.staged.contains_key(&(ncx, ncz)) {
-                        continue;
-                    }
-                    match storage.get_chunk(ChunkPos { x: ncx, z: ncz }) {
-                        Ok(Some(c)) => {
-                            self.staged.insert((ncx, ncz), Arc::new(c.clone()));
-                        }
-                        Ok(None) => {}
-                        Err(err) => {
-                            warn!(cx = ncx, cz = ncz, error = %err, "chunk read failed; skipping");
-                        }
-                    }
+        if !self.emit_next_ready(writer, light_cache).await? && wait_for_first_chunk {
+            while !self.scheduler.is_complete() {
+                let Some(result) = self.result_rx.recv().await else {
+                    break;
+                };
+                self.accept_result(result);
+                self.drain_ready();
+                if self.emit_next_ready(writer, light_cache).await? {
+                    break;
                 }
             }
         }
-        self.fetch_ms += fetch_started.elapsed().as_millis() as u64;
+
+        if self.scheduler.is_complete() {
+            return Ok(ChunkStreamStep::Complete);
+        }
+
+        Ok(ChunkStreamStep::Progress)
+    }
+
+    fn dispatch_available(&mut self) {
+        while self.scheduler.in_flight_len() < self.result_queue_size {
+            let Some(request) = self.scheduler.poll_next() else {
+                break;
+            };
+            let world = Arc::clone(&self.world);
+            let biomes = Arc::clone(&self.biomes);
+            let block_light = self.block_light.as_ref().map(Arc::clone);
+            let io_permits = Arc::clone(&self.io_permits);
+            let cpu_permits = Arc::clone(&self.cpu_permits);
+            let compression = self.compression;
+            let tx = self.result_tx.clone();
+            tokio::spawn(async move {
+                let result = prepare_chunk_request(
+                    request,
+                    world,
+                    biomes,
+                    block_light,
+                    compression,
+                    io_permits,
+                    cpu_permits,
+                )
+                .await;
+                let _ = tx.send(result).await;
+            });
+        }
+    }
+
+    fn drain_ready(&mut self) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.accept_result(result);
+        }
+    }
+
+    fn accept_result(&mut self, result: ChunkPrepareResult) {
+        if !self.scheduler.is_current(result.request) {
+            return;
+        }
+        self.ready
+            .entry(result.request.priority.sequence)
+            .or_insert(result);
+    }
+
+    async fn emit_next_ready<W>(
+        &mut self,
+        writer: &mut W,
+        light_cache: &mut LightCache,
+    ) -> Result<bool, ConnectionError>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        let Some(result) = self.ready.remove(&self.next_emit_sequence) else {
+            return Ok(false);
+        };
+        let request = result.request;
+        let cx = request.chunk_x;
+        let cz = request.chunk_z;
+        self.fetch_ms += result.fetch_ms;
+        self.staged.extend(result.staged);
+
+        match result.outcome {
+            ChunkPrepareOutcome::Ready(prepared) => {
+                if let Some(light) = prepared.light {
+                    light_cache.insert(ChunkPos { x: cx, z: cz }, light);
+                }
+                let mut write_timing = prepared.write_timing;
+                write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
+                self.build_timing.add(prepared.build_timing);
+                self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
+            }
+            ChunkPrepareOutcome::Absent => {
+                self.absent += 1;
+                debug!(cx, cz, "no chunk in storage");
+            }
+            ChunkPrepareOutcome::Failed(err) => {
+                warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+            }
+        }
+
+        self.scheduler.mark_finished(request);
+        self.next_emit_sequence = self.next_emit_sequence.wrapping_add(1);
+        Ok(true)
     }
 
     fn record_emitted(
@@ -737,21 +816,140 @@ fn spiral_chunks(
     out.into_iter()
 }
 
-/// Build the 3×3 neighbourhood centred on `(cx, cz)`. The centre is
-/// not populated here — the caller already has it as `centre_ref` and
-/// passes it through `build_chunk_packet` separately.
-fn build_neighbourhood(
-    staged: &HashMap<(i32, i32), Arc<Chunk>>,
+async fn prepare_chunk_request(
+    request: ChunkRequest,
+    world: WorldHandle,
+    biomes: Arc<Registry>,
+    block_light: Option<Arc<BlockLightTable>>,
+    compression: Compression,
+    io_permits: Arc<Semaphore>,
+    cpu_permits: Arc<Semaphore>,
+) -> ChunkPrepareResult {
+    let (centre, neighbourhood, staged, fetch_ms) = match load_chunk_neighbourhood(
+        Arc::clone(&world),
+        request.chunk_x,
+        request.chunk_z,
+        io_permits,
+    )
+    .await
+    {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            return ChunkPrepareResult {
+                request,
+                fetch_ms: 0,
+                staged: Vec::new(),
+                outcome: ChunkPrepareOutcome::Failed(err),
+            };
+        }
+    };
+
+    let Some(centre) = centre else {
+        return ChunkPrepareResult {
+            request,
+            fetch_ms,
+            staged,
+            outcome: ChunkPrepareOutcome::Absent,
+        };
+    };
+
+    let cpu_permit = match cpu_permits.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(_) => {
+            return ChunkPrepareResult {
+                request,
+                fetch_ms,
+                staged,
+                outcome: ChunkPrepareOutcome::Failed("CPU worker pool closed".into()),
+            };
+        }
+    };
+
+    let outcome = match tokio::task::spawn_blocking(move || {
+        let _permit = cpu_permit;
+        let mut workspace = block_light.is_some().then(LightWorkspace::new);
+        let built = build_chunk_packet(
+            centre.as_ref(),
+            &neighbourhood,
+            biomes.as_ref(),
+            block_light.as_deref(),
+            workspace.as_mut(),
+            request.chunk_x,
+            request.chunk_z,
+        )
+        .map_err(|err| err.to_string())?;
+        frame_chunk_packet(built, compression).map_err(|err| err.to_string())
+    })
+    .await
+    {
+        Ok(Ok(prepared)) => ChunkPrepareOutcome::Ready(Box::new(prepared)),
+        Ok(Err(err)) => ChunkPrepareOutcome::Failed(err),
+        Err(err) => ChunkPrepareOutcome::Failed(err.to_string()),
+    };
+
+    ChunkPrepareResult {
+        request,
+        fetch_ms,
+        staged,
+        outcome,
+    }
+}
+
+type LoadedNeighbourhood = (
+    Option<Arc<Chunk>>,
+    [[Option<Arc<Chunk>>; 3]; 3],
+    Vec<(i32, i32)>,
+    u64,
+);
+
+async fn load_chunk_neighbourhood(
+    world: WorldHandle,
     cx: i32,
     cz: i32,
-) -> [[Option<Arc<Chunk>>; 3]; 3] {
-    std::array::from_fn(|dz| {
-        std::array::from_fn(|dx| {
-            let nx = cx + (dx as i32 - 1);
-            let nz = cz + (dz as i32 - 1);
-            staged.get(&(nx, nz)).cloned()
-        })
-    })
+    io_permits: Arc<Semaphore>,
+) -> Result<LoadedNeighbourhood, String> {
+    let _permit = io_permits
+        .acquire_owned()
+        .await
+        .map_err(|_| "IO worker pool closed".to_string())?;
+    let fetch_started = Instant::now();
+    let mut neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
+        std::array::from_fn(|_| std::array::from_fn(|_| None));
+    let mut centre = None;
+    let mut staged = Vec::new();
+
+    let mut storage = world.lock().await;
+    for (dz, row) in neighbourhood.iter_mut().enumerate() {
+        for (dx, slot) in row.iter_mut().enumerate() {
+            let ncx = cx + (dx as i32 - 1);
+            let ncz = cz + (dz as i32 - 1);
+            match storage.get_chunk(ChunkPos { x: ncx, z: ncz }) {
+                Ok(Some(chunk)) => {
+                    let chunk = Arc::new(chunk.clone());
+                    if dx == 1 && dz == 1 {
+                        centre = Some(Arc::clone(&chunk));
+                    }
+                    *slot = Some(chunk);
+                    staged.push((ncx, ncz));
+                }
+                Ok(None) => {}
+                Err(err) => warn!(cx = ncx, cz = ncz, error = %err, "chunk read failed; skipping"),
+            }
+        }
+    }
+
+    Ok((
+        centre,
+        neighbourhood,
+        staged,
+        fetch_started.elapsed().as_millis() as u64,
+    ))
+}
+
+struct BuiltChunkPacket {
+    packet: LevelChunkWithLight,
+    light: Option<ChunkLight>,
+    timing: ChunkBuildTiming,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -761,10 +959,9 @@ fn build_chunk_packet(
     biomes: &Registry,
     block_light: Option<&BlockLightTable>,
     workspace: Option<&mut LightWorkspace>,
-    light_cache: Option<&mut LightCache>,
     cx: i32,
     cz: i32,
-) -> Result<(LevelChunkWithLight, ChunkBuildTiming), mc_world::wire::WireError> {
+) -> Result<BuiltChunkPacket, mc_world::wire::WireError> {
     let mut timing = ChunkBuildTiming::default();
 
     let chunk_data_started = Instant::now();
@@ -781,6 +978,7 @@ fn build_chunk_packet(
         .collect();
     timing.heightmap_ms = heightmap_started.elapsed().as_millis() as u64;
 
+    let mut computed_light = None;
     let light = match (block_light, workspace) {
         (Some(table), Some(ws)) => {
             // Centre slot is the chunk we already have a reference to;
@@ -800,11 +998,7 @@ fn build_chunk_packet(
             let light_encode_started = Instant::now();
             let wire = encode_chunk_light(&computed);
             timing.light_encode_ms = light_encode_started.elapsed().as_millis() as u64;
-            // M9.a: stash the computed light in the per-connection
-            // cache so subsequent edits hit the incremental path.
-            if let Some(cache) = light_cache {
-                cache.insert(ChunkPos { x: cx, z: cz }, computed);
-            }
+            computed_light = Some(computed);
             LightData {
                 sky_y_mask: wire.sky_y_mask,
                 block_y_mask: wire.block_y_mask,
@@ -816,8 +1010,8 @@ fn build_chunk_packet(
         }
         _ => LightData::empty(),
     };
-    Ok((
-        LevelChunkWithLight {
+    Ok(BuiltChunkPacket {
+        packet: LevelChunkWithLight {
             chunk_x: cx,
             chunk_z: cz,
             heightmaps,
@@ -825,35 +1019,44 @@ fn build_chunk_packet(
             block_entities: Vec::new(),
             light,
         },
+        light: computed_light,
         timing,
-    ))
+    })
 }
 
-async fn write_chunk_packet<W>(
-    writer: &mut W,
-    packet: &LevelChunkWithLight,
+fn frame_chunk_packet(
+    built: BuiltChunkPacket,
     compression: Compression,
-) -> Result<ChunkWriteTiming, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
+) -> Result<PreparedChunkFrame, ConnectionError> {
     let mut timing = ChunkWriteTiming::default();
 
     let packet_encode_started = Instant::now();
     let mut body = BytesMut::new();
-    packet.encode(&mut body)?;
+    built.packet.encode(&mut body)?;
     timing.packet_encode_ms = packet_encode_started.elapsed().as_millis() as u64;
+    let packet_data_len = built.packet.data.len();
 
     let frame_started = Instant::now();
     let framed = encode_frame(LevelChunkWithLight::ID, &body, compression)?;
     timing.frame_ms = frame_started.elapsed().as_millis() as u64;
     timing.framed_bytes = framed.len();
 
-    let socket_write_started = Instant::now();
-    writer.write_all(&framed).await?;
-    timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
+    Ok(PreparedChunkFrame {
+        frame: framed,
+        light: built.light,
+        packet_data_len,
+        build_timing: built.timing,
+        write_timing: timing,
+    })
+}
 
-    Ok(timing)
+async fn write_framed_chunk<W>(writer: &mut W, framed: &[u8]) -> Result<u64, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let socket_write_started = Instant::now();
+    writer.write_all(framed).await?;
+    Ok(socket_write_started.elapsed().as_millis() as u64)
 }
 
 /// M5.d: handle a serverbound `PlayerAction`. Acts on
@@ -1317,13 +1520,13 @@ where
     Ok(())
 }
 
-async fn play_loop<'a, R, W>(
+async fn play_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
     compression: Compression,
     mut interaction: Option<&mut InteractionState>,
-    mut chunk_stream: Option<ChunkStreamState<'a>>,
+    mut chunk_stream: Option<ChunkStreamState>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
