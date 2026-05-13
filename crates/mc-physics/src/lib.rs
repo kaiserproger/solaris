@@ -134,6 +134,87 @@ pub trait BlockSampler {
     fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GridPos {
+    pub x: i32,
+    pub y: i32,
+    pub z: i32,
+}
+
+impl GridPos {
+    #[must_use]
+    pub const fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+
+    #[must_use]
+    pub const fn below(self) -> Self {
+        Self::new(self.x, self.y - 1, self.z)
+    }
+
+    #[must_use]
+    pub const fn horizontal_neighbours(self) -> [Self; 4] {
+        [
+            Self::new(self.x + 1, self.y, self.z),
+            Self::new(self.x - 1, self.y, self.z),
+            Self::new(self.x, self.y, self.z + 1),
+            Self::new(self.x, self.y, self.z - 1),
+        ]
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockUpdateIntent {
+    Move { from: GridPos, to: GridPos },
+    SpreadFluid { from: GridPos, to: GridPos },
+}
+
+pub fn falling_block_intent<S: BlockSampler>(
+    pos: GridPos,
+    sampler: &mut S,
+) -> Option<BlockUpdateIntent> {
+    let below = pos.below();
+    matches!(
+        sampler.material_at(below.x, below.y, below.z),
+        BlockMaterial::Air | BlockMaterial::Water | BlockMaterial::Lava
+    )
+    .then_some(BlockUpdateIntent::Move {
+        from: pos,
+        to: below,
+    })
+}
+
+pub fn fluid_spread_intents<S: BlockSampler>(
+    pos: GridPos,
+    sampler: &mut S,
+    max_outputs: usize,
+) -> Vec<BlockUpdateIntent> {
+    if !sampler.material_at(pos.x, pos.y, pos.z).is_fluid() {
+        return Vec::new();
+    }
+    let mut intents = Vec::new();
+    let below = pos.below();
+    if sampler.material_at(below.x, below.y, below.z) == BlockMaterial::Air {
+        intents.push(BlockUpdateIntent::SpreadFluid {
+            from: pos,
+            to: below,
+        });
+        return intents;
+    }
+    for target in pos.horizontal_neighbours() {
+        if intents.len() >= max_outputs {
+            break;
+        }
+        if sampler.material_at(target.x, target.y, target.z) == BlockMaterial::Air {
+            intents.push(BlockUpdateIntent::SpreadFluid {
+                from: pos,
+                to: target,
+            });
+        }
+    }
+    intents
+}
+
 pub fn step_entity<S: BlockSampler>(
     mut body: EntityBody,
     sampler: &mut S,
@@ -293,5 +374,86 @@ mod tests {
         assert_eq!(ids.classify(5), BlockMaterial::Water);
         assert_eq!(ids.classify(6), BlockMaterial::Lava);
         assert_eq!(ids.classify(7), BlockMaterial::Solid);
+    }
+
+    #[derive(Debug)]
+    struct LocalBlocks {
+        solids: Vec<GridPos>,
+        fluids: Vec<GridPos>,
+    }
+
+    impl BlockSampler for LocalBlocks {
+        fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
+            let pos = GridPos::new(x, y, z);
+            if self.fluids.contains(&pos) {
+                BlockMaterial::Water
+            } else if self.solids.contains(&pos) {
+                BlockMaterial::Solid
+            } else {
+                BlockMaterial::Air
+            }
+        }
+    }
+
+    #[test]
+    fn falling_block_intent_moves_into_replaceable_cell() {
+        let mut world = LocalBlocks {
+            solids: vec![GridPos::new(0, 10, 0)],
+            fluids: Vec::new(),
+        };
+
+        let intent = falling_block_intent(GridPos::new(0, 10, 0), &mut world);
+
+        assert_eq!(
+            intent,
+            Some(BlockUpdateIntent::Move {
+                from: GridPos::new(0, 10, 0),
+                to: GridPos::new(0, 9, 0)
+            })
+        );
+    }
+
+    #[test]
+    fn fluid_prefers_downward_spread_before_horizontal() {
+        let mut world = LocalBlocks {
+            solids: Vec::new(),
+            fluids: vec![GridPos::new(0, 10, 0)],
+        };
+
+        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 4);
+
+        assert_eq!(
+            intents,
+            vec![BlockUpdateIntent::SpreadFluid {
+                from: GridPos::new(0, 10, 0),
+                to: GridPos::new(0, 9, 0)
+            }]
+        );
+    }
+
+    #[test]
+    fn fluid_horizontal_spread_is_bounded_and_deterministic() {
+        let mut world = LocalBlocks {
+            solids: vec![GridPos::new(0, 9, 0)],
+            fluids: vec![GridPos::new(0, 10, 0)],
+        };
+
+        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 2);
+
+        assert_eq!(intents.len(), 2);
+        assert_eq!(
+            intents[0],
+            BlockUpdateIntent::SpreadFluid {
+                from: GridPos::new(0, 10, 0),
+                to: GridPos::new(1, 10, 0)
+            }
+        );
+        assert_eq!(
+            intents[1],
+            BlockUpdateIntent::SpreadFluid {
+                from: GridPos::new(0, 10, 0),
+                to: GridPos::new(-1, 10, 0)
+            }
+        );
     }
 }
