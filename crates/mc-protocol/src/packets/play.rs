@@ -523,6 +523,7 @@ pub struct GameEvent {
 }
 
 impl GameEvent {
+    pub const EVENT_CHANGE_GAME_MODE: u8 = 3;
     pub const EVENT_START_WAITING_FOR_CHUNKS: u8 = 13;
 }
 

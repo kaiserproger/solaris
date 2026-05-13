@@ -33,10 +33,11 @@ use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
     ConfirmTeleportation, EntityAnimation, EntityAnimationAction, EntityPositionSync, EntityVec3,
-    ForgetLevelChunk, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
-    PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ForgetLevelChunk, GameEvent, GameMode, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
+    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
+    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
+    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundChangeGameMode,
+    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
     ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
     ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
     SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
@@ -2956,6 +2957,8 @@ where
     let mut next_id: i64 = 0;
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
+    let mut game_mode = GameMode::Survival;
+    let op_capable = true;
 
     loop {
         let mut stream_finished = false;
@@ -3119,6 +3122,18 @@ where
                         state.selected_hotbar_slot = slot;
                         debug!(slot, "hotbar selection updated");
                     }
+                } else if frame.id == ServerboundChatCommand::ID {
+                    let mut body = frame.body;
+                    let command = ServerboundChatCommand::decode(&mut body)?;
+                    if let Some(mode) = parse_gamemode_command(&command.command) {
+                        apply_game_mode(writer, compression, &mut game_mode, mode, op_capable).await?;
+                    } else {
+                        debug!(command = %command.command, "unsupported command ignored");
+                    }
+                } else if frame.id == ServerboundChangeGameMode::ID {
+                    let mut body = frame.body;
+                    let command = ServerboundChangeGameMode::decode(&mut body)?;
+                    apply_game_mode(writer, compression, &mut game_mode, command.mode, op_capable).await?;
                 } else {
                     debug!(
                         id = format!("{:#04x}", frame.id),
@@ -3131,6 +3146,58 @@ where
     }
 }
 
+fn parse_gamemode_command(command: &str) -> Option<GameMode> {
+    let mut parts = command.split_whitespace();
+    let name = parts.next()?;
+    if name != "gamemode" && name != "defaultgamemode" {
+        return None;
+    }
+    let mode = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    parse_game_mode(mode)
+}
+
+fn parse_game_mode(mode: &str) -> Option<GameMode> {
+    match mode {
+        "0" | "survival" | "s" => Some(GameMode::Survival),
+        "1" | "creative" | "c" => Some(GameMode::Creative),
+        "2" | "adventure" | "a" => Some(GameMode::Adventure),
+        "3" | "spectator" | "sp" => Some(GameMode::Spectator),
+        _ => None,
+    }
+}
+
+async fn apply_game_mode<W>(
+    writer: &mut W,
+    compression: Compression,
+    current: &mut GameMode,
+    requested: GameMode,
+    op_capable: bool,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if !op_capable {
+        debug!(mode = ?requested, "gamemode change denied for non-op player");
+        return Ok(());
+    }
+    if *current == requested {
+        return Ok(());
+    }
+    *current = requested;
+    write_packet(
+        writer,
+        &GameEvent {
+            event: GameEvent::EVENT_CHANGE_GAME_MODE,
+            value: requested.id() as f32,
+        },
+        compression,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3140,6 +3207,37 @@ mod tests {
         assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
         assert_eq!(mc_physics::TICK_SECONDS, 0.05);
         assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
+    }
+
+    #[test]
+    fn gamemode_command_parses_names_and_numeric_modes() {
+        assert_eq!(
+            parse_gamemode_command("gamemode survival"),
+            Some(GameMode::Survival)
+        );
+        assert_eq!(
+            parse_gamemode_command("gamemode creative"),
+            Some(GameMode::Creative)
+        );
+        assert_eq!(
+            parse_gamemode_command("gamemode adventure"),
+            Some(GameMode::Adventure)
+        );
+        assert_eq!(
+            parse_gamemode_command("gamemode spectator"),
+            Some(GameMode::Spectator)
+        );
+        assert_eq!(
+            parse_gamemode_command("gamemode 1"),
+            Some(GameMode::Creative)
+        );
+    }
+
+    #[test]
+    fn gamemode_command_rejects_unknown_or_extra_args() {
+        assert_eq!(parse_gamemode_command("time set day"), None);
+        assert_eq!(parse_gamemode_command("gamemode nope"), None);
+        assert_eq!(parse_gamemode_command("gamemode creative other"), None);
     }
 
     #[test]
