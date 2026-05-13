@@ -14,3 +14,17 @@ world_dir = ".analysis/test-world"
 # seed only matters for chunks the player walks into for the first
 # time. Defaults to 0.
 seed = 0
+
+[chunk_pipeline]
+# M13: chunk stream / worker policy. Defaults preserve the M12
+# single-player stream shape; later M13 slices move the heavy stages
+# onto the bounded IO and CPU workers described here.
+chunk_send_rate = 64
+chunk_load_rate = 64
+chunk_generate_rate = 32
+chunk_prepare_budget_ms = 0
+chunk_prepare_batch_size = 1
+chunk_io_threads = 2
+chunk_worker_threads = 4
+chunk_result_queue_size = 64
+region_cache_size = 4

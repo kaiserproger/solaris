@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub network: NetworkSection,
     #[serde(default)]
     pub data: DataSection,
+    #[serde(default)]
+    pub chunk_pipeline: ChunkPipelineSection,
 }
 
 /// Identity-level server settings.
@@ -68,6 +70,65 @@ pub struct DataSection {
     pub seed: i64,
 }
 
+/// Chunk preparation, worker, and cache policy. M13 moves chunk work out
+/// of the Play socket task in stages; these settings are the stable
+/// operator-facing surface for that pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkPipelineSection {
+    #[serde(default = "default_chunk_send_rate")]
+    pub chunk_send_rate: u32,
+    #[serde(default = "default_chunk_load_rate")]
+    pub chunk_load_rate: u32,
+    #[serde(default = "default_chunk_generate_rate")]
+    pub chunk_generate_rate: u32,
+    #[serde(default)]
+    pub chunk_prepare_budget_ms: u64,
+    #[serde(default = "default_chunk_prepare_batch_size")]
+    pub chunk_prepare_batch_size: usize,
+    #[serde(default = "default_chunk_io_threads")]
+    pub chunk_io_threads: usize,
+    #[serde(default = "default_chunk_worker_threads")]
+    pub chunk_worker_threads: usize,
+    #[serde(default = "default_chunk_result_queue_size")]
+    pub chunk_result_queue_size: usize,
+    #[serde(default = "default_region_cache_size")]
+    pub region_cache_size: usize,
+}
+
+impl Default for ChunkPipelineSection {
+    fn default() -> Self {
+        let policy = mc_net::ChunkPipelinePolicy::default();
+        Self {
+            chunk_send_rate: policy.chunk_send_rate,
+            chunk_load_rate: policy.chunk_load_rate,
+            chunk_generate_rate: policy.chunk_generate_rate,
+            chunk_prepare_budget_ms: policy.chunk_prepare_budget_ms,
+            chunk_prepare_batch_size: policy.chunk_prepare_batch_size,
+            chunk_io_threads: policy.chunk_io_threads,
+            chunk_worker_threads: policy.chunk_worker_threads,
+            chunk_result_queue_size: policy.chunk_result_queue_size,
+            region_cache_size: policy.region_cache_size,
+        }
+    }
+}
+
+impl ChunkPipelineSection {
+    #[must_use]
+    pub fn to_network(&self) -> mc_net::ChunkPipelinePolicy {
+        mc_net::ChunkPipelinePolicy {
+            chunk_send_rate: self.chunk_send_rate.max(1),
+            chunk_load_rate: self.chunk_load_rate.max(1),
+            chunk_generate_rate: self.chunk_generate_rate.max(1),
+            chunk_prepare_budget_ms: self.chunk_prepare_budget_ms,
+            chunk_prepare_batch_size: self.chunk_prepare_batch_size.max(1),
+            chunk_io_threads: self.chunk_io_threads.max(1),
+            chunk_worker_threads: self.chunk_worker_threads.max(1),
+            chunk_result_queue_size: self.chunk_result_queue_size.max(1),
+            region_cache_size: self.region_cache_size.max(1),
+        }
+    }
+}
+
 impl Default for DataSection {
     fn default() -> Self {
         Self {
@@ -84,6 +145,38 @@ fn default_max_players() -> u32 {
 
 fn default_vanilla_dir() -> PathBuf {
     PathBuf::from("data/vanilla")
+}
+
+fn default_chunk_send_rate() -> u32 {
+    mc_net::ChunkPipelinePolicy::default().chunk_send_rate
+}
+
+fn default_chunk_load_rate() -> u32 {
+    mc_net::ChunkPipelinePolicy::default().chunk_load_rate
+}
+
+fn default_chunk_generate_rate() -> u32 {
+    mc_net::ChunkPipelinePolicy::default().chunk_generate_rate
+}
+
+fn default_chunk_prepare_batch_size() -> usize {
+    mc_net::ChunkPipelinePolicy::default().chunk_prepare_batch_size
+}
+
+fn default_chunk_io_threads() -> usize {
+    mc_net::ChunkPipelinePolicy::default().chunk_io_threads
+}
+
+fn default_chunk_worker_threads() -> usize {
+    mc_net::ChunkPipelinePolicy::default().chunk_worker_threads
+}
+
+fn default_chunk_result_queue_size() -> usize {
+    mc_net::ChunkPipelinePolicy::default().chunk_result_queue_size
+}
+
+fn default_region_cache_size() -> usize {
+    mc_net::ChunkPipelinePolicy::default().region_cache_size
 }
 
 impl ServerConfig {
@@ -111,6 +204,7 @@ impl ServerConfig {
             tags,
             block_light,
             items,
+            chunk_pipeline: self.chunk_pipeline.to_network(),
         })
     }
 }
@@ -135,6 +229,66 @@ mod tests {
         assert_eq!(cfg.server.max_players, 20);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
+        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 1);
+        assert!(cfg.chunk_pipeline.chunk_worker_threads >= 1);
+    }
+
+    #[test]
+    fn parses_chunk_pipeline_overrides() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [chunk_pipeline]
+            chunk_send_rate = 12
+            chunk_load_rate = 8
+            chunk_generate_rate = 4
+            chunk_prepare_budget_ms = 3
+            chunk_prepare_batch_size = 2
+            chunk_io_threads = 1
+            chunk_worker_threads = 3
+            chunk_result_queue_size = 9
+            region_cache_size = 7
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 12);
+        assert_eq!(cfg.chunk_pipeline.chunk_load_rate, 8);
+        assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 4);
+        assert_eq!(cfg.chunk_pipeline.chunk_prepare_budget_ms, 3);
+        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 2);
+        assert_eq!(cfg.chunk_pipeline.chunk_io_threads, 1);
+        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads, 3);
+        assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
+        assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
+    }
+
+    #[test]
+    fn chunk_pipeline_normalizes_zero_values_for_runtime() {
+        let section = ChunkPipelineSection {
+            chunk_send_rate: 0,
+            chunk_load_rate: 0,
+            chunk_generate_rate: 0,
+            chunk_prepare_budget_ms: 0,
+            chunk_prepare_batch_size: 0,
+            chunk_io_threads: 0,
+            chunk_worker_threads: 0,
+            chunk_result_queue_size: 0,
+            region_cache_size: 0,
+        };
+        let policy = section.to_network();
+        assert_eq!(policy.chunk_send_rate, 1);
+        assert_eq!(policy.chunk_load_rate, 1);
+        assert_eq!(policy.chunk_generate_rate, 1);
+        assert_eq!(policy.chunk_prepare_batch_size, 1);
+        assert_eq!(policy.chunk_io_threads, 1);
+        assert_eq!(policy.chunk_worker_threads, 1);
+        assert_eq!(policy.chunk_result_queue_size, 1);
+        assert_eq!(policy.region_cache_size, 1);
     }
 
     fn stub_blocks() -> Arc<BlockRegistry> {
@@ -176,6 +330,7 @@ mod tests {
         assert_eq!(net.max_players, 50);
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
+        assert_eq!(net.chunk_pipeline.region_cache_size, 4);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("/tmp/vanilla"));
     }
 

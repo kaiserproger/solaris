@@ -77,9 +77,10 @@ async fn serve(path: &Path) -> Result<()> {
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
             ensure_world_region_root(world_dir)?;
-            Ok(mc_world::WorldStorage::open(
+            Ok(mc_world::WorldStorage::open_with_region_capacity(
                 world_dir,
                 Arc::clone(&blocks),
+                cfg.chunk_pipeline.region_cache_size,
             )?)
         })();
         match open_result {

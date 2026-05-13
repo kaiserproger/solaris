@@ -96,6 +96,7 @@ async fn incremental_relight_wire_matches_full_recompute() {
         tags,
         block_light: Some(Arc::clone(&block_light)),
         items: Arc::clone(&items),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

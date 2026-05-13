@@ -18,6 +18,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::ChunkPipelinePolicy;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
@@ -71,6 +72,10 @@ pub struct ServerConfig {
     /// that don't care about inventory; the M6 place flow degrades
     /// gracefully (no item → no placement).
     pub items: Arc<ItemRegistry>,
+    /// M13 chunk-pipeline policy. Early M13 slices keep the existing
+    /// cooperative stream path but thread this policy through so the
+    /// scheduler and worker-pool stages have one runtime source of truth.
+    pub chunk_pipeline: ChunkPipelinePolicy,
 }
 
 /// A listener that has been successfully bound but is not yet serving.

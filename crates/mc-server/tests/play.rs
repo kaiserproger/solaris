@@ -49,6 +49,7 @@ async fn start_server() -> SocketAddr {
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

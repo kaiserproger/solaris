@@ -117,6 +117,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         tags,
         block_light,
         items: Arc::clone(&items),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

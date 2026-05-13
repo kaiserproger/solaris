@@ -99,6 +99,23 @@ impl WorldStorage {
         registry: Arc<BlockRegistry>,
         capacity: usize,
     ) -> Result<Self, WorldError> {
+        Self::open_with_capacities(world_dir, registry, capacity, DEFAULT_REGION_LRU_CAPACITY)
+    }
+
+    pub fn open_with_region_capacity(
+        world_dir: impl AsRef<Path>,
+        registry: Arc<BlockRegistry>,
+        region_capacity: usize,
+    ) -> Result<Self, WorldError> {
+        Self::open_with_capacities(world_dir, registry, DEFAULT_LRU_CAPACITY, region_capacity)
+    }
+
+    pub fn open_with_capacities(
+        world_dir: impl AsRef<Path>,
+        registry: Arc<BlockRegistry>,
+        capacity: usize,
+        region_capacity: usize,
+    ) -> Result<Self, WorldError> {
         let dir = world_dir.as_ref();
         if !dir.is_dir() {
             return Err(WorldError::Missing(dir.to_path_buf()));
@@ -125,7 +142,7 @@ impl WorldStorage {
             capacity: capacity.max(1),
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
-            region_capacity: DEFAULT_REGION_LRU_CAPACITY,
+            region_capacity: region_capacity.max(1),
             generator: None,
         })
     }
@@ -361,6 +378,11 @@ impl WorldStorage {
         self.regions.len()
     }
 
+    #[must_use]
+    pub fn region_cache_capacity(&self) -> usize {
+        self.region_capacity
+    }
+
     /// M6.b: write every dirty chunk in the cache back to its
     /// `.mca` region file. Returns the number of chunks flushed.
     /// Groups dirty chunks by region so each `r.X.Z.mca` is rewritten
@@ -528,6 +550,17 @@ mod tests {
             chunk_pos_of(BlockPos { x: -16, y: 0, z: 0 }),
             ChunkPos { x: -1, z: 0 }
         );
+    }
+
+    #[test]
+    fn open_with_region_capacity_sets_region_lru_capacity() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+
+        let world = WorldStorage::open_with_region_capacity(tmp.path(), registry, 7).unwrap();
+
+        assert_eq!(world.region_cache_capacity(), 7);
     }
 
     /// End-to-end: open the generated flat test world, query known
