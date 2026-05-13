@@ -32,6 +32,8 @@ use mc_world::light::{LightWorkspace, compute_chunk_light_in};
 use mc_world::wire::encode_chunk_light;
 use mc_world::{Chunk, ChunkPos};
 
+const VIEW_DISTANCE: i32 = 2;
+
 fn copy_dir_recursive(src: &Path, dst: &Path) {
     std::fs::create_dir_all(dst).unwrap();
     for entry in std::fs::read_dir(src).unwrap().flatten() {
@@ -74,8 +76,14 @@ async fn incremental_relight_wire_matches_full_recompute() {
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
-    let storage = mc_world::WorldStorage::open(tmp_world.path(), Arc::clone(&blocks))
-        .expect("world storage opens");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::open_with_capacity(
+        tmp_world.path(),
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .expect("world storage opens")
+    .with_generator(generator);
     let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
     let world = Some(Arc::clone(&world_handle));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
@@ -90,6 +98,7 @@ async fn incremental_relight_wire_matches_full_recompute() {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M9.d incremental relight".into(),
         max_players: 8,
+        view_distance: VIEW_DISTANCE,
         data,
         blocks: Arc::clone(&blocks),
         world,
@@ -126,8 +135,8 @@ async fn incremental_relight_wire_matches_full_recompute() {
         .await
         .expect("ack teleport");
 
-    // Drain the spawn burst (441 chunks at view distance 10).
-    let expected_chunks = (2 * 10 + 1u32).pow(2) as usize;
+    // Drain the configured spawn burst before editing so light-cache state is stable.
+    let expected_chunks = (2 * VIEW_DISTANCE + 1).pow(2) as usize;
     let mut chunks_seen: HashSet<(i32, i32)> = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
     while chunks_seen.len() < expected_chunks {

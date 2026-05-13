@@ -31,10 +31,11 @@ use mc_protocol::packets::play::{
 };
 use mc_test_harness::client::Client;
 
-/// Matches `SPAWN_VIEW_DISTANCE` in `mc_net::play`. Hard-coded here on
-/// purpose: a regression that quietly raises the constant should fail
-/// this test by overshooting the bound, not silently pass.
+/// Matches the default `[server].view_distance` in `example.toml`.
+/// Hard-coded here on purpose: a regression that quietly raises the
+/// default should fail this test by overshooting the bound, not silently pass.
 const VIEW_DISTANCE: i32 = 10;
+const MOVEMENT_VIEW_DISTANCE: i32 = 2;
 
 #[tokio::test]
 async fn vanilla_client_receives_spawn_view_distance_window() {
@@ -56,8 +57,14 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let storage =
-        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::open_with_capacity(
+        &world_dir,
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .expect("world storage opens")
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -81,6 +88,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M3.g chunk stream".into(),
         max_players: 8,
+        view_distance: VIEW_DISTANCE,
         data,
         blocks,
         world,
@@ -269,8 +277,14 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let storage =
-        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::open_with_capacity(
+        &world_dir,
+        Arc::clone(&blocks),
+        ((2 * MOVEMENT_VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .expect("world storage opens")
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light_path = vanilla_dir.join("reports/block_light.json");
@@ -287,6 +301,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M14 movement chunk stream".into(),
         max_players: 8,
+        view_distance: MOVEMENT_VIEW_DISTANCE,
         data,
         blocks,
         world,
@@ -365,7 +380,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         }
         let mut body = frame.body;
         let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
-        if (pkt.chunk_x, pkt.chunk_z) == (VIEW_DISTANCE + 1, 0) {
+        if (pkt.chunk_x, pkt.chunk_z) == (MOVEMENT_VIEW_DISTANCE + 1, 0) {
             saw_new_strip_chunk = true;
         }
     }

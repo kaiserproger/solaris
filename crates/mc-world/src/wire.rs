@@ -136,7 +136,7 @@ pub fn client_heightmaps(chunk: &Chunk) -> Vec<HeightmapEntry> {
 pub fn encode_chunk_data(chunk: &Chunk, biomes: &Registry) -> Result<Vec<u8>, WireError> {
     debug_assert_eq!(chunk.sections.len(), SECTION_COUNT);
     debug_assert_eq!(chunk.biomes.len(), SECTION_COUNT);
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(SECTION_COUNT * 16);
     for (sec, bsec) in chunk.sections.iter().zip(chunk.biomes.iter()) {
         // i16 non_air_block_count + i16 fluid_count (we don't model
         // fluids yet, so always 0). Both big-endian on the wire.

@@ -16,6 +16,7 @@
 //! No chunk data is sent — the client renders a black world. That is the
 //! M1.g bar; chunk streaming is M2-M3 territory.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -55,6 +56,10 @@ use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
 };
 
+thread_local! {
+    static CHUNK_LIGHT_WORKSPACE: RefCell<LightWorkspace> = RefCell::new(LightWorkspace::new());
+}
+
 /// How often we ping the client. Vanilla's value.
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 /// How long we wait for the client's echo before disconnecting. Vanilla's value.
@@ -70,11 +75,8 @@ const SPAWN_X: f64 = 0.5;
 const DEFAULT_SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
 
-/// Chunk radius around spawn the server flushes before the keepalive
-/// loop starts. Currently matches `LoginPlay.view_distance` so the
-/// client renders right up to the announced render distance; tuning
-/// is M3.e/M3.f work.
-const SPAWN_VIEW_DISTANCE: i32 = 10;
+/// Default chunk radius around the player when no operator override is present.
+pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockDelta {
@@ -286,8 +288,8 @@ where
         is_hardcore: false,
         dimension_names: dim_names.to_vec(),
         max_players: 20,
-        view_distance: 10,
-        simulation_distance: 10,
+        view_distance: config.view_distance,
+        simulation_distance: config.view_distance,
         reduced_debug_info: false,
         enable_respawn_screen: true,
         do_limited_crafting: false,
@@ -349,7 +351,7 @@ where
 
     // 5. Set Center Chunk + view-distance window. Spawn is at
     //    (SPAWN_X, SPAWN_Z); the chunk anchor is the chunk that
-    //    contains it, and we stream ±SPAWN_VIEW_DISTANCE around it.
+    //    contains it, and we stream ±view_distance around it.
     let (spawn_cx, spawn_cz) = spawn_chunk_pos();
     write_packet(
         writer,
@@ -371,7 +373,7 @@ where
             compression,
             spawn_cx,
             spawn_cz,
-            SPAWN_VIEW_DISTANCE,
+            config.view_distance,
             config.chunk_pipeline,
         ))
     });
@@ -699,7 +701,7 @@ impl ChunkStreamState {
         self.dispatch_available();
         self.drain_ready();
 
-        let mut made_send_progress = self.emit_next_ready(writer, light_cache).await?;
+        let mut made_send_progress = self.emit_ready_batch(writer, light_cache).await?;
         if !made_send_progress && wait_for_first_chunk {
             while !self.scheduler.is_complete() {
                 let Some(result) = self.result_rx.recv().await else {
@@ -707,7 +709,7 @@ impl ChunkStreamState {
                 };
                 self.accept_result(result);
                 self.drain_ready();
-                if self.emit_next_ready(writer, light_cache).await? {
+                if self.emit_ready_batch(writer, light_cache).await? {
                     made_send_progress = true;
                     break;
                 }
@@ -726,6 +728,25 @@ impl ChunkStreamState {
         }
 
         Ok(ChunkStreamStep::Progress)
+    }
+
+    async fn emit_ready_batch<W>(
+        &mut self,
+        writer: &mut W,
+        light_cache: &mut LightCache,
+    ) -> Result<bool, ConnectionError>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
+        let limit = self.policy.chunk_send_rate.max(1) as usize;
+        let mut emitted = 0usize;
+        while emitted < limit && self.emit_next_ready(writer, light_cache).await? {
+            emitted += 1;
+        }
+        if emitted == limit && !self.ready.is_empty() {
+            self.last_stop_reason = ChunkPipelineStopReason::SendBudget;
+        }
+        Ok(emitted > 0)
     }
 
     fn dispatch_available(&mut self) {
@@ -1013,16 +1034,29 @@ async fn prepare_chunk_request(
 
     let outcome = match tokio::task::spawn_blocking(move || {
         let _permit = cpu_permit;
-        let mut workspace = block_light.is_some().then(LightWorkspace::new);
-        let built = build_chunk_packet(
-            centre.as_ref(),
-            &neighbourhood,
-            biomes.as_ref(),
-            block_light.as_deref(),
-            workspace.as_mut(),
-            request.chunk_x,
-            request.chunk_z,
-        )
+        let built = if let Some(table) = block_light.as_deref() {
+            CHUNK_LIGHT_WORKSPACE.with_borrow_mut(|workspace| {
+                build_chunk_packet(
+                    centre.as_ref(),
+                    &neighbourhood,
+                    biomes.as_ref(),
+                    Some(table),
+                    Some(workspace),
+                    request.chunk_x,
+                    request.chunk_z,
+                )
+            })
+        } else {
+            build_chunk_packet(
+                centre.as_ref(),
+                &neighbourhood,
+                biomes.as_ref(),
+                None,
+                None,
+                request.chunk_x,
+                request.chunk_z,
+            )
+        }
         .map_err(|err| err.to_string())?;
         frame_chunk_packet(built, compression).map_err(|err| err.to_string())
     })

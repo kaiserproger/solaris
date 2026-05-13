@@ -1,6 +1,7 @@
 [server]
 name = "MyServer"
 motd = "A Rust Minecraft Server"
+view_distance = 10
 
 [network]
 bind_address = "0.0.0.0"

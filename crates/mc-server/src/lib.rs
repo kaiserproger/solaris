@@ -36,6 +36,8 @@ pub struct ServerSection {
     pub motd: String,
     #[serde(default = "default_max_players")]
     pub max_players: u32,
+    #[serde(default = "default_view_distance")]
+    pub view_distance: i32,
 }
 
 /// Network-level server settings.
@@ -147,6 +149,10 @@ fn default_max_players() -> u32 {
     20
 }
 
+fn default_view_distance() -> i32 {
+    mc_net::DEFAULT_VIEW_DISTANCE
+}
+
 fn default_vanilla_dir() -> PathBuf {
     PathBuf::from("data/vanilla")
 }
@@ -202,6 +208,7 @@ impl ServerConfig {
             bind_address: SocketAddr::new(ip, self.network.port),
             motd: self.server.motd.clone(),
             max_players: self.server.max_players,
+            view_distance: self.server.view_distance.max(0),
             data,
             blocks,
             world,
@@ -231,6 +238,7 @@ mod tests {
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
         assert_eq!(cfg.server.name, "S");
         assert_eq!(cfg.server.max_players, 20);
+        assert_eq!(cfg.server.view_distance, 10);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 64);
@@ -314,6 +322,7 @@ mod tests {
             name = "S"
             motd = "Howdy"
             max_players = 50
+            view_distance = 7
 
             [network]
             bind_address = "127.0.0.1"
@@ -336,6 +345,7 @@ mod tests {
             .unwrap();
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
+        assert_eq!(net.view_distance, 7);
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
         assert_eq!(net.chunk_pipeline.region_cache_size, 4);

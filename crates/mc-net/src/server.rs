@@ -50,6 +50,7 @@ pub struct ServerConfig {
     pub bind_address: SocketAddr,
     pub motd: String,
     pub max_players: u32,
+    pub view_distance: i32,
     pub data: Arc<VanillaData>,
     pub blocks: Arc<BlockRegistry>,
     pub world: Option<WorldHandle>,

@@ -77,9 +77,10 @@ async fn serve(path: &Path) -> Result<()> {
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
             ensure_world_region_root(world_dir)?;
-            Ok(mc_world::WorldStorage::open_with_region_capacity(
+            Ok(mc_world::WorldStorage::open_with_capacities(
                 world_dir,
                 Arc::clone(&blocks),
+                chunk_cache_size_for_view_distance(cfg.server.view_distance),
                 cfg.chunk_pipeline.region_cache_size,
             )?)
         })();
@@ -233,6 +234,11 @@ fn net_world_clone(world: &Option<mc_net::WorldHandle>) -> Option<mc_net::WorldH
     world.as_ref().map(Arc::clone)
 }
 
+fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
+    let width = view_distance.max(0) as usize * 2 + 3;
+    width * width
+}
+
 fn count_region_files(world_dir: &Path) -> usize {
     let mut total = 0;
     for candidate in [
@@ -323,5 +329,12 @@ mod tests {
 
         assert!(modern.is_dir());
         assert!(!tmp.path().join("region").exists());
+    }
+
+    #[test]
+    fn chunk_cache_size_covers_view_plus_light_border() {
+        assert_eq!(chunk_cache_size_for_view_distance(0), 9);
+        assert_eq!(chunk_cache_size_for_view_distance(10), 529);
+        assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
     }
 }

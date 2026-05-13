@@ -29,6 +29,8 @@ use mc_protocol::packets::play::{
 };
 use mc_test_harness::client::Client;
 
+const VIEW_DISTANCE: i32 = 2;
+
 #[tokio::test]
 async fn break_block_round_trips_update_ack_relight() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -48,8 +50,14 @@ async fn break_block_round_trips_update_ack_relight() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let storage =
-        mc_world::WorldStorage::open(&world_dir, Arc::clone(&blocks)).expect("world storage opens");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::open_with_capacity(
+        &world_dir,
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .expect("world storage opens")
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -75,6 +83,7 @@ async fn break_block_round_trips_update_ack_relight() {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M5.f block edit".into(),
         max_players: 8,
+        view_distance: VIEW_DISTANCE,
         data,
         blocks,
         world,

@@ -24,6 +24,7 @@ pub use chunk_pipeline::{
 };
 pub use error::ConnectionError;
 pub use login::offline_uuid;
+pub use play::DEFAULT_VIEW_DISTANCE;
 pub use server::{BoundServer, ServerConfig, WorldHandle, bind, run};
 
 /// Crate version, exposed so other crates and the binary can report it.

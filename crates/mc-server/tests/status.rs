@@ -28,6 +28,7 @@ async fn start_server(motd: &str) -> SocketAddr {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: motd.to_string(),
         max_players: 17,
+        view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
         blocks: std::sync::Arc::new(
             mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),

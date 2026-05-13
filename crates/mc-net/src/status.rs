@@ -77,6 +77,7 @@ mod tests {
             bind_address: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 25565),
             motd: "Solaris test".into(),
             max_players: 20,
+            view_distance: crate::DEFAULT_VIEW_DISTANCE,
             data: std::sync::Arc::new(mc_data::testing::stub()),
             blocks: std::sync::Arc::new(
                 mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
