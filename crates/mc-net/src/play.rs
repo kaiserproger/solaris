@@ -475,31 +475,16 @@ where
 
     let started = Instant::now();
 
-    // Pre-fetch every chunk in the (view_distance + 1) ring so each
-    // emit_one_chunk can build its 3×3 neighbourhood from local
-    // memory without re-locking the storage. The +1 captures the
-    // outer neighbour ring needed to feed the lighting engine for
-    // the cells at the edge of the view-distance window.
+    // Stage chunks lazily in spiral order. A fresh worldgen-only world
+    // has to materialise hundreds of chunks; prefetching the whole
+    // radius before the first write makes the vanilla client time out.
+    // Loading each centre's 3×3 neighbourhood gets the spawn chunk onto
+    // the wire as soon as its immediate light inputs exist.
     let mut staged: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
-    let pre_fetch_radius = view_distance + 1;
-    {
-        let mut storage = world.lock().await;
-        for cz in (center_cz - pre_fetch_radius)..=(center_cz + pre_fetch_radius) {
-            for cx in (center_cx - pre_fetch_radius)..=(center_cx + pre_fetch_radius) {
-                match storage.get_chunk(ChunkPos { x: cx, z: cz }) {
-                    Ok(Some(c)) => {
-                        staged.insert((cx, cz), Arc::new(c.clone()));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(cx, cz, error = %err, "chunk read failed; skipping");
-                    }
-                }
-            }
-        }
-    }
-    let staged_count = staged.len();
-    let fetch_ms = started.elapsed().as_millis() as u64;
+    let mut fetch_ms = 0u64;
+    let mut build_ms = 0u64;
+    let mut write_ms = 0u64;
+    let mut first_chunk_ms: Option<u64> = None;
 
     let mut emitted = 0usize;
     let mut absent = 0usize;
@@ -513,6 +498,28 @@ where
     // renders first and the rings fill in behind. Same coverage as
     // the previous row-major loop.
     for (cx, cz) in spiral_chunks(center_cx, center_cz, view_distance) {
+        let fetch_started = Instant::now();
+        {
+            let mut storage = world.lock().await;
+            for ncz in (cz - 1)..=(cz + 1) {
+                for ncx in (cx - 1)..=(cx + 1) {
+                    if staged.contains_key(&(ncx, ncz)) {
+                        continue;
+                    }
+                    match storage.get_chunk(ChunkPos { x: ncx, z: ncz }) {
+                        Ok(Some(c)) => {
+                            staged.insert((ncx, ncz), Arc::new(c.clone()));
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            warn!(cx = ncx, cz = ncz, error = %err, "chunk read failed; skipping");
+                        }
+                    }
+                }
+            }
+        }
+        fetch_ms += fetch_started.elapsed().as_millis() as u64;
+
         let Some(centre) = staged.get(&(cx, cz)) else {
             absent += 1;
             debug!(cx, cz, "no chunk in storage");
@@ -520,6 +527,7 @@ where
         };
         let neighbours = build_neighbourhood(&staged, cx, cz);
         let centre_ref = centre.as_ref();
+        let build_started = Instant::now();
         let packet = match build_chunk_packet(
             centre_ref,
             &neighbours,
@@ -536,9 +544,13 @@ where
                 continue;
             }
         };
+        build_ms += build_started.elapsed().as_millis() as u64;
         let n = packet.data.len();
+        let write_started = Instant::now();
         write_packet(writer, &packet, compression).await?;
+        write_ms += write_started.elapsed().as_millis() as u64;
         emitted += 1;
+        first_chunk_ms.get_or_insert_with(|| started.elapsed().as_millis() as u64);
         bytes += n;
     }
 
@@ -546,11 +558,14 @@ where
         center_cx,
         center_cz,
         view_distance,
-        staged = staged_count,
+        staged = staged.len(),
         emitted,
         absent,
         bytes,
         fetch_ms,
+        build_ms,
+        write_ms,
+        first_chunk_ms,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "view-distance window flushed",
     );

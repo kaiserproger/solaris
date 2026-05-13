@@ -1,6 +1,7 @@
 //! TCP listener, accept loop, and the per-connection state-machine entry
 //! point.
 
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -107,8 +108,8 @@ impl BoundServer {
             tokio::spawn(async move {
                 if let Err(err) = handle_connection(socket, &config).await {
                     match err {
-                        ConnectionError::Eof => {
-                            debug!(%peer, "client closed before completing");
+                        err if is_client_disconnect(&err) => {
+                            debug!(%peer, "client disconnected");
                         }
                         other => {
                             warn!(%peer, error = %other, "connection terminated");
@@ -119,6 +120,20 @@ impl BoundServer {
                 }
             });
         }
+    }
+}
+
+fn is_client_disconnect(err: &ConnectionError) -> bool {
+    match err {
+        ConnectionError::Eof => true,
+        ConnectionError::Io(err) => matches!(
+            err.kind(),
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::ConnectionReset
+                | ErrorKind::UnexpectedEof
+        ),
+        _ => false,
     }
 }
 
@@ -189,5 +204,26 @@ async fn handle_connection(
             )
             .await
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broken_pipe_is_graceful_disconnect() {
+        let err = ConnectionError::Io(std::io::Error::from(ErrorKind::BrokenPipe));
+        assert!(is_client_disconnect(&err));
+    }
+
+    #[test]
+    fn codec_error_is_not_graceful_disconnect() {
+        let err = ConnectionError::UnexpectedPacketId {
+            state: State::Login,
+            expected: 1,
+            got: 2,
+        };
+        assert!(!is_client_disconnect(&err));
     }
 }

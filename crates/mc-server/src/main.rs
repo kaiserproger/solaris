@@ -75,7 +75,14 @@ async fn serve(path: &Path) -> Result<()> {
     );
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
-        match mc_world::WorldStorage::open(world_dir, Arc::clone(&blocks)) {
+        let open_result = (|| -> Result<mc_world::WorldStorage> {
+            ensure_world_region_root(world_dir)?;
+            Ok(mc_world::WorldStorage::open(
+                world_dir,
+                Arc::clone(&blocks),
+            )?)
+        })();
+        match open_result {
             Ok(storage) => {
                 let region_count = count_region_files(world_dir);
                 // M7: attach the terrain generator. Chunks missing
@@ -245,6 +252,20 @@ fn count_region_files(world_dir: &Path) -> usize {
     total
 }
 
+fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
+    let modern = world_dir
+        .join("dimensions")
+        .join("minecraft")
+        .join("overworld")
+        .join("region");
+    let legacy = world_dir.join("region");
+    if modern.is_dir() || legacy.is_dir() {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&legacy)
+        .with_context(|| format!("creating empty world region directory {}", legacy.display()))
+}
+
 fn init_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -269,5 +290,37 @@ async fn main() -> ExitCode {
             eprintln!("error: {err:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_world_region_root_creates_legacy_layout_for_missing_world() {
+        let tmp = tempfile::tempdir().unwrap();
+        let world = tmp.path().join("new-world");
+
+        ensure_world_region_root(&world).unwrap();
+
+        assert!(world.join("region").is_dir());
+    }
+
+    #[test]
+    fn ensure_world_region_root_keeps_existing_modern_layout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let modern = tmp
+            .path()
+            .join("dimensions")
+            .join("minecraft")
+            .join("overworld")
+            .join("region");
+        std::fs::create_dir_all(&modern).unwrap();
+
+        ensure_world_region_root(tmp.path()).unwrap();
+
+        assert!(modern.is_dir());
+        assert!(!tmp.path().join("region").exists());
     }
 }

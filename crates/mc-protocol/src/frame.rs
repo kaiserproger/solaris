@@ -255,7 +255,7 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
                 let mut plain = Vec::with_capacity(uncompressed_len);
                 plain.write_varint(id);
                 plain.extend_from_slice(body);
-                let mut encoder = ZlibEncoder::new(Vec::new(), ZlibLevel::default());
+                let mut encoder = ZlibEncoder::new(Vec::new(), ZlibLevel::fast());
                 encoder.write_all(&plain)?;
                 let compressed = encoder.finish()?;
 
