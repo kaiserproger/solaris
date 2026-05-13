@@ -12,12 +12,12 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_entity::EntityId;
-use mc_physics::Aabb;
+use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds};
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_world::chunk::{MAX_Y, MIN_Y};
-use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
+use mc_world::{BlockPos, BlockRegistry, WorldStorage};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
@@ -162,24 +162,33 @@ async fn entity_ground_levels(
     if queries.is_empty() {
         return Vec::new();
     }
-    let air = config
-        .blocks
-        .block(&Identifier::parse("minecraft:air").expect("static identifier"))
-        .map(|block| block.default)
-        .unwrap_or(BlockStateId(0));
+    let materials = material_ids(&config.blocks);
     let mut storage = world.lock().await;
     queries
         .iter()
         .filter_map(|&(id, x, z)| {
-            ground_y_for_bbox(&mut storage, air, x, z, COW_HALF_WIDTH)
+            ground_y_for_bbox(&mut storage, materials, x, z, COW_HALF_WIDTH)
                 .map(|ground_y| (id, f64::from(ground_y) + 1.0))
         })
         .collect()
 }
 
+fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
+    let state = |name: &str| {
+        blocks
+            .block(&Identifier::parse(name).expect("static identifier"))
+            .map(|block| block.default.0)
+    };
+    BlockMaterialIds::new(
+        state("minecraft:air").unwrap_or(0),
+        state("minecraft:water"),
+        state("minecraft:lava"),
+    )
+}
+
 fn ground_y_for_bbox(
     storage: &mut WorldStorage,
-    air: BlockStateId,
+    materials: BlockMaterialIds,
     x: f64,
     z: f64,
     half_width: f64,
@@ -192,14 +201,23 @@ fn ground_y_for_bbox(
     ];
     probes
         .into_iter()
-        .filter_map(|(px, pz)| ground_y_at(storage, air, px.floor() as i32, pz.floor() as i32))
+        .filter_map(|(px, pz)| {
+            ground_y_at(storage, materials, px.floor() as i32, pz.floor() as i32)
+        })
         .max()
 }
 
-fn ground_y_at(storage: &mut WorldStorage, air: BlockStateId, x: i32, z: i32) -> Option<i32> {
+fn ground_y_at(
+    storage: &mut WorldStorage,
+    materials: BlockMaterialIds,
+    x: i32,
+    z: i32,
+) -> Option<i32> {
     for y in (MIN_Y..MAX_Y).rev() {
         match storage.get_block(BlockPos { x, y, z }) {
-            Ok(Some(state)) if state != air => return Some(y),
+            Ok(Some(state)) if materials.classify(state.0) == BlockMaterial::Solid => {
+                return Some(y);
+            }
             Ok(_) => {}
             Err(_) => return None,
         }

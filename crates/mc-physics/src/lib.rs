@@ -64,6 +64,33 @@ impl BlockMaterial {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockMaterialIds {
+    pub air: u32,
+    pub water: Option<u32>,
+    pub lava: Option<u32>,
+}
+
+impl BlockMaterialIds {
+    #[must_use]
+    pub const fn new(air: u32, water: Option<u32>, lava: Option<u32>) -> Self {
+        Self { air, water, lava }
+    }
+
+    #[must_use]
+    pub fn classify(self, state_id: u32) -> BlockMaterial {
+        if state_id == self.air {
+            BlockMaterial::Air
+        } else if self.water == Some(state_id) {
+            BlockMaterial::Water
+        } else if self.lava == Some(state_id) {
+            BlockMaterial::Lava
+        } else {
+            BlockMaterial::Solid
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityBody {
     pub position: Vec3,
@@ -104,12 +131,12 @@ pub struct StepResult {
 }
 
 pub trait BlockSampler {
-    fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial;
+    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial;
 }
 
 pub fn step_entity<S: BlockSampler>(
     mut body: EntityBody,
-    sampler: &S,
+    sampler: &mut S,
     config: PhysicsConfig,
 ) -> StepResult {
     let in_fluid = body_overlaps_fluid(body, sampler);
@@ -146,7 +173,7 @@ pub fn step_entity<S: BlockSampler>(
     StepResult { body, in_fluid }
 }
 
-pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &S) -> Option<f64> {
+pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> Option<f64> {
     let feet_y = body.position.y.floor() as i32;
     bbox_columns(body)
         .into_iter()
@@ -156,7 +183,7 @@ pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &S) -> Opti
         .max_by(f64::total_cmp)
 }
 
-fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
+fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bool {
     let min_y = body.position.y.floor() as i32;
     let max_y = (body.position.y + body.aabb.height).floor() as i32;
     bbox_columns(body)
@@ -186,7 +213,7 @@ mod tests {
     }
 
     impl BlockSampler for FlatWorld {
-        fn material_at(&self, _x: i32, y: i32, _z: i32) -> BlockMaterial {
+        fn material_at(&mut self, _x: i32, y: i32, _z: i32) -> BlockMaterial {
             if self.water_y == Some(y) {
                 BlockMaterial::Water
             } else if y <= self.ground_y {
@@ -199,7 +226,7 @@ mod tests {
 
     #[test]
     fn gravity_lands_body_on_solid_ground() {
-        let world = FlatWorld {
+        let mut world = FlatWorld {
             ground_y: 63,
             water_y: None,
         };
@@ -211,7 +238,7 @@ mod tests {
         };
 
         for _ in 0..40 {
-            body = step_entity(body, &world, PhysicsConfig::default()).body;
+            body = step_entity(body, &mut world, PhysicsConfig::default()).body;
         }
 
         assert_eq!(body.position.y, 64.0);
@@ -221,7 +248,7 @@ mod tests {
 
     #[test]
     fn air_drag_damps_horizontal_motion() {
-        let world = FlatWorld {
+        let mut world = FlatWorld {
             ground_y: -64,
             water_y: None,
         };
@@ -232,7 +259,7 @@ mod tests {
             on_ground: false,
         };
 
-        let stepped = step_entity(body, &world, PhysicsConfig::default()).body;
+        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
 
         assert!(stepped.velocity.x < body.velocity.x);
         assert!(stepped.velocity.y < 0.0);
@@ -240,7 +267,7 @@ mod tests {
 
     #[test]
     fn water_applies_buoyancy_and_stronger_drag() {
-        let world = FlatWorld {
+        let mut world = FlatWorld {
             ground_y: 60,
             water_y: Some(64),
         };
@@ -251,10 +278,20 @@ mod tests {
             on_ground: false,
         };
 
-        let result = step_entity(body, &world, PhysicsConfig::default());
+        let result = step_entity(body, &mut world, PhysicsConfig::default());
 
         assert!(result.in_fluid);
         assert!(result.body.velocity.x < 1.0);
         assert!(result.body.velocity.y > -1.0);
+    }
+
+    #[test]
+    fn material_ids_classify_fluids_apart_from_solids() {
+        let ids = BlockMaterialIds::new(0, Some(5), Some(6));
+
+        assert_eq!(ids.classify(0), BlockMaterial::Air);
+        assert_eq!(ids.classify(5), BlockMaterial::Water);
+        assert_eq!(ids.classify(6), BlockMaterial::Lava);
+        assert_eq!(ids.classify(7), BlockMaterial::Solid);
     }
 }
