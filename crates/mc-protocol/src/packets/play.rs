@@ -362,6 +362,45 @@ impl Packet for PlayDisconnect {
     }
 }
 
+/// `Clientbound Forget Level Chunk` (CB). Unloads one chunk from the
+/// client's currently loaded view.
+///
+/// Per ADR 0002, verified against vanilla 26.1.2: `GameProtocols`
+/// registers `CLIENTBOUND_FORGET_LEVEL_CHUNK` at game-CB index 37
+/// (including `CLIENTBOUND_BUNDLE`), and
+/// `ClientboundForgetLevelChunkPacket.write` calls
+/// `FriendlyByteBuf.writeChunkPos`. `writeChunkPos` writes one raw
+/// big-endian `i64` from `ChunkPos.pack(x, z)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForgetLevelChunk {
+    pub chunk_x: i32,
+    pub chunk_z: i32,
+}
+
+impl Packet for ForgetLevelChunk {
+    const ID: i32 = 0x25;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(pack_chunk_pos(self.chunk_x, self.chunk_z));
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let packed = buf.read_i64()?;
+        Ok(Self {
+            chunk_x: packed as i32,
+            chunk_z: (packed >> 32) as i32,
+        })
+    }
+}
+
+/// Pack vanilla's `ChunkPos.pack(x, z)` representation:
+/// `(x & 0xffffffff) | ((z & 0xffffffff) << 32)`.
+#[must_use]
+pub fn pack_chunk_pos(x: i32, z: i32) -> i64 {
+    ((x as i64) & 0xFFFF_FFFF) | (((z as i64) & 0xFFFF_FFFF) << 32)
+}
+
 /// `Game Event` (CB). Used here for one specific game event:
 /// `start_waiting_for_level_chunks`, sent right after Login (Play) to
 /// tell the client "you can stop showing the loading screen".
@@ -1776,6 +1815,32 @@ mod tests {
         round_trip(PlayDisconnect {
             reason_nbt: vec![0x0A, 0x00, 0x08, b'r', b'e', b'a', b's', b'o', b'n', 0x00],
         });
+    }
+
+    #[test]
+    fn forget_level_chunk_id_matches_javap() {
+        assert_eq!(ForgetLevelChunk::ID, 0x25);
+    }
+
+    #[test]
+    fn forget_level_chunk_round_trips() {
+        for (x, z) in [(0, 0), (1, -1), (-100_000, 100_000), (i32::MIN, i32::MAX)] {
+            round_trip(ForgetLevelChunk {
+                chunk_x: x,
+                chunk_z: z,
+            });
+        }
+    }
+
+    #[test]
+    fn forget_level_chunk_wire_layout_uses_chunk_pos_long() {
+        let packet = ForgetLevelChunk {
+            chunk_x: -1,
+            chunk_z: 2,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0, 0, 0, 2, 0xFF, 0xFF, 0xFF, 0xFF]);
     }
 
     #[test]
