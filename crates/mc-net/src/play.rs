@@ -26,6 +26,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{EntityId, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3};
+use mc_physics::TICK_SECONDS;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
@@ -82,7 +83,7 @@ const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const COW_ENTITY_TYPE_ID: i32 = 30;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
-const ENTITY_TICK_DELTA_SECONDS: f64 = 0.05;
+const ENTITY_TICK_DELTA_SECONDS: f64 = TICK_SECONDS;
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
 
 /// Default chunk radius around the player when no operator override is present.

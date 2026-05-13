@@ -12,6 +12,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_entity::EntityId;
+use mc_physics::Aabb;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
@@ -26,7 +27,7 @@ use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
 
-const COW_HALF_WIDTH: f64 = 0.46;
+const COW_HALF_WIDTH: f64 = Aabb::COW.half_width;
 
 /// Shared, mutably-accessible handle to the world.
 ///

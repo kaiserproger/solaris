@@ -653,6 +653,7 @@ dependencies = [
  "bytes",
  "mc-data",
  "mc-entity",
+ "mc-physics",
  "mc-protocol",
  "mc-world",
  "md-5",
