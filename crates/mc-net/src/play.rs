@@ -151,6 +151,21 @@ struct ServerEntityMove {
     on_ground: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CommandPermissions {
+    op: bool,
+}
+
+impl CommandPermissions {
+    fn for_local_dev_profile(_profile: &LoggedInProfile) -> Self {
+        Self { op: true }
+    }
+
+    const fn can_change_game_mode(self) -> bool {
+        self.op
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct EntityPhysicsQuery {
     pub id: EntityId,
@@ -1168,6 +1183,7 @@ where
             Arc::clone(&sessions),
             session_id,
             initial_pose,
+            CommandPermissions::for_local_dev_profile(profile),
             outbound_rx,
         )
         .await
@@ -2941,6 +2957,7 @@ async fn play_loop<R, W>(
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
     mut player_pose: PlayerPose,
+    permissions: CommandPermissions,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
 ) -> Result<(), ConnectionError>
 where
@@ -2958,7 +2975,6 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut game_mode = GameMode::Survival;
-    let op_capable = true;
 
     loop {
         let mut stream_finished = false;
@@ -3126,14 +3142,14 @@ where
                     let mut body = frame.body;
                     let command = ServerboundChatCommand::decode(&mut body)?;
                     if let Some(mode) = parse_gamemode_command(&command.command) {
-                        apply_game_mode(writer, compression, &mut game_mode, mode, op_capable).await?;
+                        apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
                     } else {
                         debug!(command = %command.command, "unsupported command ignored");
                     }
                 } else if frame.id == ServerboundChangeGameMode::ID {
                     let mut body = frame.body;
                     let command = ServerboundChangeGameMode::decode(&mut body)?;
-                    apply_game_mode(writer, compression, &mut game_mode, command.mode, op_capable).await?;
+                    apply_game_mode(writer, compression, &mut game_mode, command.mode, permissions).await?;
                 } else {
                     debug!(
                         id = format!("{:#04x}", frame.id),
@@ -3174,12 +3190,12 @@ async fn apply_game_mode<W>(
     compression: Compression,
     current: &mut GameMode,
     requested: GameMode,
-    op_capable: bool,
+    permissions: CommandPermissions,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    if !op_capable {
+    if !permissions.can_change_game_mode() {
         debug!(mode = ?requested, "gamemode change denied for non-op player");
         return Ok(());
     }
@@ -3238,6 +3254,18 @@ mod tests {
         assert_eq!(parse_gamemode_command("time set day"), None);
         assert_eq!(parse_gamemode_command("gamemode nope"), None);
         assert_eq!(parse_gamemode_command("gamemode creative other"), None);
+    }
+
+    #[test]
+    fn local_dev_profiles_are_op_capable_for_now() {
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "op_probe".to_string(),
+        };
+
+        let permissions = CommandPermissions::for_local_dev_profile(&profile);
+
+        assert!(permissions.can_change_game_mode());
     }
 
     #[test]
