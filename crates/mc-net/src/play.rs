@@ -35,7 +35,9 @@ use mc_protocol::packets::play::{
     ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
     unpack_block_pos,
 };
-use mc_world::light::{LightCache, LightWorkspace, compute_chunk_light_in};
+use mc_world::light::{
+    LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
+};
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -269,12 +271,10 @@ struct InteractionState {
     /// as `emit_chunks_around`).
     workspace: LightWorkspace,
     /// M9.a: per-chunk computed light, populated during the spawn
-    /// burst and (from M9.c onwards) mutated in place on every
-    /// edit. Replaces the M5-era pattern of recomputing the full
-    /// 3×3 neighbourhood for each affected chunk on every break/
-    /// place. Field is wired up here so the spawn-burst seed can
-    /// flow into it without touching this struct again next commit.
-    #[allow(dead_code)]
+    /// burst and mutated in place by [`apply_block_change_to_light`]
+    /// on every edit. Replaces the M5-era pattern of recomputing
+    /// the full 3×3 neighbourhood for each affected chunk on every
+    /// break/place.
     light_cache: LightCache,
     /// M6.d: which item the player is currently holding. Bumped by
     /// `ServerboundSetCarriedItem` (0..=8) and consulted by
@@ -728,16 +728,16 @@ where
     )
     .await?;
 
-    // 3. Recompute light over the affected 1+4 chunks if we have
-    //    the table. Without it we'd be emitting LightData::empty()
-    //    which is the M3 fallback — useless for an edit because
-    //    the client would re-render the chunk dark from the
-    //    fallback.
+    // 3. Incremental relight (M9). Update cached per-chunk light in
+    //    place via bounded BFS, then emit one `LightUpdate` per
+    //    chunk whose stored arrays actually changed. Falls back to
+    //    no-op if the cache is empty (e.g. edits before the spawn
+    //    burst populated it) or the block-light table isn't loaded.
     let table = state.block_light.as_ref().map(Arc::clone);
     if let Some(table) = table {
         let cx = x.div_euclid(16);
         let cz = z.div_euclid(16);
-        send_relight_around(state, writer, &table, cx, cz).await?;
+        send_incremental_relight(state, writer, &table, cx, cz, x, y, z, prev, new_state).await?;
     }
 
     // 4. Ack last — vanilla expects update-before-ack so the
@@ -746,26 +746,39 @@ where
     Ok(())
 }
 
-/// Fetch the 5×5 chunk window centred on `(cx, cz)`, recompute
-/// light for the centre + 4 manhattan neighbours, and write a
-/// `LightUpdate` for each. Conservative: emits 5 packets even if
-/// some chunks weren't visibly affected — incremental relight is
-/// M6+.
-async fn send_relight_around<W>(
+/// M9: incremental relight. Pulls the post-edit 3×3 chunk
+/// neighbourhood out of storage once, runs a bounded BFS that
+/// mutates the per-chunk cached light in place, and emits one
+/// `LightUpdate` per chunk whose stored arrays changed.
+///
+/// Falls back to a single-chunk full recompute when the cache
+/// hasn't been pre-warmed (e.g. an edit lands before the spawn
+/// burst's `build_chunk_packet` got to that chunk) — same coverage
+/// as the old `send_relight_around` for the centre tile, but
+/// without the 5× cost.
+#[allow(clippy::too_many_arguments)]
+async fn send_incremental_relight<W>(
     state: &mut InteractionState,
     writer: &mut W,
     table: &BlockLightTable,
     cx: i32,
     cz: i32,
+    edit_x: i32,
+    edit_y: i32,
+    edit_z: i32,
+    prev_state: mc_world::BlockStateId,
+    new_state: mc_world::BlockStateId,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    // 1. Pull the 3×3 chunks around the edit out of storage. The
+    //    edit has already been applied, so these are post-edit.
     let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
     {
         let mut storage = state.world.lock().await;
-        for dcz in -2i32..=2 {
-            for dcx in -2i32..=2 {
+        for dcz in -1i32..=1 {
+            for dcx in -1i32..=1 {
                 let pos = ChunkPos {
                     x: cx + dcx,
                     z: cz + dcz,
@@ -783,27 +796,56 @@ where
         }
     }
 
-    let affected: [(i32, i32); 5] = [
-        (cx, cz),
-        (cx - 1, cz),
-        (cx + 1, cz),
-        (cx, cz - 1),
-        (cx, cz + 1),
-    ];
-    for (ncx, ncz) in affected {
-        let Some(centre) = chunks.get(&(ncx, ncz)) else {
-            continue;
-        };
+    let centre_pos = ChunkPos { x: cx, z: cz };
+
+    // 2. If the edit chunk isn't in the cache yet (rare: edit before
+    //    spawn burst reached it), seed it via a single full compute.
+    if !state.light_cache.contains(centre_pos) {
         let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
                 refs[(dz + 1) as usize][(dx + 1) as usize] =
-                    chunks.get(&(ncx + dx, ncz + dz)).map(|a| a.as_ref());
+                    chunks.get(&(cx + dx, cz + dz)).map(|a| a.as_ref());
             }
         }
-        refs[1][1] = Some(centre.as_ref());
+        let Some(centre) = refs[1][1] else {
+            return Ok(()); // edit chunk vanished from storage — nothing to relight
+        };
+        let _ = centre;
         let light = compute_chunk_light_in(&mut state.workspace, refs, table);
-        let wire = encode_chunk_light(&light);
+        state.light_cache.insert(centre_pos, light);
+    }
+
+    // 3. Build the 3×3 reference array for the incremental update.
+    let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+    for dz in -1i32..=1 {
+        for dx in -1i32..=1 {
+            refs[(dz + 1) as usize][(dx + 1) as usize] =
+                chunks.get(&(cx + dx, cz + dz)).map(|a| a.as_ref());
+        }
+    }
+
+    let local_x = edit_x.rem_euclid(16) as u8;
+    let local_z = edit_z.rem_euclid(16) as u8;
+
+    let touched = apply_block_change_to_light(
+        &mut state.light_cache,
+        &refs,
+        table,
+        centre_pos,
+        local_x,
+        edit_y,
+        local_z,
+        prev_state,
+        new_state,
+    );
+
+    // 4. Emit one LightUpdate per chunk whose cached light changed.
+    for pos in touched {
+        let Some(light) = state.light_cache.get(pos) else {
+            continue;
+        };
+        let wire = encode_chunk_light(light);
         let light_data = LightData {
             sky_y_mask: wire.sky_y_mask,
             block_y_mask: wire.block_y_mask,
@@ -815,8 +857,8 @@ where
         write_packet(
             writer,
             &LightUpdate {
-                chunk_x: ncx,
-                chunk_z: ncz,
+                chunk_x: pos.x,
+                chunk_z: pos.z,
                 light: light_data,
             },
             Compression::Disabled,
