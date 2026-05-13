@@ -11,12 +11,10 @@ use mc_data::VanillaData;
 use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
-use mc_entity::EntityId;
-use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds};
+use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_world::chunk::{MAX_Y, MIN_Y};
 use mc_world::{BlockPos, BlockRegistry, WorldStorage};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -26,8 +24,6 @@ use crate::ChunkPipelinePolicy;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
-
-const COW_HALF_WIDTH: f64 = Aabb::COW.half_width;
 
 /// Shared, mutably-accessible handle to the world.
 ///
@@ -124,9 +120,9 @@ impl BoundServer {
             loop {
                 ticker.tick().await;
                 tick = tick.wrapping_add(1);
-                let queries = entity_sessions.tick_entities_and_collect_ground_queries(tick);
-                let levels = entity_ground_levels(&entity_config, &queries).await;
-                entity_sessions.apply_entity_ground_levels_and_dispatch(tick, &levels);
+                let queries = entity_sessions.tick_entities_and_collect_physics_queries(tick);
+                let steps = entity_physics_steps(&entity_config, &queries).await;
+                entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
             }
         });
         loop {
@@ -152,10 +148,10 @@ impl BoundServer {
     }
 }
 
-async fn entity_ground_levels(
+async fn entity_physics_steps(
     config: &ServerConfig,
-    queries: &[(EntityId, f64, f64)],
-) -> Vec<(EntityId, f64)> {
+    queries: &[play::EntityPhysicsQuery],
+) -> Vec<play::EntityPhysicsStep> {
     let Some(world) = config.world.as_ref() else {
         return Vec::new();
     };
@@ -164,13 +160,54 @@ async fn entity_ground_levels(
     }
     let materials = material_ids(&config.blocks);
     let mut storage = world.lock().await;
+    let mut sampler = WorldPhysicsSampler {
+        storage: &mut storage,
+        materials,
+    };
     queries
         .iter()
-        .filter_map(|&(id, x, z)| {
-            ground_y_for_bbox(&mut storage, materials, x, z, COW_HALF_WIDTH)
-                .map(|ground_y| (id, f64::from(ground_y) + 1.0))
+        .map(|query| {
+            let result = mc_physics::step_entity(
+                EntityBody {
+                    position: physics_vec(query.position),
+                    velocity: physics_vec(query.velocity),
+                    aabb: Aabb::COW,
+                    on_ground: query.on_ground,
+                },
+                &mut sampler,
+                PhysicsConfig::default(),
+            );
+            play::EntityPhysicsStep {
+                id: query.id,
+                position: entity_vec(result.body.position),
+                velocity: entity_vec(result.body.velocity),
+                on_ground: result.body.on_ground,
+            }
         })
         .collect()
+}
+
+struct WorldPhysicsSampler<'a> {
+    storage: &'a mut WorldStorage,
+    materials: BlockMaterialIds,
+}
+
+impl BlockSampler for WorldPhysicsSampler<'_> {
+    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
+        match self.storage.get_block(BlockPos { x, y, z }) {
+            Ok(Some(state)) => self.materials.classify(state.0),
+            Ok(None) => BlockMaterial::Air,
+            Err(_) => BlockMaterial::Air,
+        }
+    }
+}
+
+fn physics_vec(vec: mc_entity::Vec3) -> mc_physics::Vec3 {
+    mc_physics::Vec3::new(vec.x, vec.y, vec.z)
+}
+
+fn entity_vec(vec: mc_physics::Vec3) -> mc_entity::Vec3 {
+    mc_entity::Vec3::new(vec.x, vec.y, vec.z)
 }
 
 fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
@@ -184,45 +221,6 @@ fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
         state("minecraft:water"),
         state("minecraft:lava"),
     )
-}
-
-fn ground_y_for_bbox(
-    storage: &mut WorldStorage,
-    materials: BlockMaterialIds,
-    x: f64,
-    z: f64,
-    half_width: f64,
-) -> Option<i32> {
-    let probes = [
-        (x - half_width, z - half_width),
-        (x - half_width, z + half_width),
-        (x + half_width, z - half_width),
-        (x + half_width, z + half_width),
-    ];
-    probes
-        .into_iter()
-        .filter_map(|(px, pz)| {
-            ground_y_at(storage, materials, px.floor() as i32, pz.floor() as i32)
-        })
-        .max()
-}
-
-fn ground_y_at(
-    storage: &mut WorldStorage,
-    materials: BlockMaterialIds,
-    x: i32,
-    z: i32,
-) -> Option<i32> {
-    for y in (MIN_Y..MAX_Y).rev() {
-        match storage.get_block(BlockPos { x, y, z }) {
-            Ok(Some(state)) if materials.classify(state.0) == BlockMaterial::Solid => {
-                return Some(y);
-            }
-            Ok(_) => {}
-            Err(_) => return None,
-        }
-    }
-    None
 }
 
 fn is_client_disconnect(err: &ConnectionError) -> bool {

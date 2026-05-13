@@ -313,6 +313,14 @@ impl EntityStore {
         true
     }
 
+    pub fn set_on_ground(&mut self, id: EntityId, on_ground: bool) -> bool {
+        let Some(&slot) = self.slots_by_id.get(&id) else {
+            return false;
+        };
+        self.on_ground[slot] = on_ground;
+        true
+    }
+
     pub fn set_goal(&mut self, id: EntityId, goal: GoalState) -> bool {
         let Some(&slot) = self.slots_by_id.get(&id) else {
             return false;

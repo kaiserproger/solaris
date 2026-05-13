@@ -26,7 +26,6 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{EntityId, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3};
-use mc_physics::TICK_SECONDS;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
@@ -83,7 +82,6 @@ const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const COW_ENTITY_TYPE_ID: i32 = 30;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
-const ENTITY_TICK_DELTA_SECONDS: f64 = TICK_SECONDS;
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
 
 /// Default chunk radius around the player when no operator override is present.
@@ -150,6 +148,22 @@ struct ServerEntityMove {
     delta: Vec3,
     rotation: mc_entity::Rotation,
     on_ground: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EntityPhysicsQuery {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct EntityPhysicsStep {
+    pub id: EntityId,
+    pub position: Vec3,
+    pub velocity: Vec3,
+    pub on_ground: bool,
 }
 
 #[derive(Debug)]
@@ -426,28 +440,28 @@ impl SessionRegistry {
         refresh_visibility_locked(&mut inner)
     }
 
-    pub(crate) fn tick_entities_and_collect_ground_queries(
+    pub(crate) fn tick_entities_and_collect_physics_queries(
         &self,
         tick: u64,
-    ) -> Vec<(EntityId, f64, f64)> {
+    ) -> Vec<EntityPhysicsQuery> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         if inner.entities.is_empty() {
             return Vec::new();
         }
         inner.entities.tick_goals(tick);
-        inner.entities.tick_positions(ENTITY_TICK_DELTA_SECONDS);
         inner
             .entities
             .snapshots()
-            .map(|entity| (entity.id, entity.position.x, entity.position.z))
+            .map(|entity| EntityPhysicsQuery {
+                id: entity.id,
+                position: entity.position,
+                velocity: entity.velocity,
+                on_ground: entity.on_ground,
+            })
             .collect()
     }
 
-    pub(crate) fn apply_entity_ground_levels_and_dispatch(
-        &self,
-        tick: u64,
-        levels: &[(EntityId, f64)],
-    ) {
+    pub(crate) fn apply_entity_physics_and_dispatch(&self, tick: u64, steps: &[EntityPhysicsStep]) {
         let mut inner = self.inner.lock().expect("session registry poisoned");
         if inner.entities.is_empty() {
             return;
@@ -462,11 +476,10 @@ impl SessionRegistry {
                 )
             })
             .collect();
-        for &(id, y) in levels {
-            if let Some(mut entity) = inner.entities.snapshot(id) {
-                entity.position.y = y;
-                let _ = inner.entities.set_position(id, entity.position);
-            }
+        for step in steps {
+            let _ = inner.entities.set_position(step.id, step.position);
+            let _ = inner.entities.set_velocity(step.id, step.velocity);
+            let _ = inner.entities.set_on_ground(step.id, step.on_ground);
         }
         let mut dispatches = refresh_visibility_locked(&mut inner);
         if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
@@ -3125,7 +3138,7 @@ mod tests {
     #[test]
     fn entity_tick_cadence_matches_vanilla_cow_tracking() {
         assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
-        assert_eq!(ENTITY_TICK_DELTA_SECONDS, 0.05);
+        assert_eq!(mc_physics::TICK_SECONDS, 0.05);
         assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
     }
 
