@@ -33,12 +33,12 @@
 //! pathological setups (lava lakes one chunk over) and we accept
 //! the slight darkening.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use mc_data::block_light::BlockLightTable;
 
 use crate::block::BlockStateId;
-use crate::chunk::{Chunk, MIN_Y, SECTION_COUNT};
+use crate::chunk::{Chunk, ChunkPos, MAX_Y, MIN_Y, SECTION_COUNT};
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
 /// World-height span in blocks (24 sections × 16 blocks).
@@ -127,6 +127,587 @@ impl LightWorkspace {
 impl Default for LightWorkspace {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-connection cache of computed [`ChunkLight`] keyed by
+/// [`ChunkPos`]. Owned by `mc-net::play::InteractionState`, populated
+/// during the spawn-window emit (so each chunk's lighting is computed
+/// exactly once at login), and mutated in place by
+/// [`apply_block_change_to_light`] on subsequent edits.
+///
+/// Memory: ~200 KB per cached chunk × the spawn view-window. With
+/// view distance 10 and a ~21×21 emit, the upper bound is ~17 MB per
+/// connection. Chunks the all-air fast path returned for are *not*
+/// cached (their light is reconstructable on demand) so a fresh-world
+/// connection sits well below that.
+#[derive(Debug, Default, Clone)]
+pub struct LightCache {
+    chunks: HashMap<ChunkPos, ChunkLight>,
+}
+
+impl LightCache {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            chunks: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, pos: ChunkPos, light: ChunkLight) {
+        self.chunks.insert(pos, light);
+    }
+
+    #[must_use]
+    pub fn get(&self, pos: ChunkPos) -> Option<&ChunkLight> {
+        self.chunks.get(&pos)
+    }
+
+    #[must_use]
+    pub fn contains(&self, pos: ChunkPos) -> bool {
+        self.chunks.contains_key(&pos)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.chunks.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn remove(&mut self, pos: ChunkPos) -> Option<ChunkLight> {
+        self.chunks.remove(&pos)
+    }
+}
+
+const NEIGHBOURS: [(i32, i32, i32); 6] = [
+    (-1, 0, 0),
+    (1, 0, 0),
+    (0, -1, 0),
+    (0, 1, 0),
+    (0, 0, -1),
+    (0, 0, 1),
+];
+
+/// Apply a single block change to the light cache, updating both
+/// sky and block light incrementally. Returns the chunk positions
+/// whose stored light arrays were modified — the caller emits one
+/// `ClientboundLightUpdate` per returned position.
+///
+/// The bounded-radius design: light propagates at most 15 cells
+/// from any source, so all light changes from a single edit are
+/// confined to the 3×3 chunks around `centre_pos`. We pull those
+/// nine `ChunkLight` slots out of the cache, mutate them in place
+/// via removal + addition BFS, and put them back.
+///
+/// `chunks` is the post-edit 3×3 chunk neighbourhood with the edit
+/// chunk at `[1][1]`; off-centre slots may be `None` (treated as
+/// air). Light arrays are only modified for chunks whose slot is
+/// present in the cache *and* whose chunk is present in `chunks` —
+/// missing entries are skipped, accepting the same boundary
+/// truncation as the full-recompute path.
+///
+/// Returns an empty list when the change has no possible light
+/// effect (same opacity, emission, and sky propagation in both
+/// states), which short-circuits the whole flow for like-for-like
+/// substitutions.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_block_change_to_light(
+    cache: &mut LightCache,
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    centre_pos: ChunkPos,
+    local_x: u8,
+    world_y: i32,
+    local_z: u8,
+    prev_state: BlockStateId,
+    new_state: BlockStateId,
+) -> Vec<ChunkPos> {
+    debug_assert!(local_x < SECTION_DIM as u8);
+    debug_assert!(local_z < SECTION_DIM as u8);
+    debug_assert!((MIN_Y..MAX_Y).contains(&world_y));
+
+    let prev_emit = table.emission(prev_state.0).unwrap_or(0);
+    let new_emit = table.emission(new_state.0).unwrap_or(0);
+    let prev_op = table.opacity(prev_state.0).unwrap_or(0);
+    let new_op = table.opacity(new_state.0).unwrap_or(0);
+    let prev_sky_pass = table.propagates_sky(prev_state.0).unwrap_or(true);
+    let new_sky_pass = table.propagates_sky(new_state.0).unwrap_or(true);
+
+    if prev_emit == new_emit && prev_op == new_op && prev_sky_pass == new_sky_pass {
+        return Vec::new();
+    }
+
+    let mut window: [[Option<ChunkLight>; 3]; 3] = std::array::from_fn(|dz| {
+        std::array::from_fn(|dx| {
+            let pos = ChunkPos {
+                x: centre_pos.x + (dx as i32 - 1),
+                z: centre_pos.z + (dz as i32 - 1),
+            };
+            cache.chunks.remove(&pos)
+        })
+    });
+    let mut changed = [[false; 3]; 3];
+
+    let world_x = centre_pos.x * SECTION_DIM as i32 + local_x as i32;
+    let world_z = centre_pos.z * SECTION_DIM as i32 + local_z as i32;
+
+    incremental_block_light(
+        &mut window,
+        &mut changed,
+        chunks,
+        table,
+        centre_pos,
+        world_x,
+        world_y,
+        world_z,
+        new_op,
+        new_emit,
+    );
+
+    incremental_sky_light(
+        &mut window,
+        &mut changed,
+        chunks,
+        table,
+        centre_pos,
+        world_x,
+        world_y,
+        world_z,
+        prev_sky_pass,
+        new_sky_pass,
+        new_op,
+    );
+
+    let mut touched = Vec::new();
+    for dz in 0..3 {
+        for dx in 0..3 {
+            if let Some(light) = window[dz][dx].take() {
+                let pos = ChunkPos {
+                    x: centre_pos.x + (dx as i32 - 1),
+                    z: centre_pos.z + (dz as i32 - 1),
+                };
+                if changed[dz][dx] {
+                    touched.push(pos);
+                }
+                cache.chunks.insert(pos, light);
+            }
+        }
+    }
+    touched
+}
+
+/// Window-coordinate triple: `(dx, dz)` index into the 3×3 window
+/// (0..=2) plus local block coords inside that chunk (lx, ly, lz).
+type WCoord = (usize, usize, usize, usize, usize);
+
+#[inline]
+fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WCoord> {
+    if !(MIN_Y..MAX_Y).contains(&wy) {
+        return None;
+    }
+    let cx = wx.div_euclid(SECTION_DIM as i32);
+    let cz = wz.div_euclid(SECTION_DIM as i32);
+    let dx = cx - centre_pos.x;
+    let dz = cz - centre_pos.z;
+    if !(-1..=1).contains(&dx) || !(-1..=1).contains(&dz) {
+        return None;
+    }
+    let lx = wx.rem_euclid(SECTION_DIM as i32) as usize;
+    let lz = wz.rem_euclid(SECTION_DIM as i32) as usize;
+    let ly = (wy - MIN_Y) as usize;
+    Some(((dx + 1) as usize, (dz + 1) as usize, lx, ly, lz))
+}
+
+#[inline]
+fn opacity_at_world(
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    centre_pos: ChunkPos,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+) -> u8 {
+    let Some((dx, dz, lx, _ly, lz)) = world_to_window(centre_pos, wx, wy, wz) else {
+        return 0;
+    };
+    let Some(chunk) = chunks[dz][dx] else {
+        return 0;
+    };
+    let state = chunk
+        .get_block(lx as u8, wy, lz as u8)
+        .unwrap_or(BlockStateId(0));
+    table.opacity(state.0).unwrap_or(0)
+}
+
+#[inline]
+fn propagates_sky_at_world(
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    centre_pos: ChunkPos,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+) -> bool {
+    let Some((dx, dz, lx, _ly, lz)) = world_to_window(centre_pos, wx, wy, wz) else {
+        return true;
+    };
+    let Some(chunk) = chunks[dz][dx] else {
+        return true;
+    };
+    let state = chunk
+        .get_block(lx as u8, wy, lz as u8)
+        .unwrap_or(BlockStateId(0));
+    table.propagates_sky(state.0).unwrap_or(true)
+}
+
+#[inline]
+fn block_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
+    let (dx, dz, lx, ly, lz) = coord;
+    window[dz][dx]
+        .as_ref()
+        .map(|c| c.block[chunk_idx(lx, ly, lz)])
+        .unwrap_or(0)
+}
+
+#[inline]
+fn sky_light_at(window: &[[Option<ChunkLight>; 3]; 3], coord: WCoord) -> u8 {
+    let (dx, dz, lx, ly, lz) = coord;
+    window[dz][dx]
+        .as_ref()
+        .map(|c| c.sky[chunk_idx(lx, ly, lz)])
+        .unwrap_or(0)
+}
+
+#[inline]
+fn set_block_light(
+    window: &mut [[Option<ChunkLight>; 3]; 3],
+    changed: &mut [[bool; 3]; 3],
+    coord: WCoord,
+    v: u8,
+) {
+    let (dx, dz, lx, ly, lz) = coord;
+    if let Some(c) = window[dz][dx].as_mut() {
+        let idx = chunk_idx(lx, ly, lz);
+        if c.block[idx] != v {
+            c.block[idx] = v;
+            changed[dz][dx] = true;
+        }
+    }
+}
+
+#[inline]
+fn set_sky_light(
+    window: &mut [[Option<ChunkLight>; 3]; 3],
+    changed: &mut [[bool; 3]; 3],
+    coord: WCoord,
+    v: u8,
+) {
+    let (dx, dz, lx, ly, lz) = coord;
+    if let Some(c) = window[dz][dx].as_mut() {
+        let idx = chunk_idx(lx, ly, lz);
+        if c.sky[idx] != v {
+            c.sky[idx] = v;
+            changed[dz][dx] = true;
+        }
+    }
+}
+
+/// Removal+addition BFS for block-light around a single edit cell.
+/// `world_x/y/z` is the edit cell in world coords; `new_op` and
+/// `new_emit` are post-edit opacity and emission for that cell.
+#[allow(clippy::too_many_arguments)]
+fn incremental_block_light(
+    window: &mut [[Option<ChunkLight>; 3]; 3],
+    changed: &mut [[bool; 3]; 3],
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    centre_pos: ChunkPos,
+    world_x: i32,
+    world_y: i32,
+    world_z: i32,
+    new_op: u8,
+    new_emit: u8,
+) {
+    let edit_coord = match world_to_window(centre_pos, world_x, world_y, world_z) {
+        Some(c) => c,
+        None => return,
+    };
+    if window[edit_coord.1][edit_coord.0].is_none() {
+        return;
+    }
+
+    let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
+    let mut relight: VecDeque<(i32, i32, i32)> = VecDeque::new();
+
+    let old_self = block_light_at(window, edit_coord);
+    set_block_light(window, changed, edit_coord, new_emit);
+    if old_self > new_emit {
+        removal.push_back((world_x, world_y, world_z, old_self));
+    }
+    if new_emit > 0 {
+        relight.push_back((world_x, world_y, world_z));
+    }
+    // Edit-cell neighbours are always candidate relight seeds: light
+    // propagating *through* the edit cell may now be wrong if opacity
+    // changed.
+    for (dx, dy, dz) in NEIGHBOURS {
+        relight.push_back((world_x + dx, world_y + dy, world_z + dz));
+    }
+
+    while let Some((cx, cy, cz, prev_val)) = removal.pop_front() {
+        for (dx, dy, dz) in NEIGHBOURS {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            let nz = cz + dz;
+            let Some(coord) = world_to_window(centre_pos, nx, ny, nz) else {
+                continue;
+            };
+            if window[coord.1][coord.0].is_none() {
+                continue;
+            }
+            let n_val = block_light_at(window, coord);
+            if n_val == 0 {
+                continue;
+            }
+            // Special-case the edit cell on the *receiving* side: its
+            // opacity is already accounted for via `new_op`, but we
+            // already overwrote its light to `new_emit`, so skip it
+            // (treating it as an independent source).
+            if (nx, ny, nz) == (world_x, world_y, world_z) {
+                relight.push_back((nx, ny, nz));
+                continue;
+            }
+            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let cost = n_op.max(1);
+            if n_val == prev_val.saturating_sub(cost) {
+                set_block_light(window, changed, coord, 0);
+                removal.push_back((nx, ny, nz, n_val));
+            } else {
+                relight.push_back((nx, ny, nz));
+            }
+        }
+    }
+
+    let _ = new_op; // opacity drives BFS via cost; explicit to silence unused
+    while let Some((cx, cy, cz)) = relight.pop_front() {
+        let Some(coord) = world_to_window(centre_pos, cx, cy, cz) else {
+            continue;
+        };
+        if window[coord.1][coord.0].is_none() {
+            continue;
+        }
+        let cur = block_light_at(window, coord);
+        if cur <= 1 {
+            continue;
+        }
+        let best_propagated = cur - 1;
+        for (dx, dy, dz) in NEIGHBOURS {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            let nz = cz + dz;
+            let Some(ncoord) = world_to_window(centre_pos, nx, ny, nz) else {
+                continue;
+            };
+            if window[ncoord.1][ncoord.0].is_none() {
+                continue;
+            }
+            // M9.f early-skip: skip the opacity lookup if the neighbour
+            // is already at the best possible level we could push.
+            if block_light_at(window, ncoord) >= best_propagated {
+                continue;
+            }
+            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let cost = n_op.max(1);
+            let propagated = cur.saturating_sub(cost);
+            if propagated > block_light_at(window, ncoord) {
+                set_block_light(window, changed, ncoord, propagated);
+                relight.push_back((nx, ny, nz));
+            }
+        }
+    }
+}
+
+/// Removal+addition BFS for sky-light, with column re-seed when the
+/// edit cell's `propagates_sky` flag changed.
+///
+/// Sky-light's "source" is the top of every open column. When
+/// `propagates_sky` flips at the edit cell, columns above and below
+/// may need their direct-15 status recomputed within the affected
+/// 31×31 footprint. We do this re-seeding implicitly via the
+/// removal/addition BFS plus a column walk anchored at the edit
+/// cell.
+#[allow(clippy::too_many_arguments)]
+fn incremental_sky_light(
+    window: &mut [[Option<ChunkLight>; 3]; 3],
+    changed: &mut [[bool; 3]; 3],
+    chunks: &[[Option<&Chunk>; 3]; 3],
+    table: &BlockLightTable,
+    centre_pos: ChunkPos,
+    world_x: i32,
+    world_y: i32,
+    world_z: i32,
+    prev_sky_pass: bool,
+    new_sky_pass: bool,
+    new_op: u8,
+) {
+    let edit_coord = match world_to_window(centre_pos, world_x, world_y, world_z) {
+        Some(c) => c,
+        None => return,
+    };
+    if window[edit_coord.1][edit_coord.0].is_none() {
+        return;
+    }
+
+    let mut removal: VecDeque<(i32, i32, i32, u8)> = VecDeque::new();
+    let mut relight: VecDeque<(i32, i32, i32)> = VecDeque::new();
+
+    // What's the new "ceiling" sky value at the edit cell?
+    // = 15 if propagates_sky now AND every cell directly above
+    //   propagates sky too; else 0 (BFS will re-propagate from
+    //   neighbours).
+    let new_self = if new_sky_pass {
+        let mut all_open = true;
+        for y in (world_y + 1)..MAX_Y {
+            if !propagates_sky_at_world(chunks, table, centre_pos, world_x, y, world_z) {
+                all_open = false;
+                break;
+            }
+        }
+        if all_open { 15 } else { 0 }
+    } else {
+        0
+    };
+
+    let old_self = sky_light_at(window, edit_coord);
+    set_sky_light(window, changed, edit_coord, new_self);
+    if old_self > new_self {
+        removal.push_back((world_x, world_y, world_z, old_self));
+    }
+    if new_self > 0 {
+        relight.push_back((world_x, world_y, world_z));
+    }
+
+    // Column propagation: if propagates_sky flipped at the edit cell,
+    // cells *below* may need their 15-status recomputed (they were
+    // direct-sky if and only if every cell from MAX_Y down to them
+    // propagates sky). Walk down from the edit cell, updating each
+    // cell's sky to 15 if the column is now open, or to 0 if it just
+    // closed; queue removal/relight accordingly. Stop at the first
+    // opaque cell or once we hit any cell whose new value matches its
+    // old.
+    if prev_sky_pass != new_sky_pass {
+        let column_open_above_self = new_self == 15;
+        for y in (MIN_Y..world_y).rev() {
+            let Some(coord) = world_to_window(centre_pos, world_x, y, world_z) else {
+                break;
+            };
+            if window[coord.1][coord.0].is_none() {
+                break;
+            }
+            let cell_passes =
+                propagates_sky_at_world(chunks, table, centre_pos, world_x, y, world_z);
+            if !cell_passes {
+                break;
+            }
+            let new_val = if column_open_above_self {
+                // Walking down through an open column: sky stays at 15.
+                15
+            } else {
+                // Edit cell now blocks (or column was already blocked):
+                // direct-sky path is gone. Drop to 0; relight BFS will
+                // refill from neighbours where applicable.
+                0
+            };
+            let old = sky_light_at(window, coord);
+            if old == new_val {
+                break;
+            }
+            set_sky_light(window, changed, coord, new_val);
+            if old > new_val {
+                removal.push_back((world_x, y, world_z, old));
+            }
+            if new_val > 0 {
+                relight.push_back((world_x, y, world_z));
+            }
+        }
+    }
+
+    // Edit-cell neighbours always candidate seeds — sky pushed
+    // through the edit cell may now be wrong.
+    for (dx, dy, dz) in NEIGHBOURS {
+        relight.push_back((world_x + dx, world_y + dy, world_z + dz));
+    }
+
+    while let Some((cx, cy, cz, prev_val)) = removal.pop_front() {
+        for (dx, dy, dz) in NEIGHBOURS {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            let nz = cz + dz;
+            let Some(coord) = world_to_window(centre_pos, nx, ny, nz) else {
+                continue;
+            };
+            if window[coord.1][coord.0].is_none() {
+                continue;
+            }
+            let n_val = sky_light_at(window, coord);
+            if n_val == 0 {
+                continue;
+            }
+            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let cost = n_op.max(1);
+            // Sky vertical-down cost is 0 when the source was at 15
+            // and the neighbour passes sky — that's the "direct sky
+            // column" case. The current `bfs` cost rule already
+            // models this with cost = max(1, opacity); the column
+            // re-seed above is what handles the 15-passes-through
+            // case explicitly. So removal here uses the same cost.
+            if n_val == prev_val.saturating_sub(cost) {
+                set_sky_light(window, changed, coord, 0);
+                removal.push_back((nx, ny, nz, n_val));
+            } else {
+                relight.push_back((nx, ny, nz));
+            }
+        }
+    }
+
+    let _ = new_op;
+    while let Some((cx, cy, cz)) = relight.pop_front() {
+        let Some(coord) = world_to_window(centre_pos, cx, cy, cz) else {
+            continue;
+        };
+        if window[coord.1][coord.0].is_none() {
+            continue;
+        }
+        let cur = sky_light_at(window, coord);
+        if cur <= 1 {
+            continue;
+        }
+        let best_propagated = cur - 1;
+        for (dx, dy, dz) in NEIGHBOURS {
+            let nx = cx + dx;
+            let ny = cy + dy;
+            let nz = cz + dz;
+            let Some(ncoord) = world_to_window(centre_pos, nx, ny, nz) else {
+                continue;
+            };
+            if window[ncoord.1][ncoord.0].is_none() {
+                continue;
+            }
+            if sky_light_at(window, ncoord) >= best_propagated {
+                continue;
+            }
+            let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
+            let cost = n_op.max(1);
+            let propagated = cur.saturating_sub(cost);
+            if propagated > sky_light_at(window, ncoord) {
+                set_sky_light(window, changed, ncoord, propagated);
+                relight.push_back((nx, ny, nz));
+            }
+        }
     }
 }
 
@@ -344,6 +925,12 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
             (0, 0, -1),
             (0, 0, 1),
         ];
+        // M9.f early-skip (Starlight trick): best-case propagation is
+        // `current - 1` when opacity == 1. If the neighbour already
+        // sits at that level or higher, the opacity lookup + cost
+        // math can't improve it — skip the read entirely. Saves
+        // ~5–6× block-state-equivalent reads in dense regions.
+        let best_propagated = current.saturating_sub(1);
         for (dx, dy, dz) in neighbours {
             let nx = gx as isize + dx;
             let ny = ly as isize + dy;
@@ -358,6 +945,9 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
                 continue;
             }
             let nidx = grid_idx(nx as usize, ny as usize, nz as usize);
+            if values[nidx] >= best_propagated {
+                continue;
+            }
             let cost = opacity[nidx].max(1);
             let candidate = current.saturating_sub(cost);
             if candidate > values[nidx] {
@@ -618,6 +1208,377 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // ===== M9.a-c: incremental relight tests =====
+
+    fn full_recompute(
+        neighbourhood: [[Option<&Chunk>; 3]; 3],
+        table: &BlockLightTable,
+    ) -> ChunkLight {
+        compute_chunk_light(neighbourhood, table)
+    }
+
+    fn seed_cache_from_full(
+        cache: &mut LightCache,
+        chunks: &[(ChunkPos, &Chunk)],
+        table: &BlockLightTable,
+    ) {
+        // Seed each chunk's light by running a full compute with its
+        // 3×3 neighbourhood drawn from the provided chunk list.
+        let by_pos: HashMap<ChunkPos, &Chunk> = chunks.iter().map(|&(p, c)| (p, c)).collect();
+        for &(pos, _) in chunks {
+            let mut nbh: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+            for dz in -1i32..=1 {
+                for dx in -1i32..=1 {
+                    let np = ChunkPos {
+                        x: pos.x + dx,
+                        z: pos.z + dz,
+                    };
+                    nbh[(dz + 1) as usize][(dx + 1) as usize] = by_pos.get(&np).copied();
+                }
+            }
+            let light = full_recompute(nbh, table);
+            cache.insert(pos, light);
+        }
+    }
+
+    fn assert_light_eq(actual: &ChunkLight, expected: &ChunkLight, tag: &str) {
+        for ly in 0..WORLD_HEIGHT {
+            for lz in 0..SECTION_DIM {
+                for lx in 0..SECTION_DIM {
+                    let idx = chunk_idx(lx, ly, lz);
+                    assert_eq!(
+                        actual.sky[idx], expected.sky[idx],
+                        "{tag}: sky mismatch at ({lx},{ly},{lz}): inc={} full={}",
+                        actual.sky[idx], expected.sky[idx],
+                    );
+                    assert_eq!(
+                        actual.block[idx], expected.block[idx],
+                        "{tag}: block mismatch at ({lx},{ly},{lz}): inc={} full={}",
+                        actual.block[idx], expected.block[idx],
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_no_op_for_like_for_like_swap() {
+        let table = tiny_table();
+        let chunk = air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &chunk)], &table);
+
+        // Place air on air — opacity, emission, propagates_sky all
+        // unchanged. Should return empty touched list and not mutate
+        // the cache.
+        let touched = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&chunk), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            64,
+            8,
+            BlockStateId(0),
+            BlockStateId(0),
+        );
+        assert!(touched.is_empty());
+    }
+
+    #[test]
+    fn incremental_place_glowstone_in_air() {
+        let table = tiny_table();
+        let pre = air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        // Apply: place glowstone (3) at (8, 64, 8). Build the
+        // post-edit chunk and feed both into the incremental update.
+        let mut post = pre.clone();
+        post.set_block(8, 64, 8, BlockStateId(3));
+        let touched = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            64,
+            8,
+            BlockStateId(0),
+            BlockStateId(3),
+        );
+        assert_eq!(touched, vec![pos]);
+
+        let inc = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_light_eq(inc, &full, "place glowstone");
+    }
+
+    #[test]
+    fn incremental_remove_glowstone() {
+        let table = tiny_table();
+        let mut pre = air_chunk();
+        pre.set_block(8, 64, 8, BlockStateId(3));
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        let mut post = pre.clone();
+        post.set_block(8, 64, 8, BlockStateId(0));
+        let _ = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            64,
+            8,
+            BlockStateId(3),
+            BlockStateId(0),
+        );
+
+        let inc = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_light_eq(inc, &full, "remove glowstone");
+    }
+
+    #[test]
+    fn incremental_place_stone_blocks_sky() {
+        let table = tiny_table();
+        let pre = air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        // Place stone (1) at (8, 100, 8) — opaque, blocks sky.
+        let mut post = pre.clone();
+        post.set_block(8, 100, 8, BlockStateId(1));
+        let _ = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            100,
+            8,
+            BlockStateId(0),
+            BlockStateId(1),
+        );
+
+        let inc = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_light_eq(inc, &full, "place stone in air");
+    }
+
+    #[test]
+    fn incremental_break_stone_in_solid_column() {
+        let table = tiny_table();
+        // Build a stone column at (8, *, 8) from MIN_Y..=64.
+        let mut pre = air_chunk();
+        for y in (MIN_Y + 1)..=64 {
+            pre.set_block(8, y, 8, BlockStateId(1));
+        }
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        // Break the stone at (8, 64, 8) — column top, so sky now
+        // pours into a 1-cell pocket but doesn't reach further down
+        // (cells below are still stone).
+        let mut post = pre.clone();
+        post.set_block(8, 64, 8, BlockStateId(0));
+        let _ = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            64,
+            8,
+            BlockStateId(1),
+            BlockStateId(0),
+        );
+
+        let inc = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_light_eq(inc, &full, "break stone column top");
+    }
+
+    #[test]
+    fn incremental_edit_at_chunk_seam_propagates() {
+        let table = tiny_table();
+        let pre_centre = air_chunk();
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let pre_east = Chunk::empty(ChunkPos { x: 1, z: 0 }, BlockStateId(0), plains.clone());
+
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let epos = ChunkPos { x: 1, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(
+            &mut cache,
+            &[(cpos, &pre_centre), (epos, &pre_east)],
+            &table,
+        );
+
+        // Place glowstone at the east edge of the centre chunk:
+        // (15, 64, 8). Light should ripple into the east neighbour.
+        let mut post_centre = pre_centre.clone();
+        post_centre.set_block(15, 64, 8, BlockStateId(3));
+        let post_east = pre_east.clone();
+        let touched = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post_centre), Some(&post_east)],
+                [None, None, None],
+            ],
+            &table,
+            cpos,
+            15,
+            64,
+            8,
+            BlockStateId(0),
+            BlockStateId(3),
+        );
+        assert!(touched.contains(&cpos), "centre chunk should be touched");
+        assert!(touched.contains(&epos), "east neighbour should be touched");
+
+        let inc_centre = cache.get(cpos).unwrap();
+        let inc_east = cache.get(epos).unwrap();
+        let full_centre = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post_centre), Some(&post_east)],
+                [None, None, None],
+            ],
+            &table,
+        );
+        let full_east = full_recompute(
+            [
+                [None, None, None],
+                [Some(&post_centre), Some(&post_east), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_light_eq(inc_centre, &full_centre, "centre after seam edit");
+        assert_light_eq(inc_east, &full_east, "east after seam edit");
+    }
+
+    #[test]
+    fn incremental_random_edit_sequence_matches_full_recompute() {
+        // Deterministic pseudo-random edit sequence inside one chunk;
+        // after each edit, assert the cached light equals a full
+        // recompute on the post-edit chunk. Block states limited to
+        // {air=0, stone=1, glowstone=3}.
+        let table = tiny_table();
+        let mut chunk = air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &chunk)], &table);
+
+        // Simple LCG.
+        let mut s: u32 = 0xdeadbeef;
+        let mut next = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s
+        };
+
+        for _ in 0..40 {
+            let lx = (next() % 16) as u8;
+            let lz = (next() % 16) as u8;
+            // Restrict Y to a thin band so sky-light interactions stay
+            // testable but the sequence converges.
+            let world_y = 60 + (next() % 8) as i32;
+            let new_state_choices = [BlockStateId(0), BlockStateId(1), BlockStateId(3)];
+            let new_state = new_state_choices[(next() as usize) % 3];
+
+            let prev = chunk.get_block(lx, world_y, lz).unwrap_or(BlockStateId(0));
+            chunk.set_block(lx, world_y, lz, new_state);
+
+            apply_block_change_to_light(
+                &mut cache,
+                &[
+                    [None, None, None],
+                    [None, Some(&chunk), None],
+                    [None, None, None],
+                ],
+                &table,
+                pos,
+                lx,
+                world_y,
+                lz,
+                prev,
+                new_state,
+            );
+
+            let inc = cache.get(pos).unwrap().clone();
+            let full = full_recompute(
+                [
+                    [None, None, None],
+                    [None, Some(&chunk), None],
+                    [None, None, None],
+                ],
+                &table,
+            );
+            assert_light_eq(
+                &inc,
+                &full,
+                &format!("random edit ({lx},{world_y},{lz}) -> {}", new_state.0),
+            );
         }
     }
 }

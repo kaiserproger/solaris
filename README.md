@@ -6,17 +6,25 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M8 complete on `dev/M8-polish-carryovers`, awaiting
-`m8` tag. A vanilla 26.1.2 client connecting to Solaris walks the
+**Status:** M9 complete on `dev/M9-incremental-relight`, awaiting
+`m9` tag. A vanilla 26.1.2 client connecting to Solaris walks the
 full Handshake → Login → Configuration → Play sequence, receives
 the streamed spawn-area chunks lit by `mc_world::light`'s BFS
 engine (M4), can **break and place blocks** (M5), sees those
 edits **persist** across restarts (M6), walks in any direction
-on infinite hill-noise terrain (M7) — and the **spawn burst
-now starts at the player's chunk** (M8) and fills outwards in
-chebyshev rings, so the spawn tile renders first. Single plains
-biome, no caves / ores / structures; incremental relight + Set
-Compression are M9+ polish items.
+on infinite hill-noise terrain (M7), and the spawn burst starts
+at the player's chunk and fills outwards in chebyshev rings (M8).
+Edits now also drive an **incremental relight** (M9): a single
+break/place runs a bounded BFS over a 3×3-chunk window instead
+of recomputing the full 5-chunk neighbourhood, and emits only
+the `LightUpdate` packets for chunks whose arrays actually
+changed — wire-byte-identical to a fresh full recompute. The
+BFS uses Starlight's early-skip shortcut (skip the opacity
+lookup when the neighbour is already at the best propagatable
+level), cutting block-state reads roughly 5–6× in dense
+regions. Single plains biome, no caves / ores / structures;
+per-section nibble storage, heightmap-driven sky reseed, Set
+Compression and LZ4 chunk read remain M10+ polish items.
 
 ## Build
 
