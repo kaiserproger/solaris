@@ -547,6 +547,57 @@ impl Packet for GameEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientboundPlayerAbilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub can_fly: bool,
+    pub instabuild: bool,
+    pub flying_speed: f32,
+    pub walking_speed: f32,
+}
+
+impl Packet for ClientboundPlayerAbilities {
+    // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_PLAYER_ABILITIES
+    // is game-CB index 64 = wire id 0x40. `javap -p -c
+    // ClientboundPlayerAbilitiesPacket` shows one flags byte
+    // (1=invulnerable, 2=flying, 4=canFly, 8=instabuild), then f32
+    // flying speed and f32 walking speed.
+    const ID: i32 = 0x40;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        let mut flags = 0_u8;
+        if self.invulnerable {
+            flags |= 0x01;
+        }
+        if self.flying {
+            flags |= 0x02;
+        }
+        if self.can_fly {
+            flags |= 0x04;
+        }
+        if self.instabuild {
+            flags |= 0x08;
+        }
+        buf.write_u8(flags);
+        buf.write_f32(self.flying_speed);
+        buf.write_f32(self.walking_speed);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let flags = buf.read_u8()?;
+        Ok(Self {
+            invulnerable: flags & 0x01 != 0,
+            flying: flags & 0x02 != 0,
+            can_fly: flags & 0x04 != 0,
+            instabuild: flags & 0x08 != 0,
+            flying_speed: buf.read_f32()?,
+            walking_speed: buf.read_f32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct EntityVec3 {
     pub x: f64,
     pub y: f64,
@@ -2773,6 +2824,31 @@ mod tests {
 
         let mut cursor: &[u8] = &buf;
         assert_eq!(ServerboundChatCommand::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn player_abilities_id_and_wire_layout_match_javap() {
+        assert_eq!(ClientboundPlayerAbilities::ID, 0x40);
+        let packet = ClientboundPlayerAbilities {
+            invulnerable: true,
+            flying: false,
+            can_fly: true,
+            instabuild: true,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf[0], 0x0d);
+        assert_eq!(&buf[1..5], &0.05_f32.to_be_bytes());
+        assert_eq!(&buf[5..9], &0.1_f32.to_be_bytes());
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundPlayerAbilities::decode(&mut cursor).unwrap(),
+            packet
+        );
         assert!(cursor.is_empty());
     }
 

@@ -31,17 +31,17 @@ use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
-    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
-    ConfirmTeleportation, EntityAnimation, EntityAnimationAction, EntityPositionSync, EntityVec3,
-    ForgetLevelChunk, GameEvent, GameMode, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
-    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
-    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundChangeGameMode,
-    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundPlayerAbilities,
+    ClientboundSetHeldSlot, ConfirmTeleportation, EntityAnimation, EntityAnimationAction,
+    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ItemStack,
+    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags,
+    PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
+    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
+    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSetCarriedItem,
+    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -3211,7 +3211,37 @@ where
         },
         compression,
     )
-    .await
+    .await?;
+    write_packet(writer, &player_abilities_for_mode(requested), compression).await
+}
+
+fn player_abilities_for_mode(mode: GameMode) -> ClientboundPlayerAbilities {
+    match mode {
+        GameMode::Creative => ClientboundPlayerAbilities {
+            invulnerable: true,
+            flying: false,
+            can_fly: true,
+            instabuild: true,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        },
+        GameMode::Spectator => ClientboundPlayerAbilities {
+            invulnerable: true,
+            flying: true,
+            can_fly: true,
+            instabuild: false,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        },
+        GameMode::Survival | GameMode::Adventure => ClientboundPlayerAbilities {
+            invulnerable: false,
+            flying: false,
+            can_fly: false,
+            instabuild: false,
+            flying_speed: 0.05,
+            walking_speed: 0.1,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -3266,6 +3296,33 @@ mod tests {
         let permissions = CommandPermissions::for_local_dev_profile(&profile);
 
         assert!(permissions.can_change_game_mode());
+    }
+
+    #[test]
+    fn creative_and_spectator_modes_grant_client_abilities() {
+        let creative = player_abilities_for_mode(GameMode::Creative);
+        assert!(creative.invulnerable);
+        assert!(creative.can_fly);
+        assert!(creative.instabuild);
+        assert!(!creative.flying);
+
+        let spectator = player_abilities_for_mode(GameMode::Spectator);
+        assert!(spectator.invulnerable);
+        assert!(spectator.can_fly);
+        assert!(spectator.flying);
+        assert!(!spectator.instabuild);
+    }
+
+    #[test]
+    fn survival_like_modes_revoke_client_abilities() {
+        let survival = player_abilities_for_mode(GameMode::Survival);
+        assert!(!survival.invulnerable);
+        assert!(!survival.can_fly);
+        assert!(!survival.instabuild);
+        assert!(!survival.flying);
+
+        let adventure = player_abilities_for_mode(GameMode::Adventure);
+        assert_eq!(survival, adventure);
     }
 
     #[test]
