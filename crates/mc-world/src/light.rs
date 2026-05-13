@@ -504,6 +504,7 @@ fn incremental_block_light(
         if cur <= 1 {
             continue;
         }
+        let best_propagated = cur - 1;
         for (dx, dy, dz) in NEIGHBOURS {
             let nx = cx + dx;
             let ny = cy + dy;
@@ -512,6 +513,11 @@ fn incremental_block_light(
                 continue;
             };
             if window[ncoord.1][ncoord.0].is_none() {
+                continue;
+            }
+            // M9.f early-skip: skip the opacity lookup if the neighbour
+            // is already at the best possible level we could push.
+            if block_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
             let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
@@ -680,6 +686,7 @@ fn incremental_sky_light(
         if cur <= 1 {
             continue;
         }
+        let best_propagated = cur - 1;
         for (dx, dy, dz) in NEIGHBOURS {
             let nx = cx + dx;
             let ny = cy + dy;
@@ -688,6 +695,9 @@ fn incremental_sky_light(
                 continue;
             };
             if window[ncoord.1][ncoord.0].is_none() {
+                continue;
+            }
+            if sky_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
             let n_op = opacity_at_world(chunks, table, centre_pos, nx, ny, nz);
@@ -915,6 +925,12 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
             (0, 0, -1),
             (0, 0, 1),
         ];
+        // M9.f early-skip (Starlight trick): best-case propagation is
+        // `current - 1` when opacity == 1. If the neighbour already
+        // sits at that level or higher, the opacity lookup + cost
+        // math can't improve it — skip the read entirely. Saves
+        // ~5–6× block-state-equivalent reads in dense regions.
+        let best_propagated = current.saturating_sub(1);
         for (dx, dy, dz) in neighbours {
             let nx = gx as isize + dx;
             let ny = ly as isize + dy;
@@ -929,6 +945,9 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
                 continue;
             }
             let nidx = grid_idx(nx as usize, ny as usize, nz as usize);
+            if values[nidx] >= best_propagated {
+                continue;
+            }
             let cost = opacity[nidx].max(1);
             let candidate = current.saturating_sub(cost);
             if candidate > values[nidx] {
