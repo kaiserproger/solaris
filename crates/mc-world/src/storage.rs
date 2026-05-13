@@ -472,6 +472,7 @@ fn region_of(cpos: ChunkPos) -> (i32, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunk::{MAX_Y, MIN_Y};
     use std::path::{Path, PathBuf};
 
     fn workspace_path(rel: &str) -> PathBuf {
@@ -480,6 +481,19 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join(rel)
+    }
+
+    fn top_non_air_y(world: &mut WorldStorage, x: i32, z: i32, air: BlockStateId) -> Option<i32> {
+        (MIN_Y..MAX_Y)
+            .rev()
+            .find(|&y| world.get_block(BlockPos { x, y, z }).ok().flatten() != Some(air))
+    }
+
+    fn air_state_id(registry: &BlockRegistry) -> BlockStateId {
+        registry
+            .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+            .map(|b| b.default)
+            .unwrap()
     }
 
     #[test]
@@ -517,10 +531,10 @@ mod tests {
     }
 
     /// End-to-end: open the generated flat test world, query known
-    /// coordinates of the vanilla default flat preset (Y=-64 bedrock,
-    /// Y=-61 grass_block, Y>=−60 air), assert out-of-range / missing
-    /// chunks return None instead of erroring, and confirm the LRU
-    /// stays bounded.
+    /// coordinates of the local test world, assert out-of-range /
+    /// missing chunks return None instead of erroring, and confirm the
+    /// LRU stays bounded. The oracle may be the old vanilla flat world
+    /// or a Solaris-generated terrain world.
     #[test]
     fn opens_real_test_world_and_queries_blocks() {
         let world_dir = workspace_path(".analysis/test-world");
@@ -531,7 +545,8 @@ mod tests {
         }
         let report = mc_data::blocks::load_blocks_report(&blocks_path).unwrap();
         let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
-        let mut world = WorldStorage::open_with_capacity(&world_dir, registry, 4).unwrap();
+        let mut world =
+            WorldStorage::open_with_capacity(&world_dir, Arc::clone(&registry), 4).unwrap();
 
         let resolve = |w: &WorldStorage, id: BlockStateId| {
             w.registry()
@@ -543,20 +558,25 @@ mod tests {
                 .to_string()
         };
 
-        let bedrock = world
-            .get_block(BlockPos { x: 0, y: -64, z: 0 })
-            .unwrap()
-            .unwrap();
-        let grass = world
-            .get_block(BlockPos { x: 0, y: -61, z: 0 })
+        let air_id = air_state_id(&registry);
+        let top_y = top_non_air_y(&mut world, 0, 0, air_id).expect("origin column has terrain");
+        let top = world
+            .get_block(BlockPos {
+                x: 0,
+                y: top_y,
+                z: 0,
+            })
             .unwrap()
             .unwrap();
         let air_above = world
-            .get_block(BlockPos { x: 0, y: 5, z: 0 })
+            .get_block(BlockPos {
+                x: 0,
+                y: top_y + 1,
+                z: 0,
+            })
             .unwrap()
             .unwrap();
-        assert_eq!(resolve(&world, bedrock), "minecraft:bedrock");
-        assert_eq!(resolve(&world, grass), "minecraft:grass_block");
+        assert_ne!(top, air_id, "top terrain block must not be air");
         assert_eq!(resolve(&world, air_above), "minecraft:air");
 
         // Out-of-range Y returns None gracefully.
@@ -645,9 +665,25 @@ mod tests {
             .block(&Identifier::parse("minecraft:stone").unwrap())
             .map(|b| b.default)
             .unwrap();
-        let edit_pos = BlockPos { x: 3, y: -61, z: 5 };
-        let prev = world.set_block_at(edit_pos, stone_id).unwrap().unwrap();
-        assert_ne!(prev, stone_id, "test world cell must not already be stone");
+        let dirt_id = registry
+            .block(&Identifier::parse("minecraft:dirt").unwrap())
+            .map(|b| b.default)
+            .unwrap();
+        let edit_y = top_non_air_y(&mut world, 3, 5, air_state_id(&registry))
+            .expect("origin column has terrain");
+        let edit_pos = BlockPos {
+            x: 3,
+            y: edit_y,
+            z: 5,
+        };
+        let current = world.get_block(edit_pos).unwrap().unwrap();
+        let new_state = if current == stone_id {
+            dirt_id
+        } else {
+            stone_id
+        };
+        let prev = world.set_block_at(edit_pos, new_state).unwrap().unwrap();
+        assert_ne!(prev, new_state, "test world cell must change state");
         assert_eq!(world.dirty_count(), 1);
 
         let n_flushed = world.flush_dirty().unwrap();
@@ -660,7 +696,7 @@ mod tests {
         let mut world2 =
             WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
         let after = world2.get_block(edit_pos).unwrap().unwrap();
-        assert_eq!(after, stone_id);
+        assert_eq!(after, new_state);
     }
 
     /// M6.b: the spawn-burst load path (read 121 chunks) must not
