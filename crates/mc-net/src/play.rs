@@ -1342,11 +1342,13 @@ where
                 stream.log_summary();
             }
             chunk_stream = None;
+            last_response_at = Instant::now();
+            pending_id = None;
         }
 
         tokio::select! {
             biased;
-            _ = ticker.tick() => {
+            _ = ticker.tick(), if chunk_stream.is_none() => {
                 if last_response_at.elapsed() > KEEPALIVE_TIMEOUT {
                     warn!(
                         elapsed_ms = last_response_at.elapsed().as_millis() as u64,
