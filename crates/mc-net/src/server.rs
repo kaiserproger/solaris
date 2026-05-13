@@ -88,6 +88,7 @@ pub struct ServerConfig {
 pub struct BoundServer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
 }
 
 impl BoundServer {
@@ -107,12 +108,14 @@ impl BoundServer {
             "Solaris is listening"
         );
         let config = self.config;
+        let sessions = self.sessions;
         loop {
             let (socket, peer) = self.listener.accept().await?;
             debug!(%peer, "accepted connection");
             let config = config.clone();
+            let sessions = Arc::clone(&sessions);
             tokio::spawn(async move {
-                if let Err(err) = handle_connection(socket, &config).await {
+                if let Err(err) = handle_connection(socket, &config, sessions).await {
                     match err {
                         err if is_client_disconnect(&err) => {
                             debug!(%peer, "client disconnected");
@@ -150,6 +153,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     Ok(BoundServer {
         listener,
         config: Arc::new(config),
+        sessions: Arc::new(play::SessionRegistry::new()),
     })
 }
 
@@ -161,6 +165,7 @@ pub async fn run(config: ServerConfig) -> std::io::Result<()> {
 async fn handle_connection(
     socket: tokio::net::TcpStream,
     config: &ServerConfig,
+    sessions: Arc<play::SessionRegistry>,
 ) -> Result<(), ConnectionError> {
     // Disable Nagle for low-latency interactive packets — same setting
     // vanilla uses.
@@ -213,6 +218,7 @@ async fn handle_connection(
                 compression,
                 &profile,
                 config,
+                sessions,
             )
             .await
         }

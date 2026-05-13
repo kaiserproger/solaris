@@ -25,8 +25,8 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LevelChunkWithLight, LoginPlay,
-    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
+    ClientboundKeepAlive, ConfirmTeleportation, ForgetLevelChunk, GameEvent, LevelChunkWithLight,
+    LoginPlay, MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
     SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
@@ -340,7 +340,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
 
     client
         .write_packet(&ServerboundMovePlayerPos {
-            x: 16.5,
+            x: 48.5,
             y: sync.y,
             z: 0.5,
             flags: MovePlayerFlags::new(true, false),
@@ -351,8 +351,9 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     let timeout = Duration::from_secs(180);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut saw_new_center = false;
+    let mut saw_unload = false;
     let mut saw_new_strip_chunk = false;
-    while !saw_new_strip_chunk {
+    while !(saw_unload && saw_new_strip_chunk) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let frame = client
             .read_frame_with_timeout(remaining)
@@ -370,8 +371,16 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         if frame.id == SetCenterChunk::ID {
             let mut body = frame.body;
             let center = SetCenterChunk::decode(&mut body).expect("decode SetCenterChunk");
-            if (center.chunk_x, center.chunk_z) == (1, 0) {
+            if (center.chunk_x, center.chunk_z) == (3, 0) {
                 saw_new_center = true;
+            }
+            continue;
+        }
+        if frame.id == ForgetLevelChunk::ID {
+            let mut body = frame.body;
+            let unload = ForgetLevelChunk::decode(&mut body).expect("decode ForgetLevelChunk");
+            if (unload.chunk_x, unload.chunk_z) == (0, 0) {
+                saw_unload = true;
             }
             continue;
         }
@@ -380,12 +389,13 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         }
         let mut body = frame.body;
         let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
-        if (pkt.chunk_x, pkt.chunk_z) == (MOVEMENT_VIEW_DISTANCE + 1, 0) {
+        if (pkt.chunk_x, pkt.chunk_z) == (3 + MOVEMENT_VIEW_DISTANCE, 0) {
             saw_new_strip_chunk = true;
         }
     }
 
-    assert!(saw_new_center, "movement must send SetCenterChunk(1, 0)");
+    assert!(saw_new_center, "movement must send SetCenterChunk(3, 0)");
+    assert!(saw_unload, "movement must unload a chunk that left view");
 }
 
 /// M4.f: every streamed chunk must carry a wire LightData whose

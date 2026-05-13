@@ -18,7 +18,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
@@ -31,12 +31,12 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHeldSlot,
-    ConfirmTeleportation, GameEvent, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, MovePlayerFlags, PlayerActionKind, SectionBlockChange, SectionBlocksUpdate,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
-    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
-    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
-    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ConfirmTeleportation, ForgetLevelChunk, GameEvent, ItemStack, LevelChunkWithLight, LightData,
+    LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind, SectionBlockChange,
+    SectionBlocksUpdate, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
+    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -77,6 +77,210 @@ const SPAWN_Z: f64 = 0.5;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
+
+type SessionId = u64;
+
+#[derive(Debug, Clone)]
+enum OutboundCommand {
+    BlockDeltas(Vec<BlockDelta>),
+    LightUpdates(Vec<OutboundLightUpdate>),
+}
+
+#[derive(Debug, Clone)]
+struct OutboundLightUpdate {
+    pos: ChunkPos,
+    light: ChunkLight,
+    wire: LightData,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRecipient {
+    id: SessionId,
+    tx: mpsc::Sender<OutboundCommand>,
+}
+
+#[derive(Debug)]
+struct PlaySession {
+    name: String,
+    center: (i32, i32),
+    view_distance: i32,
+    desired: HashSet<(i32, i32)>,
+    loaded: HashSet<(i32, i32)>,
+    tx: mpsc::Sender<OutboundCommand>,
+}
+
+#[derive(Debug, Default)]
+struct SessionRegistryInner {
+    next_id: SessionId,
+    sessions: HashMap<SessionId, PlaySession>,
+    tickets: HashMap<(i32, i32), HashSet<SessionId>>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct SessionRegistry {
+    inner: Mutex<SessionRegistryInner>,
+}
+
+impl SessionRegistry {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(
+        &self,
+        profile: &LoggedInProfile,
+        center: (i32, i32),
+        view_distance: i32,
+        desired: HashSet<(i32, i32)>,
+        tx: mpsc::Sender<OutboundCommand>,
+    ) -> SessionId {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        inner.next_id = inner.next_id.wrapping_add(1).max(1);
+        let id = inner.next_id;
+        for &chunk in &desired {
+            inner.tickets.entry(chunk).or_default().insert(id);
+        }
+        inner.sessions.insert(
+            id,
+            PlaySession {
+                name: profile.name.clone(),
+                center,
+                view_distance,
+                desired,
+                loaded: HashSet::new(),
+                tx,
+            },
+        );
+        debug!(
+            session_id = id,
+            player = %profile.name,
+            center_cx = center.0,
+            center_cz = center.1,
+            view_distance,
+            sessions = inner.sessions.len(),
+            tickets = inner.tickets.len(),
+            "play session registered"
+        );
+        id
+    }
+
+    fn unregister(&self, id: SessionId) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let Some(session) = inner.sessions.remove(&id) else {
+            return;
+        };
+        let desired_len = session.desired.len();
+        let loaded_len = session.loaded.len();
+        for chunk in session.desired {
+            remove_ticket(&mut inner.tickets, chunk, id);
+        }
+        debug!(
+            session_id = id,
+            player = %session.name,
+            desired = desired_len,
+            loaded = loaded_len,
+            sessions = inner.sessions.len(),
+            tickets = inner.tickets.len(),
+            "play session unregistered"
+        );
+    }
+
+    fn replace_view(&self, id: SessionId, center: (i32, i32), desired: HashSet<(i32, i32)>) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let (released, acquired, desired_len, view_distance) = {
+            let Some(session) = inner.sessions.get_mut(&id) else {
+                return;
+            };
+            let old = std::mem::replace(&mut session.desired, desired);
+            session.center = center;
+            (
+                old.difference(&session.desired)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                session
+                    .desired
+                    .difference(&old)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                session.desired.len(),
+                session.view_distance,
+            )
+        };
+
+        for chunk in released {
+            remove_ticket(&mut inner.tickets, chunk, id);
+        }
+        for chunk in acquired {
+            inner.tickets.entry(chunk).or_default().insert(id);
+        }
+        debug!(
+            session_id = id,
+            center_cx = center.0,
+            center_cz = center.1,
+            view_distance,
+            desired = desired_len,
+            global_tickets = inner.tickets.len(),
+            shared_tickets = inner.tickets.values().filter(|s| s.len() > 1).count(),
+            "play session view tickets replaced"
+        );
+    }
+
+    fn mark_loaded(&self, id: SessionId, chunk: (i32, i32)) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if let Some(session) = inner.sessions.get_mut(&id) {
+            session.loaded.insert(chunk);
+        }
+    }
+
+    fn mark_unloaded(&self, id: SessionId, chunks: &[(i32, i32)]) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if let Some(session) = inner.sessions.get_mut(&id) {
+            for chunk in chunks {
+                session.loaded.remove(chunk);
+            }
+        }
+    }
+
+    fn loaded_recipients_for_chunks(
+        &self,
+        chunks: &HashSet<(i32, i32)>,
+        except: SessionId,
+    ) -> Vec<SessionRecipient> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        let mut ids = HashSet::new();
+        for chunk in chunks {
+            if let Some(subscribers) = inner.tickets.get(chunk) {
+                ids.extend(subscribers.iter().copied().filter(|id| *id != except));
+            }
+        }
+        ids.into_iter()
+            .filter_map(|id| {
+                let session = inner.sessions.get(&id)?;
+                if !chunks.iter().any(|chunk| session.loaded.contains(chunk)) {
+                    return None;
+                }
+                Some(SessionRecipient {
+                    id,
+                    tx: session.tx.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+fn remove_ticket(
+    tickets: &mut HashMap<(i32, i32), HashSet<SessionId>>,
+    chunk: (i32, i32),
+    id: SessionId,
+) {
+    if let Some(subscribers) = tickets.get_mut(&chunk) {
+        subscribers.remove(&id);
+        if subscribers.is_empty() {
+            tickets.remove(&chunk);
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockDelta {
@@ -149,6 +353,8 @@ struct ChunkStreamState {
     biomes: Arc<Registry>,
     block_light: Option<Arc<BlockLightTable>>,
     compression: Compression,
+    sessions: Arc<SessionRegistry>,
+    session_id: SessionId,
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
     result_tx: mpsc::Sender<ChunkPrepareResult>,
@@ -161,6 +367,7 @@ struct ChunkStreamState {
     view_distance: i32,
     scheduler: ChunkScheduler,
     staged: HashSet<(i32, i32)>,
+    loaded: HashSet<(i32, i32)>,
     started: Instant,
     fetch_ms: u64,
     build_timing: ChunkBuildTiming,
@@ -256,6 +463,7 @@ pub(crate) async fn handle<R, W>(
     compression: Compression,
     profile: &LoggedInProfile,
     config: &ServerConfig,
+    sessions: Arc<SessionRegistry>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -363,6 +571,21 @@ where
     )
     .await?;
 
+    let (outbound_tx, outbound_rx) =
+        mpsc::channel(config.chunk_pipeline.chunk_result_queue_size.max(16));
+    let initial_desired = if config.world.is_some() {
+        desired_chunk_set(spawn_cx, spawn_cz, config.view_distance)
+    } else {
+        HashSet::new()
+    };
+    let session_id = sessions.register(
+        profile,
+        (spawn_cx, spawn_cz),
+        config.view_distance,
+        initial_desired,
+        outbound_tx,
+    );
+
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
@@ -371,6 +594,8 @@ where
             Arc::new(biomes.clone()),
             config.block_light.as_ref().map(Arc::clone),
             compression,
+            Arc::clone(&sessions),
+            session_id,
             spawn_cx,
             spawn_cz,
             config.view_distance,
@@ -380,61 +605,70 @@ where
     if config.world.is_some() && chunk_stream.is_none() {
         warn!("worldgen/biome registry missing; skipping chunk emission");
     }
-    if let Some(stream) = chunk_stream.as_mut()
-        && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
-    {
-        stream.log_summary();
+    let result = async {
+        if let Some(stream) = chunk_stream.as_mut()
+            && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
+        {
+            stream.log_summary();
+        }
+
+        // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
+        //    ContainerSetContent with the starter kit. Doing this even
+        //    when there's no world configured so the hotbar UI fills in
+        //    on connect-without-world (the M6 manual gate uses a world,
+        //    but tests / chunk-less debug runs should still display the
+        //    kit). When the item registry is empty (test stubs) the
+        //    starter inventory is mostly empty stacks — packets ship
+        //    anyway, just with `count == 0` slots.
+        let starter = build_starter_inventory(&config.items);
+        write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
+        write_packet(
+            writer,
+            &ClientboundContainerSetContent {
+                container_id: 0,
+                state_id: 1,
+                items: starter.as_wire_list(),
+                carried_item: ItemStack::EMPTY,
+            },
+            compression,
+        )
+        .await?;
+
+        // 7. Play loop. Runs until the connection drops or the client
+        //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
+        //    interaction state passes the M5.d/M5.e/M6.f break/place
+        //    handlers everything they need to mutate the world and emit
+        //    relight + container packets back to the client.
+        let mut interaction = config.world.as_ref().map(|world| InteractionState {
+            world: Arc::clone(world),
+            blocks: Arc::clone(&config.blocks),
+            block_light: config.block_light.as_ref().map(Arc::clone),
+            sessions: Arc::clone(&sessions),
+            session_id,
+            workspace: LightWorkspace::new(),
+            light_cache: std::mem::take(&mut light_cache),
+            compression,
+            selected_hotbar_slot: 0,
+            inventory: starter,
+            inventory_state_id: 1,
+            item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
+        });
+        play_loop(
+            reader,
+            writer,
+            buf,
+            compression,
+            interaction.as_mut(),
+            chunk_stream,
+            PlayerPose::new(spawn_x, spawn_y, spawn_z),
+            outbound_rx,
+        )
+        .await
     }
+    .await;
 
-    // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
-    //    ContainerSetContent with the starter kit. Doing this even
-    //    when there's no world configured so the hotbar UI fills in
-    //    on connect-without-world (the M6 manual gate uses a world,
-    //    but tests / chunk-less debug runs should still display the
-    //    kit). When the item registry is empty (test stubs) the
-    //    starter inventory is mostly empty stacks — packets ship
-    //    anyway, just with `count == 0` slots.
-    let starter = build_starter_inventory(&config.items);
-    write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
-    write_packet(
-        writer,
-        &ClientboundContainerSetContent {
-            container_id: 0,
-            state_id: 1,
-            items: starter.as_wire_list(),
-            carried_item: ItemStack::EMPTY,
-        },
-        compression,
-    )
-    .await?;
-
-    // 7. Play loop. Runs until the connection drops or the client
-    //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
-    //    interaction state passes the M5.d/M5.e/M6.f break/place
-    //    handlers everything they need to mutate the world and emit
-    //    relight + container packets back to the client.
-    let mut interaction = config.world.as_ref().map(|world| InteractionState {
-        world: Arc::clone(world),
-        blocks: Arc::clone(&config.blocks),
-        block_light: config.block_light.as_ref().map(Arc::clone),
-        workspace: LightWorkspace::new(),
-        light_cache: std::mem::take(&mut light_cache),
-        compression,
-        selected_hotbar_slot: 0,
-        inventory: starter,
-        inventory_state_id: 1,
-        item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
-    });
-    play_loop(
-        reader,
-        writer,
-        buf,
-        compression,
-        interaction.as_mut(),
-        chunk_stream,
-        PlayerPose::new(spawn_x, spawn_y, spawn_z),
-    )
-    .await
+    sessions.unregister(session_id);
+    result
 }
 
 /// Per-connection state the M5.d / M5.e / M6 interaction handlers
@@ -443,6 +677,8 @@ struct InteractionState {
     world: WorldHandle,
     blocks: Arc<mc_world::BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
+    sessions: Arc<SessionRegistry>,
+    session_id: SessionId,
     /// Reused across all interaction-driven relight computes for
     /// the lifetime of the connection (same amortisation pattern
     /// as `emit_chunks_around`).
@@ -591,6 +827,10 @@ fn chunk_pos_from_coords(x: f64, z: f64) -> (i32, i32) {
     )
 }
 
+fn desired_chunk_set(center_cx: i32, center_cz: i32, view_distance: i32) -> HashSet<(i32, i32)> {
+    spiral_chunks(center_cx, center_cz, view_distance).collect()
+}
+
 impl ChunkStreamState {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -598,6 +838,8 @@ impl ChunkStreamState {
         biomes: Arc<Registry>,
         block_light: Option<Arc<BlockLightTable>>,
         compression: Compression,
+        sessions: Arc<SessionRegistry>,
+        session_id: SessionId,
         center_cx: i32,
         center_cz: i32,
         view_distance: i32,
@@ -610,6 +852,8 @@ impl ChunkStreamState {
             biomes,
             block_light,
             compression,
+            sessions,
+            session_id,
             io_permits: Arc::new(Semaphore::new(policy.chunk_io_threads)),
             cpu_permits: Arc::new(Semaphore::new(policy.chunk_worker_threads)),
             result_tx,
@@ -622,6 +866,7 @@ impl ChunkStreamState {
             view_distance,
             scheduler: ChunkScheduler::new(prioritized_spiral(center_cx, center_cz, view_distance)),
             staged: HashSet::new(),
+            loaded: HashSet::new(),
             started: Instant::now(),
             fetch_ms: 0,
             build_timing: ChunkBuildTiming::default(),
@@ -650,17 +895,25 @@ impl ChunkStreamState {
         self.scheduler.is_complete()
     }
 
-    fn replan_center(&mut self, center_cx: i32, center_cz: i32) -> bool {
+    fn replan_center(&mut self, center_cx: i32, center_cz: i32) -> Vec<(i32, i32)> {
         if (self.center_cx, self.center_cz) == (center_cx, center_cz) {
-            return false;
+            return Vec::new();
         }
+        let desired = desired_chunk_set(center_cx, center_cz, self.view_distance);
+        let unloads: Vec<_> = self.loaded.difference(&desired).copied().collect();
+        for chunk in &unloads {
+            self.loaded.remove(chunk);
+        }
+        self.sessions
+            .replace_view(self.session_id, (center_cx, center_cz), desired);
+        self.sessions.mark_unloaded(self.session_id, &unloads);
         self.center_cx = center_cx;
         self.center_cz = center_cz;
         self.ready.clear();
         self.scheduler
             .replace_view(prioritized_spiral(center_cx, center_cz, self.view_distance));
         self.reset_window_metrics();
-        true
+        unloads
     }
 
     fn reset_window_metrics(&mut self) {
@@ -842,6 +1095,8 @@ impl ChunkStreamState {
                 }
                 let mut write_timing = prepared.write_timing;
                 write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
+                self.loaded.insert((cx, cz));
+                self.sessions.mark_loaded(self.session_id, (cx, cz));
                 self.build_timing.add(prepared.build_timing);
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
@@ -1335,6 +1590,80 @@ where
     Ok(())
 }
 
+async fn send_light_updates<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    updates: &[OutboundLightUpdate],
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for update in updates {
+        state.light_cache.insert(update.pos, update.light.clone());
+        write_packet(
+            writer,
+            &LightUpdate {
+                chunk_x: update.pos.x,
+                chunk_z: update.pos.z,
+                light: update.wire.clone(),
+            },
+            state.compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn broadcast_block_deltas(
+    state: &InteractionState,
+    chunks: &HashSet<(i32, i32)>,
+    deltas: &[BlockDelta],
+) {
+    if deltas.is_empty() || chunks.is_empty() {
+        return;
+    }
+    for recipient in state
+        .sessions
+        .loaded_recipients_for_chunks(chunks, state.session_id)
+    {
+        if let Err(err) = recipient
+            .tx
+            .try_send(OutboundCommand::BlockDeltas(deltas.to_vec()))
+        {
+            debug!(
+                recipient = recipient.id,
+                error = %err,
+                "dropping subscriber block delta"
+            );
+        }
+    }
+}
+
+fn broadcast_light_updates(state: &InteractionState, updates: &[OutboundLightUpdate]) {
+    if updates.is_empty() {
+        return;
+    }
+    let chunks: HashSet<_> = updates
+        .iter()
+        .map(|update| (update.pos.x, update.pos.z))
+        .collect();
+    for recipient in state
+        .sessions
+        .loaded_recipients_for_chunks(&chunks, state.session_id)
+    {
+        if let Err(err) = recipient
+            .tx
+            .try_send(OutboundCommand::LightUpdates(updates.to_vec()))
+        {
+            debug!(
+                recipient = recipient.id,
+                error = %err,
+                "dropping subscriber light update"
+            );
+        }
+    }
+}
+
 fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaPacket> {
     if deltas.len() <= 1 {
         return deltas
@@ -1428,20 +1757,20 @@ where
         return Ok(());
     }
 
-    // 2. Tell the client about the new block. Single edits stay on the
+    let block_delta = BlockDelta {
+        x,
+        y,
+        z,
+        state_id: new_state,
+    };
+    let edit_chunk = (x.div_euclid(16), z.div_euclid(16));
+    let edit_chunks = HashSet::from([edit_chunk]);
+
+    // 2. Tell subscribed clients about the new block. Single edits stay on the
     //    historical BlockUpdate wire shape; only true batches use the
     //    section packet helper.
-    send_block_deltas(
-        writer,
-        state.compression,
-        &[BlockDelta {
-            x,
-            y,
-            z,
-            state_id: new_state,
-        }],
-    )
-    .await?;
+    send_block_deltas(writer, state.compression, &[block_delta]).await?;
+    broadcast_block_deltas(state, &edit_chunks, &[block_delta]);
 
     // 3. Incremental relight (M9). Update cached per-chunk light in
     //    place via bounded BFS, then emit one `LightUpdate` per
@@ -1449,9 +1778,20 @@ where
     //    no-op if the cache is empty (e.g. edits before the spawn
     //    burst populated it) or the block-light table isn't loaded.
     if let Some(table) = table {
-        let cx = x.div_euclid(16);
-        let cz = z.div_euclid(16);
-        send_incremental_relight(state, writer, &table, cx, cz, x, y, z, prev, new_state).await?;
+        let light_updates = send_incremental_relight(
+            state,
+            writer,
+            &table,
+            edit_chunk.0,
+            edit_chunk.1,
+            x,
+            y,
+            z,
+            prev,
+            new_state,
+        )
+        .await?;
+        broadcast_light_updates(state, &light_updates);
     }
 
     // 4. Ack last — vanilla expects update-before-ack so the
@@ -1482,7 +1822,7 @@ async fn send_incremental_relight<W>(
     edit_z: i32,
     prev_state: mc_world::BlockStateId,
     new_state: mc_world::BlockStateId,
-) -> Result<(), ConnectionError>
+) -> Result<Vec<OutboundLightUpdate>, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -1523,7 +1863,7 @@ where
             }
         }
         let Some(centre) = refs[1][1] else {
-            return Ok(()); // edit chunk vanished from storage — nothing to relight
+            return Ok(Vec::new()); // edit chunk vanished from storage — nothing to relight
         };
         let _ = centre;
         let light = compute_chunk_light_in(&mut state.workspace, refs, table);
@@ -1555,6 +1895,7 @@ where
     );
 
     // 4. Emit one LightUpdate per chunk whose cached light changed.
+    let mut updates = Vec::new();
     for pos in touched {
         let Some(light) = state.light_cache.get(pos) else {
             continue;
@@ -1568,6 +1909,11 @@ where
             sky_updates: wire.sky_updates,
             block_updates: wire.block_updates,
         };
+        updates.push(OutboundLightUpdate {
+            pos,
+            light: light.clone(),
+            wire: light_data.clone(),
+        });
         write_packet(
             writer,
             &LightUpdate {
@@ -1579,7 +1925,7 @@ where
         )
         .await?;
     }
-    Ok(())
+    Ok(updates)
 }
 
 fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
@@ -1704,6 +2050,7 @@ async fn replan_after_movement<W>(
     writer: &mut W,
     compression: Compression,
     chunk_stream: &mut Option<ChunkStreamState>,
+    interaction: Option<&mut InteractionState>,
     old_center: (i32, i32),
     new_center: (i32, i32),
 ) -> Result<(), ConnectionError>
@@ -1723,7 +2070,17 @@ where
     )
     .await?;
     if let Some(stream) = chunk_stream.as_mut() {
-        stream.replan_center(new_center.0, new_center.1);
+        let unloads = stream.replan_center(new_center.0, new_center.1);
+        let mut interaction = interaction;
+        for (chunk_x, chunk_z) in unloads {
+            if let Some(state) = interaction.as_deref_mut() {
+                state.light_cache.remove(ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                });
+            }
+            write_packet(writer, &ForgetLevelChunk { chunk_x, chunk_z }, compression).await?;
+        }
     }
     debug!(
         old_cx = old_center.0,
@@ -1735,6 +2092,7 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -1743,6 +2101,7 @@ async fn play_loop<R, W>(
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
     mut player_pose: PlayerPose,
+    mut outbound_rx: mpsc::Receiver<OutboundCommand>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -1784,6 +2143,19 @@ where
 
         tokio::select! {
             biased;
+            command = outbound_rx.recv() => {
+                match command {
+                    Some(OutboundCommand::BlockDeltas(deltas)) => {
+                        send_block_deltas(writer, compression, &deltas).await?;
+                    }
+                    Some(OutboundCommand::LightUpdates(updates)) => {
+                        if let Some(state) = interaction.as_deref_mut() {
+                            send_light_updates(state, writer, &updates).await?;
+                        }
+                    }
+                    None => {}
+                }
+            }
             _ = ticker.tick(), if chunk_stream.as_ref().is_none_or(ChunkStreamState::is_complete) => {
                 if last_response_at.elapsed() > KEEPALIVE_TIMEOUT {
                     warn!(
@@ -1829,7 +2201,7 @@ where
                     player_pose.z = movement.z;
                     player_pose.flags = movement.flags;
                     let new_center = player_pose.chunk_pos();
-                    replan_after_movement(writer, compression, &mut chunk_stream, old_center, new_center).await?;
+                    replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
@@ -1841,7 +2213,7 @@ where
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
                     let new_center = player_pose.chunk_pos();
-                    replan_after_movement(writer, compression, &mut chunk_stream, old_center, new_center).await?;
+                    replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerRot::decode(&mut body)?;
