@@ -1286,12 +1286,17 @@ impl Packet for ClientboundContainerSetContent {
 /// decrement the held stack's count. Per ADR 0002, verified against
 /// `javap -p`:
 /// `ClientboundContainerSetSlotPacket(int containerId, int stateId,
-/// int slot, ItemStack itemStack)`.
+/// int slot, ItemStack itemStack)`. The Java field type is `int` but
+/// the wire codec encodes `slot` as a `short` — same convention as
+/// the symmetric serverbound `SetCarriedItem`. M6 missed this and
+/// shipped the slot as varint, which slid the downstream `ItemStack`
+/// payload and made vanilla 26.1.2 clients fail decode on every
+/// post-edit `ContainerSetSlot`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientboundContainerSetSlot {
     pub container_id: i32,
     pub state_id: i32,
-    pub slot: i32,
+    pub slot: i16,
     pub item_stack: ItemStack,
 }
 
@@ -1303,7 +1308,7 @@ impl Packet for ClientboundContainerSetSlot {
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_varint(self.container_id);
         buf.write_varint(self.state_id);
-        buf.write_varint(self.slot);
+        buf.write_i16(self.slot);
         self.item_stack.encode(buf)?;
         Ok(())
     }
@@ -1312,7 +1317,7 @@ impl Packet for ClientboundContainerSetSlot {
         Ok(Self {
             container_id: buf.read_varint()?,
             state_id: buf.read_varint()?,
-            slot: buf.read_varint()?,
+            slot: buf.read_i16()?,
             item_stack: ItemStack::decode(buf)?,
         })
     }

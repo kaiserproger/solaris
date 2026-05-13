@@ -977,7 +977,7 @@ where
         &ClientboundContainerSetSlot {
             container_id: 0,
             state_id: state.inventory_state_id,
-            slot: (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i32,
+            slot: (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
             item_stack: new_slot_value,
         },
         Compression::Disabled,
