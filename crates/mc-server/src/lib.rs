@@ -94,6 +94,8 @@ pub struct ChunkPipelineSection {
     pub chunk_io_threads_percent: u32,
     #[serde(default = "default_chunk_worker_threads_percent")]
     pub chunk_worker_threads_percent: u32,
+    #[serde(default = "default_entity_worker_threads_percent")]
+    pub entity_worker_threads_percent: u32,
     #[serde(default = "default_chunk_result_queue_size")]
     pub chunk_result_queue_size: usize,
     #[serde(default = "default_region_cache_size")]
@@ -113,6 +115,7 @@ impl Default for ChunkPipelineSection {
             chunk_prepare_batch_size: policy.chunk_prepare_batch_size,
             chunk_io_threads_percent: default_chunk_io_threads_percent(),
             chunk_worker_threads_percent: default_chunk_worker_threads_percent(),
+            entity_worker_threads_percent: default_entity_worker_threads_percent(),
             chunk_result_queue_size: policy.chunk_result_queue_size,
             region_cache_size: policy.region_cache_size,
             compression_level: policy.compression_level,
@@ -132,6 +135,7 @@ impl ChunkPipelineSection {
             chunk_prepare_batch_size: self.chunk_prepare_batch_size.max(1),
             chunk_io_threads: threads_from_percent(cores, self.chunk_io_threads_percent),
             chunk_worker_threads: threads_from_percent(cores, self.chunk_worker_threads_percent),
+            entity_worker_threads: threads_from_percent(cores, self.entity_worker_threads_percent),
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
             compression_level: self.compression_level.map(|level| level.min(9)),
@@ -195,6 +199,10 @@ fn default_chunk_io_threads_percent() -> u32 {
 
 fn default_chunk_worker_threads_percent() -> u32 {
     50
+}
+
+fn default_entity_worker_threads_percent() -> u32 {
+    25
 }
 
 fn default_chunk_result_queue_size() -> usize {
@@ -264,6 +272,7 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 64);
         assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
+        assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 25);
     }
 
     #[test]
@@ -285,6 +294,7 @@ mod tests {
             chunk_prepare_batch_size = 2
             chunk_io_threads_percent = 25
             chunk_worker_threads_percent = 75
+            entity_worker_threads_percent = 30
             chunk_result_queue_size = 9
             region_cache_size = 7
             compression_level = 6
@@ -297,6 +307,7 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 2);
         assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 75);
+        assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 30);
         assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
         assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
         assert_eq!(cfg.chunk_pipeline.compression_level, Some(6));
@@ -312,6 +323,7 @@ mod tests {
             chunk_prepare_batch_size: 0,
             chunk_io_threads_percent: 0,
             chunk_worker_threads_percent: 0,
+            entity_worker_threads_percent: 0,
             chunk_result_queue_size: 0,
             region_cache_size: 0,
             compression_level: Some(99),
@@ -323,6 +335,7 @@ mod tests {
         assert_eq!(policy.chunk_prepare_batch_size, 1);
         assert_eq!(policy.chunk_io_threads, 1);
         assert_eq!(policy.chunk_worker_threads, 1);
+        assert_eq!(policy.entity_worker_threads, 1);
         assert_eq!(policy.chunk_result_queue_size, 1);
         assert_eq!(policy.region_cache_size, 1);
         assert_eq!(policy.compression_level, Some(9));

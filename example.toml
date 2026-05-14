@@ -25,7 +25,8 @@ chunk_generate_rate = 32
 chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 64
 chunk_io_threads_percent = 25
-chunk_worker_threads_percent = 50
+chunk_worker_threads_percent = 90
+entity_worker_threads_percent = 25
 chunk_result_queue_size = 64
 region_cache_size = 4
 # Optional zlib level for compressed protocol frames. Omit for flate2's

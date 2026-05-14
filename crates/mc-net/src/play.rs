@@ -1052,9 +1052,16 @@ async fn spawn_position(config: &ServerConfig) -> (f64, f64, f64) {
 
 async fn adaptive_spawn_y(config: &ServerConfig) -> Option<f64> {
     let world = config.world.as_ref()?;
-    let table = config.block_light.as_deref()?;
     let mut storage = world.lock().await;
     let chunk = storage.get_chunk_mut(ChunkPos { x: 0, z: 0 }).ok()??;
+    spawn_y_from_chunk(chunk, config.block_light.as_deref())
+}
+
+fn spawn_y_from_chunk(chunk: &mut Chunk, table: Option<&BlockLightTable>) -> Option<f64> {
+    if let Some(top) = chunk.highest_opaque_y(0, 0) {
+        return Some((top + 2) as f64);
+    }
+    let table = table?;
     chunk.rebuild_highest_opaque(table);
     let top = chunk.highest_opaque_y(0, 0)?;
     Some((top + 2) as f64)
@@ -1255,6 +1262,7 @@ where
             world: Arc::clone(world),
             blocks: Arc::clone(&config.blocks),
             block_light: config.block_light.as_ref().map(Arc::clone),
+            water: passive_herd_water,
             sessions: Arc::clone(&sessions),
             session_id,
             workspace: LightWorkspace::new(),
@@ -1294,6 +1302,7 @@ struct InteractionState {
     world: WorldHandle,
     blocks: Arc<mc_world::BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
+    water: Option<mc_world::BlockStateId>,
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
     /// Reused across all interaction-driven relight computes for
@@ -2348,8 +2357,8 @@ where
 /// M5.d: handle a serverbound `PlayerAction`. Acts on
 /// `START_DESTROY_BLOCK` / `STOP_DESTROY_BLOCK` (creative-style
 /// instant break — survival mining timing arrives with a future
-/// inventory milestone) by setting the target cell to air,
-/// recomputing light over the affected 1+4 chunks, and emitting
+/// inventory milestone) by clearing the target cell, letting adjacent
+/// water refill it immediately when submerged, recomputing light, and emitting
 /// the resulting wire packets back to the client. Every action
 /// regardless of kind gets an ack so the client's prediction
 /// state doesn't hang.
@@ -2386,11 +2395,11 @@ where
         return Ok(());
     }
 
-    if game_mode != GameMode::Creative {
+    if matches!(game_mode, GameMode::Adventure | GameMode::Spectator) {
         debug!(
             mode = ?game_mode,
             sequence = action.sequence,
-            "instant block break denied outside creative"
+            "instant block break denied in non-building game mode"
         );
         write_packet(
             writer,
@@ -2405,9 +2414,10 @@ where
 
     let (x, y, z) = unpack_block_pos(action.position);
     let air = air_state_id(&state.blocks);
+    let replacement = break_replacement_state(state, x, y, z, air).await;
 
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-    apply_block_edit(state, writer, action.sequence, x, y, z, air).await
+    apply_block_edit(state, writer, action.sequence, x, y, z, replacement).await
 }
 
 async fn send_block_deltas<W>(
@@ -2647,7 +2657,7 @@ where
     //    place via bounded BFS, then emit one `LightUpdate` per
     //    chunk whose stored arrays actually changed. Falls back to
     //    no-op if the cache is empty (e.g. edits before the spawn
-    //    burst populated it) or the block-light table isn't loaded.
+    //    burst populated it) or tests constructed a chunkless config.
     if let Some(table) = table {
         let light_updates = send_incremental_relight(
             state,
@@ -2810,6 +2820,45 @@ fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
         .block(&air_id)
         .map(|b| b.default)
         .unwrap_or(mc_world::BlockStateId(0))
+}
+
+async fn break_replacement_state(
+    state: &InteractionState,
+    x: i32,
+    y: i32,
+    z: i32,
+    air: mc_world::BlockStateId,
+) -> mc_world::BlockStateId {
+    let Some(water) = state.water else {
+        return air;
+    };
+    let mut storage = state.world.lock().await;
+    let neighbours = [
+        (x, y + 1, z),
+        (x + 1, y, z),
+        (x - 1, y, z),
+        (x, y, z + 1),
+        (x, y, z - 1),
+    ];
+    let neighbour_states = neighbours.map(|(x, y, z)| {
+        storage
+            .get_block(mc_world::BlockPos { x, y, z })
+            .ok()
+            .flatten()
+    });
+    break_replacement_from_neighbours(neighbour_states, air, water)
+}
+
+fn break_replacement_from_neighbours(
+    neighbours: [Option<mc_world::BlockStateId>; 5],
+    air: mc_world::BlockStateId,
+    water: mc_world::BlockStateId,
+) -> mc_world::BlockStateId {
+    if neighbours.into_iter().any(|state| state == Some(water)) {
+        water
+    } else {
+        air
+    }
 }
 
 /// M6.f: handle a serverbound `UseItemOn`. Resolves the placed
@@ -4093,6 +4142,34 @@ mod tests {
     fn spawn_chunk_pos_matches_origin() {
         // SPAWN_(X,Z) = (0.5, 0.5); the containing chunk is (0, 0).
         assert_eq!(spawn_chunk_pos(), (0, 0));
+    }
+
+    #[test]
+    fn spawn_y_uses_chunk_heightmap_without_block_light_table() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
+        let top_y = 72;
+        chunk
+            .highest_opaque
+            .set(0, 0, (top_y - mc_world::MIN_Y + 1) as u32);
+
+        assert_eq!(spawn_y_from_chunk(&mut chunk, None), Some(74.0));
+    }
+
+    #[test]
+    fn underwater_break_refills_target_with_water() {
+        let air = mc_world::BlockStateId(0);
+        let water = mc_world::BlockStateId(2);
+        let stone = mc_world::BlockStateId(1);
+
+        assert_eq!(
+            break_replacement_from_neighbours([Some(water), None, None, None, None], air, water),
+            water
+        );
+        assert_eq!(
+            break_replacement_from_neighbours([Some(stone), None, None, None, None], air, water),
+            air
+        );
     }
 
     #[test]

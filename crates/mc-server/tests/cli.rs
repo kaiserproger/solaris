@@ -54,6 +54,7 @@ fn check_prints_effective_thread_minimums() {
             [chunk_pipeline]
             chunk_io_threads_percent = 0
             chunk_worker_threads_percent = 0
+            entity_worker_threads_percent = 0
         "#,
     )
     .expect("write toml");
@@ -67,7 +68,8 @@ fn check_prints_effective_thread_minimums() {
         .success()
         .stdout(contains("\"effective_chunk_pipeline\""))
         .stdout(contains("\"chunk_io_threads\": 1"))
-        .stdout(contains("\"chunk_worker_threads\": 1"));
+        .stdout(contains("\"chunk_worker_threads\": 1"))
+        .stdout(contains("\"entity_worker_threads\": 1"));
 }
 
 #[test]

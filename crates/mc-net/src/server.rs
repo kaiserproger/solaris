@@ -1,6 +1,7 @@
 //! TCP listener, accept loop, and the per-connection state-machine entry
 //! point.
 
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -19,7 +20,7 @@ use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_world::{BlockPos, BlockRegistry, WorldStorage};
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::ChunkPipelinePolicy;
@@ -64,12 +65,10 @@ pub struct ServerConfig {
     /// client then complains during registry freeze.
     pub tags: Arc<TagsData>,
     /// Per-block-state light metadata (emission / opacity /
-    /// sky-propagation). Loaded from
-    /// `data/vanilla/reports/block_light.json` at startup; the
-    /// chunk-streaming path uses it to compute light when the Anvil
-    /// nibbles are missing. `None` keeps M1/M3 behaviour (the
-    /// chunk-stream path falls back to `LightData::empty()` until
-    /// M4.e wires the engine in).
+    /// sky-propagation). Built by `mc-server` from the required block
+    /// report at startup; the chunk-streaming path uses it to compute
+    /// light when the Anvil nibbles are missing. `None` is kept for
+    /// narrow protocol tests that do not exercise chunk lighting.
     pub block_light: Option<Arc<BlockLightTable>>,
     /// Item registry (M6.c) loaded from
     /// `data/vanilla/reports/registries.json`. Drives the M6
@@ -117,6 +116,8 @@ impl BoundServer {
         let sessions = self.sessions;
         let entity_sessions = Arc::clone(&sessions);
         let entity_config = Arc::clone(&config);
+        let entity_cpu_permits =
+            Arc::new(Semaphore::new(config.chunk_pipeline.entity_worker_threads));
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -125,7 +126,9 @@ impl BoundServer {
                 ticker.tick().await;
                 tick = tick.wrapping_add(1);
                 let queries = entity_sessions.tick_entities_and_collect_physics_queries(tick);
-                let steps = entity_physics_steps(&entity_config, &queries).await;
+                let steps =
+                    entity_physics_steps(&entity_config, Arc::clone(&entity_cpu_permits), &queries)
+                        .await;
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
             }
         });
@@ -154,6 +157,7 @@ impl BoundServer {
 
 async fn entity_physics_steps(
     config: &ServerConfig,
+    cpu_permits: Arc<Semaphore>,
     queries: &[play::EntityPhysicsQuery],
 ) -> Vec<play::EntityPhysicsStep> {
     let Some(world) = config.world.as_ref() else {
@@ -163,46 +167,130 @@ async fn entity_physics_steps(
         return Vec::new();
     }
     let materials = material_ids(&config.blocks);
-    let mut storage = world.lock().await;
-    let mut sampler = WorldPhysicsSampler {
-        storage: &mut storage,
-        materials,
+    let inputs = {
+        let mut storage = world.lock().await;
+        queries
+            .iter()
+            .map(|query| sample_entity_physics_input(*query, &mut storage, materials))
+            .collect::<Vec<_>>()
     };
-    queries
-        .iter()
-        .map(|query| {
-            let result = mc_physics::step_entity(
-                EntityBody {
-                    position: physics_vec(query.position),
-                    velocity: physics_vec(query.velocity),
-                    aabb: Aabb::COW,
-                    on_ground: query.on_ground,
-                },
-                &mut sampler,
-                PhysicsConfig::default(),
-            );
-            play::EntityPhysicsStep {
-                id: query.id,
-                position: entity_vec(result.body.position),
-                velocity: entity_vec(result.body.velocity),
-                on_ground: result.body.on_ground,
-            }
-        })
-        .collect()
-}
 
-struct WorldPhysicsSampler<'a> {
-    storage: &'a mut WorldStorage,
-    materials: BlockMaterialIds,
-}
+    let workers = config
+        .chunk_pipeline
+        .entity_worker_threads
+        .max(1)
+        .min(inputs.len());
+    let batch_size = inputs.len().div_ceil(workers);
+    let mut handles = Vec::with_capacity(workers);
+    for batch in inputs.chunks(batch_size) {
+        let batch = batch.to_vec();
+        let permit = match Arc::clone(&cpu_permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => return Vec::new(),
+        };
+        handles.push(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            batch
+                .into_iter()
+                .map(step_sampled_entity)
+                .collect::<Vec<_>>()
+        }));
+    }
 
-impl BlockSampler for WorldPhysicsSampler<'_> {
-    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
-        match self.storage.get_block(BlockPos { x, y, z }) {
-            Ok(Some(state)) => self.materials.classify(state.0),
-            Ok(None) => BlockMaterial::Air,
-            Err(_) => BlockMaterial::Air,
+    let mut steps = Vec::with_capacity(queries.len());
+    for handle in handles {
+        match handle.await {
+            Ok(mut batch) => steps.append(&mut batch),
+            Err(err) => warn!(error = %err, "entity physics worker failed"),
         }
+    }
+    steps
+}
+
+#[derive(Clone)]
+struct EntityPhysicsInput {
+    query: play::EntityPhysicsQuery,
+    samples: HashMap<BlockPos, BlockMaterial>,
+}
+
+struct SampledPhysicsWorld {
+    samples: HashMap<BlockPos, BlockMaterial>,
+}
+
+impl BlockSampler for SampledPhysicsWorld {
+    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
+        self.samples
+            .get(&BlockPos { x, y, z })
+            .copied()
+            .unwrap_or(BlockMaterial::Air)
+    }
+}
+
+fn sample_entity_physics_input(
+    query: play::EntityPhysicsQuery,
+    storage: &mut WorldStorage,
+    materials: BlockMaterialIds,
+) -> EntityPhysicsInput {
+    let mut samples = HashMap::new();
+    for pos in entity_physics_sample_positions(query) {
+        let material = match storage.get_block(pos) {
+            Ok(Some(state)) => materials.classify(state.0),
+            Ok(None) | Err(_) => BlockMaterial::Air,
+        };
+        samples.insert(pos, material);
+    }
+    EntityPhysicsInput { query, samples }
+}
+
+fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<BlockPos> {
+    let config = PhysicsConfig::default();
+    let body = EntityBody {
+        position: physics_vec(query.position),
+        velocity: physics_vec(query.velocity),
+        aabb: Aabb::COW,
+        on_ground: query.on_ground,
+    };
+    let next_x = body.position.x + body.velocity.x * config.tick_seconds;
+    let next_y = body.position.y + body.velocity.y * config.tick_seconds;
+    let next_z = body.position.z + body.velocity.z * config.tick_seconds;
+    let half = body.aabb.half_width;
+    let min_x = (body.position.x.min(next_x) - half - 1.0).floor() as i32;
+    let max_x = (body.position.x.max(next_x) + half + 1.0).floor() as i32;
+    let min_z = (body.position.z.min(next_z) - half - 1.0).floor() as i32;
+    let max_z = (body.position.z.max(next_z) + half + 1.0).floor() as i32;
+    let min_y = (body.position.y.min(next_y) - 2.0).floor() as i32;
+    let max_y = (body.position.y.max(next_y) + body.aabb.height + 2.0).floor() as i32;
+
+    let mut positions = Vec::new();
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                positions.push(BlockPos { x, y, z });
+            }
+        }
+    }
+    positions
+}
+
+fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
+    let mut sampler = SampledPhysicsWorld {
+        samples: input.samples,
+    };
+    let result = mc_physics::step_entity(
+        EntityBody {
+            position: physics_vec(input.query.position),
+            velocity: physics_vec(input.query.velocity),
+            aabb: Aabb::COW,
+            on_ground: input.query.on_ground,
+        },
+        &mut sampler,
+        PhysicsConfig::default(),
+    );
+    play::EntityPhysicsStep {
+        id: input.query.id,
+        position: entity_vec(result.body.position),
+        velocity: entity_vec(result.body.velocity),
+        on_ground: result.body.on_ground,
     }
 }
 

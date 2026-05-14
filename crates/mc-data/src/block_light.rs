@@ -1,8 +1,7 @@
-//! Per-block-state light metadata loaded from
-//! `data/vanilla/reports/block_light.json` (produced by
-//! `tools/extract-block-light.sh`). Three fields per global block-state
-//! id, copied verbatim from the unobfuscated jar's
-//! `BlockBehaviour$BlockStateBase` public API:
+//! Per-block-state light metadata. Solaris can load the old local
+//! `data/vanilla/reports/block_light.json` oracle, but normal runtime
+//! builds a conservative table from the already-required `blocks.json`
+//! report so startup does not depend on a second extracted sidecar.
 //!
 //! - `emission` — `BlockState.getLightEmission()`, 0..=15 (luminance
 //!   the block radiates; torches=14, glowstone=15, soul_lantern=10).
@@ -26,6 +25,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::blocks::BlockReport;
 
 #[derive(Debug, Error)]
 pub enum BlockLightError {
@@ -130,6 +131,140 @@ impl BlockLightTable {
             propagates_sky,
         }
     }
+
+    /// Build a runtime table from `blocks.json` when the exact vanilla
+    /// light oracle is absent. Unknown blocks are treated as opaque and
+    /// non-emissive, which keeps caves and terrain sane; known air,
+    /// transparent, and light-emitting block families get small explicit
+    /// overrides.
+    #[must_use]
+    pub fn conservative_from_blocks_report(report: &[BlockReport]) -> Self {
+        let len = report
+            .iter()
+            .flat_map(|block| block.states.iter().map(|state| state.id as usize))
+            .max()
+            .map_or(0, |id| id + 1);
+        let mut emission = vec![0; len];
+        let mut opacity = vec![15; len];
+        let mut propagates_sky = vec![false; len];
+
+        for block in report {
+            let path = block.id.path();
+            for state in &block.states {
+                let idx = state.id as usize;
+                emission[idx] = conservative_emission(path, &state.properties);
+                let op = conservative_opacity(path);
+                opacity[idx] = op;
+                propagates_sky[idx] = op == 0;
+            }
+        }
+
+        Self {
+            version: "blocks-report-conservative".to_string(),
+            emission,
+            opacity,
+            propagates_sky,
+        }
+    }
+}
+
+fn conservative_opacity(path: &str) -> u8 {
+    if matches!(path, "air" | "cave_air" | "void_air")
+        || path.contains("glass")
+        || path.contains("pane")
+        || path.contains("water")
+        || path.contains("ice")
+        || path.contains("leaves")
+        || path.ends_with("torch")
+        || matches!(path, "lantern" | "soul_lantern")
+        || is_transparent_plant(path)
+        || path == "sugar_cane"
+        || path == "cactus"
+        || path.contains("flower")
+        || path.contains("sapling")
+        || path.contains("mushroom")
+        || matches!(
+            path,
+            "short_grass" | "tall_grass" | "seagrass" | "tall_seagrass"
+        )
+        || path.contains("fern")
+        || path.contains("vine")
+        || path.contains("roots")
+        || path.contains("bush")
+        || path.contains("carpet")
+        || path.contains("rail")
+        || path.contains("sign")
+        || path.contains("button")
+        || path.contains("pressure_plate")
+        || path.contains("ladder")
+        || path.contains("chain")
+        || path.contains("candle")
+        || path.contains("fire")
+    {
+        0
+    } else {
+        15
+    }
+}
+
+fn is_transparent_plant(path: &str) -> bool {
+    matches!(
+        path,
+        "poppy"
+            | "dandelion"
+            | "blue_orchid"
+            | "allium"
+            | "azure_bluet"
+            | "red_tulip"
+            | "orange_tulip"
+            | "white_tulip"
+            | "pink_tulip"
+            | "oxeye_daisy"
+            | "cornflower"
+            | "lily_of_the_valley"
+            | "wither_rose"
+            | "open_eyeblossom"
+            | "closed_eyeblossom"
+            | "torchflower"
+            | "pitcher_plant"
+            | "lilac"
+            | "rose_bush"
+            | "peony"
+            | "sunflower"
+    )
+}
+
+fn conservative_emission(path: &str, props: &std::collections::BTreeMap<String, String>) -> u8 {
+    if props.get("lit").is_some_and(|v| v == "false") {
+        return 0;
+    }
+    if path.contains("redstone_torch") {
+        return 7;
+    }
+    if path.contains("soul_torch") || path.contains("soul_lantern") || path.contains("soul_fire") {
+        return 10;
+    }
+    if path.contains("torch") {
+        return 14;
+    }
+    if path.contains("glowstone")
+        || path.contains("sea_lantern")
+        || path.contains("jack_o_lantern")
+        || path.contains("redstone_lamp")
+        || path == "lava"
+        || path.contains("lava")
+        || path.contains("fire")
+        || path.contains("lantern")
+    {
+        return 15;
+    }
+    if path.contains("candle") {
+        return props
+            .get("candles")
+            .and_then(|v| v.parse::<u8>().ok())
+            .map_or(3, |n| n.saturating_mul(3).min(12));
+    }
+    0
 }
 
 #[derive(Deserialize)]
@@ -213,6 +348,9 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Identifier;
+    use crate::blocks::{BlockReport, BlockStateReport};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
     use tempfile::TempDir;
 
@@ -230,6 +368,18 @@ mod tests {
         path
     }
 
+    fn block(id: u32, name: &str) -> BlockReport {
+        BlockReport {
+            id: Identifier::parse(name).unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![BlockStateReport {
+                id,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        }
+    }
+
     #[test]
     fn from_arrays_pins_lookups() {
         let table = BlockLightTable::from_arrays(
@@ -244,6 +394,37 @@ mod tests {
         assert_eq!(table.opacity(2), Some(15));
         assert_eq!(table.propagates_sky(1), Some(true));
         assert_eq!(table.emission(99), None);
+    }
+
+    #[test]
+    fn conservative_table_from_blocks_report_keeps_light_running_without_sidecar() {
+        let table = BlockLightTable::conservative_from_blocks_report(&[
+            block(0, "minecraft:air"),
+            block(1, "minecraft:stone"),
+            block(2, "minecraft:grass_block"),
+            block(3, "minecraft:glass"),
+            block(4, "minecraft:torch"),
+            block(5, "minecraft:glowstone"),
+            block(6, "minecraft:poppy"),
+            block(7, "minecraft:sugar_cane"),
+        ]);
+
+        assert_eq!(table.version, "blocks-report-conservative");
+        assert_eq!(table.len(), 8);
+        assert_eq!(table.opacity(0), Some(0));
+        assert_eq!(table.propagates_sky(0), Some(true));
+        assert_eq!(table.opacity(1), Some(15));
+        assert_eq!(table.propagates_sky(1), Some(false));
+        assert_eq!(
+            table.opacity(2),
+            Some(15),
+            "grass_block is terrain, not grass"
+        );
+        assert_eq!(table.opacity(3), Some(0));
+        assert_eq!(table.emission(4), Some(14));
+        assert_eq!(table.emission(5), Some(15));
+        assert_eq!(table.opacity(6), Some(0));
+        assert_eq!(table.opacity(7), Some(0));
     }
 
     #[test]
