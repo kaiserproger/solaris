@@ -52,7 +52,6 @@ impl BiomeWorldgenData {
         }
     }
 
-    #[must_use]
     pub fn biomes(&self) -> impl Iterator<Item = &Identifier> {
         self.features_by_biome.keys()
     }
