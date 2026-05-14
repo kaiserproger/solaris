@@ -35,6 +35,7 @@ pub mod blocks;
 pub mod entity_types;
 pub mod identifier;
 pub mod items;
+pub mod recipes;
 pub mod tags;
 pub mod worldgen_ores;
 
