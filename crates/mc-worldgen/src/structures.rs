@@ -121,8 +121,13 @@ impl StructureRules {
 
     #[must_use]
     pub fn single_plains_village_marker(template: StructureTemplate) -> Self {
+        Self::plains_village_markers(vec![template])
+    }
+
+    #[must_use]
+    pub fn plains_village_markers(templates: Vec<StructureTemplate>) -> Self {
         Self {
-            templates: vec![template],
+            templates,
             // Mirrors the vanilla village spacing as data, while Solaris owns
             // the placement hash and filtering below.
             grid_chunks: 34,
@@ -376,5 +381,29 @@ mod tests {
                 .iter()
                 .all(|block| registry.by_id(block.state).is_some())
         );
+    }
+
+    #[test]
+    fn plains_village_rules_accept_multiple_templates() {
+        let a = StructureTemplate::new(
+            [1, 1, 1],
+            vec![TemplateBlock {
+                pos: [0, 0, 0],
+                state: BlockStateId(1),
+            }],
+        );
+        let b = StructureTemplate::new(
+            [1, 2, 1],
+            vec![TemplateBlock {
+                pos: [0, 1, 0],
+                state: BlockStateId(2),
+            }],
+        );
+
+        let rules = StructureRules::plains_village_markers(vec![a, b]);
+
+        assert_eq!(rules.templates().len(), 2);
+        assert_eq!(rules.grid_chunks(), 34);
+        assert_eq!(rules.separation_chunks(), 8);
     }
 }

@@ -1936,6 +1936,142 @@ mod tests {
     }
 
     #[test]
+    fn generated_overlays_survive_flush_and_reopen() {
+        let registry = tiny_registry();
+        let marker = BlockStateId(25);
+        let template = StructureTemplate::new(
+            [1, 1, 1],
+            vec![crate::structures::TemplateBlock {
+                pos: [0, 0, 0],
+                state: marker,
+            }],
+        );
+        let structures =
+            StructureRules::plains_village_markers(vec![template]).with_spacing_for_tests(1, 0);
+        let generator =
+            Arc::new(TerrainGenerator::new(42, Arc::clone(&registry)).with_structures(structures));
+        let mut structure_target = None;
+        'cells: for gx in -64..=64 {
+            for gz in -64..=64 {
+                let Some((_template, center_x, center_z)) = generator.structure_plan(gx, gz) else {
+                    continue;
+                };
+                let height = generator.surface_height(center_x, center_z);
+                let biome = generator.biome_for(center_x, center_z, height);
+                if height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
+                    && generator.biomes.grassland.contains(&biome)
+                {
+                    structure_target = Some((center_x, height + 1, center_z));
+                    break 'cells;
+                }
+            }
+        }
+        let (structure_x, structure_y, structure_z) = structure_target.expect("structure target");
+
+        let root = unique_temp_world_dir();
+        std::fs::create_dir_all(root.join("region")).unwrap();
+        let mut storage = mc_world::WorldStorage::open(&root, Arc::clone(&registry))
+            .unwrap()
+            .with_generator(Arc::clone(&generator) as Arc<dyn ChunkGenerator>);
+        let structure_pos = ChunkPos {
+            x: structure_x.div_euclid(16),
+            z: structure_z.div_euclid(16),
+        };
+        let structure_lx = structure_x.rem_euclid(16) as u8;
+        let structure_lz = structure_z.rem_euclid(16) as u8;
+        let chunk = storage
+            .get_chunk(structure_pos)
+            .unwrap()
+            .expect("generated structure chunk");
+        assert_eq!(
+            chunk.get_block(structure_lx, structure_y, structure_lz),
+            Some(marker)
+        );
+
+        let (decor_pos, decor_lx, decor_y, decor_lz, decor_state) =
+            find_decoration_in_storage(&mut storage, &generator);
+        assert!(storage.dirty_count() >= 1);
+        assert!(storage.flush_dirty().unwrap() >= 1);
+        drop(storage);
+
+        let mut fresh = mc_world::WorldStorage::open(&root, Arc::clone(&registry)).unwrap();
+        let structure_chunk = fresh
+            .get_chunk(structure_pos)
+            .unwrap()
+            .expect("reopened structure chunk");
+        assert_eq!(
+            structure_chunk.get_block(structure_lx, structure_y, structure_lz),
+            Some(marker)
+        );
+        assert!(
+            structure_chunk
+                .highest_opaque_y(structure_lx, structure_lz)
+                .is_some_and(|top| top >= structure_y)
+        );
+
+        let decoration_chunk = fresh
+            .get_chunk(decor_pos)
+            .unwrap()
+            .expect("reopened decoration chunk");
+        assert_eq!(
+            decoration_chunk.get_block(decor_lx, decor_y, decor_lz),
+            Some(decor_state)
+        );
+        assert!(
+            decoration_chunk
+                .highest_opaque_y(decor_lx, decor_lz)
+                .is_some_and(|top| top >= decor_y)
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn unique_temp_world_dir() -> std::path::PathBuf {
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("solaris-worldgen-{suffix}"))
+    }
+
+    fn find_decoration_in_storage(
+        storage: &mut mc_world::WorldStorage,
+        generator: &TerrainGenerator,
+    ) -> (ChunkPos, u8, i32, u8, BlockStateId) {
+        let decorations = [
+            BlockStateId(26),
+            BlockStateId(27),
+            BlockStateId(28),
+            BlockStateId(29),
+            BlockStateId(30),
+            BlockStateId(31),
+            BlockStateId(32),
+            BlockStateId(33),
+        ];
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let pos = ChunkPos { x: cx, z: cz };
+                let chunk = storage.get_chunk(pos).unwrap().expect("generated chunk");
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let wx = cx * 16 + lx as i32;
+                        let wz = cz * 16 + lz as i32;
+                        let height = generator.surface_height(wx, wz);
+                        for y in (height + 1)..=(height + 8).min(MAX_Y - 1) {
+                            if let Some(state) = chunk.get_block(lx, y, lz)
+                                && decorations.contains(&state)
+                            {
+                                return (pos, lx, y, lz, state);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        panic!("sampled chunks should contain a decoration");
+    }
+
+    #[test]
     fn every_overworld_biome_is_reachable_by_selector() {
         use std::collections::BTreeSet;
 

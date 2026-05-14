@@ -305,32 +305,69 @@ fn load_structure_rules(
     vanilla_dir: &Path,
     blocks: &mc_world::BlockRegistry,
 ) -> Result<mc_worldgen::StructureRules> {
-    let template_path = vanilla_dir
-        .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
-    if !template_path.exists() {
+    let root = vanilla_dir.join("data/minecraft/structure/village/plains");
+    let mut template_paths = Vec::new();
+    collect_nbt_templates(&root, &mut template_paths)?;
+    template_paths.sort();
+    if template_paths.is_empty() {
         tracing::warn!(
-            path = %template_path.display(),
-            "plains village marker template missing; generated structures disabled",
+            path = %root.display(),
+            "plains village templates missing; generated structures disabled",
         );
         return Ok(mc_worldgen::StructureRules::none());
     }
 
-    let template = mc_worldgen::StructureTemplate::from_nbt_file(&template_path, blocks)
-        .with_context(|| {
-            format!(
-                "loading plains village marker from {}",
-                template_path.display()
-            )
-        })?;
-    let blocks = template.blocks().len();
+    let mut templates = Vec::new();
+    for path in template_paths.into_iter().take(8) {
+        match mc_worldgen::StructureTemplate::from_nbt_file(&path, blocks) {
+            Ok(template) if !template.blocks().is_empty() => templates.push(template),
+            Ok(_) => tracing::warn!(path = %path.display(), "empty structure template skipped"),
+            Err(err) => tracing::warn!(
+                path = %path.display(),
+                error = %err,
+                "structure template skipped",
+            ),
+        }
+    }
+    if templates.is_empty() {
+        tracing::warn!(path = %root.display(), "no usable plains village templates loaded");
+        return Ok(mc_worldgen::StructureRules::none());
+    }
+    let template_count = templates.len();
+    let block_count: usize = templates
+        .iter()
+        .map(|template| template.blocks().len())
+        .sum();
     tracing::info!(
-        path = %template_path.display(),
-        blocks,
-        "plains village marker template loaded",
+        path = %root.display(),
+        templates = template_count,
+        blocks = block_count,
+        "plains village templates loaded",
     );
-    Ok(mc_worldgen::StructureRules::single_plains_village_marker(
-        template,
+    Ok(mc_worldgen::StructureRules::plains_village_markers(
+        templates,
     ))
+}
+
+fn collect_nbt_templates(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("reading structure template directory {}", root.display()))?
+    {
+        let entry = entry.with_context(|| format!("reading entry under {}", root.display()))?;
+        let path = entry.path();
+        let ty = entry
+            .file_type()
+            .with_context(|| format!("reading file type for {}", path.display()))?;
+        if ty.is_dir() {
+            collect_nbt_templates(&path, out)?;
+        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "nbt") {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn build_terrain_generator(

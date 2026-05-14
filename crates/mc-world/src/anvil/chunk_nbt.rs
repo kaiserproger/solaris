@@ -142,6 +142,13 @@ pub fn chunk_from_nbt(nbt: &Tag, registry: &BlockRegistry) -> Result<Chunk, Chun
             }
         }
     }
+    if let Some(heightmap) = chunk
+        .heightmaps
+        .get("MOTION_BLOCKING")
+        .or_else(|| chunk.heightmaps.get("WORLD_SURFACE"))
+    {
+        chunk.highest_opaque = heightmap.clone();
+    }
 
     if let Some(be_list) = get_optional_list(root, "block_entities")? {
         for be in &be_list.elements {
