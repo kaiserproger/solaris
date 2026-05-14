@@ -33,7 +33,10 @@ const MAX_LONG_ARRAY_LEN: usize = 4096;
 const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
 const MAX_PLAYER_INFO_ENTRIES: usize = 1024;
 const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
+const MAX_ENTITY_DATA_VALUES: usize = 64;
 const MAX_COMMAND_LEN: usize = 32_767;
+pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
+pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
@@ -1095,6 +1098,106 @@ impl Packet for SetEntityMotion {
         Ok(Self {
             entity_id: buf.read_varint()?,
             movement: read_lp_vec3(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityDataValue {
+    ItemStack { index: u8, stack: ItemStack },
+}
+
+impl EntityDataValue {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        match self {
+            Self::ItemStack { index, stack } => {
+                buf.write_u8(*index);
+                buf.write_varint(ENTITY_DATA_ITEM_STACK_SERIALIZER_ID);
+                stack.encode(buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(index: u8, serializer_id: i32, buf: &mut B) -> Result<Self, CodecError> {
+        match serializer_id {
+            ENTITY_DATA_ITEM_STACK_SERIALIZER_ID => Ok(Self::ItemStack {
+                index,
+                stack: ItemStack::decode(buf)?,
+            }),
+            _ => Err(CodecError::NotSupported("entity data serializer")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundSetEntityData {
+    pub entity_id: i32,
+    pub values: Vec<EntityDataValue>,
+}
+
+impl Packet for ClientboundSetEntityData {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_ENTITY_DATA is
+    // game-CB index 99 = wire id 0x63. `javap -p -c` shows VarInt entity id,
+    // repeated DataValue entries, then EOF marker byte 255. DataValue writes one
+    // unsigned-byte metadata index, VarInt serializer id, then serializer payload.
+    const ID: i32 = 0x63;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        for value in &self.values {
+            value.encode(buf)?;
+        }
+        buf.write_u8(0xFF);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let entity_id = buf.read_varint()?;
+        let mut values = Vec::new();
+        loop {
+            let index = buf.read_u8()?;
+            if index == 0xFF {
+                break;
+            }
+            if values.len() >= MAX_ENTITY_DATA_VALUES {
+                return Err(CodecError::StringTooLong {
+                    len: values.len() + 1,
+                    max: MAX_ENTITY_DATA_VALUES,
+                });
+            }
+            let serializer_id = buf.read_varint()?;
+            values.push(EntityDataValue::decode(index, serializer_id, buf)?);
+        }
+        Ok(Self { entity_id, values })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundTakeItemEntity {
+    pub item_entity_id: i32,
+    pub player_entity_id: i32,
+    pub amount: i32,
+}
+
+impl Packet for ClientboundTakeItemEntity {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_TAKE_ITEM_ENTITY is
+    // game-CB index 124 = wire id 0x7C. `javap -p -c` shows three VarInts:
+    // item entity id, player entity id, and picked-up amount.
+    const ID: i32 = 0x7C;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.item_entity_id);
+        buf.write_varint(self.player_entity_id);
+        buf.write_varint(self.amount);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            item_entity_id: buf.read_varint()?,
+            player_entity_id: buf.read_varint()?,
+            amount: buf.read_varint()?,
         })
     }
 }
@@ -2655,6 +2758,8 @@ mod tests {
         assert_eq!(PlayerInfoUpdate::ID, 0x46);
         assert_eq!(RemoveEntities::ID, 0x4D);
         assert_eq!(RotateHead::ID, 0x53);
+        assert_eq!(ClientboundSetEntityData::ID, 0x63);
+        assert_eq!(ClientboundTakeItemEntity::ID, 0x7C);
     }
 
     #[test]
@@ -2719,6 +2824,59 @@ mod tests {
             },
             on_ground: true,
         });
+    }
+
+    #[test]
+    fn set_entity_data_item_stack_layout_matches_javap() {
+        let packet = ClientboundSetEntityData {
+            entity_id: 300,
+            values: vec![EntityDataValue::ItemStack {
+                index: ITEM_ENTITY_DATA_ITEM_INDEX,
+                stack: ItemStack::new(5, 1),
+            }],
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0xAC,
+                0x02,
+                ITEM_ENTITY_DATA_ITEM_INDEX,
+                ENTITY_DATA_ITEM_STACK_SERIALIZER_ID as u8,
+                0x01,
+                0x05,
+                0x00,
+                0x00,
+                0xFF,
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundSetEntityData::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn take_item_entity_layout_matches_javap() {
+        let packet = ClientboundTakeItemEntity {
+            item_entity_id: 300,
+            player_entity_id: 2,
+            amount: 1,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0xAC, 0x02, 0x02, 0x01]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundTakeItemEntity::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
     }
 
     #[test]

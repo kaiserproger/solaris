@@ -21,9 +21,11 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction,
-    EntityAnimation, EntityAnimationAction, GameEvent, LevelChunkWithLight, LightUpdate, LoginPlay,
-    PlayerActionKind, ServerboundChatCommand, ServerboundKeepAlive, ServerboundPlayerAction,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
+    ClientboundSetEntityData, ClientboundTakeItemEntity, ConfirmTeleportation, Direction,
+    EntityAnimation, EntityAnimationAction, EntityDataValue, GameEvent,
+    ITEM_ENTITY_DATA_ITEM_INDEX, LevelChunkWithLight, LightUpdate, LoginPlay, PlayerActionKind,
+    RemoveEntities, ServerboundChatCommand, ServerboundKeepAlive, ServerboundPlayerAction,
     SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
@@ -503,6 +505,165 @@ async fn survival_break_requires_timed_stop_before_mutation() {
             let pkt = BlockChangedAck::decode(&mut body).expect("decode survival ack");
             if pkt.sequence == 25 {
                 saw_ack = true;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn survival_break_drops_item_entity_and_picks_it_up() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+    let item_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .expect("item entity type") as i32;
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M22 drops pickup".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        block_light: None,
+        items,
+        entity_types,
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M22PickupMiner").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    let target_y = sync.y.floor() as i32 - 2;
+    let target_pos = pack_block_pos(0, target_y, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 31,
+        })
+        .await
+        .expect("send survival start break");
+    read_ack_without_target_update(&mut client, 31, (0, target_y, 0)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 32,
+        })
+        .await
+        .expect("send survival stop break");
+
+    let mut item_entity_id = None;
+    let mut dropped_stack = None;
+    let mut slot_stacks = Vec::new();
+    let mut saw_slot = false;
+    let mut saw_take = false;
+    let mut saw_remove = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(dropped_stack.is_some() && saw_slot && saw_take && saw_remove) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("drop pickup response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode item AddEntity");
+            if pkt.entity_type_id == item_entity_type {
+                item_entity_id = Some(pkt.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetEntityData::decode(&mut body).expect("decode entity data");
+            if Some(pkt.entity_id) == item_entity_id {
+                let stack = pkt.values.iter().find_map(|value| match value {
+                    EntityDataValue::ItemStack { index, stack }
+                        if *index == ITEM_ENTITY_DATA_ITEM_INDEX =>
+                    {
+                        Some(stack.clone())
+                    }
+                    _ => None,
+                });
+                if let Some(stack) = stack {
+                    assert_eq!(stack.count, 1);
+                    saw_slot = slot_stacks.iter().any(
+                        |slot_stack: &mc_protocol::packets::play::ItemStack| {
+                            slot_stack.item_id == stack.item_id && slot_stack.count >= 1
+                        },
+                    );
+                    dropped_stack = Some(stack);
+                }
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode set slot");
+            slot_stacks.push(pkt.item_stack.clone());
+            if let Some(stack) = &dropped_stack
+                && pkt.item_stack.item_id == stack.item_id
+                && pkt.item_stack.count >= 1
+            {
+                saw_slot = true;
+            }
+        } else if frame.id == ClientboundTakeItemEntity::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundTakeItemEntity::decode(&mut body).expect("decode take item");
+            if Some(pkt.item_entity_id) == item_entity_id {
+                assert_eq!(pkt.amount, 1);
+                saw_take = true;
+            }
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let pkt = RemoveEntities::decode(&mut body).expect("decode remove item");
+            if let Some(id) = item_entity_id
+                && pkt.entity_ids.contains(&id)
+            {
+                saw_remove = true;
             }
         }
     }

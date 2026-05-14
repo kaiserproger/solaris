@@ -79,6 +79,24 @@ pub enum EntityLifecycle {
     Despawning,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntityItemStack {
+    pub item_id: u32,
+    pub count: i32,
+}
+
+impl EntityItemStack {
+    #[must_use]
+    pub const fn new(item_id: u32, count: i32) -> Self {
+        Self { item_id, count }
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.count <= 0
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SpawnEntity {
     pub uuid: Option<Uuid>,
@@ -88,6 +106,7 @@ pub struct SpawnEntity {
     pub rotation: Rotation,
     pub velocity: Vec3,
     pub on_ground: bool,
+    pub item_stack: Option<EntityItemStack>,
     pub attributes: AttributeSet,
     pub goal: GoalState,
 }
@@ -103,6 +122,7 @@ impl SpawnEntity {
             rotation: Rotation::ZERO,
             velocity: Vec3::ZERO,
             on_ground: true,
+            item_stack: None,
             attributes: AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
         }
@@ -119,6 +139,7 @@ pub struct EntitySnapshot {
     pub rotation: Rotation,
     pub velocity: Vec3,
     pub on_ground: bool,
+    pub item_stack: Option<EntityItemStack>,
     pub lifecycle: EntityLifecycle,
     pub attributes: AttributeSet,
     pub goal: GoalState,
@@ -209,6 +230,7 @@ pub struct EntityStore {
     rotations: Vec<Rotation>,
     velocities: Vec<Vec3>,
     on_ground: Vec<bool>,
+    item_stacks: Vec<Option<EntityItemStack>>,
     lifecycles: Vec<EntityLifecycle>,
     attributes: Vec<AttributeSet>,
     goals: Vec<GoalState>,
@@ -260,6 +282,7 @@ impl EntityStore {
         self.rotations.push(entity.rotation);
         self.velocities.push(entity.velocity);
         self.on_ground.push(entity.on_ground);
+        self.item_stacks.push(entity.item_stack);
         self.lifecycles.push(EntityLifecycle::Alive);
         self.attributes.push(entity.attributes);
         self.goals.push(entity.goal);
@@ -318,6 +341,14 @@ impl EntityStore {
             return false;
         };
         self.on_ground[slot] = on_ground;
+        true
+    }
+
+    pub fn set_item_stack(&mut self, id: EntityId, item_stack: Option<EntityItemStack>) -> bool {
+        let Some(&slot) = self.slots_by_id.get(&id) else {
+            return false;
+        };
+        self.item_stacks[slot] = item_stack;
         true
     }
 
@@ -406,6 +437,7 @@ impl EntityStore {
             rotation: self.rotations[slot],
             velocity: self.velocities[slot],
             on_ground: self.on_ground[slot],
+            item_stack: self.item_stacks[slot],
             lifecycle: self.lifecycles[slot],
             attributes: self.attributes[slot].clone(),
             goal: self.goals[slot].clone(),
@@ -421,6 +453,7 @@ impl EntityStore {
         self.rotations.swap_remove(slot);
         self.velocities.swap_remove(slot);
         self.on_ground.swap_remove(slot);
+        self.item_stacks.swap_remove(slot);
         self.lifecycles.swap_remove(slot);
         self.attributes.swap_remove(slot);
         self.goals.swap_remove(slot);
@@ -477,6 +510,25 @@ mod tests {
         assert_eq!(
             store.snapshot(b).unwrap().position,
             Vec3::new(2.0, 64.0, 2.0)
+        );
+    }
+
+    #[test]
+    fn item_stack_payload_round_trips_through_snapshots() {
+        let mut store = EntityStore::new();
+        let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.5, 0.5));
+        item.item_stack = Some(EntityItemStack::new(42, 3));
+
+        let id = store.spawn(item);
+
+        assert_eq!(
+            store.snapshot(id).and_then(|snapshot| snapshot.item_stack),
+            Some(EntityItemStack::new(42, 3))
+        );
+        assert!(store.set_item_stack(id, Some(EntityItemStack::new(42, 1))));
+        assert_eq!(
+            store.snapshot(id).and_then(|snapshot| snapshot.item_stack),
+            Some(EntityItemStack::new(42, 1))
         );
     }
 

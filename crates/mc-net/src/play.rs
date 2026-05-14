@@ -23,25 +23,30 @@ use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
 use mc_data::block_light::BlockLightTable;
+use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::items::ItemRegistry;
 use mc_data::{Registry, VanillaData};
-use mc_entity::{EntityId, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3};
+use mc_entity::{
+    EntityId, EntityItemStack, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3,
+};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundPlayerAbilities,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, Direction, EntityAnimation,
-    EntityAnimationAction, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
-    ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
-    MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove,
-    PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange,
-    SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
-    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundSetCarriedItem,
-    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ClientboundSetEntityData, ClientboundSetHealth, ClientboundSetHeldSlot,
+    ClientboundTakeItemEntity, ConfirmTeleportation, Direction, EntityAnimation,
+    EntityAnimationAction, EntityDataValue, EntityPositionSync, EntityVec3, ForgetLevelChunk,
+    GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData,
+    LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
+    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
+    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundChangeGameMode,
+    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -99,9 +104,17 @@ enum OutboundCommand {
     MovePlayer(PlayerEntitySnapshot),
     DespawnPlayer(PlayerEntitySnapshot),
     SpawnEntity(ServerEntitySnapshot),
+    UpdateEntityData(ServerEntitySnapshot),
     MoveEntityRelative(ServerEntityMove),
+    TakeItemEntity {
+        item_entity_id: i32,
+        player_entity_id: i32,
+        amount: i32,
+    },
     DespawnEntity(ServerEntitySnapshot),
-    AnimatePlayer { entity_id: i32 },
+    AnimatePlayer {
+        entity_id: i32,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +155,7 @@ struct ServerEntitySnapshot {
     rotation: mc_entity::Rotation,
     velocity: Vec3,
     on_ground: bool,
+    item_stack: Option<EntityItemStack>,
 }
 
 #[derive(Debug, Clone)]
@@ -540,6 +554,112 @@ impl SessionRegistry {
         refresh_visibility_locked(&mut inner)
     }
 
+    fn spawn_item_drop(
+        &self,
+        entity_type_id: i32,
+        position: Vec3,
+        stack: EntityItemStack,
+    ) -> Vec<VisibilityDispatch> {
+        if stack.is_empty() {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
+        entity.item_stack = Some(stack);
+        entity.velocity = Vec3::new(0.0, 0.1, 0.0);
+        let id = inner.entities.spawn(entity);
+        inner.last_sent_entity_positions.insert(id, position);
+        refresh_visibility_locked(&mut inner)
+    }
+
+    fn nearby_item_entities(&self, position: Vec3, radius: f64) -> Vec<ServerEntitySnapshot> {
+        let radius_sq = radius * radius;
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .entities
+            .snapshots()
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .filter(|entity| entity.item_stack.is_some())
+            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+            .map(server_entity_snapshot_from)
+            .collect()
+    }
+
+    fn update_item_stack(
+        &self,
+        entity_id: EntityId,
+        stack: EntityItemStack,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if !inner.entities.set_item_stack(entity_id, Some(stack)) {
+            return Vec::new();
+        }
+        let Some(snapshot) = inner
+            .entities
+            .snapshot(entity_id)
+            .map(server_entity_snapshot_from)
+        else {
+            return Vec::new();
+        };
+        visible_entity_observers_locked(&inner, entity_id)
+            .into_iter()
+            .filter_map(|observer_id| {
+                let observer = inner.sessions.get(&observer_id)?;
+                Some(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::UpdateEntityData(snapshot.clone()),
+                })
+            })
+            .collect()
+    }
+
+    fn remove_picked_item(
+        &self,
+        entity_id: EntityId,
+        collector_session: SessionId,
+        amount: i32,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let Some(snapshot) = inner
+            .entities
+            .remove(entity_id)
+            .map(server_entity_snapshot_from)
+        else {
+            return Vec::new();
+        };
+        inner.last_sent_entity_positions.remove(&entity_id);
+        let collector_entity_id = inner
+            .sessions
+            .get(&collector_session)
+            .map(|session| session.entity_id)
+            .unwrap_or_default();
+        let mut dispatches = Vec::new();
+        for (&observer_id, observer) in &mut inner.sessions {
+            if observer.visible_entities.remove(&entity_id) {
+                let recipient = SessionRecipient {
+                    id: observer_id,
+                    tx: observer.tx.clone(),
+                };
+                dispatches.push(VisibilityDispatch {
+                    recipient: recipient.clone(),
+                    command: OutboundCommand::TakeItemEntity {
+                        item_entity_id: entity_id.0,
+                        player_entity_id: collector_entity_id,
+                        amount,
+                    },
+                });
+                dispatches.push(VisibilityDispatch {
+                    recipient,
+                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
+                });
+            }
+        }
+        dispatches
+    }
+
     pub(crate) fn tick_entities_and_collect_physics_queries(
         &self,
         tick: u64,
@@ -704,11 +824,19 @@ fn server_entity_snapshot_from(entity: mc_entity::EntitySnapshot) -> ServerEntit
         rotation: entity.rotation,
         velocity: entity.velocity,
         on_ground: entity.on_ground,
+        item_stack: entity.item_stack,
     }
 }
 
 fn server_entity_chunk_pos(entity: &ServerEntitySnapshot) -> (i32, i32) {
     chunk_pos_from_coords(entity.position.x, entity.position.z)
+}
+
+fn distance_sq(a: Vec3, b: Vec3) -> f64 {
+    let dx = a.x - b.x;
+    let dy = a.y - b.y;
+    let dz = a.z - b.z;
+    dx * dx + dy * dy + dz * dz
 }
 
 fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {
@@ -1276,6 +1404,7 @@ where
             inventory: initial_inventory,
             inventory_state_id: 1,
             items: Arc::clone(&config.items),
+            entity_types: Arc::clone(&config.entity_types),
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
             pending_break: None,
         });
@@ -1335,6 +1464,7 @@ struct InteractionState {
     /// ContainerSetContent on login).
     inventory_state_id: i32,
     items: Arc<ItemRegistry>,
+    entity_types: Arc<EntityTypeRegistry>,
     /// Registry-derived item→default-block resolver. Built once from
     /// vanilla item/block registries at construction time.
     item_to_block: ItemToBlockTable,
@@ -1421,6 +1551,42 @@ impl PlayerInventory {
 
     fn set_hotbar(&mut self, hotbar_slot: u8, stack: ItemStack) {
         self.slots[Self::HOTBAR_BASE + hotbar_slot as usize] = stack;
+    }
+
+    fn merge_stack(&mut self, mut stack: ItemStack) -> (ItemStack, Vec<(usize, ItemStack)>) {
+        let mut changed = Vec::new();
+        if stack.is_empty() {
+            return (ItemStack::EMPTY, changed);
+        }
+
+        for slot in 9..=44 {
+            let current = &mut self.slots[slot];
+            if current.is_empty() || current.item_id != stack.item_id || current.count >= 64 {
+                continue;
+            }
+            let moved = (64 - current.count).min(stack.count);
+            current.count += moved;
+            stack.count -= moved;
+            changed.push((slot, current.clone()));
+            if stack.count <= 0 {
+                return (ItemStack::EMPTY, changed);
+            }
+        }
+
+        for slot in 9..=44 {
+            if !self.slots[slot].is_empty() {
+                continue;
+            }
+            let moved = stack.count.min(64);
+            self.slots[slot] = ItemStack::new(stack.item_id, moved);
+            stack.count -= moved;
+            changed.push((slot, self.slots[slot].clone()));
+            if stack.count <= 0 {
+                return (ItemStack::EMPTY, changed);
+            }
+        }
+
+        (stack, changed)
     }
 
     fn as_wire_list(&self) -> Vec<ItemStack> {
@@ -2590,11 +2756,94 @@ async fn mining_time_for_target(state: &InteractionState, position: i64) -> Dura
     })
 }
 
+fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let item = mc_data::Identifier::parse("minecraft:item").expect("static identifier");
+    entity_types
+        .id_of(&item)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Option<ItemStack> {
+    let block = state.blocks.by_id(block_state)?;
+    let item_id = state.items.id_of(&block.block.id)?;
+    Some(ItemStack::new(item_id, 1))
+}
+
+fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
+    EntityItemStack::new(stack.item_id, stack.count)
+}
+
+async fn write_inventory_slot_updates<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    changed: Vec<(usize, ItemStack)>,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for (slot, item_stack) in changed {
+        state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+        write_packet(
+            writer,
+            &ClientboundContainerSetSlot {
+                container_id: 0,
+                state_id: state.inventory_state_id,
+                slot: slot as i16,
+                item_stack,
+            },
+            state.compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn pickup_nearby_items<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    player_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let player_position = Vec3::new(player_pose.x, player_pose.y, player_pose.z);
+    let candidates = state.sessions.nearby_item_entities(player_position, 2.25);
+    for entity in candidates {
+        let Some(stack) = entity.item_stack else {
+            continue;
+        };
+        let original_count = stack.count;
+        let (remaining, changed) = state
+            .inventory
+            .merge_stack(ItemStack::new(stack.item_id, stack.count));
+        if changed.is_empty() {
+            continue;
+        }
+        write_inventory_slot_updates(state, writer, changed).await?;
+        if remaining.is_empty() {
+            dispatch_visibility_commands(state.sessions.remove_picked_item(
+                entity.id,
+                state.session_id,
+                original_count,
+            ));
+        } else {
+            dispatch_visibility_commands(
+                state
+                    .sessions
+                    .update_item_stack(entity.id, entity_item_stack(remaining)),
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn complete_block_break<W>(
     state: &mut InteractionState,
     writer: &mut W,
     sequence: i32,
     position: i64,
+    drop_items: bool,
+    player_pose: PlayerPose,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -2604,7 +2853,19 @@ where
     let replacement = break_replacement_state(state, x, y, z, air).await;
 
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-    apply_block_edit(state, writer, sequence, x, y, z, replacement).await
+    let prev = apply_block_edit(state, writer, sequence, x, y, z, replacement).await?;
+    if drop_items
+        && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
+        && let Some(drop) = block_drop_stack(state, prev)
+    {
+        dispatch_visibility_commands(state.sessions.spawn_item_drop(
+            entity_type_id,
+            Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+            entity_item_stack(drop),
+        ));
+        pickup_nearby_items(state, writer, player_pose).await?;
+    }
+    Ok(())
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
@@ -2614,6 +2875,7 @@ async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
+    player_pose: PlayerPose,
     action: ServerboundPlayerAction,
 ) -> Result<(), ConnectionError>
 where
@@ -2644,7 +2906,15 @@ where
             if matches!(action.action, PlayerActionKind::AbortDestroyBlock) {
                 return write_block_ack(writer, state.compression, action.sequence).await;
             }
-            complete_block_break(state, writer, action.sequence, action.position).await
+            complete_block_break(
+                state,
+                writer,
+                action.sequence,
+                action.position,
+                false,
+                player_pose,
+            )
+            .await
         }
         GameMode::Survival => match action.action {
             PlayerActionKind::StartDestroyBlock => {
@@ -2670,7 +2940,15 @@ where
                 });
                 state.pending_break = None;
                 if can_complete {
-                    complete_block_break(state, writer, action.sequence, action.position).await
+                    complete_block_break(
+                        state,
+                        writer,
+                        action.sequence,
+                        action.position,
+                        true,
+                        player_pose,
+                    )
+                    .await
                 } else {
                     debug!(
                         sequence = action.sequence,
@@ -2868,7 +3146,7 @@ async fn apply_block_edit<W>(
     y: i32,
     z: i32,
     new_state: mc_world::BlockStateId,
-) -> Result<(), ConnectionError>
+) -> Result<Option<mc_world::BlockStateId>, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -2893,7 +3171,7 @@ where
             Err(err) => {
                 warn!(error = %err, x, y, z, "set_block_at failed; skipping edit");
                 write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-                return Ok(());
+                return Ok(None);
             }
         }
     };
@@ -2903,11 +3181,11 @@ where
     // LightUpdate ripple.
     let Some(prev) = prev else {
         write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-        return Ok(());
+        return Ok(None);
     };
     if prev == new_state {
         write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-        return Ok(());
+        return Ok(None);
     }
 
     let block_delta = BlockDelta {
@@ -2956,7 +3234,7 @@ where
     // 4. Ack last — vanilla expects update-before-ack so the
     //    prediction reconciles against a known state.
     write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-    Ok(())
+    Ok(Some(prev))
 }
 
 /// M9: incremental relight. Pulls the post-edit 3×3 chunk
@@ -3235,7 +3513,7 @@ where
         return Ok(());
     }
 
-    apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
+    let _ = apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
 
     // M6.f: decrement the held stack's count + tell the client the
@@ -3493,7 +3771,33 @@ where
         compression,
     )
     .await?;
+    send_entity_data(writer, compression, entity).await?;
     send_entity_move(writer, compression, entity).await
+}
+
+async fn send_entity_data<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(stack) = entity.item_stack else {
+        return Ok(());
+    };
+    write_packet(
+        writer,
+        &ClientboundSetEntityData {
+            entity_id: entity.id.0,
+            values: vec![EntityDataValue::ItemStack {
+                index: ITEM_ENTITY_DATA_ITEM_INDEX,
+                stack: ItemStack::new(stack.item_id, stack.count),
+            }],
+        },
+        compression,
+    )
+    .await
 }
 
 async fn send_entity_move<W>(
@@ -3589,6 +3893,28 @@ where
         writer,
         &RemoveEntities {
             entity_ids: vec![entity.id.0],
+        },
+        compression,
+    )
+    .await
+}
+
+async fn send_take_item_entity<W>(
+    writer: &mut W,
+    compression: Compression,
+    item_entity_id: i32,
+    player_entity_id: i32,
+    amount: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundTakeItemEntity {
+            item_entity_id,
+            player_entity_id,
+            amount,
         },
         compression,
     )
@@ -3693,8 +4019,24 @@ where
                     Some(OutboundCommand::SpawnEntity(entity)) => {
                         send_entity_spawn(writer, compression, &entity).await?;
                     }
+                    Some(OutboundCommand::UpdateEntityData(entity)) => {
+                        send_entity_data(writer, compression, &entity).await?;
+                    }
                     Some(OutboundCommand::MoveEntityRelative(movement)) => {
                         send_entity_relative_move(writer, compression, &movement).await?;
+                    }
+                    Some(OutboundCommand::TakeItemEntity {
+                        item_entity_id,
+                        player_entity_id,
+                        amount,
+                    }) => {
+                        send_take_item_entity(
+                            writer,
+                            compression,
+                            item_entity_id,
+                            player_entity_id,
+                            amount,
+                        ).await?;
                     }
                     Some(OutboundCommand::DespawnEntity(entity)) => {
                         send_entity_despawn(writer, compression, &entity).await?;
@@ -3781,7 +4123,7 @@ where
                     let mut body = frame.body;
                     let action = ServerboundPlayerAction::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_player_action(state, writer, game_mode, action).await?;
+                        handle_player_action(state, writer, game_mode, player_pose, action).await?;
                     } else {
                         debug!(
                             action = ?action.action,
@@ -4215,6 +4557,19 @@ mod tests {
 
         assert_eq!(table.resolve(42), Some(mc_world::BlockStateId(1)));
         assert_eq!(table.resolve(43), None);
+    }
+
+    #[test]
+    fn inventory_merge_prefers_existing_stacks_then_empty_slots() {
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[10] = ItemStack::new(42, 63);
+
+        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 3));
+
+        assert!(remaining.is_empty());
+        assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
+        assert_eq!(inventory.slots[9], ItemStack::new(42, 2));
+        assert_eq!(changed.len(), 2);
     }
 
     #[test]
