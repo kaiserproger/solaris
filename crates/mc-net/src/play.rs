@@ -2913,6 +2913,7 @@ async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
+    survival_state: SurvivalState,
     player_pose: PlayerPose,
     action: ServerboundPlayerAction,
 ) -> Result<(), ConnectionError>
@@ -2936,6 +2937,15 @@ where
         );
         write_block_ack(writer, state.compression, action.sequence).await?;
         return Ok(());
+    }
+
+    if game_mode == GameMode::Survival && survival_state.is_dead() {
+        state.pending_break = None;
+        debug!(
+            sequence = action.sequence,
+            "survival block break ignored for dead player"
+        );
+        return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
     match game_mode {
@@ -3461,11 +3471,28 @@ async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
+    survival_state: SurvivalState,
     action: ServerboundUseItemOn,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    if game_mode == GameMode::Survival && survival_state.is_dead() {
+        debug!(
+            sequence = action.sequence,
+            "survival block placement ignored for dead player"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            state.compression,
+        )
+        .await?;
+        return Ok(());
+    }
+
     if game_mode != GameMode::Creative {
         debug!(
             mode = ?game_mode,
@@ -4200,7 +4227,15 @@ where
                     let mut body = frame.body;
                     let action = ServerboundPlayerAction::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_player_action(state, writer, game_mode, player_pose, action).await?;
+                        handle_player_action(
+                            state,
+                            writer,
+                            game_mode,
+                            survival_state,
+                            player_pose,
+                            action,
+                        )
+                        .await?;
                     } else {
                         debug!(
                             action = ?action.action,
@@ -4212,7 +4247,7 @@ where
                     let mut body = frame.body;
                     let use_on = ServerboundUseItemOn::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_use_item_on(state, writer, game_mode, use_on).await?;
+                        handle_use_item_on(state, writer, game_mode, survival_state, use_on).await?;
                     } else {
                         debug!(
                             sequence = use_on.sequence,
@@ -4385,7 +4420,7 @@ async fn apply_debug_command<W>(
     writer: &mut W,
     compression: Compression,
     survival_state: &mut SurvivalState,
-    interaction: Option<&mut InteractionState>,
+    mut interaction: Option<&mut InteractionState>,
     command: DebugCommand,
     permissions: CommandPermissions,
 ) -> Result<(), ConnectionError>
@@ -4399,7 +4434,13 @@ where
 
     match command {
         DebugCommand::Survival(command) => {
-            apply_survival_command(writer, compression, survival_state, command).await
+            let result = apply_survival_command(writer, compression, survival_state, command).await;
+            if survival_state.is_dead()
+                && let Some(state) = interaction.as_mut()
+            {
+                state.pending_break = None;
+            }
+            result
         }
         DebugCommand::Give {
             item,

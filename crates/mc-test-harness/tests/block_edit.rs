@@ -780,6 +780,120 @@ async fn survival_use_item_eats_apple_and_updates_food() {
     }
 }
 
+#[tokio::test]
+async fn dead_survival_player_cannot_mine_or_eat() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let apple_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
+        .expect("apple item");
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M22 dead survival guard".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        block_light: None,
+        items,
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M22DeadGuard").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival exhaust 28".into(),
+        })
+        .await
+        .expect("exhaust hunger");
+    wait_for_food_level(&mut client, 18).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:apple 2 0".into(),
+        })
+        .await
+        .expect("give apple");
+    wait_for_slot_stack(&mut client, apple_id, 2).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival damage 100".into(),
+        })
+        .await
+        .expect("kill player");
+    wait_for_health_level(&mut client, 0.0).await;
+
+    let target_y = sync.y.floor() as i32 - 2;
+    let target_pos = pack_block_pos(0, target_y, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 71,
+        })
+        .await
+        .expect("dead start break");
+    read_ack_without_target_update(&mut client, 71, (0, target_y, 0)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 72,
+        })
+        .await
+        .expect("dead stop break");
+    read_ack_without_target_update(&mut client, 72, (0, target_y, 0)).await;
+
+    client
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::MainHand,
+            sequence: 73,
+            y_rot: 0.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("dead eat apple");
+    read_ack_without_food_or_slot_change(&mut client, 73, apple_id).await;
+}
+
 async fn connect_to_play(
     addr: std::net::SocketAddr,
     name: &str,
@@ -888,6 +1002,61 @@ async fn wait_for_food_level(client: &mut Client, food: i32) {
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
             if pkt.food == food {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_health_level(client: &mut Client, health: f32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("health level update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
+            if (pkt.health - health).abs() < f32::EPSILON {
+                return;
+            }
+        }
+    }
+}
+
+async fn read_ack_without_food_or_slot_change(client: &mut Client, sequence: i32, item_id: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("dead use item ack");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
+            assert!(
+                pkt.item_stack.item_id != item_id || pkt.item_stack.count != 1,
+                "dead use item must not consume the held food stack"
+            );
+        } else if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
+            assert_ne!(pkt.food, 20, "dead use item must not restore food");
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if pkt.sequence == sequence {
                 return;
             }
         }
