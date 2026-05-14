@@ -1346,9 +1346,46 @@ struct PendingBreak {
     position: i64,
     direction: Direction,
     started_at: Instant,
+    required_time: Duration,
     held_hotbar_slot: u8,
     held_item_id: Option<u32>,
 }
+
+#[derive(Debug, Clone, Copy)]
+struct MiningRule {
+    block_path_contains: &'static [&'static str],
+    base_time: Duration,
+    tool_suffix: Option<&'static str>,
+}
+
+const FALLBACK_MINING_RULES: &[MiningRule] = &[
+    MiningRule {
+        block_path_contains: &["stone", "ore", "deepslate", "brick"],
+        base_time: Duration::from_millis(1_500),
+        tool_suffix: Some("_pickaxe"),
+    },
+    MiningRule {
+        block_path_contains: &["log", "wood", "planks"],
+        base_time: Duration::from_millis(900),
+        tool_suffix: Some("_axe"),
+    },
+    MiningRule {
+        block_path_contains: &["dirt", "sand", "gravel", "clay", "snow"],
+        base_time: Duration::from_millis(600),
+        tool_suffix: Some("_shovel"),
+    },
+    MiningRule {
+        block_path_contains: &["leaves", "grass", "flower"],
+        base_time: SURVIVAL_MINING_FALLBACK_TIME,
+        tool_suffix: None,
+    },
+];
+
+const UNKNOWN_BLOCK_MINING_RULE: MiningRule = MiningRule {
+    block_path_contains: &[],
+    base_time: Duration::from_millis(800),
+    tool_suffix: None,
+};
 
 /// 46-slot player inventory (window 0).
 ///
@@ -2469,7 +2506,88 @@ fn pending_break_matches(
 }
 
 fn pending_break_is_complete(pending: &PendingBreak, now: Instant) -> bool {
-    now.duration_since(pending.started_at) >= SURVIVAL_MINING_FALLBACK_TIME
+    now.duration_since(pending.started_at) >= pending.required_time
+}
+
+fn fallback_mining_rule(block_path: &str) -> MiningRule {
+    FALLBACK_MINING_RULES
+        .iter()
+        .copied()
+        .find(|rule| {
+            rule.block_path_contains
+                .iter()
+                .any(|needle| block_path.contains(needle))
+        })
+        .unwrap_or(UNKNOWN_BLOCK_MINING_RULE)
+}
+
+fn tool_speed_divisor(tool_path: Option<&str>, required_suffix: Option<&str>) -> u64 {
+    let Some(tool_path) = tool_path else {
+        return 1;
+    };
+    if required_suffix.is_some_and(|suffix| !tool_path.ends_with(suffix)) {
+        return 1;
+    }
+
+    if tool_path.starts_with("golden_") {
+        10
+    } else if tool_path.starts_with("netherite_") {
+        8
+    } else if tool_path.starts_with("diamond_") {
+        6
+    } else if tool_path.starts_with("iron_") {
+        4
+    } else if tool_path.starts_with("stone_") {
+        3
+    } else if tool_path.starts_with("wooden_") {
+        2
+    } else {
+        1
+    }
+}
+
+fn fallback_mining_time(block_path: &str, tool_path: Option<&str>) -> Duration {
+    let rule = fallback_mining_rule(block_path);
+    let divisor = tool_speed_divisor(tool_path, rule.tool_suffix);
+    Duration::from_millis((rule.base_time.as_millis() as u64 / divisor).max(100))
+}
+
+fn mining_time_for_block(
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    block_state: BlockStateId,
+    held_item_id: Option<u32>,
+) -> Duration {
+    let Some(block_state) = blocks.by_id(block_state) else {
+        return UNKNOWN_BLOCK_MINING_RULE.base_time;
+    };
+    let tool_path = held_item_id
+        .and_then(|id| items.name_of(id))
+        .map(mc_data::Identifier::path);
+    fallback_mining_time(block_state.block.id.path(), tool_path)
+}
+
+async fn mining_time_for_target(state: &InteractionState, position: i64) -> Duration {
+    let (x, y, z) = unpack_block_pos(position);
+    let block_state = {
+        let mut storage = state.world.lock().await;
+        storage
+            .get_block(mc_world::BlockPos { x, y, z })
+            .map_err(|err| {
+                warn!(error = %err, x, y, z, "mining target read failed; using fallback timing");
+            })
+            .ok()
+            .flatten()
+    };
+
+    block_state.map_or(UNKNOWN_BLOCK_MINING_RULE.base_time, |block_state| {
+        mining_time_for_block(
+            &state.blocks,
+            &state.items,
+            block_state,
+            held_item_id(state),
+        )
+    })
 }
 
 async fn complete_block_break<W>(
@@ -2530,10 +2648,12 @@ where
         }
         GameMode::Survival => match action.action {
             PlayerActionKind::StartDestroyBlock => {
+                let required_time = mining_time_for_target(state, action.position).await;
                 state.pending_break = Some(PendingBreak {
                     position: action.position,
                     direction: action.direction,
                     started_at: Instant::now(),
+                    required_time,
                     held_hotbar_slot: state.selected_hotbar_slot,
                     held_item_id: held_item_id(state),
                 });
@@ -4095,6 +4215,28 @@ mod tests {
 
         assert_eq!(table.resolve(42), Some(mc_world::BlockStateId(1)));
         assert_eq!(table.resolve(43), None);
+    }
+
+    #[test]
+    fn fallback_mining_rules_use_block_family_and_matching_tool() {
+        let stone_hand = fallback_mining_time("stone", None);
+        let stone_pickaxe = fallback_mining_time("stone", Some("iron_pickaxe"));
+        let stone_shovel = fallback_mining_time("stone", Some("iron_shovel"));
+
+        assert!(stone_pickaxe < stone_hand);
+        assert_eq!(stone_shovel, stone_hand);
+        assert!(
+            fallback_mining_time("oak_log", Some("stone_axe"))
+                < fallback_mining_time("oak_log", None)
+        );
+        assert!(
+            fallback_mining_time("dirt", Some("wooden_shovel"))
+                < fallback_mining_time("dirt", None)
+        );
+        assert_eq!(
+            fallback_mining_time("unknown_custom_block", None),
+            Duration::from_millis(800)
+        );
     }
 
     #[test]
