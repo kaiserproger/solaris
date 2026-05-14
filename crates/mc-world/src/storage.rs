@@ -277,6 +277,17 @@ impl WorldStorage {
         Ok(self.cache.get_mut(&cpos))
     }
 
+    /// Insert a freshly generated chunk through the same cache/LRU path
+    /// as the lazy generator fallback. Existing cached chunks win.
+    pub fn insert_generated_chunk(
+        &mut self,
+        cpos: ChunkPos,
+        mut chunk: Chunk,
+    ) -> Result<(), WorldError> {
+        chunk.dirty = true;
+        self.insert_chunk(cpos, chunk)
+    }
+
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
         if self.cache.contains_key(&cpos) {
             self.touch(cpos);

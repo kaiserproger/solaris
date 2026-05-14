@@ -3,6 +3,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -102,7 +104,12 @@ async fn serve(path: &Path) -> Result<()> {
                 let mut storage = storage.with_generator(generator);
                 let mut region_count = count_region_files(world_dir);
                 if region_count == 0 {
-                    let generated = generate_spawn_window(&mut storage, cfg.server.view_distance)?;
+                    let generated = generate_spawn_window(
+                        &mut storage,
+                        Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
+                        cfg.server.view_distance,
+                        cfg.chunk_pipeline.chunk_worker_threads,
+                    )?;
                     let flushed = storage.flush_dirty()?;
                     region_count = count_region_files(world_dir);
                     tracing::info!(
@@ -455,19 +462,84 @@ fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
 
 fn generate_spawn_window(
     storage: &mut mc_world::WorldStorage,
+    generator: Arc<dyn mc_world::ChunkGenerator>,
     view_distance: i32,
+    worker_threads: usize,
 ) -> Result<usize> {
     let view_distance = view_distance.max(0);
+    let positions = spawn_window_positions(view_distance);
+    let total = positions.len();
+    if total == 0 {
+        return Ok(0);
+    }
+
+    let workers = worker_threads.max(1).min(total);
+    tracing::info!(
+        chunks = total,
+        workers,
+        view_distance,
+        "empty world pre-generation started",
+    );
+
+    let positions = Arc::new(positions);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..workers {
+        let positions = Arc::clone(&positions);
+        let next = Arc::clone(&next);
+        let tx = tx.clone();
+        let generator = Arc::clone(&generator);
+        std::thread::spawn(move || {
+            loop {
+                let idx = next.fetch_add(1, Ordering::Relaxed);
+                let Some(&pos) = positions.get(idx) else {
+                    break;
+                };
+                let chunk = generator.generate(pos);
+                if tx.send((pos, chunk)).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+    drop(tx);
+
+    let started = Instant::now();
+    let mut last_log = Instant::now();
+    let log_every = (total / 20).max(64);
     let mut generated = 0usize;
-    for z in -view_distance..=view_distance {
-        for x in -view_distance..=view_distance {
-            storage
-                .get_chunk(mc_world::ChunkPos { x, z })
-                .with_context(|| format!("pre-generating spawn chunk ({x}, {z})"))?;
-            generated += 1;
+    for (pos, chunk) in rx {
+        storage
+            .insert_generated_chunk(pos, chunk)
+            .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))?;
+        generated += 1;
+        if generated == total
+            || generated.is_multiple_of(log_every)
+            || last_log.elapsed() >= Duration::from_secs(2)
+        {
+            tracing::info!(
+                generated,
+                total,
+                elapsed_ms = started.elapsed().as_millis(),
+                "empty world pre-generation progress",
+            );
+            last_log = Instant::now();
         }
     }
+
     Ok(generated)
+}
+
+fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    let view_distance = view_distance.max(0);
+    let width = view_distance as usize * 2 + 1;
+    let mut positions = Vec::with_capacity(width * width);
+    for z in -view_distance..=view_distance {
+        for x in -view_distance..=view_distance {
+            positions.push(mc_world::ChunkPos { x, z });
+        }
+    }
+    positions
 }
 
 fn count_region_files(world_dir: &Path) -> usize {
@@ -571,15 +643,24 @@ mod tests {
 
     #[test]
     fn generate_spawn_window_materializes_view_square() {
-        struct StubGen;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct StubGen {
+            active: Arc<AtomicUsize>,
+            max_active: Arc<AtomicUsize>,
+        }
 
         impl mc_world::ChunkGenerator for StubGen {
             fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+                let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_active.fetch_max(active, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(5));
                 let air = mc_world::BlockStateId(0);
                 let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
                 let mut chunk = mc_world::Chunk::empty(pos, air, biome);
                 chunk.status = "minecraft:full".into();
                 chunk.dirty = true;
+                self.active.fetch_sub(1, Ordering::SeqCst);
                 chunk
             }
         }
@@ -594,11 +675,23 @@ mod tests {
             }],
         }];
         let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
-        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 16)
-            .with_generator(Arc::new(StubGen));
+        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 16);
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let generator = Arc::new(StubGen {
+            active,
+            max_active: Arc::clone(&max_active),
+        });
 
-        assert_eq!(generate_spawn_window(&mut storage, 1).unwrap(), 9);
+        assert_eq!(
+            generate_spawn_window(&mut storage, generator, 1, 4).unwrap(),
+            9
+        );
         assert_eq!(storage.cache_len(), 9);
         assert_eq!(storage.dirty_count(), 9);
+        assert!(
+            max_active.load(Ordering::SeqCst) > 1,
+            "startup pre-generation should use worker threads"
+        );
     }
 }
