@@ -35,9 +35,43 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
 
 fn check_config(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
-    let rendered = serde_json::to_string_pretty(&cfg).context("rendering config as JSON")?;
+    let effective = EffectiveConfig::from(&cfg);
+    let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
     println!("{rendered}");
     Ok(())
+}
+
+#[derive(serde::Serialize)]
+struct EffectiveConfig<'a> {
+    #[serde(flatten)]
+    config: &'a ServerConfig,
+    effective_chunk_pipeline: EffectiveChunkPipeline,
+}
+
+impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
+    fn from(config: &'a ServerConfig) -> Self {
+        Self {
+            config,
+            effective_chunk_pipeline: EffectiveChunkPipeline::from(
+                config.chunk_pipeline.to_network(),
+            ),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EffectiveChunkPipeline {
+    chunk_io_threads: usize,
+    chunk_worker_threads: usize,
+}
+
+impl From<mc_net::ChunkPipelinePolicy> for EffectiveChunkPipeline {
+    fn from(policy: mc_net::ChunkPipelinePolicy) -> Self {
+        Self {
+            chunk_io_threads: policy.chunk_io_threads,
+            chunk_worker_threads: policy.chunk_worker_threads,
+        }
+    }
 }
 
 async fn serve(path: &Path) -> Result<()> {
@@ -76,6 +110,7 @@ async fn serve(path: &Path) -> Result<()> {
         "block registry source loaded",
     );
     let structure_rules = load_structure_rules(&cfg.data.vanilla_dir, blocks.as_ref())?;
+    let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let terrain_generator = build_terrain_generator(
         cfg.data.seed,
         &cfg.data.vanilla_dir,
@@ -90,7 +125,7 @@ async fn serve(path: &Path) -> Result<()> {
                 world_dir,
                 Arc::clone(&blocks),
                 chunk_cache_size_for_view_distance(cfg.server.view_distance),
-                cfg.chunk_pipeline.region_cache_size,
+                chunk_pipeline.region_cache_size,
             )?)
         })();
         match open_result {
@@ -108,7 +143,7 @@ async fn serve(path: &Path) -> Result<()> {
                         &mut storage,
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
                         cfg.server.view_distance,
-                        cfg.chunk_pipeline.chunk_worker_threads,
+                        chunk_pipeline.chunk_worker_threads,
                     )?;
                     let flushed = storage.flush_dirty()?;
                     region_count = count_region_files(world_dir);

@@ -5,6 +5,7 @@
 //! Part of the Solaris engine.
 
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -89,10 +90,10 @@ pub struct ChunkPipelineSection {
     pub chunk_prepare_budget_ms: u64,
     #[serde(default = "default_chunk_prepare_batch_size")]
     pub chunk_prepare_batch_size: usize,
-    #[serde(default = "default_chunk_io_threads")]
-    pub chunk_io_threads: usize,
-    #[serde(default = "default_chunk_worker_threads")]
-    pub chunk_worker_threads: usize,
+    #[serde(default = "default_chunk_io_threads_percent")]
+    pub chunk_io_threads_percent: u32,
+    #[serde(default = "default_chunk_worker_threads_percent")]
+    pub chunk_worker_threads_percent: u32,
     #[serde(default = "default_chunk_result_queue_size")]
     pub chunk_result_queue_size: usize,
     #[serde(default = "default_region_cache_size")]
@@ -110,8 +111,8 @@ impl Default for ChunkPipelineSection {
             chunk_generate_rate: policy.chunk_generate_rate,
             chunk_prepare_budget_ms: policy.chunk_prepare_budget_ms,
             chunk_prepare_batch_size: policy.chunk_prepare_batch_size,
-            chunk_io_threads: policy.chunk_io_threads,
-            chunk_worker_threads: policy.chunk_worker_threads,
+            chunk_io_threads_percent: default_chunk_io_threads_percent(),
+            chunk_worker_threads_percent: default_chunk_worker_threads_percent(),
             chunk_result_queue_size: policy.chunk_result_queue_size,
             region_cache_size: policy.region_cache_size,
             compression_level: policy.compression_level,
@@ -122,19 +123,32 @@ impl Default for ChunkPipelineSection {
 impl ChunkPipelineSection {
     #[must_use]
     pub fn to_network(&self) -> mc_net::ChunkPipelinePolicy {
+        let cores = available_parallelism();
         mc_net::ChunkPipelinePolicy {
             chunk_send_rate: self.chunk_send_rate.max(1),
             chunk_load_rate: self.chunk_load_rate.max(1),
             chunk_generate_rate: self.chunk_generate_rate.max(1),
             chunk_prepare_budget_ms: self.chunk_prepare_budget_ms,
             chunk_prepare_batch_size: self.chunk_prepare_batch_size.max(1),
-            chunk_io_threads: self.chunk_io_threads.max(1),
-            chunk_worker_threads: self.chunk_worker_threads.max(1),
+            chunk_io_threads: threads_from_percent(cores, self.chunk_io_threads_percent),
+            chunk_worker_threads: threads_from_percent(cores, self.chunk_worker_threads_percent),
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
             compression_level: self.compression_level.map(|level| level.min(9)),
         }
     }
+}
+
+fn available_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+fn threads_from_percent(cores: usize, percent: u32) -> usize {
+    let cores = cores.max(1);
+    let scaled = cores.saturating_mul(percent as usize).div_ceil(100);
+    scaled.max(1)
 }
 
 impl Default for DataSection {
@@ -175,12 +189,12 @@ fn default_chunk_prepare_batch_size() -> usize {
     mc_net::ChunkPipelinePolicy::default().chunk_prepare_batch_size
 }
 
-fn default_chunk_io_threads() -> usize {
-    mc_net::ChunkPipelinePolicy::default().chunk_io_threads
+fn default_chunk_io_threads_percent() -> u32 {
+    25
 }
 
-fn default_chunk_worker_threads() -> usize {
-    mc_net::ChunkPipelinePolicy::default().chunk_worker_threads
+fn default_chunk_worker_threads_percent() -> u32 {
+    50
 }
 
 fn default_chunk_result_queue_size() -> usize {
@@ -248,7 +262,8 @@ mod tests {
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 64);
-        assert!(cfg.chunk_pipeline.chunk_worker_threads >= 1);
+        assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
+        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
     }
 
     #[test]
@@ -268,8 +283,8 @@ mod tests {
             chunk_generate_rate = 4
             chunk_prepare_budget_ms = 3
             chunk_prepare_batch_size = 2
-            chunk_io_threads = 1
-            chunk_worker_threads = 3
+            chunk_io_threads_percent = 25
+            chunk_worker_threads_percent = 75
             chunk_result_queue_size = 9
             region_cache_size = 7
             compression_level = 6
@@ -280,8 +295,8 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 4);
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_budget_ms, 3);
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 2);
-        assert_eq!(cfg.chunk_pipeline.chunk_io_threads, 1);
-        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads, 3);
+        assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
+        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 75);
         assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
         assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
         assert_eq!(cfg.chunk_pipeline.compression_level, Some(6));
@@ -295,8 +310,8 @@ mod tests {
             chunk_generate_rate: 0,
             chunk_prepare_budget_ms: 0,
             chunk_prepare_batch_size: 0,
-            chunk_io_threads: 0,
-            chunk_worker_threads: 0,
+            chunk_io_threads_percent: 0,
+            chunk_worker_threads_percent: 0,
             chunk_result_queue_size: 0,
             region_cache_size: 0,
             compression_level: Some(99),
@@ -311,6 +326,15 @@ mod tests {
         assert_eq!(policy.chunk_result_queue_size, 1);
         assert_eq!(policy.region_cache_size, 1);
         assert_eq!(policy.compression_level, Some(9));
+    }
+
+    #[test]
+    fn chunk_pool_percentages_scale_from_available_cores() {
+        assert_eq!(threads_from_percent(3, 25), 1);
+        assert_eq!(threads_from_percent(3, 50), 2);
+        assert_eq!(threads_from_percent(8, 25), 2);
+        assert_eq!(threads_from_percent(8, 50), 4);
+        assert_eq!(threads_from_percent(8, 0), 1);
     }
 
     fn stub_blocks() -> Arc<BlockRegistry> {
