@@ -20,6 +20,8 @@
 use std::sync::Arc;
 
 use mc_data::Identifier;
+use mc_data::biomes::BiomeWorldgenData;
+use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
 use mc_world::chunk::{Chunk, ChunkPos, Heightmap, MAX_Y, MIN_Y};
 use mc_world::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockRegistry, BlockStateId, ChunkGenerator,
@@ -238,6 +240,48 @@ impl OreRules {
     }
 
     #[must_use]
+    pub fn from_features(
+        registry: &BlockRegistry,
+        biomes: &BiomeRules,
+        features: &[OreFeature],
+        biome_data: Option<&BiomeWorldgenData>,
+    ) -> Option<Self> {
+        let mut rules = Vec::new();
+        for feature in features {
+            let Some((normal, deepslate)) = ore_targets(registry, &feature.targets) else {
+                continue;
+            };
+            let Some(height) = &feature.placement.height else {
+                continue;
+            };
+            let min = height_anchor_y(height.min).clamp(MIN_Y, MAX_Y - 1);
+            let max = height_anchor_y(height.max).clamp(MIN_Y, MAX_Y - 1);
+            if min > max {
+                continue;
+            }
+            let y = YRange::new(min, max);
+            let spacing = ore_spacing(&feature.placement, y);
+            let feature_biomes = biome_data
+                .map(|data| data.biomes_for_feature(&feature.placed_feature))
+                .unwrap_or_default();
+            let biome_scope =
+                if feature_biomes.is_empty() || feature_biomes.len() >= biomes.all.len() {
+                    BiomeScope::Any
+                } else {
+                    BiomeScope::only(feature_biomes)
+                };
+            rules.push(OreRule {
+                normal,
+                deepslate,
+                y,
+                spacing,
+                biomes: biome_scope,
+            });
+        }
+        (!rules.is_empty()).then(|| Self::new(rules))
+    }
+
+    #[must_use]
     pub fn rules(&self) -> &[OreRule] {
         &self.rules
     }
@@ -448,6 +492,68 @@ impl BiomeRules {
     }
 
     #[must_use]
+    pub fn from_worldgen_data(data: &BiomeWorldgenData) -> Option<Self> {
+        let fallback = Self::vanilla_overworld();
+        let tag = |name: &str| -> Vec<Identifier> {
+            data.tag(&Identifier::parse(format!("minecraft:{name}")).expect("static biome tag"))
+                .to_vec()
+        };
+        let by_name = |names: &[&str]| -> Vec<Identifier> {
+            names
+                .iter()
+                .filter_map(|name| Identifier::parse(format!("minecraft:{name}")).ok())
+                .filter(|id| data.biomes().any(|biome| biome == id))
+                .collect()
+        };
+        let all = tag("is_overworld");
+        if all.is_empty() {
+            return None;
+        }
+        let deep_ocean = tag("is_deep_ocean");
+        let ocean = without(tag("is_ocean"), &deep_ocean);
+        Some(Self {
+            default: Identifier::parse("minecraft:plains").expect("static biome identifier"),
+            all,
+            deep_ocean: or_fallback(deep_ocean, &fallback.deep_ocean),
+            ocean: or_fallback(ocean, &fallback.ocean),
+            beach: or_fallback(
+                union([tag("is_beach"), by_name(&["stony_shore"])]),
+                &fallback.beach,
+            ),
+            river: or_fallback(tag("is_river"), &fallback.river),
+            swamp: or_fallback(by_name(&["swamp", "mangrove_swamp"]), &fallback.swamp),
+            cold: or_fallback(
+                union([
+                    tag("is_taiga"),
+                    by_name(&["snowy_plains", "ice_spikes", "grove"]),
+                ]),
+                &fallback.cold,
+            ),
+            temperate_forest: or_fallback(
+                union([tag("is_forest"), by_name(&["cherry_grove", "pale_garden"])]),
+                &fallback.temperate_forest,
+            ),
+            grassland: or_fallback(
+                by_name(&["plains", "sunflower_plains", "meadow", "mushroom_fields"]),
+                &fallback.grassland,
+            ),
+            hot_dry: or_fallback(
+                union([tag("is_badlands"), tag("is_savanna"), by_name(&["desert"])]),
+                &fallback.hot_dry,
+            ),
+            mountain: or_fallback(
+                union([tag("is_mountain"), tag("is_hill")]),
+                &fallback.mountain,
+            ),
+            jungle: or_fallback(tag("is_jungle"), &fallback.jungle),
+            cave: or_fallback(
+                by_name(&["dripstone_caves", "lush_caves", "deep_dark"]),
+                &fallback.cave,
+            ),
+        })
+    }
+
+    #[must_use]
     pub fn overworld_ids(&self) -> &[Identifier] {
         &self.all
     }
@@ -474,6 +580,73 @@ impl BiomeRules {
 
     fn is_surface_water(&self, biome: &Identifier) -> bool {
         self.is_ocean(biome) || self.is_river(biome)
+    }
+}
+
+fn or_fallback(values: Vec<Identifier>, fallback: &[Identifier]) -> Vec<Identifier> {
+    if values.is_empty() {
+        fallback.to_vec()
+    } else {
+        values
+    }
+}
+
+fn union<const N: usize>(lists: [Vec<Identifier>; N]) -> Vec<Identifier> {
+    let mut out = Vec::new();
+    for id in lists.into_iter().flatten() {
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+fn without(mut values: Vec<Identifier>, excluded: &[Identifier]) -> Vec<Identifier> {
+    values.retain(|id| !excluded.contains(id));
+    values
+}
+
+fn ore_targets(
+    registry: &BlockRegistry,
+    targets: &[OreTarget],
+) -> Option<(BlockStateId, BlockStateId)> {
+    let mut normal = None;
+    let mut deepslate = None;
+    for target in targets {
+        let state = registry.block(&target.state)?.default;
+        match target.replaceable_tag.as_ref().map(Identifier::as_str) {
+            Some("minecraft:stone_ore_replaceables") => normal = Some(state),
+            Some("minecraft:deepslate_ore_replaceables") => deepslate = Some(state),
+            _ => {}
+        }
+    }
+    Some((normal?, deepslate?))
+}
+
+fn height_anchor_y(anchor: HeightAnchor) -> i32 {
+    match anchor {
+        HeightAnchor::Absolute(y) => y,
+        HeightAnchor::AboveBottom(offset) => MIN_Y + offset,
+        HeightAnchor::BelowTop(offset) => MAX_Y - offset,
+    }
+}
+
+fn ore_spacing(placement: &mc_data::worldgen_ores::OrePlacement, y: YRange) -> OreSpacing {
+    let count = match placement.count {
+        Some(OrePlacementCount::Constant(count)) => count.max(1),
+        Some(OrePlacementCount::Uniform { min, max }) => ((min + max) / 2).max(1),
+        None => 1,
+    } as u64;
+    let density = count.saturating_mul(7).max(1);
+    let base = 512u64.saturating_div(density).max(5);
+    if placement
+        .height
+        .as_ref()
+        .is_some_and(|height| height.kind.as_str() == "minecraft:trapezoid")
+    {
+        OreSpacing::peaked((y.min + y.max) / 2, base, base * 3)
+    } else {
+        OreSpacing::Fixed(base)
     }
 }
 
@@ -1515,6 +1688,45 @@ mod tests {
         panic!("could not find ore {expected:?} at y={y} for biome {biome}");
     }
 
+    fn ore_feature(
+        feature: &str,
+        normal: &str,
+        deepslate: &str,
+        min_y: i32,
+        max_y: i32,
+        count: u32,
+    ) -> OreFeature {
+        mc_data::worldgen_ores::OreFeature {
+            placed_feature: Identifier::parse(feature).unwrap(),
+            configured_feature: Identifier::parse(feature).unwrap(),
+            placement: mc_data::worldgen_ores::OrePlacement {
+                count: Some(OrePlacementCount::Constant(count)),
+                rarity_chance: None,
+                height: Some(mc_data::worldgen_ores::HeightRange {
+                    kind: Identifier::parse("minecraft:uniform").unwrap(),
+                    min: HeightAnchor::Absolute(min_y),
+                    max: HeightAnchor::Absolute(max_y),
+                }),
+            },
+            size: 4,
+            discard_chance_on_air_exposure: 0.0,
+            targets: vec![
+                OreTarget {
+                    state: Identifier::parse(normal).unwrap(),
+                    replaceable_tag: Some(
+                        Identifier::parse("minecraft:stone_ore_replaceables").unwrap(),
+                    ),
+                },
+                OreTarget {
+                    state: Identifier::parse(deepslate).unwrap(),
+                    replaceable_tag: Some(
+                        Identifier::parse("minecraft:deepslate_ore_replaceables").unwrap(),
+                    ),
+                },
+            ],
+        }
+    }
+
     #[test]
     fn default_ore_rules_keep_priority_order() {
         let g = TerrainGenerator::new(42, tiny_registry());
@@ -1560,6 +1772,152 @@ mod tests {
             g.ore_for(gold_x, 80, gold_z, g.stone, &plains),
             BlockStateId(15),
             "high gold boost should stay hot-dry scoped"
+        );
+    }
+
+    #[test]
+    fn data_fed_ore_rules_reach_generation() {
+        let registry = tiny_registry();
+        let biomes = BiomeRules::vanilla_overworld();
+        let mountain = Identifier::parse("minecraft:jagged_peaks").unwrap();
+        let hot_dry = Identifier::parse("minecraft:badlands").unwrap();
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let biome_data = mc_data::biomes::BiomeWorldgenData::from_parts(
+            BTreeMap::from([
+                (
+                    mountain.clone(),
+                    vec![Identifier::parse("minecraft:ore_emerald").unwrap()],
+                ),
+                (
+                    hot_dry.clone(),
+                    vec![Identifier::parse("minecraft:ore_gold_extra").unwrap()],
+                ),
+                (
+                    plains.clone(),
+                    vec![Identifier::parse("minecraft:ore_diamond").unwrap()],
+                ),
+            ]),
+            BTreeMap::new(),
+        );
+        let features = vec![
+            ore_feature(
+                "minecraft:ore_emerald",
+                "minecraft:emerald_ore",
+                "minecraft:deepslate_emerald_ore",
+                200,
+                240,
+                64,
+            ),
+            ore_feature(
+                "minecraft:ore_gold_extra",
+                "minecraft:gold_ore",
+                "minecraft:deepslate_gold_ore",
+                72,
+                96,
+                64,
+            ),
+            ore_feature(
+                "minecraft:ore_diamond",
+                "minecraft:diamond_ore",
+                "minecraft:deepslate_diamond_ore",
+                -64,
+                -48,
+                64,
+            ),
+        ];
+        let ores =
+            OreRules::from_features(registry.as_ref(), &biomes, &features, Some(&biome_data))
+                .expect("sidecar ore features should become rules");
+        let g = TerrainGenerator::with_rules(42, registry, biomes, ores);
+
+        for (y, biome, stone_ore, deepslate_ore) in [
+            (224, &mountain, BlockStateId(19), BlockStateId(24)),
+            (80, &hot_dry, BlockStateId(15), BlockStateId(20)),
+            (-56, &plains, BlockStateId(17), BlockStateId(22)),
+        ] {
+            let (x, z) = find_ore_cell(&g, y, biome, stone_ore);
+            assert_eq!(g.ore_for(x, y, z, g.deepslate, biome), deepslate_ore);
+        }
+
+        let (emerald_x, emerald_z) = find_ore_cell(&g, 224, &mountain, BlockStateId(19));
+        assert_eq!(
+            g.ore_for(emerald_x, 224, emerald_z, g.stone, &plains),
+            g.stone
+        );
+    }
+
+    #[test]
+    fn biome_rules_can_use_sidecar_tags() {
+        let data = mc_data::biomes::BiomeWorldgenData::from_parts(
+            BTreeMap::from([
+                (Identifier::parse("minecraft:plains").unwrap(), Vec::new()),
+                (Identifier::parse("minecraft:forest").unwrap(), Vec::new()),
+                (Identifier::parse("minecraft:badlands").unwrap(), Vec::new()),
+                (Identifier::parse("minecraft:ocean").unwrap(), Vec::new()),
+                (
+                    Identifier::parse("minecraft:deep_ocean").unwrap(),
+                    Vec::new(),
+                ),
+            ]),
+            BTreeMap::from([
+                (
+                    Identifier::parse("minecraft:is_overworld").unwrap(),
+                    vec![
+                        Identifier::parse("minecraft:plains").unwrap(),
+                        Identifier::parse("minecraft:forest").unwrap(),
+                        Identifier::parse("minecraft:badlands").unwrap(),
+                        Identifier::parse("minecraft:ocean").unwrap(),
+                        Identifier::parse("minecraft:deep_ocean").unwrap(),
+                    ],
+                ),
+                (
+                    Identifier::parse("minecraft:is_forest").unwrap(),
+                    vec![Identifier::parse("minecraft:forest").unwrap()],
+                ),
+                (
+                    Identifier::parse("minecraft:is_badlands").unwrap(),
+                    vec![Identifier::parse("minecraft:badlands").unwrap()],
+                ),
+                (
+                    Identifier::parse("minecraft:is_ocean").unwrap(),
+                    vec![
+                        Identifier::parse("minecraft:ocean").unwrap(),
+                        Identifier::parse("minecraft:deep_ocean").unwrap(),
+                    ],
+                ),
+                (
+                    Identifier::parse("minecraft:is_deep_ocean").unwrap(),
+                    vec![Identifier::parse("minecraft:deep_ocean").unwrap()],
+                ),
+            ]),
+        );
+
+        let rules = BiomeRules::from_worldgen_data(&data).expect("is_overworld tag is present");
+
+        assert!(
+            rules
+                .overworld_ids()
+                .contains(&Identifier::parse("minecraft:plains").unwrap())
+        );
+        assert!(
+            rules
+                .temperate_forest
+                .contains(&Identifier::parse("minecraft:forest").unwrap())
+        );
+        assert!(
+            rules
+                .hot_dry
+                .contains(&Identifier::parse("minecraft:badlands").unwrap())
+        );
+        assert!(
+            rules
+                .ocean
+                .contains(&Identifier::parse("minecraft:ocean").unwrap())
+        );
+        assert!(
+            rules
+                .deep_ocean
+                .contains(&Identifier::parse("minecraft:deep_ocean").unwrap())
         );
     }
 

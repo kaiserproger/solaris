@@ -74,6 +74,12 @@ async fn serve(path: &Path) -> Result<()> {
         "block registry source loaded",
     );
     let structure_rules = load_structure_rules(&cfg.data.vanilla_dir, blocks.as_ref())?;
+    let terrain_generator = build_terrain_generator(
+        cfg.data.seed,
+        &cfg.data.vanilla_dir,
+        Arc::clone(&blocks),
+        structure_rules,
+    );
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
@@ -91,10 +97,8 @@ async fn serve(path: &Path) -> Result<()> {
                 // from disk get materialised on demand; the M6 flush
                 // path then persists them so this only runs once per
                 // chunk per fresh world.
-                let generator: Arc<dyn mc_world::ChunkGenerator> = Arc::new(
-                    mc_worldgen::TerrainGenerator::new(cfg.data.seed, Arc::clone(&blocks))
-                        .with_structures(structure_rules.clone()),
-                );
+                let generator: Arc<dyn mc_world::ChunkGenerator> =
+                    Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
                 let mut storage = storage.with_generator(generator);
                 let mut region_count = count_region_files(world_dir);
                 if region_count == 0 {
@@ -327,6 +331,84 @@ fn load_structure_rules(
     Ok(mc_worldgen::StructureRules::single_plains_village_marker(
         template,
     ))
+}
+
+fn build_terrain_generator(
+    seed: i64,
+    vanilla_dir: &Path,
+    blocks: Arc<mc_world::BlockRegistry>,
+    structure_rules: mc_worldgen::StructureRules,
+) -> Arc<mc_worldgen::TerrainGenerator> {
+    let biome_dir = vanilla_dir.join("data/minecraft/worldgen/biome");
+    let biome_tags_dir = vanilla_dir.join("data/minecraft/tags/worldgen/biome");
+    let biome_data = match mc_data::biomes::load_biome_worldgen_data(&biome_dir, &biome_tags_dir) {
+        Ok(data) => {
+            tracing::info!(
+                biomes = data.biomes().count(),
+                tags = data.tags_len(),
+                path = %biome_dir.display(),
+                "biome worldgen data loaded",
+            );
+            Some(data)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %biome_dir.display(),
+                error = %err,
+                "biome worldgen data load failed; using Solaris fallback biome rules",
+            );
+            None
+        }
+    };
+    let biomes = biome_data
+        .as_ref()
+        .and_then(mc_worldgen::BiomeRules::from_worldgen_data)
+        .unwrap_or_else(mc_worldgen::BiomeRules::vanilla_overworld);
+
+    let stone = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").expect("static identifier"))
+        .map(|block| block.default)
+        .expect("block registry contains stone");
+    let ore_features =
+        mc_data::worldgen_ores::load_ore_features(vanilla_dir.join("data/minecraft/worldgen"));
+    let ores = match ore_features {
+        Ok(features) => {
+            match mc_worldgen::OreRules::from_features(
+                blocks.as_ref(),
+                &biomes,
+                &features,
+                biome_data.as_ref(),
+            ) {
+                Some(rules) => {
+                    tracing::info!(
+                        features = features.len(),
+                        rules = rules.rules().len(),
+                        "ore sidecar data fed into terrain generator",
+                    );
+                    rules
+                }
+                None => {
+                    tracing::warn!(
+                        features = features.len(),
+                        "ore sidecar data produced no Solaris ore rules; using fallback",
+                    );
+                    mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone)
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "ore sidecar data load failed; using Solaris fallback ore rules",
+            );
+            mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone)
+        }
+    };
+
+    Arc::new(
+        mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores)
+            .with_structures(structure_rules),
+    )
 }
 
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
