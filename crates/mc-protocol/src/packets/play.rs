@@ -2285,6 +2285,39 @@ impl Packet for ServerboundUseItemOn {
     }
 }
 
+/// `Serverbound Use Item` (SB) — right-click air / consume held item.
+/// Verified via `.analysis/protocol-dump.txt` and `javap -p`:
+/// `ServerboundUseItemPacket(InteractionHand hand, int sequence,
+/// float yRot, float xRot)`; game-SB index 67 = wire id 0x43.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundUseItem {
+    pub hand: InteractionHand,
+    pub sequence: i32,
+    pub y_rot: f32,
+    pub x_rot: f32,
+}
+
+impl Packet for ServerboundUseItem {
+    const ID: i32 = 0x43;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.hand as i32);
+        buf.write_varint(self.sequence);
+        buf.write_f32(self.y_rot);
+        buf.write_f32(self.x_rot);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            hand: InteractionHand::from_wire(buf.read_varint()?)?,
+            sequence: buf.read_varint()?,
+            y_rot: buf.read_f32()?,
+            x_rot: buf.read_f32()?,
+        })
+    }
+}
+
 /// Pack `(x, y, z)` world coordinates into vanilla's `BlockPos`
 /// `i64`. `x` and `z` are 26-bit signed; `y` is 12-bit signed.
 /// Used by every packet in this module that carries a `BlockPos`.
@@ -3295,6 +3328,29 @@ mod tests {
             world_border_hit: true,
             sequence: 99,
         });
+    }
+
+    #[test]
+    fn serverbound_use_item_id_and_layout_match_javap() {
+        assert_eq!(ServerboundUseItem::ID, 0x43);
+        let packet = ServerboundUseItem {
+            hand: InteractionHand::MainHand,
+            sequence: 300,
+            y_rot: 90.0,
+            x_rot: -15.0,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x00, 0xAC, 0x02, 0x42, 0xB4, 0x00, 0x00, 0xC1, 0x70, 0x00, 0x00
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ServerboundUseItem::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
     }
 
     #[test]

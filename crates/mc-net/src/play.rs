@@ -44,9 +44,9 @@ use mc_protocol::packets::play::{
     RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundChangeGameMode,
     ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
     ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -1517,6 +1517,26 @@ const UNKNOWN_BLOCK_MINING_RULE: MiningRule = MiningRule {
     tool_suffix: None,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FoodRule {
+    item: &'static str,
+    food: i32,
+    saturation: f32,
+}
+
+const FALLBACK_FOOD_RULES: &[FoodRule] = &[
+    FoodRule {
+        item: "minecraft:apple",
+        food: 4,
+        saturation: 2.4,
+    },
+    FoodRule {
+        item: "minecraft:bread",
+        food: 5,
+        saturation: 6.0,
+    },
+];
+
 /// 46-slot player inventory (window 0).
 ///
 /// Layout (vanilla wire numbering):
@@ -2769,6 +2789,24 @@ fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Opti
     Some(ItemStack::new(item_id, 1))
 }
 
+fn food_rule_for_item(item: &mc_data::Identifier) -> Option<FoodRule> {
+    FALLBACK_FOOD_RULES
+        .iter()
+        .copied()
+        .find(|rule| item.as_str() == rule.item)
+}
+
+fn held_food_rule(state: &InteractionState) -> Option<FoodRule> {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    if held.is_empty() {
+        return None;
+    }
+    state
+        .items
+        .name_of(held.item_id)
+        .and_then(food_rule_for_item)
+}
+
 fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
     EntityItemStack::new(stack.item_id, stack.count)
 }
@@ -3541,6 +3579,45 @@ where
     Ok(())
 }
 
+async fn handle_use_item<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: &mut SurvivalState,
+    action: ServerboundUseItem,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if game_mode != GameMode::Survival
+        || action.hand != mc_protocol::packets::play::InteractionHand::MainHand
+    {
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+    if survival_state.is_dead() || survival_state.food >= SurvivalState::MAX_FOOD {
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+
+    let Some(rule) = held_food_rule(state) else {
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    };
+
+    survival_state.add_food(rule.food, rule.saturation);
+    let held_slot = state.selected_hotbar_slot;
+    {
+        let held = state.inventory.held_mut(held_slot);
+        held.count = held.count.saturating_sub(1);
+        if held.count <= 0 {
+            *held = ItemStack::EMPTY;
+        }
+    }
+    let slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
+    let slot_value = state.inventory.held(held_slot).clone();
+    write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
+    write_packet(writer, &survival_state.as_packet(), state.compression).await?;
+    write_block_ack(writer, state.compression, action.sequence).await
+}
+
 async fn replan_after_movement<W>(
     writer: &mut W,
     compression: Compression,
@@ -4142,6 +4219,18 @@ where
                             "UseItemOn ignored — no world configured"
                         );
                     }
+                } else if frame.id == ServerboundUseItem::ID {
+                    let mut body = frame.body;
+                    let use_item = ServerboundUseItem::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_use_item(state, writer, game_mode, &mut survival_state, use_item)
+                            .await?;
+                    } else {
+                        debug!(
+                            sequence = use_item.sequence,
+                            "UseItem ignored — no world configured"
+                        );
+                    }
                 } else if frame.id == ServerboundSetCarriedItem::ID {
                     let mut body = frame.body;
                     let pick = ServerboundSetCarriedItem::decode(&mut body)?;
@@ -4570,6 +4659,22 @@ mod tests {
         assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
         assert_eq!(inventory.slots[9], ItemStack::new(42, 2));
         assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn fallback_food_rules_include_common_edibles() {
+        assert_eq!(
+            food_rule_for_item(&mc_data::Identifier::parse("minecraft:apple").unwrap()),
+            Some(FoodRule {
+                item: "minecraft:apple",
+                food: 4,
+                saturation: 2.4,
+            })
+        );
+        assert_eq!(
+            food_rule_for_item(&mc_data::Identifier::parse("minecraft:dirt").unwrap()),
+            None
+        );
     }
 
     #[test]
