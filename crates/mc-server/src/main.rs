@@ -73,6 +73,7 @@ async fn serve(path: &Path) -> Result<()> {
         path = %blocks_path.display(),
         "block registry source loaded",
     );
+    let structure_rules = load_structure_rules(&cfg.data.vanilla_dir, blocks.as_ref())?;
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
@@ -86,15 +87,28 @@ async fn serve(path: &Path) -> Result<()> {
         })();
         match open_result {
             Ok(storage) => {
-                let region_count = count_region_files(world_dir);
                 // M7: attach the terrain generator. Chunks missing
                 // from disk get materialised on demand; the M6 flush
                 // path then persists them so this only runs once per
                 // chunk per fresh world.
                 let generator: Arc<dyn mc_world::ChunkGenerator> = Arc::new(
-                    mc_worldgen::TerrainGenerator::new(cfg.data.seed, Arc::clone(&blocks)),
+                    mc_worldgen::TerrainGenerator::new(cfg.data.seed, Arc::clone(&blocks))
+                        .with_structures(structure_rules.clone()),
                 );
-                let storage = storage.with_generator(generator);
+                let mut storage = storage.with_generator(generator);
+                let mut region_count = count_region_files(world_dir);
+                if region_count == 0 {
+                    let generated = generate_spawn_window(&mut storage, cfg.server.view_distance)?;
+                    let flushed = storage.flush_dirty()?;
+                    region_count = count_region_files(world_dir);
+                    tracing::info!(
+                        path = %world_dir.display(),
+                        chunks = generated,
+                        flushed,
+                        region_files = region_count,
+                        "empty world pre-generated around spawn",
+                    );
+                }
                 tracing::info!(
                     path = %world_dir.display(),
                     block_count = storage.registry().len(),
@@ -190,9 +204,58 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let entity_types = match mc_data::entity_types::load_entity_types_report(&items_path) {
+        Ok(report) => {
+            let reg = mc_data::entity_types::EntityTypeRegistry::from_report(&report);
+            tracing::info!(
+                entries = reg.len(),
+                path = %items_path.display(),
+                "entity type registry loaded",
+            );
+            Arc::new(reg)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %items_path.display(),
+                error = %err,
+                "entity type registry load failed; passive mob spawning disabled",
+            );
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default())
+        }
+    };
+
+    let biome_spawns_path = cfg.data.vanilla_dir.join("data/minecraft/worldgen/biome");
+    let biome_spawns = match mc_data::biomes::load_biome_spawn_rules(&biome_spawns_path) {
+        Ok(rules) => {
+            tracing::info!(
+                biomes = rules.len(),
+                path = %biome_spawns_path.display(),
+                "biome spawn rules loaded",
+            );
+            Arc::new(rules)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %biome_spawns_path.display(),
+                error = %err,
+                "biome spawn rules load failed; passive mob spawning disabled",
+            );
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default())
+        }
+    };
+
     let world_for_shutdown = net_world_clone(&world);
     let net = cfg
-        .to_network(data, blocks, world, tags, block_light, items)
+        .to_network(
+            data,
+            blocks,
+            world,
+            tags,
+            block_light,
+            items,
+            entity_types,
+            biome_spawns,
+        )
         .with_context(|| format!("translating bind_address from {}", path.display()))?;
     tracing::info!(
         version = mc_server::VERSION,
@@ -234,9 +297,58 @@ fn net_world_clone(world: &Option<mc_net::WorldHandle>) -> Option<mc_net::WorldH
     world.as_ref().map(Arc::clone)
 }
 
+fn load_structure_rules(
+    vanilla_dir: &Path,
+    blocks: &mc_world::BlockRegistry,
+) -> Result<mc_worldgen::StructureRules> {
+    let template_path = vanilla_dir
+        .join("data/minecraft/structure/village/plains/town_centers/plains_fountain_01.nbt");
+    if !template_path.exists() {
+        tracing::warn!(
+            path = %template_path.display(),
+            "plains village marker template missing; generated structures disabled",
+        );
+        return Ok(mc_worldgen::StructureRules::none());
+    }
+
+    let template = mc_worldgen::StructureTemplate::from_nbt_file(&template_path, blocks)
+        .with_context(|| {
+            format!(
+                "loading plains village marker from {}",
+                template_path.display()
+            )
+        })?;
+    let blocks = template.blocks().len();
+    tracing::info!(
+        path = %template_path.display(),
+        blocks,
+        "plains village marker template loaded",
+    );
+    Ok(mc_worldgen::StructureRules::single_plains_village_marker(
+        template,
+    ))
+}
+
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
     let width = view_distance.max(0) as usize * 2 + 3;
     width * width
+}
+
+fn generate_spawn_window(
+    storage: &mut mc_world::WorldStorage,
+    view_distance: i32,
+) -> Result<usize> {
+    let view_distance = view_distance.max(0);
+    let mut generated = 0usize;
+    for z in -view_distance..=view_distance {
+        for x in -view_distance..=view_distance {
+            storage
+                .get_chunk(mc_world::ChunkPos { x, z })
+                .with_context(|| format!("pre-generating spawn chunk ({x}, {z})"))?;
+            generated += 1;
+        }
+    }
+    Ok(generated)
 }
 
 fn count_region_files(world_dir: &Path) -> usize {
@@ -336,5 +448,38 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
         assert_eq!(chunk_cache_size_for_view_distance(10), 529);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn generate_spawn_window_materializes_view_square() {
+        struct StubGen;
+
+        impl mc_world::ChunkGenerator for StubGen {
+            fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+                let air = mc_world::BlockStateId(0);
+                let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = mc_world::Chunk::empty(pos, air, biome);
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 16)
+            .with_generator(Arc::new(StubGen));
+
+        assert_eq!(generate_spawn_window(&mut storage, 1).unwrap(), 9);
+        assert_eq!(storage.cache_len(), 9);
+        assert_eq!(storage.dirty_count(), 9);
     }
 }

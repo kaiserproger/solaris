@@ -51,6 +51,8 @@ async fn start_server() -> SocketAddr {
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -171,7 +173,10 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!(login.dimension_type_id, 0);
     assert_eq!(login.dimension_name.as_str(), "minecraft:alpha");
     assert_eq!(login.game_mode, 0); // survival
-    assert!(login.is_flat, "M1.g world is intentionally flat/empty");
+    assert!(
+        !login.is_flat,
+        "generated terrain is no longer a flat world"
+    );
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
@@ -313,7 +318,7 @@ async fn play_state_survival_damage_command_updates_health() {
     write_frame(
         &mut stream,
         &ServerboundChatCommand {
-            command: "damage 7.5".to_string(),
+            command: "debug survival damage 7.5".to_string(),
         },
         compression,
     )

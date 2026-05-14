@@ -18,10 +18,9 @@
 //!    placed dirt block is visible at (0, -60, 0) — proves the edit
 //!    landed on disk, not just in the LRU.
 //!
-//! Skipped silently when the test-world or required vanilla data
-//! sidecars are missing.
+//! Skipped silently when required vanilla data sidecars are missing.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,36 +28,22 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundContainerSetContent, ClientboundContainerSetSlot,
     ClientboundKeepAlive, ClientboundSetHeldSlot, ConfirmTeleportation, Direction, GameEvent,
-    LevelChunkWithLight, LoginPlay, ServerboundKeepAlive, ServerboundSetCarriedItem,
-    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
-    unpack_block_pos,
+    LevelChunkWithLight, LoginPlay, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use std::collections::HashSet;
 
 const VIEW_DISTANCE: i32 = 2;
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap().flatten() {
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive(&path, &target);
-        } else {
-            std::fs::copy(&path, &target).unwrap();
-        }
-    }
-}
-
 #[tokio::test]
 async fn place_dirt_persists_through_flush_to_disk() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_src = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
-    if !world_src.exists() || !blocks_json.exists() || !registries_json.exists() {
+    if !blocks_json.exists() || !registries_json.exists() {
         eprintln!(
             "skipping: prerequisites missing under {}",
             vanilla_dir.display()
@@ -66,9 +51,8 @@ async fn place_dirt_persists_through_flush_to_disk() {
         return;
     }
 
-    // Stage a writable copy of the world under tempfile.
     let tmp_world = tempfile::tempdir().unwrap();
-    copy_dir_recursive(&world_src, tmp_world.path());
+    std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
@@ -77,17 +61,13 @@ async fn place_dirt_persists_through_flush_to_disk() {
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
+    let storage = mc_world::WorldStorage::open_with_capacity(
         tmp_world.path(),
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_src.display());
-            return;
-        }
-    };
+    )
+    .expect("temp world opens")
+    .with_generator(generator);
     let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
     let world = Some(Arc::clone(&world_handle));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
@@ -130,6 +110,8 @@ async fn place_dirt_persists_through_flush_to_disk() {
         tags,
         block_light,
         items: Arc::clone(&items),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -160,8 +142,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         .await
         .expect("ack teleport");
 
-    // Drain the spawn burst + collect the SetHeldSlot + ContainerSetContent
-    // emitted by the M6 seed (they ship after the chunk burst).
+    // Drain the spawn burst + collect the empty inventory seed.
     let expected_chunks = (2 * VIEW_DISTANCE + 1).pow(2) as usize;
     let mut chunks_seen: HashSet<(i32, i32)> = HashSet::new();
     let mut saw_set_held_slot = false;
@@ -187,7 +168,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         } else if frame.id == ClientboundSetHeldSlot::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetHeldSlot::decode(&mut body).expect("decode SetHeldSlot");
-            assert_eq!(pkt.slot, 0, "M6 seeds slot 0 on login");
+            assert_eq!(pkt.slot, 0, "login selects slot 0");
             saw_set_held_slot = true;
         } else if frame.id == ClientboundContainerSetContent::ID {
             let mut body = frame.body;
@@ -196,19 +177,28 @@ async fn place_dirt_persists_through_flush_to_disk() {
             assert_eq!(pkt.container_id, 0, "window 0 = player inventory");
             assert_eq!(pkt.items.len(), 46, "46-slot window-0 inventory");
             assert!(
-                pkt.items[36].item_id
-                    == items
-                        .id_of(&mc_data::Identifier::parse("minecraft:stone").unwrap())
-                        .unwrap(),
-                "starter kit slot 36 = stone"
-            );
-            assert!(
-                pkt.items[37].item_id == dirt_item_id,
-                "starter kit slot 37 = dirt",
+                pkt.items
+                    .iter()
+                    .all(mc_protocol::packets::play::ItemStack::is_empty),
+                "normal play starts with no implicit starter kit"
             );
             saw_set_content = true;
         }
     }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 64 1".into(),
+        })
+        .await
+        .expect("seed dirt slot");
+    wait_for_debug_give_slot(&mut client, dirt_item_id).await;
 
     // 1. Select dirt (hotbar slot 1).
     client
@@ -324,4 +314,35 @@ async fn place_dirt_persists_through_flush_to_disk() {
         "minecraft:dirt",
         "the placed block must persist as dirt on disk",
     );
+}
+
+async fn wait_for_debug_give_slot(client: &mut Client, dirt_item_id: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("debug give ContainerSetSlot");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id != ClientboundContainerSetSlot::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode ContainerSetSlot");
+        if pkt.slot == 37 {
+            assert_eq!(pkt.item_stack.item_id, dirt_item_id);
+            assert_eq!(pkt.item_stack.count, 64);
+            return;
+        }
+    }
 }

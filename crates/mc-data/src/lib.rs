@@ -29,11 +29,14 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, trace};
 
+pub mod biomes;
 pub mod block_light;
 pub mod blocks;
+pub mod entity_types;
 pub mod identifier;
 pub mod items;
 pub mod tags;
+pub mod worldgen_ores;
 
 pub use identifier::{Identifier, IdentifierError};
 

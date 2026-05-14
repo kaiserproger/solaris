@@ -501,7 +501,16 @@ fn encode_biome_section(section: &BiomeSection) -> Tag {
                     elements: pal_tags,
                 }),
             ));
-            let longs: Vec<i64> = indices.words().iter().map(|&w| w as i64).collect();
+            let bits = biome_bits_per_entry(palette.len());
+            let longs: Vec<i64> = if indices.bits_per_entry() == bits {
+                indices.words().iter().map(|&w| w as i64).collect()
+            } else {
+                let mut packed = PackedBitArray::zeroed(bits, BIOME_VOLUME);
+                for idx in 0..BIOME_VOLUME {
+                    packed.set(idx, indices.get(idx));
+                }
+                packed.words().iter().map(|&w| w as i64).collect()
+            };
             out.push(("data".into(), Tag::LongArray(longs)));
         }
     }

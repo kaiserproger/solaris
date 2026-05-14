@@ -4,8 +4,8 @@
 //! anywhere) attached to a `TerrainGenerator`. After the spawn
 //! burst the test consults the shared world handle directly and
 //! asserts a chunk at an arbitrary far position resolves to terrain
-//! that contains the expected layers (bedrock at the bottom, grass
-//! cap on the surface). The test does *not* drain the full spawn
+//! that contains the expected layers (bedrock at the bottom, a valid
+//! biome surface, and water for ocean columns). The test does *not* drain the full spawn
 //! burst on the wire to keep its wall-clock reasonable — driving
 //! the burst is already covered by the M3.g / M4.f / M5.f / M6.g
 //! harnesses.
@@ -52,6 +52,14 @@ async fn empty_world_plus_generator_produces_terrain_on_demand() {
         .block(&mc_data::Identifier::parse("minecraft:grass_block").unwrap())
         .map(|b| b.default)
         .unwrap();
+    let sand_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:sand").unwrap())
+        .map(|b| b.default)
+        .unwrap();
+    let water_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:water").unwrap())
+        .map(|b| b.default)
+        .unwrap();
 
     // Pull a far chunk through the storage; the generator runs
     // because no region file exists. Assert it has the expected
@@ -70,13 +78,25 @@ async fn empty_world_plus_generator_produces_terrain_on_demand() {
             Some(bedrock_state_id)
         );
 
-        // Find the surface column and assert grass on top.
+        // Find the surface column and assert the biome-aware top.
         let height = generator.surface_height(50 * 16, -50 * 16);
+        let surface = chunk.get_block(0, height, 0);
         assert_eq!(
-            chunk.get_block(0, height, 0),
-            Some(grass_state_id),
-            "generator output: column (0,{height},0) of chunk (50,-50) should be grass"
+            surface,
+            Some(if height < mc_worldgen::terrain::SEA_LEVEL {
+                sand_state_id
+            } else {
+                grass_state_id
+            }),
+            "generator output: column (0,{height},0) of chunk (50,-50) has unexpected surface"
         );
+        if height < mc_worldgen::terrain::SEA_LEVEL {
+            assert_eq!(
+                chunk.get_block(0, mc_worldgen::terrain::SEA_LEVEL, 0),
+                Some(water_state_id),
+                "ocean column should be water-filled to sea level"
+            );
+        }
         // Chunk is dirty so the M6 flush will persist it.
         assert!(chunk.dirty);
     }

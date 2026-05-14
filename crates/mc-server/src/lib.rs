@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use mc_data::VanillaData;
+use mc_data::biomes::BiomeSpawnRules;
+use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_net::WorldHandle;
@@ -202,6 +204,8 @@ impl ServerConfig {
         tags: Arc<TagsData>,
         block_light: Option<Arc<mc_data::block_light::BlockLightTable>>,
         items: Arc<ItemRegistry>,
+        entity_types: Arc<EntityTypeRegistry>,
+        biome_spawns: Arc<BiomeSpawnRules>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
         Ok(mc_net::ServerConfig {
@@ -215,6 +219,8 @@ impl ServerConfig {
             tags,
             block_light,
             items,
+            entity_types,
+            biome_spawns,
             chunk_pipeline: self.chunk_pipeline.to_network(),
         })
     }
@@ -341,6 +347,8 @@ mod tests {
                 stub_tags(),
                 None,
                 Arc::new(ItemRegistry::default()),
+                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(BiomeSpawnRules::default()),
             )
             .unwrap();
         assert_eq!(net.motd, "Howdy");
@@ -372,7 +380,9 @@ mod tests {
                 None,
                 stub_tags(),
                 None,
-                Arc::new(ItemRegistry::default())
+                Arc::new(ItemRegistry::default()),
+                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(BiomeSpawnRules::default())
             )
             .is_err()
         );

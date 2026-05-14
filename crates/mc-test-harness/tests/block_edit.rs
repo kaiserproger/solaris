@@ -1,7 +1,7 @@
 //! M5.f — raw-TCP integration test for the break-block flow.
 //!
-//! Boots `mc_net::run` on an ephemeral port against
-//! `.analysis/test-world/`, walks the spawn burst, sends a
+//! Boots `mc_net::run` on an ephemeral port against an in-memory
+//! generated world, walks the spawn burst, sends a
 //! `ServerboundPlayerAction(START_DESTROY_BLOCK)` at the grass
 //! cell directly under spawn `(0, -61, 0)`, and asserts that:
 //!
@@ -12,8 +12,7 @@
 //!   arrives with a well-shaped `LightData` payload (same M4.f
 //!   mask invariants).
 //!
-//! Skipped silently when the test-world or required vanilla data
-//! sidecars are missing.
+//! Skipped silently when required vanilla data sidecars are missing.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -24,8 +23,8 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction,
     EntityAnimation, EntityAnimationAction, GameEvent, LevelChunkWithLight, LightUpdate, LoginPlay,
-    PlayerActionKind, ServerboundKeepAlive, ServerboundPlayerAction, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    PlayerActionKind, ServerboundChatCommand, ServerboundKeepAlive, ServerboundPlayerAction,
+    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -34,15 +33,10 @@ const VIEW_DISTANCE: i32 = 2;
 #[tokio::test]
 async fn break_block_round_trips_update_ack_relight() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_dir = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !world_dir.exists() || !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} or {} missing",
-            world_dir.display(),
-            blocks_json.display()
-        );
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
         return;
     }
 
@@ -51,17 +45,11 @@ async fn break_block_round_trips_update_ack_relight() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        &world_dir,
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_dir.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -94,6 +82,8 @@ async fn break_block_round_trips_update_ack_relight() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -124,6 +114,12 @@ async fn break_block_round_trips_update_ack_relight() {
         })
         .await
         .expect("ack teleport");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
 
     // Wait only for the spawn chunk, then send the edit while the rest
     // of the view-distance window is still streaming. This is the M12
@@ -246,15 +242,10 @@ async fn break_block_round_trips_update_ack_relight() {
 #[tokio::test]
 async fn break_block_broadcasts_update_to_second_subscriber() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_dir = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !world_dir.exists() || !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} or {} missing",
-            world_dir.display(),
-            blocks_json.display()
-        );
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
         return;
     }
 
@@ -263,17 +254,11 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        &world_dir,
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_dir.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light_path = vanilla_dir.join("reports/block_light.json");
@@ -300,6 +285,8 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -312,6 +299,12 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
     let (mut observer, _) = connect_to_play(addr, "M15Observer").await;
     drain_until_chunk(&mut actor, (0, 0)).await;
     drain_until_chunk(&mut observer, (0, 0)).await;
+    actor
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch actor to creative");
 
     let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);

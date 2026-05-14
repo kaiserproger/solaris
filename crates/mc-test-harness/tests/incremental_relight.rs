@@ -1,7 +1,7 @@
 //! M9.d — wire parity gate for the incremental relight engine.
 //!
-//! Boots `mc_net::run` on an ephemeral port against a writable copy
-//! of `.analysis/test-world/`, drives the spawn burst, places a
+//! Boots `mc_net::run` on an ephemeral port against an in-memory
+//! generated world, drives the spawn burst, places a
 //! dirt block mid-chunk via `ServerboundUseItemOn`, and asserts:
 //!
 //! - Exactly one `ClientboundLightUpdate` arrives for the centre
@@ -13,19 +13,19 @@
 //!   3×3 chunks. Pins the incremental BFS against the M4 reference
 //!   engine end-to-end.
 //!
-//! Skipped silently when the test-world or required vanilla data
-//! sidecars are missing.
+//! Skipped silently when required vanilla data sidecars are missing.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
-    LevelChunkWithLight, LightUpdate, LoginPlay, ServerboundKeepAlive, ServerboundSetCarriedItem,
-    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    LevelChunkWithLight, LightUpdate, LoginPlay, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    pack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
@@ -34,41 +34,20 @@ use mc_world::{Chunk, ChunkPos};
 
 const VIEW_DISTANCE: i32 = 2;
 
-fn copy_dir_recursive(src: &Path, dst: &Path) {
-    std::fs::create_dir_all(dst).unwrap();
-    for entry in std::fs::read_dir(src).unwrap().flatten() {
-        let path = entry.path();
-        let target = dst.join(entry.file_name());
-        if path.is_dir() {
-            copy_dir_recursive(&path, &target);
-        } else {
-            std::fs::copy(&path, &target).unwrap();
-        }
-    }
-}
-
 #[tokio::test]
 async fn incremental_relight_wire_matches_full_recompute() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_src = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     let block_light_path = vanilla_dir.join("reports/block_light.json");
-    if !world_src.exists()
-        || !blocks_json.exists()
-        || !registries_json.exists()
-        || !block_light_path.exists()
-    {
+    if !blocks_json.exists() || !registries_json.exists() || !block_light_path.exists() {
         eprintln!(
             "skipping: prerequisites missing under {}",
             vanilla_dir.display()
         );
         return;
     }
-
-    let tmp_world = tempfile::tempdir().unwrap();
-    copy_dir_recursive(&world_src, tmp_world.path());
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report");
@@ -77,26 +56,16 @@ async fn incremental_relight_wire_matches_full_recompute() {
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        tmp_world.path(),
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_src.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
     let world = Some(Arc::clone(&world_handle));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light =
         Arc::new(mc_data::block_light::load(&block_light_path).expect("block_light loads"));
-
-    let dirt_item_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
-        .expect("dirt item id");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -109,6 +78,8 @@ async fn incremental_relight_wire_matches_full_recompute() {
         tags,
         block_light: Some(Arc::clone(&block_light)),
         items: Arc::clone(&items),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -138,6 +109,18 @@ async fn incremental_relight_wire_matches_full_recompute() {
         })
         .await
         .expect("ack teleport");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 64 1".into(),
+        })
+        .await
+        .expect("seed dirt slot");
 
     // Drain the configured spawn burst before editing so light-cache state is stable.
     let expected_chunks = (2 * VIEW_DISTANCE + 1).pow(2) as usize;
@@ -203,7 +186,6 @@ async fn incremental_relight_wire_matches_full_recompute() {
     // (0, 0). Stop after the BlockChangedAck arrives, since the
     // server emits updates in order BlockUpdate → LightUpdate(s) →
     // BlockChangedAck.
-    let _ = dirt_item_id;
     let mut light_updates: Vec<LightUpdate> = Vec::new();
     let mut saw_block_update = false;
     let mut saw_ack = false;

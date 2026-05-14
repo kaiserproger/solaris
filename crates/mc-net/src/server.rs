@@ -8,7 +8,9 @@ use std::sync::Arc;
 use bytes::BytesMut;
 use mc_data::Identifier;
 use mc_data::VanillaData;
+use mc_data::biomes::BiomeSpawnRules;
 use mc_data::block_light::BlockLightTable;
+use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
@@ -75,6 +77,8 @@ pub struct ServerConfig {
     /// that don't care about inventory; the M6 place flow degrades
     /// gracefully (no item → no placement).
     pub items: Arc<ItemRegistry>,
+    pub entity_types: Arc<EntityTypeRegistry>,
+    pub biome_spawns: Arc<BiomeSpawnRules>,
     /// M13 chunk-pipeline policy. Early M13 slices keep the existing
     /// cooperative stream path but thread this policy through so the
     /// scheduler and worker-pool stages have one runtime source of truth.

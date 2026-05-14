@@ -2,7 +2,7 @@
 //! spawn burst.
 //!
 //! Boots `mc_net::run` on an ephemeral port with a real
-//! `WorldStorage` opened on `.analysis/test-world/`, walks
+//! in-memory generated `WorldStorage`, walks
 //! Handshake → Login → Configuration → Play exactly as a vanilla
 //! client does, and asserts that the M3.e view-distance ring around
 //! spawn arrives as `LevelChunkWithLight` packets — each with the
@@ -15,8 +15,8 @@
 //! channels, the layer counts must match the mask popcount, and the
 //! spawn chunk's above-world slot must ship 0xFF nibbles (open sky).
 //!
-//! Skipped silently when the test-world or `blocks.json` is missing,
-//! matching the M2 round-trip oracle's pattern.
+//! Skipped silently when `blocks.json` is missing, matching the M2
+//! round-trip oracle's pattern.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -40,14 +40,11 @@ const MOVEMENT_VIEW_DISTANCE: i32 = 2;
 #[tokio::test]
 async fn vanilla_client_receives_spawn_view_distance_window() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_dir = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !world_dir.exists() || !blocks_json.exists() {
+    if !blocks_json.exists() {
         eprintln!(
-            "skipping: {} or {} missing — run tools/generate-test-world.sh \
-             and tools/extract-vanilla-data.sh --reports",
-            world_dir.display(),
+            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
             blocks_json.display()
         );
         return;
@@ -58,17 +55,11 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        &world_dir,
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_dir.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
@@ -99,6 +90,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -149,10 +142,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
 
     let expected_count = (2 * VIEW_DISTANCE + 1).pow(2) as usize; // 21×21 = 441
     let mut seen: HashSet<(i32, i32)> = HashSet::new();
-    // Cap per-chunk client-usage heightmaps so a partially-generated
-    // test-world chunk (Status: empty, no Heightmaps NBT) doesn't fail
-    // the test. The spawn chunk (0,0) is always fully-generated; we
-    // assert its heightmaps explicitly after the loop.
+    // Cap per-chunk client-usage heightmaps so the spawn chunk remains
+    // the explicit canary for end-to-end heightmap encoding.
     let mut chunks_with_heightmaps = 0usize;
     let mut spawn_heightmaps_seen = 0usize;
     // 180 s gives the M4.f light-bearing burst comfortable margin in
@@ -242,14 +233,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         }
     }
 
-    // The test-world generator (tools/generate-test-world.sh) boots the
-    // bundled server at view-distance=2, so vanilla fully populates a
-    // small core around spawn and leaves the rest of the .mca slots as
-    // Status: empty placeholders without Heightmaps NBT — chunks we
-    // serve faithfully but with the heightmap list empty (vanilla
-    // accepts the subset). The spawn chunk is always fully generated;
-    // the rest of the ring must have at least one populated chunk to
-    // prove the encoder is actually emitting heightmaps end-to-end.
+    // Generated chunks carry heightmaps end-to-end; the spawn chunk is
+    // the strongest canary because every client must receive it first.
     assert!(
         spawn_heightmaps_seen > 0,
         "spawn chunk (0, 0) must carry client-usage heightmaps"
@@ -264,14 +249,11 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
 #[tokio::test]
 async fn movement_across_chunk_boundary_replans_view_subscription() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_dir = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !world_dir.exists() || !blocks_json.exists() {
+    if !blocks_json.exists() {
         eprintln!(
-            "skipping: {} or {} missing — run tools/generate-test-world.sh \
-             and tools/extract-vanilla-data.sh --reports",
-            world_dir.display(),
+            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
             blocks_json.display()
         );
         return;
@@ -282,17 +264,11 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        &world_dir,
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * MOVEMENT_VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_dir.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light_path = vanilla_dir.join("reports/block_light.json");
@@ -316,6 +292,8 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: policy,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

@@ -38,6 +38,8 @@ async fn start_server() -> SocketAddr {
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

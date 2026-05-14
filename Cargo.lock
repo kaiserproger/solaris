@@ -747,8 +747,12 @@ dependencies = [
 name = "mc-worldgen"
 version = "0.0.1"
 dependencies = [
+ "bytes",
+ "flate2",
  "mc-data",
+ "mc-nbt",
  "mc-world",
+ "thiserror",
 ]
 
 [[package]]

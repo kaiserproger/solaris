@@ -19,15 +19,10 @@ const VIEW_DISTANCE: i32 = 2;
 #[tokio::test]
 async fn two_clients_spawn_move_and_despawn_visible_players() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let world_dir = manifest.join("../../.analysis/test-world");
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !world_dir.exists() || !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} or {} missing",
-            world_dir.display(),
-            blocks_json.display()
-        );
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
         return;
     }
 
@@ -36,17 +31,11 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = match mc_world::WorldStorage::open_with_capacity(
-        &world_dir,
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    ) {
-        Ok(storage) => storage.with_generator(generator),
-        Err(err) => {
-            eprintln!("skipping: {} ({err})", world_dir.display());
-            return;
-        }
-    };
+    )
+    .with_generator(generator);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light_path = vanilla_dir.join("reports/block_light.json");
@@ -65,6 +54,8 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
         tags,
         block_light,
         items: Arc::new(mc_data::items::ItemRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");

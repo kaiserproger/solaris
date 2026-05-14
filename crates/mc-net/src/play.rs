@@ -79,8 +79,8 @@ const SPAWN_X: f64 = 0.5;
 // debug-mode burst exposed the latent bug.)
 const DEFAULT_SPAWN_Y: f64 = -59.0;
 const SPAWN_Z: f64 = 0.5;
+const DEFAULT_SEA_LEVEL: i32 = 63;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;
-const COW_ENTITY_TYPE_ID: i32 = 30;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
@@ -149,6 +149,15 @@ struct ServerEntityMove {
     delta: Vec3,
     rotation: mc_entity::Rotation,
     on_ground: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct HerdSpawn {
+    chunk: (i32, i32),
+    slot: u8,
+    entity_type_id: i32,
+    entity_type_name: String,
+    position: Vec3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,7 +272,7 @@ struct SessionRegistryInner {
     prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
     entities: EntityStore,
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
-    demo_entities_ready: bool,
+    spawned_entity_chunks: HashSet<(i32, i32)>,
 }
 
 impl Default for SessionRegistryInner {
@@ -275,7 +284,7 @@ impl Default for SessionRegistryInner {
             prepared: HashMap::new(),
             entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
             last_sent_entity_positions: HashMap::new(),
-            demo_entities_ready: false,
+            spawned_entity_chunks: HashSet::new(),
         }
     }
 }
@@ -497,20 +506,36 @@ impl SessionRegistry {
             .collect()
     }
 
-    fn ensure_demo_entities(&self, spawn_y: f64) -> Vec<VisibilityDispatch> {
+    fn ensure_chunk_herd(
+        &self,
+        chunk: (i32, i32),
+        spawns: &[HerdSpawn],
+    ) -> Vec<VisibilityDispatch> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
-        if !inner.demo_entities_ready {
-            let position = Vec3::new(SPAWN_X + 4.0, spawn_y, SPAWN_Z);
-            let mut cow = SpawnEntity::new(COW_ENTITY_TYPE_ID, "minecraft:cow", position);
-            cow.goal = GoalState::Wander {
+        if !inner.spawned_entity_chunks.insert(chunk) {
+            return Vec::new();
+        }
+        for spawn in spawns {
+            debug_assert_eq!(spawn.chunk, chunk);
+            let mut entity = SpawnEntity::new(
+                spawn.entity_type_id,
+                spawn.entity_type_name.clone(),
+                spawn.position,
+            );
+            entity.uuid = Some(herd_uuid(spawn.chunk, spawn.slot));
+            entity.goal = GoalState::Wander {
                 speed: 0.8,
                 period_ticks: 80,
             };
-            let id = inner.entities.spawn(cow);
-            inner.last_sent_entity_positions.insert(id, position);
-            inner.demo_entities_ready = true;
-            debug!(entity_id = id.0, "spawned demo vanilla cow entity");
+            let id = inner.entities.spawn(entity);
+            inner.last_sent_entity_positions.insert(id, spawn.position);
         }
+        debug!(
+            cx = chunk.0,
+            cz = chunk.1,
+            entities = spawns.len(),
+            "spawned passive entity herd"
+        );
         refresh_visibility_locked(&mut inner)
     }
 
@@ -925,6 +950,10 @@ struct ChunkStreamState {
     world: WorldHandle,
     biomes: Arc<Registry>,
     block_light: Option<Arc<BlockLightTable>>,
+    passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
+    entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
@@ -968,6 +997,7 @@ struct ChunkStreamState {
 struct PreparedChunkFrame {
     frame: Bytes,
     light: Option<ChunkLight>,
+    herd_spawns: Vec<HerdSpawn>,
     packet_data_len: usize,
     build_timing: ChunkBuildTiming,
     write_timing: ChunkWriteTiming,
@@ -1063,7 +1093,6 @@ where
     );
 
     let (spawn_x, spawn_y, spawn_z) = spawn_position(config).await;
-    dispatch_visibility_commands(sessions.ensure_demo_entities(spawn_y));
 
     let (spawn_cx, spawn_cz) = spawn_chunk_pos();
     let (outbound_tx, outbound_rx) =
@@ -1088,7 +1117,7 @@ where
         entity_id: i32::try_from(session_id).unwrap_or(i32::MAX),
         is_hardcore: false,
         dimension_names: dim_names.to_vec(),
-        max_players: 20,
+        max_players: config.max_players.min(i32::MAX as u32) as i32,
         view_distance: config.view_distance,
         simulation_distance: config.view_distance,
         reduced_debug_info: false,
@@ -1100,10 +1129,10 @@ where
         game_mode: 0, // survival
         previous_game_mode: -1,
         is_debug: false,
-        is_flat: true,
+        is_flat: false,
         death_location: None,
         portal_cooldown: 0,
-        sea_level: 63,
+        sea_level: DEFAULT_SEA_LEVEL,
         enforces_secure_chat: false,
     };
     write_packet(writer, &login, compression).await?;
@@ -1164,6 +1193,12 @@ where
     )
     .await?;
 
+    let passive_herd_surface = mc_data::Identifier::parse("minecraft:grass_block")
+        .ok()
+        .and_then(|id| config.blocks.block(&id).map(|block| block.default));
+    let passive_herd_water = mc_data::Identifier::parse("minecraft:water")
+        .ok()
+        .and_then(|id| config.blocks.block(&id).map(|block| block.default));
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
@@ -1171,6 +1206,10 @@ where
             Arc::clone(world),
             Arc::new(biomes.clone()),
             config.block_light.as_ref().map(Arc::clone),
+            passive_herd_surface,
+            passive_herd_water,
+            Arc::clone(&config.biome_spawns),
+            Arc::clone(&config.entity_types),
             compression,
             Arc::clone(&sessions),
             session_id,
@@ -1190,22 +1229,17 @@ where
             stream.log_summary();
         }
 
-        // 6. Seed the player inventory (M6). Send SetHeldSlot{0} +
-        //    ContainerSetContent with the starter kit. Doing this even
-        //    when there's no world configured so the hotbar UI fills in
-        //    on connect-without-world (the M6 manual gate uses a world,
-        //    but tests / chunk-less debug runs should still display the
-        //    kit). When the item registry is empty (test stubs) the
-        //    starter inventory is mostly empty stacks — packets ship
-        //    anyway, just with `count == 0` slots.
-        let starter = build_starter_inventory(&config.items);
+        // 6. Seed an empty server-authoritative player inventory. Test
+        //    and dev-only inventory mutation goes through explicit
+        //    debug commands; normal survival no longer gets a starter kit.
+        let initial_inventory = PlayerInventory::empty();
         write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
         write_packet(
             writer,
             &ClientboundContainerSetContent {
                 container_id: 0,
                 state_id: 1,
-                items: starter.as_wire_list(),
+                items: initial_inventory.as_wire_list(),
                 carried_item: ItemStack::EMPTY,
             },
             compression,
@@ -1227,8 +1261,9 @@ where
             light_cache: std::mem::take(&mut light_cache),
             compression,
             selected_hotbar_slot: 0,
-            inventory: starter,
+            inventory: initial_inventory,
             inventory_state_id: 1,
+            items: Arc::clone(&config.items),
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
         });
         play_loop(
@@ -1285,9 +1320,9 @@ struct InteractionState {
     /// it to detect desyncs. Starts at 1 (after the seed
     /// ContainerSetContent on login).
     inventory_state_id: i32,
-    /// M6.f: hard-coded item→block resolver for the M6 starter
-    /// kit. Resolved once from the block registry at construction
-    /// time; lookups are an `if`-ladder on the item id.
+    items: Arc<ItemRegistry>,
+    /// Registry-derived item→default-block resolver. Built once from
+    /// vanilla item/block registries at construction time.
     item_to_block: ItemToBlockTable,
 }
 
@@ -1323,46 +1358,32 @@ impl PlayerInventory {
         &mut self.slots[Self::HOTBAR_BASE + hotbar_slot as usize]
     }
 
+    fn set_hotbar(&mut self, hotbar_slot: u8, stack: ItemStack) {
+        self.slots[Self::HOTBAR_BASE + hotbar_slot as usize] = stack;
+    }
+
     fn as_wire_list(&self) -> Vec<ItemStack> {
         self.slots.to_vec()
     }
 }
 
-/// Hard-coded item→default-block-state lookup for the M6 starter
-/// kit. Resolved once at connection setup from the block registry.
+/// Item→default-block-state lookup for items whose identifier also
+/// names a registered block.
 #[derive(Debug, Clone, Default)]
 struct ItemToBlockTable {
-    /// `(item_id, BlockStateId)` pairs. Stays tiny — full coverage
-    /// is M9+ work.
     entries: Vec<(u32, mc_world::BlockStateId)>,
 }
 
 impl ItemToBlockTable {
     fn build(items: &ItemRegistry, blocks: &mc_world::BlockRegistry) -> Self {
-        let starter_pairs = &[
-            ("minecraft:stone", "minecraft:stone"),
-            ("minecraft:dirt", "minecraft:dirt"),
-            ("minecraft:oak_planks", "minecraft:oak_planks"),
-            ("minecraft:torch", "minecraft:torch"),
-        ];
-        let mut entries = Vec::with_capacity(starter_pairs.len());
-        for (item_name, block_name) in starter_pairs {
-            let item_id = match mc_data::Identifier::parse(*item_name) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-            let block_id = match mc_data::Identifier::parse(*block_name) {
-                Ok(id) => id,
-                Err(_) => continue,
-            };
-            let Some(item_pid) = items.id_of(&item_id) else {
-                continue;
-            };
-            let Some(block) = blocks.block(&block_id) else {
-                continue;
-            };
-            entries.push((item_pid, block.default));
-        }
+        let entries = items
+            .iter()
+            .filter_map(|(item_name, item_pid)| {
+                blocks
+                    .block(item_name)
+                    .map(|block| (item_pid, block.default))
+            })
+            .collect();
         Self { entries }
     }
 
@@ -1371,28 +1392,6 @@ impl ItemToBlockTable {
             .iter()
             .find_map(|(id, state)| (*id == item_id).then_some(*state))
     }
-}
-
-/// Build a starter-kit inventory: hotbar 0..=3 = stone, dirt, oak
-/// planks, torch; everything else empty. Items the registry doesn't
-/// resolve (test stubs without the real `items.json`) are quietly
-/// dropped — the slot stays empty.
-fn build_starter_inventory(items: &ItemRegistry) -> PlayerInventory {
-    let mut inv = PlayerInventory::empty();
-    let starter_kit: [(&str, i32); 4] = [
-        ("minecraft:stone", 64),
-        ("minecraft:dirt", 64),
-        ("minecraft:oak_planks", 64),
-        ("minecraft:torch", 64),
-    ];
-    for (i, (name, count)) in starter_kit.iter().enumerate() {
-        if let Ok(id) = mc_data::Identifier::parse(*name)
-            && let Some(item_id) = items.id_of(&id)
-        {
-            inv.slots[PlayerInventory::HOTBAR_BASE + i] = ItemStack::new(item_id, *count);
-        }
-    }
-    inv
 }
 
 /// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
@@ -1409,6 +1408,210 @@ fn chunk_pos_from_coords(x: f64, z: f64) -> (i32, i32) {
     )
 }
 
+fn passive_chunk_spawns(chunk: (i32, i32)) -> bool {
+    if chunk == (0, 0) {
+        return true;
+    }
+    let h = herd_hash(chunk, 0, 0x4845_5244);
+    h.is_multiple_of(9)
+}
+
+fn herd_hash(chunk: (i32, i32), slot: u8, salt: u64) -> u64 {
+    let mut h = salt;
+    h ^= (chunk.0 as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    h = h.rotate_left(23);
+    h ^= (chunk.1 as i64 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    h = h.rotate_left(17);
+    h ^= (slot as u64).wrapping_mul(0x1656_67B1_9E37_79F9);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h.wrapping_mul(0x94D0_49BB_1331_11EB) ^ (h >> 31)
+}
+
+fn herd_uuid(chunk: (i32, i32), slot: u8) -> uuid::Uuid {
+    let hi = herd_hash(chunk, slot, 0x434F_575F_4845_5244);
+    let lo = herd_hash(chunk, slot, 0x5041_5353_4956_4500);
+    uuid::Uuid::from_u128(((hi as u128) << 64) | lo as u128)
+}
+
+fn plan_passive_herd(
+    chunk: &Chunk,
+    land_surface: Option<mc_world::BlockStateId>,
+    water: Option<mc_world::BlockStateId>,
+    rules: &mc_data::biomes::BiomeSpawnRules,
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
+) -> Vec<HerdSpawn> {
+    let chunk_pos = (chunk.pos.x, chunk.pos.z);
+    if !passive_chunk_spawns(chunk_pos) {
+        return Vec::new();
+    }
+    let mut spawns = Vec::new();
+    if let Some(surface) = land_surface {
+        plan_group_spawns(chunk, surface, "creature", rules, entity_types, &mut spawns);
+    }
+    if let Some(water) = water {
+        plan_water_group_spawns(
+            chunk,
+            water,
+            "water_ambient",
+            rules,
+            entity_types,
+            &mut spawns,
+        );
+        plan_water_group_spawns(
+            chunk,
+            water,
+            "water_creature",
+            rules,
+            entity_types,
+            &mut spawns,
+        );
+    }
+    spawns
+}
+
+fn plan_group_spawns(
+    chunk: &Chunk,
+    surface: mc_world::BlockStateId,
+    group: &str,
+    rules: &mc_data::biomes::BiomeSpawnRules,
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
+    out: &mut Vec<HerdSpawn>,
+) {
+    let chunk_pos = (chunk.pos.x, chunk.pos.z);
+    let slot_base = out.len() as u8;
+    let h = herd_hash(chunk_pos, slot_base, 0x5350_4157_4E00_0000);
+    let lx = 3 + (h as u8 % 10);
+    let lz = 3 + ((h >> 8) as u8 % 10);
+    let Some(y) = herd_surface_y(chunk, lx, lz, surface) else {
+        return;
+    };
+    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
+        return;
+    };
+    let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
+        return;
+    };
+    let Some(entity_type_id) = entity_types
+        .id_of(&entry.entity_type)
+        .and_then(|id| i32::try_from(id).ok())
+    else {
+        return;
+    };
+    let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
+    for i in 0..count {
+        let slot = slot_base + i as u8;
+        let offset = herd_hash(chunk_pos, slot, 0x4F46_4653_4554_0000);
+        out.push(HerdSpawn {
+            chunk: chunk_pos,
+            slot,
+            entity_type_id,
+            entity_type_name: entry.entity_type.as_str().to_string(),
+            position: Vec3::new(
+                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.35 + (offset & 3) as f64 * 0.1,
+                f64::from(y + 1),
+                f64::from(chunk.pos.z * 16 + i32::from(lz))
+                    + 0.35
+                    + ((offset >> 2) & 3) as f64 * 0.1,
+            ),
+        });
+    }
+}
+
+fn plan_water_group_spawns(
+    chunk: &Chunk,
+    water: mc_world::BlockStateId,
+    group: &str,
+    rules: &mc_data::biomes::BiomeSpawnRules,
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
+    out: &mut Vec<HerdSpawn>,
+) {
+    let chunk_pos = (chunk.pos.x, chunk.pos.z);
+    let slot_base = out.len() as u8;
+    let h = herd_hash(chunk_pos, slot_base, 0x5741_5445_5200_0000);
+    let lx = 3 + (h as u8 % 10);
+    let lz = 3 + ((h >> 8) as u8 % 10);
+    if chunk.get_block(lx, DEFAULT_SEA_LEVEL, lz) != Some(water) {
+        return;
+    }
+    let Some(biome) = chunk_biome_at(chunk, lx, DEFAULT_SEA_LEVEL, lz) else {
+        return;
+    };
+    let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
+        return;
+    };
+    let Some(entity_type_id) = entity_types
+        .id_of(&entry.entity_type)
+        .and_then(|id| i32::try_from(id).ok())
+    else {
+        return;
+    };
+    let count = herd_entry_count(entry, chunk_pos, slot_base).min(6);
+    for i in 0..count {
+        let slot = slot_base + i as u8;
+        out.push(HerdSpawn {
+            chunk: chunk_pos,
+            slot,
+            entity_type_id,
+            entity_type_name: entry.entity_type.as_str().to_string(),
+            position: Vec3::new(
+                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
+                f64::from(DEFAULT_SEA_LEVEL - 2),
+                f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
+            ),
+        });
+    }
+}
+
+fn choose_biome_spawn(
+    entries: &[mc_data::biomes::BiomeSpawnEntry],
+    chunk: (i32, i32),
+    slot: u8,
+) -> Option<&mc_data::biomes::BiomeSpawnEntry> {
+    let total: u32 = entries.iter().map(|entry| entry.weight).sum();
+    if total == 0 {
+        return None;
+    }
+    let mut pick = (herd_hash(chunk, slot, 0x5745_4947_4854_0000) % u64::from(total)) as u32;
+    for entry in entries {
+        if pick < entry.weight {
+            return Some(entry);
+        }
+        pick -= entry.weight;
+    }
+    entries.last()
+}
+
+fn herd_entry_count(
+    entry: &mc_data::biomes::BiomeSpawnEntry,
+    chunk: (i32, i32),
+    slot: u8,
+) -> usize {
+    let min = entry.min_count.min(entry.max_count).max(1);
+    let max = entry.max_count.max(min);
+    let span = max - min + 1;
+    (min + (herd_hash(chunk, slot, 0x434F_554E_5400_0000) as u32 % span)) as usize
+}
+
+fn chunk_biome_at(chunk: &Chunk, lx: u8, y: i32, lz: u8) -> Option<&mc_data::Identifier> {
+    let section = ((y - mc_world::MIN_Y) / 16).clamp(0, mc_world::SECTION_COUNT as i32 - 1);
+    let section = chunk.biomes.get(section as usize)?;
+    let local_y = (y - mc_world::MIN_Y).rem_euclid(16) as u8 / 4;
+    Some(section.get(lx / 4, local_y, lz / 4))
+}
+
+fn herd_surface_y(chunk: &Chunk, lx: u8, lz: u8, surface: mc_world::BlockStateId) -> Option<i32> {
+    if let Some(y) = chunk.highest_opaque_y(lx, lz)
+        && chunk.get_block(lx, y, lz) == Some(surface)
+    {
+        return Some(y);
+    }
+    (mc_world::MIN_Y..mc_world::MAX_Y)
+        .rev()
+        .find(|&y| chunk.get_block(lx, y, lz) == Some(surface))
+}
+
 fn desired_chunk_set(center_cx: i32, center_cz: i32, view_distance: i32) -> HashSet<(i32, i32)> {
     spiral_chunks(center_cx, center_cz, view_distance).collect()
 }
@@ -1419,6 +1622,10 @@ impl ChunkStreamState {
         world: WorldHandle,
         biomes: Arc<Registry>,
         block_light: Option<Arc<BlockLightTable>>,
+        passive_herd_surface: Option<mc_world::BlockStateId>,
+        passive_herd_water: Option<mc_world::BlockStateId>,
+        passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
+        entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
         compression: Compression,
         sessions: Arc<SessionRegistry>,
         session_id: SessionId,
@@ -1433,6 +1640,10 @@ impl ChunkStreamState {
             world,
             biomes,
             block_light,
+            passive_herd_surface,
+            passive_herd_water,
+            passive_spawn_rules,
+            entity_types,
             compression,
             sessions,
             session_id,
@@ -1630,6 +1841,10 @@ impl ChunkStreamState {
             let world = Arc::clone(&self.world);
             let biomes = Arc::clone(&self.biomes);
             let block_light = self.block_light.as_ref().map(Arc::clone);
+            let passive_herd_surface = self.passive_herd_surface;
+            let passive_herd_water = self.passive_herd_water;
+            let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
+            let entity_types = Arc::clone(&self.entity_types);
             let io_permits = Arc::clone(&self.io_permits);
             let cpu_permits = Arc::clone(&self.cpu_permits);
             let compression = self.compression;
@@ -1640,6 +1855,10 @@ impl ChunkStreamState {
                     world,
                     biomes,
                     block_light,
+                    passive_herd_surface,
+                    passive_herd_water,
+                    passive_spawn_rules,
+                    entity_types,
                     compression,
                     io_permits,
                     cpu_permits,
@@ -1694,7 +1913,12 @@ impl ChunkStreamState {
                 let mut write_timing = prepared.write_timing;
                 write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
                 self.loaded.insert((cx, cz));
-                dispatch_visibility_commands(self.sessions.mark_loaded(self.session_id, (cx, cz)));
+                let mut visibility = self.sessions.mark_loaded(self.session_id, (cx, cz));
+                visibility.extend(
+                    self.sessions
+                        .ensure_chunk_herd((cx, cz), &prepared.herd_spawns),
+                );
+                dispatch_visibility_commands(visibility);
                 self.sessions
                     .cache_prepared_chunk((cx, cz), Arc::new((*prepared).clone()));
                 self.build_timing.add(prepared.build_timing);
@@ -1838,11 +2062,16 @@ fn prioritized_spiral(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_chunk_request(
     request: ChunkRequest,
     world: WorldHandle,
     biomes: Arc<Registry>,
     block_light: Option<Arc<BlockLightTable>>,
+    passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
+    entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
@@ -1896,6 +2125,10 @@ async fn prepare_chunk_request(
                     &neighbourhood,
                     biomes.as_ref(),
                     Some(table),
+                    passive_herd_surface,
+                    passive_herd_water,
+                    passive_spawn_rules.as_ref(),
+                    entity_types.as_ref(),
                     Some(workspace),
                     request.chunk_x,
                     request.chunk_z,
@@ -1907,6 +2140,10 @@ async fn prepare_chunk_request(
                 &neighbourhood,
                 biomes.as_ref(),
                 None,
+                passive_herd_surface,
+                passive_herd_water,
+                passive_spawn_rules.as_ref(),
+                entity_types.as_ref(),
                 None,
                 request.chunk_x,
                 request.chunk_z,
@@ -1984,6 +2221,7 @@ async fn load_chunk_neighbourhood(
 struct BuiltChunkPacket {
     packet: LevelChunkWithLight,
     light: Option<ChunkLight>,
+    herd_spawns: Vec<HerdSpawn>,
     timing: ChunkBuildTiming,
 }
 
@@ -1993,6 +2231,10 @@ fn build_chunk_packet(
     neighbourhood: &[[Option<Arc<Chunk>>; 3]; 3],
     biomes: &Registry,
     block_light: Option<&BlockLightTable>,
+    passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_spawn_rules: &mc_data::biomes::BiomeSpawnRules,
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
     workspace: Option<&mut LightWorkspace>,
     cx: i32,
     cz: i32,
@@ -2045,6 +2287,13 @@ fn build_chunk_packet(
         }
         _ => LightData::empty(),
     };
+    let herd_spawns = plan_passive_herd(
+        centre,
+        passive_herd_surface,
+        passive_herd_water,
+        passive_spawn_rules,
+        entity_types,
+    );
     Ok(BuiltChunkPacket {
         packet: LevelChunkWithLight {
             chunk_x: cx,
@@ -2055,6 +2304,7 @@ fn build_chunk_packet(
             light,
         },
         light: computed_light,
+        herd_spawns,
         timing,
     })
 }
@@ -2079,6 +2329,7 @@ fn frame_chunk_packet(
     Ok(PreparedChunkFrame {
         frame: framed,
         light: built.light,
+        herd_spawns: built.herd_spawns,
         packet_data_len,
         build_timing: built.timing,
         write_timing: timing,
@@ -2105,6 +2356,7 @@ where
 async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    game_mode: GameMode,
     action: ServerboundPlayerAction,
 ) -> Result<(), ConnectionError>
 where
@@ -2122,6 +2374,23 @@ where
             action = ?action.action,
             sequence = action.sequence,
             "non-destroy player action ignored"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            state.compression,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if game_mode != GameMode::Creative {
+        debug!(
+            mode = ?game_mode,
+            sequence = action.sequence,
+            "instant block break denied outside creative"
         );
         write_packet(
             writer,
@@ -2553,11 +2822,29 @@ fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
 async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    game_mode: GameMode,
     action: ServerboundUseItemOn,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    if game_mode != GameMode::Creative {
+        debug!(
+            mode = ?game_mode,
+            sequence = action.sequence,
+            "block placement denied outside creative"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            state.compression,
+        )
+        .await?;
+        return Ok(());
+    }
+
     let (cx, cy, cz) = unpack_block_pos(action.position);
     let (dx, dy, dz) = action.direction.normal();
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
@@ -3172,7 +3459,7 @@ where
                     let mut body = frame.body;
                     let action = ServerboundPlayerAction::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_player_action(state, writer, action).await?;
+                        handle_player_action(state, writer, game_mode, action).await?;
                     } else {
                         debug!(
                             action = ?action.action,
@@ -3184,7 +3471,7 @@ where
                     let mut body = frame.body;
                     let use_on = ServerboundUseItemOn::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_use_item_on(state, writer, use_on).await?;
+                        handle_use_item_on(state, writer, game_mode, use_on).await?;
                     } else {
                         debug!(
                             sequence = use_on.sequence,
@@ -3204,8 +3491,15 @@ where
                     let command = ServerboundChatCommand::decode(&mut body)?;
                     if let Some(mode) = parse_gamemode_command(&command.command) {
                         apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
-                    } else if let Some(command) = parse_survival_command(&command.command) {
-                        apply_survival_command(writer, compression, &mut survival_state, command, permissions).await?;
+                    } else if let Some(command) = parse_debug_command(&command.command) {
+                        apply_debug_command(
+                            writer,
+                            compression,
+                            &mut survival_state,
+                            interaction.as_deref_mut(),
+                            command,
+                            permissions,
+                        ).await?;
                     } else {
                         debug!(command = %command.command, "unsupported command ignored");
                     }
@@ -3256,6 +3550,40 @@ enum SurvivalCommand {
     Exhaust(f32),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum DebugCommand {
+    Survival(SurvivalCommand),
+    Give {
+        item: mc_data::Identifier,
+        count: i32,
+        hotbar_slot: u8,
+    },
+}
+
+fn parse_debug_command(command: &str) -> Option<DebugCommand> {
+    let rest = command.strip_prefix("debug ")?;
+    if let Some(survival) = rest.strip_prefix("survival ") {
+        return parse_survival_command(survival).map(DebugCommand::Survival);
+    }
+
+    let mut parts = rest.split_whitespace();
+    let name = parts.next()?;
+    if name != "give" {
+        return None;
+    }
+    let item = mc_data::Identifier::parse(parts.next()?.to_string()).ok()?;
+    let count = parts.next().unwrap_or("1").parse().ok()?;
+    let hotbar_slot = parts.next().unwrap_or("0").parse::<i32>().ok()?;
+    if parts.next().is_some() || !(0..=8).contains(&hotbar_slot) {
+        return None;
+    }
+    Some(DebugCommand::Give {
+        item,
+        count,
+        hotbar_slot: hotbar_slot as u8,
+    })
+}
+
 fn parse_survival_command(command: &str) -> Option<SurvivalCommand> {
     let mut parts = command.split_whitespace();
     let name = parts.next()?;
@@ -3293,20 +3621,70 @@ fn parse_survival_command(command: &str) -> Option<SurvivalCommand> {
     }
 }
 
-async fn apply_survival_command<W>(
+async fn apply_debug_command<W>(
     writer: &mut W,
     compression: Compression,
-    state: &mut SurvivalState,
-    command: SurvivalCommand,
+    survival_state: &mut SurvivalState,
+    interaction: Option<&mut InteractionState>,
+    command: DebugCommand,
     permissions: CommandPermissions,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
     if !permissions.op {
-        debug!(command = ?command, "survival command denied for non-op player");
+        debug!(command = ?command, "debug command denied for non-op player");
         return Ok(());
     }
+
+    match command {
+        DebugCommand::Survival(command) => {
+            apply_survival_command(writer, compression, survival_state, command).await
+        }
+        DebugCommand::Give {
+            item,
+            count,
+            hotbar_slot,
+        } => {
+            let Some(state) = interaction else {
+                debug!(%item, "debug give ignored — no interaction state");
+                return Ok(());
+            };
+            let Some(item_id) = state.items.id_of(&item) else {
+                debug!(%item, "debug give ignored — item not in registry");
+                return Ok(());
+            };
+            let stack = if count <= 0 {
+                ItemStack::EMPTY
+            } else {
+                ItemStack::new(item_id, count.min(i32::from(u8::MAX)))
+            };
+            state.inventory.set_hotbar(hotbar_slot, stack.clone());
+            state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+            write_packet(
+                writer,
+                &ClientboundContainerSetSlot {
+                    container_id: 0,
+                    state_id: state.inventory_state_id,
+                    slot: (PlayerInventory::HOTBAR_BASE + hotbar_slot as usize) as i16,
+                    item_stack: stack,
+                },
+                compression,
+            )
+            .await
+        }
+    }
+}
+
+async fn apply_survival_command<W>(
+    writer: &mut W,
+    compression: Compression,
+    state: &mut SurvivalState,
+    command: SurvivalCommand,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     match command {
         SurvivalCommand::Damage(amount) => state.apply_damage(amount),
         SurvivalCommand::Heal(amount) => state.heal(amount),
@@ -3421,27 +3799,36 @@ mod tests {
     }
 
     #[test]
-    fn survival_commands_parse_damage_heal_feed_and_exhaustion() {
+    fn debug_commands_parse_survival_mutations_and_give() {
         assert_eq!(
-            parse_survival_command("damage 7.5"),
-            Some(SurvivalCommand::Damage(7.5))
+            parse_debug_command("debug survival damage 7.5"),
+            Some(DebugCommand::Survival(SurvivalCommand::Damage(7.5)))
         );
         assert_eq!(
-            parse_survival_command("heal"),
-            Some(SurvivalCommand::Heal(20.0))
+            parse_debug_command("debug survival heal"),
+            Some(DebugCommand::Survival(SurvivalCommand::Heal(20.0)))
         );
         assert_eq!(
-            parse_survival_command("feed 2 0.5"),
-            Some(SurvivalCommand::Feed {
+            parse_debug_command("debug survival feed 2 0.5"),
+            Some(DebugCommand::Survival(SurvivalCommand::Feed {
                 food: 2,
                 saturation: 0.5
-            })
+            }))
         );
         assert_eq!(
-            parse_survival_command("exhaust 4"),
-            Some(SurvivalCommand::Exhaust(4.0))
+            parse_debug_command("debug survival exhaust 4"),
+            Some(DebugCommand::Survival(SurvivalCommand::Exhaust(4.0)))
         );
-        assert_eq!(parse_survival_command("damage bad"), None);
+        assert_eq!(
+            parse_debug_command("debug give minecraft:dirt 64 1"),
+            Some(DebugCommand::Give {
+                item: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+                count: 64,
+                hotbar_slot: 1,
+            })
+        );
+        assert_eq!(parse_debug_command("damage 7.5"), None);
+        assert_eq!(parse_debug_command("debug survival damage bad"), None);
     }
 
     #[test]
@@ -3454,6 +3841,152 @@ mod tests {
         let permissions = CommandPermissions::for_local_dev_profile(&profile);
 
         assert!(permissions.can_change_game_mode());
+    }
+
+    #[test]
+    fn item_to_block_table_is_registry_derived() {
+        use std::collections::BTreeMap;
+
+        use mc_data::blocks::{BlockReport, BlockStateReport};
+        use mc_data::items::ItemReport;
+
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+                protocol_id: 42,
+            },
+            ItemReport {
+                id: mc_data::Identifier::parse("minecraft:apple").unwrap(),
+                protocol_id: 43,
+            },
+        ]);
+        let blocks = mc_world::BlockRegistry::from_report(&[
+            BlockReport {
+                id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+        ])
+        .unwrap();
+
+        let table = ItemToBlockTable::build(&items, &blocks);
+
+        assert_eq!(table.resolve(42), Some(mc_world::BlockStateId(1)));
+        assert_eq!(table.resolve(43), None);
+    }
+
+    #[test]
+    fn passive_spawn_planner_keeps_water_mobs_off_land() {
+        use std::collections::BTreeMap;
+
+        let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let ocean = mc_data::Identifier::parse("minecraft:ocean").unwrap();
+        let pig = mc_data::Identifier::parse("minecraft:pig").unwrap();
+        let cod = mc_data::Identifier::parse("minecraft:cod").unwrap();
+        let rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
+            plains.clone(),
+            BTreeMap::from([
+                (
+                    "creature".to_string(),
+                    vec![mc_data::biomes::BiomeSpawnEntry {
+                        entity_type: pig.clone(),
+                        min_count: 2,
+                        max_count: 2,
+                        weight: 1,
+                    }],
+                ),
+                (
+                    "water_ambient".to_string(),
+                    vec![mc_data::biomes::BiomeSpawnEntry {
+                        entity_type: cod.clone(),
+                        min_count: 4,
+                        max_count: 4,
+                        weight: 1,
+                    }],
+                ),
+            ]),
+        )]));
+        let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
+            mc_data::entity_types::EntityTypeReport {
+                id: pig,
+                protocol_id: 1,
+            },
+            mc_data::entity_types::EntityTypeReport {
+                id: cod,
+                protocol_id: 2,
+            },
+        ]);
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
+        let grass = mc_world::BlockStateId(1);
+        let water = mc_world::BlockStateId(2);
+        for lx in 3..=12 {
+            for lz in 3..=12 {
+                let _ = chunk.set_block(lx, 64, lz, grass);
+            }
+        }
+
+        let spawns = plan_passive_herd(&chunk, Some(grass), Some(water), &rules, &entity_types);
+
+        assert!(!spawns.is_empty());
+        assert!(
+            spawns
+                .iter()
+                .all(|spawn| spawn.entity_type_name == "minecraft:pig")
+        );
+        assert!(spawns.iter().all(|spawn| spawn.position.y == 65.0));
+        assert!(spawns.iter().all(|spawn| spawn.entity_type_id == 1));
+
+        let ocean_rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
+            ocean.clone(),
+            BTreeMap::from([(
+                "water_ambient".to_string(),
+                vec![mc_data::biomes::BiomeSpawnEntry {
+                    entity_type: mc_data::Identifier::parse("minecraft:cod").unwrap(),
+                    min_count: 3,
+                    max_count: 3,
+                    weight: 1,
+                }],
+            )]),
+        )]));
+        let mut ocean_chunk =
+            Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), ocean);
+        for lx in 3..=12 {
+            for lz in 3..=12 {
+                let _ = ocean_chunk.set_block(lx, DEFAULT_SEA_LEVEL, lz, water);
+            }
+        }
+
+        let spawns = plan_passive_herd(
+            &ocean_chunk,
+            Some(grass),
+            Some(water),
+            &ocean_rules,
+            &entity_types,
+        );
+
+        assert!(
+            spawns
+                .iter()
+                .all(|spawn| spawn.entity_type_name == "minecraft:cod")
+        );
+        assert!(
+            spawns
+                .iter()
+                .all(|spawn| spawn.position.y < f64::from(DEFAULT_SEA_LEVEL))
+        );
     }
 
     #[test]
@@ -3592,6 +4125,7 @@ mod tests {
             Arc::new(PreparedChunkFrame {
                 frame: Bytes::from_static(b"chunk-frame"),
                 light: None,
+                herd_spawns: Vec::new(),
                 packet_data_len: 0,
                 build_timing: ChunkBuildTiming::default(),
                 write_timing: ChunkWriteTiming::default(),

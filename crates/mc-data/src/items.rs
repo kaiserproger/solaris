@@ -104,6 +104,10 @@ impl ItemRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&Identifier, u32)> {
+        self.by_name.iter().map(|(name, id)| (name, *id))
+    }
 }
 
 // Raw deserialisation shape — keep separate so the public ItemReport
@@ -163,5 +167,33 @@ mod tests {
         // Round-trip.
         let stone_id = reg.id_of(&stone).unwrap();
         assert_eq!(reg.name_of(stone_id), Some(&stone));
+    }
+
+    #[test]
+    fn iter_yields_names_and_protocol_ids() {
+        let report = [
+            ItemReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                protocol_id: 0,
+            },
+            ItemReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                protocol_id: 1,
+            },
+        ];
+        let reg = ItemRegistry::from_report(&report);
+
+        let entries: Vec<_> = reg
+            .iter()
+            .map(|(name, id)| (name.as_str().to_string(), id))
+            .collect();
+
+        assert_eq!(
+            entries,
+            vec![
+                ("minecraft:air".to_string(), 0),
+                ("minecraft:stone".to_string(), 1),
+            ]
+        );
     }
 }
