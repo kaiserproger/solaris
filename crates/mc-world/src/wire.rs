@@ -49,8 +49,9 @@
 //!                       in the long[])
 //! ```
 //!
-//! The network storage is contiguous bit storage. This differs from
-//! Anvil's non-crossing long layout whenever `64 % bits_per_entry != 0`.
+//! The network storage is vanilla `SimpleBitStorage`: entries do not
+//! cross `i64` boundaries, so each word may have unused high bits when
+//! `64 % bits_per_entry != 0`.
 
 use mc_data::{Identifier, Registry};
 use thiserror::Error;
@@ -70,6 +71,7 @@ const DIRECT_BITS: u8 = 15;
 /// HashMapPalette indirect formats to GlobalPalette (direct). Matches
 /// vanilla's threshold (`Strategy.getConfigurationForBitCount`).
 const DIRECT_BITS_THRESHOLD: u8 = 9;
+const BIOME_DIRECT_BITS_THRESHOLD: u8 = 4;
 
 /// Heightmap type ids — the ordinals of `Heightmap$Types` in the
 /// vanilla source, verified via `javap -p -c` (ADR 0002). Only the
@@ -223,18 +225,33 @@ fn encode_biome_palette(
         }
         BiomeSection::Indirect { palette, indices } => {
             debug_assert_eq!(indices.len(), BIOME_VOLUME);
-            buf.push(indices.bits_per_entry());
-            write_varint(
-                buf,
-                i32::try_from(palette.len()).expect("palette len < i32::MAX"),
-            );
-            for biome in palette {
-                write_varint(buf, registry_index_of(registry, biome)?);
-            }
-            for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
-                indices.get(idx)
-            }) {
-                buf.extend_from_slice(&(word as i64).to_be_bytes());
+            if indices.bits_per_entry() >= BIOME_DIRECT_BITS_THRESHOLD {
+                let direct_bits = bits_for_distinct_values(registry.entries.len());
+                let palette_ids = palette
+                    .iter()
+                    .map(|biome| registry_index_of(registry, biome).map(|id| id as u32))
+                    .collect::<Result<Vec<_>, _>>()?;
+                buf.push(direct_bits);
+                for word in pack_fixed_longs(direct_bits, indices.len(), |idx| {
+                    let p = indices.get(idx) as usize;
+                    palette_ids[p]
+                }) {
+                    buf.extend_from_slice(&(word as i64).to_be_bytes());
+                }
+            } else {
+                buf.push(indices.bits_per_entry());
+                write_varint(
+                    buf,
+                    i32::try_from(palette.len()).expect("palette len < i32::MAX"),
+                );
+                for biome in palette {
+                    write_varint(buf, registry_index_of(registry, biome)?);
+                }
+                for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
+                    indices.get(idx)
+                }) {
+                    buf.extend_from_slice(&(word as i64).to_be_bytes());
+                }
             }
         }
     }
@@ -247,24 +264,23 @@ where
 {
     let bits = bits_per_entry as usize;
     debug_assert!((1..=32).contains(&bits_per_entry));
-    let mask = if bits == 64 {
-        u64::MAX
-    } else {
-        (1u64 << bits) - 1
-    };
-    let mut words = vec![0u64; (len * bits).div_ceil(64)];
+    let entries_per_word = (64 / bits).max(1);
+    let mask = (1u64 << bits) - 1;
+    let mut words = vec![0u64; len.div_ceil(entries_per_word)];
     for idx in 0..len {
         let value = value_at(idx) as u64 & mask;
-        let bit_index = idx * bits;
-        let word_index = bit_index / 64;
-        let bit_offset = bit_index % 64;
+        let word_index = idx / entries_per_word;
+        let bit_offset = (idx % entries_per_word) * bits;
         words[word_index] |= value << bit_offset;
-        let spill = bit_offset + bits;
-        if spill > 64 {
-            words[word_index + 1] |= value >> (64 - bit_offset);
-        }
     }
     words
+}
+
+fn bits_for_distinct_values(len: usize) -> u8 {
+    if len <= 1 {
+        return 1;
+    }
+    (len - 1).ilog2() as u8 + 1
 }
 
 fn registry_index_of(registry: &Registry, biome: &Identifier) -> Result<i32, WireError> {
@@ -401,6 +417,15 @@ mod tests {
                 Identifier::parse("minecraft:plains").unwrap(),
                 Identifier::parse("minecraft:the_void").unwrap(),
             ],
+        }
+    }
+
+    fn numbered_biome_registry(len: usize) -> Registry {
+        Registry {
+            id: Identifier::parse("minecraft:worldgen/biome").unwrap(),
+            entries: (0..len)
+                .map(|i| Identifier::parse(format!("minecraft:biome_{i}")).unwrap())
+                .collect(),
         }
     }
 
@@ -746,7 +771,7 @@ mod tests {
         // No VarInt palette length: the next bytes are the packed
         // long array. Compute the expected long count.
         let bits = super::DIRECT_BITS as usize;
-        let expected_longs = (SECTION_VOLUME * bits).div_ceil(64);
+        let expected_longs = SECTION_VOLUME.div_ceil(64 / bits);
         assert_eq!(
             buf.len() - 1,
             expected_longs * 8,
@@ -755,7 +780,7 @@ mod tests {
     }
 
     #[test]
-    fn block_palette_uses_contiguous_fixed_longs_for_five_bit_indirect() {
+    fn block_palette_uses_vanilla_fixed_longs_for_five_bit_indirect() {
         use crate::section::ChunkSection;
         let mut section = ChunkSection::filled(AIR, AIR);
         for i in 1..=17u32 {
@@ -779,8 +804,61 @@ mod tests {
             assert_eq!(buf[offset], state);
             offset += 1;
         }
-        let expected_longs = (SECTION_VOLUME * 5).div_ceil(64);
+        let expected_longs = SECTION_VOLUME.div_ceil(64 / 5);
         assert_eq!(buf.len() - offset, expected_longs * 8);
+
+        let word0 = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+        let word1 = u64::from_be_bytes(buf[offset + 8..offset + 16].try_into().unwrap());
+        assert_eq!(word0 >> 60, 0, "top four bits are padding");
+        assert_eq!(word1 & 0x1F, 13, "entry 12 starts a fresh word");
+    }
+
+    #[test]
+    fn biome_palette_uses_vanilla_fixed_longs_for_three_bit_indirect() {
+        let registry = numbered_biome_registry(8);
+        let palette: Vec<_> = registry.entries[..5].to_vec();
+        let mut indices = PackedBitArray::zeroed(3, BIOME_VOLUME);
+        for idx in 0..BIOME_VOLUME {
+            indices.set(idx, (idx % palette.len()) as u32);
+        }
+        let section = BiomeSection::from_indirect(palette, indices);
+
+        let mut buf = Vec::new();
+        super::encode_biome_palette(&mut buf, &section, &registry).unwrap();
+
+        assert_eq!(buf[0], 3, "five biomes stay indirect at three bits");
+        let mut offset = 1;
+        assert_eq!(buf[offset], 5, "palette length");
+        offset += 1 + 5;
+        let expected_longs = BIOME_VOLUME.div_ceil(64 / 3);
+        assert_eq!(buf.len() - offset, expected_longs * 8);
+
+        let word0 = u64::from_be_bytes(buf[offset..offset + 8].try_into().unwrap());
+        let word1 = u64::from_be_bytes(buf[offset + 8..offset + 16].try_into().unwrap());
+        assert_eq!(word0 >> 63, 0, "top bit is padding");
+        assert_eq!(word1 & 0x07, 1, "entry 21 starts a fresh word");
+    }
+
+    #[test]
+    fn biome_palette_switches_to_direct_mode_above_three_bits() {
+        let registry = numbered_biome_registry(10);
+        let palette = registry.entries.clone();
+        let mut indices = PackedBitArray::zeroed(4, BIOME_VOLUME);
+        for idx in 0..BIOME_VOLUME {
+            indices.set(idx, (idx % palette.len()) as u32);
+        }
+        let section = BiomeSection::from_indirect(palette, indices);
+
+        let mut buf = Vec::new();
+        super::encode_biome_palette(&mut buf, &section, &registry).unwrap();
+
+        assert_eq!(buf[0], 4, "ten-entry biome registry needs four direct bits");
+        let expected_longs = BIOME_VOLUME.div_ceil(64 / 4);
+        assert_eq!(
+            buf.len() - 1,
+            expected_longs * 8,
+            "direct biome body has no palette length or entries"
+        );
     }
 
     #[test]
