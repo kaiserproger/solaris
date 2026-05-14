@@ -49,9 +49,8 @@
 //!                       in the long[])
 //! ```
 //!
-//! M3.b produces **single-value** and **indirect** outputs; "direct"
-//! / GlobalPalette emission is M3+ territory and not used by any of
-//! the test-world chunks we exercise.
+//! The network storage is contiguous bit storage. This differs from
+//! Anvil's non-crossing long layout whenever `64 % bits_per_entry != 0`.
 
 use mc_data::{Identifier, Registry};
 use thiserror::Error;
@@ -177,7 +176,9 @@ fn encode_block_palette(buf: &mut Vec<u8>, section: &ChunkSection) {
                 for state in palette {
                     write_varint(buf, i32::try_from(state.0).expect("state id < i32::MAX"));
                 }
-                for &word in indices.words() {
+                for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
+                    indices.get(idx)
+                }) {
                     buf.extend_from_slice(&(word as i64).to_be_bytes());
                 }
             }
@@ -198,14 +199,13 @@ fn encode_block_direct(
     indices: &PackedBitArray,
 ) {
     let bits = DIRECT_BITS.max(indices.bits_per_entry());
-    let mut direct = PackedBitArray::zeroed(bits, SECTION_VOLUME);
-    for cell in 0..SECTION_VOLUME {
+    let direct = pack_fixed_longs(bits, SECTION_VOLUME, |cell| {
         let p = indices.get(cell) as usize;
-        direct.set(cell, palette[p].0);
-    }
+        palette[p].0
+    });
     buf.push(bits);
     // GlobalPalette: no palette VarInts.
-    for &word in direct.words() {
+    for word in direct {
         buf.extend_from_slice(&(word as i64).to_be_bytes());
     }
 }
@@ -231,12 +231,40 @@ fn encode_biome_palette(
             for biome in palette {
                 write_varint(buf, registry_index_of(registry, biome)?);
             }
-            for &word in indices.words() {
+            for word in pack_fixed_longs(indices.bits_per_entry(), indices.len(), |idx| {
+                indices.get(idx)
+            }) {
                 buf.extend_from_slice(&(word as i64).to_be_bytes());
             }
         }
     }
     Ok(())
+}
+
+fn pack_fixed_longs<F>(bits_per_entry: u8, len: usize, mut value_at: F) -> Vec<u64>
+where
+    F: FnMut(usize) -> u32,
+{
+    let bits = bits_per_entry as usize;
+    debug_assert!((1..=32).contains(&bits_per_entry));
+    let mask = if bits == 64 {
+        u64::MAX
+    } else {
+        (1u64 << bits) - 1
+    };
+    let mut words = vec![0u64; (len * bits).div_ceil(64)];
+    for idx in 0..len {
+        let value = value_at(idx) as u64 & mask;
+        let bit_index = idx * bits;
+        let word_index = bit_index / 64;
+        let bit_offset = bit_index % 64;
+        words[word_index] |= value << bit_offset;
+        let spill = bit_offset + bits;
+        if spill > 64 {
+            words[word_index + 1] |= value >> (64 - bit_offset);
+        }
+    }
+    words
 }
 
 fn registry_index_of(registry: &Registry, biome: &Identifier) -> Result<i32, WireError> {
@@ -580,10 +608,18 @@ mod tests {
             .expect("chunk (0,0) present in r.0.0.mca")
             .clone();
 
-        // Synthesise a 3-entry biome registry with plains at index 1
-        // (matching the test-world generator's default).
-        let registry = biome_registry();
-        let bytes = encode_chunk_data(&chunk, &registry).expect("encode");
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla");
+        let data = match mc_data::load(&data_dir) {
+            Ok(data) => data,
+            Err(err) => {
+                eprintln!("skipping: {} ({err})", data_dir.display());
+                return;
+            }
+        };
+        let registry = data
+            .registry("worldgen/biome")
+            .expect("vanilla data carries biome registry");
+        let bytes = encode_chunk_data(&chunk, registry).expect("encode");
 
         // Structural checks: 24 sections, each ≥ minimum length.
         // Minimum per section = 4 (counts) + 2 (single-value block:
@@ -710,13 +746,41 @@ mod tests {
         // No VarInt palette length: the next bytes are the packed
         // long array. Compute the expected long count.
         let bits = super::DIRECT_BITS as usize;
-        let epw = 64 / bits;
-        let expected_longs = SECTION_VOLUME.div_ceil(epw);
+        let expected_longs = (SECTION_VOLUME * bits).div_ceil(64);
         assert_eq!(
             buf.len() - 1,
             expected_longs * 8,
             "direct-mode body = {expected_longs} longs (no palette section)"
         );
+    }
+
+    #[test]
+    fn block_palette_uses_contiguous_fixed_longs_for_five_bit_indirect() {
+        use crate::section::ChunkSection;
+        let mut section = ChunkSection::filled(AIR, AIR);
+        for i in 1..=17u32 {
+            let cell = i - 1;
+            section.set(
+                (cell & 0x0F) as u8,
+                ((cell >> 4) & 0x0F) as u8,
+                0,
+                BlockStateId(i),
+            );
+        }
+
+        let mut buf = Vec::new();
+        super::encode_block_palette(&mut buf, &section);
+
+        assert_eq!(buf[0], 5, "17 states require five bits");
+        let mut offset = 1;
+        assert_eq!(buf[offset], 18, "palette includes air plus 17 states");
+        offset += 1;
+        for state in 0..=17u8 {
+            assert_eq!(buf[offset], state);
+            offset += 1;
+        }
+        let expected_longs = (SECTION_VOLUME * 5).div_ceil(64);
+        assert_eq!(buf.len() - offset, expected_longs * 8);
     }
 
     #[test]
