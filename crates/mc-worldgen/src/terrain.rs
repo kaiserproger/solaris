@@ -148,10 +148,38 @@ pub struct TerrainGenerator {
     biomes: BiomeRules,
     ores: OreRules,
     structures: StructureRules,
+    decorations: DecorationBlocks,
     // Kept so the generator's lifetime is bounded by something
     // sensible if the storage drops the only other reference.
     #[allow(dead_code)]
     registry: Arc<BlockRegistry>,
+}
+
+#[derive(Clone, Copy)]
+struct DecorationBlocks {
+    oak_log: Option<BlockStateId>,
+    oak_leaves: Option<BlockStateId>,
+    short_grass: Option<BlockStateId>,
+    dandelion: Option<BlockStateId>,
+    poppy: Option<BlockStateId>,
+    pumpkin: Option<BlockStateId>,
+    sugar_cane: Option<BlockStateId>,
+    cactus: Option<BlockStateId>,
+}
+
+impl DecorationBlocks {
+    fn new(registry: &BlockRegistry) -> Self {
+        Self {
+            oak_log: optional_block(registry, "minecraft:oak_log"),
+            oak_leaves: optional_block(registry, "minecraft:oak_leaves"),
+            short_grass: optional_block(registry, "minecraft:short_grass"),
+            dandelion: optional_block(registry, "minecraft:dandelion"),
+            poppy: optional_block(registry, "minecraft:poppy"),
+            pumpkin: optional_block(registry, "minecraft:pumpkin"),
+            sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
+            cactus: optional_block(registry, "minecraft:cactus"),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -384,6 +412,11 @@ fn resolve_block(registry: &BlockRegistry, name: &str) -> BlockStateId {
 fn resolve_block_or(registry: &BlockRegistry, name: &str, fallback: BlockStateId) -> BlockStateId {
     let id = Identifier::parse(name).expect("static identifier");
     registry.block(&id).map(|b| b.default).unwrap_or(fallback)
+}
+
+fn optional_block(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> {
+    let id = Identifier::parse(name).expect("static identifier");
+    registry.block(&id).map(|b| b.default)
 }
 
 #[derive(Clone)]
@@ -691,6 +724,7 @@ impl TerrainGenerator {
             biomes,
             ores,
             structures: StructureRules::none(),
+            decorations: DecorationBlocks::new(registry.as_ref()),
             registry,
         }
     }
@@ -997,6 +1031,186 @@ impl TerrainGenerator {
         }
     }
 
+    fn apply_decorations(&self, chunk: &mut Chunk, column_heights: &[i32; 256]) {
+        let mut touched = [false; 256];
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
+                let idx = lz as usize * 16 + lx as usize;
+                let height = column_heights[idx];
+                if height <= MIN_Y || height + 8 >= MAX_Y {
+                    continue;
+                }
+                let wx = chunk.pos.x * 16 + lx as i32;
+                let wz = chunk.pos.z * 16 + lz as i32;
+                let biome = self.biome_for(wx, wz, height);
+                let surface = chunk.get_block(lx, height, lz).unwrap_or(self.air);
+                let h = feature_hash(self.seed, wx, height, wz, 0xDEC0_0001);
+
+                if (self.biomes.temperate_forest.contains(&biome)
+                    || self.biomes.jungle.contains(&biome))
+                    && h.is_multiple_of(83)
+                    && self.place_tree(chunk, lx, height + 1, lz, &mut touched)
+                {
+                    continue;
+                }
+                if self.biomes.hot_dry.contains(&biome)
+                    && surface == self.sand
+                    && h.is_multiple_of(47)
+                    && self.place_cactus(chunk, lx, height + 1, lz, &mut touched)
+                {
+                    continue;
+                }
+                if (self.biomes.beach.contains(&biome) || self.biomes.river.contains(&biome))
+                    && h.is_multiple_of(29)
+                    && self.place_sugar_cane(chunk, lx, height + 1, lz, &mut touched)
+                {
+                    continue;
+                }
+                if (self.biomes.grassland.contains(&biome)
+                    || self.biomes.temperate_forest.contains(&biome))
+                    && surface == self.grass_block
+                {
+                    let plant = if h.is_multiple_of(97) {
+                        self.decorations.pumpkin
+                    } else if h.is_multiple_of(37) {
+                        self.decorations.dandelion
+                    } else if h.is_multiple_of(41) {
+                        self.decorations.poppy
+                    } else if h.is_multiple_of(11) {
+                        self.decorations.short_grass
+                    } else {
+                        None
+                    };
+                    if let Some(plant) = plant {
+                        self.place_single(chunk, lx, height + 1, lz, plant, &mut touched);
+                    }
+                }
+            }
+        }
+        for lz in 0..16u8 {
+            for lx in 0..16u8 {
+                if touched[lz as usize * 16 + lx as usize] {
+                    self.refresh_structure_column(chunk, lx, lz);
+                }
+            }
+        }
+    }
+
+    fn place_tree(
+        &self,
+        chunk: &mut Chunk,
+        lx: u8,
+        base_y: i32,
+        lz: u8,
+        touched: &mut [bool; 256],
+    ) -> bool {
+        let (Some(log), Some(leaves)) = (self.decorations.oak_log, self.decorations.oak_leaves)
+        else {
+            return false;
+        };
+        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || base_y + 5 >= MAX_Y {
+            return false;
+        }
+        for y in base_y..=(base_y + 5) {
+            if chunk.get_block(lx, y, lz) != Some(self.air) {
+                return false;
+            }
+        }
+        for y in base_y..=(base_y + 3) {
+            self.place_single(chunk, lx, y, lz, log, touched);
+        }
+        for dz in -2i8..=2 {
+            for dx in -2i8..=2 {
+                let distance = dx.unsigned_abs() + dz.unsigned_abs();
+                if distance > 3 {
+                    continue;
+                }
+                let x = lx.wrapping_add_signed(dx);
+                let z = lz.wrapping_add_signed(dz);
+                for y in (base_y + 3)..=(base_y + 5) {
+                    if chunk.get_block(x, y, z) == Some(self.air) {
+                        self.place_single(chunk, x, y, z, leaves, touched);
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn place_cactus(
+        &self,
+        chunk: &mut Chunk,
+        lx: u8,
+        base_y: i32,
+        lz: u8,
+        touched: &mut [bool; 256],
+    ) -> bool {
+        let Some(cactus) = self.decorations.cactus else {
+            return false;
+        };
+        let height =
+            1 + (feature_hash(self.seed, lx as i32, base_y, lz as i32, 0xCA_C7) % 3) as i32;
+        for y in base_y..(base_y + height) {
+            if chunk.get_block(lx, y, lz) != Some(self.air) {
+                return false;
+            }
+        }
+        for y in base_y..(base_y + height) {
+            self.place_single(chunk, lx, y, lz, cactus, touched);
+        }
+        true
+    }
+
+    fn place_sugar_cane(
+        &self,
+        chunk: &mut Chunk,
+        lx: u8,
+        base_y: i32,
+        lz: u8,
+        touched: &mut [bool; 256],
+    ) -> bool {
+        let Some(sugar_cane) = self.decorations.sugar_cane else {
+            return false;
+        };
+        if chunk.get_block(lx, base_y, lz) != Some(self.air)
+            || !self.has_adjacent_water(chunk, lx, base_y - 1, lz)
+        {
+            return false;
+        }
+        self.place_single(chunk, lx, base_y, lz, sugar_cane, touched);
+        if chunk.get_block(lx, base_y + 1, lz) == Some(self.air) {
+            self.place_single(chunk, lx, base_y + 1, lz, sugar_cane, touched);
+        }
+        true
+    }
+
+    fn has_adjacent_water(&self, chunk: &Chunk, lx: u8, y: i32, lz: u8) -> bool {
+        [(1i8, 0i8), (-1, 0), (0, 1), (0, -1)]
+            .into_iter()
+            .any(|(dx, dz)| {
+                let x = lx as i8 + dx;
+                let z = lz as i8 + dz;
+                (0..16).contains(&x)
+                    && (0..16).contains(&z)
+                    && (chunk.get_block(x as u8, y, z as u8) == Some(self.water)
+                        || chunk.get_block(x as u8, y + 1, z as u8) == Some(self.water))
+            })
+    }
+
+    fn place_single(
+        &self,
+        chunk: &mut Chunk,
+        lx: u8,
+        y: i32,
+        lz: u8,
+        state: BlockStateId,
+        touched: &mut [bool; 256],
+    ) {
+        if chunk.set_block(lx, y, lz, state).is_some() {
+            touched[lz as usize * 16 + lx as usize] = true;
+        }
+    }
+
     fn apply_structure_cell(
         &self,
         chunk: &mut Chunk,
@@ -1214,6 +1428,7 @@ impl ChunkGenerator for TerrainGenerator {
             }
         }
         self.assign_biomes(&mut chunk, &column_heights);
+        self.apply_decorations(&mut chunk, &column_heights);
         self.apply_structures(&mut chunk);
         chunk.status = "minecraft:full".into();
         chunk.dirty = true;
@@ -1463,6 +1678,78 @@ mod tests {
                     properties: BTreeMap::new(),
                 }],
             },
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_log").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 26,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 27,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:short_grass").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 28,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:dandelion").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 29,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:poppy").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 30,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:pumpkin").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 31,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:sugar_cane").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 32,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:cactus").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 33,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
         ];
         Arc::new(BlockRegistry::from_report(&report).unwrap())
     }
@@ -1596,6 +1883,55 @@ mod tests {
         assert_eq!(
             chunk.get_block(lx, SEA_LEVEL + 1, lz),
             Some(BlockStateId(0))
+        );
+    }
+
+    #[test]
+    fn surface_decorations_are_visible_and_refresh_heightmaps() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let decorations = [
+            BlockStateId(26),
+            BlockStateId(27),
+            BlockStateId(28),
+            BlockStateId(29),
+            BlockStateId(30),
+            BlockStateId(31),
+            BlockStateId(32),
+            BlockStateId(33),
+        ];
+        let mut saw_decoration = false;
+
+        for cx in -2..=2 {
+            for cz in -2..=2 {
+                let chunk = g.generate(ChunkPos { x: cx, z: cz });
+                let again = g.generate(ChunkPos { x: cx, z: cz });
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let wx = cx * 16 + lx as i32;
+                        let wz = cz * 16 + lz as i32;
+                        let height = g.surface_height(wx, wz);
+                        for y in (height + 1)..=(height + 8).min(MAX_Y - 1) {
+                            assert_eq!(chunk.get_block(lx, y, lz), again.get_block(lx, y, lz));
+                            if chunk
+                                .get_block(lx, y, lz)
+                                .is_some_and(|state| decorations.contains(&state))
+                            {
+                                saw_decoration = true;
+                                assert!(chunk.highest_opaque_y(lx, lz).is_some_and(|top| top >= y));
+                                assert!(
+                                    chunk.heightmaps["WORLD_SURFACE"].get(lx, lz)
+                                        >= (y + 1 - MIN_Y) as u32
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assert!(
+            saw_decoration,
+            "sampled chunks should contain surface decorations"
         );
     }
 
