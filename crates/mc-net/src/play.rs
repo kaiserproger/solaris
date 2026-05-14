@@ -32,7 +32,7 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundPlayerAbilities,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, EntityAnimation,
+    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, Direction, EntityAnimation,
     EntityAnimationAction, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
     ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
     MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove,
@@ -84,6 +84,7 @@ const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
+const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -1276,6 +1277,7 @@ where
             inventory_state_id: 1,
             items: Arc::clone(&config.items),
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
+            pending_break: None,
         });
         play_loop(
             reader,
@@ -1336,6 +1338,16 @@ struct InteractionState {
     /// Registry-derived item→default-block resolver. Built once from
     /// vanilla item/block registries at construction time.
     item_to_block: ItemToBlockTable,
+    pending_break: Option<PendingBreak>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingBreak {
+    position: i64,
+    direction: Direction,
+    started_at: Instant,
+    held_hotbar_slot: u8,
+    held_item_id: Option<u32>,
 }
 
 /// 46-slot player inventory (window 0).
@@ -2429,14 +2441,57 @@ where
     Ok(socket_write_started.elapsed().as_millis() as u64)
 }
 
-/// M5.d: handle a serverbound `PlayerAction`. Acts on
-/// `START_DESTROY_BLOCK` / `STOP_DESTROY_BLOCK` (creative-style
-/// instant break — survival mining timing arrives with a future
-/// inventory milestone) by clearing the target cell, letting adjacent
-/// water refill it immediately when submerged, recomputing light, and emitting
-/// the resulting wire packets back to the client. Every action
-/// regardless of kind gets an ack so the client's prediction
-/// state doesn't hang.
+async fn write_block_ack<W>(
+    writer: &mut W,
+    compression: Compression,
+    sequence: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(writer, &BlockChangedAck { sequence }, compression).await
+}
+
+fn held_item_id(state: &InteractionState) -> Option<u32> {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    (!held.is_empty()).then_some(held.item_id)
+}
+
+fn pending_break_matches(
+    state: &InteractionState,
+    pending: &PendingBreak,
+    action: &ServerboundPlayerAction,
+) -> bool {
+    pending.position == action.position
+        && pending.direction == action.direction
+        && pending.held_hotbar_slot == state.selected_hotbar_slot
+        && pending.held_item_id == held_item_id(state)
+}
+
+fn pending_break_is_complete(pending: &PendingBreak, now: Instant) -> bool {
+    now.duration_since(pending.started_at) >= SURVIVAL_MINING_FALLBACK_TIME
+}
+
+async fn complete_block_break<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    position: i64,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (x, y, z) = unpack_block_pos(position);
+    let air = air_state_id(&state.blocks);
+    let replacement = break_replacement_state(state, x, y, z, air).await;
+
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+    apply_block_edit(state, writer, sequence, x, y, z, replacement).await
+}
+
+/// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
+/// historical instant edit path; survival now requires a server-timed start/stop
+/// pair before the shared mutation back-half can run.
 async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2448,7 +2503,9 @@ where
 {
     let is_destroy = matches!(
         action.action,
-        PlayerActionKind::StartDestroyBlock | PlayerActionKind::StopDestroyBlock
+        PlayerActionKind::StartDestroyBlock
+            | PlayerActionKind::AbortDestroyBlock
+            | PlayerActionKind::StopDestroyBlock
     );
     if !is_destroy {
         // DROP_*, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND, STAB —
@@ -2459,40 +2516,61 @@ where
             sequence = action.sequence,
             "non-destroy player action ignored"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
+        write_block_ack(writer, state.compression, action.sequence).await?;
         return Ok(());
     }
 
-    if game_mode != GameMode::Creative {
-        debug!(
-            mode = ?game_mode,
-            sequence = action.sequence,
-            "instant block break denied outside creative"
-        );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+    match game_mode {
+        GameMode::Creative => {
+            state.pending_break = None;
+            if matches!(action.action, PlayerActionKind::AbortDestroyBlock) {
+                return write_block_ack(writer, state.compression, action.sequence).await;
+            }
+            complete_block_break(state, writer, action.sequence, action.position).await
+        }
+        GameMode::Survival => match action.action {
+            PlayerActionKind::StartDestroyBlock => {
+                state.pending_break = Some(PendingBreak {
+                    position: action.position,
+                    direction: action.direction,
+                    started_at: Instant::now(),
+                    held_hotbar_slot: state.selected_hotbar_slot,
+                    held_item_id: held_item_id(state),
+                });
+                write_block_ack(writer, state.compression, action.sequence).await
+            }
+            PlayerActionKind::AbortDestroyBlock => {
+                state.pending_break = None;
+                write_block_ack(writer, state.compression, action.sequence).await
+            }
+            PlayerActionKind::StopDestroyBlock => {
+                let can_complete = state.pending_break.as_ref().is_some_and(|pending| {
+                    pending_break_matches(state, pending, &action)
+                        && pending_break_is_complete(pending, Instant::now())
+                });
+                state.pending_break = None;
+                if can_complete {
+                    complete_block_break(state, writer, action.sequence, action.position).await
+                } else {
+                    debug!(
+                        sequence = action.sequence,
+                        "survival block break rejected before completion"
+                    );
+                    write_block_ack(writer, state.compression, action.sequence).await
+                }
+            }
+            _ => write_block_ack(writer, state.compression, action.sequence).await,
+        },
+        GameMode::Adventure | GameMode::Spectator => {
+            state.pending_break = None;
+            debug!(
+                mode = ?game_mode,
+                sequence = action.sequence,
+                "block break denied outside survival/creative"
+            );
+            write_block_ack(writer, state.compression, action.sequence).await
+        }
     }
-
-    let (x, y, z) = unpack_block_pos(action.position);
-    let air = air_state_id(&state.blocks);
-    let replacement = break_replacement_state(state, x, y, z, air).await;
-
-    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-    apply_block_edit(state, writer, action.sequence, x, y, z, replacement).await
 }
 
 async fn send_block_deltas<W>(
@@ -3607,6 +3685,7 @@ where
                     let pick = ServerboundSetCarriedItem::decode(&mut body)?;
                     let slot = pick.slot.clamp(0, 8) as u8;
                     if let Some(state) = interaction.as_deref_mut() {
+                        state.pending_break = None;
                         state.selected_hotbar_slot = slot;
                         debug!(slot, "hotbar selection updated");
                     }
@@ -3614,6 +3693,9 @@ where
                     let mut body = frame.body;
                     let command = ServerboundChatCommand::decode(&mut body)?;
                     if let Some(mode) = parse_gamemode_command(&command.command) {
+                        if let Some(state) = interaction.as_deref_mut() {
+                            state.pending_break = None;
+                        }
                         apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
                     } else if let Some(command) = parse_debug_command(&command.command) {
                         apply_debug_command(
@@ -3630,6 +3712,9 @@ where
                 } else if frame.id == ServerboundChangeGameMode::ID {
                     let mut body = frame.body;
                     let command = ServerboundChangeGameMode::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        state.pending_break = None;
+                    }
                     apply_game_mode(writer, compression, &mut game_mode, command.mode, permissions).await?;
                 } else {
                     debug!(
