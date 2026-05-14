@@ -1,7 +1,7 @@
 [server]
 name = "solaris-test"
 motd = "First server powered by Solaris: Innovative Minecraft server engine written in Rust"
-view_distance = 32
+view_distance = 10
 
 [network]
 bind_address = "0.0.0.0"
@@ -25,7 +25,7 @@ chunk_generate_rate = 32
 chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 64
 chunk_io_threads_percent = 25
-chunk_worker_threads_percent = 90
+chunk_worker_threads_percent = 25
 entity_worker_threads_percent = 25
 chunk_result_queue_size = 64
 region_cache_size = 4

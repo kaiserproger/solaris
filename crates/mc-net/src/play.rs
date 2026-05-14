@@ -47,7 +47,7 @@ use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
 };
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
-use mc_world::{Chunk, ChunkPos};
+use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval};
@@ -83,7 +83,7 @@ const DEFAULT_SEA_LEVEL: i32 = 63;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
-const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 3;
+const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -952,6 +952,7 @@ struct ChunkStreamState {
     block_light: Option<Arc<BlockLightTable>>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
@@ -1206,6 +1207,7 @@ where
     let passive_herd_water = mc_data::Identifier::parse("minecraft:water")
         .ok()
         .and_then(|id| config.blocks.block(&id).map(|block| block.default));
+    let passive_herd_passable = Arc::new(passive_entity_passable_blocks(&config.blocks));
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
@@ -1215,6 +1217,7 @@ where
             config.block_light.as_ref().map(Arc::clone),
             passive_herd_surface,
             passive_herd_water,
+            Arc::clone(&passive_herd_passable),
             Arc::clone(&config.biome_spawns),
             Arc::clone(&config.entity_types),
             compression,
@@ -1448,6 +1451,7 @@ fn plan_passive_herd(
     chunk: &Chunk,
     land_surface: Option<mc_world::BlockStateId>,
     water: Option<mc_world::BlockStateId>,
+    passable: &[BlockStateId],
     rules: &mc_data::biomes::BiomeSpawnRules,
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
 ) -> Vec<HerdSpawn> {
@@ -1457,7 +1461,15 @@ fn plan_passive_herd(
     }
     let mut spawns = Vec::new();
     if let Some(surface) = land_surface {
-        plan_group_spawns(chunk, surface, "creature", rules, entity_types, &mut spawns);
+        plan_group_spawns(
+            chunk,
+            surface,
+            passable,
+            "creature",
+            rules,
+            entity_types,
+            &mut spawns,
+        );
     }
     if let Some(water) = water {
         plan_water_group_spawns(
@@ -1483,6 +1495,7 @@ fn plan_passive_herd(
 fn plan_group_spawns(
     chunk: &Chunk,
     surface: mc_world::BlockStateId,
+    passable: &[BlockStateId],
     group: &str,
     rules: &mc_data::biomes::BiomeSpawnRules,
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
@@ -1491,9 +1504,7 @@ fn plan_group_spawns(
     let chunk_pos = (chunk.pos.x, chunk.pos.z);
     let slot_base = out.len() as u8;
     let h = herd_hash(chunk_pos, slot_base, 0x5350_4157_4E00_0000);
-    let lx = 3 + (h as u8 % 10);
-    let lz = 3 + ((h >> 8) as u8 % 10);
-    let Some(y) = herd_surface_y(chunk, lx, lz, surface) else {
+    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surface, passable, h) else {
         return;
     };
     let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
@@ -1621,6 +1632,61 @@ fn herd_surface_y(chunk: &Chunk, lx: u8, lz: u8, surface: mc_world::BlockStateId
         .find(|&y| chunk.get_block(lx, y, lz) == Some(surface))
 }
 
+fn herd_spawn_surface(
+    chunk: &Chunk,
+    surface: BlockStateId,
+    passable: &[BlockStateId],
+    h: u64,
+) -> Option<(u8, i32, u8)> {
+    for attempt in 0..100u64 {
+        let candidate = h.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let lx = 3 + (candidate as u8 % 10);
+        let lz = 3 + ((candidate >> 8) as u8 % 10);
+        let Some(y) = herd_surface_y(chunk, lx, lz, surface) else {
+            continue;
+        };
+        if herd_spawn_clearance(chunk, lx, y + 1, lz, passable) {
+            return Some((lx, y, lz));
+        }
+    }
+    None
+}
+
+fn herd_spawn_clearance(
+    chunk: &Chunk,
+    lx: u8,
+    spawn_y: i32,
+    lz: u8,
+    passable: &[BlockStateId],
+) -> bool {
+    (spawn_y..=spawn_y + 1).all(|y| {
+        chunk
+            .get_block(lx, y, lz)
+            .is_some_and(|state| passable.contains(&state))
+    })
+}
+
+pub(crate) fn passive_entity_passable_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {
+    const PASSABLE_BLOCKS: &[&str] = &[
+        "minecraft:air",
+        "minecraft:short_grass",
+        "minecraft:tall_grass",
+        "minecraft:fern",
+        "minecraft:large_fern",
+        "minecraft:dandelion",
+        "minecraft:poppy",
+        "minecraft:sugar_cane",
+    ];
+
+    PASSABLE_BLOCKS
+        .iter()
+        .filter_map(|name| {
+            blocks.block(&mc_data::Identifier::parse(*name).expect("static identifier"))
+        })
+        .flat_map(|block| block.states.iter().copied())
+        .collect()
+}
+
 fn desired_chunk_set(center_cx: i32, center_cz: i32, view_distance: i32) -> HashSet<(i32, i32)> {
     spiral_chunks(center_cx, center_cz, view_distance).collect()
 }
@@ -1633,6 +1699,7 @@ impl ChunkStreamState {
         block_light: Option<Arc<BlockLightTable>>,
         passive_herd_surface: Option<mc_world::BlockStateId>,
         passive_herd_water: Option<mc_world::BlockStateId>,
+        passive_herd_passable: Arc<Vec<BlockStateId>>,
         passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
         entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
         compression: Compression,
@@ -1651,6 +1718,7 @@ impl ChunkStreamState {
             block_light,
             passive_herd_surface,
             passive_herd_water,
+            passive_herd_passable,
             passive_spawn_rules,
             entity_types,
             compression,
@@ -1852,6 +1920,7 @@ impl ChunkStreamState {
             let block_light = self.block_light.as_ref().map(Arc::clone);
             let passive_herd_surface = self.passive_herd_surface;
             let passive_herd_water = self.passive_herd_water;
+            let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
             let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
             let entity_types = Arc::clone(&self.entity_types);
             let io_permits = Arc::clone(&self.io_permits);
@@ -1866,6 +1935,7 @@ impl ChunkStreamState {
                     block_light,
                     passive_herd_surface,
                     passive_herd_water,
+                    passive_herd_passable,
                     passive_spawn_rules,
                     entity_types,
                     compression,
@@ -2079,6 +2149,7 @@ async fn prepare_chunk_request(
     block_light: Option<Arc<BlockLightTable>>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
@@ -2136,6 +2207,7 @@ async fn prepare_chunk_request(
                     Some(table),
                     passive_herd_surface,
                     passive_herd_water,
+                    passive_herd_passable.as_ref(),
                     passive_spawn_rules.as_ref(),
                     entity_types.as_ref(),
                     Some(workspace),
@@ -2151,6 +2223,7 @@ async fn prepare_chunk_request(
                 None,
                 passive_herd_surface,
                 passive_herd_water,
+                passive_herd_passable.as_ref(),
                 passive_spawn_rules.as_ref(),
                 entity_types.as_ref(),
                 None,
@@ -2242,6 +2315,7 @@ fn build_chunk_packet(
     block_light: Option<&BlockLightTable>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: Option<mc_world::BlockStateId>,
+    passive_herd_passable: &[BlockStateId],
     passive_spawn_rules: &mc_data::biomes::BiomeSpawnRules,
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
     workspace: Option<&mut LightWorkspace>,
@@ -2300,6 +2374,7 @@ fn build_chunk_packet(
         centre,
         passive_herd_surface,
         passive_herd_water,
+        passive_herd_passable,
         passive_spawn_rules,
         entity_types,
     );
@@ -2395,11 +2470,11 @@ where
         return Ok(());
     }
 
-    if matches!(game_mode, GameMode::Adventure | GameMode::Spectator) {
+    if game_mode != GameMode::Creative {
         debug!(
             mode = ?game_mode,
             sequence = action.sequence,
-            "instant block break denied in non-building game mode"
+            "instant block break denied outside creative"
         );
         write_packet(
             writer,
@@ -3813,7 +3888,7 @@ mod tests {
     fn entity_tick_cadence_matches_vanilla_cow_tracking() {
         assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
         assert_eq!(mc_physics::TICK_SECONDS, 0.05);
-        assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 3);
+        assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 1);
     }
 
     #[test]
@@ -3979,6 +4054,7 @@ mod tests {
             },
         ]);
         let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
+        let passable = vec![mc_world::BlockStateId(0)];
         let grass = mc_world::BlockStateId(1);
         let water = mc_world::BlockStateId(2);
         for lx in 3..=12 {
@@ -3987,7 +4063,14 @@ mod tests {
             }
         }
 
-        let spawns = plan_passive_herd(&chunk, Some(grass), Some(water), &rules, &entity_types);
+        let spawns = plan_passive_herd(
+            &chunk,
+            Some(grass),
+            Some(water),
+            &passable,
+            &rules,
+            &entity_types,
+        );
 
         assert!(!spawns.is_empty());
         assert!(
@@ -4022,6 +4105,7 @@ mod tests {
             &ocean_chunk,
             Some(grass),
             Some(water),
+            &passable,
             &ocean_rules,
             &entity_types,
         );

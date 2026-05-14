@@ -53,7 +53,7 @@ const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
 const CAVE_MIN_Y: i32 = MIN_Y + 8;
-const CAVE_SURFACE_CLEARANCE: i32 = 8;
+const CAVE_SURFACE_CLEARANCE: i32 = 24;
 const CAVE_FREQUENCY: f64 = 1.0 / 34.0;
 const CAVE_THRESHOLD: f64 = 0.24;
 const DEEPSLATE_TOP_Y: i32 = 0;
@@ -144,7 +144,6 @@ pub struct TerrainGenerator {
     sand: BlockStateId,
     deepslate: BlockStateId,
     water: BlockStateId,
-    lava: BlockStateId,
     biomes: BiomeRules,
     ores: OreRules,
     structures: StructureRules,
@@ -720,7 +719,6 @@ impl TerrainGenerator {
             sand: resolve_block_or(registry.as_ref(), "minecraft:sand", stone),
             deepslate: resolve_block_or(registry.as_ref(), "minecraft:deepslate", stone),
             water: resolve_block_or(registry.as_ref(), "minecraft:water", air),
-            lava: resolve_block_or(registry.as_ref(), "minecraft:lava", air),
             biomes,
             ores,
             structures: StructureRules::none(),
@@ -986,8 +984,7 @@ impl TerrainGenerator {
         let cave_max_y = (height - CAVE_SURFACE_CLEARANCE).max(CAVE_MIN_Y);
         for y in (MIN_Y + 1)..height {
             if y >= CAVE_MIN_Y && y <= cave_max_y && self.is_cave_cell(wx, y, wz) {
-                let fluid = self.cave_fluid(wx, y, wz);
-                let _ = chunk.set_block(lx, y, lz, fluid.unwrap_or(self.air));
+                let _ = chunk.set_block(lx, y, lz, self.air);
                 continue;
             }
 
@@ -1299,17 +1296,6 @@ impl TerrainGenerator {
             0.55,
         );
         n > CAVE_THRESHOLD
-    }
-
-    fn cave_fluid(&self, x: i32, y: i32, z: i32) -> Option<BlockStateId> {
-        let h = feature_hash(self.seed, x, y, z, 0xF17D);
-        if y < MIN_Y + 16 && h.is_multiple_of(31) {
-            Some(self.lava)
-        } else if y < 48 && h.is_multiple_of(53) {
-            Some(self.water)
-        } else {
-            None
-        }
     }
 
     fn ore_for(
@@ -2394,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn feature_layer_adds_caves_ores_and_fluids() {
+    fn feature_layer_adds_caves_and_ores_without_cave_fluids() {
         let g = TerrainGenerator::new(42, tiny_registry());
         let chunks = [
             g.generate(ChunkPos { x: 0, z: 0 }),
@@ -2405,7 +2391,6 @@ mod tests {
         let mut saw_cave_air = false;
         let mut saw_ore = false;
         let mut saw_deepslate = false;
-        let mut saw_fluid = false;
         for chunk in chunks {
             for lx in 0..16u8 {
                 for lz in 0..16u8 {
@@ -2415,7 +2400,6 @@ mod tests {
                     for y in (MIN_Y + 1)..top - CAVE_SURFACE_CLEARANCE {
                         match chunk.get_block(lx, y, lz) {
                             Some(BlockStateId(0)) => saw_cave_air = true,
-                            Some(BlockStateId(5)) | Some(BlockStateId(6)) => saw_fluid = true,
                             Some(BlockStateId(7)) => saw_deepslate = true,
                             Some(BlockStateId(8..=13 | 15..=24)) => saw_ore = true,
                             _ => {}
@@ -2431,6 +2415,5 @@ mod tests {
             saw_deepslate,
             "expected deepslate below the transition band"
         );
-        assert!(saw_fluid, "expected at least one water/lava cave pocket");
     }
 }

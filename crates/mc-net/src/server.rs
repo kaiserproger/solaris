@@ -171,7 +171,7 @@ async fn entity_physics_steps(
         let mut storage = world.lock().await;
         queries
             .iter()
-            .map(|query| sample_entity_physics_input(*query, &mut storage, materials))
+            .map(|query| sample_entity_physics_input(*query, &mut storage, &materials))
             .collect::<Vec<_>>()
     };
 
@@ -201,6 +201,7 @@ async fn entity_physics_steps(
     for handle in handles {
         match handle.await {
             Ok(mut batch) => steps.append(&mut batch),
+            Err(err) if err.is_cancelled() => debug!("entity physics worker cancelled"),
             Err(err) => warn!(error = %err, "entity physics worker failed"),
         }
     }
@@ -229,7 +230,7 @@ impl BlockSampler for SampledPhysicsWorld {
 fn sample_entity_physics_input(
     query: play::EntityPhysicsQuery,
     storage: &mut WorldStorage,
-    materials: BlockMaterialIds,
+    materials: &BlockMaterialIds,
 ) -> EntityPhysicsInput {
     let mut samples = HashMap::new();
     for pos in entity_physics_sample_positions(query) {
@@ -308,11 +309,17 @@ fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
             .block(&Identifier::parse(name).expect("static identifier"))
             .map(|block| block.default.0)
     };
+    let passable = crate::play::passive_entity_passable_blocks(blocks)
+        .into_iter()
+        .map(|state| state.0)
+        .collect();
+
     BlockMaterialIds::new(
         state("minecraft:air").unwrap_or(0),
         state("minecraft:water"),
         state("minecraft:lava"),
     )
+    .with_passable(passable)
 }
 
 fn is_client_disconnect(err: &ConnectionError) -> bool {
@@ -411,6 +418,36 @@ async fn handle_connection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mc_data::blocks::{BlockReport, BlockStateReport};
+    use std::collections::BTreeMap;
+
+    type StateSpec<'a> = (u32, bool, &'a [(&'a str, &'a str)]);
+
+    fn report(id: &str, props: &[(&str, &[&str])], states: &[StateSpec<'_>]) -> BlockReport {
+        BlockReport {
+            id: Identifier::parse(id).unwrap(),
+            properties: props
+                .iter()
+                .map(|(name, values)| {
+                    (
+                        (*name).to_string(),
+                        values.iter().map(|value| (*value).to_string()).collect(),
+                    )
+                })
+                .collect(),
+            states: states
+                .iter()
+                .map(|(id, default, props)| BlockStateReport {
+                    id: *id,
+                    default: *default,
+                    properties: props
+                        .iter()
+                        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                        .collect::<BTreeMap<_, _>>(),
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn broken_pipe_is_graceful_disconnect() {
@@ -426,5 +463,32 @@ mod tests {
             got: 2,
         };
         assert!(!is_client_disconnect(&err));
+    }
+
+    #[test]
+    fn material_ids_treat_generated_vegetation_as_passable() {
+        let reports = vec![
+            report("minecraft:air", &[], &[(0, true, &[])]),
+            report("minecraft:stone", &[], &[(1, true, &[])]),
+            report("minecraft:water", &[], &[(2, true, &[])]),
+            report("minecraft:lava", &[], &[(3, true, &[])]),
+            report("minecraft:short_grass", &[], &[(4, true, &[])]),
+            report("minecraft:poppy", &[], &[(5, true, &[])]),
+            report(
+                "minecraft:sugar_cane",
+                &[("age", &["0", "1"])],
+                &[(6, true, &[("age", "0")]), (7, false, &[("age", "1")])],
+            ),
+        ];
+        let registry = BlockRegistry::from_report(&reports).unwrap();
+        let ids = material_ids(&registry);
+
+        assert_eq!(ids.classify(1), BlockMaterial::Solid);
+        assert_eq!(ids.classify(2), BlockMaterial::Water);
+        assert_eq!(ids.classify(3), BlockMaterial::Lava);
+        assert_eq!(ids.classify(4), BlockMaterial::Air);
+        assert_eq!(ids.classify(5), BlockMaterial::Air);
+        assert_eq!(ids.classify(6), BlockMaterial::Air);
+        assert_eq!(ids.classify(7), BlockMaterial::Air);
     }
 }

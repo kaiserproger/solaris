@@ -64,27 +64,41 @@ impl BlockMaterial {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockMaterialIds {
     pub air: u32,
     pub water: Option<u32>,
     pub lava: Option<u32>,
+    pub passable: Vec<u32>,
 }
 
 impl BlockMaterialIds {
     #[must_use]
     pub const fn new(air: u32, water: Option<u32>, lava: Option<u32>) -> Self {
-        Self { air, water, lava }
+        Self {
+            air,
+            water,
+            lava,
+            passable: Vec::new(),
+        }
     }
 
     #[must_use]
-    pub fn classify(self, state_id: u32) -> BlockMaterial {
+    pub fn with_passable(mut self, passable: Vec<u32>) -> Self {
+        self.passable = passable;
+        self
+    }
+
+    #[must_use]
+    pub fn classify(&self, state_id: u32) -> BlockMaterial {
         if state_id == self.air {
             BlockMaterial::Air
         } else if self.water == Some(state_id) {
             BlockMaterial::Water
         } else if self.lava == Some(state_id) {
             BlockMaterial::Lava
+        } else if self.passable.contains(&state_id) {
+            BlockMaterial::Air
         } else {
             BlockMaterial::Solid
         }
@@ -233,9 +247,21 @@ pub fn step_entity<S: BlockSampler>(
     }
     body.velocity.y = body.velocity.y.max(config.terminal_velocity);
 
-    body.position.x += body.velocity.x * config.tick_seconds;
+    let dx = body.velocity.x * config.tick_seconds;
+    body.position.x += dx;
+    if dx != 0.0 && body_collides_with_solid(body, sampler) {
+        body.position.x -= dx;
+        body.velocity.x = 0.0;
+    }
+
+    let dz = body.velocity.z * config.tick_seconds;
+    body.position.z += dz;
+    if dz != 0.0 && body_collides_with_solid(body, sampler) {
+        body.position.z -= dz;
+        body.velocity.z = 0.0;
+    }
+
     body.position.y += body.velocity.y * config.tick_seconds;
-    body.position.z += body.velocity.z * config.tick_seconds;
 
     let ground_y = ground_y_for_body(body, sampler);
     let min_y = body.position.y;
@@ -270,6 +296,29 @@ fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bo
     bbox_columns(body)
         .into_iter()
         .any(|(x, z)| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
+}
+
+fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bool {
+    let x = body.position.x;
+    let z = body.position.z;
+    let half = body.aabb.half_width;
+    let min_x = (x - half).floor() as i32;
+    let max_x = (x + half).floor() as i32;
+    let min_y = body.position.y.floor() as i32;
+    let max_y = (body.position.y + body.aabb.height - 1.0e-6).floor() as i32;
+    let min_z = (z - half).floor() as i32;
+    let max_z = (z + half).floor() as i32;
+
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                if sampler.material_at(x, y, z).is_solid() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn bbox_columns(body: EntityBody) -> [(i32, i32); 4] {
@@ -347,6 +396,25 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_collision_stops_body_at_wall() {
+        let mut world = LocalBlocks {
+            solids: vec![GridPos::new(1, 64, 0), GridPos::new(1, 65, 0)],
+            fluids: Vec::new(),
+        };
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::new(20.0, 0.0, 0.0),
+            aabb: Aabb::COW,
+            on_ground: true,
+        };
+
+        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
+
+        assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
+        assert_eq!(stepped.velocity.x, 0.0);
+    }
+
+    #[test]
     fn water_applies_buoyancy_and_stronger_drag() {
         let mut world = FlatWorld {
             ground_y: 60,
@@ -374,6 +442,15 @@ mod tests {
         assert_eq!(ids.classify(5), BlockMaterial::Water);
         assert_eq!(ids.classify(6), BlockMaterial::Lava);
         assert_eq!(ids.classify(7), BlockMaterial::Solid);
+    }
+
+    #[test]
+    fn material_ids_classify_passable_apart_from_fluids() {
+        let ids = BlockMaterialIds::new(0, Some(5), Some(6)).with_passable(vec![6, 7]);
+
+        assert_eq!(ids.classify(5), BlockMaterial::Water);
+        assert_eq!(ids.classify(6), BlockMaterial::Lava);
+        assert_eq!(ids.classify(7), BlockMaterial::Air);
     }
 
     #[derive(Debug)]
