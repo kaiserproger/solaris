@@ -1932,6 +1932,212 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
 }
 
 #[tokio::test]
+async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let chest_id = mc_data::Identifier::parse("minecraft:chest").unwrap();
+    let chest_state_id = i32::try_from(blocks.block(&chest_id).expect("chest block").default.0)
+        .expect("chest state id fits i32");
+
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let dirt_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+    let chest_item_id = items.id_of(&chest_id).expect("chest item");
+
+    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
+    let world = Some(Arc::clone(&world_handle));
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M28 double chest".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M28DoubleChest").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:chest 2 0".into(),
+        })
+        .await
+        .expect("give chests");
+    wait_for_slot_stack(&mut client, chest_item_id, 2).await;
+
+    let support_y = sync.y.floor() as i32 - 2;
+    let chest_y = support_y + 1;
+    let left_pos = mc_world::BlockPos {
+        x: 0,
+        y: chest_y,
+        z: 1,
+    };
+    let right_pos = mc_world::BlockPos {
+        x: 1,
+        y: chest_y,
+        z: 1,
+    };
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(left_pos.x, support_y, left_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 89,
+        })
+        .await
+        .expect("place left chest");
+    wait_for_block_update(
+        &mut client,
+        (left_pos.x, left_pos.y, left_pos.z),
+        chest_state_id,
+    )
+    .await;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(right_pos.x, support_y, right_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 90,
+        })
+        .await
+        .expect("place right chest");
+    wait_for_block_update(
+        &mut client,
+        (right_pos.x, right_pos.y, right_pos.z),
+        chest_state_id,
+    )
+    .await;
+
+    {
+        let mut world = world_handle.lock().await;
+        let mut left_chest = mc_world::ChestBlockEntity::default();
+        left_chest.slots[0] = mc_world::FurnaceSlot {
+            item_id: dirt_id,
+            count: 5,
+            damage: None,
+        };
+        let mut right_chest = mc_world::ChestBlockEntity::default();
+        right_chest.slots[0] = mc_world::FurnaceSlot {
+            item_id: dirt_id,
+            count: 7,
+            damage: None,
+        };
+        world
+            .set_chest_block_entity(left_pos, left_chest)
+            .expect("seed left chest entity");
+        world
+            .set_chest_block_entity(right_pos, right_chest)
+            .expect("seed right chest entity");
+    }
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(left_pos.x, left_pos.y, left_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 91,
+        })
+        .await
+        .expect("open double chest");
+
+    let opened = wait_for_open_screen(&mut client, 5).await;
+    let content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.items.len() == 90
+            && pkt.items[0].item_id == dirt_id
+            && pkt.items[0].count == 5
+            && pkt.items[27].item_id == dirt_id
+            && pkt.items[27].count == 7
+    })
+    .await;
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: content.state_id,
+            slot_num: 27,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("take from second chest half");
+    wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.items[27].is_empty()
+            && pkt.carried_item.item_id == dirt_id
+            && pkt.carried_item.count == 7
+    })
+    .await;
+
+    let mut world = world_handle.lock().await;
+    let left = world
+        .chest_block_entity(left_pos)
+        .expect("left chest read")
+        .expect("left chest present");
+    let right = world
+        .chest_block_entity(right_pos)
+        .expect("right chest read")
+        .expect("right chest present");
+    assert_eq!(left.slots[0].count, 5);
+    assert!(right.slots[0].is_empty());
+}
+
+#[tokio::test]
 async fn survival_armor_slot_reduces_debug_damage() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
@@ -2314,6 +2520,15 @@ async fn dead_survival_player_cannot_mine_or_eat() {
     let apple_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
         .expect("apple item");
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+    let item_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("item entity type");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -2330,7 +2545,7 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -2364,6 +2579,7 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         .await
         .expect("kill player");
     wait_for_health_level(&mut client, 0.0).await;
+    wait_for_death_inventory_drop(&mut client, item_entity_type, apple_id, 2).await;
 
     let target_y = sync.y.floor() as i32 - 2;
     let target_pos = pack_block_pos(0, target_y, 0);
@@ -2509,6 +2725,14 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             }
         }
     }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:apple 1 0".into(),
+        })
+        .await
+        .expect("give post-respawn apple");
+    wait_for_slot_stack(&mut client, apple_id, 1).await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -2692,6 +2916,57 @@ async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) 
             if (pkt.health - health).abs() <= tolerance {
                 return;
             }
+        }
+    }
+}
+
+async fn wait_for_death_inventory_drop(
+    client: &mut Client,
+    item_entity_type: i32,
+    item_id: u32,
+    count: i32,
+) {
+    let mut item_entities = HashSet::new();
+    let mut saw_drop_stack = false;
+    let mut saw_inventory_clear = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_drop_stack && saw_inventory_clear) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("death inventory drop");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode death drop AddEntity");
+            if pkt.entity_type_id == item_entity_type {
+                item_entities.insert(pkt.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetEntityData::decode(&mut body).expect("decode death drop data");
+            if item_entities.contains(&pkt.entity_id) {
+                saw_drop_stack |= pkt.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == count
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetContent::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetContent::decode(&mut body)
+                .expect("decode death inventory clear");
+            saw_inventory_clear |= pkt.container_id == 0
+                && pkt.items.get(36).is_some_and(|stack| stack.is_empty())
+                && pkt.carried_item.is_empty();
         }
     }
 }
