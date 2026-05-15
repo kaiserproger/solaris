@@ -270,6 +270,26 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let loot_path = cfg.data.vanilla_dir.join("data/minecraft/loot_table");
+    let loot = match mc_data::loot::load_vanilla_subset(&loot_path) {
+        Ok(loot) => {
+            tracing::info!(
+                drops = loot.total_drops(),
+                path = %loot_path.display(),
+                "loot table subset loaded",
+            );
+            Arc::new(loot)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %loot_path.display(),
+                error = %err,
+                "loot table subset load failed; drops will use explicit fallbacks",
+            );
+            Arc::new(mc_data::loot::LootTables::default())
+        }
+    };
+
     let block_light = Arc::new(
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&blocks_report),
     );
@@ -327,6 +347,7 @@ async fn serve(path: &Path) -> Result<()> {
             world,
             tags,
             recipes,
+            loot,
             Some(block_light),
             items,
             item_facts,

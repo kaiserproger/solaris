@@ -1654,6 +1654,7 @@ where
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
             tags: Arc::clone(&config.tags),
             recipes,
+            loot: Arc::clone(&config.loot),
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
             pending_break: None,
@@ -1727,6 +1728,7 @@ struct InteractionState {
     item_to_block: ItemToBlockTable,
     tags: Arc<TagsData>,
     recipes: Vec<mc_data::recipes::Recipe>,
+    loot: Arc<mc_data::loot::LootTables>,
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
@@ -3575,15 +3577,20 @@ fn is_hostile_entity(entity_type: &str) -> bool {
 
 fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
     let entity = Identifier::parse(entity_type.to_string()).ok()?;
-    let item = mc_data::loot::builtin().entity_drop(&entity)?;
+    let item = state
+        .loot
+        .entity_drop(&entity)
+        .or_else(|| mc_data::loot::builtin().entity_drop(&entity))?;
     let item_id = state.items.id_of(item)?;
     Some(ItemStack::new(item_id, 1))
 }
 
 fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Option<ItemStack> {
     let block = state.blocks.by_id(block_state)?;
-    let item = mc_data::loot::builtin()
+    let item = state
+        .loot
         .block_drop(&block.block.id)
+        .or_else(|| mc_data::loot::builtin().block_drop(&block.block.id))
         .unwrap_or(&block.block.id);
     let item_id = state.items.id_of(item)?;
     Some(ItemStack::new(item_id, 1))

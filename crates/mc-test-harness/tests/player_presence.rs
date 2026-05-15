@@ -53,6 +53,7 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light,
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),

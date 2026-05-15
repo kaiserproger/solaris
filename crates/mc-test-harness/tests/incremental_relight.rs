@@ -77,6 +77,7 @@ async fn incremental_relight_wire_matches_full_recompute() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light: Some(Arc::clone(&block_light)),
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),

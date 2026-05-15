@@ -14,6 +14,7 @@ use mc_data::biomes::BiomeSpawnRules;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
+use mc_data::loot::LootTables;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
 use mc_net::WorldHandle;
@@ -227,6 +228,7 @@ impl ServerConfig {
         world: Option<WorldHandle>,
         tags: Arc<TagsData>,
         recipes: Arc<Vec<Recipe>>,
+        loot: Arc<LootTables>,
         block_light: Option<Arc<mc_data::block_light::BlockLightTable>>,
         items: Arc<ItemRegistry>,
         item_facts: Arc<ItemFactsTable>,
@@ -244,6 +246,7 @@ impl ServerConfig {
             world,
             tags,
             recipes,
+            loot,
             block_light,
             items,
             item_facts,
@@ -389,6 +392,7 @@ mod tests {
                 None,
                 stub_tags(),
                 Arc::new(Vec::new()),
+                Arc::new(LootTables::default()),
                 None,
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
@@ -425,6 +429,7 @@ mod tests {
                 None,
                 stub_tags(),
                 Arc::new(Vec::new()),
+                Arc::new(LootTables::default()),
                 None,
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),

@@ -36,6 +36,7 @@ async fn start_server(motd: &str) -> SocketAddr {
         world: None,
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         recipes: std::sync::Arc::new(Vec::new()),
+        loot: std::sync::Arc::new(mc_data::loot::LootTables::default()),
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),

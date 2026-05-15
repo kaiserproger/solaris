@@ -63,6 +63,7 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light,
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -134,6 +135,7 @@ async fn survival_attack_passive_mob_drops_food() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -243,6 +245,16 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
     let rotten_flesh_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:rotten_flesh").unwrap())
         .expect("rotten_flesh item");
+    let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
+    let loot = Arc::new(
+        mc_data::loot::load_vanilla_subset(vanilla_dir.join("data/minecraft/loot_table"))
+            .expect("loot tables load"),
+    );
+    assert_eq!(
+        loot.entity_drop(&zombie),
+        Some(&mc_data::Identifier::parse("minecraft:rotten_flesh").unwrap()),
+        "zombie drop must come from sidecar loot tables"
+    );
     let biome_spawns =
         mc_data::biomes::load_biome_spawn_rules(vanilla_dir.join("data/minecraft/worldgen/biome"))
             .map(Arc::new)
@@ -258,6 +270,7 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
+        loot,
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
