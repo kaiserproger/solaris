@@ -127,6 +127,14 @@ enum OutboundCommand {
     AnimatePlayer {
         entity_id: i32,
     },
+    FurnaceSlots {
+        position: mc_world::BlockPos,
+        slots: [ItemStack; 3],
+    },
+    FurnaceData {
+        position: mc_world::BlockPos,
+        changed: Vec<(i16, i16)>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +314,11 @@ struct PlaySession {
     tx: mpsc::Sender<OutboundCommand>,
 }
 
+#[derive(Debug, Clone)]
+struct FurnaceViewer {
+    tx: mpsc::Sender<OutboundCommand>,
+}
+
 #[derive(Debug)]
 struct SessionRegistryInner {
     next_id: SessionId,
@@ -315,6 +328,7 @@ struct SessionRegistryInner {
     entities: EntityStore,
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
+    furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
 }
 
 impl Default for SessionRegistryInner {
@@ -327,6 +341,7 @@ impl Default for SessionRegistryInner {
             entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
             last_sent_entity_positions: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
+            furnace_viewers: HashMap::new(),
         }
     }
 }
@@ -394,6 +409,12 @@ impl SessionRegistry {
         let Some(session) = inner.sessions.remove(&id) else {
             return Vec::new();
         };
+        for viewers in inner.furnace_viewers.values_mut() {
+            viewers.remove(&id);
+        }
+        inner
+            .furnace_viewers
+            .retain(|_, viewers| !viewers.is_empty());
         let snapshot = session_snapshot(id, &session);
         let mut dispatches = Vec::new();
         for (&observer_id, observer) in &mut inner.sessions {
@@ -424,6 +445,86 @@ impl SessionRegistry {
             "play session unregistered"
         );
         dispatches
+    }
+
+    fn register_furnace_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
+            return;
+        };
+        inner
+            .furnace_viewers
+            .entry(position)
+            .or_default()
+            .insert(id, FurnaceViewer { tx });
+    }
+
+    fn unregister_furnace_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if let Some(viewers) = inner.furnace_viewers.get_mut(&position) {
+            viewers.remove(&id);
+            if viewers.is_empty() {
+                inner.furnace_viewers.remove(&position);
+            }
+        }
+    }
+
+    fn furnace_slot_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        except: SessionId,
+        slots: [ItemStack; 3],
+    ) -> Vec<VisibilityDispatch> {
+        self.furnace_dispatches(
+            position,
+            except,
+            OutboundCommand::FurnaceSlots { position, slots },
+        )
+    }
+
+    fn furnace_data_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        except: SessionId,
+        changed: Vec<(i16, i16)>,
+    ) -> Vec<VisibilityDispatch> {
+        self.furnace_dispatches(
+            position,
+            except,
+            OutboundCommand::FurnaceData { position, changed },
+        )
+    }
+
+    fn furnace_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        except: SessionId,
+        command: OutboundCommand,
+    ) -> Vec<VisibilityDispatch> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .furnace_viewers
+            .get(&position)
+            .into_iter()
+            .flat_map(|viewers| viewers.iter())
+            .filter(|&(&id, _)| id != except)
+            .map(|(&id, viewer)| VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id,
+                    tx: viewer.tx.clone(),
+                },
+                command: command.clone(),
+            })
+            .collect()
+    }
+
+    fn is_furnace_tick_owner(&self, position: mc_world::BlockPos, id: SessionId) -> bool {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .furnace_viewers
+            .get(&position)
+            .and_then(|viewers| viewers.keys().min().copied())
+            == Some(id)
     }
 
     fn replace_view(
@@ -3705,7 +3806,11 @@ fn next_container_id(state: &mut InteractionState) -> i32 {
 }
 
 fn store_active_container(state: &mut InteractionState) {
-    state.active_container = None;
+    if let Some(ActiveContainer::Furnace(window)) = state.active_container.take() {
+        state
+            .sessions
+            .unregister_furnace_viewer(state.session_id, window.position);
+    }
 }
 
 fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
@@ -3747,6 +3852,10 @@ fn furnace_wire_items(furnace: &FurnaceBlockEntity, inventory: &PlayerInventory)
     items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
     items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
     items
+}
+
+fn furnace_slot_stacks(furnace: &FurnaceBlockEntity) -> [ItemStack; 3] {
+    std::array::from_fn(|slot| furnace_slot_to_stack(&furnace.slots[slot]))
 }
 
 async fn write_furnace_data<W>(
@@ -3869,6 +3978,9 @@ where
     .await?;
     write_furnace_content(state, writer, &window, &furnace).await?;
     write_furnace_data(writer, state.compression, &window, &furnace).await?;
+    state
+        .sessions
+        .register_furnace_viewer(state.session_id, window.position);
     state.active_container = Some(ActiveContainer::Furnace(window));
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
@@ -4397,6 +4509,11 @@ where
                 warn!(error = %err, ?window.position, "furnace state write failed");
                 err
             })?;
+        dispatch_visibility_commands(state.sessions.furnace_slot_dispatches(
+            window.position,
+            state.session_id,
+            furnace_slot_stacks(&furnace),
+        ));
     }
     write_furnace_content(state, writer, &window, &furnace).await?;
     Ok(window)
@@ -4507,6 +4624,13 @@ where
     };
     match active {
         ActiveContainer::Furnace(mut window) => {
+            if !state
+                .sessions
+                .is_furnace_tick_owner(window.position, state.session_id)
+            {
+                state.active_container = Some(ActiveContainer::Furnace(window));
+                return Ok(());
+            }
             let mut furnace = {
                 let mut storage = state.world.lock().await;
                 storage
@@ -4529,11 +4653,25 @@ where
             if slots_changed || !data_changed.is_empty() {
                 let mut storage = state.world.lock().await;
                 storage
-                    .set_furnace_block_entity(window.position, furnace)
+                    .set_furnace_block_entity(window.position, furnace.clone())
                     .map_err(|err| {
                         warn!(error = %err, ?window.position, "furnace state write failed");
                         err
                     })?;
+            }
+            if slots_changed {
+                dispatch_visibility_commands(state.sessions.furnace_slot_dispatches(
+                    window.position,
+                    state.session_id,
+                    furnace_slot_stacks(&furnace),
+                ));
+            }
+            if !data_changed.is_empty() {
+                dispatch_visibility_commands(state.sessions.furnace_data_dispatches(
+                    window.position,
+                    state.session_id,
+                    data_changed,
+                ));
             }
             state.active_container = Some(ActiveContainer::Furnace(window));
         }
@@ -6088,6 +6226,37 @@ where
                     }
                     Some(OutboundCommand::AnimatePlayer { entity_id }) => {
                         send_player_animation(writer, compression, entity_id).await?;
+                    }
+                    Some(OutboundCommand::FurnaceSlots { position, slots }) => {
+                        if let Some(state) = interaction.as_deref_mut()
+                            && let Some(ActiveContainer::Furnace(mut window)) = state.active_container.take()
+                        {
+                            if window.position == position {
+                                window.state_id = window.state_id.wrapping_add(1);
+                                for (slot, item_stack) in slots.into_iter().enumerate() {
+                                    write_packet(
+                                        writer,
+                                        &ClientboundContainerSetSlot {
+                                            container_id: window.container_id,
+                                            state_id: window.state_id,
+                                            slot: slot as i16,
+                                            item_stack,
+                                        },
+                                        compression,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            state.active_container = Some(ActiveContainer::Furnace(window));
+                        }
+                    }
+                    Some(OutboundCommand::FurnaceData { position, changed }) => {
+                        if let Some(state) = interaction.as_deref_mut()
+                            && let Some(ActiveContainer::Furnace(window)) = state.active_container.as_ref()
+                            && window.position == position
+                        {
+                            write_furnace_data_changes(writer, compression, window, &changed).await?;
+                        }
                     }
                     None => {}
                 }

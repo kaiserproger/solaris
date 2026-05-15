@@ -1315,6 +1315,28 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         .expect("place furnace");
     wait_for_block_update(&mut client, (0, furnace_y, 0), furnace_state_id).await;
 
+    let (mut observer, _) = connect_to_play(addr, "M24FurnaceViewer").await;
+    drain_until_chunk(&mut observer, (0, 0)).await;
+    observer
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, furnace_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 90,
+        })
+        .await
+        .expect("observer opens furnace");
+    let observer_opened = wait_for_open_screen(&mut observer, furnace_menu_id).await;
+    wait_for_furnace_content(&mut observer, observer_opened.container_id, |pkt| {
+        pkt.items[0].is_empty() && pkt.items[1].is_empty() && pkt.items[2].is_empty()
+    })
+    .await;
+
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:raw_iron 1 0".into(),
@@ -1386,6 +1408,10 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
             && pkt.carried_item.is_empty()
     })
     .await;
+    wait_for_container_slot(&mut observer, observer_opened.container_id, 0, |stack| {
+        stack.item_id == raw_iron_id && stack.count == 1
+    })
+    .await;
 
     client
         .write_packet(&ServerboundContainerClose {
@@ -1447,8 +1473,16 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         })
         .await
         .expect("place coal fuel");
+    wait_for_container_slot(&mut observer, observer_opened.container_id, 1, |stack| {
+        stack.item_id == coal_id && stack.count == 1
+    })
+    .await;
 
     wait_for_furnace_data(&mut client, opened.container_id, 2, |value| value > 0).await;
+    wait_for_furnace_data(&mut observer, observer_opened.container_id, 2, |value| {
+        value > 0
+    })
+    .await;
     let content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
         pkt.items[2].item_id == iron_ingot_id && pkt.items[2].count == 1
     })
@@ -2287,6 +2321,33 @@ async fn wait_for_slot_damage(client: &mut Client, slot: i16, item_id: u32, dama
                 && pkt.item_stack.damage == Some(damage)
             {
                 return;
+            }
+        }
+    }
+}
+
+async fn wait_for_container_slot(
+    client: &mut Client,
+    container_id: i32,
+    slot: i16,
+    predicate: impl Fn(&mc_protocol::packets::play::ItemStack) -> bool,
+) -> ClientboundContainerSetSlot {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("container slot update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
+            if pkt.container_id == container_id && pkt.slot == slot && predicate(&pkt.item_stack) {
+                return pkt;
             }
         }
     }
