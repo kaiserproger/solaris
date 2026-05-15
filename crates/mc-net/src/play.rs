@@ -1624,15 +1624,7 @@ where
         )
         .await?;
 
-        let mut recipes = match mc_data::recipes::load_recipes(
-            config.data.root().join("data/minecraft/recipe"),
-        ) {
-            Ok(recipes) => recipes,
-            Err(err) => {
-                warn!(error = %err, "recipe data load failed; crafting disabled");
-                Vec::new()
-            }
-        };
+        let mut recipes = (*config.recipes).clone();
         if recipes.is_empty() {
             recipes = fallback_crafting_recipes();
         }

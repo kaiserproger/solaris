@@ -108,6 +108,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         blocks: Arc::clone(&blocks),
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),

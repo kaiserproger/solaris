@@ -14,6 +14,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
+use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
 use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
 use mc_protocol::State;
@@ -65,6 +66,7 @@ pub struct ServerConfig {
     /// empty default when the sidecar lacks tag JSON; the vanilla
     /// client then complains during registry freeze.
     pub tags: Arc<TagsData>,
+    pub recipes: Arc<Vec<Recipe>>,
     /// Per-block-state light metadata (emission / opacity /
     /// sky-propagation). Built by `mc-server` from the required block
     /// report at startup; the chunk-streaming path uses it to compute

@@ -250,6 +250,26 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let recipes_path = cfg.data.vanilla_dir.join("data/minecraft/recipe");
+    let recipes = match mc_data::recipes::load_recipes(&recipes_path) {
+        Ok(recipes) => {
+            tracing::info!(
+                entries = recipes.len(),
+                path = %recipes_path.display(),
+                "recipe data loaded",
+            );
+            Arc::new(recipes)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %recipes_path.display(),
+                error = %err,
+                "recipe data load failed; crafting will use explicit fallbacks",
+            );
+            Arc::new(Vec::new())
+        }
+    };
+
     let block_light = Arc::new(
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&blocks_report),
     );
@@ -306,6 +326,7 @@ async fn serve(path: &Path) -> Result<()> {
             blocks,
             world,
             tags,
+            recipes,
             Some(block_light),
             items,
             item_facts,

@@ -86,6 +86,7 @@ async fn break_block_round_trips_update_ack_relight() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -290,6 +291,7 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -425,6 +427,7 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -564,6 +567,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -728,6 +732,7 @@ async fn survival_can_place_naturally_picked_up_block() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -863,6 +868,7 @@ async fn survival_break_damages_held_tool() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1003,6 +1009,7 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1165,6 +1172,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1269,6 +1277,22 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     let oak_planks_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:oak_planks").unwrap())
         .expect("oak_planks item");
+    let recipes = Arc::new(
+        mc_data::recipes::load_recipes(vanilla_dir.join("data/minecraft/recipe"))
+            .expect("recipes load"),
+    );
+    assert!(
+        recipes
+            .iter()
+            .any(|recipe| recipe.id.as_str() == "minecraft:oak_planks"),
+        "oak planks recipe must come from sidecar"
+    );
+    assert!(
+        recipes
+            .iter()
+            .any(|recipe| recipe.id.as_str() == "minecraft:crafting_table"),
+        "crafting table recipe must come from sidecar"
+    );
     let crafting_menu_id = 12;
 
     let cfg = mc_net::ServerConfig {
@@ -1280,6 +1304,7 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         blocks,
         world,
         tags,
+        recipes,
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1530,6 +1555,7 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1808,6 +1834,7 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -1913,6 +1940,7 @@ async fn survival_armor_slot_reduces_debug_damage() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -2038,6 +2066,7 @@ async fn survival_use_item_eats_apple_and_updates_food() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts,
@@ -2156,6 +2185,7 @@ async fn survival_use_item_release_cancels_food_use() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts,
@@ -2252,6 +2282,7 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -2367,6 +2398,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         blocks,
         world,
         tags,
+        recipes: Arc::new(Vec::new()),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),

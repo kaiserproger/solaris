@@ -84,6 +84,7 @@ mod tests {
             ),
             world: None,
             tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
+            recipes: std::sync::Arc::new(Vec::new()),
             block_light: None,
             items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
             item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
