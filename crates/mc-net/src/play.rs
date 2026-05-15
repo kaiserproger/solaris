@@ -4355,6 +4355,72 @@ fn set_crafting_menu_stack(
     }
 }
 
+fn can_place_in_crafting_menu_slot(
+    state: &InteractionState,
+    menu_slot: usize,
+    stack: &ItemStack,
+) -> bool {
+    if stack.is_empty() {
+        return true;
+    }
+    match menu_slot {
+        0 => false,
+        1..=9 => true,
+        _ => crafting_player_slot(menu_slot)
+            .is_some_and(|slot| can_place_in_player_slot(state, slot, stack)),
+    }
+}
+
+fn apply_crafting_swap_click(
+    state: &mut InteractionState,
+    window: &mut CraftingTableWindow,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= CRAFTING_MENU_SLOT_COUNT || menu_slot == 0 {
+        return false;
+    }
+    let Some(player_slot) = hotbar_swap_slot(button) else {
+        return false;
+    };
+    if crafting_player_slot(menu_slot) == Some(player_slot) {
+        return false;
+    }
+    let Some(clicked) = crafting_menu_stack(window, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let swap = state.inventory.slots[player_slot].clone();
+    if !can_place_in_crafting_menu_slot(state, menu_slot, &swap)
+        || !can_place_in_player_slot(state, player_slot, &clicked)
+    {
+        return false;
+    }
+    if !set_crafting_menu_stack(window, &mut state.inventory, menu_slot, swap) {
+        return false;
+    }
+    state.inventory.slots[player_slot] = clicked;
+    refresh_crafting_result(state, window);
+    true
+}
+
+fn apply_crafting_throw_click(
+    state: &mut InteractionState,
+    window: &mut CraftingTableWindow,
+    menu_slot: usize,
+    button: i8,
+) -> Option<ItemStack> {
+    if menu_slot >= CRAFTING_MENU_SLOT_COUNT || menu_slot == 0 {
+        return None;
+    }
+    let mut stack = crafting_menu_stack(window, &state.inventory, menu_slot)?;
+    let dropped = take_throw_stack(&mut stack, button)?;
+    if !set_crafting_menu_stack(window, &mut state.inventory, menu_slot, stack) {
+        return None;
+    }
+    refresh_crafting_result(state, window);
+    Some(dropped)
+}
+
 fn crafting_remainder_for_item(state: &InteractionState, item_id: u32) -> Option<ItemStack> {
     let name = state.items.name_of(item_id)?;
     let bucket = Identifier::parse("minecraft:bucket").expect("static identifier");
@@ -4582,6 +4648,7 @@ async fn handle_crafting_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
     mut window: CraftingTableWindow,
+    player_pose: PlayerPose,
     packet: ServerboundContainerClick,
 ) -> Result<CraftingTableWindow, ConnectionError>
 where
@@ -4591,6 +4658,7 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let mut dropped = None;
     let changed = match packet.container_input {
         ContainerInput::Pickup if packet.slot_num >= 0 => apply_crafting_pickup_click(
             state,
@@ -4601,10 +4669,32 @@ where
         ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
             apply_crafting_quick_move_click(state, &mut window, packet.slot_num as usize)
         }
+        ContainerInput::Swap if packet.slot_num >= 0 => apply_crafting_swap_click(
+            state,
+            &mut window,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::Throw if packet.slot_num >= 0 => {
+            if item_entity_type_id(&state.entity_types).is_some() {
+                dropped = apply_crafting_throw_click(
+                    state,
+                    &mut window,
+                    packet.slot_num as usize,
+                    packet.button_num,
+                );
+                dropped.is_some()
+            } else {
+                false
+            }
+        }
         _ => false,
     };
     if changed {
         window.state_id = window.state_id.wrapping_add(1);
+    }
+    if let Some(stack) = dropped {
+        dispatch_inventory_drop(state, player_pose, stack);
     }
     write_crafting_content(state, writer, &window).await?;
     Ok(window)
@@ -4897,6 +4987,39 @@ fn decrement_cursor(cursor: &mut ItemStack) {
     }
 }
 
+fn hotbar_swap_slot(button: i8) -> Option<usize> {
+    (0..=8)
+        .contains(&button)
+        .then_some(PlayerInventory::HOTBAR_BASE + button as usize)
+}
+
+fn player_swap_slot(button: i8) -> Option<usize> {
+    hotbar_swap_slot(button).or_else(|| (button == 40).then_some(45))
+}
+
+fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
+    match button {
+        0 => (!slot.is_empty()).then(|| take_from_slot(slot, 1)),
+        1 => (!slot.is_empty()).then(|| std::mem::take(slot)),
+        _ => None,
+    }
+}
+
+fn dispatch_inventory_drop(state: &InteractionState, player_pose: PlayerPose, stack: ItemStack) {
+    if stack.is_empty() {
+        return;
+    }
+    let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
+        debug!("inventory drop ignored: item entity type unavailable");
+        return;
+    };
+    dispatch_visibility_commands(state.sessions.spawn_item_drop(
+        entity_type_id,
+        Vec3::new(player_pose.x, player_pose.y + 1.0, player_pose.z),
+        entity_item_stack(stack),
+    ));
+}
+
 fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> bool {
     if slot >= state.inventory.slots.len() || !(button == 0 || button == 1) {
         return false;
@@ -4964,6 +5087,35 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
         return false;
     }
     true
+}
+
+fn apply_swap_click(state: &mut InteractionState, slot: usize, button: i8) -> bool {
+    if slot >= state.inventory.slots.len() {
+        return false;
+    }
+    let Some(swap_slot) = player_swap_slot(button) else {
+        return false;
+    };
+    if slot == swap_slot {
+        return false;
+    }
+    let clicked = state.inventory.slots[slot].clone();
+    let swap = state.inventory.slots[swap_slot].clone();
+    if !can_place_in_player_slot(state, slot, &swap)
+        || !can_place_in_player_slot(state, swap_slot, &clicked)
+    {
+        return false;
+    }
+    state.inventory.slots[slot] = swap;
+    state.inventory.slots[swap_slot] = clicked;
+    true
+}
+
+fn apply_throw_click(state: &mut InteractionState, slot: usize, button: i8) -> Option<ItemStack> {
+    if slot >= state.inventory.slots.len() {
+        return None;
+    }
+    take_throw_stack(&mut state.inventory.slots[slot], button)
 }
 
 fn can_place_in_player_slot(state: &InteractionState, slot: usize, stack: &ItemStack) -> bool {
@@ -5070,6 +5222,54 @@ fn can_place_in_furnace_menu_slot(
         3..=38 => true,
         _ => false,
     }
+}
+
+fn apply_furnace_swap_click(
+    state: &mut InteractionState,
+    furnace: &mut FurnaceBlockEntity,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= FURNACE_MENU_SLOT_COUNT || menu_slot == 2 {
+        return false;
+    }
+    let Some(player_slot) = hotbar_swap_slot(button) else {
+        return false;
+    };
+    if furnace_player_slot(menu_slot) == Some(player_slot) {
+        return false;
+    }
+    let Some(clicked) = furnace_menu_stack(furnace, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let swap = state.inventory.slots[player_slot].clone();
+    if !can_place_in_furnace_menu_slot(state, menu_slot, &swap)
+        || !can_place_in_player_slot(state, player_slot, &clicked)
+    {
+        return false;
+    }
+    if !set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, swap) {
+        return false;
+    }
+    state.inventory.slots[player_slot] = clicked;
+    true
+}
+
+fn apply_furnace_throw_click(
+    state: &mut InteractionState,
+    furnace: &mut FurnaceBlockEntity,
+    menu_slot: usize,
+    button: i8,
+) -> Option<ItemStack> {
+    if menu_slot >= FURNACE_MENU_SLOT_COUNT || menu_slot == 2 {
+        return None;
+    }
+    let mut stack = furnace_menu_stack(furnace, &state.inventory, menu_slot)?;
+    let dropped = take_throw_stack(&mut stack, button)?;
+    if !set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, stack) {
+        return None;
+    }
+    Some(dropped)
 }
 
 fn apply_furnace_pickup_click(
@@ -5268,6 +5468,7 @@ async fn handle_furnace_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
     mut window: FurnaceWindow,
+    player_pose: PlayerPose,
     packet: ServerboundContainerClick,
 ) -> Result<FurnaceWindow, ConnectionError>
 where
@@ -5287,6 +5488,7 @@ where
         write_furnace_content(state, writer, &window, &furnace).await?;
         return Ok(window);
     }
+    let mut dropped = None;
     let changed = match packet.container_input {
         ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
             state,
@@ -5296,6 +5498,25 @@ where
         ),
         ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
             apply_furnace_quick_move_click(state, &mut furnace, packet.slot_num as usize)
+        }
+        ContainerInput::Swap if packet.slot_num >= 0 => apply_furnace_swap_click(
+            state,
+            &mut furnace,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::Throw if packet.slot_num >= 0 => {
+            if item_entity_type_id(&state.entity_types).is_some() {
+                dropped = apply_furnace_throw_click(
+                    state,
+                    &mut furnace,
+                    packet.slot_num as usize,
+                    packet.button_num,
+                );
+                dropped.is_some()
+            } else {
+                false
+            }
         }
         _ => false,
     };
@@ -5313,6 +5534,9 @@ where
             state.session_id,
             furnace_slot_stacks(&furnace),
         ));
+    }
+    if let Some(stack) = dropped {
+        dispatch_inventory_drop(state, player_pose, stack);
     }
     write_furnace_content(state, writer, &window, &furnace).await?;
     Ok(window)
@@ -5486,6 +5710,7 @@ async fn handle_container_click<W>(
     writer: &mut W,
     game_mode: GameMode,
     survival_state: SurvivalState,
+    player_pose: PlayerPose,
     packet: ServerboundContainerClick,
 ) -> Result<(), ConnectionError>
 where
@@ -5533,12 +5758,14 @@ where
                 if crafting.container_id == packet.container_id =>
             {
                 let crafting =
-                    handle_crafting_container_click(state, writer, crafting, packet).await?;
+                    handle_crafting_container_click(state, writer, crafting, player_pose, packet)
+                        .await?;
                 state.active_container = Some(ActiveContainer::CraftingTable(crafting));
             }
             ActiveContainer::Furnace(furnace) if furnace.container_id == packet.container_id => {
                 let furnace =
-                    handle_furnace_container_click(state, writer, furnace, packet).await?;
+                    handle_furnace_container_click(state, writer, furnace, player_pose, packet)
+                        .await?;
                 state.active_container = Some(ActiveContainer::Furnace(furnace));
             }
             other => {
@@ -5563,12 +5790,24 @@ where
         return Ok(());
     }
 
+    let mut dropped = None;
     let changed = match packet.container_input {
         ContainerInput::Pickup if packet.slot_num >= 0 => {
             apply_pickup_click(state, packet.slot_num as usize, packet.button_num)
         }
         ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
             apply_quick_move_click(state, packet.slot_num as usize)
+        }
+        ContainerInput::Swap if packet.slot_num >= 0 => {
+            apply_swap_click(state, packet.slot_num as usize, packet.button_num)
+        }
+        ContainerInput::Throw if packet.slot_num >= 0 => {
+            if item_entity_type_id(&state.entity_types).is_some() {
+                dropped = apply_throw_click(state, packet.slot_num as usize, packet.button_num);
+                dropped.is_some()
+            } else {
+                false
+            }
         }
         _ => false,
     };
@@ -5580,6 +5819,9 @@ where
             input = ?packet.container_input,
             "container click unsupported or no-op; resyncing"
         );
+    }
+    if let Some(stack) = dropped {
+        dispatch_inventory_drop(state, player_pose, stack);
     }
     write_inventory_content(state, writer).await
 }
@@ -8718,7 +8960,15 @@ where
                     let mut body = frame.body;
                     let click = ServerboundContainerClick::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_container_click(state, writer, game_mode, survival_state, click).await?;
+                        handle_container_click(
+                            state,
+                            writer,
+                            game_mode,
+                            survival_state,
+                            player_pose,
+                            click,
+                        )
+                        .await?;
                     } else {
                         debug!(
                             container_id = click.container_id,
@@ -9941,6 +10191,24 @@ mod tests {
         assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
         assert_eq!(inventory.slots[36], ItemStack::new(42, 2));
         assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn click_swap_button_maps_hotbar_and_offhand_slots() {
+        assert_eq!(hotbar_swap_slot(0), Some(36));
+        assert_eq!(hotbar_swap_slot(8), Some(44));
+        assert_eq!(hotbar_swap_slot(9), None);
+        assert_eq!(player_swap_slot(40), Some(45));
+    }
+
+    #[test]
+    fn throw_click_takes_one_or_full_stack() {
+        let mut stack = ItemStack::new(42, 3);
+        assert_eq!(take_throw_stack(&mut stack, 0), Some(ItemStack::new(42, 1)));
+        assert_eq!(stack, ItemStack::new(42, 2));
+        assert_eq!(take_throw_stack(&mut stack, 1), Some(ItemStack::new(42, 2)));
+        assert!(stack.is_empty());
+        assert_eq!(take_throw_stack(&mut stack, 0), None);
     }
 
     #[test]
