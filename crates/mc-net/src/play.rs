@@ -28,7 +28,8 @@ use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
-    EntityId, EntityItemStack, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3,
+    AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntityStore, GoalState, SpawnEntity,
+    Vec3,
 };
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
@@ -105,6 +106,8 @@ const FURNACE_MENU_SLOT_COUNT: usize = 39;
 const FURNACE_FUEL_TICKS: i16 = 1600;
 const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
 const DEFAULT_FOOD_USE_DURATION: Duration = Duration::from_millis(1_600);
+const HOSTILE_MELEE_RANGE: f64 = 1.8;
+const HOSTILE_MELEE_COOLDOWN: Duration = Duration::from_secs(1);
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -196,6 +199,7 @@ struct HerdSpawn {
     entity_type_id: i32,
     entity_type_name: String,
     position: Vec3,
+    hostile: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,6 +673,12 @@ impl SessionRegistry {
                 spawn.position,
             );
             entity.uuid = Some(herd_uuid(spawn.chunk, spawn.slot));
+            if spawn.hostile {
+                entity.attributes.set_base(AttributeKind::AttackDamage, 3.0);
+                entity
+                    .attributes
+                    .set_base(AttributeKind::MovementSpeed, 0.23);
+            }
             entity.goal = GoalState::Wander {
                 speed: 0.8,
                 period_ticks: 80,
@@ -711,6 +721,20 @@ impl SessionRegistry {
             .snapshots()
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .filter(|entity| entity.item_stack.is_some())
+            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+            .map(server_entity_snapshot_from)
+            .collect()
+    }
+
+    fn nearby_hostile_entities(&self, position: Vec3, radius: f64) -> Vec<ServerEntitySnapshot> {
+        let radius_sq = radius * radius;
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .entities
+            .snapshots()
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .filter(|entity| entity.item_stack.is_none())
+            .filter(|entity| is_hostile_entity(&entity.type_name))
             .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
             .map(server_entity_snapshot_from)
             .collect()
@@ -1640,6 +1664,7 @@ where
             active_container: None,
             pending_break: None,
             pending_use: None,
+            last_hostile_damage_at: None,
         });
         play_loop(
             reader,
@@ -1711,6 +1736,7 @@ struct InteractionState {
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
     pending_use: Option<PendingUse>,
+    last_hostile_damage_at: Option<Instant>,
 }
 
 #[derive(Debug, Clone)]
@@ -2439,6 +2465,7 @@ fn plan_passive_herd(
             entity_types,
             &mut spawns,
         );
+        plan_hostile_spawns(chunk, surface, passable, rules, entity_types, &mut spawns);
     }
     if let Some(water) = water {
         plan_water_group_spawns(
@@ -2459,6 +2486,54 @@ fn plan_passive_herd(
         );
     }
     spawns
+}
+
+fn plan_hostile_spawns(
+    chunk: &Chunk,
+    surface: mc_world::BlockStateId,
+    passable: &[BlockStateId],
+    rules: &mc_data::biomes::BiomeSpawnRules,
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
+    out: &mut Vec<HerdSpawn>,
+) {
+    let chunk_pos = (chunk.pos.x, chunk.pos.z);
+    if chunk_pos != (0, 0) {
+        return;
+    }
+    let slot_base = out.len() as u8;
+    let h = herd_hash(chunk_pos, slot_base, 0x5A4F_4D42_4945_0000);
+    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surface, passable, h) else {
+        return;
+    };
+    let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
+        return;
+    };
+    let zombie = Identifier::parse("minecraft:zombie").expect("static identifier");
+    if !rules
+        .entries(biome, "monster")
+        .iter()
+        .any(|entry| entry.entity_type == zombie)
+    {
+        return;
+    }
+    let Some(entity_type_id) = entity_types
+        .id_of(&zombie)
+        .and_then(|id| i32::try_from(id).ok())
+    else {
+        return;
+    };
+    out.push(HerdSpawn {
+        chunk: chunk_pos,
+        slot: slot_base,
+        entity_type_id,
+        entity_type_name: zombie.as_str().to_string(),
+        position: Vec3::new(
+            f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
+            f64::from(y + 1),
+            f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
+        ),
+        hostile: true,
+    });
 }
 
 fn plan_group_spawns(
@@ -2504,6 +2579,7 @@ fn plan_group_spawns(
                     + 0.35
                     + ((offset >> 2) & 3) as f64 * 0.1,
             ),
+            hostile: false,
         });
     }
 }
@@ -2549,6 +2625,7 @@ fn plan_water_group_spawns(
                 f64::from(DEFAULT_SEA_LEVEL - 2),
                 f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
             ),
+            hostile: false,
         });
     }
 }
@@ -3517,7 +3594,11 @@ fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
         .and_then(|id| i32::try_from(id).ok())
 }
 
-fn passive_mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
+fn is_hostile_entity(entity_type: &str) -> bool {
+    matches!(entity_type, "minecraft:zombie")
+}
+
+fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
     let entity = Identifier::parse(entity_type.to_string()).ok()?;
     let item = mc_data::loot::builtin().entity_drop(&entity)?;
     let item_id = state.items.id_of(item)?;
@@ -5429,7 +5510,7 @@ where
     dispatch_visibility_commands(despawn);
 
     if let (Some(drop), Some(entity_type_id)) = (
-        passive_mob_drop_stack(state, &entity.type_name),
+        mob_drop_stack(state, &entity.type_name),
         item_entity_type_id(&state.entity_types),
     ) {
         dispatch_visibility_commands(state.sessions.spawn_item_drop(
@@ -6317,6 +6398,45 @@ where
     Ok(())
 }
 
+async fn tick_hostile_pressure<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: &mut SurvivalState,
+    player_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if game_mode != GameMode::Survival || survival_state.is_dead() {
+        return Ok(());
+    }
+    let now = Instant::now();
+    if state
+        .last_hostile_damage_at
+        .is_some_and(|last| now.duration_since(last) < HOSTILE_MELEE_COOLDOWN)
+    {
+        return Ok(());
+    }
+    let player_position = Vec3::new(player_pose.x, player_pose.y, player_pose.z);
+    let Some(_hostile) = state
+        .sessions
+        .nearby_hostile_entities(player_position, HOSTILE_MELEE_RANGE)
+        .into_iter()
+        .next()
+    else {
+        return Ok(());
+    };
+    let damage = survival_damage_after_armor(Some(state), 3.0);
+    survival_state.apply_damage(damage);
+    state.last_hostile_damage_at = Some(now);
+    let armor_changed = damage_equipped_armor(state);
+    if !armor_changed.is_empty() {
+        write_inventory_slot_updates(state, writer, armor_changed).await?;
+    }
+    write_packet(writer, &survival_state.as_packet(), state.compression).await
+}
+
 async fn replan_after_movement<W>(
     writer: &mut W,
     compression: Compression,
@@ -6898,6 +7018,7 @@ where
                 if let Some(state) = interaction.as_deref_mut() {
                     tick_active_container(state, writer).await?;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
+                    tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
                 }
             }
             result = read_frame(reader, buf, compression) => {
@@ -7771,7 +7892,7 @@ mod tests {
     }
 
     #[test]
-    fn passive_mob_drops_come_from_repo_loot_data() {
+    fn mob_drops_come_from_repo_loot_data() {
         let id = |value: &str| mc_data::Identifier::parse(value).unwrap();
         let loot = mc_data::loot::builtin();
 
@@ -7787,7 +7908,10 @@ mod tests {
             loot.entity_drop(&id("minecraft:chicken")),
             Some(&id("minecraft:chicken"))
         );
-        assert_eq!(loot.entity_drop(&id("minecraft:zombie")), None);
+        assert_eq!(
+            loot.entity_drop(&id("minecraft:zombie")),
+            Some(&id("minecraft:rotten_flesh"))
+        );
     }
 
     #[test]
