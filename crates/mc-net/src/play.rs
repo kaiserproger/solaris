@@ -5648,10 +5648,26 @@ where
     let (x, y, z) = unpack_block_pos(position);
     let air = air_state_id(&state.blocks);
     let replacement = break_replacement_state(state, x, y, z, air).await;
+    let pos = mc_world::BlockPos { x, y, z };
+    let (prev, edits) = {
+        let mut storage = state.world.lock().await;
+        let prev = storage.get_block(pos).ok().flatten();
+        let edits = prev
+            .map(|state_id| {
+                plan_break_block_edits(&state.blocks, &mut storage, pos, state_id, replacement, air)
+            })
+            .unwrap_or_else(|| {
+                vec![BlockEdit {
+                    pos,
+                    new_state: replacement,
+                }]
+            });
+        (prev, edits)
+    };
 
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-    let prev = apply_block_edit(state, writer, sequence, x, y, z, replacement).await?;
-    let changed = prev.is_some();
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
+    let changed = !outcome.applied.is_empty();
     if drop_items
         && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
         && let Some(drop) = block_drop_stack(state, prev)
@@ -5664,6 +5680,42 @@ where
         pickup_nearby_items(state, writer, player_pose).await?;
     }
     Ok(changed)
+}
+
+fn plan_break_block_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state_id: mc_world::BlockStateId,
+    replacement: mc_world::BlockStateId,
+    air: mc_world::BlockStateId,
+) -> Vec<BlockEdit> {
+    let mut edits = vec![BlockEdit {
+        pos,
+        new_state: replacement,
+    }];
+    let Some(state) = blocks.by_id(state_id) else {
+        return edits;
+    };
+    if !state.block.id.path().ends_with("_door") {
+        return edits;
+    }
+    let other_y = match block_state_property(state, "half") {
+        Some("lower") => pos.y + 1,
+        Some("upper") => pos.y - 1,
+        _ => return edits,
+    };
+    let other_pos = mc_world::BlockPos { y: other_y, ..pos };
+    if let Ok(Some(other_state_id)) = storage.get_block(other_pos)
+        && let Some(other_state) = blocks.by_id(other_state_id)
+        && other_state.block.id == state.block.id
+    {
+        edits.push(BlockEdit {
+            pos: other_pos,
+            new_state: air,
+        });
+    }
+    edits
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
@@ -5915,6 +5967,14 @@ fn broadcast_light_updates(
     updates: &[OutboundLightUpdate],
     except: Option<SessionId>,
 ) {
+    broadcast_light_updates_to_sessions(&state.sessions, updates, except);
+}
+
+fn broadcast_light_updates_to_sessions(
+    sessions: &SessionRegistry,
+    updates: &[OutboundLightUpdate],
+    except: Option<SessionId>,
+) {
     if updates.is_empty() {
         return;
     }
@@ -5922,7 +5982,7 @@ fn broadcast_light_updates(
         .iter()
         .map(|update| (update.pos.x, update.pos.z))
         .collect();
-    for recipient in state.sessions.loaded_recipients_for_chunks(&chunks, except) {
+    for recipient in sessions.loaded_recipients_for_chunks(&chunks, except) {
         if let Err(err) = recipient
             .tx
             .try_send(OutboundCommand::LightUpdates(updates.to_vec()))
@@ -6022,6 +6082,14 @@ pub(crate) async fn run_random_ticks(
     if !outcome.applied.is_empty() {
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
         broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
+        if let Some(table) = table {
+            let light_updates = {
+                let mut storage = world.lock().await;
+                collect_full_light_updates_for_chunks(&mut storage, table, &outcome.edit_chunks)
+            };
+            sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+            broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+        }
     }
 
     if eligible > 0 {
@@ -6051,11 +6119,72 @@ fn random_tick_edit(
             next_farmland_state(blocks, facts, storage, pos, state)
                 .map(|new_state| BlockEdit { pos, new_state })
         }
-        mc_data::block_facts::RandomTickFamily::Fire
-        | mc_data::block_facts::RandomTickFamily::Grass
-        | mc_data::block_facts::RandomTickFamily::Leaves
-        | mc_data::block_facts::RandomTickFamily::Sapling => None,
+        mc_data::block_facts::RandomTickFamily::Fire => {
+            next_fire_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+        }
+        mc_data::block_facts::RandomTickFamily::Grass => {
+            next_grass_edit(blocks, storage, pos, state)
+        }
+        mc_data::block_facts::RandomTickFamily::Leaves => {
+            next_leaf_decay_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+        }
+        mc_data::block_facts::RandomTickFamily::Sapling => None,
     }
+}
+
+fn collect_full_light_updates_for_chunks(
+    storage: &mut mc_world::WorldStorage,
+    table: &BlockLightTable,
+    chunks: &HashSet<(i32, i32)>,
+) -> Vec<OutboundLightUpdate> {
+    let mut updates = Vec::new();
+    for &(cx, cz) in chunks {
+        let mut neighbourhood: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                let pos = ChunkPos {
+                    x: cx + dx,
+                    z: cz + dz,
+                };
+                match storage.get_chunk(pos) {
+                    Ok(Some(chunk)) => {
+                        neighbourhood.insert((cx + dx, cz + dz), Arc::new(chunk.clone()));
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, cx = pos.x, cz = pos.z, "random-tick relight chunk read failed");
+                    }
+                }
+            }
+        }
+        let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
+        for dz in -1i32..=1 {
+            for dx in -1i32..=1 {
+                refs[(dz + 1) as usize][(dx + 1) as usize] = neighbourhood
+                    .get(&(cx + dx, cz + dz))
+                    .map(|chunk| chunk.as_ref());
+            }
+        }
+        if refs[1][1].is_none() {
+            continue;
+        }
+        let light = CHUNK_LIGHT_WORKSPACE
+            .with(|cell| compute_chunk_light_in(&mut cell.borrow_mut(), refs, table));
+        let wire = encode_chunk_light(&light);
+        updates.push(OutboundLightUpdate {
+            pos: ChunkPos { x: cx, z: cz },
+            light,
+            wire: LightData {
+                sky_y_mask: wire.sky_y_mask,
+                block_y_mask: wire.block_y_mask,
+                empty_sky_y_mask: wire.empty_sky_y_mask,
+                empty_block_y_mask: wire.empty_block_y_mask,
+                sky_updates: wire.sky_updates,
+                block_updates: wire.block_updates,
+            },
+        });
+    }
+    updates
 }
 
 fn next_crop_growth_state(
@@ -6071,6 +6200,125 @@ fn next_crop_growth_state(
         return None;
     }
     crop_state_with_age(blocks, &current.block.id, age + 1)
+}
+
+fn next_leaf_decay_state(
+    blocks: &mc_world::BlockRegistry,
+    state: mc_world::BlockStateId,
+) -> Option<mc_world::BlockStateId> {
+    let current = blocks.by_id(state)?;
+    if !current.block.id.path().ends_with("_leaves") {
+        return None;
+    }
+    if block_state_property(current, "persistent") == Some("true") {
+        return None;
+    }
+    let distance = block_state_property(current, "distance")?
+        .parse::<u8>()
+        .ok()?;
+    (distance >= 7).then(|| air_state_id(blocks))
+}
+
+fn next_fire_state(
+    blocks: &mc_world::BlockRegistry,
+    state: mc_world::BlockStateId,
+) -> Option<mc_world::BlockStateId> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() == "minecraft:soul_fire" {
+        return Some(air_state_id(blocks));
+    }
+    if current.block.id.as_str() != "minecraft:fire" {
+        return None;
+    }
+    let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
+    if age >= 15 {
+        return Some(air_state_id(blocks));
+    }
+    sibling_state_with_property(blocks, current, "age", &(age + 1).to_string())
+}
+
+fn next_grass_edit(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<BlockEdit> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:grass_block" {
+        return None;
+    }
+    if !block_above_allows_grass(blocks, storage, pos) {
+        let dirt = Identifier::parse("minecraft:dirt").expect("static identifier");
+        return blocks.block(&dirt).map(|block| BlockEdit {
+            pos,
+            new_state: block.default,
+        });
+    }
+    let grass_state = blocks
+        .block(&Identifier::parse("minecraft:grass_block").expect("static identifier"))
+        .map(|block| block.default)?;
+    for dy in -1..=1 {
+        for dz in -1..=1 {
+            for dx in -1..=1 {
+                if dx == 0 && dy == 0 && dz == 0 {
+                    continue;
+                }
+                let target = mc_world::BlockPos {
+                    x: pos.x + dx,
+                    y: pos.y + dy,
+                    z: pos.z + dz,
+                };
+                if block_is(blocks, storage, target, "minecraft:dirt")
+                    && block_above_allows_grass(blocks, storage, target)
+                {
+                    return Some(BlockEdit {
+                        pos: target,
+                        new_state: grass_state,
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+fn block_above_allows_grass(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> bool {
+    storage
+        .get_block(mc_world::BlockPos {
+            x: pos.x,
+            y: pos.y + 1,
+            z: pos.z,
+        })
+        .ok()
+        .flatten()
+        .and_then(|state| blocks.by_id(state))
+        .is_none_or(|state| {
+            matches!(
+                state.block.id.as_str(),
+                "minecraft:air"
+                    | "minecraft:cave_air"
+                    | "minecraft:short_grass"
+                    | "minecraft:tall_grass"
+            )
+        })
+}
+
+fn block_is(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    name: &str,
+) -> bool {
+    storage
+        .get_block(pos)
+        .ok()
+        .flatten()
+        .and_then(|state| blocks.by_id(state))
+        .is_some_and(|state| state.block.id.as_str() == name)
 }
 
 fn next_farmland_state(
@@ -6107,6 +6355,27 @@ fn block_state_property<'a>(state: &'a mc_world::BlockState, name: &str) -> Opti
         .properties
         .iter()
         .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+}
+
+fn sibling_state_with_property(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    name: &str,
+    value: &str,
+) -> Option<mc_world::BlockStateId> {
+    let mut props = state.properties.clone();
+    let (_, current) = props.iter_mut().find(|(key, _)| key == name)?;
+    *current = value.to_string();
+    blocks.by_name_and_props(&state.block.id, &props)
+}
+
+fn sibling_state_with_bool_property(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    name: &str,
+    value: bool,
+) -> Option<mc_world::BlockStateId> {
+    sibling_state_with_property(blocks, state, name, if value { "true" } else { "false" })
 }
 
 fn crop_state_with_age(
@@ -6213,6 +6482,103 @@ where
         .await?;
     }
     Ok(())
+}
+
+async fn interact_with_toggle_block<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let pos = mc_world::BlockPos { x, y, z };
+    let edits = {
+        let mut storage = state.world.lock().await;
+        let clicked = match storage.get_block(pos) {
+            Ok(Some(state)) => state,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(error = %err, x, y, z, "interactive block read failed");
+                return write_block_ack(writer, state.compression, sequence)
+                    .await
+                    .map(|()| true);
+            }
+        };
+        plan_toggle_block_edits(&state.blocks, &mut storage, pos, clicked)
+    };
+    let Some(edits) = edits else {
+        return Ok(false);
+    };
+    let _ = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
+    Ok(true)
+}
+
+fn plan_toggle_block_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state_id: mc_world::BlockStateId,
+) -> Option<Vec<BlockEdit>> {
+    let state = blocks.by_id(state_id)?;
+    if state.block.id.path().ends_with("_door") && block_state_property(state, "half").is_some() {
+        return plan_door_toggle_edits(blocks, storage, pos, state);
+    }
+    if let Some(open) = toggled_bool_state(blocks, state, "open") {
+        return Some(vec![BlockEdit {
+            pos,
+            new_state: open,
+        }]);
+    }
+    toggled_bool_state(blocks, state, "powered").map(|new_state| vec![BlockEdit { pos, new_state }])
+}
+
+fn plan_door_toggle_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+) -> Option<Vec<BlockEdit>> {
+    let new_open = block_state_property(state, "open")? != "true";
+    let mut edits = Vec::with_capacity(2);
+    edits.push(BlockEdit {
+        pos,
+        new_state: sibling_state_with_bool_property(blocks, state, "open", new_open)?,
+    });
+    let other_y = match block_state_property(state, "half")? {
+        "lower" => pos.y + 1,
+        "upper" => pos.y - 1,
+        _ => return Some(edits),
+    };
+    let other_pos = mc_world::BlockPos { y: other_y, ..pos };
+    if let Ok(Some(other_state_id)) = storage.get_block(other_pos)
+        && let Some(other_state) = blocks.by_id(other_state_id)
+        && other_state.block.id == state.block.id
+        && let Some(new_state) =
+            sibling_state_with_bool_property(blocks, other_state, "open", new_open)
+    {
+        edits.push(BlockEdit {
+            pos: other_pos,
+            new_state,
+        });
+    }
+    Some(edits)
+}
+
+fn toggled_bool_state(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    name: &str,
+) -> Option<mc_world::BlockStateId> {
+    let next = match block_state_property(state, name)? {
+        "true" => false,
+        "false" => true,
+        _ => return None,
+    };
+    sibling_state_with_bool_property(blocks, state, name, next)
 }
 
 fn sample_random_tick_positions(
@@ -6391,37 +6757,6 @@ fn merge_light_updates(target: &mut Vec<OutboundLightUpdate>, updates: Vec<Outbo
             target.push(update);
         }
     }
-}
-
-/// Shared back-half of the break / place flows: mutates the world
-/// at `(x, y, z)` to `new_state`, broadcasts the block delta +
-/// recomputed `LightUpdate`s + `BlockChangedAck` to the connected
-/// client. The actual edit is applied via
-/// `WorldStorage::set_block_at` so heightmap recompute lands in
-/// the same atomic step.
-async fn apply_block_edit<W>(
-    state: &mut InteractionState,
-    writer: &mut W,
-    sequence: i32,
-    x: i32,
-    y: i32,
-    z: i32,
-    new_state: mc_world::BlockStateId,
-) -> Result<Option<mc_world::BlockStateId>, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let outcome = apply_player_block_edit_batch(
-        state,
-        writer,
-        sequence,
-        &[BlockEdit {
-            pos: mc_world::BlockPos { x, y, z },
-            new_state,
-        }],
-    )
-    .await?;
-    Ok(outcome.applied.first().map(|edit| edit.previous))
 }
 
 /// M9: incremental relight. Pulls the post-edit 3×3 chunk
@@ -6657,6 +6992,9 @@ where
     if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
         return Ok(());
     }
+    if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
 
     let (dx, dy, dz) = action.direction.normal();
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
@@ -6751,7 +7089,24 @@ where
         return Ok(());
     };
 
-    let _ = apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
+    let Some(edits) = plan_place_block_edits(
+        state,
+        mc_world::BlockPos {
+            x: tx,
+            y: ty,
+            z: tz,
+        },
+        placed_state,
+        player_pose,
+    )
+    .await
+    else {
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    };
+    let outcome = apply_player_block_edit_batch(state, writer, action.sequence, &edits).await?;
+    if outcome.applied.is_empty() {
+        return Ok(());
+    }
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
 
     // M6.f: decrement the held stack's count + tell the client the
@@ -6777,6 +7132,75 @@ where
     )
     .await?;
     Ok(())
+}
+
+async fn plan_place_block_edits(
+    state: &InteractionState,
+    pos: mc_world::BlockPos,
+    placed_state: mc_world::BlockStateId,
+    player_pose: PlayerPose,
+) -> Option<Vec<BlockEdit>> {
+    let placed = state.blocks.by_id(placed_state)?;
+    if !placed.block.id.path().ends_with("_door") {
+        return Some(vec![BlockEdit {
+            pos,
+            new_state: placed_state,
+        }]);
+    }
+    let upper_pos = mc_world::BlockPos {
+        y: pos.y + 1,
+        ..pos
+    };
+    let air = air_state_id(&state.blocks);
+    let upper_is_air = {
+        let mut storage = state.world.lock().await;
+        matches!(storage.get_block(upper_pos), Ok(Some(state_id)) if state_id == air)
+    };
+    if !upper_is_air {
+        return None;
+    }
+    let facing = horizontal_facing_from_yaw(player_pose.yaw);
+    let lower = door_half_state(&state.blocks, placed, "lower", facing)?;
+    let upper = door_half_state(&state.blocks, placed, "upper", facing)?;
+    Some(vec![
+        BlockEdit {
+            pos,
+            new_state: lower,
+        },
+        BlockEdit {
+            pos: upper_pos,
+            new_state: upper,
+        },
+    ])
+}
+
+fn door_half_state(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    half: &str,
+    facing: &str,
+) -> Option<mc_world::BlockStateId> {
+    let mut props = state.properties.clone();
+    set_prop_if_present(&mut props, "half", half);
+    set_prop_if_present(&mut props, "facing", facing);
+    set_prop_if_present(&mut props, "open", "false");
+    set_prop_if_present(&mut props, "powered", "false");
+    blocks.by_name_and_props(&state.block.id, &props)
+}
+
+fn set_prop_if_present(props: &mut [(String, String)], name: &str, value: &str) {
+    if let Some((_, current)) = props.iter_mut().find(|(key, _)| key == name) {
+        *current = value.to_string();
+    }
+}
+
+fn horizontal_facing_from_yaw(yaw: f32) -> &'static str {
+    match ((yaw.rem_euclid(360.0) / 90.0).round() as i32).rem_euclid(4) {
+        0 => "south",
+        1 => "west",
+        2 => "north",
+        _ => "east",
+    }
 }
 
 async fn handle_use_item<W>(
@@ -8097,6 +8521,18 @@ mod tests {
         }
     }
 
+    fn prop_schema(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
+        entries
+            .iter()
+            .map(|(key, values)| {
+                (
+                    (*key).to_string(),
+                    values.iter().map(|value| (*value).to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
     fn crop_test_reports() -> Vec<BlockReport> {
         let mut farmland_properties = BTreeMap::new();
         farmland_properties.insert(
@@ -8350,6 +8786,188 @@ mod tests {
         );
         assert_eq!(farmland_trample_pos(old_pose, hovering), None);
         assert_eq!(farmland_trample_pos(landed, landed), None);
+    }
+
+    #[test]
+    fn natural_random_tick_helpers_cover_leaves_grass_and_fire() {
+        let blocks = mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:dirt"),
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+                properties: prop_schema(&[
+                    ("distance", &["6", "7"]),
+                    ("persistent", &["false", "true"]),
+                ]),
+                states: vec![
+                    state(2, true, &[("distance", "7"), ("persistent", "false")]),
+                    state(3, false, &[("distance", "7"), ("persistent", "true")]),
+                    state(4, false, &[("distance", "6"), ("persistent", "false")]),
+                ],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:fire").unwrap(),
+                properties: prop_schema(&[("age", &["14", "15"])]),
+                states: vec![
+                    state(5, true, &[("age", "14")]),
+                    state(6, false, &[("age", "15")]),
+                ],
+            },
+            simple_block(7, "minecraft:grass_block"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            next_leaf_decay_state(&blocks, mc_world::BlockStateId(2)),
+            Some(mc_world::BlockStateId(0))
+        );
+        assert_eq!(
+            next_leaf_decay_state(&blocks, mc_world::BlockStateId(3)),
+            None
+        );
+        assert_eq!(
+            next_leaf_decay_state(&blocks, mc_world::BlockStateId(4)),
+            None
+        );
+        assert_eq!(
+            next_fire_state(&blocks, mc_world::BlockStateId(5)),
+            Some(mc_world::BlockStateId(6))
+        );
+        assert_eq!(
+            next_fire_state(&blocks, mc_world::BlockStateId(6)),
+            Some(mc_world::BlockStateId(0))
+        );
+    }
+
+    #[test]
+    fn interactive_toggle_helpers_preserve_other_properties() {
+        let blocks = mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_trapdoor").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north"]),
+                    ("open", &["false", "true"]),
+                    ("waterlogged", &["false"]),
+                ]),
+                states: vec![
+                    state(
+                        1,
+                        true,
+                        &[
+                            ("facing", "north"),
+                            ("open", "false"),
+                            ("waterlogged", "false"),
+                        ],
+                    ),
+                    state(
+                        2,
+                        false,
+                        &[
+                            ("facing", "north"),
+                            ("open", "true"),
+                            ("waterlogged", "false"),
+                        ],
+                    ),
+                ],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:lever").unwrap(),
+                properties: prop_schema(&[("facing", &["north"]), ("powered", &["false", "true"])]),
+                states: vec![
+                    state(3, true, &[("facing", "north"), ("powered", "false")]),
+                    state(4, false, &[("facing", "north"), ("powered", "true")]),
+                ],
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(
+            toggled_bool_state(
+                &blocks,
+                blocks.by_id(mc_world::BlockStateId(1)).unwrap(),
+                "open"
+            ),
+            Some(mc_world::BlockStateId(2))
+        );
+        assert_eq!(
+            toggled_bool_state(
+                &blocks,
+                blocks.by_id(mc_world::BlockStateId(3)).unwrap(),
+                "powered"
+            ),
+            Some(mc_world::BlockStateId(4))
+        );
+    }
+
+    #[test]
+    fn door_half_state_builds_two_block_placement_states() {
+        let blocks = mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_door").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north", "south"]),
+                    ("half", &["lower", "upper"]),
+                    ("open", &["false"]),
+                    ("powered", &["false"]),
+                ]),
+                states: vec![
+                    state(
+                        1,
+                        true,
+                        &[
+                            ("facing", "north"),
+                            ("half", "lower"),
+                            ("open", "false"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                    state(
+                        2,
+                        false,
+                        &[
+                            ("facing", "north"),
+                            ("half", "upper"),
+                            ("open", "false"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                    state(
+                        3,
+                        false,
+                        &[
+                            ("facing", "south"),
+                            ("half", "lower"),
+                            ("open", "false"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                    state(
+                        4,
+                        false,
+                        &[
+                            ("facing", "south"),
+                            ("half", "upper"),
+                            ("open", "false"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                ],
+            },
+        ])
+        .unwrap();
+        let default = blocks.by_id(mc_world::BlockStateId(1)).unwrap();
+
+        assert_eq!(
+            door_half_state(&blocks, default, "lower", "south"),
+            Some(mc_world::BlockStateId(3))
+        );
+        assert_eq!(
+            door_half_state(&blocks, default, "upper", "south"),
+            Some(mc_world::BlockStateId(4))
+        );
+        assert_eq!(horizontal_facing_from_yaw(180.0), "north");
     }
 
     #[test]
