@@ -15,8 +15,8 @@ pub mod wire;
 pub use block::{Block, BlockRegistry, BlockState, BlockStateId, RegistryError};
 pub use chunk::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkGenerator, ChunkPos,
-    HEIGHTMAP_BITS, HEIGHTMAP_LEN, Heightmap, LIGHT_LAYER_BYTES, MAX_Y, MIN_SECTION_Y, MIN_Y,
-    SECTION_COUNT, SectionLight,
+    FurnaceBlockEntity, FurnaceSlot, HEIGHTMAP_BITS, HEIGHTMAP_LEN, Heightmap, LIGHT_LAYER_BYTES,
+    MAX_Y, MIN_SECTION_Y, MIN_Y, SECTION_COUNT, SectionLight,
 };
 pub use section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
 pub use storage::{WorldError, WorldStorage};

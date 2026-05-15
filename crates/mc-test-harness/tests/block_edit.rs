@@ -28,9 +28,9 @@ use mc_protocol::packets::play::{
     EntityAnimationAction, EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
     ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate, LoginPlay,
     PlayerActionKind, RemoveEntities, ServerboundChatCommand, ServerboundClientCommand,
-    ServerboundContainerClick, ServerboundKeepAlive, ServerboundPlaceRecipe,
-    ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundKeepAlive,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -1380,6 +1380,34 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         })
         .await
         .expect("place raw iron input");
+    wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.items[0].item_id == raw_iron_id
+            && pkt.items[0].count == 1
+            && pkt.carried_item.is_empty()
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClose {
+            container_id: opened.container_id,
+        })
+        .await
+        .expect("close furnace after input insert");
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, furnace_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 93,
+        })
+        .await
+        .expect("reopen furnace");
+    let opened = wait_for_open_screen(&mut client, furnace_menu_id).await;
     let content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
         pkt.items[0].item_id == raw_iron_id
             && pkt.items[0].count == 1

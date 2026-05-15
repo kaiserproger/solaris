@@ -23,7 +23,7 @@ use crate::anvil::{
     write_region,
 };
 use crate::block::{BlockRegistry, BlockStateId};
-use crate::chunk::{BlockPos, Chunk, ChunkGenerator, ChunkPos};
+use crate::chunk::{BlockPos, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity};
 use crate::section::SECTION_DIM;
 
 const REGION_AXIS_CHUNKS: i32 = 32;
@@ -275,6 +275,41 @@ impl WorldStorage {
         }
         self.touch(cpos);
         Ok(self.cache.get_mut(&cpos))
+    }
+
+    pub fn furnace_block_entity(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Option<FurnaceBlockEntity>, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(None);
+        }
+        let chunk = self
+            .cache
+            .get(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(Some(chunk.furnaces.get(&pos).cloned().unwrap_or_default()))
+    }
+
+    pub fn set_furnace_block_entity(
+        &mut self,
+        pos: BlockPos,
+        furnace: FurnaceBlockEntity,
+    ) -> Result<bool, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(false);
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        if chunk.furnaces.get(&pos) == Some(&furnace) {
+            return Ok(true);
+        }
+        chunk.furnaces.insert(pos, furnace);
+        Ok(true)
     }
 
     /// Insert a freshly generated chunk through the same cache/LRU path
@@ -595,6 +630,36 @@ mod tests {
         let world = WorldStorage::open_with_region_capacity(tmp.path(), registry, 7).unwrap();
 
         assert_eq!(world.region_cache_capacity(), 7);
+    }
+
+    #[test]
+    fn furnace_block_entities_are_chunk_scoped_runtime_state() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        let mut furnace = world.furnace_block_entity(pos).unwrap().unwrap();
+        assert!(furnace.slots[0].is_empty());
+        furnace.slots[0] = crate::chunk::FurnaceSlot {
+            count: 2,
+            item_id: 42,
+            damage: Some(7),
+        };
+        furnace.cook_progress = 11;
+
+        assert!(
+            world
+                .set_furnace_block_entity(pos, furnace.clone())
+                .unwrap()
+        );
+        assert_eq!(world.dirty_count(), 0);
+        assert_eq!(world.furnace_block_entity(pos).unwrap(), Some(furnace));
     }
 
     /// End-to-end: open the generated flat test world, query known

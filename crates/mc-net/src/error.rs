@@ -1,6 +1,7 @@
 //! Per-connection errors.
 
 use mc_protocol::{CodecError, FramingError, State};
+use mc_world::WorldError;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -13,6 +14,9 @@ pub enum ConnectionError {
 
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
+
+    #[error("world error: {0}")]
+    World(#[from] WorldError),
 
     /// The peer closed the socket before sending us a complete packet.
     #[error("peer disconnected mid-packet")]

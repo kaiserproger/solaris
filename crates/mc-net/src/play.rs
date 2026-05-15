@@ -58,7 +58,7 @@ use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
 };
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
-use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos};
+use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval};
@@ -99,7 +99,6 @@ const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
 const FURNACE_MENU_TYPE_ID: i32 = 14;
 const FURNACE_CONTAINER_ID_MIN: i32 = 1;
 const FURNACE_CONTAINER_ID_MAX: i32 = 100;
-const FURNACE_SLOT_COUNT: usize = 3;
 const FURNACE_MENU_SLOT_COUNT: usize = 39;
 const FURNACE_FUEL_TICKS: i16 = 1600;
 const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
@@ -1535,7 +1534,6 @@ where
             recipes,
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
-            furnaces: HashMap::new(),
             pending_break: None,
         });
         play_loop(
@@ -1606,69 +1604,36 @@ struct InteractionState {
     recipes: Vec<mc_data::recipes::Recipe>,
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
-    furnaces: HashMap<(i32, i32, i32), FurnaceContainer>,
     pending_break: Option<PendingBreak>,
 }
 
 #[derive(Debug, Clone)]
 enum ActiveContainer {
-    Furnace(FurnaceContainer),
+    Furnace(FurnaceWindow),
 }
 
 impl ActiveContainer {
     fn container_id(&self) -> i32 {
         match self {
-            Self::Furnace(furnace) => furnace.container_id,
+            Self::Furnace(window) => window.container_id,
         }
     }
 }
 
 #[derive(Debug, Clone)]
-struct FurnaceContainer {
+struct FurnaceWindow {
     container_id: i32,
-    position: (i32, i32, i32),
+    position: mc_world::BlockPos,
     state_id: i32,
-    slots: [ItemStack; FURNACE_SLOT_COUNT],
-    burn_remaining: i16,
-    burn_total: i16,
-    cook_progress: i16,
-    cook_total: i16,
 }
 
-impl FurnaceContainer {
-    fn new(position: (i32, i32, i32)) -> Self {
+impl FurnaceWindow {
+    fn new(position: mc_world::BlockPos, container_id: i32) -> Self {
         Self {
-            container_id: 0,
+            container_id,
             position,
             state_id: 1,
-            slots: std::array::from_fn(|_| ItemStack::EMPTY),
-            burn_remaining: 0,
-            burn_total: FURNACE_FUEL_TICKS,
-            cook_progress: 0,
-            cook_total: DEFAULT_FURNACE_COOK_TICKS,
         }
-    }
-
-    fn bind_to_client(&mut self, container_id: i32) {
-        self.container_id = container_id;
-        self.state_id = 1;
-    }
-
-    fn data_values(&self) -> [(i16, i16); 4] {
-        [
-            (0, self.burn_remaining),
-            (1, self.burn_total),
-            (2, self.cook_progress),
-            (3, self.cook_total),
-        ]
-    }
-
-    fn wire_items(&self, inventory: &PlayerInventory) -> Vec<ItemStack> {
-        let mut items = Vec::with_capacity(FURNACE_MENU_SLOT_COUNT);
-        items.extend(self.slots.iter().cloned());
-        items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
-        items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
-        items
     }
 }
 
@@ -3740,30 +3705,64 @@ fn next_container_id(state: &mut InteractionState) -> i32 {
 }
 
 fn store_active_container(state: &mut InteractionState) {
-    let Some(active) = state.active_container.take() else {
-        return;
-    };
-    match active {
-        ActiveContainer::Furnace(mut furnace) => {
-            furnace.container_id = 0;
-            state.furnaces.insert(furnace.position, furnace);
+    state.active_container = None;
+}
+
+fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
+    if slot.is_empty() {
+        ItemStack::EMPTY
+    } else {
+        ItemStack {
+            count: slot.count,
+            item_id: slot.item_id,
+            damage: slot.damage,
         }
     }
+}
+
+fn stack_to_furnace_slot(stack: &ItemStack) -> FurnaceSlot {
+    if stack.is_empty() {
+        FurnaceSlot::EMPTY
+    } else {
+        FurnaceSlot {
+            count: stack.count,
+            item_id: stack.item_id,
+            damage: stack.damage,
+        }
+    }
+}
+
+fn furnace_data_values(furnace: &FurnaceBlockEntity) -> [(i16, i16); 4] {
+    [
+        (0, furnace.burn_remaining),
+        (1, furnace.burn_total),
+        (2, furnace.cook_progress),
+        (3, furnace.cook_total),
+    ]
+}
+
+fn furnace_wire_items(furnace: &FurnaceBlockEntity, inventory: &PlayerInventory) -> Vec<ItemStack> {
+    let mut items = Vec::with_capacity(FURNACE_MENU_SLOT_COUNT);
+    items.extend(furnace.slots.iter().map(furnace_slot_to_stack));
+    items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
+    items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
+    items
 }
 
 async fn write_furnace_data<W>(
     writer: &mut W,
     compression: Compression,
-    furnace: &FurnaceContainer,
+    window: &FurnaceWindow,
+    furnace: &FurnaceBlockEntity,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    for (id, value) in furnace.data_values() {
+    for (id, value) in furnace_data_values(furnace) {
         write_packet(
             writer,
             &ClientboundContainerSetData {
-                container_id: furnace.container_id,
+                container_id: window.container_id,
                 id,
                 value,
             },
@@ -3777,7 +3776,7 @@ where
 async fn write_furnace_data_changes<W>(
     writer: &mut W,
     compression: Compression,
-    furnace: &FurnaceContainer,
+    window: &FurnaceWindow,
     changed: &[(i16, i16)],
 ) -> Result<(), ConnectionError>
 where
@@ -3787,7 +3786,7 @@ where
         write_packet(
             writer,
             &ClientboundContainerSetData {
-                container_id: furnace.container_id,
+                container_id: window.container_id,
                 id,
                 value,
             },
@@ -3801,7 +3800,8 @@ where
 async fn write_furnace_content<W>(
     state: &InteractionState,
     writer: &mut W,
-    furnace: &FurnaceContainer,
+    window: &FurnaceWindow,
+    furnace: &FurnaceBlockEntity,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -3809,9 +3809,9 @@ where
     write_packet(
         writer,
         &ClientboundContainerSetContent {
-            container_id: furnace.container_id,
-            state_id: furnace.state_id,
-            items: furnace.wire_items(&state.inventory),
+            container_id: window.container_id,
+            state_id: window.state_id,
+            items: furnace_wire_items(furnace, &state.inventory),
             carried_item: state.carried_item.clone(),
         },
         state.compression,
@@ -3830,10 +3830,11 @@ async fn open_furnace_container<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    let position = mc_world::BlockPos { x, y, z };
     let clicked = {
         let mut storage = state.world.lock().await;
         storage
-            .get_block(mc_world::BlockPos { x, y, z })
+            .get_block(position)
             .map_err(|err| {
                 warn!(error = %err, x, y, z, "furnace use target read failed");
                 err
@@ -3847,11 +3848,15 @@ where
 
     store_active_container(state);
     let container_id = next_container_id(state);
-    let mut furnace = state
-        .furnaces
-        .remove(&(x, y, z))
-        .unwrap_or_else(|| FurnaceContainer::new((x, y, z)));
-    furnace.bind_to_client(container_id);
+    let window = FurnaceWindow::new(position, container_id);
+    let furnace = {
+        let mut storage = state.world.lock().await;
+        storage.furnace_block_entity(position).map_err(|err| {
+            warn!(error = %err, x, y, z, "furnace state read failed");
+            err
+        })?
+    }
+    .unwrap_or_default();
     write_packet(
         writer,
         &ClientboundOpenScreen {
@@ -3862,9 +3867,9 @@ where
         state.compression,
     )
     .await?;
-    write_furnace_content(state, writer, &furnace).await?;
-    write_furnace_data(writer, state.compression, &furnace).await?;
-    state.active_container = Some(ActiveContainer::Furnace(furnace));
+    write_furnace_content(state, writer, &window, &furnace).await?;
+    write_furnace_data(writer, state.compression, &window, &furnace).await?;
+    state.active_container = Some(ActiveContainer::Furnace(window));
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
 }
@@ -4109,25 +4114,25 @@ fn furnace_player_slot(menu_slot: usize) -> Option<usize> {
 }
 
 fn furnace_menu_stack(
-    furnace: &FurnaceContainer,
+    furnace: &FurnaceBlockEntity,
     inventory: &PlayerInventory,
     menu_slot: usize,
 ) -> Option<ItemStack> {
     match menu_slot {
-        0..=2 => Some(furnace.slots[menu_slot].clone()),
+        0..=2 => Some(furnace_slot_to_stack(&furnace.slots[menu_slot])),
         _ => furnace_player_slot(menu_slot).map(|slot| inventory.slots[slot].clone()),
     }
 }
 
 fn set_furnace_menu_stack(
-    furnace: &mut FurnaceContainer,
+    furnace: &mut FurnaceBlockEntity,
     inventory: &mut PlayerInventory,
     menu_slot: usize,
     stack: ItemStack,
 ) -> bool {
     match menu_slot {
         0..=2 => {
-            furnace.slots[menu_slot] = stack;
+            furnace.slots[menu_slot] = stack_to_furnace_slot(&stack);
             true
         }
         _ => {
@@ -4159,7 +4164,7 @@ fn can_place_in_furnace_menu_slot(
 
 fn apply_furnace_pickup_click(
     state: &mut InteractionState,
-    furnace: &mut FurnaceContainer,
+    furnace: &mut FurnaceBlockEntity,
     menu_slot: usize,
     button: i8,
 ) -> bool {
@@ -4268,7 +4273,7 @@ fn apply_furnace_pickup_click(
 
 fn merge_stack_into_furnace_slot(
     state: &InteractionState,
-    furnace: &mut FurnaceContainer,
+    furnace: &mut FurnaceBlockEntity,
     menu_slot: usize,
     stack: ItemStack,
 ) -> ItemStack {
@@ -4281,7 +4286,7 @@ fn merge_stack_into_furnace_slot(
         let moved = stack.count.min(max_stack);
         let mut moved_stack = stack.clone();
         moved_stack.count = moved;
-        *target = moved_stack;
+        *target = stack_to_furnace_slot(&moved_stack);
         let mut remaining = stack;
         remaining.count -= moved;
         if remaining.count <= 0 {
@@ -4289,7 +4294,7 @@ fn merge_stack_into_furnace_slot(
         } else {
             remaining
         }
-    } else if can_stack(target, &stack) && target.count < max_stack {
+    } else if can_stack(&furnace_slot_to_stack(target), &stack) && target.count < max_stack {
         let moved = (max_stack - target.count).min(stack.count);
         target.count += moved;
         let mut remaining = stack;
@@ -4306,7 +4311,7 @@ fn merge_stack_into_furnace_slot(
 
 fn apply_furnace_quick_move_click(
     state: &mut InteractionState,
-    furnace: &mut FurnaceContainer,
+    furnace: &mut FurnaceBlockEntity,
     menu_slot: usize,
 ) -> bool {
     if menu_slot >= FURNACE_MENU_SLOT_COUNT {
@@ -4314,13 +4319,13 @@ fn apply_furnace_quick_move_click(
     }
     match menu_slot {
         0..=2 => {
-            let original = furnace.slots[menu_slot].clone();
+            let original = furnace_slot_to_stack(&furnace.slots[menu_slot]);
             if original.is_empty() {
                 return false;
             }
             let (remaining, _) = state.inventory.merge_stack(original.clone());
-            furnace.slots[menu_slot] = remaining;
-            furnace.slots[menu_slot] != original
+            furnace.slots[menu_slot] = stack_to_furnace_slot(&remaining);
+            remaining != original
         }
         _ => {
             let Some(player_slot) = furnace_player_slot(menu_slot) else {
@@ -4351,15 +4356,25 @@ fn apply_furnace_quick_move_click(
 async fn handle_furnace_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    mut furnace: FurnaceContainer,
+    mut window: FurnaceWindow,
     packet: ServerboundContainerClick,
-) -> Result<FurnaceContainer, ConnectionError>
+) -> Result<FurnaceWindow, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    if packet.state_id != furnace.state_id {
-        write_furnace_content(state, writer, &furnace).await?;
-        return Ok(furnace);
+    let mut furnace = {
+        let mut storage = state.world.lock().await;
+        storage
+            .furnace_block_entity(window.position)
+            .map_err(|err| {
+                warn!(error = %err, ?window.position, "furnace state read failed");
+                err
+            })?
+    }
+    .unwrap_or_default();
+    if packet.state_id != window.state_id {
+        write_furnace_content(state, writer, &window, &furnace).await?;
+        return Ok(window);
     }
     let changed = match packet.container_input {
         ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
@@ -4374,56 +4389,63 @@ where
         _ => false,
     };
     if changed {
-        furnace.state_id = furnace.state_id.wrapping_add(1);
+        window.state_id = window.state_id.wrapping_add(1);
+        let mut storage = state.world.lock().await;
+        storage
+            .set_furnace_block_entity(window.position, furnace.clone())
+            .map_err(|err| {
+                warn!(error = %err, ?window.position, "furnace state write failed");
+                err
+            })?;
     }
-    write_furnace_content(state, writer, &furnace).await?;
-    Ok(furnace)
+    write_furnace_content(state, writer, &window, &furnace).await?;
+    Ok(window)
 }
 
-fn furnace_output_room(furnace: &FurnaceContainer, item_id: u32, count: i32) -> bool {
-    let output = &furnace.slots[2];
+fn furnace_output_room(furnace: &FurnaceBlockEntity, item_id: u32, count: i32) -> bool {
+    let output = furnace_slot_to_stack(&furnace.slots[2]);
     output.is_empty()
         || output.item_id == item_id && output.damage.is_none() && output.count + count <= 64
 }
 
-fn add_furnace_output(furnace: &mut FurnaceContainer, item_id: u32, count: i32) {
+fn add_furnace_output(furnace: &mut FurnaceBlockEntity, item_id: u32, count: i32) {
     if furnace.slots[2].is_empty() {
-        furnace.slots[2] = ItemStack::new(item_id, count);
+        furnace.slots[2] = stack_to_furnace_slot(&ItemStack::new(item_id, count));
     } else {
         furnace.slots[2].count += count;
     }
 }
 
-fn decrement_stack(stack: &mut ItemStack) {
+fn decrement_furnace_slot(stack: &mut FurnaceSlot) {
     stack.count -= 1;
     if stack.count <= 0 {
-        *stack = ItemStack::EMPTY;
+        *stack = FurnaceSlot::EMPTY;
     }
 }
 
 fn tick_furnace(
     state: &InteractionState,
-    furnace: &mut FurnaceContainer,
+    furnace: &mut FurnaceBlockEntity,
 ) -> (bool, Vec<(i16, i16)>) {
     let before_slots = furnace.slots.clone();
-    let before_data = furnace.data_values();
+    let before_data = furnace_data_values(furnace);
 
     if furnace.burn_remaining > 0 {
         furnace.burn_remaining -= 1;
     }
 
-    let input = furnace.slots[0].clone();
+    let input = furnace_slot_to_stack(&furnace.slots[0]);
     let recipe = (!input.is_empty())
         .then(|| find_smelting_recipe_for_item(state, input.item_id))
         .flatten();
     let Some(recipe) = recipe else {
         furnace.cook_progress = 0;
-        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        let changed_data = changed_furnace_data(before_data, furnace_data_values(furnace));
         return (furnace.slots != before_slots, changed_data);
     };
     let Some(output_item_id) = state.items.id_of(&recipe.result.item) else {
         furnace.cook_progress = 0;
-        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        let changed_data = changed_furnace_data(before_data, furnace_data_values(furnace));
         return (furnace.slots != before_slots, changed_data);
     };
     let output_count = i32::try_from(recipe.result.count).unwrap_or(0);
@@ -4437,7 +4459,7 @@ fn tick_furnace(
 
     if output_count <= 0 || !furnace_output_room(furnace, output_item_id, output_count) {
         furnace.cook_progress = 0;
-        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        let changed_data = changed_furnace_data(before_data, furnace_data_values(furnace));
         return (furnace.slots != before_slots, changed_data);
     }
 
@@ -4445,7 +4467,7 @@ fn tick_furnace(
         && !furnace.slots[1].is_empty()
         && is_fuel_item(state, furnace.slots[1].item_id)
     {
-        decrement_stack(&mut furnace.slots[1]);
+        decrement_furnace_slot(&mut furnace.slots[1]);
         furnace.burn_total = FURNACE_FUEL_TICKS;
         furnace.burn_remaining = FURNACE_FUEL_TICKS;
     }
@@ -4453,7 +4475,7 @@ fn tick_furnace(
     if furnace.burn_remaining > 0 {
         furnace.cook_progress += 1;
         if furnace.cook_progress >= furnace.cook_total {
-            decrement_stack(&mut furnace.slots[0]);
+            decrement_furnace_slot(&mut furnace.slots[0]);
             add_furnace_output(furnace, output_item_id, output_count);
             furnace.cook_progress = 0;
         }
@@ -4461,7 +4483,7 @@ fn tick_furnace(
         furnace.cook_progress = 0;
     }
 
-    let changed_data = changed_furnace_data(before_data, furnace.data_values());
+    let changed_data = changed_furnace_data(before_data, furnace_data_values(furnace));
     (furnace.slots != before_slots, changed_data)
 }
 
@@ -4484,17 +4506,36 @@ where
         return Ok(());
     };
     match active {
-        ActiveContainer::Furnace(mut furnace) => {
+        ActiveContainer::Furnace(mut window) => {
+            let mut furnace = {
+                let mut storage = state.world.lock().await;
+                storage
+                    .furnace_block_entity(window.position)
+                    .map_err(|err| {
+                        warn!(error = %err, ?window.position, "furnace state read failed");
+                        err
+                    })?
+            }
+            .unwrap_or_default();
             let (slots_changed, data_changed) = tick_furnace(state, &mut furnace);
             if slots_changed {
-                furnace.state_id = furnace.state_id.wrapping_add(1);
-                write_furnace_content(state, writer, &furnace).await?;
+                window.state_id = window.state_id.wrapping_add(1);
+                write_furnace_content(state, writer, &window, &furnace).await?;
             }
             if !data_changed.is_empty() {
-                write_furnace_data_changes(writer, state.compression, &furnace, &data_changed)
+                write_furnace_data_changes(writer, state.compression, &window, &data_changed)
                     .await?;
             }
-            state.active_container = Some(ActiveContainer::Furnace(furnace));
+            if slots_changed || !data_changed.is_empty() {
+                let mut storage = state.world.lock().await;
+                storage
+                    .set_furnace_block_entity(window.position, furnace)
+                    .map_err(|err| {
+                        warn!(error = %err, ?window.position, "furnace state write failed");
+                        err
+                    })?;
+            }
+            state.active_container = Some(ActiveContainer::Furnace(window));
         }
     }
     Ok(())
@@ -4516,9 +4557,19 @@ where
     {
         if packet.container_id == 0 {
             write_inventory_content(state, writer).await?;
-        } else if let Some(ActiveContainer::Furnace(furnace)) = state.active_container.take() {
-            write_furnace_content(state, writer, &furnace).await?;
-            state.active_container = Some(ActiveContainer::Furnace(furnace));
+        } else if let Some(ActiveContainer::Furnace(window)) = state.active_container.take() {
+            let furnace = {
+                let mut storage = state.world.lock().await;
+                storage
+                    .furnace_block_entity(window.position)
+                    .map_err(|err| {
+                        warn!(error = %err, ?window.position, "furnace state read failed");
+                        err
+                    })?
+            }
+            .unwrap_or_default();
+            write_furnace_content(state, writer, &window, &furnace).await?;
+            state.active_container = Some(ActiveContainer::Furnace(window));
         }
         return Ok(());
     }

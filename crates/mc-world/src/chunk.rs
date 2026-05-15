@@ -56,6 +56,47 @@ pub struct BlockPos {
     pub z: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FurnaceSlot {
+    pub count: i32,
+    pub item_id: u32,
+    pub damage: Option<i32>,
+}
+
+impl FurnaceSlot {
+    pub const EMPTY: FurnaceSlot = FurnaceSlot {
+        count: 0,
+        item_id: 0,
+        damage: None,
+    };
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.count <= 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FurnaceBlockEntity {
+    pub slots: [FurnaceSlot; 3],
+    pub burn_remaining: i16,
+    pub burn_total: i16,
+    pub cook_progress: i16,
+    pub cook_total: i16,
+}
+
+impl Default for FurnaceBlockEntity {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| FurnaceSlot::EMPTY),
+            burn_remaining: 0,
+            burn_total: 1600,
+            cook_progress: 0,
+            cook_total: 200,
+        }
+    }
+}
+
 /// Biome storage for one section (4³ cells, palette of `Identifier`s).
 ///
 /// Almost every section in a generated world has a single biome, so
@@ -198,6 +239,8 @@ pub struct Chunk {
     /// opaque (raw Java-standard NBT bytes) until M3 needs typed
     /// access.
     pub block_entities: HashMap<BlockPos, Vec<u8>>,
+    /// Runtime-typed furnace state keyed by absolute world position.
+    pub furnaces: HashMap<BlockPos, FurnaceBlockEntity>,
     /// Vanilla generation status (`"full"`, `"biomes"`, `"structure_starts"`, …).
     pub status: String,
     /// Baked light arrays read from Anvil, one entry per
@@ -257,6 +300,7 @@ impl Chunk {
             heightmaps: HashMap::new(),
             highest_opaque: Heightmap::zeroed(),
             block_entities: HashMap::new(),
+            furnaces: HashMap::new(),
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
             extras: Vec::new(),
