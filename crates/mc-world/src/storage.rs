@@ -26,6 +26,7 @@ use crate::anvil::{
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BlockPos, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity, ScheduledBlockTick,
+    ScheduledFluidTick,
 };
 use crate::section::SECTION_DIM;
 
@@ -380,6 +381,63 @@ impl WorldStorage {
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
         Ok(chunk.drain_due_block_ticks(world_tick, max_ticks))
+    }
+
+    pub fn scheduled_fluid_ticks(
+        &mut self,
+        cpos: ChunkPos,
+    ) -> Result<Option<&[ScheduledFluidTick]>, WorldError> {
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(None);
+        }
+        let chunk = self
+            .cache
+            .get(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(Some(chunk.scheduled_fluid_ticks()))
+    }
+
+    pub fn schedule_fluid_tick(&mut self, tick: ScheduledFluidTick) -> Result<bool, WorldError> {
+        let cpos = chunk_pos_of(tick.pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(false);
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(chunk.schedule_fluid_tick(tick))
+    }
+
+    pub fn remove_scheduled_fluid_ticks_at(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Vec<ScheduledFluidTick>, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(chunk.remove_scheduled_fluid_ticks_at(pos))
+    }
+
+    pub fn drain_due_fluid_ticks(
+        &mut self,
+        cpos: ChunkPos,
+        world_tick: u64,
+        max_ticks: usize,
+    ) -> Result<Vec<ScheduledFluidTick>, WorldError> {
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(Vec::new());
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(chunk.drain_due_fluid_ticks(world_tick, max_ticks))
     }
 
     /// Insert a freshly generated chunk through the same cache/LRU path
@@ -787,6 +845,61 @@ mod tests {
         assert!(
             world
                 .scheduled_block_ticks(cpos)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn scheduled_fluid_ticks_are_chunk_scoped_runtime_state() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let fluid = mc_data::Identifier::parse("minecraft:water").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        assert!(
+            world
+                .schedule_fluid_tick(ScheduledFluidTick::new(pos, fluid.clone(), 20, 0))
+                .unwrap()
+        );
+        assert_eq!(world.dirty_count(), 1);
+        assert_eq!(
+            world.scheduled_fluid_ticks(cpos).unwrap().unwrap()[0].fluid,
+            fluid
+        );
+
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+        assert!(
+            world
+                .drain_due_fluid_ticks(cpos, 19, usize::MAX)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(world.dirty_count(), 0);
+
+        let due = world.drain_due_fluid_ticks(cpos, 20, usize::MAX).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].pos, pos);
+        assert_eq!(world.dirty_count(), 1);
+
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+        assert!(
+            world
+                .schedule_fluid_tick(ScheduledFluidTick::new(pos, fluid, 30, 0))
+                .unwrap()
+        );
+        let removed = world.remove_scheduled_fluid_ticks_at(pos).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(
+            world
+                .scheduled_fluid_ticks(cpos)
                 .unwrap()
                 .unwrap()
                 .is_empty()

@@ -65,6 +65,60 @@ pub struct ScheduledBlockTick {
     sequence: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledFluidTick {
+    pub pos: BlockPos,
+    pub fluid: Identifier,
+    pub trigger_tick: u64,
+    pub priority: i32,
+    sequence: u64,
+}
+
+impl ScheduledFluidTick {
+    #[must_use]
+    pub fn new(pos: BlockPos, fluid: Identifier, trigger_tick: u64, priority: i32) -> Self {
+        Self {
+            pos,
+            fluid,
+            trigger_tick,
+            priority,
+            sequence: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    pub(crate) fn from_storage(
+        pos: BlockPos,
+        fluid: Identifier,
+        trigger_tick: u64,
+        priority: i32,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            pos,
+            fluid,
+            trigger_tick,
+            priority,
+            sequence,
+        }
+    }
+
+    fn sort_key(&self) -> (u64, i32, u64) {
+        (self.trigger_tick, self.priority, self.sequence)
+    }
+
+    fn same_request(&self, other: &ScheduledFluidTick) -> bool {
+        self.pos == other.pos
+            && self.fluid == other.fluid
+            && self.trigger_tick == other.trigger_tick
+            && self.priority == other.priority
+    }
+}
+
 impl ScheduledBlockTick {
     #[must_use]
     pub fn new(pos: BlockPos, block: Identifier, trigger_tick: u64, priority: i32) -> Self {
@@ -300,6 +354,10 @@ pub struct Chunk {
     /// is wired in separately once the local 26.1.2 shape is verified.
     pub scheduled_block_ticks: Vec<ScheduledBlockTick>,
     next_scheduled_block_tick_sequence: u64,
+    /// Chunk-owned scheduled fluid ticks. Mirrors block tick ordering but is
+    /// kept separate because vanilla persists them under `fluid_ticks`.
+    pub scheduled_fluid_ticks: Vec<ScheduledFluidTick>,
+    next_scheduled_fluid_tick_sequence: u64,
     /// Vanilla generation status (`"full"`, `"biomes"`, `"structure_starts"`, …).
     pub status: String,
     /// Baked light arrays read from Anvil, one entry per
@@ -311,8 +369,7 @@ pub struct Chunk {
     pub section_lights: Vec<SectionLight>,
     /// Root-level NBT fields M5.c keeps for byte-stable round-trip
     /// through the Anvil codec without modelling them yet. Covers
-    /// what M2 dropped on decode: structures, `block_ticks`,
-    /// `fluid_ticks`, `PostProcessing`, `InhabitedTime`,
+    /// what M2 dropped on decode: structures, `PostProcessing`, `InhabitedTime`,
     /// `LastUpdate`, `DataVersion`, plus any future field whose key
     /// isn't in our modelled set. Order preserved from the original
     /// compound so a load-then-save produces a stable byte stream
@@ -362,6 +419,8 @@ impl Chunk {
             furnaces: HashMap::new(),
             scheduled_block_ticks: Vec::new(),
             next_scheduled_block_tick_sequence: 0,
+            scheduled_fluid_ticks: Vec::new(),
+            next_scheduled_fluid_tick_sequence: 0,
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
             extras: Vec::new(),
@@ -513,6 +572,76 @@ impl Chunk {
     }
 
     #[must_use]
+    pub fn scheduled_fluid_ticks(&self) -> &[ScheduledFluidTick] {
+        &self.scheduled_fluid_ticks
+    }
+
+    pub fn schedule_fluid_tick(&mut self, mut tick: ScheduledFluidTick) -> bool {
+        if !self.contains_block_pos(tick.pos)
+            || self
+                .scheduled_fluid_ticks
+                .iter()
+                .any(|existing| existing.same_request(&tick))
+        {
+            return false;
+        }
+        tick.sequence = self.next_scheduled_fluid_tick_sequence;
+        self.next_scheduled_fluid_tick_sequence =
+            self.next_scheduled_fluid_tick_sequence.wrapping_add(1);
+        self.scheduled_fluid_ticks.push(tick);
+        self.scheduled_fluid_ticks
+            .sort_by_key(ScheduledFluidTick::sort_key);
+        self.dirty = true;
+        true
+    }
+
+    pub(crate) fn load_scheduled_fluid_ticks(&mut self, mut ticks: Vec<ScheduledFluidTick>) {
+        ticks.sort_by_key(ScheduledFluidTick::sort_key);
+        self.next_scheduled_fluid_tick_sequence = ticks
+            .iter()
+            .map(ScheduledFluidTick::sequence)
+            .max()
+            .map_or(0, |sequence| sequence.wrapping_add(1));
+        self.scheduled_fluid_ticks = ticks;
+    }
+
+    pub fn remove_scheduled_fluid_ticks_at(&mut self, pos: BlockPos) -> Vec<ScheduledFluidTick> {
+        let before = self.scheduled_fluid_ticks.len();
+        let mut removed = Vec::new();
+        self.scheduled_fluid_ticks.retain(|tick| {
+            if tick.pos == pos {
+                removed.push(tick.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if self.scheduled_fluid_ticks.len() != before {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    pub fn drain_due_fluid_ticks(
+        &mut self,
+        world_tick: u64,
+        max_ticks: usize,
+    ) -> Vec<ScheduledFluidTick> {
+        if max_ticks == 0 {
+            return Vec::new();
+        }
+        let due_count = self
+            .scheduled_fluid_ticks
+            .partition_point(|tick| tick.trigger_tick <= world_tick)
+            .min(max_ticks);
+        if due_count == 0 {
+            return Vec::new();
+        }
+        self.dirty = true;
+        self.scheduled_fluid_ticks.drain(0..due_count).collect()
+    }
+
+    #[must_use]
     pub fn contains_block_pos(&self, pos: BlockPos) -> bool {
         pos.y >= MIN_Y
             && pos.y < MAX_Y
@@ -585,6 +714,9 @@ mod tests {
     }
     fn wheat() -> Identifier {
         Identifier::parse("minecraft:wheat").unwrap()
+    }
+    fn water() -> Identifier {
+        Identifier::parse("minecraft:water").unwrap()
     }
 
     #[test]
@@ -808,6 +940,91 @@ mod tests {
 
         c.dirty = false;
         assert!(c.remove_scheduled_block_ticks_at(pos).is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_fluid_ticks_drain_in_deterministic_order() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let pos_a = BlockPos { x: 1, y: 64, z: 1 };
+        let pos_b = BlockPos { x: 2, y: 64, z: 1 };
+        let pos_c = BlockPos { x: 3, y: 64, z: 1 };
+
+        assert!(c.schedule_fluid_tick(ScheduledFluidTick::new(pos_a, water(), 10, 0)));
+        assert!(c.schedule_fluid_tick(ScheduledFluidTick::new(pos_b, water(), 5, 0)));
+        assert!(c.schedule_fluid_tick(ScheduledFluidTick::new(pos_c, water(), 10, -1)));
+
+        c.dirty = false;
+        let due = c.drain_due_fluid_ticks(10, usize::MAX);
+
+        assert_eq!(
+            due.iter().map(|tick| tick.pos).collect::<Vec<_>>(),
+            vec![pos_b, pos_c, pos_a]
+        );
+        assert!(c.scheduled_fluid_ticks().is_empty());
+        assert!(c.dirty);
+    }
+
+    #[test]
+    fn scheduled_fluid_ticks_skip_duplicates_and_mark_dirty_only_on_change() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let tick = ScheduledFluidTick::new(BlockPos { x: 1, y: 64, z: 1 }, water(), 10, 0);
+
+        assert!(c.schedule_fluid_tick(tick.clone()));
+        c.dirty = false;
+        assert!(!c.schedule_fluid_tick(tick));
+        assert_eq!(c.scheduled_fluid_ticks().len(), 1);
+        assert!(!c.dirty);
+
+        assert!(c.drain_due_fluid_ticks(9, usize::MAX).is_empty());
+        assert!(!c.dirty);
+        assert!(c.drain_due_fluid_ticks(10, 0).is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_fluid_ticks_reject_positions_outside_chunk() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+
+        assert!(!c.schedule_fluid_tick(ScheduledFluidTick::new(
+            BlockPos { x: 16, y: 64, z: 1 },
+            water(),
+            10,
+            0,
+        )));
+        assert!(!c.schedule_fluid_tick(ScheduledFluidTick::new(
+            BlockPos {
+                x: 1,
+                y: MAX_Y,
+                z: 1,
+            },
+            water(),
+            10,
+            0,
+        )));
+        assert!(c.scheduled_fluid_ticks().is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_fluid_ticks_remove_by_position() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let pos = BlockPos { x: 1, y: 64, z: 1 };
+        let other = BlockPos { x: 2, y: 64, z: 1 };
+        assert!(c.schedule_fluid_tick(ScheduledFluidTick::new(pos, water(), 10, 0)));
+        assert!(c.schedule_fluid_tick(ScheduledFluidTick::new(other, water(), 10, 0)));
+
+        c.dirty = false;
+        let removed = c.remove_scheduled_fluid_ticks_at(pos);
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].pos, pos);
+        assert_eq!(c.scheduled_fluid_ticks().len(), 1);
+        assert_eq!(c.scheduled_fluid_ticks()[0].pos, other);
+        assert!(c.dirty);
+
+        c.dirty = false;
+        assert!(c.remove_scheduled_fluid_ticks_at(pos).is_empty());
         assert!(!c.dirty);
     }
 }

@@ -29,7 +29,8 @@ use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot,
-    Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, ScheduledBlockTick, SectionLight,
+    Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, ScheduledBlockTick,
+    ScheduledFluidTick, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
@@ -215,10 +216,13 @@ pub fn chunk_from_nbt_with_items(
     if let Some(block_ticks) = get_optional_list(root, "block_ticks")? {
         chunk.load_scheduled_block_ticks(decode_scheduled_block_ticks(block_ticks, 0)?);
     }
+    if let Some(fluid_ticks) = get_optional_list(root, "fluid_ticks")? {
+        chunk.load_scheduled_fluid_ticks(decode_scheduled_fluid_ticks(fluid_ticks, 0)?);
+    }
 
     // M5.c.2: capture every other root-level field verbatim so a
     // load → save round-trip preserves the unmodelled subset
-    // (PostProcessing, block_ticks, fluid_ticks, structures,
+    // (PostProcessing, structures,
     // InhabitedTime, LastUpdate, DataVersion, ...). Order is the
     // original compound's insertion order — vanilla doesn't require
     // any particular ordering, but stable ordering keeps byte-diff
@@ -244,6 +248,7 @@ const MODELLED_ROOT_KEYS: &[&str] = &[
     "Heightmaps",
     "block_entities",
     "block_ticks",
+    "fluid_ticks",
 ];
 
 fn decode_scheduled_block_ticks(
@@ -269,6 +274,37 @@ fn decode_scheduled_block_ticks(
                     z: get_int(tick, "z")?,
                 },
                 block,
+                current_tick + delay as u64,
+                get_int(tick, "p")?,
+                sequence as u64,
+            ))
+        })
+        .collect()
+}
+
+fn decode_scheduled_fluid_ticks(
+    list: &ListTag,
+    current_tick: u64,
+) -> Result<Vec<ScheduledFluidTick>, ChunkNbtError> {
+    list.elements
+        .iter()
+        .enumerate()
+        .map(|(sequence, tag)| {
+            let tick = expect_compound(tag, "fluid_ticks[]")?;
+            let fluid_name = get_string(tick, "i")?;
+            let fluid = Identifier::parse(fluid_name.clone())
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(fluid_name.clone()))?;
+            let delay = get_int(tick, "t")?;
+            if delay < 0 {
+                return Err(ChunkNbtError::NegativeTickDelay(delay));
+            }
+            Ok(ScheduledFluidTick::from_storage(
+                BlockPos {
+                    x: get_int(tick, "x")?,
+                    y: get_int(tick, "y")?,
+                    z: get_int(tick, "z")?,
+                },
+                fluid,
                 current_tick + delay as u64,
                 get_int(tick, "p")?,
                 sequence as u64,
@@ -513,9 +549,13 @@ pub fn chunk_to_nbt_with_items(
         "block_ticks".into(),
         encode_scheduled_block_ticks(&chunk.scheduled_block_ticks, 0)?,
     ));
+    root.push((
+        "fluid_ticks".into(),
+        encode_scheduled_fluid_ticks(&chunk.scheduled_fluid_ticks, 0)?,
+    ));
 
     // M5.c.2: re-emit every root-level field decode kept in
-    // `extras` (PostProcessing, block_ticks, fluid_ticks,
+    // `extras` (PostProcessing,
     // structures, InhabitedTime, LastUpdate, DataVersion, etc.).
     // Order is the decode-time insertion order so the round-trip
     // stays stable.
@@ -540,6 +580,35 @@ fn encode_scheduled_block_ticks(
         }
         elements.push(Tag::Compound(vec![
             ("i".into(), Tag::String(tick.block.as_str().to_string())),
+            ("x".into(), Tag::Int(tick.pos.x)),
+            ("y".into(), Tag::Int(tick.pos.y)),
+            ("z".into(), Tag::Int(tick.pos.z)),
+            ("t".into(), Tag::Int(delay as i32)),
+            ("p".into(), Tag::Int(tick.priority)),
+        ]));
+    }
+    Ok(Tag::List(ListTag {
+        element_type: if elements.is_empty() {
+            tag_type::END
+        } else {
+            tag_type::COMPOUND
+        },
+        elements,
+    }))
+}
+
+fn encode_scheduled_fluid_ticks(
+    ticks: &[ScheduledFluidTick],
+    current_tick: u64,
+) -> Result<Tag, ChunkNbtError> {
+    let mut elements = Vec::with_capacity(ticks.len());
+    for tick in ticks {
+        let delay = tick.trigger_tick.saturating_sub(current_tick);
+        if delay > i32::MAX as u64 {
+            return Err(ChunkNbtError::TickDelayOutOfRange(delay));
+        }
+        elements.push(Tag::Compound(vec![
+            ("i".into(), Tag::String(tick.fluid.as_str().to_string())),
             ("x".into(), Tag::Int(tick.pos.x)),
             ("y".into(), Tag::Int(tick.pos.y)),
             ("z".into(), Tag::Int(tick.pos.z)),
@@ -1021,6 +1090,12 @@ mod tests {
                 "scheduled block ticks in {:?}",
                 chunk1.pos
             );
+            assert_eq!(
+                chunk1.scheduled_fluid_ticks(),
+                chunk2.scheduled_fluid_ticks(),
+                "scheduled fluid ticks in {:?}",
+                chunk1.pos
+            );
 
             // M5.c.2: extras must round-trip key-and-value.
             assert_eq!(
@@ -1321,7 +1396,34 @@ mod tests {
     }
 
     #[test]
-    fn block_ticks_is_modelled_and_fluid_ticks_stays_extra() {
+    fn decodes_scheduled_fluid_ticks_from_fluid_ticks() {
+        let mut root = build_chunk_root_with_sections(Vec::new());
+        add_root_field(
+            &mut root,
+            "fluid_ticks",
+            scheduled_tick_list(vec![
+                scheduled_tick_tag("minecraft:water", 2, 64, 2, 5, 0),
+                scheduled_tick_tag("minecraft:lava", 1, 64, 1, 5, 0),
+                scheduled_tick_tag("minecraft:water", 3, 64, 3, 1, 1),
+            ]),
+        );
+
+        let mut chunk = chunk_from_nbt(&root, &tiny_registry()).expect("decode");
+        let ticks = chunk.scheduled_fluid_ticks();
+        assert_eq!(ticks.len(), 3);
+        assert_eq!(ticks[0].trigger_tick, 1);
+        assert_eq!(ticks[0].priority, 1);
+        assert_eq!(ticks[0].fluid.as_str(), "minecraft:water");
+
+        let due = chunk.drain_due_fluid_ticks(5, usize::MAX);
+        assert_eq!(
+            due.iter().map(|tick| tick.pos.x).collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+
+    #[test]
+    fn block_and_fluid_ticks_are_modelled_not_extras() {
         let mut root = build_chunk_root_with_sections(Vec::new());
         add_root_field(
             &mut root,
@@ -1337,8 +1439,9 @@ mod tests {
         let chunk = chunk_from_nbt(&root, &tiny_registry()).expect("decode");
 
         assert_eq!(chunk.scheduled_block_ticks().len(), 1);
+        assert_eq!(chunk.scheduled_fluid_ticks().len(), 1);
         assert!(!chunk.extras.iter().any(|(key, _)| key == "block_ticks"));
-        assert!(chunk.extras.iter().any(|(key, _)| key == "fluid_ticks"));
+        assert!(!chunk.extras.iter().any(|(key, _)| key == "fluid_ticks"));
     }
 
     #[test]
@@ -1375,23 +1478,57 @@ mod tests {
     }
 
     #[test]
-    fn scheduled_block_ticks_round_trip_through_disk() {
+    fn encodes_scheduled_fluid_ticks_without_duplicate_root_key() {
         let registry = tiny_registry();
         let mut chunk = Chunk::empty(
             ChunkPos { x: 0, z: 0 },
             BlockStateId(0),
             Identifier::parse("minecraft:plains").unwrap(),
         );
-        let fluid_ticks =
-            scheduled_tick_list(vec![scheduled_tick_tag("minecraft:water", 1, 64, 1, 2, 0)]);
-        chunk
-            .extras
-            .push(("fluid_ticks".into(), fluid_ticks.clone()));
+        assert!(chunk.schedule_fluid_tick(ScheduledFluidTick::new(
+            BlockPos { x: 1, y: 64, z: 1 },
+            Identifier::parse("minecraft:water").unwrap(),
+            7,
+            -1,
+        )));
+        chunk.extras.push((
+            "fluid_ticks".into(),
+            scheduled_tick_list(vec![scheduled_tick_tag("minecraft:lava", 2, 64, 2, 1, 0)]),
+        ));
+
+        let root = chunk_to_nbt(&chunk, &registry).expect("encode");
+        let fluid_tick_fields: Vec<&Tag> = root_fields(&root)
+            .iter()
+            .filter_map(|(key, value)| (key == "fluid_ticks").then_some(value))
+            .collect();
+
+        assert_eq!(fluid_tick_fields.len(), 1);
+        let Tag::List(list) = fluid_tick_fields[0] else {
+            panic!("fluid_ticks must encode as list");
+        };
+        assert_eq!(list.element_type, tag_type::COMPOUND);
+        assert_eq!(list.elements.len(), 1);
+    }
+
+    #[test]
+    fn scheduled_ticks_round_trip_through_disk() {
+        let registry = tiny_registry();
+        let mut chunk = Chunk::empty(
+            ChunkPos { x: 0, z: 0 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
         assert!(chunk.schedule_block_tick(ScheduledBlockTick::new(
             BlockPos { x: 1, y: 64, z: 1 },
             Identifier::parse("minecraft:stone").unwrap(),
             12,
             0,
+        )));
+        assert!(chunk.schedule_fluid_tick(ScheduledFluidTick::new(
+            BlockPos { x: 2, y: 64, z: 2 },
+            Identifier::parse("minecraft:water").unwrap(),
+            8,
+            -1,
         )));
 
         let payload = chunk_to_payload(&chunk, &registry, 1_700_000_001).unwrap();
@@ -1405,12 +1542,10 @@ mod tests {
         assert_eq!(decoded.scheduled_block_ticks().len(), 1);
         assert_eq!(decoded.scheduled_block_ticks()[0].trigger_tick, 12);
         assert_eq!(decoded.scheduled_block_ticks()[0].priority, 0);
-        assert!(
-            decoded
-                .extras
-                .iter()
-                .any(|(key, value)| key == "fluid_ticks" && value == &fluid_ticks)
-        );
+        assert_eq!(decoded.scheduled_fluid_ticks().len(), 1);
+        assert_eq!(decoded.scheduled_fluid_ticks()[0].trigger_tick, 8);
+        assert_eq!(decoded.scheduled_fluid_ticks()[0].priority, -1);
+        assert!(!decoded.extras.iter().any(|(key, _)| key == "fluid_ticks"));
     }
 
     #[test]
@@ -1420,6 +1555,21 @@ mod tests {
             &mut root,
             "block_ticks",
             scheduled_tick_list(vec![scheduled_tick_tag("minecraft:stone", 1, 64, 1, -1, 0)]),
+        );
+
+        match chunk_from_nbt(&root, &tiny_registry()) {
+            Err(ChunkNbtError::NegativeTickDelay(-1)) => {}
+            other => panic!("expected NegativeTickDelay, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_negative_scheduled_fluid_tick_delay() {
+        let mut root = build_chunk_root_with_sections(Vec::new());
+        add_root_field(
+            &mut root,
+            "fluid_ticks",
+            scheduled_tick_list(vec![scheduled_tick_tag("minecraft:water", 1, 64, 1, -1, 0)]),
         );
 
         match chunk_from_nbt(&root, &tiny_registry()) {
