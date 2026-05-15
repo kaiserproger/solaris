@@ -104,6 +104,7 @@ const FURNACE_CONTAINER_ID_MAX: i32 = 100;
 const FURNACE_MENU_SLOT_COUNT: usize = 39;
 const FURNACE_FUEL_TICKS: i16 = 1600;
 const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
+const DEFAULT_FOOD_USE_DURATION: Duration = Duration::from_millis(1_600);
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -1638,6 +1639,7 @@ where
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
             pending_break: None,
+            pending_use: None,
         });
         play_loop(
             reader,
@@ -1708,6 +1710,7 @@ struct InteractionState {
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
+    pending_use: Option<PendingUse>,
 }
 
 #[derive(Debug, Clone)]
@@ -1769,6 +1772,15 @@ struct PendingBreak {
     required_time: Duration,
     held_hotbar_slot: u8,
     held_item_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingUse {
+    started_at: Instant,
+    required_time: Duration,
+    held_hotbar_slot: u8,
+    held_item_id: u32,
+    rule: FoodRule,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3528,15 +3540,25 @@ fn food_rule_for_item(item: &mc_data::Identifier) -> Option<FoodRule> {
         .find(|rule| item.as_str() == rule.item)
 }
 
-fn held_food_rule(state: &InteractionState) -> Option<FoodRule> {
+fn held_food_use(state: &InteractionState) -> Option<(u32, FoodRule)> {
     let held = state.inventory.held(state.selected_hotbar_slot);
     if held.is_empty() {
         return None;
     }
-    state
+    let rule = state
         .items
         .name_of(held.item_id)
-        .and_then(food_rule_for_item)
+        .and_then(food_rule_for_item)?;
+    Some((held.item_id, rule))
+}
+
+fn pending_use_matches(state: &InteractionState, pending: &PendingUse) -> bool {
+    pending.held_hotbar_slot == state.selected_hotbar_slot
+        && state.inventory.held(pending.held_hotbar_slot).item_id == pending.held_item_id
+}
+
+fn pending_use_is_complete(pending: &PendingUse, now: Instant) -> bool {
+    now.duration_since(pending.started_at) >= pending.required_time
 }
 
 fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
@@ -4492,6 +4514,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     state.pending_break = None;
+    state.pending_use = None;
     if packet.container_id != 0 {
         debug!(
             container_id = packet.container_id,
@@ -5188,6 +5211,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     state.pending_break = None;
+    state.pending_use = None;
     if game_mode == GameMode::Spectator
         || matches!(game_mode, GameMode::Survival | GameMode::Adventure) && survival_state.is_dead()
     {
@@ -5470,6 +5494,10 @@ where
             | PlayerActionKind::AbortDestroyBlock
             | PlayerActionKind::StopDestroyBlock
     );
+    if matches!(action.action, PlayerActionKind::ReleaseUseItem) {
+        state.pending_use = None;
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
     if !is_destroy {
         // DROP_*, RELEASE_USE_ITEM, SWAP_ITEM_WITH_OFFHAND, STAB —
         // all out of scope for M5. Ack so the client doesn't hang
@@ -5485,6 +5513,7 @@ where
 
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         state.pending_break = None;
+        state.pending_use = None;
         debug!(
             sequence = action.sequence,
             "survival block break ignored for dead player"
@@ -5496,6 +5525,7 @@ where
         && !within_block_reach(player_pose, action.position, game_mode)
     {
         state.pending_break = None;
+        state.pending_use = None;
         debug!(
             sequence = action.sequence,
             "survival block break ignored: target out of reach"
@@ -5506,6 +5536,7 @@ where
     match game_mode {
         GameMode::Creative => {
             state.pending_break = None;
+            state.pending_use = None;
             if matches!(action.action, PlayerActionKind::AbortDestroyBlock) {
                 return write_block_ack(writer, state.compression, action.sequence).await;
             }
@@ -5570,6 +5601,7 @@ where
         },
         GameMode::Adventure | GameMode::Spectator => {
             state.pending_break = None;
+            state.pending_use = None;
             debug!(
                 mode = ?game_mode,
                 sequence = action.sequence,
@@ -6038,6 +6070,7 @@ async fn handle_use_item_on<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    state.pending_use = None;
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         debug!(
             sequence = action.sequence,
@@ -6211,11 +6244,38 @@ where
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
-    let Some(rule) = held_food_rule(state) else {
+    let Some((held_item_id, rule)) = held_food_use(state) else {
         return write_block_ack(writer, state.compression, action.sequence).await;
     };
 
-    survival_state.add_food(rule.food, rule.saturation);
+    state.pending_break = None;
+    state.pending_use = Some(PendingUse {
+        started_at: Instant::now(),
+        required_time: DEFAULT_FOOD_USE_DURATION,
+        held_hotbar_slot: state.selected_hotbar_slot,
+        held_item_id,
+        rule,
+    });
+    write_block_ack(writer, state.compression, action.sequence).await
+}
+
+async fn complete_food_use<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    survival_state: &mut SurvivalState,
+    pending: PendingUse,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if survival_state.is_dead()
+        || survival_state.food >= SurvivalState::MAX_FOOD
+        || !pending_use_matches(state, &pending)
+    {
+        return Ok(());
+    }
+
+    survival_state.add_food(pending.rule.food, pending.rule.saturation);
     let held_slot = state.selected_hotbar_slot;
     {
         let held = state.inventory.held_mut(held_slot);
@@ -6227,8 +6287,34 @@ where
     let slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
     let slot_value = state.inventory.held(held_slot).clone();
     write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
-    write_packet(writer, &survival_state.as_packet(), state.compression).await?;
-    write_block_ack(writer, state.compression, action.sequence).await
+    write_packet(writer, &survival_state.as_packet(), state.compression).await
+}
+
+async fn tick_pending_use<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: &mut SurvivalState,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if game_mode != GameMode::Survival {
+        state.pending_use = None;
+        return Ok(());
+    }
+    let Some(pending) = state.pending_use else {
+        return Ok(());
+    };
+    if survival_state.is_dead() || !pending_use_matches(state, &pending) {
+        state.pending_use = None;
+        return Ok(());
+    }
+    if pending_use_is_complete(&pending, Instant::now()) {
+        state.pending_use = None;
+        complete_food_use(state, writer, survival_state, pending).await?;
+    }
+    Ok(())
 }
 
 async fn replan_after_movement<W>(
@@ -6802,6 +6888,7 @@ where
                             && let Some(state) = interaction.as_deref_mut()
                         {
                             state.pending_break = None;
+                            state.pending_use = None;
                         }
                         write_packet(writer, &survival_state.as_packet(), compression).await?;
                     }
@@ -6810,6 +6897,7 @@ where
             _ = furnace_ticker.tick() => {
                 if let Some(state) = interaction.as_deref_mut() {
                     tick_active_container(state, writer).await?;
+                    tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                 }
             }
             result = read_frame(reader, buf, compression) => {
@@ -6996,6 +7084,7 @@ where
                     let slot = pick.slot.clamp(0, 8) as u8;
                     if let Some(state) = interaction.as_deref_mut() {
                         state.pending_break = None;
+                        state.pending_use = None;
                         state.selected_hotbar_slot = slot;
                         debug!(slot, "hotbar selection updated");
                     }
@@ -7020,6 +7109,7 @@ where
                     if let Some(mode) = parse_gamemode_command(&command.command) {
                         if let Some(state) = interaction.as_deref_mut() {
                             state.pending_break = None;
+                            state.pending_use = None;
                         }
                         apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
                     } else if let Some(command) = parse_debug_command(&command.command) {
@@ -7039,6 +7129,7 @@ where
                     let command = ServerboundChangeGameMode::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
                         state.pending_break = None;
+                        state.pending_use = None;
                     }
                     apply_game_mode(writer, compression, &mut game_mode, command.mode, permissions).await?;
                 } else {
