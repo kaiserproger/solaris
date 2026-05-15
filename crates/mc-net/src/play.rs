@@ -1806,7 +1806,7 @@ struct PendingUse {
     required_time: Duration,
     held_hotbar_slot: u8,
     held_item_id: u32,
-    rule: FoodRule,
+    rule: mc_data::food::FoodEntry,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1846,30 +1846,10 @@ const UNKNOWN_BLOCK_MINING_RULE: MiningRule = MiningRule {
 };
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct FoodRule {
-    item: &'static str,
-    food: i32,
-    saturation: f32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
 struct ArmorStats {
     armor: f32,
     toughness: f32,
 }
-
-const FALLBACK_FOOD_RULES: &[FoodRule] = &[
-    FoodRule {
-        item: "minecraft:apple",
-        food: 4,
-        saturation: 2.4,
-    },
-    FoodRule {
-        item: "minecraft:bread",
-        food: 5,
-        saturation: 6.0,
-    },
-];
 
 /// 46-slot player inventory (window 0).
 ///
@@ -3614,14 +3594,11 @@ fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Opti
     Some(ItemStack::new(item_id, 1))
 }
 
-fn food_rule_for_item(item: &mc_data::Identifier) -> Option<FoodRule> {
-    FALLBACK_FOOD_RULES
-        .iter()
-        .copied()
-        .find(|rule| item.as_str() == rule.item)
+fn food_rule_for_item(item: &mc_data::Identifier) -> Option<mc_data::food::FoodEntry> {
+    mc_data::food::builtin().entry(item).copied()
 }
 
-fn held_food_use(state: &InteractionState) -> Option<(u32, FoodRule)> {
+fn held_food_use(state: &InteractionState) -> Option<(u32, mc_data::food::FoodEntry)> {
     let held = state.inventory.held(state.selected_hotbar_slot);
     if held.is_empty() {
         return None;
@@ -8009,8 +7986,7 @@ mod tests {
     fn fallback_food_rules_include_common_edibles() {
         assert_eq!(
             food_rule_for_item(&mc_data::Identifier::parse("minecraft:apple").unwrap()),
-            Some(FoodRule {
-                item: "minecraft:apple",
+            Some(mc_data::food::FoodEntry {
                 food: 4,
                 saturation: 2.4,
             })

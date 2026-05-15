@@ -34,6 +34,7 @@ pub mod biomes;
 pub mod block_light;
 pub mod blocks;
 pub mod entity_types;
+pub mod food;
 pub mod identifier;
 pub mod items;
 pub mod loot;

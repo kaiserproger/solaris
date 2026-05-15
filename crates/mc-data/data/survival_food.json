@@ -1,0 +1,12 @@
+{
+  "items": {
+    "minecraft:apple": {
+      "food": 4,
+      "saturation": 2.4
+    },
+    "minecraft:bread": {
+      "food": 5,
+      "saturation": 6.0
+    }
+  }
+}
