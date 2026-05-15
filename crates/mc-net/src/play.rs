@@ -1961,7 +1961,11 @@ impl PlayerInventory {
         self.slots[Self::HOTBAR_BASE + hotbar_slot as usize] = stack;
     }
 
-    fn merge_stack(&mut self, mut stack: ItemStack) -> (ItemStack, Vec<(usize, ItemStack)>) {
+    fn merge_stack(
+        &mut self,
+        mut stack: ItemStack,
+        max_stack: i32,
+    ) -> (ItemStack, Vec<(usize, ItemStack)>) {
         let mut changed = Vec::new();
         if stack.is_empty() {
             return (ItemStack::EMPTY, changed);
@@ -1972,11 +1976,11 @@ impl PlayerInventory {
             if current.is_empty()
                 || current.item_id != stack.item_id
                 || current.damage != stack.damage
-                || current.count >= 64
+                || current.count >= max_stack
             {
                 continue;
             }
-            let moved = (64 - current.count).min(stack.count);
+            let moved = (max_stack - current.count).min(stack.count);
             current.count += moved;
             stack.count -= moved;
             changed.push((slot, current.clone()));
@@ -1989,7 +1993,7 @@ impl PlayerInventory {
             if !self.slots[slot].is_empty() {
                 continue;
             }
-            let moved = stack.count.min(64);
+            let moved = stack.count.min(max_stack);
             let mut moved_stack = stack.clone();
             moved_stack.count = moved;
             self.slots[slot] = moved_stack;
@@ -2003,7 +2007,11 @@ impl PlayerInventory {
         (stack, changed)
     }
 
-    fn merge_pickup_stack(&mut self, mut stack: ItemStack) -> (ItemStack, Vec<(usize, ItemStack)>) {
+    fn merge_pickup_stack(
+        &mut self,
+        mut stack: ItemStack,
+        max_stack: i32,
+    ) -> (ItemStack, Vec<(usize, ItemStack)>) {
         let mut changed = Vec::new();
         if stack.is_empty() {
             return (ItemStack::EMPTY, changed);
@@ -2014,11 +2022,11 @@ impl PlayerInventory {
             if current.is_empty()
                 || current.item_id != stack.item_id
                 || current.damage != stack.damage
-                || current.count >= 64
+                || current.count >= max_stack
             {
                 continue;
             }
-            let moved = (64 - current.count).min(stack.count);
+            let moved = (max_stack - current.count).min(stack.count);
             current.count += moved;
             stack.count -= moved;
             changed.push((slot, current.clone()));
@@ -2031,7 +2039,7 @@ impl PlayerInventory {
             if !self.slots[slot].is_empty() {
                 continue;
             }
-            let moved = stack.count.min(64);
+            let moved = stack.count.min(max_stack);
             let mut moved_stack = stack.clone();
             moved_stack.count = moved;
             self.slots[slot] = moved_stack;
@@ -2046,7 +2054,7 @@ impl PlayerInventory {
             if !self.slots[slot].is_empty() {
                 continue;
             }
-            let moved = stack.count.min(64);
+            let moved = stack.count.min(max_stack);
             let mut moved_stack = stack.clone();
             moved_stack.count = moved;
             self.slots[slot] = moved_stack;
@@ -2116,13 +2124,20 @@ fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
         && left.damage == right.damage
 }
 
-fn item_max_stack(items: &ItemRegistry, stack: &ItemStack) -> i32 {
+fn item_max_stack(item_facts: &ItemFactsTable, items: &ItemRegistry, stack: &ItemStack) -> i32 {
     if stack.is_empty() || stack.damage.is_some() {
         return 1;
     }
     let Some(name) = items.name_of(stack.item_id) else {
         return 64;
     };
+    if let Some(max_stack) = item_facts
+        .get(name)
+        .and_then(|facts| facts.max_stack_size)
+        .and_then(|value| i32::try_from(value).ok())
+    {
+        return max_stack.max(1);
+    }
     let path = name.path();
     if max_tool_damage_for_path(path).is_some()
         || matches!(
@@ -3976,12 +3991,20 @@ fn ingredient_alternative_accepts_item(
 
 fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: i32) -> bool {
     let mut remaining = count;
+    let max_stack = item_max_stack(
+        &state.item_facts,
+        &state.items,
+        &ItemStack::new(item_id, count),
+    );
     for slot in 9..=44 {
         let current = &state.inventory.slots[slot];
         if current.is_empty() {
-            remaining -= remaining.min(64);
-        } else if current.item_id == item_id && current.damage.is_none() && current.count < 64 {
-            remaining -= remaining.min(64 - current.count);
+            remaining -= remaining.min(max_stack);
+        } else if current.item_id == item_id
+            && current.damage.is_none()
+            && current.count < max_stack
+        {
+            remaining -= remaining.min(max_stack - current.count);
         }
         if remaining <= 0 {
             return true;
@@ -4022,9 +4045,9 @@ fn craft_recipe_once(
         changed.insert(slot, current.clone());
     }
 
-    let (remaining, output_changed) = state
-        .inventory
-        .merge_stack(ItemStack::new(output_item_id, output_count));
+    let output = ItemStack::new(output_item_id, output_count);
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &output);
+    let (remaining, output_changed) = state.inventory.merge_stack(output, max_stack);
     if !remaining.is_empty() {
         return None;
     }
@@ -4133,7 +4156,8 @@ fn store_active_container(state: &mut InteractionState) {
         }
         Some(ActiveContainer::CraftingTable(window)) => {
             for stack in window.input {
-                let (remaining, _) = state.inventory.merge_stack(stack);
+                let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
+                let (remaining, _) = state.inventory.merge_stack(stack, max_stack);
                 if !remaining.is_empty() {
                     debug!(
                         item_id = remaining.item_id,
@@ -4359,7 +4383,8 @@ fn consume_crafting_ingredients(state: &mut InteractionState, window: &mut Craft
             window.input[idx] =
                 crafting_remainder_for_item(state, item_id).unwrap_or(ItemStack::EMPTY);
         } else if let Some(remainder) = crafting_remainder_for_item(state, item_id) {
-            let (remaining, _) = state.inventory.merge_stack(remainder);
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &remainder);
+            let (remaining, _) = state.inventory.merge_stack(remainder, max_stack);
             if !remaining.is_empty() {
                 debug!(
                     item_id = remaining.item_id,
@@ -4377,7 +4402,7 @@ fn take_crafting_result(state: &mut InteractionState, window: &mut CraftingTable
     if result.is_empty() {
         return false;
     }
-    let max_stack = item_max_stack(&state.items, &result);
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
     if state.carried_item.is_empty() {
         state.carried_item = result;
         consume_crafting_ingredients(state, window);
@@ -4410,9 +4435,9 @@ fn apply_crafting_pickup_click(
     };
     let cursor = state.carried_item.clone();
     let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.items, &slot_stack)
+        item_max_stack(&state.item_facts, &state.items, &slot_stack)
     } else {
-        item_max_stack(&state.items, &cursor)
+        item_max_stack(&state.item_facts, &state.items, &cursor)
     };
 
     let changed = if button == 0 {
@@ -4486,7 +4511,8 @@ fn apply_crafting_quick_move_click(
         if result.is_empty() {
             return false;
         }
-        let (remaining, _) = state.inventory.merge_stack(result.clone());
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
+        let (remaining, _) = state.inventory.merge_stack(result.clone(), max_stack);
         if !remaining.is_empty() {
             return false;
         }
@@ -4504,7 +4530,7 @@ fn apply_crafting_quick_move_click(
     let remaining = state.inventory.merge_stack_into_ranges(
         original.clone(),
         &[9..=35, 36..=44],
-        item_max_stack(&state.items, &original),
+        item_max_stack(&state.item_facts, &state.items, &original),
     );
     state.inventory.slots[player_slot] = remaining;
     state.inventory.slots[player_slot] != original
@@ -4891,9 +4917,9 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
             state.inventory.slots[slot] = std::mem::take(&mut state.carried_item);
         } else if can_stack(&slot_stack, &cursor)
             && can_place_in_player_slot(state, slot, &cursor)
-            && slot_stack.count < item_max_stack(&state.items, &cursor)
+            && slot_stack.count < item_max_stack(&state.item_facts, &state.items, &cursor)
         {
-            let max_stack = item_max_stack(&state.items, &cursor);
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &cursor);
             let moved =
                 (max_stack - state.inventory.slots[slot].count).min(state.carried_item.count);
             if moved <= 0 {
@@ -4930,7 +4956,7 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
         decrement_cursor(&mut state.carried_item);
     } else if can_stack(&slot_stack, &cursor)
         && can_place_in_player_slot(state, slot, &cursor)
-        && slot_stack.count < item_max_stack(&state.items, &cursor)
+        && slot_stack.count < item_max_stack(&state.item_facts, &state.items, &cursor)
     {
         state.inventory.slots[slot].count += 1;
         decrement_cursor(&mut state.carried_item);
@@ -4957,7 +4983,7 @@ fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
     }
 
     let original = state.inventory.slots[slot].clone();
-    let max_stack = item_max_stack(&state.items, &original);
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &original);
     if !(5..=8).contains(&slot)
         && let Some(entry) = armor_entry_for_item(&state.items, original.item_id)
     {
@@ -5060,9 +5086,9 @@ fn apply_furnace_pickup_click(
     };
     let cursor = state.carried_item.clone();
     let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.items, &slot_stack)
+        item_max_stack(&state.item_facts, &state.items, &slot_stack)
     } else {
-        item_max_stack(&state.items, &cursor)
+        item_max_stack(&state.item_facts, &state.items, &cursor)
     };
 
     if menu_slot == 2 && !slot_stack.is_empty() {
@@ -5165,7 +5191,7 @@ fn merge_stack_into_furnace_slot(
         return stack;
     }
     let target = &mut furnace.slots[menu_slot];
-    let max_stack = item_max_stack(&state.items, &stack);
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
     if target.is_empty() {
         let moved = stack.count.min(max_stack);
         let mut moved_stack = stack.clone();
@@ -5207,7 +5233,8 @@ fn apply_furnace_quick_move_click(
             if original.is_empty() {
                 return false;
             }
-            let (remaining, _) = state.inventory.merge_stack(original.clone());
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &original);
+            let (remaining, _) = state.inventory.merge_stack(original.clone(), max_stack);
             furnace.slots[menu_slot] = stack_to_furnace_slot(&remaining);
             remaining != original
         }
@@ -5572,9 +5599,9 @@ where
             continue;
         };
         let original_count = stack.count;
-        let (remaining, changed) = state
-            .inventory
-            .merge_pickup_stack(ItemStack::new(stack.item_id, stack.count));
+        let stack = ItemStack::new(stack.item_id, stack.count);
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
+        let (remaining, changed) = state.inventory.merge_pickup_stack(stack, max_stack);
         if changed.is_empty() {
             continue;
         }
@@ -9871,7 +9898,7 @@ mod tests {
         let mut inventory = PlayerInventory::empty();
         inventory.slots[10] = ItemStack::new(42, 63);
 
-        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 3));
+        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 3), 64);
 
         assert!(remaining.is_empty());
         assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
@@ -9884,7 +9911,7 @@ mod tests {
         let mut inventory = PlayerInventory::empty();
         inventory.slots[10] = ItemStack::new(42, 1).with_damage(1);
 
-        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 1).with_damage(2));
+        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 1).with_damage(2), 1);
 
         assert!(remaining.is_empty());
         assert_eq!(inventory.slots[10], ItemStack::new(42, 1).with_damage(1));
@@ -9896,7 +9923,7 @@ mod tests {
     fn pickup_merge_prefers_hotbar_for_new_stacks() {
         let mut inventory = PlayerInventory::empty();
 
-        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3));
+        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3), 64);
 
         assert!(remaining.is_empty());
         assert_eq!(inventory.slots[36], ItemStack::new(42, 3));
@@ -9908,7 +9935,7 @@ mod tests {
         let mut inventory = PlayerInventory::empty();
         inventory.slots[10] = ItemStack::new(42, 63);
 
-        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3));
+        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3), 64);
 
         assert!(remaining.is_empty());
         assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
@@ -10211,6 +10238,38 @@ mod tests {
                 },
                 Duration::from_millis(500),
             ))
+        );
+    }
+
+    #[test]
+    fn item_max_stack_prefers_component_facts() {
+        use mc_data::items::ItemReport;
+
+        let ender_pearl = mc_data::Identifier::parse("minecraft:ender_pearl").unwrap();
+        let stone = mc_data::Identifier::parse("minecraft:stone").unwrap();
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: ender_pearl.clone(),
+                protocol_id: 1,
+            },
+            ItemReport {
+                id: stone.clone(),
+                protocol_id: 2,
+            },
+        ]);
+        let facts = ItemFactsTable::from_entries([(
+            ender_pearl,
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(16),
+                ..Default::default()
+            },
+        )]);
+
+        assert_eq!(item_max_stack(&facts, &items, &ItemStack::new(1, 1)), 16);
+        assert_eq!(item_max_stack(&facts, &items, &ItemStack::new(2, 1)), 64);
+        assert_eq!(
+            item_max_stack(&facts, &items, &ItemStack::new(1, 1).with_damage(3)),
+            1
         );
     }
 
