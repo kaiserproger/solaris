@@ -82,6 +82,22 @@ impl ScheduledBlockTick {
         self.sequence
     }
 
+    pub(crate) fn from_storage(
+        pos: BlockPos,
+        block: Identifier,
+        trigger_tick: u64,
+        priority: i32,
+        sequence: u64,
+    ) -> Self {
+        Self {
+            pos,
+            block,
+            trigger_tick,
+            priority,
+            sequence,
+        }
+    }
+
     fn sort_key(&self) -> (u64, i32, u64) {
         (self.trigger_tick, self.priority, self.sequence)
     }
@@ -448,6 +464,16 @@ impl Chunk {
             .sort_by_key(ScheduledBlockTick::sort_key);
         self.dirty = true;
         true
+    }
+
+    pub(crate) fn load_scheduled_block_ticks(&mut self, mut ticks: Vec<ScheduledBlockTick>) {
+        ticks.sort_by_key(ScheduledBlockTick::sort_key);
+        self.next_scheduled_block_tick_sequence = ticks
+            .iter()
+            .map(ScheduledBlockTick::sequence)
+            .max()
+            .map_or(0, |sequence| sequence.wrapping_add(1));
+        self.scheduled_block_ticks = ticks;
     }
 
     pub fn remove_scheduled_block_ticks_at(&mut self, pos: BlockPos) -> Vec<ScheduledBlockTick> {
