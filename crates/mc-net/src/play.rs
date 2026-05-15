@@ -96,6 +96,8 @@ const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
+const CRAFTING_MENU_TYPE_ID: i32 = 12;
+const CRAFTING_MENU_SLOT_COUNT: usize = 46;
 const FURNACE_MENU_TYPE_ID: i32 = 14;
 const FURNACE_CONTAINER_ID_MIN: i32 = 1;
 const FURNACE_CONTAINER_ID_MAX: i32 = 100;
@@ -1710,13 +1712,34 @@ struct InteractionState {
 
 #[derive(Debug, Clone)]
 enum ActiveContainer {
+    CraftingTable(CraftingTableWindow),
     Furnace(FurnaceWindow),
 }
 
 impl ActiveContainer {
     fn container_id(&self) -> i32 {
         match self {
+            Self::CraftingTable(window) => window.container_id,
             Self::Furnace(window) => window.container_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CraftingTableWindow {
+    container_id: i32,
+    state_id: i32,
+    input: [ItemStack; 9],
+    result: ItemStack,
+}
+
+impl CraftingTableWindow {
+    fn new(container_id: i32) -> Self {
+        Self {
+            container_id,
+            state_id: 1,
+            input: std::array::from_fn(|_| ItemStack::EMPTY),
+            result: ItemStack::EMPTY,
         }
     }
 }
@@ -3760,6 +3783,13 @@ fn is_furnace_state(state: &InteractionState, block_state: mc_world::BlockStateI
         .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:furnace")
 }
 
+fn is_crafting_table_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
+    state
+        .blocks
+        .by_id(block_state)
+        .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:crafting_table")
+}
+
 fn find_smelting_recipe_for_item(
     state: &InteractionState,
     item_id: u32,
@@ -3796,6 +3826,19 @@ fn furnace_menu_title_nbt() -> Vec<u8> {
     out
 }
 
+fn crafting_menu_title_nbt() -> Vec<u8> {
+    let mut out = Vec::new();
+    mc_nbt::write_network(
+        &mut out,
+        &Tag::Compound(vec![(
+            "text".to_string(),
+            Tag::String("Crafting".to_string()),
+        )]),
+    )
+    .expect("static text component is valid NBT");
+    out
+}
+
 fn next_container_id(state: &mut InteractionState) -> i32 {
     let id = state.next_container_id;
     state.next_container_id += 1;
@@ -3806,11 +3849,463 @@ fn next_container_id(state: &mut InteractionState) -> i32 {
 }
 
 fn store_active_container(state: &mut InteractionState) {
-    if let Some(ActiveContainer::Furnace(window)) = state.active_container.take() {
-        state
-            .sessions
-            .unregister_furnace_viewer(state.session_id, window.position);
+    match state.active_container.take() {
+        Some(ActiveContainer::Furnace(window)) => {
+            state
+                .sessions
+                .unregister_furnace_viewer(state.session_id, window.position);
+        }
+        Some(ActiveContainer::CraftingTable(window)) => {
+            for stack in window.input {
+                let (remaining, _) = state.inventory.merge_stack(stack);
+                if !remaining.is_empty() {
+                    debug!(
+                        item_id = remaining.item_id,
+                        count = remaining.count,
+                        "dropping crafting remainder because inventory is full"
+                    );
+                }
+            }
+        }
+        None => {}
     }
+}
+
+fn crafting_player_slot(menu_slot: usize) -> Option<usize> {
+    match menu_slot {
+        10..=36 => Some(9 + (menu_slot - 10)),
+        37..=45 => Some(36 + (menu_slot - 37)),
+        _ => None,
+    }
+}
+
+fn shaped_recipe_matches(
+    state: &InteractionState,
+    input: &[ItemStack; 9],
+    shaped: &mc_data::recipes::ShapedRecipe,
+) -> bool {
+    let height = shaped.pattern.len();
+    let width = shaped
+        .pattern
+        .iter()
+        .map(|row| row.chars().count())
+        .max()
+        .unwrap_or(0);
+    if height == 0 || width == 0 || height > 3 || width > 3 {
+        return false;
+    }
+
+    for top in 0..=(3 - height) {
+        'left: for left in 0..=(3 - width) {
+            for row in 0..3 {
+                for col in 0..3 {
+                    let stack = &input[row * 3 + col];
+                    let ingredient =
+                        if row >= top && row < top + height && col >= left && col < left + width {
+                            shaped
+                                .pattern
+                                .get(row - top)
+                                .and_then(|pattern_row| pattern_row.chars().nth(col - left))
+                                .filter(|ch| *ch != ' ')
+                                .and_then(|ch| shaped.key.get(&ch))
+                        } else {
+                            None
+                        };
+                    match ingredient {
+                        Some(ingredient)
+                            if !stack.is_empty()
+                                && ingredient_accepts_item(
+                                    &state.items,
+                                    &state.tags,
+                                    stack.item_id,
+                                    ingredient,
+                                ) => {}
+                        None if stack.is_empty() => {}
+                        _ => continue 'left,
+                    }
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+fn shapeless_recipe_matches(
+    state: &InteractionState,
+    input: &[ItemStack; 9],
+    shapeless: &mc_data::recipes::ShapelessRecipe,
+) -> bool {
+    let stacks: Vec<_> = input.iter().filter(|stack| !stack.is_empty()).collect();
+    if stacks.len() != shapeless.ingredients.len() {
+        return false;
+    }
+    let mut used = vec![false; shapeless.ingredients.len()];
+    for stack in stacks {
+        let Some((idx, _)) = shapeless
+            .ingredients
+            .iter()
+            .enumerate()
+            .find(|(idx, ingredient)| {
+                !used[*idx]
+                    && ingredient_accepts_item(&state.items, &state.tags, stack.item_id, ingredient)
+            })
+        else {
+            return false;
+        };
+        used[idx] = true;
+    }
+    true
+}
+
+fn crafting_recipe_matches(
+    state: &InteractionState,
+    input: &[ItemStack; 9],
+    recipe: &mc_data::recipes::Recipe,
+) -> bool {
+    match &recipe.kind {
+        mc_data::recipes::RecipeKind::Shaped(shaped) => shaped_recipe_matches(state, input, shaped),
+        mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
+            shapeless_recipe_matches(state, input, shapeless)
+        }
+        mc_data::recipes::RecipeKind::Smelting(_) => false,
+    }
+}
+
+fn crafting_result_from_input(state: &InteractionState, input: &[ItemStack; 9]) -> ItemStack {
+    state
+        .recipes
+        .iter()
+        .find(|recipe| crafting_recipe_matches(state, input, recipe))
+        .and_then(|recipe| {
+            let item_id = state.items.id_of(&recipe.result.item)?;
+            let count = i32::try_from(recipe.result.count).ok()?;
+            (count > 0).then(|| ItemStack::new(item_id, count))
+        })
+        .unwrap_or(ItemStack::EMPTY)
+}
+
+fn refresh_crafting_result(state: &InteractionState, window: &mut CraftingTableWindow) {
+    window.result = crafting_result_from_input(state, &window.input);
+}
+
+fn crafting_wire_items(
+    window: &CraftingTableWindow,
+    inventory: &PlayerInventory,
+) -> Vec<ItemStack> {
+    let mut items = Vec::with_capacity(CRAFTING_MENU_SLOT_COUNT);
+    items.push(window.result.clone());
+    items.extend(window.input.iter().cloned());
+    items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
+    items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
+    items
+}
+
+async fn write_crafting_content<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    window: &CraftingTableWindow,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: window.container_id,
+            state_id: window.state_id,
+            items: crafting_wire_items(window, &state.inventory),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+fn crafting_menu_stack(
+    window: &CraftingTableWindow,
+    inventory: &PlayerInventory,
+    menu_slot: usize,
+) -> Option<ItemStack> {
+    match menu_slot {
+        0 => Some(window.result.clone()),
+        1..=9 => Some(window.input[menu_slot - 1].clone()),
+        _ => crafting_player_slot(menu_slot).map(|slot| inventory.slots[slot].clone()),
+    }
+}
+
+fn set_crafting_menu_stack(
+    window: &mut CraftingTableWindow,
+    inventory: &mut PlayerInventory,
+    menu_slot: usize,
+    stack: ItemStack,
+) -> bool {
+    match menu_slot {
+        1..=9 => {
+            window.input[menu_slot - 1] = stack;
+            true
+        }
+        _ => {
+            let Some(slot) = crafting_player_slot(menu_slot) else {
+                return false;
+            };
+            inventory.slots[slot] = stack;
+            true
+        }
+    }
+}
+
+fn crafting_remainder_for_item(state: &InteractionState, item_id: u32) -> Option<ItemStack> {
+    let name = state.items.name_of(item_id)?;
+    let bucket = Identifier::parse("minecraft:bucket").expect("static identifier");
+    if name.path().ends_with("_bucket") || name.as_str() == "minecraft:milk_bucket" {
+        state
+            .items
+            .id_of(&bucket)
+            .map(|bucket_id| ItemStack::new(bucket_id, 1))
+    } else {
+        None
+    }
+}
+
+fn consume_crafting_ingredients(state: &mut InteractionState, window: &mut CraftingTableWindow) {
+    let consumed: Vec<_> = window
+        .input
+        .iter()
+        .map(|stack| (!stack.is_empty()).then_some(stack.item_id))
+        .collect();
+    for (idx, item_id) in consumed.into_iter().enumerate() {
+        let Some(item_id) = item_id else {
+            continue;
+        };
+        window.input[idx].count -= 1;
+        if window.input[idx].count <= 0 {
+            window.input[idx] =
+                crafting_remainder_for_item(state, item_id).unwrap_or(ItemStack::EMPTY);
+        } else if let Some(remainder) = crafting_remainder_for_item(state, item_id) {
+            let (remaining, _) = state.inventory.merge_stack(remainder);
+            if !remaining.is_empty() {
+                debug!(
+                    item_id = remaining.item_id,
+                    count = remaining.count,
+                    "dropping crafting remainder because inventory is full"
+                );
+            }
+        }
+    }
+    refresh_crafting_result(state, window);
+}
+
+fn take_crafting_result(state: &mut InteractionState, window: &mut CraftingTableWindow) -> bool {
+    let result = window.result.clone();
+    if result.is_empty() {
+        return false;
+    }
+    let max_stack = item_max_stack(&state.items, &result);
+    if state.carried_item.is_empty() {
+        state.carried_item = result;
+        consume_crafting_ingredients(state, window);
+        return true;
+    }
+    if can_stack(&state.carried_item, &result)
+        && state.carried_item.count + result.count <= max_stack
+    {
+        state.carried_item.count += result.count;
+        consume_crafting_ingredients(state, window);
+        return true;
+    }
+    false
+}
+
+fn apply_crafting_pickup_click(
+    state: &mut InteractionState,
+    window: &mut CraftingTableWindow,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= CRAFTING_MENU_SLOT_COUNT || !(button == 0 || button == 1) {
+        return false;
+    }
+    if menu_slot == 0 {
+        return take_crafting_result(state, window);
+    }
+    let Some(slot_stack) = crafting_menu_stack(window, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let cursor = state.carried_item.clone();
+    let max_stack = if cursor.is_empty() {
+        item_max_stack(&state.items, &slot_stack)
+    } else {
+        item_max_stack(&state.items, &cursor)
+    };
+
+    let changed = if button == 0 {
+        if cursor.is_empty() {
+            if slot_stack.is_empty() {
+                false
+            } else {
+                state.carried_item = slot_stack;
+                set_crafting_menu_stack(window, &mut state.inventory, menu_slot, ItemStack::EMPTY)
+            }
+        } else if slot_stack.is_empty() {
+            state.carried_item = ItemStack::EMPTY;
+            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, cursor)
+        } else if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
+            let moved = (max_stack - slot_stack.count).min(cursor.count);
+            let mut new_slot = slot_stack;
+            new_slot.count += moved;
+            state.carried_item.count -= moved;
+            if state.carried_item.count <= 0 {
+                state.carried_item = ItemStack::EMPTY;
+            }
+            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_slot)
+        } else {
+            state.carried_item = slot_stack;
+            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, cursor)
+        }
+    } else if cursor.is_empty() {
+        if slot_stack.is_empty() {
+            false
+        } else {
+            let moved = (slot_stack.count + 1) / 2;
+            let mut new_cursor = slot_stack.clone();
+            new_cursor.count = moved;
+            let mut remaining = slot_stack;
+            remaining.count -= moved;
+            if remaining.count <= 0 {
+                remaining = ItemStack::EMPTY;
+            }
+            state.carried_item = new_cursor;
+            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, remaining)
+        }
+    } else if slot_stack.is_empty() {
+        let mut one = cursor;
+        one.count = 1;
+        decrement_cursor(&mut state.carried_item);
+        set_crafting_menu_stack(window, &mut state.inventory, menu_slot, one)
+    } else if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
+        let mut new_slot = slot_stack;
+        new_slot.count += 1;
+        decrement_cursor(&mut state.carried_item);
+        set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_slot)
+    } else {
+        false
+    };
+    if changed {
+        refresh_crafting_result(state, window);
+    }
+    changed
+}
+
+fn apply_crafting_quick_move_click(
+    state: &mut InteractionState,
+    window: &mut CraftingTableWindow,
+    menu_slot: usize,
+) -> bool {
+    if menu_slot >= CRAFTING_MENU_SLOT_COUNT {
+        return false;
+    }
+    if menu_slot == 0 {
+        let result = window.result.clone();
+        if result.is_empty() {
+            return false;
+        }
+        let (remaining, _) = state.inventory.merge_stack(result.clone());
+        if !remaining.is_empty() {
+            return false;
+        }
+        consume_crafting_ingredients(state, window);
+        return true;
+    }
+    let Some(player_slot) = crafting_player_slot(menu_slot) else {
+        return false;
+    };
+    let original = state.inventory.slots[player_slot].clone();
+    if original.is_empty() {
+        return false;
+    }
+    state.inventory.slots[player_slot] = ItemStack::EMPTY;
+    let remaining = state.inventory.merge_stack_into_ranges(
+        original.clone(),
+        &[9..=35, 36..=44],
+        item_max_stack(&state.items, &original),
+    );
+    state.inventory.slots[player_slot] = remaining;
+    state.inventory.slots[player_slot] != original
+}
+
+async fn open_crafting_table_container<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let position = mc_world::BlockPos { x, y, z };
+    let clicked = {
+        let mut storage = state.world.lock().await;
+        storage.get_block(position).map_err(|err| {
+            warn!(error = %err, x, y, z, "crafting table use target read failed");
+            err
+        })?
+    };
+    if !clicked.is_some_and(|block_state| is_crafting_table_state(state, block_state)) {
+        return Ok(false);
+    }
+
+    store_active_container(state);
+    let mut window = CraftingTableWindow::new(next_container_id(state));
+    refresh_crafting_result(state, &mut window);
+    write_packet(
+        writer,
+        &ClientboundOpenScreen {
+            container_id: window.container_id,
+            menu_type: CRAFTING_MENU_TYPE_ID,
+            title_nbt: crafting_menu_title_nbt(),
+        },
+        state.compression,
+    )
+    .await?;
+    write_crafting_content(state, writer, &window).await?;
+    state.active_container = Some(ActiveContainer::CraftingTable(window));
+    write_block_ack(writer, state.compression, sequence).await?;
+    Ok(true)
+}
+
+async fn handle_crafting_container_click<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    mut window: CraftingTableWindow,
+    packet: ServerboundContainerClick,
+) -> Result<CraftingTableWindow, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if packet.state_id != window.state_id {
+        write_crafting_content(state, writer, &window).await?;
+        return Ok(window);
+    }
+    let changed = match packet.container_input {
+        ContainerInput::Pickup if packet.slot_num >= 0 => apply_crafting_pickup_click(
+            state,
+            &mut window,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+            apply_crafting_quick_move_click(state, &mut window, packet.slot_num as usize)
+        }
+        _ => false,
+    };
+    if changed {
+        window.state_id = window.state_id.wrapping_add(1);
+    }
+    write_crafting_content(state, writer, &window).await?;
+    Ok(window)
 }
 
 fn furnace_slot_to_stack(slot: &FurnaceSlot) -> ItemStack {
@@ -4675,6 +5170,9 @@ where
             }
             state.active_container = Some(ActiveContainer::Furnace(window));
         }
+        ActiveContainer::CraftingTable(window) => {
+            state.active_container = Some(ActiveContainer::CraftingTable(window));
+        }
     }
     Ok(())
 }
@@ -4695,19 +5193,27 @@ where
     {
         if packet.container_id == 0 {
             write_inventory_content(state, writer).await?;
-        } else if let Some(ActiveContainer::Furnace(window)) = state.active_container.take() {
-            let furnace = {
-                let mut storage = state.world.lock().await;
-                storage
-                    .furnace_block_entity(window.position)
-                    .map_err(|err| {
-                        warn!(error = %err, ?window.position, "furnace state read failed");
-                        err
-                    })?
+        } else if let Some(active) = state.active_container.take() {
+            match active {
+                ActiveContainer::Furnace(window) => {
+                    let furnace = {
+                        let mut storage = state.world.lock().await;
+                        storage
+                            .furnace_block_entity(window.position)
+                            .map_err(|err| {
+                                warn!(error = %err, ?window.position, "furnace state read failed");
+                                err
+                            })?
+                    }
+                    .unwrap_or_default();
+                    write_furnace_content(state, writer, &window, &furnace).await?;
+                    state.active_container = Some(ActiveContainer::Furnace(window));
+                }
+                ActiveContainer::CraftingTable(window) => {
+                    write_crafting_content(state, writer, &window).await?;
+                    state.active_container = Some(ActiveContainer::CraftingTable(window));
+                }
             }
-            .unwrap_or_default();
-            write_furnace_content(state, writer, &window, &furnace).await?;
-            state.active_container = Some(ActiveContainer::Furnace(window));
         }
         return Ok(());
     }
@@ -4718,6 +5224,13 @@ where
             return Ok(());
         };
         match active {
+            ActiveContainer::CraftingTable(crafting)
+                if crafting.container_id == packet.container_id =>
+            {
+                let crafting =
+                    handle_crafting_container_click(state, writer, crafting, packet).await?;
+                state.active_container = Some(ActiveContainer::CraftingTable(crafting));
+            }
             ActiveContainer::Furnace(furnace) if furnace.container_id == packet.container_id => {
                 let furnace =
                     handle_furnace_container_click(state, writer, furnace, packet).await?;
@@ -5577,6 +6090,9 @@ where
     }
 
     let (cx, cy, cz) = unpack_block_pos(action.position);
+    if open_crafting_table_container(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
     if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
         return Ok(());
     }
