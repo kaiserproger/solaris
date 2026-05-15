@@ -12,9 +12,23 @@ pub enum RandomTickFamily {
     Sapling,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FluidKind {
+    Water,
+    Lava,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FluidStateFacts {
+    pub kind: FluidKind,
+    pub level: u8,
+    pub source: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BlockFacts {
     pub random_tick_family: Option<RandomTickFamily>,
+    pub fluid: Option<FluidStateFacts>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -35,12 +49,24 @@ impl BlockFactsTable {
         let mut eligible_states = 0;
         for block in report {
             let family = classify_random_tick_family(block.id.path());
+            let fluid_kind = classify_fluid_kind(block.id.path());
             for state in &block.states {
                 let facts = &mut states[state.id as usize];
                 if facts.random_tick_family.is_none() && family.is_some() {
                     eligible_states += 1;
                 }
                 facts.random_tick_family = family;
+                facts.fluid = fluid_kind.and_then(|kind| {
+                    state
+                        .properties
+                        .get("level")
+                        .and_then(|level| level.parse::<u8>().ok())
+                        .map(|level| FluidStateFacts {
+                            kind,
+                            level,
+                            source: level == 0,
+                        })
+                });
             }
         }
         Self {
@@ -69,6 +95,19 @@ impl BlockFactsTable {
         self.states
             .get(state_id as usize)
             .and_then(|facts| facts.random_tick_family)
+    }
+
+    #[must_use]
+    pub fn fluid(&self, state_id: u32) -> Option<FluidStateFacts> {
+        self.states.get(state_id as usize).and_then(|facts| facts.fluid)
+    }
+}
+
+fn classify_fluid_kind(path: &str) -> Option<FluidKind> {
+    match path {
+        "water" => Some(FluidKind::Water),
+        "lava" => Some(FluidKind::Lava),
+        _ => None,
     }
 }
 
@@ -142,6 +181,28 @@ mod tests {
         }
     }
 
+    fn fluid_block(first_id: u32, name: &str) -> BlockReport {
+        let mut properties = BTreeMap::new();
+        properties.insert("level".to_string(), vec!["0".to_string(), "1".to_string()]);
+
+        BlockReport {
+            id: Identifier::parse(name).unwrap(),
+            properties,
+            states: [0, 1]
+                .into_iter()
+                .map(|level| {
+                    let mut state_properties = BTreeMap::new();
+                    state_properties.insert("level".to_string(), level.to_string());
+                    BlockStateReport {
+                        id: first_id + level,
+                        default: level == 0,
+                        properties: state_properties,
+                    }
+                })
+                .collect(),
+        }
+    }
+
     #[test]
     fn classifies_common_random_tick_families() {
         let table = BlockFactsTable::from_blocks_report(&[
@@ -189,6 +250,73 @@ mod tests {
         assert_eq!(
             table.random_tick_family(wheat_default.id),
             Some(RandomTickFamily::Crop)
+        );
+    }
+
+    #[test]
+    fn derives_fluid_facts_from_level_property() {
+        let table = BlockFactsTable::from_blocks_report(&[
+            block(0, "minecraft:air"),
+            fluid_block(1, "minecraft:water"),
+            fluid_block(3, "minecraft:lava"),
+        ]);
+
+        assert_eq!(
+            table.fluid(1),
+            Some(FluidStateFacts {
+                kind: FluidKind::Water,
+                level: 0,
+                source: true,
+            })
+        );
+        assert_eq!(
+            table.fluid(2),
+            Some(FluidStateFacts {
+                kind: FluidKind::Water,
+                level: 1,
+                source: false,
+            })
+        );
+        assert_eq!(
+            table.fluid(3),
+            Some(FluidStateFacts {
+                kind: FluidKind::Lava,
+                level: 0,
+                source: true,
+            })
+        );
+        assert_eq!(table.fluid(0), None);
+    }
+
+    #[test]
+    fn loads_real_fluid_facts_when_present() {
+        let path = workspace_path("data/vanilla/reports/blocks.json");
+        if !path.is_file() {
+            eprintln!(
+                "skipping: {} not present (run tools/extract-vanilla-data.sh)",
+                path.display()
+            );
+            return;
+        }
+        let report = crate::blocks::load_blocks_report(&path).unwrap();
+        let table = BlockFactsTable::from_blocks_report(&report);
+        let water = report
+            .iter()
+            .find(|block| block.id.as_str() == "minecraft:water")
+            .unwrap();
+        let source = water
+            .states
+            .iter()
+            .find(|state| state.properties.get("level").is_some_and(|level| level == "0"))
+            .unwrap();
+
+        assert_eq!(
+            table.fluid(source.id),
+            Some(FluidStateFacts {
+                kind: FluidKind::Water,
+                level: 0,
+                source: true,
+            })
         );
     }
 }
