@@ -957,13 +957,13 @@ impl SessionRegistry {
     fn loaded_recipients_for_chunks(
         &self,
         chunks: &HashSet<(i32, i32)>,
-        except: SessionId,
+        except: Option<SessionId>,
     ) -> Vec<SessionRecipient> {
         let inner = self.inner.lock().expect("session registry poisoned");
         let mut ids = HashSet::new();
         for chunk in chunks {
             if let Some(subscribers) = inner.tickets.get(chunk) {
-                ids.extend(subscribers.iter().copied().filter(|id| *id != except));
+                ids.extend(subscribers.iter().copied().filter(|id| Some(*id) != except));
             }
         }
         ids.into_iter()
@@ -1241,6 +1241,26 @@ struct BlockDelta {
     y: i32,
     z: i32,
     state_id: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BlockEdit {
+    pos: mc_world::BlockPos,
+    new_state: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AppliedBlockEdit {
+    pos: mc_world::BlockPos,
+    previous: mc_world::BlockStateId,
+    new_state: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Default)]
+struct BlockEditBatchOutcome {
+    applied: Vec<AppliedBlockEdit>,
+    deltas: Vec<BlockDelta>,
+    edit_chunks: HashSet<(i32, i32)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5766,14 +5786,12 @@ fn broadcast_block_deltas(
     state: &InteractionState,
     chunks: &HashSet<(i32, i32)>,
     deltas: &[BlockDelta],
+    except: Option<SessionId>,
 ) {
     if deltas.is_empty() || chunks.is_empty() {
         return;
     }
-    for recipient in state
-        .sessions
-        .loaded_recipients_for_chunks(chunks, state.session_id)
-    {
+    for recipient in state.sessions.loaded_recipients_for_chunks(chunks, except) {
         if let Err(err) = recipient
             .tx
             .try_send(OutboundCommand::BlockDeltas(deltas.to_vec()))
@@ -5787,7 +5805,11 @@ fn broadcast_block_deltas(
     }
 }
 
-fn broadcast_light_updates(state: &InteractionState, updates: &[OutboundLightUpdate]) {
+fn broadcast_light_updates(
+    state: &InteractionState,
+    updates: &[OutboundLightUpdate],
+    except: Option<SessionId>,
+) {
     if updates.is_empty() {
         return;
     }
@@ -5795,10 +5817,7 @@ fn broadcast_light_updates(state: &InteractionState, updates: &[OutboundLightUpd
         .iter()
         .map(|update| (update.pos.x, update.pos.z))
         .collect();
-    for recipient in state
-        .sessions
-        .loaded_recipients_for_chunks(&chunks, state.session_id)
-    {
+    for recipient in state.sessions.loaded_recipients_for_chunks(&chunks, except) {
         if let Err(err) = recipient
             .tx
             .try_send(OutboundCommand::LightUpdates(updates.to_vec()))
@@ -5849,6 +5868,110 @@ fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaPacket> {
     packets
 }
 
+async fn apply_block_edit_batch_to_world(
+    state: &mut InteractionState,
+    edits: &[BlockEdit],
+) -> BlockEditBatchOutcome {
+    let table = state.block_light.as_ref().map(Arc::clone);
+    let mut outcome = BlockEditBatchOutcome::default();
+
+    let mut storage = state.world.lock().await;
+    for edit in edits {
+        let pos = edit.pos;
+        match storage.set_block_at(pos, edit.new_state) {
+            Ok(Some(previous)) if previous != edit.new_state => {
+                if let Some(table) = table.as_deref()
+                    && let Err(err) = storage.update_highest_opaque_at(pos, table)
+                {
+                    warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "highest-opaque heightmap update failed");
+                }
+                outcome.applied.push(AppliedBlockEdit {
+                    pos,
+                    previous,
+                    new_state: edit.new_state,
+                });
+                outcome.deltas.push(BlockDelta {
+                    x: pos.x,
+                    y: pos.y,
+                    z: pos.z,
+                    state_id: edit.new_state,
+                });
+                outcome
+                    .edit_chunks
+                    .insert((pos.x.div_euclid(16), pos.z.div_euclid(16)));
+            }
+            Ok(Some(_)) | Ok(None) => {}
+            Err(err) => {
+                warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "set_block_at failed; skipping edit");
+            }
+        }
+    }
+
+    outcome
+}
+
+async fn apply_player_block_edit_batch<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    edits: &[BlockEdit],
+) -> Result<BlockEditBatchOutcome, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let table = state.block_light.as_ref().map(Arc::clone);
+    let outcome = apply_block_edit_batch_to_world(state, edits).await;
+
+    if outcome.applied.is_empty() {
+        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
+        return Ok(outcome);
+    }
+
+    state
+        .sessions
+        .invalidate_prepared_chunks(&outcome.edit_chunks);
+    send_block_deltas(writer, state.compression, &outcome.deltas).await?;
+    broadcast_block_deltas(
+        state,
+        &outcome.edit_chunks,
+        &outcome.deltas,
+        Some(state.session_id),
+    );
+
+    if let Some(table) = table {
+        let mut light_updates = Vec::new();
+        for edit in &outcome.applied {
+            merge_light_updates(
+                &mut light_updates,
+                collect_incremental_relight(state, &table, edit).await?,
+            );
+        }
+        let light_chunks: HashSet<_> = light_updates
+            .iter()
+            .map(|update| (update.pos.x, update.pos.z))
+            .collect();
+        state.sessions.invalidate_prepared_chunks(&light_chunks);
+        send_light_updates(state, writer, &light_updates).await?;
+        broadcast_light_updates(state, &light_updates, Some(state.session_id));
+    }
+
+    write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
+    Ok(outcome)
+}
+
+fn merge_light_updates(target: &mut Vec<OutboundLightUpdate>, updates: Vec<OutboundLightUpdate>) {
+    for update in updates {
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|existing| existing.pos == update.pos)
+        {
+            *existing = update;
+        } else {
+            target.push(update);
+        }
+    }
+}
+
 /// Shared back-half of the break / place flows: mutates the world
 /// at `(x, y, z)` to `new_state`, broadcasts the block delta +
 /// recomputed `LightUpdate`s + `BlockChangedAck` to the connected
@@ -5867,91 +5990,17 @@ async fn apply_block_edit<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let pos = mc_world::BlockPos { x, y, z };
-    let table = state.block_light.as_ref().map(Arc::clone);
-
-    // 1. Apply the mutation. Drop the lock as soon as it's done so
-    //    the light-recompute path can re-acquire it for the
-    //    neighbourhood read without deadlocking.
-    let prev = {
-        let mut storage = state.world.lock().await;
-        match storage.set_block_at(pos, new_state) {
-            Ok(p) => {
-                if let (Some(prev), Some(table)) = (p, table.as_deref())
-                    && prev != new_state
-                    && let Err(err) = storage.update_highest_opaque_at(pos, table)
-                {
-                    warn!(error = %err, x, y, z, "highest-opaque heightmap update failed");
-                }
-                p
-            }
-            Err(err) => {
-                warn!(error = %err, x, y, z, "set_block_at failed; skipping edit");
-                write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-                return Ok(None);
-            }
-        }
-    };
-
-    // Absent chunk or no-op edit: ack the sequence so the client
-    // doesn't roll back forever, but skip the BlockUpdate /
-    // LightUpdate ripple.
-    let Some(prev) = prev else {
-        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-        return Ok(None);
-    };
-    if prev == new_state {
-        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-        return Ok(None);
-    }
-
-    let block_delta = BlockDelta {
-        x,
-        y,
-        z,
-        state_id: new_state,
-    };
-    let edit_chunk = (x.div_euclid(16), z.div_euclid(16));
-    let edit_chunks = HashSet::from([edit_chunk]);
-    state.sessions.invalidate_prepared_chunks(&edit_chunks);
-
-    // 2. Tell subscribed clients about the new block. Single edits stay on the
-    //    historical BlockUpdate wire shape; only true batches use the
-    //    section packet helper.
-    send_block_deltas(writer, state.compression, &[block_delta]).await?;
-    broadcast_block_deltas(state, &edit_chunks, &[block_delta]);
-
-    // 3. Incremental relight (M9). Update cached per-chunk light in
-    //    place via bounded BFS, then emit one `LightUpdate` per
-    //    chunk whose stored arrays actually changed. Falls back to
-    //    no-op if the cache is empty (e.g. edits before the spawn
-    //    burst populated it) or tests constructed a chunkless config.
-    if let Some(table) = table {
-        let light_updates = send_incremental_relight(
-            state,
-            writer,
-            &table,
-            edit_chunk.0,
-            edit_chunk.1,
-            x,
-            y,
-            z,
-            prev,
+    let outcome = apply_player_block_edit_batch(
+        state,
+        writer,
+        sequence,
+        &[BlockEdit {
+            pos: mc_world::BlockPos { x, y, z },
             new_state,
-        )
-        .await?;
-        let light_chunks: HashSet<_> = light_updates
-            .iter()
-            .map(|update| (update.pos.x, update.pos.z))
-            .collect();
-        state.sessions.invalidate_prepared_chunks(&light_chunks);
-        broadcast_light_updates(state, &light_updates);
-    }
-
-    // 4. Ack last — vanilla expects update-before-ack so the
-    //    prediction reconciles against a known state.
-    write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-    Ok(Some(prev))
+        }],
+    )
+    .await?;
+    Ok(outcome.applied.first().map(|edit| edit.previous))
 }
 
 /// M9: incremental relight. Pulls the post-edit 3×3 chunk
@@ -5964,22 +6013,14 @@ where
 /// burst's `build_chunk_packet` got to that chunk) — same coverage
 /// as the old `send_relight_around` for the centre tile, but
 /// without the 5× cost.
-#[allow(clippy::too_many_arguments)]
-async fn send_incremental_relight<W>(
+async fn collect_incremental_relight(
     state: &mut InteractionState,
-    writer: &mut W,
     table: &BlockLightTable,
-    cx: i32,
-    cz: i32,
-    edit_x: i32,
-    edit_y: i32,
-    edit_z: i32,
-    prev_state: mc_world::BlockStateId,
-    new_state: mc_world::BlockStateId,
-) -> Result<Vec<OutboundLightUpdate>, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
+    edit: &AppliedBlockEdit,
+) -> Result<Vec<OutboundLightUpdate>, ConnectionError> {
+    let cx = edit.pos.x.div_euclid(16);
+    let cz = edit.pos.z.div_euclid(16);
+
     // 1. Pull the 3×3 chunks around the edit out of storage. The
     //    edit has already been applied, so these are post-edit.
     let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
@@ -6033,8 +6074,8 @@ where
         }
     }
 
-    let local_x = edit_x.rem_euclid(16) as u8;
-    let local_z = edit_z.rem_euclid(16) as u8;
+    let local_x = edit.pos.x.rem_euclid(16) as u8;
+    let local_z = edit.pos.z.rem_euclid(16) as u8;
 
     let touched = apply_block_change_to_light(
         &mut state.light_cache,
@@ -6042,13 +6083,13 @@ where
         table,
         centre_pos,
         local_x,
-        edit_y,
+        edit.pos.y,
         local_z,
-        prev_state,
-        new_state,
+        edit.previous,
+        edit.new_state,
     );
 
-    // 4. Emit one LightUpdate per chunk whose cached light changed.
+    // 4. Collect one LightUpdate per chunk whose cached light changed.
     let mut updates = Vec::new();
     for pos in touched {
         let Some(light) = state.light_cache.get(pos) else {
@@ -6068,16 +6109,6 @@ where
             light: light.clone(),
             wire: light_data.clone(),
         });
-        write_packet(
-            writer,
-            &LightUpdate {
-                chunk_x: pos.x,
-                chunk_z: pos.z,
-                light: light_data,
-            },
-            state.compression,
-        )
-        .await?;
     }
     Ok(updates)
 }
@@ -8363,6 +8394,93 @@ mod tests {
         let _ = registry.unregister(id);
 
         assert!(registry.prepared_chunk((0, 0)).is_none());
+    }
+
+    #[test]
+    fn session_registry_invalidates_multiple_prepared_chunks() {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(1);
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "tester".to_string(),
+        };
+        let _ = registry.register(
+            &profile,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0), (1, 0)]),
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        for chunk in [(0, 0), (1, 0)] {
+            registry.cache_prepared_chunk(
+                chunk,
+                Arc::new(PreparedChunkFrame {
+                    frame: Bytes::from_static(b"chunk-frame"),
+                    light: None,
+                    herd_spawns: Vec::new(),
+                    packet_data_len: 0,
+                    build_timing: ChunkBuildTiming::default(),
+                    write_timing: ChunkWriteTiming::default(),
+                }),
+            );
+            assert!(registry.prepared_chunk(chunk).is_some());
+        }
+
+        registry.invalidate_prepared_chunks(&HashSet::from([(0, 0), (1, 0)]));
+
+        assert!(registry.prepared_chunk((0, 0)).is_none());
+        assert!(registry.prepared_chunk((1, 0)).is_none());
+    }
+
+    #[test]
+    fn loaded_recipients_for_chunks_can_include_origin() {
+        let registry = SessionRegistry::new();
+        let (alice_tx, _alice_rx) = mpsc::channel(8);
+        let (bob_tx, _bob_rx) = mpsc::channel(8);
+        let alice = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(1),
+            name: "Alice".to_string(),
+        };
+        let bob = LoggedInProfile {
+            uuid: uuid::Uuid::from_u128(2),
+            name: "Bob".to_string(),
+        };
+        let (alice_id, _) = registry.register(
+            &alice,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            alice_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let (bob_id, _) = registry.register(
+            &bob,
+            (0, 0),
+            0,
+            HashSet::from([(0, 0)]),
+            bob_tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let _ = registry.mark_loaded(alice_id, (0, 0));
+        let _ = registry.mark_loaded(bob_id, (0, 0));
+        let chunks = HashSet::from([(0, 0)]);
+
+        let mut without_origin: Vec<_> = registry
+            .loaded_recipients_for_chunks(&chunks, Some(alice_id))
+            .into_iter()
+            .map(|recipient| recipient.id)
+            .collect();
+        without_origin.sort_unstable();
+        let mut with_origin: Vec<_> = registry
+            .loaded_recipients_for_chunks(&chunks, None)
+            .into_iter()
+            .map(|recipient| recipient.id)
+            .collect();
+        with_origin.sort_unstable();
+
+        assert_eq!(without_origin, vec![bob_id]);
+        assert_eq!(with_origin, vec![alice_id, bob_id]);
     }
 
     #[test]
