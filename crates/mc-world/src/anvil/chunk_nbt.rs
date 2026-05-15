@@ -21,14 +21,15 @@
 use std::io::Cursor;
 
 use mc_data::Identifier;
+use mc_data::items::ItemRegistry;
 use mc_nbt::{ListTag, Tag, tag_type};
 use thiserror::Error;
 
 use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
-    BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, Heightmap, LIGHT_LAYER_BYTES,
-    MIN_SECTION_Y, SECTION_COUNT, SectionLight,
+    BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot,
+    Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
@@ -45,7 +46,16 @@ pub fn chunk_to_payload(
     registry: &BlockRegistry,
     timestamp: u32,
 ) -> Result<ChunkPayload, ChunkNbtError> {
-    let nbt = chunk_to_nbt(chunk, registry)?;
+    chunk_to_payload_with_items(chunk, registry, None, timestamp)
+}
+
+pub fn chunk_to_payload_with_items(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+    timestamp: u32,
+) -> Result<ChunkPayload, ChunkNbtError> {
+    let nbt = chunk_to_nbt_with_items(chunk, registry, items)?;
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     mc_nbt::write_named(&mut buf, "", &nbt)?;
     let local_x = chunk.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -79,6 +89,8 @@ pub enum ChunkNbtError {
         name: String,
         props: Vec<(String, String)>,
     },
+    #[error("item {0} not in registry")]
+    UnknownItem(String),
     #[error("section Y={0} is outside the {SECTION_COUNT}-section range")]
     SectionOutOfRange(i32),
     #[error("packed bit-array length mismatch: expected {expected} words, got {got}")]
@@ -96,6 +108,14 @@ pub enum ChunkNbtError {
 // ---------------------------------------------------------------------
 
 pub fn chunk_from_nbt(nbt: &Tag, registry: &BlockRegistry) -> Result<Chunk, ChunkNbtError> {
+    chunk_from_nbt_with_items(nbt, registry, None)
+}
+
+pub fn chunk_from_nbt_with_items(
+    nbt: &Tag,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+) -> Result<Chunk, ChunkNbtError> {
     let root = expect_compound(nbt, "root")?;
 
     let x = get_int(root, "xPos")?;
@@ -156,6 +176,22 @@ pub fn chunk_from_nbt(nbt: &Tag, registry: &BlockRegistry) -> Result<Chunk, Chun
             let bx = get_int(cmp, "x")?;
             let by = get_int(cmp, "y")?;
             let bz = get_int(cmp, "z")?;
+            if get_string(cmp, "id")
+                .ok()
+                .is_some_and(|id| id == "minecraft:furnace")
+                && let Some(items) = items
+            {
+                chunk.furnaces.insert(
+                    BlockPos {
+                        x: bx,
+                        y: by,
+                        z: bz,
+                    },
+                    decode_furnace(cmp, items)?,
+                );
+                continue;
+            }
+
             // Round-trip the entry verbatim by re-encoding it through
             // the network NBT path ([type][payload], no name). Read
             // back via read_network when needed.
@@ -358,6 +394,14 @@ fn biome_bits_per_entry(palette_len: usize) -> u8 {
 // ---------------------------------------------------------------------
 
 pub fn chunk_to_nbt(chunk: &Chunk, registry: &BlockRegistry) -> Result<Tag, ChunkNbtError> {
+    chunk_to_nbt_with_items(chunk, registry, None)
+}
+
+pub fn chunk_to_nbt_with_items(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+) -> Result<Tag, ChunkNbtError> {
     let mut root: Vec<(String, Tag)> = Vec::with_capacity(8);
     root.push(("xPos".into(), Tag::Int(chunk.pos.x)));
     root.push(("zPos".into(), Tag::Int(chunk.pos.z)));
@@ -395,12 +439,23 @@ pub fn chunk_to_nbt(chunk: &Chunk, registry: &BlockRegistry) -> Result<Tag, Chun
 
     // block_entities — read back the opaque network NBT into Tags.
     let mut be_list: Vec<Tag> = Vec::with_capacity(chunk.block_entities.len());
-    let mut be_entries: Vec<(&BlockPos, &Vec<u8>)> = chunk.block_entities.iter().collect();
+    let mut be_entries: Vec<(&BlockPos, &Vec<u8>)> = chunk
+        .block_entities
+        .iter()
+        .filter(|(pos, _)| !chunk.furnaces.contains_key(pos))
+        .collect();
     be_entries.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
     for (_, bytes) in be_entries {
         let mut cur = Cursor::new(&bytes[..]);
         let tag = mc_nbt::read_network(&mut cur)?;
         be_list.push(tag);
+    }
+    if let Some(items) = items {
+        let mut furnaces: Vec<(&BlockPos, &FurnaceBlockEntity)> = chunk.furnaces.iter().collect();
+        furnaces.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+        for (pos, furnace) in furnaces {
+            be_list.push(encode_furnace(pos, furnace, items)?);
+        }
     }
     root.push((
         "block_entities".into(),
@@ -524,6 +579,91 @@ fn encode_biome_section(section: &BiomeSection) -> Tag {
     Tag::Compound(out)
 }
 
+fn decode_furnace(
+    cmp: &[(String, Tag)],
+    items: &ItemRegistry,
+) -> Result<FurnaceBlockEntity, ChunkNbtError> {
+    let mut furnace = FurnaceBlockEntity {
+        burn_remaining: get_optional_short(cmp, "lit_time_remaining")?.unwrap_or(0),
+        burn_total: get_optional_short(cmp, "lit_total_time")?.unwrap_or(1600),
+        cook_progress: get_optional_short(cmp, "cooking_time_spent")?.unwrap_or(0),
+        cook_total: get_optional_short(cmp, "cooking_total_time")?.unwrap_or(200),
+        ..FurnaceBlockEntity::default()
+    };
+
+    if let Some(list) = get_optional_list(cmp, "Items")? {
+        for tag in &list.elements {
+            let item = expect_compound(tag, "Items[]")?;
+            let slot = get_int(item, "Slot")?;
+            if !(0..=2).contains(&slot) {
+                continue;
+            }
+            let item_name = get_string(item, "id")?;
+            let parsed = Identifier::parse(item_name.clone())
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
+            let item_id = items
+                .id_of(&parsed)
+                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
+            furnace.slots[slot as usize] = FurnaceSlot {
+                count: get_int(item, "count")?,
+                item_id,
+                damage: None,
+            };
+        }
+    }
+    Ok(furnace)
+}
+
+fn encode_furnace(
+    pos: &BlockPos,
+    furnace: &FurnaceBlockEntity,
+    items: &ItemRegistry,
+) -> Result<Tag, ChunkNbtError> {
+    let mut compound = vec![
+        ("id".into(), Tag::String("minecraft:furnace".into())),
+        ("x".into(), Tag::Int(pos.x)),
+        ("y".into(), Tag::Int(pos.y)),
+        ("z".into(), Tag::Int(pos.z)),
+    ];
+
+    let mut item_tags = Vec::new();
+    for (slot, stack) in furnace.slots.iter().enumerate() {
+        if stack.is_empty() {
+            continue;
+        }
+        let name = items
+            .name_of(stack.item_id)
+            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
+        item_tags.push(Tag::Compound(vec![
+            ("Slot".into(), Tag::Int(slot as i32)),
+            ("id".into(), Tag::String(name.as_str().to_string())),
+            ("count".into(), Tag::Int(stack.count)),
+        ]));
+    }
+    compound.push((
+        "Items".into(),
+        Tag::List(ListTag {
+            element_type: if item_tags.is_empty() {
+                tag_type::END
+            } else {
+                tag_type::COMPOUND
+            },
+            elements: item_tags,
+        }),
+    ));
+    compound.push((
+        "lit_time_remaining".into(),
+        Tag::Short(furnace.burn_remaining),
+    ));
+    compound.push(("lit_total_time".into(), Tag::Short(furnace.burn_total)));
+    compound.push((
+        "cooking_time_spent".into(),
+        Tag::Short(furnace.cook_progress),
+    ));
+    compound.push(("cooking_total_time".into(), Tag::Short(furnace.cook_total)));
+    Ok(Tag::Compound(compound))
+}
+
 // ---------------------------------------------------------------------
 // Small NBT helpers
 // ---------------------------------------------------------------------
@@ -571,6 +711,23 @@ fn get_byte(cmp: &[(String, Tag)], name: &'static str) -> Result<i8, ChunkNbtErr
         other => Err(ChunkNbtError::WrongType {
             field: name,
             expected: "Byte",
+            got: other.type_id(),
+        }),
+    }
+}
+
+fn get_optional_short(
+    cmp: &[(String, Tag)],
+    name: &'static str,
+) -> Result<Option<i16>, ChunkNbtError> {
+    let Some(tag) = cmp.iter().find(|(k, _)| k == name).map(|(_, v)| v) else {
+        return Ok(None);
+    };
+    match tag {
+        Tag::Short(v) => Ok(Some(*v)),
+        other => Err(ChunkNbtError::WrongType {
+            field: name,
+            expected: "Short",
             got: other.type_id(),
         }),
     }

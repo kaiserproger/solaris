@@ -119,6 +119,26 @@ async fn serve(path: &Path) -> Result<()> {
         Arc::clone(&blocks),
         structure_rules,
     );
+    let items_path = cfg.data.vanilla_dir.join("reports").join("registries.json");
+    let items = match mc_data::items::load_items_report(&items_path) {
+        Ok(report) => {
+            let reg = mc_data::items::ItemRegistry::from_report(&report);
+            tracing::info!(
+                entries = reg.len(),
+                path = %items_path.display(),
+                "item registry loaded",
+            );
+            Arc::new(reg)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %items_path.display(),
+                error = %err,
+                "item registry load failed; M6 place will fall back to stone",
+            );
+            Arc::new(mc_data::items::ItemRegistry::default())
+        }
+    };
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
@@ -138,7 +158,9 @@ async fn serve(path: &Path) -> Result<()> {
                 // chunk per fresh world.
                 let generator: Arc<dyn mc_world::ChunkGenerator> =
                     Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
-                let mut storage = storage.with_generator(generator);
+                let mut storage = storage
+                    .with_generator(generator)
+                    .with_item_registry(Arc::clone(&items));
                 let mut region_count = count_region_files(world_dir);
                 if region_count == 0 {
                     let generated = generate_spawn_window(
@@ -213,27 +235,6 @@ async fn serve(path: &Path) -> Result<()> {
         states = block_light.len(),
         "block-light table built from blocks report",
     );
-
-    let items_path = cfg.data.vanilla_dir.join("reports").join("registries.json");
-    let items = match mc_data::items::load_items_report(&items_path) {
-        Ok(report) => {
-            let reg = mc_data::items::ItemRegistry::from_report(&report);
-            tracing::info!(
-                entries = reg.len(),
-                path = %items_path.display(),
-                "item registry loaded",
-            );
-            Arc::new(reg)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %items_path.display(),
-                error = %err,
-                "item registry load failed; M6 place will fall back to stone",
-            );
-            Arc::new(mc_data::items::ItemRegistry::default())
-        }
-    };
 
     let entity_types = match mc_data::entity_types::load_entity_types_report(&items_path) {
         Ok(report) => {

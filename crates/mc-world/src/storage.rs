@@ -17,10 +17,11 @@ use thiserror::Error;
 
 use mc_data::Identifier;
 use mc_data::block_light::BlockLightTable;
+use mc_data::items::ItemRegistry;
 
 use crate::anvil::{
-    ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt, chunk_to_payload, read_region,
-    write_region,
+    ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt_with_items,
+    chunk_to_payload_with_items, read_region, write_region,
 };
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{BlockPos, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity};
@@ -73,6 +74,7 @@ pub struct WorldStorage {
     regions: HashMap<(i32, i32), Arc<DecodedRegion>>,
     region_lru: VecDeque<(i32, i32)>,
     region_capacity: usize,
+    item_registry: Option<Arc<ItemRegistry>>,
     /// M7: optional fallback that materialises chunks for positions
     /// not covered by an `.mca` slot. Generated chunks come back
     /// dirty so the M6 flush pipeline persists them; subsequent
@@ -143,6 +145,7 @@ impl WorldStorage {
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: region_capacity.max(1),
+            item_registry: None,
             generator: None,
         })
     }
@@ -166,8 +169,15 @@ impl WorldStorage {
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: DEFAULT_REGION_LRU_CAPACITY,
+            item_registry: None,
             generator: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_item_registry(mut self, item_registry: Arc<ItemRegistry>) -> Self {
+        self.item_registry = Some(item_registry);
+        self
     }
 
     /// Builder: attach a chunk generator. Slots not present on disk
@@ -309,6 +319,7 @@ impl WorldStorage {
             return Ok(true);
         }
         chunk.furnaces.insert(pos, furnace);
+        chunk.dirty = true;
         Ok(true)
     }
 
@@ -338,7 +349,8 @@ impl WorldStorage {
         if let Some(payload) = payload {
             let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
             let (_, root) = mc_nbt::read_named(&mut cursor)?;
-            let chunk = chunk_from_nbt(&root, &self.registry)?;
+            let chunk =
+                chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())?;
             self.insert_chunk(cpos, chunk)?;
             return Ok(self.cache.get(&cpos));
         }
@@ -508,7 +520,12 @@ impl WorldStorage {
                 .cache
                 .get(&cpos)
                 .expect("dirty position must still be in cache");
-            let payload = chunk_to_payload(chunk, &self.registry, now)?;
+            let payload = chunk_to_payload_with_items(
+                chunk,
+                &self.registry,
+                self.item_registry.as_deref(),
+                now,
+            )?;
             by_slot.insert((payload.local_x, payload.local_z), payload);
         }
 
@@ -658,8 +675,71 @@ mod tests {
                 .set_furnace_block_entity(pos, furnace.clone())
                 .unwrap()
         );
-        assert_eq!(world.dirty_count(), 0);
+        assert_eq!(world.dirty_count(), 1);
         assert_eq!(world.furnace_block_entity(pos).unwrap(), Some(furnace));
+    }
+
+    #[test]
+    fn furnace_block_entity_survives_flush_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let air = mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        };
+        let registry = Arc::new(BlockRegistry::from_report(&[air]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:raw_iron").unwrap(),
+                protocol_id: 10,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:coal").unwrap(),
+                protocol_id: 11,
+            },
+        ]));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4)
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        let mut furnace = FurnaceBlockEntity {
+            burn_remaining: 1200,
+            burn_total: 1600,
+            cook_progress: 37,
+            cook_total: 200,
+            ..FurnaceBlockEntity::default()
+        };
+        furnace.slots[0] = crate::chunk::FurnaceSlot {
+            count: 1,
+            item_id: 10,
+            damage: None,
+        };
+        furnace.slots[1] = crate::chunk::FurnaceSlot {
+            count: 3,
+            item_id: 11,
+            damage: None,
+        };
+        world
+            .set_furnace_block_entity(pos, furnace.clone())
+            .unwrap();
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+
+        let mut fresh = WorldStorage::open(tmp.path(), Arc::clone(&registry))
+            .unwrap()
+            .with_item_registry(items);
+        assert_eq!(fresh.furnace_block_entity(pos).unwrap(), Some(furnace));
     }
 
     /// End-to-end: open the generated flat test world, query known
