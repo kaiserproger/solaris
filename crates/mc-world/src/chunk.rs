@@ -56,6 +56,44 @@ pub struct BlockPos {
     pub z: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledBlockTick {
+    pub pos: BlockPos,
+    pub block: Identifier,
+    pub trigger_tick: u64,
+    pub priority: i32,
+    sequence: u64,
+}
+
+impl ScheduledBlockTick {
+    #[must_use]
+    pub fn new(pos: BlockPos, block: Identifier, trigger_tick: u64, priority: i32) -> Self {
+        Self {
+            pos,
+            block,
+            trigger_tick,
+            priority,
+            sequence: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
+
+    fn sort_key(&self) -> (u64, i32, u64) {
+        (self.trigger_tick, self.priority, self.sequence)
+    }
+
+    fn same_request(&self, other: &ScheduledBlockTick) -> bool {
+        self.pos == other.pos
+            && self.block == other.block
+            && self.trigger_tick == other.trigger_tick
+            && self.priority == other.priority
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FurnaceSlot {
     pub count: i32,
@@ -241,6 +279,11 @@ pub struct Chunk {
     pub block_entities: HashMap<BlockPos, Vec<u8>>,
     /// Runtime-typed furnace state keyed by absolute world position.
     pub furnaces: HashMap<BlockPos, FurnaceBlockEntity>,
+    /// Chunk-owned scheduled block ticks. Runtime code orders by
+    /// trigger tick, priority, and insertion sequence; Anvil persistence
+    /// is wired in separately once the local 26.1.2 shape is verified.
+    pub scheduled_block_ticks: Vec<ScheduledBlockTick>,
+    next_scheduled_block_tick_sequence: u64,
     /// Vanilla generation status (`"full"`, `"biomes"`, `"structure_starts"`, …).
     pub status: String,
     /// Baked light arrays read from Anvil, one entry per
@@ -301,6 +344,8 @@ impl Chunk {
             highest_opaque: Heightmap::zeroed(),
             block_entities: HashMap::new(),
             furnaces: HashMap::new(),
+            scheduled_block_ticks: Vec::new(),
+            next_scheduled_block_tick_sequence: 0,
             status: "full".to_string(),
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
             extras: Vec::new(),
@@ -380,6 +425,74 @@ impl Chunk {
     pub fn highest_opaque_y(&self, x: u8, z: u8) -> Option<i32> {
         heightmap_value_to_world_y(self.highest_opaque.get(x, z))
     }
+
+    #[must_use]
+    pub fn scheduled_block_ticks(&self) -> &[ScheduledBlockTick] {
+        &self.scheduled_block_ticks
+    }
+
+    pub fn schedule_block_tick(&mut self, mut tick: ScheduledBlockTick) -> bool {
+        if !self.contains_block_pos(tick.pos)
+            || self
+                .scheduled_block_ticks
+                .iter()
+                .any(|existing| existing.same_request(&tick))
+        {
+            return false;
+        }
+        tick.sequence = self.next_scheduled_block_tick_sequence;
+        self.next_scheduled_block_tick_sequence =
+            self.next_scheduled_block_tick_sequence.wrapping_add(1);
+        self.scheduled_block_ticks.push(tick);
+        self.scheduled_block_ticks
+            .sort_by_key(ScheduledBlockTick::sort_key);
+        self.dirty = true;
+        true
+    }
+
+    pub fn remove_scheduled_block_ticks_at(&mut self, pos: BlockPos) -> Vec<ScheduledBlockTick> {
+        let before = self.scheduled_block_ticks.len();
+        let mut removed = Vec::new();
+        self.scheduled_block_ticks.retain(|tick| {
+            if tick.pos == pos {
+                removed.push(tick.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if self.scheduled_block_ticks.len() != before {
+            self.dirty = true;
+        }
+        removed
+    }
+
+    pub fn drain_due_block_ticks(
+        &mut self,
+        world_tick: u64,
+        max_ticks: usize,
+    ) -> Vec<ScheduledBlockTick> {
+        if max_ticks == 0 {
+            return Vec::new();
+        }
+        let due_count = self
+            .scheduled_block_ticks
+            .partition_point(|tick| tick.trigger_tick <= world_tick)
+            .min(max_ticks);
+        if due_count == 0 {
+            return Vec::new();
+        }
+        self.dirty = true;
+        self.scheduled_block_ticks.drain(0..due_count).collect()
+    }
+
+    #[must_use]
+    pub fn contains_block_pos(&self, pos: BlockPos) -> bool {
+        pos.y >= MIN_Y
+            && pos.y < MAX_Y
+            && pos.x.div_euclid(SECTION_DIM as i32) == self.pos.x
+            && pos.z.div_euclid(SECTION_DIM as i32) == self.pos.z
+    }
 }
 
 /// Walk column `(x, z)` from `MAX_Y - 1` down to `MIN_Y` and return
@@ -443,6 +556,9 @@ mod tests {
     }
     fn plains() -> Identifier {
         Identifier::parse("minecraft:plains").unwrap()
+    }
+    fn wheat() -> Identifier {
+        Identifier::parse("minecraft:wheat").unwrap()
     }
 
     #[test]
@@ -582,5 +698,90 @@ mod tests {
         c.set_block(3, 64, 7, air());
         c.update_highest_opaque_column(3, 7, &table);
         assert_eq!(c.highest_opaque_y(3, 7), None);
+    }
+
+    #[test]
+    fn scheduled_block_ticks_drain_in_deterministic_order() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let pos_a = BlockPos { x: 1, y: 64, z: 1 };
+        let pos_b = BlockPos { x: 2, y: 64, z: 1 };
+        let pos_c = BlockPos { x: 3, y: 64, z: 1 };
+
+        assert!(c.schedule_block_tick(ScheduledBlockTick::new(pos_a, wheat(), 10, 0)));
+        assert!(c.schedule_block_tick(ScheduledBlockTick::new(pos_b, wheat(), 5, 0)));
+        assert!(c.schedule_block_tick(ScheduledBlockTick::new(pos_c, wheat(), 10, -1)));
+
+        c.dirty = false;
+        let due = c.drain_due_block_ticks(10, usize::MAX);
+
+        assert_eq!(
+            due.iter().map(|tick| tick.pos).collect::<Vec<_>>(),
+            vec![pos_b, pos_c, pos_a]
+        );
+        assert!(c.scheduled_block_ticks().is_empty());
+        assert!(c.dirty);
+    }
+
+    #[test]
+    fn scheduled_block_ticks_skip_duplicates_and_mark_dirty_only_on_change() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let tick = ScheduledBlockTick::new(BlockPos { x: 1, y: 64, z: 1 }, wheat(), 10, 0);
+
+        assert!(c.schedule_block_tick(tick.clone()));
+        c.dirty = false;
+        assert!(!c.schedule_block_tick(tick));
+        assert_eq!(c.scheduled_block_ticks().len(), 1);
+        assert!(!c.dirty);
+
+        assert!(c.drain_due_block_ticks(9, usize::MAX).is_empty());
+        assert!(!c.dirty);
+        assert!(c.drain_due_block_ticks(10, 0).is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_block_ticks_reject_positions_outside_chunk() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+
+        assert!(!c.schedule_block_tick(ScheduledBlockTick::new(
+            BlockPos { x: 16, y: 64, z: 1 },
+            wheat(),
+            10,
+            0,
+        )));
+        assert!(!c.schedule_block_tick(ScheduledBlockTick::new(
+            BlockPos {
+                x: 1,
+                y: MAX_Y,
+                z: 1
+            },
+            wheat(),
+            10,
+            0,
+        )));
+        assert!(c.scheduled_block_ticks().is_empty());
+        assert!(!c.dirty);
+    }
+
+    #[test]
+    fn scheduled_block_ticks_remove_by_position() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let pos = BlockPos { x: 1, y: 64, z: 1 };
+        let other = BlockPos { x: 2, y: 64, z: 1 };
+        assert!(c.schedule_block_tick(ScheduledBlockTick::new(pos, wheat(), 10, 0)));
+        assert!(c.schedule_block_tick(ScheduledBlockTick::new(other, wheat(), 10, 0)));
+
+        c.dirty = false;
+        let removed = c.remove_scheduled_block_ticks_at(pos);
+
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].pos, pos);
+        assert_eq!(c.scheduled_block_ticks().len(), 1);
+        assert_eq!(c.scheduled_block_ticks()[0].pos, other);
+        assert!(c.dirty);
+
+        c.dirty = false;
+        assert!(c.remove_scheduled_block_ticks_at(pos).is_empty());
+        assert!(!c.dirty);
     }
 }
