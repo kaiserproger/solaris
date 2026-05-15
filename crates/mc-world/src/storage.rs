@@ -1184,6 +1184,71 @@ mod tests {
         assert_eq!(after, new_state);
     }
 
+    #[test]
+    fn fluid_state_and_scheduled_tick_survive_flush_and_reopen() {
+        use mc_data::Identifier;
+        use std::collections::BTreeMap;
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let mut water_properties = BTreeMap::new();
+        water_properties.insert("level".to_string(), vec!["0".to_string(), "1".to_string()]);
+        let report = vec![
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:water").unwrap(),
+                properties: water_properties,
+                states: vec![
+                    mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: BTreeMap::from([("level".to_string(), "0".to_string())]),
+                    },
+                    mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: false,
+                        properties: BTreeMap::from([("level".to_string(), "1".to_string())]),
+                    },
+                ],
+            },
+        ];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 64, z: 1 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let water = Identifier::parse("minecraft:water").unwrap();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+        assert!(
+            world
+                .schedule_fluid_tick(ScheduledFluidTick::new(pos, water.clone(), 12, 0))
+                .unwrap()
+        );
+
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+        drop(world);
+
+        let mut reopened = WorldStorage::open_with_capacity(tmp_world.path(), registry, 4).unwrap();
+        assert_eq!(reopened.get_block(pos).unwrap(), Some(BlockStateId(1)));
+        let ticks = reopened.scheduled_fluid_ticks(cpos).unwrap().unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].pos, pos);
+        assert_eq!(ticks[0].fluid, water);
+        assert_eq!(ticks[0].trigger_tick, 12);
+    }
+
     /// M6.b: the spawn-burst load path (read 121 chunks) must not
     /// produce any dirty chunks (chunks decoded from disk start
     /// clean). This guards against an accidental `dirty = true`

@@ -99,7 +99,9 @@ impl BlockFactsTable {
 
     #[must_use]
     pub fn fluid(&self, state_id: u32) -> Option<FluidStateFacts> {
-        self.states.get(state_id as usize).and_then(|facts| facts.fluid)
+        self.states
+            .get(state_id as usize)
+            .and_then(|facts| facts.fluid)
     }
 }
 
@@ -307,7 +309,12 @@ mod tests {
         let source = water
             .states
             .iter()
-            .find(|state| state.properties.get("level").is_some_and(|level| level == "0"))
+            .find(|state| {
+                state
+                    .properties
+                    .get("level")
+                    .is_some_and(|level| level == "0")
+            })
             .unwrap();
 
         assert_eq!(

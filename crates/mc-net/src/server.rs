@@ -140,6 +140,7 @@ impl BoundServer {
                         .await;
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
                 play::run_random_ticks(&entity_config, &entity_sessions, tick).await;
+                play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
             }
         });
         loop {

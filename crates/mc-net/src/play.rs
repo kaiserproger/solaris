@@ -22,6 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::{Bytes, BytesMut};
+use mc_data::block_facts::{FluidKind, FluidStateFacts};
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
@@ -60,7 +61,10 @@ use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
 };
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
-use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot};
+use mc_world::{
+    BlockRegistry, BlockStateId, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot,
+    ScheduledFluidTick,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
 use tokio::time::{MissedTickBehavior, interval};
@@ -109,6 +113,9 @@ const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
 const DEFAULT_FOOD_USE_DURATION: Duration = Duration::from_millis(1_600);
 const HOSTILE_MELEE_RANGE: f64 = 1.8;
 const HOSTILE_MELEE_COOLDOWN: Duration = Duration::from_secs(1);
+const FLUID_TICK_BUDGET: usize = 256;
+const WATER_FLOW_DELAY_TICKS: u64 = 5;
+const LAVA_FLOW_DELAY_TICKS: u64 = 30;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -1704,6 +1711,7 @@ where
             world: Arc::clone(world),
             blocks: Arc::clone(&config.blocks),
             block_light: config.block_light.as_ref().map(Arc::clone),
+            block_facts: Arc::clone(&config.block_facts),
             water: passive_herd_water,
             sessions: Arc::clone(&sessions),
             session_id,
@@ -1726,6 +1734,7 @@ where
             pending_break: None,
             pending_use: None,
             last_hostile_damage_at: None,
+            fluid_schedule_tick: 0,
         });
         play_loop(
             reader,
@@ -1757,6 +1766,7 @@ struct InteractionState {
     world: WorldHandle,
     blocks: Arc<mc_world::BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
+    block_facts: Arc<mc_data::block_facts::BlockFactsTable>,
     water: Option<mc_world::BlockStateId>,
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
@@ -1800,6 +1810,7 @@ struct InteractionState {
     pending_break: Option<PendingBreak>,
     pending_use: Option<PendingUse>,
     last_hostile_damage_at: Option<Instant>,
+    fluid_schedule_tick: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -2123,6 +2134,8 @@ fn item_max_stack(items: &ItemRegistry, stack: &ItemStack) -> i32 {
                 | "fishing_rod"
                 | "shears"
                 | "flint_and_steel"
+                | "water_bucket"
+                | "lava_bucket"
         )
         || path.ends_with("_helmet")
         || path.ends_with("_chestplate")
@@ -2130,6 +2143,8 @@ fn item_max_stack(items: &ItemRegistry, stack: &ItemStack) -> i32 {
         || path.ends_with("_boots")
     {
         1
+    } else if path == "bucket" {
+        16
     } else {
         64
     }
@@ -2214,6 +2229,11 @@ fn damage_equipped_armor(state: &mut InteractionState) -> Vec<(usize, ItemStack)
 struct ItemToBlockTable {
     entries: Vec<(u32, mc_world::BlockStateId)>,
     crop_entries: Vec<CropPlacementEntry>,
+    empty_bucket_item: Option<u32>,
+    water_bucket_item: Option<u32>,
+    lava_bucket_item: Option<u32>,
+    water_source: Option<mc_world::BlockStateId>,
+    lava_source: Option<mc_world::BlockStateId>,
 }
 
 #[derive(Debug, Clone)]
@@ -2236,9 +2256,19 @@ impl ItemToBlockTable {
         let crop_entries = wheat_crop_placement_entry(items, blocks)
             .into_iter()
             .collect();
+        let empty_bucket_item = item_id(items, "minecraft:bucket");
+        let water_bucket_item = item_id(items, "minecraft:water_bucket");
+        let lava_bucket_item = item_id(items, "minecraft:lava_bucket");
+        let water_source = fluid_state_with_level(blocks, FluidKind::Water, 0);
+        let lava_source = fluid_state_with_level(blocks, FluidKind::Lava, 0);
         Self {
             entries,
             crop_entries,
+            empty_bucket_item,
+            water_bucket_item,
+            lava_bucket_item,
+            water_source,
+            lava_source,
         }
     }
 
@@ -2266,6 +2296,38 @@ impl ItemToBlockTable {
         }
         self.resolve(item_id)
     }
+
+    fn empty_bucket_item(&self) -> Option<u32> {
+        self.empty_bucket_item
+    }
+
+    fn filled_bucket_item(&self, kind: FluidKind) -> Option<u32> {
+        match kind {
+            FluidKind::Water => self.water_bucket_item,
+            FluidKind::Lava => self.lava_bucket_item,
+        }
+    }
+
+    fn bucket_fluid_kind(&self, item_id: u32) -> Option<FluidKind> {
+        if Some(item_id) == self.water_bucket_item {
+            Some(FluidKind::Water)
+        } else if Some(item_id) == self.lava_bucket_item {
+            Some(FluidKind::Lava)
+        } else {
+            None
+        }
+    }
+
+    fn fluid_source_state(&self, kind: FluidKind) -> Option<mc_world::BlockStateId> {
+        match kind {
+            FluidKind::Water => self.water_source,
+            FluidKind::Lava => self.lava_source,
+        }
+    }
+}
+
+fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
+    items.id_of(&Identifier::parse(name).expect("static identifier"))
 }
 
 fn wheat_crop_placement_entry(
@@ -5668,6 +5730,9 @@ where
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
     let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
     let changed = !outcome.applied.is_empty();
+    if changed {
+        schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
+    }
     if drop_items
         && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
         && let Some(drop) = block_drop_stack(state, prev)
@@ -6103,6 +6168,372 @@ pub(crate) async fn run_random_ticks(
     }
 }
 
+pub(crate) async fn run_scheduled_fluid_ticks(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    world_tick: u64,
+) {
+    let Some(world) = config.world.as_ref() else {
+        return;
+    };
+    let ticketed_chunks = sessions.ticketed_chunks_sorted();
+    if ticketed_chunks.is_empty() {
+        return;
+    }
+
+    let table = config.block_light.as_deref();
+    let mut drained = 0usize;
+    let mut outcome = BlockEditBatchOutcome::default();
+    {
+        let mut storage = world.lock().await;
+        for &(cx, cz) in &ticketed_chunks {
+            if drained >= FLUID_TICK_BUDGET {
+                break;
+            }
+            let cpos = ChunkPos { x: cx, z: cz };
+            let remaining = FLUID_TICK_BUDGET - drained;
+            let due = match storage.drain_due_fluid_ticks(cpos, world_tick, remaining) {
+                Ok(due) => due,
+                Err(err) => {
+                    warn!(error = %err, cx, cz, "scheduled fluid tick drain failed");
+                    continue;
+                }
+            };
+            drained += due.len();
+            for tick in due {
+                let Ok(Some(state)) = storage.get_block(tick.pos) else {
+                    continue;
+                };
+                let Some(fluid) = config.block_facts.fluid(state.0) else {
+                    continue;
+                };
+                if fluid_identifier(fluid.kind) != tick.fluid {
+                    continue;
+                }
+                let edits = fluid_tick_edits(
+                    &config.blocks,
+                    &config.block_facts,
+                    &mut storage,
+                    tick.pos,
+                    state,
+                    fluid,
+                );
+                for edit in edits {
+                    apply_block_edit_to_storage(&mut storage, table, &edit, &mut outcome);
+                }
+            }
+        }
+        schedule_fluid_ticks_near_applied(
+            &mut storage,
+            &config.block_facts,
+            world_tick,
+            &outcome.applied,
+        );
+    }
+
+    if !outcome.applied.is_empty() {
+        sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+        broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
+        if let Some(table) = table {
+            let light_updates = {
+                let mut storage = world.lock().await;
+                collect_full_light_updates_for_chunks(&mut storage, table, &outcome.edit_chunks)
+            };
+            sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+            broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+        }
+        debug!(
+            world_tick,
+            drained,
+            applied = outcome.applied.len(),
+            "scheduled fluid ticks applied edits"
+        );
+    }
+}
+
+fn fluid_tick_edits(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+    fluid: FluidStateFacts,
+) -> Vec<BlockEdit> {
+    let mut edits = fluid_interaction_edits(blocks, facts, storage, pos, fluid);
+    if !edits.is_empty() {
+        return edits;
+    }
+
+    if !fluid.source
+        && let Some(new_state) = supported_flow_state(blocks, facts, storage, pos, fluid)
+        && new_state != state
+    {
+        edits.push(BlockEdit { pos, new_state });
+        return edits;
+    }
+
+    edits.extend(fluid_spread_edits(blocks, facts, storage, pos, fluid));
+    edits
+}
+
+fn fluid_interaction_edits(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    fluid: FluidStateFacts,
+) -> Vec<BlockEdit> {
+    let mut edits = Vec::new();
+    for neighbour in fluid_neighbour_positions(pos) {
+        let Ok(Some(neighbour_state)) = storage.get_block(neighbour) else {
+            continue;
+        };
+        let Some(other) = facts.fluid(neighbour_state.0) else {
+            continue;
+        };
+        if other.kind == fluid.kind {
+            continue;
+        }
+        match (fluid.kind, other.kind) {
+            (FluidKind::Water, FluidKind::Lava) => {
+                if let Some(new_state) = lava_contact_result(blocks, other, pos, neighbour) {
+                    push_unique_block_edit(
+                        &mut edits,
+                        BlockEdit {
+                            pos: neighbour,
+                            new_state,
+                        },
+                    );
+                }
+            }
+            (FluidKind::Lava, FluidKind::Water) => {
+                if let Some(new_state) = lava_contact_result(blocks, fluid, neighbour, pos) {
+                    push_unique_block_edit(&mut edits, BlockEdit { pos, new_state });
+                }
+            }
+            _ => {}
+        }
+    }
+    edits
+}
+
+fn push_unique_block_edit(edits: &mut Vec<BlockEdit>, edit: BlockEdit) {
+    if edits.iter().any(|existing| existing.pos == edit.pos) {
+        return;
+    }
+    edits.push(edit);
+}
+
+fn lava_contact_result(
+    blocks: &mc_world::BlockRegistry,
+    lava: FluidStateFacts,
+    water_pos: mc_world::BlockPos,
+    lava_pos: mc_world::BlockPos,
+) -> Option<mc_world::BlockStateId> {
+    if lava.source {
+        return named_block_default(blocks, "minecraft:obsidian");
+    }
+    if water_pos.y > lava_pos.y {
+        named_block_default(blocks, "minecraft:stone")
+    } else {
+        named_block_default(blocks, "minecraft:cobblestone")
+    }
+}
+
+fn supported_flow_state(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    fluid: FluidStateFacts,
+) -> Option<mc_world::BlockStateId> {
+    let above = mc_world::BlockPos {
+        y: pos.y + 1,
+        ..pos
+    };
+    if storage
+        .get_block(above)
+        .ok()
+        .flatten()
+        .and_then(|state| facts.fluid(state.0))
+        .is_some_and(|above| above.kind == fluid.kind)
+    {
+        return fluid_state_with_level(blocks, fluid.kind, 1);
+    }
+
+    let next_level = horizontal_fluid_neighbours(pos)
+        .into_iter()
+        .filter_map(|neighbour| storage.get_block(neighbour).ok().flatten())
+        .filter_map(|state| facts.fluid(state.0))
+        .filter(|other| other.kind == fluid.kind)
+        .map(|other| other.level.saturating_add(1))
+        .min();
+
+    match next_level {
+        Some(level) if level <= max_flow_level(fluid.kind) => {
+            fluid_state_with_level(blocks, fluid.kind, level)
+        }
+        _ => Some(air_state_id(blocks)),
+    }
+}
+
+fn fluid_spread_edits(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    fluid: FluidStateFacts,
+) -> Vec<BlockEdit> {
+    let next_level = if fluid.source { 1 } else { fluid.level + 1 };
+    if next_level > max_flow_level(fluid.kind) {
+        return Vec::new();
+    }
+    let Some(next_state) = fluid_state_with_level(blocks, fluid.kind, next_level) else {
+        return Vec::new();
+    };
+    let below = mc_world::BlockPos {
+        y: pos.y - 1,
+        ..pos
+    };
+    if can_flow_into(blocks, facts, storage, below, fluid.kind, next_level) {
+        return vec![BlockEdit {
+            pos: below,
+            new_state: next_state,
+        }];
+    }
+
+    horizontal_fluid_neighbours(pos)
+        .into_iter()
+        .filter(|&target| can_flow_into(blocks, facts, storage, target, fluid.kind, next_level))
+        .map(|target| BlockEdit {
+            pos: target,
+            new_state: next_state,
+        })
+        .collect()
+}
+
+fn can_flow_into(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    kind: FluidKind,
+    new_level: u8,
+) -> bool {
+    let Ok(Some(state)) = storage.get_block(pos) else {
+        return false;
+    };
+    if state == air_state_id(blocks) {
+        return true;
+    }
+    facts
+        .fluid(state.0)
+        .is_some_and(|fluid| fluid.kind == kind && !fluid.source && fluid.level > new_level)
+}
+
+fn schedule_fluid_ticks_near_applied(
+    storage: &mut mc_world::WorldStorage,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    world_tick: u64,
+    applied: &[AppliedBlockEdit],
+) {
+    let mut positions = HashSet::new();
+    for edit in applied {
+        positions.insert(edit.pos);
+        for pos in fluid_neighbour_positions(edit.pos) {
+            positions.insert(pos);
+        }
+    }
+    for pos in positions {
+        let Ok(Some(state)) = storage.get_block(pos) else {
+            continue;
+        };
+        let Some(fluid) = facts.fluid(state.0) else {
+            continue;
+        };
+        let delay = fluid_tick_delay(fluid.kind);
+        let _ = storage.schedule_fluid_tick(ScheduledFluidTick::new(
+            pos,
+            fluid_identifier(fluid.kind),
+            world_tick.wrapping_add(delay),
+            0,
+        ));
+    }
+}
+
+fn fluid_tick_delay(kind: FluidKind) -> u64 {
+    match kind {
+        FluidKind::Water => WATER_FLOW_DELAY_TICKS,
+        FluidKind::Lava => LAVA_FLOW_DELAY_TICKS,
+    }
+}
+
+fn max_flow_level(kind: FluidKind) -> u8 {
+    match kind {
+        FluidKind::Water => 7,
+        FluidKind::Lava => 3,
+    }
+}
+
+fn fluid_neighbour_positions(pos: mc_world::BlockPos) -> [mc_world::BlockPos; 6] {
+    [
+        mc_world::BlockPos {
+            x: pos.x + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            x: pos.x - 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z - 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            y: pos.y + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            y: pos.y - 1,
+            ..pos
+        },
+    ]
+}
+
+fn horizontal_fluid_neighbours(pos: mc_world::BlockPos) -> [mc_world::BlockPos; 4] {
+    [
+        mc_world::BlockPos {
+            x: pos.x + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            x: pos.x - 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z - 1,
+            ..pos
+        },
+    ]
+}
+
+fn named_block_default(
+    blocks: &mc_world::BlockRegistry,
+    name: &str,
+) -> Option<mc_world::BlockStateId> {
+    blocks
+        .block(&Identifier::parse(name).expect("static identifier"))
+        .map(|block| block.default)
+}
+
 fn random_tick_edit(
     blocks: &mc_world::BlockRegistry,
     facts: &mc_data::block_facts::BlockFactsTable,
@@ -6384,6 +6815,25 @@ fn crop_state_with_age(
     age: u8,
 ) -> Option<mc_world::BlockStateId> {
     blocks.by_name_and_props(crop, &[("age".to_string(), age.to_string())])
+}
+
+fn fluid_identifier(kind: FluidKind) -> Identifier {
+    Identifier::parse(match kind {
+        FluidKind::Water => "minecraft:water",
+        FluidKind::Lava => "minecraft:lava",
+    })
+    .expect("static identifier")
+}
+
+fn fluid_state_with_level(
+    blocks: &mc_world::BlockRegistry,
+    kind: FluidKind,
+    level: u8,
+) -> Option<mc_world::BlockStateId> {
+    blocks.by_name_and_props(
+        &fluid_identifier(kind),
+        &[("level".to_string(), level.to_string())],
+    )
 }
 
 fn farmland_state_with_moisture(
@@ -6916,6 +7366,154 @@ fn break_replacement_from_neighbours(
     }
 }
 
+async fn handle_bucket_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    direction: Direction,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let held_slot = state.selected_hotbar_slot;
+    let held = state.inventory.held(held_slot).clone();
+    if held.is_empty() {
+        return Ok(false);
+    }
+
+    if let Some(kind) = state.item_to_block.bucket_fluid_kind(held.item_id) {
+        let Some(source_state) = state.item_to_block.fluid_source_state(kind) else {
+            return Ok(false);
+        };
+        let Some(empty_bucket) = state.item_to_block.empty_bucket_item() else {
+            return Ok(false);
+        };
+        let (dx, dy, dz) = direction.normal();
+        let target = mc_world::BlockPos {
+            x: clicked_pos.x + dx,
+            y: clicked_pos.y + dy,
+            z: clicked_pos.z + dz,
+        };
+        let air = air_state_id(&state.blocks);
+        let target_is_air = {
+            let mut storage = state.world.lock().await;
+            matches!(storage.get_block(target), Ok(Some(state_id)) if state_id == air)
+        };
+        if !target_is_air {
+            return Ok(false);
+        }
+
+        let inventory_update = (game_mode == GameMode::Survival)
+            .then(|| plan_bucket_replacement(&state.inventory, held_slot, empty_bucket, 16))
+            .flatten();
+        if game_mode == GameMode::Survival && inventory_update.is_none() {
+            return Ok(false);
+        }
+
+        let edits = [BlockEdit {
+            pos: target,
+            new_state: source_state,
+        }];
+        let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
+        if outcome.applied.is_empty() {
+            return Ok(true);
+        }
+        schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
+        if let Some((inventory, changed)) = inventory_update {
+            state.inventory = inventory;
+            write_inventory_slot_updates(state, writer, changed).await?;
+        }
+        dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+        return Ok(true);
+    }
+
+    if Some(held.item_id) != state.item_to_block.empty_bucket_item() {
+        return Ok(false);
+    }
+    let clicked_state = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(clicked_pos) {
+            Ok(Some(state_id)) => state_id,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(error = %err, x = clicked_pos.x, y = clicked_pos.y, z = clicked_pos.z, "bucket pickup read failed");
+                return write_block_ack(writer, state.compression, sequence)
+                    .await
+                    .map(|()| true);
+            }
+        }
+    };
+    let Some(fluid) = state.block_facts.fluid(clicked_state.0) else {
+        return Ok(false);
+    };
+    if !fluid.source {
+        return Ok(false);
+    }
+    let Some(filled_bucket) = state.item_to_block.filled_bucket_item(fluid.kind) else {
+        return Ok(false);
+    };
+    let inventory_update = (game_mode == GameMode::Survival)
+        .then(|| plan_bucket_replacement(&state.inventory, held_slot, filled_bucket, 1))
+        .flatten();
+    if game_mode == GameMode::Survival && inventory_update.is_none() {
+        return Ok(false);
+    }
+
+    let edits = [BlockEdit {
+        pos: clicked_pos,
+        new_state: air_state_id(&state.blocks),
+    }];
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
+    if outcome.applied.is_empty() {
+        return Ok(true);
+    }
+    schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
+    if let Some((inventory, changed)) = inventory_update {
+        state.inventory = inventory;
+        write_inventory_slot_updates(state, writer, changed).await?;
+    }
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+    Ok(true)
+}
+
+fn plan_bucket_replacement(
+    inventory: &PlayerInventory,
+    held_slot: u8,
+    replacement_item: u32,
+    _replacement_max_stack: i32,
+) -> Option<(PlayerInventory, Vec<(usize, ItemStack)>)> {
+    let mut inventory = inventory.clone();
+    let wire_slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
+    let mut changed = Vec::new();
+    let held = inventory.held_mut(held_slot);
+    if held.count > 1 {
+        return None;
+    }
+
+    *held = ItemStack {
+        item_id: replacement_item,
+        count: 1,
+        damage: None,
+    };
+    changed.push((wire_slot, held.clone()));
+    Some((inventory, changed))
+}
+
+async fn schedule_fluid_ticks_for_interaction(
+    state: &InteractionState,
+    applied: &[AppliedBlockEdit],
+) {
+    let mut storage = state.world.lock().await;
+    schedule_fluid_ticks_near_applied(
+        &mut storage,
+        &state.block_facts,
+        state.fluid_schedule_tick,
+        applied,
+    );
+}
+
 /// M6.f/M23 follow-up: handle a serverbound `UseItemOn`. Resolves the placed
 /// block via the player's currently-held hotbar slot through the item→block
 /// table. Drops the placement silently (still acking) if the held stack is
@@ -6993,6 +7591,24 @@ where
         return Ok(());
     }
     if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
+
+    let clicked_pos = mc_world::BlockPos {
+        x: cx,
+        y: cy,
+        z: cz,
+    };
+    if handle_bucket_use_on(
+        state,
+        writer,
+        game_mode,
+        action.sequence,
+        clicked_pos,
+        action.direction,
+    )
+    .await?
+    {
         return Ok(());
     }
 
@@ -7913,6 +8529,7 @@ where
             }
             _ = furnace_ticker.tick() => {
                 if let Some(state) = interaction.as_deref_mut() {
+                    state.fluid_schedule_tick = state.fluid_schedule_tick.wrapping_add(1);
                     tick_active_container(state, writer).await?;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                     tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
@@ -8578,6 +9195,46 @@ mod tests {
         mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
     }
 
+    fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
+        let mut properties = BTreeMap::new();
+        properties.insert(
+            "level".to_string(),
+            (0..=max_level).map(|level| level.to_string()).collect(),
+        );
+        BlockReport {
+            id: Identifier::parse(name).unwrap(),
+            properties,
+            states: (0..=max_level)
+                .map(|level| {
+                    state(
+                        first_id + u32::from(level),
+                        level == 0,
+                        &[("level", &level.to_string())],
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn fluid_test_reports() -> Vec<BlockReport> {
+        vec![
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:stone"),
+            fluid_block(2, "minecraft:water", 7),
+            fluid_block(10, "minecraft:lava", 3),
+            simple_block(14, "minecraft:obsidian"),
+            simple_block(15, "minecraft:cobblestone"),
+        ]
+    }
+
+    fn fluid_test_registry() -> mc_world::BlockRegistry {
+        mc_world::BlockRegistry::from_report(&fluid_test_reports()).unwrap()
+    }
+
+    fn fluid_test_facts() -> mc_data::block_facts::BlockFactsTable {
+        mc_data::block_facts::BlockFactsTable::from_blocks_report(&fluid_test_reports())
+    }
+
     #[test]
     fn entity_tick_cadence_matches_vanilla_cow_tracking() {
         assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
@@ -8735,6 +9392,245 @@ mod tests {
         assert_eq!(
             table.resolve_for_use_on(50, dirt_state, Direction::Up, &blocks),
             None
+        );
+    }
+
+    #[test]
+    fn bucket_items_resolve_fluid_sources() {
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: Identifier::parse("minecraft:bucket").unwrap(),
+                protocol_id: 60,
+            },
+            ItemReport {
+                id: Identifier::parse("minecraft:water_bucket").unwrap(),
+                protocol_id: 61,
+            },
+            ItemReport {
+                id: Identifier::parse("minecraft:lava_bucket").unwrap(),
+                protocol_id: 62,
+            },
+        ]);
+        let blocks = fluid_test_registry();
+        let table = ItemToBlockTable::build(&items, &blocks);
+
+        assert_eq!(table.empty_bucket_item(), Some(60));
+        assert_eq!(table.bucket_fluid_kind(61), Some(FluidKind::Water));
+        assert_eq!(table.bucket_fluid_kind(62), Some(FluidKind::Lava));
+        assert_eq!(
+            table.fluid_source_state(FluidKind::Water),
+            Some(BlockStateId(2))
+        );
+        assert_eq!(
+            table.fluid_source_state(FluidKind::Lava),
+            Some(BlockStateId(10))
+        );
+    }
+
+    #[test]
+    fn bucket_replacement_updates_single_held_stack_only() {
+        let mut inventory = PlayerInventory::empty();
+        inventory.set_hotbar(
+            0,
+            ItemStack {
+                item_id: 61,
+                count: 1,
+                damage: None,
+            },
+        );
+
+        let (next, changed) = plan_bucket_replacement(&inventory, 0, 60, 16).unwrap();
+
+        assert_eq!(next.held(0).item_id, 60);
+        assert_eq!(next.held(0).count, 1);
+        assert_eq!(
+            changed,
+            vec![(PlayerInventory::HOTBAR_BASE, next.held(0).clone())]
+        );
+
+        inventory.set_hotbar(
+            0,
+            ItemStack {
+                item_id: 60,
+                count: 2,
+                damage: None,
+            },
+        );
+        assert!(plan_bucket_replacement(&inventory, 0, 61, 1).is_none());
+    }
+
+    #[test]
+    fn fluid_tick_flows_sideways_when_blocked_below() {
+        let facts = fluid_test_facts();
+        let registry = Arc::new(fluid_test_registry());
+        let blocks = registry.as_ref();
+        let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        world
+            .set_block_at(mc_world::BlockPos { y: 63, ..pos }, BlockStateId(1))
+            .unwrap();
+
+        let edits = fluid_tick_edits(
+            blocks,
+            &facts,
+            &mut world,
+            pos,
+            BlockStateId(2),
+            facts.fluid(2).unwrap(),
+        );
+
+        assert_eq!(edits.len(), 4);
+        assert!(edits.iter().all(|edit| edit.new_state == BlockStateId(3)));
+    }
+
+    #[test]
+    fn unsupported_flow_decays_to_air() {
+        let facts = fluid_test_facts();
+        let registry = Arc::new(fluid_test_registry());
+        let blocks = registry.as_ref();
+        let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        world.set_block_at(pos, BlockStateId(4)).unwrap();
+        world
+            .set_block_at(mc_world::BlockPos { y: 63, ..pos }, BlockStateId(1))
+            .unwrap();
+
+        let edits = fluid_tick_edits(
+            blocks,
+            &facts,
+            &mut world,
+            pos,
+            BlockStateId(4),
+            facts.fluid(4).unwrap(),
+        );
+
+        assert_eq!(
+            edits,
+            vec![BlockEdit {
+                pos,
+                new_state: BlockStateId(0)
+            }]
+        );
+    }
+
+    #[test]
+    fn scheduling_fluid_edits_uses_current_tick_delay() {
+        let facts = fluid_test_facts();
+        let registry = Arc::new(fluid_test_registry());
+        let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+
+        schedule_fluid_ticks_near_applied(
+            &mut world,
+            &facts,
+            100,
+            &[AppliedBlockEdit {
+                pos,
+                previous: BlockStateId(0),
+                new_state: BlockStateId(2),
+            }],
+        );
+
+        let ticks = world.scheduled_fluid_ticks(cpos).unwrap().unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].pos, pos);
+        assert_eq!(ticks[0].trigger_tick, 100 + WATER_FLOW_DELAY_TICKS);
+    }
+
+    #[test]
+    fn water_lava_interactions_make_solid_blocks() {
+        let facts = fluid_test_facts();
+        let registry = Arc::new(fluid_test_registry());
+        let blocks = registry.as_ref();
+        let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let water_pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        let lava_source_pos = mc_world::BlockPos { x: 5, y: 64, z: 4 };
+        world.set_block_at(water_pos, BlockStateId(2)).unwrap();
+        world
+            .set_block_at(lava_source_pos, BlockStateId(10))
+            .unwrap();
+
+        let edits = fluid_tick_edits(
+            blocks,
+            &facts,
+            &mut world,
+            water_pos,
+            BlockStateId(2),
+            facts.fluid(2).unwrap(),
+        );
+        assert_eq!(
+            edits,
+            vec![BlockEdit {
+                pos: lava_source_pos,
+                new_state: BlockStateId(14),
+            }]
+        );
+
+        world
+            .set_block_at(lava_source_pos, BlockStateId(0))
+            .unwrap();
+        let lava_flow_pos = mc_world::BlockPos { x: 4, y: 63, z: 4 };
+        world.set_block_at(lava_flow_pos, BlockStateId(11)).unwrap();
+        let edits = fluid_tick_edits(
+            blocks,
+            &facts,
+            &mut world,
+            lava_flow_pos,
+            BlockStateId(11),
+            facts.fluid(11).unwrap(),
+        );
+        assert_eq!(
+            edits,
+            vec![BlockEdit {
+                pos: lava_flow_pos,
+                new_state: BlockStateId(1),
+            }]
         );
     }
 
