@@ -57,12 +57,15 @@ The script pulls a deterministic subset from `.analysis/server.jar`:
   `blocks.json` is the canonical block-state-id mapping `mc-world`
   loads at startup (M2.b); the other two are kept as cross-check
   oracles for the protocol layer.
+- `reports/minecraft/components/item/` — produced by the server's own
+  Default Components provider and used by M25+ item fact loaders.
 
 Everything else (advancements, full worldgen beyond the selected subset,
 structures) is left out by default — add explicit copy steps in the script when
 a later milestone needs it.
 
-Generating reports invokes the bundled server's own data generator,
+Generating reports invokes the bundled server's own data generator with
+`--server --reports`,
 which requires Java matching `version.json`'s `java_version` field
 (25 for 26.1.x). Override the JDK path with `JAVA=…` if your default
 `java` is on a different major.
