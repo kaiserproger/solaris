@@ -2213,6 +2213,14 @@ fn damage_equipped_armor(state: &mut InteractionState) -> Vec<(usize, ItemStack)
 #[derive(Debug, Clone, Default)]
 struct ItemToBlockTable {
     entries: Vec<(u32, mc_world::BlockStateId)>,
+    crop_entries: Vec<CropPlacementEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct CropPlacementEntry {
+    item_id: u32,
+    soil_block: Identifier,
+    crop_state: mc_world::BlockStateId,
 }
 
 impl ItemToBlockTable {
@@ -2225,7 +2233,13 @@ impl ItemToBlockTable {
                     .map(|block| (item_pid, block.default))
             })
             .collect();
-        Self { entries }
+        let crop_entries = wheat_crop_placement_entry(items, blocks)
+            .into_iter()
+            .collect();
+        Self {
+            entries,
+            crop_entries,
+        }
     }
 
     fn resolve(&self, item_id: u32) -> Option<mc_world::BlockStateId> {
@@ -2233,6 +2247,42 @@ impl ItemToBlockTable {
             .iter()
             .find_map(|(id, state)| (*id == item_id).then_some(*state))
     }
+
+    fn resolve_for_use_on(
+        &self,
+        item_id: u32,
+        clicked_state: mc_world::BlockStateId,
+        direction: Direction,
+        blocks: &mc_world::BlockRegistry,
+    ) -> Option<mc_world::BlockStateId> {
+        if direction.normal().1 == 1
+            && let Some(clicked) = blocks.by_id(clicked_state)
+            && let Some(entry) = self
+                .crop_entries
+                .iter()
+                .find(|entry| entry.item_id == item_id && clicked.block.id == entry.soil_block)
+        {
+            return Some(entry.crop_state);
+        }
+        self.resolve(item_id)
+    }
+}
+
+fn wheat_crop_placement_entry(
+    items: &ItemRegistry,
+    blocks: &mc_world::BlockRegistry,
+) -> Option<CropPlacementEntry> {
+    let wheat_seeds = Identifier::parse("minecraft:wheat_seeds").expect("static identifier");
+    let farmland = Identifier::parse("minecraft:farmland").expect("static identifier");
+    let wheat = Identifier::parse("minecraft:wheat").expect("static identifier");
+    let item_id = items.id_of(&wheat_seeds)?;
+    blocks.block(&farmland)?;
+    let crop_state = crop_state_with_age(blocks, &wheat, 0)?;
+    Some(CropPlacementEntry {
+        item_id,
+        soil_block: farmland,
+        crop_state,
+    })
 }
 
 fn fallback_crafting_recipes() -> Vec<mc_data::recipes::Recipe> {
@@ -5834,10 +5884,19 @@ fn broadcast_block_deltas(
     deltas: &[BlockDelta],
     except: Option<SessionId>,
 ) {
+    broadcast_block_deltas_to_sessions(&state.sessions, chunks, deltas, except);
+}
+
+fn broadcast_block_deltas_to_sessions(
+    sessions: &SessionRegistry,
+    chunks: &HashSet<(i32, i32)>,
+    deltas: &[BlockDelta],
+    except: Option<SessionId>,
+) {
     if deltas.is_empty() || chunks.is_empty() {
         return;
     }
-    for recipient in state.sessions.loaded_recipients_for_chunks(chunks, except) {
+    for recipient in sessions.loaded_recipients_for_chunks(chunks, except) {
         if let Err(err) = recipient
             .tx
             .try_send(OutboundCommand::BlockDeltas(deltas.to_vec()))
@@ -5932,8 +5991,10 @@ pub(crate) async fn run_random_ticks(
         return;
     }
 
+    let table = config.block_light.as_deref();
     let mut sampled = 0usize;
     let mut eligible = 0usize;
+    let mut outcome = BlockEditBatchOutcome::default();
     {
         let mut storage = world.lock().await;
         for sample in &samples {
@@ -5941,18 +6002,217 @@ pub(crate) async fn run_random_ticks(
                 continue;
             };
             sampled += 1;
-            if config.block_facts.random_tick_family(state.0).is_some() {
-                eligible += 1;
+            let Some(family) = config.block_facts.random_tick_family(state.0) else {
+                continue;
+            };
+            eligible += 1;
+            if let Some(edit) = random_tick_edit(
+                &config.blocks,
+                &config.block_facts,
+                &mut storage,
+                sample.pos,
+                state,
+                family,
+            ) {
+                apply_block_edit_to_storage(&mut storage, table, &edit, &mut outcome);
             }
         }
+    }
+
+    if !outcome.applied.is_empty() {
+        sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+        broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
     }
 
     if eligible > 0 {
         debug!(
             world_tick,
-            sampled, eligible, "random tick sampled eligible blocks"
+            sampled,
+            eligible,
+            applied = outcome.applied.len(),
+            "random tick sampled eligible blocks"
         );
     }
+}
+
+fn random_tick_edit(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+    family: mc_data::block_facts::RandomTickFamily,
+) -> Option<BlockEdit> {
+    match family {
+        mc_data::block_facts::RandomTickFamily::Crop => {
+            next_crop_growth_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+        }
+        mc_data::block_facts::RandomTickFamily::Farmland => {
+            next_farmland_state(blocks, facts, storage, pos, state)
+                .map(|new_state| BlockEdit { pos, new_state })
+        }
+        mc_data::block_facts::RandomTickFamily::Fire
+        | mc_data::block_facts::RandomTickFamily::Grass
+        | mc_data::block_facts::RandomTickFamily::Leaves
+        | mc_data::block_facts::RandomTickFamily::Sapling => None,
+    }
+}
+
+fn next_crop_growth_state(
+    blocks: &mc_world::BlockRegistry,
+    state: mc_world::BlockStateId,
+) -> Option<mc_world::BlockStateId> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:wheat" {
+        return None;
+    }
+    let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
+    if age >= 7 {
+        return None;
+    }
+    crop_state_with_age(blocks, &current.block.id, age + 1)
+}
+
+fn next_farmland_state(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<mc_world::BlockStateId> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:farmland" {
+        return None;
+    }
+    let moisture = block_state_property(current, "moisture")?
+        .parse::<u8>()
+        .ok()?;
+    if farmland_has_nearby_water(blocks, storage, pos) {
+        return (moisture < 7)
+            .then(|| farmland_state_with_moisture(blocks, 7))
+            .flatten();
+    }
+    if moisture > 0 {
+        return farmland_state_with_moisture(blocks, moisture - 1);
+    }
+    if farmland_has_crop_above(facts, storage, pos) {
+        return None;
+    }
+    let dirt = Identifier::parse("minecraft:dirt").expect("static identifier");
+    blocks.block(&dirt).map(|block| block.default)
+}
+
+fn block_state_property<'a>(state: &'a mc_world::BlockState, name: &str) -> Option<&'a str> {
+    state
+        .properties
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
+}
+
+fn crop_state_with_age(
+    blocks: &mc_world::BlockRegistry,
+    crop: &Identifier,
+    age: u8,
+) -> Option<mc_world::BlockStateId> {
+    blocks.by_name_and_props(crop, &[("age".to_string(), age.to_string())])
+}
+
+fn farmland_state_with_moisture(
+    blocks: &mc_world::BlockRegistry,
+    moisture: u8,
+) -> Option<mc_world::BlockStateId> {
+    let farmland = Identifier::parse("minecraft:farmland").expect("static identifier");
+    blocks.by_name_and_props(&farmland, &[("moisture".to_string(), moisture.to_string())])
+}
+
+fn farmland_has_crop_above(
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> bool {
+    storage
+        .get_block(mc_world::BlockPos {
+            x: pos.x,
+            y: pos.y + 1,
+            z: pos.z,
+        })
+        .ok()
+        .flatten()
+        .and_then(|state| facts.random_tick_family(state.0))
+        == Some(mc_data::block_facts::RandomTickFamily::Crop)
+}
+
+fn farmland_has_nearby_water(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> bool {
+    for x in (pos.x - 4)..=(pos.x + 4) {
+        for z in (pos.z - 4)..=(pos.z + 4) {
+            for y in pos.y..=(pos.y + 1) {
+                let Ok(Some(state)) = storage.get_block(mc_world::BlockPos { x, y, z }) else {
+                    continue;
+                };
+                if blocks
+                    .by_id(state)
+                    .is_some_and(|state| state.block.id.as_str() == "minecraft:water")
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn farmland_trample_pos(old_pose: PlayerPose, new_pose: PlayerPose) -> Option<mc_world::BlockPos> {
+    if old_pose.flags.on_ground || !new_pose.flags.on_ground || old_pose.y - new_pose.y <= 0.5 {
+        return None;
+    }
+    Some(mc_world::BlockPos {
+        x: new_pose.x.floor() as i32,
+        y: (new_pose.y - 0.01).floor() as i32,
+        z: new_pose.z.floor() as i32,
+    })
+}
+
+async fn maybe_trample_farmland<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    old_pose: PlayerPose,
+    new_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(pos) = farmland_trample_pos(old_pose, new_pose) else {
+        return Ok(());
+    };
+    let dirt = Identifier::parse("minecraft:dirt").expect("static identifier");
+    let Some(dirt_state) = state.blocks.block(&dirt).map(|block| block.default) else {
+        return Ok(());
+    };
+    let is_farmland = {
+        let mut storage = state.world.lock().await;
+        storage
+            .get_block(pos)
+            .ok()
+            .flatten()
+            .and_then(|state_id| state.blocks.by_id(state_id))
+            .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:farmland")
+    };
+    if is_farmland {
+        let _ = apply_visible_block_edit_batch(
+            state,
+            writer,
+            &[BlockEdit {
+                pos,
+                new_state: dirt_state,
+            }],
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn sample_random_tick_positions(
@@ -6012,43 +6272,51 @@ async fn apply_block_edit_batch_to_world(
 
     let mut storage = state.world.lock().await;
     for edit in edits {
-        let pos = edit.pos;
-        match storage.set_block_at(pos, edit.new_state) {
-            Ok(Some(previous)) if previous != edit.new_state => {
-                if let Some(table) = table.as_deref()
-                    && let Err(err) = storage.update_highest_opaque_at(pos, table)
-                {
-                    warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "highest-opaque heightmap update failed");
-                }
-                outcome.applied.push(AppliedBlockEdit {
-                    pos,
-                    previous,
-                    new_state: edit.new_state,
-                });
-                outcome.deltas.push(BlockDelta {
-                    x: pos.x,
-                    y: pos.y,
-                    z: pos.z,
-                    state_id: edit.new_state,
-                });
-                outcome
-                    .edit_chunks
-                    .insert((pos.x.div_euclid(16), pos.z.div_euclid(16)));
-            }
-            Ok(Some(_)) | Ok(None) => {}
-            Err(err) => {
-                warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "set_block_at failed; skipping edit");
-            }
-        }
+        apply_block_edit_to_storage(&mut storage, table.as_deref(), edit, &mut outcome);
     }
 
     outcome
 }
 
-async fn apply_player_block_edit_batch<W>(
+fn apply_block_edit_to_storage(
+    storage: &mut mc_world::WorldStorage,
+    table: Option<&BlockLightTable>,
+    edit: &BlockEdit,
+    outcome: &mut BlockEditBatchOutcome,
+) {
+    let pos = edit.pos;
+    match storage.set_block_at(pos, edit.new_state) {
+        Ok(Some(previous)) if previous != edit.new_state => {
+            if let Some(table) = table
+                && let Err(err) = storage.update_highest_opaque_at(pos, table)
+            {
+                warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "highest-opaque heightmap update failed");
+            }
+            outcome.applied.push(AppliedBlockEdit {
+                pos,
+                previous,
+                new_state: edit.new_state,
+            });
+            outcome.deltas.push(BlockDelta {
+                x: pos.x,
+                y: pos.y,
+                z: pos.z,
+                state_id: edit.new_state,
+            });
+            outcome
+                .edit_chunks
+                .insert((pos.x.div_euclid(16), pos.z.div_euclid(16)));
+        }
+        Ok(Some(_)) | Ok(None) => {}
+        Err(err) => {
+            warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "set_block_at failed; skipping edit");
+        }
+    }
+}
+
+async fn apply_visible_block_edit_batch<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    sequence: i32,
     edits: &[BlockEdit],
 ) -> Result<BlockEditBatchOutcome, ConnectionError>
 where
@@ -6058,7 +6326,6 @@ where
     let outcome = apply_block_edit_batch_to_world(state, edits).await;
 
     if outcome.applied.is_empty() {
-        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
         return Ok(outcome);
     }
 
@@ -6088,6 +6355,25 @@ where
         state.sessions.invalidate_prepared_chunks(&light_chunks);
         send_light_updates(state, writer, &light_updates).await?;
         broadcast_light_updates(state, &light_updates, Some(state.session_id));
+    }
+
+    Ok(outcome)
+}
+
+async fn apply_player_block_edit_batch<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    edits: &[BlockEdit],
+) -> Result<BlockEditBatchOutcome, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let outcome = apply_visible_block_edit_batch(state, writer, edits).await?;
+
+    if outcome.applied.is_empty() {
+        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
+        return Ok(outcome);
     }
 
     write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
@@ -6380,12 +6666,7 @@ where
     // M6.f: resolve the placed block from the held item.
     let held_slot = state.selected_hotbar_slot;
     let held = state.inventory.held(held_slot).clone();
-    let placed_state = if held.is_empty() {
-        None
-    } else {
-        state.item_to_block.resolve(held.item_id)
-    };
-    let Some(placed_state) = placed_state else {
+    if held.is_empty() {
         debug!(
             sequence = action.sequence,
             held_item = held.item_id,
@@ -6403,12 +6684,32 @@ where
         return Ok(());
     };
 
-    // Validate: target cell must currently be air. We can borrow
-    // the world briefly to peek; if the cell is non-air or absent,
-    // skip the edit but still ack.
-    let target_is_air = {
+    // Validate: target cell must currently be air. Crop items also
+    // inspect the clicked block because seeds place the crop above
+    // their supporting soil instead of mapping item name to block name.
+    let placed_state = {
         let mut storage = state.world.lock().await;
-        match storage.get_block(mc_world::BlockPos {
+        let clicked = match storage.get_block(mc_world::BlockPos {
+            x: cx,
+            y: cy,
+            z: cz,
+        }) {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                debug!(
+                    x = cx,
+                    y = cy,
+                    z = cz,
+                    "UseItemOn clicked cell absent; skipping placement"
+                );
+                return write_block_ack(writer, state.compression, action.sequence).await;
+            }
+            Err(err) => {
+                warn!(error = %err, x = cx, y = cy, z = cz, "UseItemOn clicked read failed");
+                return write_block_ack(writer, state.compression, action.sequence).await;
+            }
+        };
+        let target_is_air = match storage.get_block(mc_world::BlockPos {
             x: tx,
             y: ty,
             z: tz,
@@ -6419,14 +6720,25 @@ where
                 warn!(error = %err, x = tx, y = ty, z = tz, "UseItemOn target read failed");
                 false
             }
+        };
+        if !target_is_air {
+            None
+        } else {
+            state.item_to_block.resolve_for_use_on(
+                held.item_id,
+                clicked,
+                action.direction,
+                &state.blocks,
+            )
         }
     };
-    if !target_is_air {
+    let Some(placed_state) = placed_state else {
         debug!(
             x = tx,
             y = ty,
             z = tz,
-            "UseItemOn target not air; skipping placement"
+            held_item = held.item_id,
+            "UseItemOn target invalid or held item not placeable; skipping placement"
         );
         write_packet(
             writer,
@@ -6437,7 +6749,7 @@ where
         )
         .await?;
         return Ok(());
-    }
+    };
 
     let _ = apply_block_edit(state, writer, action.sequence, tx, ty, tz, placed_state).await?;
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
@@ -7205,10 +7517,16 @@ where
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPos::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
+                    let old_pose = player_pose;
                     player_pose.x = movement.x;
                     player_pose.y = movement.y;
                     player_pose.z = movement.z;
                     player_pose.flags = movement.flags;
+                    if game_mode == GameMode::Survival
+                        && let Some(state) = interaction.as_deref_mut()
+                    {
+                        maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
+                    }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                     replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
@@ -7216,12 +7534,18 @@ where
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
+                    let old_pose = player_pose;
                     player_pose.x = movement.x;
                     player_pose.y = movement.y;
                     player_pose.z = movement.z;
                     player_pose.yaw = movement.yaw;
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
+                    if game_mode == GameMode::Survival
+                        && let Some(state) = interaction.as_deref_mut()
+                    {
+                        maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
+                    }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                     replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
@@ -7745,6 +8069,78 @@ fn player_abilities_for_mode(mode: GameMode) -> ClientboundPlayerAbilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
+    use mc_data::blocks::{BlockReport, BlockStateReport};
+    use mc_data::items::ItemReport;
+
+    fn props(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
+        entries
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect()
+    }
+
+    fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
+        BlockStateReport {
+            id,
+            default,
+            properties: props(properties),
+        }
+    }
+
+    fn simple_block(id: u32, name: &str) -> BlockReport {
+        BlockReport {
+            id: Identifier::parse(name).unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![state(id, true, &[])],
+        }
+    }
+
+    fn crop_test_reports() -> Vec<BlockReport> {
+        let mut farmland_properties = BTreeMap::new();
+        farmland_properties.insert(
+            "moisture".to_string(),
+            (0..=7).map(|value| value.to_string()).collect(),
+        );
+        let mut wheat_properties = BTreeMap::new();
+        wheat_properties.insert(
+            "age".to_string(),
+            (0..=7).map(|value| value.to_string()).collect(),
+        );
+
+        let mut reports = vec![
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:dirt"),
+            simple_block(2, "minecraft:water"),
+            BlockReport {
+                id: Identifier::parse("minecraft:farmland").unwrap(),
+                properties: farmland_properties,
+                states: (0..=7)
+                    .map(|moisture| {
+                        state(
+                            3 + moisture,
+                            moisture == 0,
+                            &[("moisture", &moisture.to_string())],
+                        )
+                    })
+                    .collect(),
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:wheat").unwrap(),
+                properties: wheat_properties,
+                states: (0..=7)
+                    .map(|age| state(11 + age, age == 0, &[("age", &age.to_string())]))
+                    .collect(),
+            },
+        ];
+        reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
+        reports
+    }
+
+    fn crop_test_registry() -> mc_world::BlockRegistry {
+        mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
+    }
 
     #[test]
     fn entity_tick_cadence_matches_vanilla_cow_tracking() {
@@ -7872,6 +8268,88 @@ mod tests {
 
         assert_eq!(table.resolve(42), Some(mc_world::BlockStateId(1)));
         assert_eq!(table.resolve(43), None);
+    }
+
+    #[test]
+    fn wheat_seeds_place_wheat_on_farmland_only() {
+        let items = ItemRegistry::from_report(&[ItemReport {
+            id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
+            protocol_id: 50,
+        }]);
+        let blocks = crop_test_registry();
+        let table = ItemToBlockTable::build(&items, &blocks);
+        let farmland = Identifier::parse("minecraft:farmland").unwrap();
+        let farmland_state = blocks
+            .by_name_and_props(&farmland, &[("moisture".to_string(), "0".to_string())])
+            .unwrap();
+        let dirt_state = blocks
+            .block(&Identifier::parse("minecraft:dirt").unwrap())
+            .unwrap()
+            .default;
+
+        assert_eq!(table.resolve(50), None);
+        assert_eq!(
+            table.resolve_for_use_on(50, farmland_state, Direction::Up, &blocks),
+            Some(mc_world::BlockStateId(11))
+        );
+        assert_eq!(
+            table.resolve_for_use_on(50, farmland_state, Direction::North, &blocks),
+            None
+        );
+        assert_eq!(
+            table.resolve_for_use_on(50, dirt_state, Direction::Up, &blocks),
+            None
+        );
+    }
+
+    #[test]
+    fn wheat_random_tick_advances_age_until_mature() {
+        let blocks = crop_test_registry();
+
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(11)),
+            Some(mc_world::BlockStateId(12))
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(17)),
+            Some(mc_world::BlockStateId(18))
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(18)),
+            None
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn farmland_trample_requires_landing_on_block() {
+        let old_pose = PlayerPose {
+            x: 2.7,
+            y: 3.0,
+            z: -1.2,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(false, false),
+        };
+        let landed = PlayerPose {
+            y: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+            ..old_pose
+        };
+        let hovering = PlayerPose {
+            flags: MovePlayerFlags::new(false, false),
+            ..landed
+        };
+
+        assert_eq!(
+            farmland_trample_pos(old_pose, landed),
+            Some(mc_world::BlockPos { x: 2, y: 0, z: -2 })
+        );
+        assert_eq!(farmland_trample_pos(old_pose, hovering), None);
+        assert_eq!(farmland_trample_pos(landed, landed), None);
     }
 
     #[test]
