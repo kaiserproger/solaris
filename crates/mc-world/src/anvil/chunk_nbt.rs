@@ -28,8 +28,8 @@ use thiserror::Error;
 use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
-    BIOME_VOLUME, BiomeSection, BlockPos, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot,
-    Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, ScheduledBlockTick,
+    BIOME_VOLUME, BiomeSection, BlockPos, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
+    FurnaceSlot, Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, ScheduledBlockTick,
     ScheduledFluidTick, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
@@ -181,9 +181,8 @@ pub fn chunk_from_nbt_with_items(
             let bx = get_int(cmp, "x")?;
             let by = get_int(cmp, "y")?;
             let bz = get_int(cmp, "z")?;
-            if get_string(cmp, "id")
-                .ok()
-                .is_some_and(|id| id == "minecraft:furnace")
+            let block_entity_id = get_string(cmp, "id").ok();
+            if block_entity_id.is_some_and(|id| id == "minecraft:furnace")
                 && let Some(items) = items
             {
                 chunk.furnaces.insert(
@@ -193,6 +192,19 @@ pub fn chunk_from_nbt_with_items(
                         z: bz,
                     },
                     decode_furnace(cmp, items)?,
+                );
+                continue;
+            }
+            if block_entity_id.is_some_and(|id| id == "minecraft:chest")
+                && let Some(items) = items
+            {
+                chunk.chests.insert(
+                    BlockPos {
+                        x: bx,
+                        y: by,
+                        z: bz,
+                    },
+                    decode_chest(cmp, items)?,
                 );
                 continue;
             }
@@ -518,7 +530,7 @@ pub fn chunk_to_nbt_with_items(
     let mut be_entries: Vec<(&BlockPos, &Vec<u8>)> = chunk
         .block_entities
         .iter()
-        .filter(|(pos, _)| !chunk.furnaces.contains_key(pos))
+        .filter(|(pos, _)| !chunk.furnaces.contains_key(pos) && !chunk.chests.contains_key(pos))
         .collect();
     be_entries.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
     for (_, bytes) in be_entries {
@@ -531,6 +543,11 @@ pub fn chunk_to_nbt_with_items(
         furnaces.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
         for (pos, furnace) in furnaces {
             be_list.push(encode_furnace(pos, furnace, items)?);
+        }
+        let mut chests: Vec<(&BlockPos, &ChestBlockEntity)> = chunk.chests.iter().collect();
+        chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+        for (pos, chest) in chests {
+            be_list.push(encode_chest(pos, chest, items)?);
         }
     }
     root.push((
@@ -759,6 +776,34 @@ fn decode_furnace(
     Ok(furnace)
 }
 
+fn decode_chest(
+    cmp: &[(String, Tag)],
+    items: &ItemRegistry,
+) -> Result<ChestBlockEntity, ChunkNbtError> {
+    let mut chest = ChestBlockEntity::default();
+    if let Some(list) = get_optional_list(cmp, "Items")? {
+        for tag in &list.elements {
+            let item = expect_compound(tag, "Items[]")?;
+            let slot = get_int(item, "Slot")?;
+            if !(0..=26).contains(&slot) {
+                continue;
+            }
+            let item_name = get_string(item, "id")?;
+            let parsed = Identifier::parse(item_name.clone())
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
+            let item_id = items
+                .id_of(&parsed)
+                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
+            chest.slots[slot as usize] = FurnaceSlot {
+                count: get_int(item, "count")?,
+                item_id,
+                damage: None,
+            };
+        }
+    }
+    Ok(chest)
+}
+
 fn encode_furnace(
     pos: &BlockPos,
     furnace: &FurnaceBlockEntity,
@@ -806,6 +851,46 @@ fn encode_furnace(
         Tag::Short(furnace.cook_progress),
     ));
     compound.push(("cooking_total_time".into(), Tag::Short(furnace.cook_total)));
+    Ok(Tag::Compound(compound))
+}
+
+fn encode_chest(
+    pos: &BlockPos,
+    chest: &ChestBlockEntity,
+    items: &ItemRegistry,
+) -> Result<Tag, ChunkNbtError> {
+    let mut compound = vec![
+        ("id".into(), Tag::String("minecraft:chest".into())),
+        ("x".into(), Tag::Int(pos.x)),
+        ("y".into(), Tag::Int(pos.y)),
+        ("z".into(), Tag::Int(pos.z)),
+    ];
+
+    let mut item_tags = Vec::new();
+    for (slot, stack) in chest.slots.iter().enumerate() {
+        if stack.is_empty() {
+            continue;
+        }
+        let name = items
+            .name_of(stack.item_id)
+            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
+        item_tags.push(Tag::Compound(vec![
+            ("Slot".into(), Tag::Int(slot as i32)),
+            ("id".into(), Tag::String(name.as_str().to_string())),
+            ("count".into(), Tag::Int(stack.count)),
+        ]));
+    }
+    compound.push((
+        "Items".into(),
+        Tag::List(ListTag {
+            element_type: if item_tags.is_empty() {
+                tag_type::END
+            } else {
+                tag_type::COMPOUND
+            },
+            elements: item_tags,
+        }),
+    ));
     Ok(Tag::Compound(compound))
 }
 

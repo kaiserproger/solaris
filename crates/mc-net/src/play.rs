@@ -62,8 +62,8 @@ use mc_world::light::{
 };
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{
-    BlockRegistry, BlockStateId, Chunk, ChunkPos, FurnaceBlockEntity, FurnaceSlot,
-    ScheduledFluidTick,
+    BlockRegistry, BlockStateId, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
+    FurnaceSlot, ScheduledFluidTick,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, mpsc};
@@ -104,6 +104,8 @@ const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
 const CRAFTING_MENU_TYPE_ID: i32 = 12;
 const CRAFTING_MENU_SLOT_COUNT: usize = 46;
+const CHEST_MENU_TYPE_ID: i32 = 2;
+const CHEST_MENU_SLOT_COUNT: usize = 63;
 const FURNACE_MENU_TYPE_ID: i32 = 14;
 const FURNACE_CONTAINER_ID_MIN: i32 = 1;
 const FURNACE_CONTAINER_ID_MAX: i32 = 100;
@@ -177,6 +179,10 @@ enum OutboundCommand {
     FurnaceSlots {
         position: mc_world::BlockPos,
         slots: [ItemStack; 3],
+    },
+    ChestSlots {
+        position: mc_world::BlockPos,
+        slots: [ItemStack; 27],
     },
     FurnaceData {
         position: mc_world::BlockPos,
@@ -377,6 +383,7 @@ struct SessionRegistryInner {
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
+    chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
 }
 
 impl Default for SessionRegistryInner {
@@ -390,6 +397,7 @@ impl Default for SessionRegistryInner {
             last_sent_entity_positions: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
+            chest_viewers: HashMap::new(),
         }
     }
 }
@@ -460,9 +468,13 @@ impl SessionRegistry {
         for viewers in inner.furnace_viewers.values_mut() {
             viewers.remove(&id);
         }
+        for viewers in inner.chest_viewers.values_mut() {
+            viewers.remove(&id);
+        }
         inner
             .furnace_viewers
             .retain(|_, viewers| !viewers.is_empty());
+        inner.chest_viewers.retain(|_, viewers| !viewers.is_empty());
         let snapshot = session_snapshot(id, &session);
         let mut dispatches = Vec::new();
         for (&observer_id, observer) in &mut inner.sessions {
@@ -515,6 +527,54 @@ impl SessionRegistry {
                 inner.furnace_viewers.remove(&position);
             }
         }
+    }
+
+    fn register_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
+            return;
+        };
+        inner
+            .chest_viewers
+            .entry(position)
+            .or_default()
+            .insert(id, FurnaceViewer { tx });
+    }
+
+    fn unregister_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        if let Some(viewers) = inner.chest_viewers.get_mut(&position) {
+            viewers.remove(&id);
+            if viewers.is_empty() {
+                inner.chest_viewers.remove(&position);
+            }
+        }
+    }
+
+    fn chest_slot_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        except: SessionId,
+        slots: [ItemStack; 27],
+    ) -> Vec<VisibilityDispatch> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .chest_viewers
+            .get(&position)
+            .into_iter()
+            .flat_map(|viewers| viewers.iter())
+            .filter(|&(&id, _)| id != except)
+            .map(|(&id, viewer)| VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id,
+                    tx: viewer.tx.clone(),
+                },
+                command: OutboundCommand::ChestSlots {
+                    position,
+                    slots: slots.clone(),
+                },
+            })
+            .collect()
     }
 
     fn furnace_slot_dispatches(
@@ -1817,6 +1877,7 @@ struct InteractionState {
 enum ActiveContainer {
     CraftingTable(CraftingTableWindow),
     Furnace(FurnaceWindow),
+    Chest(ChestWindow),
 }
 
 impl ActiveContainer {
@@ -1824,6 +1885,7 @@ impl ActiveContainer {
         match self {
             Self::CraftingTable(window) => window.container_id,
             Self::Furnace(window) => window.container_id,
+            Self::Chest(window) => window.container_id,
         }
     }
 }
@@ -1852,6 +1914,23 @@ struct FurnaceWindow {
     container_id: i32,
     position: mc_world::BlockPos,
     state_id: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ChestWindow {
+    container_id: i32,
+    position: mc_world::BlockPos,
+    state_id: i32,
+}
+
+impl ChestWindow {
+    fn new(position: mc_world::BlockPos, container_id: i32) -> Self {
+        Self {
+            container_id,
+            position,
+            state_id: 1,
+        }
+    }
 }
 
 impl FurnaceWindow {
@@ -4082,6 +4161,13 @@ fn is_furnace_state(state: &InteractionState, block_state: mc_world::BlockStateI
         .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:furnace")
 }
 
+fn is_chest_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
+    state
+        .blocks
+        .by_id(block_state)
+        .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:chest")
+}
+
 fn is_crafting_table_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
     state
         .blocks
@@ -4138,6 +4224,16 @@ fn crafting_menu_title_nbt() -> Vec<u8> {
     out
 }
 
+fn chest_menu_title_nbt() -> Vec<u8> {
+    let mut out = Vec::new();
+    mc_nbt::write_network(
+        &mut out,
+        &Tag::Compound(vec![("text".to_string(), Tag::String("Chest".to_string()))]),
+    )
+    .expect("static text component is valid NBT");
+    out
+}
+
 fn next_container_id(state: &mut InteractionState) -> i32 {
     let id = state.next_container_id;
     state.next_container_id += 1;
@@ -4153,6 +4249,11 @@ fn store_active_container(state: &mut InteractionState) {
             state
                 .sessions
                 .unregister_furnace_viewer(state.session_id, window.position);
+        }
+        Some(ActiveContainer::Chest(window)) => {
+            state
+                .sessions
+                .unregister_chest_viewer(state.session_id, window.position);
         }
         Some(ActiveContainer::CraftingTable(window)) => {
             for stack in window.input {
@@ -4745,6 +4846,58 @@ fn furnace_slot_stacks(furnace: &FurnaceBlockEntity) -> [ItemStack; 3] {
     std::array::from_fn(|slot| furnace_slot_to_stack(&furnace.slots[slot]))
 }
 
+fn chest_player_slot(menu_slot: usize) -> Option<usize> {
+    match menu_slot {
+        27..=53 => Some(9 + (menu_slot - 27)),
+        54..=62 => Some(36 + (menu_slot - 54)),
+        _ => None,
+    }
+}
+
+fn chest_menu_stack(
+    chest: &ChestBlockEntity,
+    inventory: &PlayerInventory,
+    menu_slot: usize,
+) -> Option<ItemStack> {
+    match menu_slot {
+        0..=26 => Some(furnace_slot_to_stack(&chest.slots[menu_slot])),
+        _ => chest_player_slot(menu_slot).map(|slot| inventory.slots[slot].clone()),
+    }
+}
+
+fn set_chest_menu_stack(
+    chest: &mut ChestBlockEntity,
+    inventory: &mut PlayerInventory,
+    menu_slot: usize,
+    stack: ItemStack,
+) -> bool {
+    match menu_slot {
+        0..=26 => {
+            chest.slots[menu_slot] = stack_to_furnace_slot(&stack);
+            true
+        }
+        _ => {
+            let Some(slot) = chest_player_slot(menu_slot) else {
+                return false;
+            };
+            inventory.slots[slot] = stack;
+            true
+        }
+    }
+}
+
+fn chest_wire_items(chest: &ChestBlockEntity, inventory: &PlayerInventory) -> Vec<ItemStack> {
+    let mut items = Vec::with_capacity(CHEST_MENU_SLOT_COUNT);
+    items.extend(chest.slots.iter().map(furnace_slot_to_stack));
+    items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
+    items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
+    items
+}
+
+fn chest_slot_stacks(chest: &ChestBlockEntity) -> [ItemStack; 27] {
+    std::array::from_fn(|slot| furnace_slot_to_stack(&chest.slots[slot]))
+}
+
 async fn write_furnace_data<W>(
     writer: &mut W,
     compression: Compression,
@@ -4813,6 +4966,85 @@ where
         state.compression,
     )
     .await
+}
+
+async fn write_chest_content<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    window: &ChestWindow,
+    chest: &ChestBlockEntity,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: window.container_id,
+            state_id: window.state_id,
+            items: chest_wire_items(chest, &state.inventory),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+async fn open_chest_container<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let position = mc_world::BlockPos { x, y, z };
+    let clicked = {
+        let mut storage = state.world.lock().await;
+        storage
+            .get_block(position)
+            .map_err(|err| {
+                warn!(error = %err, x, y, z, "chest use target read failed");
+                err
+            })
+            .ok()
+            .flatten()
+    };
+    if !clicked.is_some_and(|block_state| is_chest_state(state, block_state)) {
+        return Ok(false);
+    }
+
+    store_active_container(state);
+    let container_id = next_container_id(state);
+    let window = ChestWindow::new(position, container_id);
+    let chest = {
+        let mut storage = state.world.lock().await;
+        storage.chest_block_entity(position).map_err(|err| {
+            warn!(error = %err, x, y, z, "chest state read failed");
+            err
+        })?
+    }
+    .unwrap_or_default();
+    write_packet(
+        writer,
+        &ClientboundOpenScreen {
+            container_id,
+            menu_type: CHEST_MENU_TYPE_ID,
+            title_nbt: chest_menu_title_nbt(),
+        },
+        state.compression,
+    )
+    .await?;
+    write_chest_content(state, writer, &window, &chest).await?;
+    state
+        .sessions
+        .register_chest_viewer(state.session_id, window.position);
+    state.active_container = Some(ActiveContainer::Chest(window));
+    write_block_ack(writer, state.compression, sequence).await?;
+    Ok(true)
 }
 
 async fn open_furnace_container<W>(
@@ -5464,6 +5696,298 @@ fn apply_furnace_quick_move_click(
     }
 }
 
+fn can_place_in_chest_menu_slot(
+    state: &InteractionState,
+    menu_slot: usize,
+    stack: &ItemStack,
+) -> bool {
+    if stack.is_empty() {
+        return true;
+    }
+    match menu_slot {
+        0..=26 => true,
+        _ => chest_player_slot(menu_slot)
+            .is_some_and(|slot| can_place_in_player_slot(state, slot, stack)),
+    }
+}
+
+fn apply_chest_pickup_click(
+    state: &mut InteractionState,
+    chest: &mut ChestBlockEntity,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= CHEST_MENU_SLOT_COUNT || !(button == 0 || button == 1) {
+        return false;
+    }
+    let Some(slot_stack) = chest_menu_stack(chest, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let cursor = state.carried_item.clone();
+    let max_stack = if cursor.is_empty() {
+        item_max_stack(&state.item_facts, &state.items, &slot_stack)
+    } else {
+        item_max_stack(&state.item_facts, &state.items, &cursor)
+    };
+
+    if button == 0 {
+        if cursor.is_empty() {
+            if slot_stack.is_empty() {
+                return false;
+            }
+            state.carried_item = slot_stack;
+            set_chest_menu_stack(chest, &mut state.inventory, menu_slot, ItemStack::EMPTY)
+        } else if slot_stack.is_empty() {
+            if !can_place_in_chest_menu_slot(state, menu_slot, &cursor) {
+                return false;
+            }
+            state.carried_item = ItemStack::EMPTY;
+            set_chest_menu_stack(chest, &mut state.inventory, menu_slot, cursor)
+        } else if can_stack(&slot_stack, &cursor)
+            && can_place_in_chest_menu_slot(state, menu_slot, &cursor)
+            && slot_stack.count < max_stack
+        {
+            let moved = (max_stack - slot_stack.count).min(cursor.count);
+            let mut new_slot = slot_stack;
+            new_slot.count += moved;
+            state.carried_item.count -= moved;
+            if state.carried_item.count <= 0 {
+                state.carried_item = ItemStack::EMPTY;
+            }
+            set_chest_menu_stack(chest, &mut state.inventory, menu_slot, new_slot)
+        } else {
+            if !can_place_in_chest_menu_slot(state, menu_slot, &cursor) {
+                return false;
+            }
+            state.carried_item = slot_stack;
+            set_chest_menu_stack(chest, &mut state.inventory, menu_slot, cursor)
+        }
+    } else if cursor.is_empty() {
+        if slot_stack.is_empty() {
+            return false;
+        }
+        let moved = (slot_stack.count + 1) / 2;
+        let mut new_cursor = slot_stack.clone();
+        new_cursor.count = moved;
+        let mut remaining = slot_stack;
+        remaining.count -= moved;
+        if remaining.count <= 0 {
+            remaining = ItemStack::EMPTY;
+        }
+        state.carried_item = new_cursor;
+        set_chest_menu_stack(chest, &mut state.inventory, menu_slot, remaining)
+    } else if slot_stack.is_empty() {
+        if !can_place_in_chest_menu_slot(state, menu_slot, &cursor) {
+            return false;
+        }
+        let mut one = cursor;
+        one.count = 1;
+        decrement_cursor(&mut state.carried_item);
+        set_chest_menu_stack(chest, &mut state.inventory, menu_slot, one)
+    } else if can_stack(&slot_stack, &cursor)
+        && can_place_in_chest_menu_slot(state, menu_slot, &cursor)
+        && slot_stack.count < max_stack
+    {
+        let mut new_slot = slot_stack;
+        new_slot.count += 1;
+        decrement_cursor(&mut state.carried_item);
+        set_chest_menu_stack(chest, &mut state.inventory, menu_slot, new_slot)
+    } else {
+        false
+    }
+}
+
+fn merge_stack_into_chest(
+    chest: &mut ChestBlockEntity,
+    state: &InteractionState,
+    mut stack: ItemStack,
+) -> ItemStack {
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
+    for slot in &mut chest.slots {
+        if can_stack(&furnace_slot_to_stack(slot), &stack) && slot.count < max_stack {
+            let moved = (max_stack - slot.count).min(stack.count);
+            slot.count += moved;
+            stack.count -= moved;
+            if stack.count <= 0 {
+                return ItemStack::EMPTY;
+            }
+        }
+    }
+    for slot in &mut chest.slots {
+        if !slot.is_empty() {
+            continue;
+        }
+        let moved = stack.count.min(max_stack);
+        let mut moved_stack = stack.clone();
+        moved_stack.count = moved;
+        *slot = stack_to_furnace_slot(&moved_stack);
+        stack.count -= moved;
+        if stack.count <= 0 {
+            return ItemStack::EMPTY;
+        }
+    }
+    stack
+}
+
+fn apply_chest_quick_move_click(
+    state: &mut InteractionState,
+    chest: &mut ChestBlockEntity,
+    menu_slot: usize,
+) -> bool {
+    if menu_slot >= CHEST_MENU_SLOT_COUNT {
+        return false;
+    }
+    match menu_slot {
+        0..=26 => {
+            let original = furnace_slot_to_stack(&chest.slots[menu_slot]);
+            if original.is_empty() {
+                return false;
+            }
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &original);
+            let (remaining, _) = state.inventory.merge_stack(original.clone(), max_stack);
+            chest.slots[menu_slot] = stack_to_furnace_slot(&remaining);
+            remaining != original
+        }
+        _ => {
+            let Some(player_slot) = chest_player_slot(menu_slot) else {
+                return false;
+            };
+            let original = state.inventory.slots[player_slot].clone();
+            if original.is_empty() {
+                return false;
+            }
+            state.inventory.slots[player_slot] = ItemStack::EMPTY;
+            let remaining = merge_stack_into_chest(chest, state, original.clone());
+            state.inventory.slots[player_slot] = remaining;
+            state.inventory.slots[player_slot] != original
+        }
+    }
+}
+
+fn apply_chest_swap_click(
+    state: &mut InteractionState,
+    chest: &mut ChestBlockEntity,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= CHEST_MENU_SLOT_COUNT {
+        return false;
+    }
+    let Some(player_slot) = hotbar_swap_slot(button) else {
+        return false;
+    };
+    if chest_player_slot(menu_slot) == Some(player_slot) {
+        return false;
+    }
+    let Some(clicked) = chest_menu_stack(chest, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let swap = state.inventory.slots[player_slot].clone();
+    if !can_place_in_chest_menu_slot(state, menu_slot, &swap)
+        || !can_place_in_player_slot(state, player_slot, &clicked)
+    {
+        return false;
+    }
+    if !set_chest_menu_stack(chest, &mut state.inventory, menu_slot, swap) {
+        return false;
+    }
+    state.inventory.slots[player_slot] = clicked;
+    true
+}
+
+fn apply_chest_throw_click(
+    state: &mut InteractionState,
+    chest: &mut ChestBlockEntity,
+    menu_slot: usize,
+    button: i8,
+) -> Option<ItemStack> {
+    if menu_slot >= CHEST_MENU_SLOT_COUNT {
+        return None;
+    }
+    let mut stack = chest_menu_stack(chest, &state.inventory, menu_slot)?;
+    let dropped = take_throw_stack(&mut stack, button)?;
+    if !set_chest_menu_stack(chest, &mut state.inventory, menu_slot, stack) {
+        return None;
+    }
+    Some(dropped)
+}
+
+async fn handle_chest_container_click<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    mut window: ChestWindow,
+    player_pose: PlayerPose,
+    packet: ServerboundContainerClick,
+) -> Result<ChestWindow, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut chest = {
+        let mut storage = state.world.lock().await;
+        storage.chest_block_entity(window.position).map_err(|err| {
+            warn!(error = %err, ?window.position, "chest state read failed");
+            err
+        })?
+    }
+    .unwrap_or_default();
+    if packet.state_id != window.state_id {
+        write_chest_content(state, writer, &window, &chest).await?;
+        return Ok(window);
+    }
+    let mut dropped = None;
+    let changed = match packet.container_input {
+        ContainerInput::Pickup if packet.slot_num >= 0 => apply_chest_pickup_click(
+            state,
+            &mut chest,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+            apply_chest_quick_move_click(state, &mut chest, packet.slot_num as usize)
+        }
+        ContainerInput::Swap if packet.slot_num >= 0 => apply_chest_swap_click(
+            state,
+            &mut chest,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::Throw if packet.slot_num >= 0 => {
+            if item_entity_type_id(&state.entity_types).is_some() {
+                dropped = apply_chest_throw_click(
+                    state,
+                    &mut chest,
+                    packet.slot_num as usize,
+                    packet.button_num,
+                );
+                dropped.is_some()
+            } else {
+                false
+            }
+        }
+        _ => false,
+    };
+    if changed {
+        window.state_id = window.state_id.wrapping_add(1);
+        let mut storage = state.world.lock().await;
+        storage
+            .set_chest_block_entity(window.position, chest.clone())
+            .map_err(|err| {
+                warn!(error = %err, ?window.position, "chest state write failed");
+                err
+            })?;
+        dispatch_visibility_commands(state.sessions.chest_slot_dispatches(
+            window.position,
+            state.session_id,
+            chest_slot_stacks(&chest),
+        ));
+    }
+    if let Some(stack) = dropped {
+        dispatch_inventory_drop(state, player_pose, stack);
+    }
+    write_chest_content(state, writer, &window, &chest).await?;
+    Ok(window)
+}
+
 async fn handle_furnace_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -5701,6 +6225,9 @@ where
         ActiveContainer::CraftingTable(window) => {
             state.active_container = Some(ActiveContainer::CraftingTable(window));
         }
+        ActiveContainer::Chest(window) => {
+            state.active_container = Some(ActiveContainer::Chest(window));
+        }
     }
     Ok(())
 }
@@ -5743,6 +6270,18 @@ where
                     write_crafting_content(state, writer, &window).await?;
                     state.active_container = Some(ActiveContainer::CraftingTable(window));
                 }
+                ActiveContainer::Chest(window) => {
+                    let chest = {
+                        let mut storage = state.world.lock().await;
+                        storage.chest_block_entity(window.position).map_err(|err| {
+                            warn!(error = %err, ?window.position, "chest state read failed");
+                            err
+                        })?
+                    }
+                    .unwrap_or_default();
+                    write_chest_content(state, writer, &window, &chest).await?;
+                    state.active_container = Some(ActiveContainer::Chest(window));
+                }
             }
         }
         return Ok(());
@@ -5767,6 +6306,11 @@ where
                     handle_furnace_container_click(state, writer, furnace, player_pose, packet)
                         .await?;
                 state.active_container = Some(ActiveContainer::Furnace(furnace));
+            }
+            ActiveContainer::Chest(chest) if chest.container_id == packet.container_id => {
+                let chest =
+                    handle_chest_container_click(state, writer, chest, player_pose, packet).await?;
+                state.active_container = Some(ActiveContainer::Chest(chest));
             }
             other => {
                 debug!(
@@ -7859,6 +8403,9 @@ where
     if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
         return Ok(());
     }
+    if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
     if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
         return Ok(());
     }
@@ -8760,6 +9307,29 @@ where
                             && window.position == position
                         {
                             write_furnace_data_changes(writer, compression, window, &changed).await?;
+                        }
+                    }
+                    Some(OutboundCommand::ChestSlots { position, slots }) => {
+                        if let Some(state) = interaction.as_deref_mut()
+                            && let Some(ActiveContainer::Chest(mut window)) = state.active_container.take()
+                        {
+                            if window.position == position {
+                                window.state_id = window.state_id.wrapping_add(1);
+                                for (slot, item_stack) in slots.into_iter().enumerate() {
+                                    write_packet(
+                                        writer,
+                                        &ClientboundContainerSetSlot {
+                                            container_id: window.container_id,
+                                            state_id: window.state_id,
+                                            slot: slot as i16,
+                                            item_stack,
+                                        },
+                                        compression,
+                                    )
+                                    .await?;
+                                }
+                            }
+                            state.active_container = Some(ActiveContainer::Chest(window));
                         }
                     }
                     None => {}

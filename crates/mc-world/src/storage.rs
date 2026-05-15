@@ -25,8 +25,8 @@ use crate::anvil::{
 };
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
-    BlockPos, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity, ScheduledBlockTick,
-    ScheduledFluidTick,
+    BlockPos, ChestBlockEntity, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity,
+    ScheduledBlockTick, ScheduledFluidTick,
 };
 use crate::section::SECTION_DIM;
 
@@ -322,6 +322,42 @@ impl WorldStorage {
             return Ok(true);
         }
         chunk.furnaces.insert(pos, furnace);
+        chunk.dirty = true;
+        Ok(true)
+    }
+
+    pub fn chest_block_entity(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Option<ChestBlockEntity>, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(None);
+        }
+        let chunk = self
+            .cache
+            .get(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        Ok(Some(chunk.chests.get(&pos).cloned().unwrap_or_default()))
+    }
+
+    pub fn set_chest_block_entity(
+        &mut self,
+        pos: BlockPos,
+        chest: ChestBlockEntity,
+    ) -> Result<bool, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(false);
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        if chunk.chests.get(&pos) == Some(&chest) {
+            return Ok(true);
+        }
+        chunk.chests.insert(pos, chest);
         chunk.dirty = true;
         Ok(true)
     }
@@ -967,6 +1003,61 @@ mod tests {
             .unwrap()
             .with_item_registry(items);
         assert_eq!(fresh.furnace_block_entity(pos).unwrap(), Some(furnace));
+    }
+
+    #[test]
+    fn chest_block_entity_survives_flush_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let air = mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        };
+        let registry = Arc::new(BlockRegistry::from_report(&[air]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:cobblestone").unwrap(),
+                protocol_id: 10,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:apple").unwrap(),
+                protocol_id: 11,
+            },
+        ]));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4)
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = crate::chunk::FurnaceSlot {
+            count: 64,
+            item_id: 10,
+            damage: None,
+        };
+        chest.slots[26] = crate::chunk::FurnaceSlot {
+            count: 3,
+            item_id: 11,
+            damage: None,
+        };
+        world.set_chest_block_entity(pos, chest.clone()).unwrap();
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+
+        let mut fresh = WorldStorage::open(tmp.path(), Arc::clone(&registry))
+            .unwrap()
+            .with_item_registry(items);
+        assert_eq!(fresh.chest_block_entity(pos).unwrap(), Some(chest));
     }
 
     /// End-to-end: open the generated flat test world, query known
