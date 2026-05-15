@@ -113,6 +113,39 @@ const HOSTILE_MELEE_COOLDOWN: Duration = Duration::from_secs(1);
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RandomTickPolicy {
+    pub random_tick_speed: u32,
+    pub chunk_budget: usize,
+    pub seed: u64,
+}
+
+impl Default for RandomTickPolicy {
+    fn default() -> Self {
+        Self {
+            random_tick_speed: 3,
+            chunk_budget: 64,
+            seed: 0,
+        }
+    }
+}
+
+impl RandomTickPolicy {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            random_tick_speed: self.random_tick_speed,
+            chunk_budget: self.chunk_budget.max(1),
+            seed: self.seed,
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self.random_tick_speed > 0 && self.chunk_budget > 0
+    }
+}
+
 type SessionId = u64;
 
 #[derive(Debug, Clone)]
@@ -1001,6 +1034,13 @@ impl SessionRegistry {
             inner.prepared.remove(chunk);
         }
     }
+
+    pub(crate) fn ticketed_chunks_sorted(&self) -> Vec<(i32, i32)> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        let mut chunks: Vec<_> = inner.tickets.keys().copied().collect();
+        chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
+        chunks
+    }
 }
 
 fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEntitySnapshot {
@@ -1261,6 +1301,12 @@ struct BlockEditBatchOutcome {
     applied: Vec<AppliedBlockEdit>,
     deltas: Vec<BlockDelta>,
     edit_chunks: HashSet<(i32, i32)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RandomTickSample {
+    pub chunk: (i32, i32),
+    pub pos: mc_world::BlockPos,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -5868,6 +5914,95 @@ fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaPacket> {
     packets
 }
 
+pub(crate) async fn run_random_ticks(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    world_tick: u64,
+) {
+    let policy = config.random_tick.normalized();
+    let Some(world) = config.world.as_ref() else {
+        return;
+    };
+    let ticketed_chunks = sessions.ticketed_chunks_sorted();
+    if ticketed_chunks.is_empty() {
+        return;
+    }
+    let samples = sample_random_tick_positions(policy, world_tick, &ticketed_chunks);
+    if samples.is_empty() {
+        return;
+    }
+
+    let mut sampled = 0usize;
+    let mut eligible = 0usize;
+    {
+        let mut storage = world.lock().await;
+        for sample in &samples {
+            let Ok(Some(state)) = storage.get_block(sample.pos) else {
+                continue;
+            };
+            sampled += 1;
+            if config.block_facts.random_tick_family(state.0).is_some() {
+                eligible += 1;
+            }
+        }
+    }
+
+    if eligible > 0 {
+        debug!(
+            world_tick,
+            sampled, eligible, "random tick sampled eligible blocks"
+        );
+    }
+}
+
+fn sample_random_tick_positions(
+    policy: RandomTickPolicy,
+    world_tick: u64,
+    chunks: &[(i32, i32)],
+) -> Vec<RandomTickSample> {
+    let policy = policy.normalized();
+    if !policy.is_enabled() || chunks.is_empty() {
+        return Vec::new();
+    }
+    let chunk_count = chunks.len();
+    let budget = policy.chunk_budget.min(chunk_count);
+    let start = (world_tick as usize) % chunk_count;
+    let mut samples = Vec::with_capacity(budget * policy.random_tick_speed as usize);
+    for offset in 0..budget {
+        let chunk = chunks[(start + offset) % chunk_count];
+        for sample_idx in 0..policy.random_tick_speed {
+            let hash = splitmix64(
+                policy.seed
+                    ^ world_tick
+                    ^ ((chunk.0 as i64 as u64) << 32)
+                    ^ (chunk.1 as i64 as u64)
+                    ^ ((offset as u64) << 48)
+                    ^ u64::from(sample_idx),
+            );
+            let local_x = (hash & 0xF) as i32;
+            let local_z = ((hash >> 4) & 0xF) as i32;
+            let height = (mc_world::MAX_Y - mc_world::MIN_Y) as u64;
+            let y = mc_world::MIN_Y + ((hash >> 8) % height) as i32;
+            samples.push(RandomTickSample {
+                chunk,
+                pos: mc_world::BlockPos {
+                    x: chunk.0 * 16 + local_x,
+                    y,
+                    z: chunk.1 * 16 + local_z,
+                },
+            });
+        }
+    }
+    samples
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
 async fn apply_block_edit_batch_to_world(
     state: &mut InteractionState,
     edits: &[BlockEdit],
@@ -8481,6 +8616,83 @@ mod tests {
 
         assert_eq!(without_origin, vec![bob_id]);
         assert_eq!(with_origin, vec![alice_id, bob_id]);
+    }
+
+    #[test]
+    fn session_registry_reports_ticketed_chunks_sorted() {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "tester".to_string(),
+        };
+        let (id, _) = registry.register(
+            &profile,
+            (0, 0),
+            0,
+            HashSet::from([(1, 0), (0, -1), (0, 0)]),
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+
+        assert_eq!(
+            registry.ticketed_chunks_sorted(),
+            vec![(0, -1), (0, 0), (1, 0)]
+        );
+
+        let _ = registry.unregister(id);
+        assert!(registry.ticketed_chunks_sorted().is_empty());
+    }
+
+    #[test]
+    fn random_tick_sampling_is_deterministic_for_seed_tick_and_chunks() {
+        let policy = RandomTickPolicy {
+            random_tick_speed: 2,
+            chunk_budget: 2,
+            seed: 99,
+        };
+        let chunks = vec![(0, 0), (1, 0), (2, 0)];
+
+        let first = sample_random_tick_positions(policy, 7, &chunks);
+        let second = sample_random_tick_positions(policy, 7, &chunks);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 4);
+        assert!(first.iter().all(|sample| sample.pos.y >= mc_world::MIN_Y));
+        assert!(first.iter().all(|sample| sample.pos.y < mc_world::MAX_Y));
+    }
+
+    #[test]
+    fn random_tick_sampling_rotates_chunk_budget() {
+        let policy = RandomTickPolicy {
+            random_tick_speed: 1,
+            chunk_budget: 2,
+            seed: 0,
+        };
+        let chunks = vec![(0, 0), (1, 0), (2, 0)];
+
+        let tick_zero = sample_random_tick_positions(policy, 0, &chunks)
+            .into_iter()
+            .map(|sample| sample.chunk)
+            .collect::<Vec<_>>();
+        let tick_one = sample_random_tick_positions(policy, 1, &chunks)
+            .into_iter()
+            .map(|sample| sample.chunk)
+            .collect::<Vec<_>>();
+
+        assert_eq!(tick_zero, vec![(0, 0), (1, 0)]);
+        assert_eq!(tick_one, vec![(1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn random_tick_speed_zero_disables_sampling() {
+        let policy = RandomTickPolicy {
+            random_tick_speed: 0,
+            chunk_budget: 2,
+            seed: 0,
+        };
+
+        assert!(sample_random_tick_positions(policy, 0, &[(0, 0)]).is_empty());
     }
 
     #[test]

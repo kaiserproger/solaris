@@ -91,9 +91,11 @@ async fn break_block_round_trips_update_ack_relight() {
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -297,9 +299,11 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -434,9 +438,11 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -575,9 +581,11 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -741,9 +749,11 @@ async fn survival_can_place_naturally_picked_up_block() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -878,9 +888,11 @@ async fn survival_break_damages_held_tool() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1020,9 +1032,11 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1184,9 +1198,11 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1317,9 +1333,11 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1569,9 +1587,11 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1849,9 +1869,11 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -1956,9 +1978,11 @@ async fn survival_armor_slot_reduces_debug_damage() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -2083,9 +2107,11 @@ async fn survival_use_item_eats_apple_and_updates_food() {
         block_light: None,
         items,
         item_facts,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -2203,9 +2229,11 @@ async fn survival_use_item_release_cancels_food_use() {
         block_light: None,
         items,
         item_facts,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -2301,9 +2329,11 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -2418,9 +2448,11 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

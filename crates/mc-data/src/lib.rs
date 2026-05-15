@@ -31,6 +31,7 @@ use tracing::{debug, trace};
 
 pub mod armor;
 pub mod biomes;
+pub mod block_facts;
 pub mod block_light;
 pub mod blocks;
 pub mod entity_types;

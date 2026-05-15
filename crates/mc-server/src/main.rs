@@ -299,6 +299,15 @@ async fn serve(path: &Path) -> Result<()> {
         "block-light table built from blocks report",
     );
 
+    let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &blocks_report,
+    ));
+    tracing::info!(
+        states = block_facts.len(),
+        random_tick_states = block_facts.eligible_states(),
+        "block simulation facts built from blocks report",
+    );
+
     let entity_types = match mc_data::entity_types::load_entity_types_report(&items_path) {
         Ok(report) => {
             let reg = mc_data::entity_types::EntityTypeRegistry::from_report(&report);
@@ -351,6 +360,7 @@ async fn serve(path: &Path) -> Result<()> {
             Some(block_light),
             items,
             item_facts,
+            block_facts,
             entity_types,
             biome_spawns,
         )

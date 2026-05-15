@@ -67,9 +67,11 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         block_light,
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -139,9 +141,11 @@ async fn survival_attack_passive_mob_drops_food() {
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -274,9 +278,11 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
+use mc_data::block_facts::BlockFactsTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub data: DataSection,
     #[serde(default)]
     pub chunk_pipeline: ChunkPipelineSection,
+    #[serde(default)]
+    pub simulation: SimulationSection,
 }
 
 /// Identity-level server settings.
@@ -105,6 +108,35 @@ pub struct ChunkPipelineSection {
     pub region_cache_size: usize,
     #[serde(default)]
     pub compression_level: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationSection {
+    #[serde(default = "default_random_tick_speed")]
+    pub random_tick_speed: u32,
+    #[serde(default = "default_random_tick_chunk_budget")]
+    pub random_tick_chunk_budget: usize,
+}
+
+impl Default for SimulationSection {
+    fn default() -> Self {
+        let policy = mc_net::RandomTickPolicy::default();
+        Self {
+            random_tick_speed: policy.random_tick_speed,
+            random_tick_chunk_budget: policy.chunk_budget,
+        }
+    }
+}
+
+impl SimulationSection {
+    #[must_use]
+    pub fn to_network(&self, seed: i64) -> mc_net::RandomTickPolicy {
+        mc_net::RandomTickPolicy {
+            random_tick_speed: self.random_tick_speed,
+            chunk_budget: self.random_tick_chunk_budget.max(1),
+            seed: seed as u64,
+        }
+    }
 }
 
 impl Default for ChunkPipelineSection {
@@ -216,6 +248,14 @@ fn default_region_cache_size() -> usize {
     mc_net::ChunkPipelinePolicy::default().region_cache_size
 }
 
+fn default_random_tick_speed() -> u32 {
+    mc_net::RandomTickPolicy::default().random_tick_speed
+}
+
+fn default_random_tick_chunk_budget() -> usize {
+    mc_net::RandomTickPolicy::default().chunk_budget
+}
+
 impl ServerConfig {
     /// Convert a parsed TOML config into the network-layer
     /// [`mc_net::ServerConfig`], using the pre-loaded vanilla data,
@@ -232,6 +272,7 @@ impl ServerConfig {
         block_light: Option<Arc<mc_data::block_light::BlockLightTable>>,
         items: Arc<ItemRegistry>,
         item_facts: Arc<ItemFactsTable>,
+        block_facts: Arc<BlockFactsTable>,
         entity_types: Arc<EntityTypeRegistry>,
         biome_spawns: Arc<BiomeSpawnRules>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
@@ -250,9 +291,11 @@ impl ServerConfig {
             block_light,
             items,
             item_facts,
+            block_facts,
             entity_types,
             biome_spawns,
             chunk_pipeline: self.chunk_pipeline.to_network(),
+            random_tick: self.simulation.to_network(self.data.seed),
         })
     }
 }
@@ -282,6 +325,8 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
         assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 25);
+        assert_eq!(cfg.simulation.random_tick_speed, 3);
+        assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
     }
 
     #[test]
@@ -351,6 +396,40 @@ mod tests {
     }
 
     #[test]
+    fn parses_simulation_overrides() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [simulation]
+            random_tick_speed = 7
+            random_tick_chunk_budget = 11
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+
+        assert_eq!(cfg.simulation.random_tick_speed, 7);
+        assert_eq!(cfg.simulation.random_tick_chunk_budget, 11);
+    }
+
+    #[test]
+    fn simulation_normalizes_runtime_budget() {
+        let section = SimulationSection {
+            random_tick_speed: 0,
+            random_tick_chunk_budget: 0,
+        };
+        let policy = section.to_network(42);
+
+        assert_eq!(policy.random_tick_speed, 0);
+        assert_eq!(policy.chunk_budget, 1);
+        assert_eq!(policy.seed, 42);
+    }
+
+    #[test]
     fn chunk_pool_percentages_scale_from_available_cores() {
         assert_eq!(threads_from_percent(3, 25), 1);
         assert_eq!(threads_from_percent(3, 50), 2);
@@ -396,6 +475,7 @@ mod tests {
                 None,
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
+                Arc::new(BlockFactsTable::default()),
                 Arc::new(EntityTypeRegistry::default()),
                 Arc::new(BiomeSpawnRules::default()),
             )
@@ -433,6 +513,7 @@ mod tests {
                 None,
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
+                Arc::new(BlockFactsTable::default()),
                 Arc::new(EntityTypeRegistry::default()),
                 Arc::new(BiomeSpawnRules::default())
             )

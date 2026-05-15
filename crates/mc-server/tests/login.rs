@@ -41,9 +41,11 @@ async fn start_server() -> SocketAddr {
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

@@ -16,6 +16,13 @@ world_dir = ".analysis/test-world"
 # time. Defaults to 0.
 seed = 0
 
+[simulation]
+# Random block ticks per active chunk per game tick. Set to 0 to disable
+# random block simulation while keeping scheduled ticks enabled.
+random_tick_speed = 3
+# Maximum active/ticketed chunks sampled per game tick.
+random_tick_chunk_budget = 64
+
 [chunk_pipeline]
 # Chunk stream / worker policy. Thread pools are configured as percentages
 # of available CPU cores and resolve to at least one thread each.

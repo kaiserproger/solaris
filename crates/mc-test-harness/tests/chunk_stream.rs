@@ -93,9 +93,11 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -298,9 +300,11 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: policy,
+        random_tick: mc_net::RandomTickPolicy::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");

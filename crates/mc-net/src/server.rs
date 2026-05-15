@@ -10,6 +10,7 @@ use bytes::BytesMut;
 use mc_data::Identifier;
 use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
+use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
@@ -82,12 +83,14 @@ pub struct ServerConfig {
     /// gracefully (no item → no placement).
     pub items: Arc<ItemRegistry>,
     pub item_facts: Arc<ItemFactsTable>,
+    pub block_facts: Arc<BlockFactsTable>,
     pub entity_types: Arc<EntityTypeRegistry>,
     pub biome_spawns: Arc<BiomeSpawnRules>,
     /// M13 chunk-pipeline policy. Early M13 slices keep the existing
     /// cooperative stream path but thread this policy through so the
     /// scheduler and worker-pool stages have one runtime source of truth.
     pub chunk_pipeline: ChunkPipelinePolicy,
+    pub random_tick: play::RandomTickPolicy,
 }
 
 /// A listener that has been successfully bound but is not yet serving.
@@ -136,6 +139,7 @@ impl BoundServer {
                     entity_physics_steps(&entity_config, Arc::clone(&entity_cpu_permits), &queries)
                         .await;
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
+                play::run_random_ticks(&entity_config, &entity_sessions, tick).await;
             }
         });
         loop {
