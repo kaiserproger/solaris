@@ -141,8 +141,15 @@ pub struct EntitySnapshot {
     pub on_ground: bool,
     pub item_stack: Option<EntityItemStack>,
     pub lifecycle: EntityLifecycle,
+    pub health: f32,
     pub attributes: AttributeSet,
     pub goal: GoalState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityDamage {
+    pub snapshot: EntitySnapshot,
+    pub killed: bool,
 }
 
 /// Small vanilla attribute subset needed before real mob AI/combat.
@@ -232,6 +239,7 @@ pub struct EntityStore {
     on_ground: Vec<bool>,
     item_stacks: Vec<Option<EntityItemStack>>,
     lifecycles: Vec<EntityLifecycle>,
+    healths: Vec<f32>,
     attributes: Vec<AttributeSet>,
     goals: Vec<GoalState>,
 }
@@ -284,6 +292,12 @@ impl EntityStore {
         self.on_ground.push(entity.on_ground);
         self.item_stacks.push(entity.item_stack);
         self.lifecycles.push(EntityLifecycle::Alive);
+        let health = entity
+            .attributes
+            .base(&AttributeKind::MaxHealth)
+            .unwrap_or(20.0)
+            .max(1.0) as f32;
+        self.healths.push(health);
         self.attributes.push(entity.attributes);
         self.goals.push(entity.goal);
         id
@@ -358,6 +372,22 @@ impl EntityStore {
         };
         self.goals[slot] = goal;
         true
+    }
+
+    pub fn damage(&mut self, id: EntityId, amount: f32) -> Option<EntityDamage> {
+        let slot = *self.slots_by_id.get(&id)?;
+        if self.lifecycles[slot] != EntityLifecycle::Alive {
+            return None;
+        }
+        self.healths[slot] = (self.healths[slot] - amount.max(0.0)).max(0.0);
+        let killed = self.healths[slot] <= 0.0;
+        if killed {
+            self.lifecycles[slot] = EntityLifecycle::Despawning;
+        }
+        Some(EntityDamage {
+            snapshot: self.snapshot_slot(slot),
+            killed,
+        })
     }
 
     pub fn attributes_mut(&mut self, id: EntityId) -> Option<&mut AttributeSet> {
@@ -439,6 +469,7 @@ impl EntityStore {
             on_ground: self.on_ground[slot],
             item_stack: self.item_stacks[slot],
             lifecycle: self.lifecycles[slot],
+            health: self.healths[slot],
             attributes: self.attributes[slot].clone(),
             goal: self.goals[slot].clone(),
         }
@@ -455,6 +486,7 @@ impl EntityStore {
         self.on_ground.swap_remove(slot);
         self.item_stacks.swap_remove(slot);
         self.lifecycles.swap_remove(slot);
+        self.healths.swap_remove(slot);
         self.attributes.swap_remove(slot);
         self.goals.swap_remove(slot);
 
@@ -530,6 +562,22 @@ mod tests {
             store.snapshot(id).and_then(|snapshot| snapshot.item_stack),
             Some(EntityItemStack::new(42, 1))
         );
+    }
+
+    #[test]
+    fn damage_reduces_health_and_marks_killed_entities() {
+        let mut store = EntityStore::new();
+        let id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
+
+        let hit = store.damage(id, 5.0).unwrap();
+        assert!(!hit.killed);
+        assert_eq!(hit.snapshot.health, 15.0);
+        assert_eq!(hit.snapshot.lifecycle, EntityLifecycle::Alive);
+
+        let lethal = store.damage(id, 20.0).unwrap();
+        assert!(lethal.killed);
+        assert_eq!(lethal.snapshot.health, 0.0);
+        assert_eq!(lethal.snapshot.lifecycle, EntityLifecycle::Despawning);
     }
 
     #[test]

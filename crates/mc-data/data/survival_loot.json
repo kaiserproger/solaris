@@ -1,0 +1,37 @@
+{
+  "entities": {
+    "minecraft:chicken": "minecraft:chicken",
+    "minecraft:cod": "minecraft:cod",
+    "minecraft:cow": "minecraft:beef",
+    "minecraft:goat": "minecraft:mutton",
+    "minecraft:hoglin": "minecraft:porkchop",
+    "minecraft:mooshroom": "minecraft:beef",
+    "minecraft:pig": "minecraft:porkchop",
+    "minecraft:rabbit": "minecraft:rabbit",
+    "minecraft:salmon": "minecraft:salmon",
+    "minecraft:sheep": "minecraft:mutton",
+    "minecraft:tropical_fish": "minecraft:tropical_fish"
+  },
+  "blocks": {
+    "minecraft:coal_ore": "minecraft:coal",
+    "minecraft:copper_ore": "minecraft:raw_copper",
+    "minecraft:dark_oak_leaves": "minecraft:apple",
+    "minecraft:deepslate_coal_ore": "minecraft:coal",
+    "minecraft:deepslate_copper_ore": "minecraft:raw_copper",
+    "minecraft:deepslate_diamond_ore": "minecraft:diamond",
+    "minecraft:deepslate_emerald_ore": "minecraft:emerald",
+    "minecraft:deepslate_gold_ore": "minecraft:raw_gold",
+    "minecraft:deepslate_iron_ore": "minecraft:raw_iron",
+    "minecraft:deepslate_lapis_ore": "minecraft:lapis_lazuli",
+    "minecraft:deepslate_redstone_ore": "minecraft:redstone",
+    "minecraft:diamond_ore": "minecraft:diamond",
+    "minecraft:emerald_ore": "minecraft:emerald",
+    "minecraft:gold_ore": "minecraft:raw_gold",
+    "minecraft:grass_block": "minecraft:dirt",
+    "minecraft:iron_ore": "minecraft:raw_iron",
+    "minecraft:lapis_ore": "minecraft:lapis_lazuli",
+    "minecraft:oak_leaves": "minecraft:apple",
+    "minecraft:redstone_ore": "minecraft:redstone",
+    "minecraft:stone": "minecraft:cobblestone"
+  }
+}

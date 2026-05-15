@@ -34,9 +34,12 @@ const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
 const MAX_PLAYER_INFO_ENTRIES: usize = 1024;
 const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
 const MAX_ENTITY_DATA_VALUES: usize = 64;
+const MAX_CONTAINER_CLICK_CHANGED_SLOTS: usize = 128;
+const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
 const MAX_COMMAND_LEN: usize = 32_767;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
+pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
@@ -316,6 +319,83 @@ impl Packet for LoginPlay {
             portal_cooldown,
             sea_level,
             enforces_secure_chat,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundRespawn {
+    pub dimension_type_id: i32,
+    pub dimension_name: Identifier,
+    pub hashed_seed: i64,
+    pub game_mode: u8,
+    pub previous_game_mode: i8,
+    pub is_debug: bool,
+    pub is_flat: bool,
+    pub death_location: Option<(Identifier, i64)>,
+    pub portal_cooldown: i32,
+    pub sea_level: i32,
+    pub data_to_keep: i8,
+}
+
+impl Packet for ClientboundRespawn {
+    // CLIENTBOUND_RESPAWN is game-CB index 82 = wire id 0x52 in the
+    // local 26.1.2 GameProtocols dump. Its body is CommonPlayerSpawnInfo
+    // followed by one byte of keep flags.
+    const ID: i32 = 0x52;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.dimension_type_id);
+        buf.write_identifier(&self.dimension_name);
+        buf.write_i64(self.hashed_seed);
+        buf.write_u8(self.game_mode);
+        buf.write_i8(self.previous_game_mode);
+        buf.write_bool(self.is_debug);
+        buf.write_bool(self.is_flat);
+        match &self.death_location {
+            Some((dim, pos)) => {
+                buf.write_bool(true);
+                buf.write_identifier(dim);
+                buf.write_i64(*pos);
+            }
+            None => buf.write_bool(false),
+        }
+        buf.write_varint(self.portal_cooldown);
+        buf.write_varint(self.sea_level);
+        buf.write_i8(self.data_to_keep);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let dimension_type_id = buf.read_varint()?;
+        let dimension_name = buf.read_identifier()?;
+        let hashed_seed = buf.read_i64()?;
+        let game_mode = buf.read_u8()?;
+        let previous_game_mode = buf.read_i8()?;
+        let is_debug = buf.read_bool()?;
+        let is_flat = buf.read_bool()?;
+        let death_location = if buf.read_bool()? {
+            let dim = buf.read_identifier()?;
+            let pos = buf.read_i64()?;
+            Some((dim, pos))
+        } else {
+            None
+        };
+        let portal_cooldown = buf.read_varint()?;
+        let sea_level = buf.read_varint()?;
+        let data_to_keep = buf.read_i8()?;
+        Ok(Self {
+            dimension_type_id,
+            dimension_name,
+            hashed_seed,
+            game_mode,
+            previous_game_mode,
+            is_debug,
+            is_flat,
+            death_location,
+            portal_cooldown,
+            sea_level,
+            data_to_keep,
         })
     }
 }
@@ -1705,6 +1785,62 @@ impl Packet for ServerboundKeepAlive {
     }
 }
 
+/// `Serverbound Attack` (SB). Verified against the local vanilla 26.1.2 class:
+/// `ServerboundAttackPacket(int entityId)` uses `ByteBufCodecs.VAR_INT` and is
+/// registered immediately after `SERVERBOUND_ACCEPT_TELEPORTATION`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundAttack {
+    pub entity_id: i32,
+}
+
+impl Packet for ServerboundAttack {
+    const ID: i32 = 0x01;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Serverbound Interact` (SB). Verified against the local vanilla 26.1.2 class:
+/// `ServerboundInteractPacket(int entityId, InteractionHand hand, Vec3 location,
+/// boolean usingSecondaryAction)` uses `Vec3.LP_STREAM_CODEC`. Entity attacks are
+/// carried by `ServerboundAttackPacket`, not by this packet.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundInteract {
+    pub entity_id: i32,
+    pub hand: InteractionHand,
+    pub location: EntityVec3,
+    pub using_secondary_action: bool,
+}
+
+impl Packet for ServerboundInteract {
+    const ID: i32 = 0x1A;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_varint(self.hand as i32);
+        write_lp_vec3(buf, self.location);
+        buf.write_bool(self.using_secondary_action);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            hand: InteractionHand::from_wire(buf.read_varint()?)?,
+            location: read_lp_vec3(buf)?,
+            using_secondary_action: buf.read_bool()?,
+        })
+    }
+}
+
 /// Flags shared by vanilla's four `ServerboundMovePlayerPacket` variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MovePlayerFlags {
@@ -2363,10 +2499,7 @@ fn sign_extend_12(v: i32) -> i32 {
 /// One slot of a vanilla container. The modern wire format encodes an
 /// empty stack as a single zero-byte `count` VarInt; a non-empty stack
 /// is `(count, item_id, components_to_add, components_to_remove,
-/// [DataComponentPatch entries…])`. M6 only emits stacks with zero
-/// component patches, so the encoder writes two trailing zero VarInts;
-/// the decoder reads them back and refuses non-zero patch counts —
-/// full DataComponentPatch handling is M7+.
+/// [DataComponentPatch entries...])`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ItemStack {
     /// `0` ⇒ empty slot; `count > 0` ⇒ `count` copies of `item_id`.
@@ -2374,6 +2507,9 @@ pub struct ItemStack {
     /// Item-registry id (the protocol_id from
     /// `data/vanilla/reports/registries.json:minecraft:item`).
     pub item_id: u32,
+    /// Narrow M23 component support: `minecraft:damage`, encoded as
+    /// DataComponents registration id 3 with a VarInt integer payload.
+    pub damage: Option<i32>,
 }
 
 impl ItemStack {
@@ -2381,6 +2517,7 @@ impl ItemStack {
     pub const EMPTY: ItemStack = ItemStack {
         count: 0,
         item_id: 0,
+        damage: None,
     };
 
     #[must_use]
@@ -2390,7 +2527,17 @@ impl ItemStack {
 
     #[must_use]
     pub fn new(item_id: u32, count: i32) -> Self {
-        Self { count, item_id }
+        Self {
+            count,
+            item_id,
+            damage: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_damage(mut self, damage: i32) -> Self {
+        self.damage = Some(damage.max(0));
+        self
     }
 
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
@@ -2400,9 +2547,12 @@ impl ItemStack {
         }
         buf.write_varint(self.count);
         buf.write_varint(self.item_id as i32);
-        // No component patches in M6.
+        buf.write_varint(i32::from(self.damage.is_some()));
         buf.write_varint(0);
-        buf.write_varint(0);
+        if let Some(damage) = self.damage {
+            buf.write_varint(DATA_COMPONENT_DAMAGE_ID);
+            buf.write_varint(damage);
+        }
         Ok(())
     }
 
@@ -2414,12 +2564,30 @@ impl ItemStack {
         let item_id = buf.read_varint()? as u32;
         let n_add = buf.read_varint()?;
         let n_remove = buf.read_varint()?;
-        if n_add != 0 || n_remove != 0 {
+        if n_add < 0 || n_remove < 0 {
+            return Err(CodecError::NegativeLength(n_add.min(n_remove)));
+        }
+        if n_add > 1 || n_remove != 0 {
             return Err(CodecError::NotSupported(
-                "ItemStack with DataComponentPatch (M7+)",
+                "ItemStack with unsupported DataComponentPatch shape",
             ));
         }
-        Ok(Self { count, item_id })
+        let damage = if n_add == 1 {
+            let component_id = buf.read_varint()?;
+            if component_id != DATA_COMPONENT_DAMAGE_ID {
+                return Err(CodecError::NotSupported(
+                    "ItemStack with unsupported DataComponentPatch component",
+                ));
+            }
+            Some(buf.read_varint()?.max(0))
+        } else {
+            None
+        };
+        Ok(Self {
+            count,
+            item_id,
+            damage,
+        })
     }
 }
 
@@ -2510,6 +2678,58 @@ impl Packet for ClientboundContainerSetContent {
     }
 }
 
+/// `Clientbound Container Close` (CB). Verified against the local vanilla
+/// 26.1.2 class: `ClientboundContainerClosePacket(int containerId)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundContainerClose {
+    pub container_id: i32,
+}
+
+impl Packet for ClientboundContainerClose {
+    const ID: i32 = 0x11;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+        })
+    }
+}
+
+/// `Clientbound Container Set Data` (CB). Furnace/progress bars use this packet.
+/// Verified against the local vanilla 26.1.2 class:
+/// `ClientboundContainerSetDataPacket(int containerId, int id, int value)`;
+/// `id` and `value` are encoded as shorts on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundContainerSetData {
+    pub container_id: i32,
+    pub id: i16,
+    pub value: i16,
+}
+
+impl Packet for ClientboundContainerSetData {
+    const ID: i32 = 0x13;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_i16(self.id);
+        buf.write_i16(self.value);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+            id: buf.read_i16()?,
+            value: buf.read_i16()?,
+        })
+    }
+}
+
 /// `Clientbound Container Set Slot` (CB). Single-slot update inside a
 /// container. M6 emits one of these after a place mutation to
 /// decrement the held stack's count. Per ADR 0002, verified against
@@ -2552,6 +2772,237 @@ impl Packet for ClientboundContainerSetSlot {
     }
 }
 
+/// `Clientbound Open Screen` (CB). Verified against the local vanilla 26.1.2
+/// class: `ClientboundOpenScreenPacket(int containerId, MenuType<?> type,
+/// Component title)`. The title is an opaque binary text `Component` payload;
+/// decode treats it as the final field and consumes the rest of the packet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundOpenScreen {
+    pub container_id: i32,
+    pub menu_type: i32,
+    pub title_nbt: Vec<u8>,
+}
+
+impl Packet for ClientboundOpenScreen {
+    const ID: i32 = 0x3B;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.menu_type);
+        buf.put_slice(&self.title_nbt);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let container_id = buf.read_varint()?;
+        let menu_type = buf.read_varint()?;
+        let remaining = buf.remaining();
+        let mut title_nbt = vec![0; remaining];
+        buf.copy_to_slice(&mut title_nbt);
+        Ok(Self {
+            container_id,
+            menu_type,
+            title_nbt,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HashedStackComponentHashes {
+    pub added: Vec<(i32, i32)>,
+    pub removed: Vec<i32>,
+}
+
+impl HashedStackComponentHashes {
+    pub fn empty() -> Self {
+        Self {
+            added: Vec::new(),
+            removed: Vec::new(),
+        }
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_count(buf, self.added.len())?;
+        for (component_id, hash) in &self.added {
+            buf.write_varint(*component_id);
+            buf.write_i32(*hash);
+        }
+
+        write_count(buf, self.removed.len())?;
+        for component_id in &self.removed {
+            buf.write_varint(*component_id);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let added_len = read_count(buf, MAX_HASHED_STACK_COMPONENT_HASHES)?;
+        let mut added = Vec::with_capacity(added_len);
+        for _ in 0..added_len {
+            added.push((buf.read_varint()?, buf.read_i32()?));
+        }
+
+        let removed_len = read_count(buf, MAX_HASHED_STACK_COMPONENT_HASHES)?;
+        let mut removed = Vec::with_capacity(removed_len);
+        for _ in 0..removed_len {
+            removed.push(buf.read_varint()?);
+        }
+        Ok(Self { added, removed })
+    }
+}
+
+/// Client-side hash view of an item stack, used only by serverbound
+/// container reconciliation. The server never trusts these values for
+/// inventory mutation; they are decoded so the stream stays aligned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HashedStack {
+    Empty,
+    Actual {
+        item_id: u32,
+        count: i32,
+        components: HashedStackComponentHashes,
+    },
+}
+
+impl HashedStack {
+    pub fn empty() -> Self {
+        Self::Empty
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        match self {
+            Self::Empty => buf.write_bool(false),
+            Self::Actual {
+                item_id,
+                count,
+                components,
+            } => {
+                buf.write_bool(true);
+                buf.write_varint(*item_id as i32);
+                buf.write_varint(*count);
+                components.encode(buf)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        if !buf.read_bool()? {
+            return Ok(Self::Empty);
+        }
+        let item_id = buf.read_varint()?;
+        if item_id < 0 {
+            return Err(CodecError::NegativeLength(item_id));
+        }
+        let count = buf.read_varint()?;
+        if count <= 0 {
+            return Err(CodecError::NotSupported(
+                "HashedStack actual item with non-positive count",
+            ));
+        }
+        Ok(Self::Actual {
+            item_id: item_id as u32,
+            count,
+            components: HashedStackComponentHashes::decode(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerInput {
+    Pickup,
+    QuickMove,
+    Swap,
+    Clone,
+    Throw,
+    QuickCraft,
+    PickupAll,
+}
+
+impl ContainerInput {
+    const fn as_wire(self) -> i32 {
+        match self {
+            Self::Pickup => 0,
+            Self::QuickMove => 1,
+            Self::Swap => 2,
+            Self::Clone => 3,
+            Self::Throw => 4,
+            Self::QuickCraft => 5,
+            Self::PickupAll => 6,
+        }
+    }
+
+    fn from_wire(value: i32) -> Result<Self, CodecError> {
+        Ok(match value {
+            0 => Self::Pickup,
+            1 => Self::QuickMove,
+            2 => Self::Swap,
+            3 => Self::Clone,
+            4 => Self::Throw,
+            5 => Self::QuickCraft,
+            6 => Self::PickupAll,
+            _ => return Err(CodecError::NotSupported("unknown ContainerInput id")),
+        })
+    }
+}
+
+/// `Serverbound Container Click` (SB). Verified against the local vanilla 26.1.2 class:
+/// `ServerboundContainerClickPacket(int containerId, int stateId, short slotNum,
+/// byte buttonNum, ContainerInput containerInput, Int2ObjectMap<HashedStack>
+/// changedSlots, HashedStack carriedItem)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundContainerClick {
+    pub container_id: i32,
+    pub state_id: i32,
+    pub slot_num: i16,
+    pub button_num: i8,
+    pub container_input: ContainerInput,
+    pub changed_slots: Vec<(i16, HashedStack)>,
+    pub carried_item: HashedStack,
+}
+
+impl Packet for ServerboundContainerClick {
+    const ID: i32 = 0x12;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.state_id);
+        buf.write_i16(self.slot_num);
+        buf.write_i8(self.button_num);
+        buf.write_varint(self.container_input.as_wire());
+        write_count(buf, self.changed_slots.len())?;
+        for (slot, stack) in &self.changed_slots {
+            buf.write_i16(*slot);
+            stack.encode(buf)?;
+        }
+        self.carried_item.encode(buf)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let container_id = buf.read_varint()?;
+        let state_id = buf.read_varint()?;
+        let slot_num = buf.read_i16()?;
+        let button_num = buf.read_i8()?;
+        let container_input = ContainerInput::from_wire(buf.read_varint()?)?;
+        let changed_len = read_count(buf, MAX_CONTAINER_CLICK_CHANGED_SLOTS)?;
+        let mut changed_slots = Vec::with_capacity(changed_len);
+        for _ in 0..changed_len {
+            changed_slots.push((buf.read_i16()?, HashedStack::decode(buf)?));
+        }
+        let carried_item = HashedStack::decode(buf)?;
+        Ok(Self {
+            container_id,
+            state_id,
+            slot_num,
+            button_num,
+            container_input,
+            changed_slots,
+            carried_item,
+        })
+    }
+}
+
 /// `Serverbound Set Carried Item` (SB). Sent when the client scrolls
 /// the hotbar — `slot` ∈ `0..=8`. Per ADR 0002, verified against
 /// `javap -p`: `ServerboundSetCarriedItemPacket(short slot)`.
@@ -2573,6 +3024,191 @@ impl Packet for ServerboundSetCarriedItem {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             slot: buf.read_i16()?,
+        })
+    }
+}
+
+/// `Serverbound Place Recipe` (SB). Per local 26.1.2 `javap`:
+/// `ServerboundPlaceRecipePacket(int containerId, RecipeDisplayId recipe,
+/// boolean useMaxItems)`, encoded as container-id VarInt, recipe display
+/// index VarInt, then bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundPlaceRecipe {
+    pub container_id: i32,
+    pub recipe_display_id: i32,
+    pub use_max_items: bool,
+}
+
+impl Packet for ServerboundPlaceRecipe {
+    // GameProtocols registers SERVERBOUND_PLACE_RECIPE immediately before
+    // PLAYER_ABILITIES / PLAYER_ACTION; with SERVERBOUND_PLAYER_ACTION pinned
+    // at index 41, this packet is game-SB index 39 = wire id 0x27.
+    const ID: i32 = 0x27;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.recipe_display_id);
+        buf.write_bool(self.use_max_items);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+            recipe_display_id: buf.read_varint()?,
+            use_max_items: buf.read_bool()?,
+        })
+    }
+}
+
+/// `Serverbound Container Close` (SB). Verified against the local vanilla 26.1.2 class:
+/// `ServerboundContainerClosePacket` carries one `readContainerId` VarInt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundContainerClose {
+    pub container_id: i32,
+}
+
+impl Packet for ServerboundContainerClose {
+    const ID: i32 = 0x13;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeBookType {
+    Crafting,
+    Furnace,
+    BlastFurnace,
+    Smoker,
+}
+
+impl RecipeBookType {
+    const fn as_wire(self) -> i32 {
+        match self {
+            Self::Crafting => 0,
+            Self::Furnace => 1,
+            Self::BlastFurnace => 2,
+            Self::Smoker => 3,
+        }
+    }
+
+    fn from_wire(value: i32) -> Result<Self, CodecError> {
+        Ok(match value {
+            0 => Self::Crafting,
+            1 => Self::Furnace,
+            2 => Self::BlastFurnace,
+            3 => Self::Smoker,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 3,
+                });
+            }
+        })
+    }
+}
+
+/// `Serverbound Recipe Book Change Settings` (SB). Verified against the local
+/// vanilla 26.1.2 class: `RecipeBookType` enum ordinal, then two booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundRecipeBookChangeSettings {
+    pub book_type: RecipeBookType,
+    pub is_open: bool,
+    pub is_filtering: bool,
+}
+
+impl Packet for ServerboundRecipeBookChangeSettings {
+    const ID: i32 = 0x2E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.book_type.as_wire());
+        buf.write_bool(self.is_open);
+        buf.write_bool(self.is_filtering);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            book_type: RecipeBookType::from_wire(buf.read_varint()?)?,
+            is_open: buf.read_bool()?,
+            is_filtering: buf.read_bool()?,
+        })
+    }
+}
+
+/// `Serverbound Recipe Book Seen Recipe` (SB). Verified against the local
+/// vanilla 26.1.2 class: one `RecipeDisplayId` VarInt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundRecipeBookSeenRecipe {
+    pub recipe_display_id: i32,
+}
+
+impl Packet for ServerboundRecipeBookSeenRecipe {
+    const ID: i32 = 0x2F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.recipe_display_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            recipe_display_id: buf.read_varint()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCommandAction {
+    PerformRespawn,
+    RequestStats,
+    RequestGameruleValues,
+}
+
+impl ClientCommandAction {
+    fn from_wire(v: i32) -> Result<Self, CodecError> {
+        Ok(match v {
+            0 => Self::PerformRespawn,
+            1 => Self::RequestStats,
+            2 => Self::RequestGameruleValues,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 2,
+                });
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundClientCommand {
+    pub action: ClientCommandAction,
+}
+
+impl Packet for ServerboundClientCommand {
+    // SERVERBOUND_CLIENT_COMMAND is game-SB index 12 = wire id 0x0C;
+    // Action enum ordinals are PERFORM_RESPAWN=0, REQUEST_STATS=1,
+    // REQUEST_GAMERULE_VALUES=2 per local javap.
+    const ID: i32 = 0x0C;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.action as i32);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            action: ClientCommandAction::from_wire(buf.read_varint()?)?,
         })
     }
 }
@@ -2652,6 +3288,44 @@ mod tests {
             sea_level: 0,
             enforces_secure_chat: true,
         });
+    }
+
+    #[test]
+    fn clientbound_respawn_id_and_layout_match_javap() {
+        assert_eq!(ClientboundRespawn::ID, 0x52);
+        let packet = ClientboundRespawn {
+            dimension_type_id: 0,
+            dimension_name: sample_identifier("overworld"),
+            hashed_seed: 0,
+            game_mode: 0,
+            previous_game_mode: -1,
+            is_debug: false,
+            is_flat: false,
+            death_location: None,
+            portal_cooldown: 0,
+            sea_level: 63,
+            data_to_keep: 0,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x00, // dimension type id
+                0x13, b'm', b'i', b'n', b'e', b'c', b'r', b'a', b'f', b't', b':', b'o', b'v', b'e',
+                b'r', b'w', b'o', b'r', b'l', b'd', 0, 0, 0, 0, 0, 0, 0, 0, 0,    // game mode
+                0xFF, // previous game mode
+                0, 0,  // debug/flat
+                0,  // no death location
+                0,  // portal cooldown
+                63, // sea level
+                0,  // data to keep
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ClientboundRespawn::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
     }
 
     #[test]
@@ -3331,6 +4005,65 @@ mod tests {
     }
 
     #[test]
+    fn serverbound_attack_id_and_layout_match_local_vanilla() {
+        assert_eq!(ServerboundAttack::ID, 0x01);
+        let packet = ServerboundAttack { entity_id: 123 };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x7B]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ServerboundAttack::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_interact_id_and_layout_match_local_vanilla() {
+        assert_eq!(ServerboundInteract::ID, 0x1A);
+        let packet = ServerboundInteract {
+            entity_id: 123,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            using_secondary_action: false,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x7B, 0x00, 0x00, 0x00]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ServerboundInteract::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_interact_variants_round_trip() {
+        round_trip(ServerboundInteract {
+            entity_id: 1,
+            hand: InteractionHand::MainHand,
+            location: EntityVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            using_secondary_action: true,
+        });
+        round_trip(ServerboundInteract {
+            entity_id: 2,
+            hand: InteractionHand::OffHand,
+            location: EntityVec3 {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            using_secondary_action: false,
+        });
+    }
+
+    #[test]
     fn serverbound_use_item_id_and_layout_match_javap() {
         assert_eq!(ServerboundUseItem::ID, 0x43);
         let packet = ServerboundUseItem {
@@ -3502,9 +4235,25 @@ mod tests {
     }
 
     #[test]
-    fn item_stack_decoder_refuses_component_patches() {
-        // count=1, item_id=1, n_add=1 (unsupported), …
-        let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00];
+    fn item_stack_damage_component_round_trips() {
+        let pickaxe = ItemStack::new(777, 1).with_damage(12);
+        let mut buf = Vec::new();
+        pickaxe.encode(&mut buf).unwrap();
+        // count=1, item_id=777, n_add=1, n_remove=0,
+        // DataComponents.DAMAGE id=3, value=12. Per local javap:
+        // DataComponentPatch$3 writes add/remove counts first, then
+        // DataComponentType.STREAM_CODEC and the component StreamCodec;
+        // DataComponents registers `damage` fourth after ids 0..2.
+        assert_eq!(buf, vec![0x01, 0x89, 0x06, 0x01, 0x00, 0x03, 0x0C]);
+        let mut cur: &[u8] = &buf;
+        assert_eq!(ItemStack::decode(&mut cur).unwrap(), pickaxe);
+        assert!(cur.is_empty());
+    }
+
+    #[test]
+    fn item_stack_decoder_refuses_unsupported_component_patches() {
+        // count=1, item_id=1, n_add=1, n_remove=0, unsupported component id=4.
+        let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x04];
         let mut cur: &[u8] = &bytes;
         let err = ItemStack::decode(&mut cur).unwrap_err();
         assert!(matches!(err, CodecError::NotSupported(_)));
@@ -3549,8 +4298,209 @@ mod tests {
     }
 
     #[test]
+    fn clientbound_container_close_and_data_layout_match_local_vanilla() {
+        assert_eq!(ClientboundContainerClose::ID, 0x11);
+        let close = ClientboundContainerClose { container_id: 3 };
+        let mut buf = Vec::new();
+        close.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x03]);
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundContainerClose::decode(&mut cursor).unwrap(),
+            close
+        );
+
+        assert_eq!(ClientboundContainerSetData::ID, 0x13);
+        let data = ClientboundContainerSetData {
+            container_id: 3,
+            id: 2,
+            value: 200,
+        };
+        let mut buf = Vec::new();
+        data.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x03, 0x00, 0x02, 0x00, 0xC8]);
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundContainerSetData::decode(&mut cursor).unwrap(),
+            data
+        );
+    }
+
+    #[test]
+    fn clientbound_open_screen_layout_matches_local_vanilla() {
+        assert_eq!(ClientboundOpenScreen::ID, 0x3B);
+        // Minimal network NBT component: Compound { text: "Furnace" }.
+        let title_nbt = vec![
+            0x0A, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x07, b'F', b'u', b'r', b'n',
+            b'a', b'c', b'e', 0x00,
+        ];
+        let packet = ClientboundOpenScreen {
+            container_id: 1,
+            menu_type: 14,
+            title_nbt,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(&buf[..2], &[0x01, 0x0E]);
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ClientboundOpenScreen::decode(&mut cursor).unwrap(), packet);
+    }
+
+    #[test]
+    fn serverbound_container_click_layout_matches_local_vanilla() {
+        assert_eq!(ServerboundContainerClick::ID, 0x12);
+        let packet = ServerboundContainerClick {
+            container_id: 0,
+            state_id: 9,
+            slot_num: 36,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(36, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: 7,
+                count: 64,
+                components: HashedStackComponentHashes::empty(),
+            },
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x00, 0x09, // container id, state id
+                0x00, 0x24, // slot short 36
+                0x00, // button byte
+                0x00, // PICKUP
+                0x01, // changed slot count
+                0x00, 0x24, // changed slot key
+                0x00, // changed slot hashed stack empty
+                0x01, // carried item present
+                0x07, 0x40, // item id, count
+                0x00, 0x00, // hashed patch add/remove counts
+            ]
+        );
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundContainerClick::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_container_click_rejects_invalid_input_and_hashed_count() {
+        let invalid_input = [0x00, 0x01, 0x00, 0x24, 0x00, 0x07, 0x00, 0x00];
+        let mut cursor: &[u8] = &invalid_input;
+        assert!(matches!(
+            ServerboundContainerClick::decode(&mut cursor),
+            Err(CodecError::NotSupported(_))
+        ));
+
+        let invalid_hashed_count = [
+            0x00, 0x01, // container id, state id
+            0x00, 0x24, // slot
+            0x00, // button
+            0x00, // PICKUP
+            0x00, // changed slots
+            0x01, // carried item present
+            0x07, // item id
+            0x00, // invalid actual count
+        ];
+        let mut cursor: &[u8] = &invalid_hashed_count;
+        assert!(matches!(
+            ServerboundContainerClick::decode(&mut cursor),
+            Err(CodecError::NotSupported(_))
+        ));
+    }
+
+    #[test]
     fn set_carried_item_round_trip() {
         round_trip(ServerboundSetCarriedItem { slot: 0 });
         round_trip(ServerboundSetCarriedItem { slot: 8 });
+    }
+
+    #[test]
+    fn serverbound_place_recipe_id_and_layout_match_javap() {
+        assert_eq!(ServerboundPlaceRecipe::ID, 0x27);
+        let packet = ServerboundPlaceRecipe {
+            container_id: 0,
+            recipe_display_id: 300,
+            use_max_items: true,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x00, 0xAC, 0x02, 0x01]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(ServerboundPlaceRecipe::decode(&mut cursor).unwrap(), packet);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_container_close_layout_matches_local_vanilla() {
+        assert_eq!(ServerboundContainerClose::ID, 0x13);
+        let packet = ServerboundContainerClose { container_id: 7 };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x07]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundContainerClose::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_recipe_book_packets_match_local_vanilla() {
+        assert_eq!(ServerboundRecipeBookChangeSettings::ID, 0x2E);
+        let settings = ServerboundRecipeBookChangeSettings {
+            book_type: RecipeBookType::Furnace,
+            is_open: true,
+            is_filtering: false,
+        };
+        let mut buf = Vec::new();
+        settings.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x01, 0x01, 0x00]);
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundRecipeBookChangeSettings::decode(&mut cursor).unwrap(),
+            settings
+        );
+        assert!(cursor.is_empty());
+
+        assert_eq!(ServerboundRecipeBookSeenRecipe::ID, 0x2F);
+        let seen = ServerboundRecipeBookSeenRecipe {
+            recipe_display_id: 300,
+        };
+        let mut buf = Vec::new();
+        seen.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0xAC, 0x02]);
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundRecipeBookSeenRecipe::decode(&mut cursor).unwrap(),
+            seen
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_client_command_respawn_layout_matches_javap() {
+        assert_eq!(ServerboundClientCommand::ID, 0x0C);
+        let packet = ServerboundClientCommand {
+            action: ClientCommandAction::PerformRespawn,
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(buf, vec![0x00]);
+
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundClientCommand::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
     }
 }

@@ -1,0 +1,33 @@
+{
+  "items": {
+    "minecraft:chainmail_boots": { "slot": "feet", "armor": 1, "toughness": 0, "max_damage": 195 },
+    "minecraft:chainmail_chestplate": { "slot": "chest", "armor": 5, "toughness": 0, "max_damage": 240 },
+    "minecraft:chainmail_helmet": { "slot": "head", "armor": 2, "toughness": 0, "max_damage": 165 },
+    "minecraft:chainmail_leggings": { "slot": "legs", "armor": 4, "toughness": 0, "max_damage": 225 },
+    "minecraft:copper_boots": { "slot": "feet", "armor": 2, "toughness": 0, "max_damage": 143 },
+    "minecraft:copper_chestplate": { "slot": "chest", "armor": 4, "toughness": 0, "max_damage": 176 },
+    "minecraft:copper_helmet": { "slot": "head", "armor": 1, "toughness": 0, "max_damage": 121 },
+    "minecraft:copper_leggings": { "slot": "legs", "armor": 3, "toughness": 0, "max_damage": 165 },
+    "minecraft:diamond_boots": { "slot": "feet", "armor": 3, "toughness": 2, "max_damage": 429 },
+    "minecraft:diamond_chestplate": { "slot": "chest", "armor": 8, "toughness": 2, "max_damage": 528 },
+    "minecraft:diamond_helmet": { "slot": "head", "armor": 3, "toughness": 2, "max_damage": 363 },
+    "minecraft:diamond_leggings": { "slot": "legs", "armor": 6, "toughness": 2, "max_damage": 495 },
+    "minecraft:golden_boots": { "slot": "feet", "armor": 1, "toughness": 0, "max_damage": 91 },
+    "minecraft:golden_chestplate": { "slot": "chest", "armor": 5, "toughness": 0, "max_damage": 112 },
+    "minecraft:golden_helmet": { "slot": "head", "armor": 2, "toughness": 0, "max_damage": 77 },
+    "minecraft:golden_leggings": { "slot": "legs", "armor": 3, "toughness": 0, "max_damage": 105 },
+    "minecraft:iron_boots": { "slot": "feet", "armor": 2, "toughness": 0, "max_damage": 195 },
+    "minecraft:iron_chestplate": { "slot": "chest", "armor": 6, "toughness": 0, "max_damage": 240 },
+    "minecraft:iron_helmet": { "slot": "head", "armor": 2, "toughness": 0, "max_damage": 165 },
+    "minecraft:iron_leggings": { "slot": "legs", "armor": 5, "toughness": 0, "max_damage": 225 },
+    "minecraft:leather_boots": { "slot": "feet", "armor": 1, "toughness": 0, "max_damage": 65 },
+    "minecraft:leather_chestplate": { "slot": "chest", "armor": 3, "toughness": 0, "max_damage": 80 },
+    "minecraft:leather_helmet": { "slot": "head", "armor": 1, "toughness": 0, "max_damage": 55 },
+    "minecraft:leather_leggings": { "slot": "legs", "armor": 2, "toughness": 0, "max_damage": 75 },
+    "minecraft:netherite_boots": { "slot": "feet", "armor": 3, "toughness": 3, "max_damage": 481 },
+    "minecraft:netherite_chestplate": { "slot": "chest", "armor": 8, "toughness": 3, "max_damage": 592 },
+    "minecraft:netherite_helmet": { "slot": "head", "armor": 3, "toughness": 3, "max_damage": 407 },
+    "minecraft:netherite_leggings": { "slot": "legs", "armor": 6, "toughness": 3, "max_damage": 555 },
+    "minecraft:turtle_helmet": { "slot": "head", "armor": 2, "toughness": 0, "max_damage": 275 }
+  }
+}

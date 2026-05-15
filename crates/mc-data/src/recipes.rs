@@ -49,6 +49,7 @@ pub struct Recipe {
 pub enum RecipeKind {
     Shaped(ShapedRecipe),
     Shapeless(ShapelessRecipe),
+    Smelting(SmeltingRecipe),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,8 +64,20 @@ pub struct ShapelessRecipe {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SmeltingRecipe {
+    pub ingredient: Ingredient,
+    pub cooking_time: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ingredient {
-    pub alternatives: Vec<Identifier>,
+    pub alternatives: Vec<IngredientAlternative>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngredientAlternative {
+    Item(Identifier),
+    Tag(Identifier),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,6 +148,10 @@ fn load_one_recipe(root: &Path, path: &Path) -> Result<Option<Recipe>, RecipeDat
             let raw: RawShapelessRecipe = from_value(path, value)?;
             Ok(Some(parse_shapeless_recipe(path, id, raw)?))
         }
+        "minecraft:smelting" => {
+            let raw: RawSmeltingRecipe = from_value(path, value)?;
+            Ok(Some(parse_smelting_recipe(path, id, raw)?))
+        }
         _ => Ok(None),
     }
 }
@@ -203,6 +220,21 @@ fn parse_shapeless_recipe(
     })
 }
 
+fn parse_smelting_recipe(
+    path: &Path,
+    id: Identifier,
+    raw: RawSmeltingRecipe,
+) -> Result<Recipe, RecipeDataError> {
+    Ok(Recipe {
+        id,
+        kind: RecipeKind::Smelting(SmeltingRecipe {
+            ingredient: parse_ingredient(path, raw.ingredient)?,
+            cooking_time: raw.cooking_time,
+        }),
+        result: parse_result(path, raw.result)?,
+    })
+}
+
 fn validate_pattern(path: &Path, pattern: &[String]) -> Result<(), RecipeDataError> {
     let Some(width) = pattern.first().map(String::len) else {
         return Err(RecipeDataError::InvalidPattern {
@@ -219,10 +251,10 @@ fn validate_pattern(path: &Path, pattern: &[String]) -> Result<(), RecipeDataErr
 
 fn parse_ingredient(path: &Path, raw: RawIngredient) -> Result<Ingredient, RecipeDataError> {
     let alternatives = match raw {
-        RawIngredient::Single(value) => vec![parse_id(path, value)?],
+        RawIngredient::Single(value) => vec![parse_ingredient_alternative(path, value)?],
         RawIngredient::Alternatives(values) => values
             .into_iter()
-            .map(|value| parse_id(path, value))
+            .map(|value| parse_ingredient_alternative(path, value))
             .collect::<Result<Vec<_>, _>>()?,
     };
     if alternatives.is_empty() {
@@ -231,6 +263,33 @@ fn parse_ingredient(path: &Path, raw: RawIngredient) -> Result<Ingredient, Recip
         });
     }
     Ok(Ingredient { alternatives })
+}
+
+fn parse_ingredient_alternative(
+    path: &Path,
+    value: RawIngredientValue,
+) -> Result<IngredientAlternative, RecipeDataError> {
+    match value {
+        RawIngredientValue::String(value) => {
+            if let Some(tag) = value.strip_prefix('#') {
+                parse_id(path, tag.to_string()).map(IngredientAlternative::Tag)
+            } else {
+                parse_id(path, value).map(IngredientAlternative::Item)
+            }
+        }
+        RawIngredientValue::Object {
+            item: Some(item),
+            tag: None,
+        } => parse_id(path, item).map(IngredientAlternative::Item),
+        RawIngredientValue::Object {
+            item: None,
+            tag: Some(tag),
+        } => parse_id(path, tag).map(IngredientAlternative::Tag),
+        RawIngredientValue::Object { item, tag } => Err(RecipeDataError::InvalidIdentifier {
+            path: path.to_path_buf(),
+            value: format!("ingredient object item={item:?} tag={tag:?}"),
+        }),
+    }
 }
 
 fn parse_result(path: &Path, raw: RawResult) -> Result<RecipeResult, RecipeDataError> {
@@ -291,6 +350,10 @@ fn default_count() -> u32 {
     1
 }
 
+fn default_cooking_time() -> u32 {
+    200
+}
+
 #[derive(Deserialize)]
 struct RawRecipeHeader {
     #[serde(rename = "type")]
@@ -315,10 +378,30 @@ struct RawShapelessRecipe {
 }
 
 #[derive(Deserialize)]
+struct RawSmeltingRecipe {
+    #[serde(rename = "type")]
+    _kind: String,
+    ingredient: RawIngredient,
+    result: RawResult,
+    #[serde(default = "default_cooking_time")]
+    cooking_time: u32,
+}
+
+#[derive(Deserialize)]
 #[serde(untagged)]
 enum RawIngredient {
-    Single(String),
-    Alternatives(Vec<String>),
+    Single(RawIngredientValue),
+    Alternatives(Vec<RawIngredientValue>),
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawIngredientValue {
+    String(String),
+    Object {
+        item: Option<String>,
+        tag: Option<String>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -375,7 +458,7 @@ mod tests {
 
         let recipes = load_recipes(root).unwrap();
 
-        assert_eq!(recipes.len(), 2);
+        assert_eq!(recipes.len(), 3);
         assert_eq!(
             recipes[0].id.as_str(),
             "minecraft:building_blocks/test_planks"
@@ -390,21 +473,69 @@ mod tests {
             shaped.key[&'#']
                 .alternatives
                 .iter()
-                .map(Identifier::as_str)
+                .map(|alternative| match alternative {
+                    IngredientAlternative::Item(id) => id.as_str(),
+                    IngredientAlternative::Tag(id) => id.as_str(),
+                })
                 .collect::<Vec<_>>(),
             ["minecraft:oak_log", "minecraft:birch_log"]
         );
 
-        assert_eq!(recipes[1].id.as_str(), "minecraft:misc/test_stick");
-        let RecipeKind::Shapeless(shapeless) = &recipes[1].kind else {
+        let stick = recipes
+            .iter()
+            .find(|recipe| recipe.id.as_str() == "minecraft:misc/test_stick")
+            .unwrap();
+        let RecipeKind::Shapeless(shapeless) = &stick.kind else {
             panic!("expected shapeless recipe");
         };
         assert_eq!(shapeless.ingredients.len(), 2);
         assert_eq!(
-            shapeless.ingredients[0].alternatives[0].as_str(),
-            "minecraft:test_planks"
+            shapeless.ingredients[0].alternatives[0],
+            IngredientAlternative::Item(Identifier::parse("minecraft:test_planks").unwrap())
         );
-        assert_eq!(recipes[1].result.item.as_str(), "minecraft:stick");
+        assert_eq!(
+            shapeless.ingredients[1].alternatives[0],
+            IngredientAlternative::Item(Identifier::parse("minecraft:oak_planks").unwrap())
+        );
+        assert_eq!(stick.result.item.as_str(), "minecraft:stick");
+
+        let smelting_recipe = recipes
+            .iter()
+            .find(|recipe| recipe.id.as_str() == "minecraft:ignored/test_smelting")
+            .unwrap();
+        let RecipeKind::Smelting(smelting) = &smelting_recipe.kind else {
+            panic!("expected smelting recipe");
+        };
+        assert_eq!(smelting.cooking_time, 200);
+        assert_eq!(
+            smelting.ingredient.alternatives[0],
+            IngredientAlternative::Item(Identifier::parse("minecraft:iron_ore").unwrap())
+        );
+        assert_eq!(smelting_recipe.result.item.as_str(), "minecraft:iron_ingot");
+    }
+
+    #[test]
+    fn parses_tag_ingredients() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        write(
+            &root.join("oak_planks.json"),
+            r##"{
+              "type": "minecraft:crafting_shapeless",
+              "ingredients": ["#minecraft:oak_logs"],
+              "result": { "id": "minecraft:oak_planks", "count": 4 }
+            }"##,
+        );
+
+        let recipes = load_recipes(root).unwrap();
+        let RecipeKind::Shapeless(shapeless) = &recipes[0].kind else {
+            panic!("expected shapeless recipe");
+        };
+        assert_eq!(
+            shapeless.ingredients[0].alternatives[0],
+            IngredientAlternative::Tag(Identifier::parse("minecraft:oak_logs").unwrap())
+        );
+        assert_eq!(recipes[0].result.item.as_str(), "minecraft:oak_planks");
     }
 
     #[test]

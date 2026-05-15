@@ -25,28 +25,34 @@ use bytes::{Bytes, BytesMut};
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::items::ItemRegistry;
+use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
     EntityId, EntityItemStack, EntityLifecycle, EntityStore, GoalState, SpawnEntity, Vec3,
 };
+use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientboundContainerSetContent,
-    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundPlayerAbilities,
+    AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
+    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
+    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundPlayerAbilities, ClientboundRespawn,
     ClientboundSetEntityData, ClientboundSetHealth, ClientboundSetHeldSlot,
-    ClientboundTakeItemEntity, ConfirmTeleportation, Direction, EntityAnimation,
+    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
     EntityAnimationAction, EntityDataValue, EntityPositionSync, EntityVec3, ForgetLevelChunk,
     GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData,
     LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
     PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
-    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundChangeGameMode,
-    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlayerAction, ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_section_pos,
-    pack_section_relative_pos, unpack_block_pos,
+    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
+    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientCommand,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
+    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
+    ServerboundPlayerAction, ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe,
+    ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -90,6 +96,13 @@ const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
+const FURNACE_MENU_TYPE_ID: i32 = 14;
+const FURNACE_CONTAINER_ID_MIN: i32 = 1;
+const FURNACE_CONTAINER_ID_MAX: i32 = 100;
+const FURNACE_SLOT_COUNT: usize = 3;
+const FURNACE_MENU_SLOT_COUNT: usize = 39;
+const FURNACE_FUEL_TICKS: i16 = 1600;
+const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
 
 /// Default chunk radius around the player when no operator override is present.
 pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
@@ -192,6 +205,7 @@ impl SurvivalState {
     const MAX_HEALTH: f32 = 20.0;
     const MAX_FOOD: i32 = 20;
     const EXHAUSTION_STEP: f32 = 4.0;
+    const HEALTH_TICK_PERIOD: u32 = 4;
 
     const FULL: Self = Self {
         health: Self::MAX_HEALTH,
@@ -235,6 +249,20 @@ impl SurvivalState {
                 self.food -= 1;
             }
         }
+    }
+
+    fn tick_health(&mut self, tick: u32) -> bool {
+        if self.is_dead() || !tick.is_multiple_of(Self::HEALTH_TICK_PERIOD) {
+            return false;
+        }
+        let before = *self;
+        if self.food >= 18 && self.health < Self::MAX_HEALTH {
+            self.heal(1.0);
+            self.add_exhaustion(6.0);
+        } else if self.food == 0 {
+            self.apply_damage(1.0);
+        }
+        *self != before
     }
 }
 
@@ -585,6 +613,23 @@ impl SessionRegistry {
             .collect()
     }
 
+    fn server_entity_snapshot(&self, entity_id: EntityId) -> Option<ServerEntitySnapshot> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .entities
+            .snapshot(entity_id)
+            .map(server_entity_snapshot_from)
+    }
+
+    fn damage_server_entity(
+        &self,
+        entity_id: EntityId,
+        amount: f32,
+    ) -> Option<mc_entity::EntityDamage> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        inner.entities.damage(entity_id, amount)
+    }
+
     fn update_item_stack(
         &self,
         entity_id: EntityId,
@@ -614,6 +659,32 @@ impl SessionRegistry {
                 })
             })
             .collect()
+    }
+
+    fn remove_server_entity(
+        &self,
+        entity_id: EntityId,
+    ) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let snapshot = inner
+            .entities
+            .remove(entity_id)
+            .map(server_entity_snapshot_from)?;
+        inner.last_sent_entity_positions.remove(&entity_id);
+
+        let mut dispatches = Vec::new();
+        for (&observer_id, observer) in &mut inner.sessions {
+            if observer.visible_entities.remove(&entity_id) {
+                dispatches.push(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
+                });
+            }
+        }
+        Some((snapshot, dispatches))
     }
 
     fn remove_picked_item(
@@ -837,6 +908,33 @@ fn distance_sq(a: Vec3, b: Vec3) -> f64 {
     let dy = a.y - b.y;
     let dz = a.z - b.z;
     dx * dx + dy * dy + dz * dz
+}
+
+fn player_eye_position(pose: PlayerPose) -> Vec3 {
+    Vec3::new(pose.x, pose.y + 1.62, pose.z)
+}
+
+fn block_center(position: i64) -> Vec3 {
+    let (x, y, z) = unpack_block_pos(position);
+    Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
+}
+
+fn within_block_reach(pose: PlayerPose, position: i64, game_mode: GameMode) -> bool {
+    let max = if game_mode == GameMode::Creative {
+        6.0
+    } else {
+        5.0
+    };
+    distance_sq(player_eye_position(pose), block_center(position)) <= max * max
+}
+
+fn within_entity_reach(pose: PlayerPose, position: Vec3, game_mode: GameMode) -> bool {
+    let max = if game_mode == GameMode::Creative {
+        6.0
+    } else {
+        4.0
+    };
+    distance_sq(player_eye_position(pose), position) <= max * max
 }
 
 fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {
@@ -1272,6 +1370,19 @@ where
         sea_level: DEFAULT_SEA_LEVEL,
         enforces_secure_chat: false,
     };
+    let respawn = ClientboundRespawn {
+        dimension_type_id: login.dimension_type_id,
+        dimension_name: login.dimension_name.clone(),
+        hashed_seed: login.hashed_seed,
+        game_mode: login.game_mode,
+        previous_game_mode: login.previous_game_mode,
+        is_debug: login.is_debug,
+        is_flat: login.is_flat,
+        death_location: None,
+        portal_cooldown: login.portal_cooldown,
+        sea_level: login.sea_level,
+        data_to_keep: 0,
+    };
     write_packet(writer, &login, compression).await?;
     dispatch_visibility_commands(visibility);
 
@@ -1385,6 +1496,19 @@ where
         )
         .await?;
 
+        let mut recipes = match mc_data::recipes::load_recipes(
+            config.data.root().join("data/minecraft/recipe"),
+        ) {
+            Ok(recipes) => recipes,
+            Err(err) => {
+                warn!(error = %err, "recipe data load failed; crafting disabled");
+                Vec::new()
+            }
+        };
+        if recipes.is_empty() {
+            recipes = fallback_crafting_recipes();
+        }
+
         // 7. Play loop. Runs until the connection drops or the client
         //    misses a heartbeat by more than `KEEPALIVE_TIMEOUT`. The
         //    interaction state passes the M5.d/M5.e/M6.f break/place
@@ -1402,10 +1526,16 @@ where
             compression,
             selected_hotbar_slot: 0,
             inventory: initial_inventory,
+            carried_item: ItemStack::EMPTY,
             inventory_state_id: 1,
             items: Arc::clone(&config.items),
             entity_types: Arc::clone(&config.entity_types),
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
+            tags: Arc::clone(&config.tags),
+            recipes,
+            next_container_id: FURNACE_CONTAINER_ID_MIN,
+            active_container: None,
+            furnaces: HashMap::new(),
             pending_break: None,
         });
         play_loop(
@@ -1418,6 +1548,8 @@ where
             Arc::clone(&sessions),
             session_id,
             initial_pose,
+            initial_pose,
+            respawn,
             CommandPermissions::for_local_dev_profile(profile),
             SurvivalState::FULL,
             outbound_rx,
@@ -1458,6 +1590,8 @@ struct InteractionState {
     /// numbering: 0..4 crafting (output + 2×2 input), 5..8 armor,
     /// 9..35 main rows, 36..44 hotbar, 45 offhand.
     inventory: PlayerInventory,
+    /// Server-authoritative cursor stack for vanilla container clicks.
+    carried_item: ItemStack,
     /// M6.e: per-vanilla, the server bumps this counter on every
     /// inventory mutation it ships to the client; the client uses
     /// it to detect desyncs. Starts at 1 (after the seed
@@ -1468,7 +1602,74 @@ struct InteractionState {
     /// Registry-derived item→default-block resolver. Built once from
     /// vanilla item/block registries at construction time.
     item_to_block: ItemToBlockTable,
+    tags: Arc<TagsData>,
+    recipes: Vec<mc_data::recipes::Recipe>,
+    next_container_id: i32,
+    active_container: Option<ActiveContainer>,
+    furnaces: HashMap<(i32, i32, i32), FurnaceContainer>,
     pending_break: Option<PendingBreak>,
+}
+
+#[derive(Debug, Clone)]
+enum ActiveContainer {
+    Furnace(FurnaceContainer),
+}
+
+impl ActiveContainer {
+    fn container_id(&self) -> i32 {
+        match self {
+            Self::Furnace(furnace) => furnace.container_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct FurnaceContainer {
+    container_id: i32,
+    position: (i32, i32, i32),
+    state_id: i32,
+    slots: [ItemStack; FURNACE_SLOT_COUNT],
+    burn_remaining: i16,
+    burn_total: i16,
+    cook_progress: i16,
+    cook_total: i16,
+}
+
+impl FurnaceContainer {
+    fn new(position: (i32, i32, i32)) -> Self {
+        Self {
+            container_id: 0,
+            position,
+            state_id: 1,
+            slots: std::array::from_fn(|_| ItemStack::EMPTY),
+            burn_remaining: 0,
+            burn_total: FURNACE_FUEL_TICKS,
+            cook_progress: 0,
+            cook_total: DEFAULT_FURNACE_COOK_TICKS,
+        }
+    }
+
+    fn bind_to_client(&mut self, container_id: i32) {
+        self.container_id = container_id;
+        self.state_id = 1;
+    }
+
+    fn data_values(&self) -> [(i16, i16); 4] {
+        [
+            (0, self.burn_remaining),
+            (1, self.burn_total),
+            (2, self.cook_progress),
+            (3, self.cook_total),
+        ]
+    }
+
+    fn wire_items(&self, inventory: &PlayerInventory) -> Vec<ItemStack> {
+        let mut items = Vec::with_capacity(FURNACE_MENU_SLOT_COUNT);
+        items.extend(self.slots.iter().cloned());
+        items.extend((9..=35).map(|slot| inventory.slots[slot].clone()));
+        items.extend((36..=44).map(|slot| inventory.slots[slot].clone()));
+        items
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1522,6 +1723,12 @@ struct FoodRule {
     item: &'static str,
     food: i32,
     saturation: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ArmorStats {
+    armor: f32,
+    toughness: f32,
 }
 
 const FALLBACK_FOOD_RULES: &[FoodRule] = &[
@@ -1581,7 +1788,11 @@ impl PlayerInventory {
 
         for slot in 9..=44 {
             let current = &mut self.slots[slot];
-            if current.is_empty() || current.item_id != stack.item_id || current.count >= 64 {
+            if current.is_empty()
+                || current.item_id != stack.item_id
+                || current.damage != stack.damage
+                || current.count >= 64
+            {
                 continue;
             }
             let moved = (64 - current.count).min(stack.count);
@@ -1598,7 +1809,66 @@ impl PlayerInventory {
                 continue;
             }
             let moved = stack.count.min(64);
-            self.slots[slot] = ItemStack::new(stack.item_id, moved);
+            let mut moved_stack = stack.clone();
+            moved_stack.count = moved;
+            self.slots[slot] = moved_stack;
+            stack.count -= moved;
+            changed.push((slot, self.slots[slot].clone()));
+            if stack.count <= 0 {
+                return (ItemStack::EMPTY, changed);
+            }
+        }
+
+        (stack, changed)
+    }
+
+    fn merge_pickup_stack(&mut self, mut stack: ItemStack) -> (ItemStack, Vec<(usize, ItemStack)>) {
+        let mut changed = Vec::new();
+        if stack.is_empty() {
+            return (ItemStack::EMPTY, changed);
+        }
+
+        for slot in 9..=44 {
+            let current = &mut self.slots[slot];
+            if current.is_empty()
+                || current.item_id != stack.item_id
+                || current.damage != stack.damage
+                || current.count >= 64
+            {
+                continue;
+            }
+            let moved = (64 - current.count).min(stack.count);
+            current.count += moved;
+            stack.count -= moved;
+            changed.push((slot, current.clone()));
+            if stack.count <= 0 {
+                return (ItemStack::EMPTY, changed);
+            }
+        }
+
+        for slot in 36..=44 {
+            if !self.slots[slot].is_empty() {
+                continue;
+            }
+            let moved = stack.count.min(64);
+            let mut moved_stack = stack.clone();
+            moved_stack.count = moved;
+            self.slots[slot] = moved_stack;
+            stack.count -= moved;
+            changed.push((slot, self.slots[slot].clone()));
+            if stack.count <= 0 {
+                return (ItemStack::EMPTY, changed);
+            }
+        }
+
+        for slot in 9..=35 {
+            if !self.slots[slot].is_empty() {
+                continue;
+            }
+            let moved = stack.count.min(64);
+            let mut moved_stack = stack.clone();
+            moved_stack.count = moved;
+            self.slots[slot] = moved_stack;
             stack.count -= moved;
             changed.push((slot, self.slots[slot].clone()));
             if stack.count <= 0 {
@@ -1612,6 +1882,160 @@ impl PlayerInventory {
     fn as_wire_list(&self) -> Vec<ItemStack> {
         self.slots.to_vec()
     }
+
+    fn merge_stack_into_ranges(
+        &mut self,
+        mut stack: ItemStack,
+        ranges: &[std::ops::RangeInclusive<usize>],
+        max_stack: i32,
+    ) -> ItemStack {
+        if stack.is_empty() {
+            return ItemStack::EMPTY;
+        }
+
+        for range in ranges {
+            for slot in range.clone() {
+                let current = &mut self.slots[slot];
+                if !can_stack(current, &stack) || current.count >= max_stack {
+                    continue;
+                }
+                let moved = (max_stack - current.count).min(stack.count);
+                current.count += moved;
+                stack.count -= moved;
+                if stack.count <= 0 {
+                    return ItemStack::EMPTY;
+                }
+            }
+        }
+
+        for range in ranges {
+            for slot in range.clone() {
+                if !self.slots[slot].is_empty() {
+                    continue;
+                }
+                let moved = stack.count.min(max_stack);
+                let mut moved_stack = stack.clone();
+                moved_stack.count = moved;
+                self.slots[slot] = moved_stack;
+                stack.count -= moved;
+                if stack.count <= 0 {
+                    return ItemStack::EMPTY;
+                }
+            }
+        }
+
+        stack
+    }
+}
+
+fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && left.item_id == right.item_id
+        && left.damage == right.damage
+}
+
+fn item_max_stack(items: &ItemRegistry, stack: &ItemStack) -> i32 {
+    if stack.is_empty() || stack.damage.is_some() {
+        return 1;
+    }
+    let Some(name) = items.name_of(stack.item_id) else {
+        return 64;
+    };
+    let path = name.path();
+    if max_tool_damage_for_path(path).is_some()
+        || matches!(
+            path,
+            "shield"
+                | "bow"
+                | "crossbow"
+                | "trident"
+                | "fishing_rod"
+                | "shears"
+                | "flint_and_steel"
+        )
+        || path.ends_with("_helmet")
+        || path.ends_with("_chestplate")
+        || path.ends_with("_leggings")
+        || path.ends_with("_boots")
+    {
+        1
+    } else {
+        64
+    }
+}
+
+fn armor_slot_for_kind(kind: mc_data::armor::ArmorSlot) -> usize {
+    match kind {
+        mc_data::armor::ArmorSlot::Head => 5,
+        mc_data::armor::ArmorSlot::Chest => 6,
+        mc_data::armor::ArmorSlot::Legs => 7,
+        mc_data::armor::ArmorSlot::Feet => 8,
+    }
+}
+
+fn armor_entry_for_item(
+    items: &ItemRegistry,
+    item_id: u32,
+) -> Option<&'static mc_data::armor::ArmorEntry> {
+    items
+        .name_of(item_id)
+        .and_then(|name| mc_data::armor::builtin().entry(name))
+}
+
+fn equipped_armor_stats(items: &ItemRegistry, inventory: &PlayerInventory) -> ArmorStats {
+    let mut total = ArmorStats {
+        armor: 0.0,
+        toughness: 0.0,
+    };
+    for slot in 5..=8 {
+        let stack = &inventory.slots[slot];
+        if stack.is_empty() {
+            continue;
+        }
+        if let Some(entry) = armor_entry_for_item(items, stack.item_id) {
+            total.armor += entry.armor;
+            total.toughness += entry.toughness;
+        }
+    }
+    total
+}
+
+fn armor_reduced_damage(amount: f32, stats: ArmorStats) -> f32 {
+    let damage = amount.max(0.0);
+    let toughness = 2.0 + stats.toughness / 4.0;
+    let real_armor = (stats.armor - damage / toughness)
+        .clamp(stats.armor * 0.2, 20.0)
+        .max(0.0);
+    damage * (1.0 - real_armor / 25.0)
+}
+
+fn survival_damage_after_armor(state: Option<&InteractionState>, amount: f32) -> f32 {
+    let Some(state) = state else {
+        return amount.max(0.0);
+    };
+    armor_reduced_damage(amount, equipped_armor_stats(&state.items, &state.inventory))
+}
+
+fn damage_equipped_armor(state: &mut InteractionState) -> Vec<(usize, ItemStack)> {
+    let mut changed = Vec::new();
+    for slot in 5..=8 {
+        let stack = &mut state.inventory.slots[slot];
+        if stack.is_empty() {
+            continue;
+        }
+        let Some(entry) = armor_entry_for_item(&state.items, stack.item_id) else {
+            continue;
+        };
+        let next_damage = stack.damage.unwrap_or(0) + 1;
+        if next_damage >= entry.max_damage {
+            *stack = ItemStack::EMPTY;
+        } else {
+            stack.damage = Some(next_damage);
+        }
+        changed.push((slot, stack.clone()));
+    }
+    changed
 }
 
 /// Item→default-block-state lookup for items whose identifier also
@@ -1639,6 +2063,215 @@ impl ItemToBlockTable {
             .iter()
             .find_map(|(id, state)| (*id == item_id).then_some(*state))
     }
+}
+
+fn fallback_crafting_recipes() -> Vec<mc_data::recipes::Recipe> {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, ShapedRecipe,
+        ShapelessRecipe, SmeltingRecipe,
+    };
+
+    let item =
+        |id: &str| IngredientAlternative::Item(Identifier::parse(id).expect("static identifier"));
+    let tag =
+        |id: &str| IngredientAlternative::Tag(Identifier::parse(id).expect("static identifier"));
+    let ingredient = |alternatives: Vec<IngredientAlternative>| Ingredient { alternatives };
+    let shaped = |id: &str,
+                  pattern: Vec<&str>,
+                  key: Vec<(char, Vec<IngredientAlternative>)>,
+                  result: &str,
+                  count: u32| {
+        Recipe {
+            id: Identifier::parse(id).expect("static identifier"),
+            kind: RecipeKind::Shaped(ShapedRecipe {
+                pattern: pattern.into_iter().map(str::to_string).collect(),
+                key: key
+                    .into_iter()
+                    .map(|(ch, alternatives)| (ch, ingredient(alternatives)))
+                    .collect(),
+            }),
+            result: RecipeResult {
+                item: Identifier::parse(result).expect("static identifier"),
+                count,
+            },
+        }
+    };
+    let smelting = |id: &str, input: &str, result: &str| Recipe {
+        id: Identifier::parse(id).expect("static identifier"),
+        kind: RecipeKind::Smelting(SmeltingRecipe {
+            ingredient: ingredient(vec![item(input)]),
+            cooking_time: 200,
+        }),
+        result: RecipeResult {
+            item: Identifier::parse(result).expect("static identifier"),
+            count: 1,
+        },
+    };
+
+    let mut recipes = vec![
+        shaped(
+            "minecraft:torch",
+            vec!["X", "#"],
+            vec![
+                (
+                    'X',
+                    vec![item("minecraft:coal"), item("minecraft:charcoal")],
+                ),
+                ('#', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:torch",
+            4,
+        ),
+        Recipe {
+            id: Identifier::parse("minecraft:oak_planks").expect("static identifier"),
+            kind: RecipeKind::Shapeless(ShapelessRecipe {
+                ingredients: vec![ingredient(vec![tag("minecraft:oak_logs")])],
+            }),
+            result: RecipeResult {
+                item: Identifier::parse("minecraft:oak_planks").expect("static identifier"),
+                count: 4,
+            },
+        },
+        shaped(
+            "minecraft:stick",
+            vec!["#", "#"],
+            vec![('#', vec![tag("minecraft:planks")])],
+            "minecraft:stick",
+            4,
+        ),
+        shaped(
+            "minecraft:crafting_table",
+            vec!["##", "##"],
+            vec![('#', vec![tag("minecraft:planks")])],
+            "minecraft:crafting_table",
+            1,
+        ),
+        shaped(
+            "minecraft:wooden_pickaxe",
+            vec!["###", " X ", " X "],
+            vec![
+                ('#', vec![tag("minecraft:planks")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:wooden_pickaxe",
+            1,
+        ),
+        shaped(
+            "minecraft:wooden_axe",
+            vec!["##", "#X", " X"],
+            vec![
+                ('#', vec![tag("minecraft:planks")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:wooden_axe",
+            1,
+        ),
+        shaped(
+            "minecraft:wooden_shovel",
+            vec!["#", "X", "X"],
+            vec![
+                ('#', vec![tag("minecraft:planks")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:wooden_shovel",
+            1,
+        ),
+        shaped(
+            "minecraft:wooden_sword",
+            vec!["#", "#", "X"],
+            vec![
+                ('#', vec![tag("minecraft:planks")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:wooden_sword",
+            1,
+        ),
+        shaped(
+            "minecraft:stone_pickaxe",
+            vec!["###", " X ", " X "],
+            vec![
+                ('#', vec![item("minecraft:cobblestone")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:stone_pickaxe",
+            1,
+        ),
+        shaped(
+            "minecraft:stone_axe",
+            vec!["##", "#X", " X"],
+            vec![
+                ('#', vec![item("minecraft:cobblestone")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:stone_axe",
+            1,
+        ),
+        shaped(
+            "minecraft:stone_shovel",
+            vec!["#", "X", "X"],
+            vec![
+                ('#', vec![item("minecraft:cobblestone")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:stone_shovel",
+            1,
+        ),
+        shaped(
+            "minecraft:stone_sword",
+            vec!["#", "#", "X"],
+            vec![
+                ('#', vec![item("minecraft:cobblestone")]),
+                ('X', vec![item("minecraft:stick")]),
+            ],
+            "minecraft:stone_sword",
+            1,
+        ),
+        shaped(
+            "minecraft:furnace",
+            vec!["###", "# #", "###"],
+            vec![('#', vec![item("minecraft:cobblestone")])],
+            "minecraft:furnace",
+            1,
+        ),
+    ];
+    recipes.extend([
+        smelting(
+            "minecraft:iron_ingot_from_smelting_raw_iron",
+            "minecraft:raw_iron",
+            "minecraft:iron_ingot",
+        ),
+        smelting(
+            "minecraft:gold_ingot_from_smelting_raw_gold",
+            "minecraft:raw_gold",
+            "minecraft:gold_ingot",
+        ),
+        smelting(
+            "minecraft:copper_ingot_from_smelting_raw_copper",
+            "minecraft:raw_copper",
+            "minecraft:copper_ingot",
+        ),
+        smelting(
+            "minecraft:cooked_beef",
+            "minecraft:beef",
+            "minecraft:cooked_beef",
+        ),
+        smelting(
+            "minecraft:cooked_porkchop",
+            "minecraft:porkchop",
+            "minecraft:cooked_porkchop",
+        ),
+        smelting(
+            "minecraft:cooked_chicken",
+            "minecraft:chicken",
+            "minecraft:cooked_chicken",
+        ),
+        smelting(
+            "minecraft:baked_potato",
+            "minecraft:potato",
+            "minecraft:baked_potato",
+        ),
+    ]);
+    recipes
 }
 
 /// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
@@ -2783,9 +3416,19 @@ fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
         .and_then(|id| i32::try_from(id).ok())
 }
 
+fn passive_mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
+    let entity = Identifier::parse(entity_type.to_string()).ok()?;
+    let item = mc_data::loot::builtin().entity_drop(&entity)?;
+    let item_id = state.items.id_of(item)?;
+    Some(ItemStack::new(item_id, 1))
+}
+
 fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Option<ItemStack> {
     let block = state.blocks.by_id(block_state)?;
-    let item_id = state.items.id_of(&block.block.id)?;
+    let item = mc_data::loot::builtin()
+        .block_drop(&block.block.id)
+        .unwrap_or(&block.block.id);
+    let item_id = state.items.id_of(item)?;
     Some(ItemStack::new(item_id, 1))
 }
 
@@ -2809,6 +3452,467 @@ fn held_food_rule(state: &InteractionState) -> Option<FoodRule> {
 
 fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
     EntityItemStack::new(stack.item_id, stack.count)
+}
+
+fn held_attack_damage(state: &InteractionState) -> f32 {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    let Some(path) = (!held.is_empty())
+        .then(|| state.items.name_of(held.item_id))
+        .flatten()
+        .map(|id| id.path())
+    else {
+        return 2.0;
+    };
+    if path.ends_with("_sword") {
+        8.0
+    } else if path.ends_with("_axe") {
+        7.0
+    } else if path.ends_with("_pickaxe") || path.ends_with("_shovel") {
+        4.0
+    } else {
+        2.0
+    }
+}
+
+fn is_durability_tool_path(path: &str) -> bool {
+    path.ends_with("_axe")
+        || path.ends_with("_hoe")
+        || path.ends_with("_pickaxe")
+        || path.ends_with("_shovel")
+        || path.ends_with("_sword")
+}
+
+fn max_tool_damage_for_path(path: &str) -> Option<i32> {
+    if !is_durability_tool_path(path) {
+        return None;
+    }
+    let max = if path.starts_with("wooden_") {
+        59
+    } else if path.starts_with("stone_") {
+        131
+    } else if path.starts_with("iron_") {
+        250
+    } else if path.starts_with("diamond_") {
+        1561
+    } else if path.starts_with("golden_") {
+        32
+    } else if path.starts_with("netherite_") {
+        2031
+    } else {
+        return None;
+    };
+    Some(max)
+}
+
+fn damage_held_tool_stack(state: &mut InteractionState) -> Option<(usize, ItemStack)> {
+    let hotbar_slot = state.selected_hotbar_slot;
+    let wire_slot = PlayerInventory::HOTBAR_BASE + hotbar_slot as usize;
+    let item_path = {
+        let held = state.inventory.held(hotbar_slot);
+        if held.is_empty() {
+            return None;
+        }
+        state.items.name_of(held.item_id)?.path().to_owned()
+    };
+    let max_damage = max_tool_damage_for_path(&item_path)?;
+
+    let held = state.inventory.held_mut(hotbar_slot);
+    let new_damage = held.damage.unwrap_or(0).saturating_add(1);
+    if new_damage >= max_damage {
+        *held = ItemStack::EMPTY;
+    } else {
+        held.damage = Some(new_damage);
+    }
+    Some((wire_slot, held.clone()))
+}
+
+async fn damage_held_tool_after_mining<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(changed) = damage_held_tool_stack(state) {
+        write_inventory_slot_updates(state, writer, vec![changed]).await?;
+    }
+    Ok(())
+}
+
+fn recipe_ingredients(
+    recipe: &mc_data::recipes::Recipe,
+) -> Option<Vec<&mc_data::recipes::Ingredient>> {
+    match &recipe.kind {
+        mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
+            Some(shapeless.ingredients.iter().collect())
+        }
+        mc_data::recipes::RecipeKind::Shaped(shaped) => {
+            let mut ingredients = Vec::new();
+            for row in &shaped.pattern {
+                for ch in row.chars().filter(|ch| *ch != ' ') {
+                    ingredients.push(shaped.key.get(&ch)?);
+                }
+            }
+            Some(ingredients)
+        }
+        mc_data::recipes::RecipeKind::Smelting(_) => None,
+    }
+}
+
+fn matching_ingredient_slot(
+    state: &InteractionState,
+    available: &[i32; 46],
+    ingredient: &mc_data::recipes::Ingredient,
+) -> Option<usize> {
+    for (slot, available_count) in available.iter().enumerate().take(45).skip(9) {
+        let current = &state.inventory.slots[slot];
+        if *available_count > 0
+            && ingredient_accepts_item(&state.items, &state.tags, current.item_id, ingredient)
+        {
+            return Some(slot);
+        }
+    }
+    None
+}
+
+fn ingredient_accepts_item(
+    items: &ItemRegistry,
+    tags: &TagsData,
+    item_id: u32,
+    ingredient: &mc_data::recipes::Ingredient,
+) -> bool {
+    ingredient
+        .alternatives
+        .iter()
+        .any(|alternative| ingredient_alternative_accepts_item(items, tags, item_id, alternative))
+}
+
+fn ingredient_alternative_accepts_item(
+    items: &ItemRegistry,
+    tags: &TagsData,
+    item_id: u32,
+    alternative: &mc_data::recipes::IngredientAlternative,
+) -> bool {
+    match alternative {
+        mc_data::recipes::IngredientAlternative::Item(item) => items.id_of(item) == Some(item_id),
+        mc_data::recipes::IngredientAlternative::Tag(tag) => {
+            let item_registry = Identifier::parse("minecraft:item").expect("static identifier");
+            tags.registries
+                .get(&item_registry)
+                .and_then(|item_tags| item_tags.get(tag))
+                .is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| u32::try_from(*entry).ok() == Some(item_id))
+                })
+        }
+    }
+}
+
+fn inventory_has_room_for_output(state: &InteractionState, item_id: u32, count: i32) -> bool {
+    let mut remaining = count;
+    for slot in 9..=44 {
+        let current = &state.inventory.slots[slot];
+        if current.is_empty() {
+            remaining -= remaining.min(64);
+        } else if current.item_id == item_id && current.damage.is_none() && current.count < 64 {
+            remaining -= remaining.min(64 - current.count);
+        }
+        if remaining <= 0 {
+            return true;
+        }
+    }
+    false
+}
+
+fn craft_recipe_once(
+    state: &mut InteractionState,
+    recipe: &mc_data::recipes::Recipe,
+) -> Option<Vec<(usize, ItemStack)>> {
+    let ingredients = recipe_ingredients(recipe)?;
+    if ingredients.is_empty() {
+        return None;
+    }
+    let output_item_id = state.items.id_of(&recipe.result.item)?;
+    let output_count = i32::try_from(recipe.result.count).ok()?;
+    if output_count <= 0 || !inventory_has_room_for_output(state, output_item_id, output_count) {
+        return None;
+    }
+
+    let mut available = std::array::from_fn(|slot| state.inventory.slots[slot].count.max(0));
+    let mut consumed_slots = Vec::with_capacity(ingredients.len());
+    for ingredient in ingredients {
+        let slot = matching_ingredient_slot(state, &available, ingredient)?;
+        available[slot] -= 1;
+        consumed_slots.push(slot);
+    }
+
+    let mut changed = BTreeMap::new();
+    for slot in consumed_slots {
+        let current = &mut state.inventory.slots[slot];
+        current.count -= 1;
+        if current.count <= 0 {
+            *current = ItemStack::EMPTY;
+        }
+        changed.insert(slot, current.clone());
+    }
+
+    let (remaining, output_changed) = state
+        .inventory
+        .merge_stack(ItemStack::new(output_item_id, output_count));
+    if !remaining.is_empty() {
+        return None;
+    }
+    for (slot, stack) in output_changed {
+        changed.insert(slot, stack);
+    }
+    Some(changed.into_iter().collect())
+}
+
+fn craft_recipe(
+    state: &mut InteractionState,
+    recipe: &mc_data::recipes::Recipe,
+    use_max_items: bool,
+) -> Option<Vec<(usize, ItemStack)>> {
+    if !use_max_items {
+        return craft_recipe_once(state, recipe);
+    }
+
+    let mut all_changed = BTreeMap::new();
+    while let Some(changed) = craft_recipe_once(state, recipe) {
+        for (slot, stack) in changed {
+            all_changed.insert(slot, stack);
+        }
+    }
+    (!all_changed.is_empty()).then(|| all_changed.into_iter().collect())
+}
+
+fn is_furnace_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
+    state
+        .blocks
+        .by_id(block_state)
+        .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:furnace")
+}
+
+fn find_smelting_recipe_for_item(
+    state: &InteractionState,
+    item_id: u32,
+) -> Option<mc_data::recipes::Recipe> {
+    state.recipes.iter().find_map(|recipe| {
+        let mc_data::recipes::RecipeKind::Smelting(smelting) = &recipe.kind else {
+            return None;
+        };
+        ingredient_accepts_item(&state.items, &state.tags, item_id, &smelting.ingredient)
+            .then(|| recipe.clone())
+    })
+}
+
+fn is_fuel_item(state: &InteractionState, item_id: u32) -> bool {
+    let coal = state
+        .items
+        .id_of(&Identifier::parse("minecraft:coal").expect("static identifier"));
+    let charcoal = state
+        .items
+        .id_of(&Identifier::parse("minecraft:charcoal").expect("static identifier"));
+    Some(item_id) == coal || Some(item_id) == charcoal
+}
+
+fn furnace_menu_title_nbt() -> Vec<u8> {
+    let mut out = Vec::new();
+    mc_nbt::write_network(
+        &mut out,
+        &Tag::Compound(vec![(
+            "text".to_string(),
+            Tag::String("Furnace".to_string()),
+        )]),
+    )
+    .expect("static text component is valid NBT");
+    out
+}
+
+fn next_container_id(state: &mut InteractionState) -> i32 {
+    let id = state.next_container_id;
+    state.next_container_id += 1;
+    if state.next_container_id > FURNACE_CONTAINER_ID_MAX {
+        state.next_container_id = FURNACE_CONTAINER_ID_MIN;
+    }
+    id
+}
+
+fn store_active_container(state: &mut InteractionState) {
+    let Some(active) = state.active_container.take() else {
+        return;
+    };
+    match active {
+        ActiveContainer::Furnace(mut furnace) => {
+            furnace.container_id = 0;
+            state.furnaces.insert(furnace.position, furnace);
+        }
+    }
+}
+
+async fn write_furnace_data<W>(
+    writer: &mut W,
+    compression: Compression,
+    furnace: &FurnaceContainer,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for (id, value) in furnace.data_values() {
+        write_packet(
+            writer,
+            &ClientboundContainerSetData {
+                container_id: furnace.container_id,
+                id,
+                value,
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_furnace_data_changes<W>(
+    writer: &mut W,
+    compression: Compression,
+    furnace: &FurnaceContainer,
+    changed: &[(i16, i16)],
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for &(id, value) in changed {
+        write_packet(
+            writer,
+            &ClientboundContainerSetData {
+                container_id: furnace.container_id,
+                id,
+                value,
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn write_furnace_content<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    furnace: &FurnaceContainer,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: furnace.container_id,
+            state_id: furnace.state_id,
+            items: furnace.wire_items(&state.inventory),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+async fn open_furnace_container<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let clicked = {
+        let mut storage = state.world.lock().await;
+        storage
+            .get_block(mc_world::BlockPos { x, y, z })
+            .map_err(|err| {
+                warn!(error = %err, x, y, z, "furnace use target read failed");
+                err
+            })
+            .ok()
+            .flatten()
+    };
+    if !clicked.is_some_and(|block_state| is_furnace_state(state, block_state)) {
+        return Ok(false);
+    }
+
+    store_active_container(state);
+    let container_id = next_container_id(state);
+    let mut furnace = state
+        .furnaces
+        .remove(&(x, y, z))
+        .unwrap_or_else(|| FurnaceContainer::new((x, y, z)));
+    furnace.bind_to_client(container_id);
+    write_packet(
+        writer,
+        &ClientboundOpenScreen {
+            container_id,
+            menu_type: FURNACE_MENU_TYPE_ID,
+            title_nbt: furnace_menu_title_nbt(),
+        },
+        state.compression,
+    )
+    .await?;
+    write_furnace_content(state, writer, &furnace).await?;
+    write_furnace_data(writer, state.compression, &furnace).await?;
+    state.active_container = Some(ActiveContainer::Furnace(furnace));
+    write_block_ack(writer, state.compression, sequence).await?;
+    Ok(true)
+}
+
+async fn handle_place_recipe<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: SurvivalState,
+    packet: ServerboundPlaceRecipe,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    state.pending_break = None;
+    if packet.container_id != 0 {
+        debug!(
+            container_id = packet.container_id,
+            "place recipe ignored for non-player container"
+        );
+        return Ok(());
+    }
+    if game_mode == GameMode::Survival && survival_state.is_dead() {
+        debug!(
+            recipe = packet.recipe_display_id,
+            "place recipe ignored for dead player"
+        );
+        return Ok(());
+    }
+    let Some(recipe) = packet
+        .recipe_display_id
+        .try_into()
+        .ok()
+        .and_then(|idx: usize| state.recipes.get(idx).cloned())
+    else {
+        debug!(
+            recipe = packet.recipe_display_id,
+            "place recipe ignored: unknown recipe display id"
+        );
+        return Ok(());
+    };
+
+    if let Some(changed) = craft_recipe(state, &recipe, packet.use_max_items) {
+        write_inventory_slot_updates(state, writer, changed).await?;
+    } else {
+        debug!(recipe = %recipe.id, "place recipe ignored: missing ingredients or output space");
+    }
+    Ok(())
 }
 
 async fn write_inventory_slot_updates<W>(
@@ -2836,6 +3940,643 @@ where
     Ok(())
 }
 
+async fn write_inventory_content<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: 0,
+            state_id: state.inventory_state_id,
+            items: state.inventory.as_wire_list(),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+fn take_from_slot(slot: &mut ItemStack, count: i32) -> ItemStack {
+    if slot.is_empty() || count <= 0 {
+        return ItemStack::EMPTY;
+    }
+    let moved = slot.count.min(count);
+    let mut out = slot.clone();
+    out.count = moved;
+    slot.count -= moved;
+    if slot.count <= 0 {
+        *slot = ItemStack::EMPTY;
+    }
+    out
+}
+
+fn decrement_cursor(cursor: &mut ItemStack) {
+    cursor.count -= 1;
+    if cursor.count <= 0 {
+        *cursor = ItemStack::EMPTY;
+    }
+}
+
+fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> bool {
+    if slot >= state.inventory.slots.len() || !(button == 0 || button == 1) {
+        return false;
+    }
+
+    let slot_stack = state.inventory.slots[slot].clone();
+    let cursor = state.carried_item.clone();
+    if button == 0 {
+        if cursor.is_empty() {
+            if slot_stack.is_empty() {
+                return false;
+            }
+            state.carried_item = std::mem::take(&mut state.inventory.slots[slot]);
+        } else if slot_stack.is_empty() {
+            if !can_place_in_player_slot(state, slot, &cursor) {
+                return false;
+            }
+            state.inventory.slots[slot] = std::mem::take(&mut state.carried_item);
+        } else if can_stack(&slot_stack, &cursor)
+            && can_place_in_player_slot(state, slot, &cursor)
+            && slot_stack.count < item_max_stack(&state.items, &cursor)
+        {
+            let max_stack = item_max_stack(&state.items, &cursor);
+            let moved =
+                (max_stack - state.inventory.slots[slot].count).min(state.carried_item.count);
+            if moved <= 0 {
+                return false;
+            }
+            state.inventory.slots[slot].count += moved;
+            state.carried_item.count -= moved;
+            if state.carried_item.count <= 0 {
+                state.carried_item = ItemStack::EMPTY;
+            }
+        } else {
+            if !can_place_in_player_slot(state, slot, &cursor) {
+                return false;
+            }
+            state.inventory.slots[slot] = cursor;
+            state.carried_item = slot_stack;
+        }
+        return true;
+    }
+
+    if cursor.is_empty() {
+        if slot_stack.is_empty() {
+            return false;
+        }
+        let moved = (slot_stack.count + 1) / 2;
+        state.carried_item = take_from_slot(&mut state.inventory.slots[slot], moved);
+    } else if slot_stack.is_empty() {
+        if !can_place_in_player_slot(state, slot, &cursor) {
+            return false;
+        }
+        let mut one = cursor;
+        one.count = 1;
+        state.inventory.slots[slot] = one;
+        decrement_cursor(&mut state.carried_item);
+    } else if can_stack(&slot_stack, &cursor)
+        && can_place_in_player_slot(state, slot, &cursor)
+        && slot_stack.count < item_max_stack(&state.items, &cursor)
+    {
+        state.inventory.slots[slot].count += 1;
+        decrement_cursor(&mut state.carried_item);
+    } else {
+        return false;
+    }
+    true
+}
+
+fn can_place_in_player_slot(state: &InteractionState, slot: usize, stack: &ItemStack) -> bool {
+    if stack.is_empty() {
+        return true;
+    }
+    match slot {
+        5..=8 => armor_entry_for_item(&state.items, stack.item_id)
+            .is_some_and(|entry| armor_slot_for_kind(entry.slot) == slot),
+        _ => true,
+    }
+}
+
+fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
+    if slot >= state.inventory.slots.len() || state.inventory.slots[slot].is_empty() {
+        return false;
+    }
+
+    let original = state.inventory.slots[slot].clone();
+    let max_stack = item_max_stack(&state.items, &original);
+    if !(5..=8).contains(&slot)
+        && let Some(entry) = armor_entry_for_item(&state.items, original.item_id)
+    {
+        let armor_slot = armor_slot_for_kind(entry.slot);
+        if state.inventory.slots[armor_slot].is_empty() {
+            let mut equipped = original.clone();
+            equipped.count = 1;
+            state.inventory.slots[armor_slot] = equipped;
+            if original.count <= 1 {
+                state.inventory.slots[slot] = ItemStack::EMPTY;
+            } else {
+                state.inventory.slots[slot].count -= 1;
+            }
+            return true;
+        }
+    }
+
+    state.inventory.slots[slot] = ItemStack::EMPTY;
+    let remaining = if (36..=44).contains(&slot) {
+        state
+            .inventory
+            .merge_stack_into_ranges(original.clone(), &[9..=35], max_stack)
+    } else {
+        state
+            .inventory
+            .merge_stack_into_ranges(original.clone(), &[36..=44, 9..=35], max_stack)
+    };
+    state.inventory.slots[slot] = remaining;
+    state.inventory.slots[slot] != original
+}
+
+fn furnace_player_slot(menu_slot: usize) -> Option<usize> {
+    match menu_slot {
+        3..=29 => Some(9 + (menu_slot - 3)),
+        30..=38 => Some(36 + (menu_slot - 30)),
+        _ => None,
+    }
+}
+
+fn furnace_menu_stack(
+    furnace: &FurnaceContainer,
+    inventory: &PlayerInventory,
+    menu_slot: usize,
+) -> Option<ItemStack> {
+    match menu_slot {
+        0..=2 => Some(furnace.slots[menu_slot].clone()),
+        _ => furnace_player_slot(menu_slot).map(|slot| inventory.slots[slot].clone()),
+    }
+}
+
+fn set_furnace_menu_stack(
+    furnace: &mut FurnaceContainer,
+    inventory: &mut PlayerInventory,
+    menu_slot: usize,
+    stack: ItemStack,
+) -> bool {
+    match menu_slot {
+        0..=2 => {
+            furnace.slots[menu_slot] = stack;
+            true
+        }
+        _ => {
+            let Some(slot) = furnace_player_slot(menu_slot) else {
+                return false;
+            };
+            inventory.slots[slot] = stack;
+            true
+        }
+    }
+}
+
+fn can_place_in_furnace_menu_slot(
+    state: &InteractionState,
+    menu_slot: usize,
+    stack: &ItemStack,
+) -> bool {
+    if stack.is_empty() {
+        return true;
+    }
+    match menu_slot {
+        0 => find_smelting_recipe_for_item(state, stack.item_id).is_some(),
+        1 => is_fuel_item(state, stack.item_id),
+        2 => false,
+        3..=38 => true,
+        _ => false,
+    }
+}
+
+fn apply_furnace_pickup_click(
+    state: &mut InteractionState,
+    furnace: &mut FurnaceContainer,
+    menu_slot: usize,
+    button: i8,
+) -> bool {
+    if menu_slot >= FURNACE_MENU_SLOT_COUNT || !(button == 0 || button == 1) {
+        return false;
+    }
+    let Some(slot_stack) = furnace_menu_stack(furnace, &state.inventory, menu_slot) else {
+        return false;
+    };
+    let cursor = state.carried_item.clone();
+    let max_stack = if cursor.is_empty() {
+        item_max_stack(&state.items, &slot_stack)
+    } else {
+        item_max_stack(&state.items, &cursor)
+    };
+
+    if menu_slot == 2 && !slot_stack.is_empty() {
+        if cursor.is_empty() {
+            state.carried_item = slot_stack;
+            return set_furnace_menu_stack(
+                furnace,
+                &mut state.inventory,
+                menu_slot,
+                ItemStack::EMPTY,
+            );
+        }
+        if can_stack(&cursor, &slot_stack) && cursor.count < max_stack {
+            let moved = (max_stack - state.carried_item.count).min(slot_stack.count);
+            state.carried_item.count += moved;
+            let mut remaining = slot_stack;
+            remaining.count -= moved;
+            if remaining.count <= 0 {
+                remaining = ItemStack::EMPTY;
+            }
+            return set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, remaining);
+        }
+        return false;
+    }
+
+    if button == 0 {
+        if cursor.is_empty() {
+            if slot_stack.is_empty() {
+                return false;
+            }
+            state.carried_item = slot_stack;
+            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, ItemStack::EMPTY)
+        } else if slot_stack.is_empty() {
+            if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+                return false;
+            }
+            state.carried_item = ItemStack::EMPTY;
+            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, cursor)
+        } else if can_stack(&slot_stack, &cursor)
+            && can_place_in_furnace_menu_slot(state, menu_slot, &cursor)
+            && slot_stack.count < max_stack
+        {
+            let moved = (max_stack - slot_stack.count).min(cursor.count);
+            let mut new_slot = slot_stack;
+            new_slot.count += moved;
+            state.carried_item.count -= moved;
+            if state.carried_item.count <= 0 {
+                state.carried_item = ItemStack::EMPTY;
+            }
+            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
+        } else {
+            if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+                return false;
+            }
+            state.carried_item = slot_stack;
+            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, cursor)
+        }
+    } else if cursor.is_empty() {
+        if slot_stack.is_empty() {
+            return false;
+        }
+        let moved = (slot_stack.count + 1) / 2;
+        let mut new_cursor = slot_stack.clone();
+        new_cursor.count = moved;
+        let mut remaining = slot_stack;
+        remaining.count -= moved;
+        if remaining.count <= 0 {
+            remaining = ItemStack::EMPTY;
+        }
+        state.carried_item = new_cursor;
+        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, remaining)
+    } else if slot_stack.is_empty() {
+        if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+            return false;
+        }
+        let mut one = cursor;
+        one.count = 1;
+        decrement_cursor(&mut state.carried_item);
+        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, one)
+    } else if can_stack(&slot_stack, &cursor)
+        && can_place_in_furnace_menu_slot(state, menu_slot, &cursor)
+        && slot_stack.count < max_stack
+    {
+        let mut new_slot = slot_stack;
+        new_slot.count += 1;
+        decrement_cursor(&mut state.carried_item);
+        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
+    } else {
+        false
+    }
+}
+
+fn merge_stack_into_furnace_slot(
+    state: &InteractionState,
+    furnace: &mut FurnaceContainer,
+    menu_slot: usize,
+    stack: ItemStack,
+) -> ItemStack {
+    if stack.is_empty() || !can_place_in_furnace_menu_slot(state, menu_slot, &stack) {
+        return stack;
+    }
+    let target = &mut furnace.slots[menu_slot];
+    let max_stack = item_max_stack(&state.items, &stack);
+    if target.is_empty() {
+        let moved = stack.count.min(max_stack);
+        let mut moved_stack = stack.clone();
+        moved_stack.count = moved;
+        *target = moved_stack;
+        let mut remaining = stack;
+        remaining.count -= moved;
+        if remaining.count <= 0 {
+            ItemStack::EMPTY
+        } else {
+            remaining
+        }
+    } else if can_stack(target, &stack) && target.count < max_stack {
+        let moved = (max_stack - target.count).min(stack.count);
+        target.count += moved;
+        let mut remaining = stack;
+        remaining.count -= moved;
+        if remaining.count <= 0 {
+            ItemStack::EMPTY
+        } else {
+            remaining
+        }
+    } else {
+        stack
+    }
+}
+
+fn apply_furnace_quick_move_click(
+    state: &mut InteractionState,
+    furnace: &mut FurnaceContainer,
+    menu_slot: usize,
+) -> bool {
+    if menu_slot >= FURNACE_MENU_SLOT_COUNT {
+        return false;
+    }
+    match menu_slot {
+        0..=2 => {
+            let original = furnace.slots[menu_slot].clone();
+            if original.is_empty() {
+                return false;
+            }
+            let (remaining, _) = state.inventory.merge_stack(original.clone());
+            furnace.slots[menu_slot] = remaining;
+            furnace.slots[menu_slot] != original
+        }
+        _ => {
+            let Some(player_slot) = furnace_player_slot(menu_slot) else {
+                return false;
+            };
+            let original = state.inventory.slots[player_slot].clone();
+            if original.is_empty() {
+                return false;
+            }
+            let target = if find_smelting_recipe_for_item(state, original.item_id).is_some() {
+                Some(0)
+            } else if is_fuel_item(state, original.item_id) {
+                Some(1)
+            } else {
+                None
+            };
+            let Some(target) = target else {
+                return false;
+            };
+            state.inventory.slots[player_slot] = ItemStack::EMPTY;
+            let remaining = merge_stack_into_furnace_slot(state, furnace, target, original.clone());
+            state.inventory.slots[player_slot] = remaining;
+            state.inventory.slots[player_slot] != original
+        }
+    }
+}
+
+async fn handle_furnace_container_click<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    mut furnace: FurnaceContainer,
+    packet: ServerboundContainerClick,
+) -> Result<FurnaceContainer, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if packet.state_id != furnace.state_id {
+        write_furnace_content(state, writer, &furnace).await?;
+        return Ok(furnace);
+    }
+    let changed = match packet.container_input {
+        ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
+            state,
+            &mut furnace,
+            packet.slot_num as usize,
+            packet.button_num,
+        ),
+        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+            apply_furnace_quick_move_click(state, &mut furnace, packet.slot_num as usize)
+        }
+        _ => false,
+    };
+    if changed {
+        furnace.state_id = furnace.state_id.wrapping_add(1);
+    }
+    write_furnace_content(state, writer, &furnace).await?;
+    Ok(furnace)
+}
+
+fn furnace_output_room(furnace: &FurnaceContainer, item_id: u32, count: i32) -> bool {
+    let output = &furnace.slots[2];
+    output.is_empty()
+        || output.item_id == item_id && output.damage.is_none() && output.count + count <= 64
+}
+
+fn add_furnace_output(furnace: &mut FurnaceContainer, item_id: u32, count: i32) {
+    if furnace.slots[2].is_empty() {
+        furnace.slots[2] = ItemStack::new(item_id, count);
+    } else {
+        furnace.slots[2].count += count;
+    }
+}
+
+fn decrement_stack(stack: &mut ItemStack) {
+    stack.count -= 1;
+    if stack.count <= 0 {
+        *stack = ItemStack::EMPTY;
+    }
+}
+
+fn tick_furnace(
+    state: &InteractionState,
+    furnace: &mut FurnaceContainer,
+) -> (bool, Vec<(i16, i16)>) {
+    let before_slots = furnace.slots.clone();
+    let before_data = furnace.data_values();
+
+    if furnace.burn_remaining > 0 {
+        furnace.burn_remaining -= 1;
+    }
+
+    let input = furnace.slots[0].clone();
+    let recipe = (!input.is_empty())
+        .then(|| find_smelting_recipe_for_item(state, input.item_id))
+        .flatten();
+    let Some(recipe) = recipe else {
+        furnace.cook_progress = 0;
+        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        return (furnace.slots != before_slots, changed_data);
+    };
+    let Some(output_item_id) = state.items.id_of(&recipe.result.item) else {
+        furnace.cook_progress = 0;
+        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        return (furnace.slots != before_slots, changed_data);
+    };
+    let output_count = i32::try_from(recipe.result.count).unwrap_or(0);
+    let cooking_time = match &recipe.kind {
+        mc_data::recipes::RecipeKind::Smelting(smelting) => smelting.cooking_time,
+        _ => DEFAULT_FURNACE_COOK_TICKS as u32,
+    };
+    furnace.cook_total = i16::try_from(cooking_time)
+        .unwrap_or(DEFAULT_FURNACE_COOK_TICKS)
+        .max(1);
+
+    if output_count <= 0 || !furnace_output_room(furnace, output_item_id, output_count) {
+        furnace.cook_progress = 0;
+        let changed_data = changed_furnace_data(before_data, furnace.data_values());
+        return (furnace.slots != before_slots, changed_data);
+    }
+
+    if furnace.burn_remaining <= 0
+        && !furnace.slots[1].is_empty()
+        && is_fuel_item(state, furnace.slots[1].item_id)
+    {
+        decrement_stack(&mut furnace.slots[1]);
+        furnace.burn_total = FURNACE_FUEL_TICKS;
+        furnace.burn_remaining = FURNACE_FUEL_TICKS;
+    }
+
+    if furnace.burn_remaining > 0 {
+        furnace.cook_progress += 1;
+        if furnace.cook_progress >= furnace.cook_total {
+            decrement_stack(&mut furnace.slots[0]);
+            add_furnace_output(furnace, output_item_id, output_count);
+            furnace.cook_progress = 0;
+        }
+    } else {
+        furnace.cook_progress = 0;
+    }
+
+    let changed_data = changed_furnace_data(before_data, furnace.data_values());
+    (furnace.slots != before_slots, changed_data)
+}
+
+fn changed_furnace_data(before: [(i16, i16); 4], after: [(i16, i16); 4]) -> Vec<(i16, i16)> {
+    before
+        .into_iter()
+        .zip(after)
+        .filter_map(|(before, after)| (before != after).then_some(after))
+        .collect()
+}
+
+async fn tick_active_container<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(active) = state.active_container.take() else {
+        return Ok(());
+    };
+    match active {
+        ActiveContainer::Furnace(mut furnace) => {
+            let (slots_changed, data_changed) = tick_furnace(state, &mut furnace);
+            if slots_changed {
+                furnace.state_id = furnace.state_id.wrapping_add(1);
+                write_furnace_content(state, writer, &furnace).await?;
+            }
+            if !data_changed.is_empty() {
+                write_furnace_data_changes(writer, state.compression, &furnace, &data_changed)
+                    .await?;
+            }
+            state.active_container = Some(ActiveContainer::Furnace(furnace));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_container_click<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: SurvivalState,
+    packet: ServerboundContainerClick,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    state.pending_break = None;
+    if game_mode == GameMode::Spectator
+        || matches!(game_mode, GameMode::Survival | GameMode::Adventure) && survival_state.is_dead()
+    {
+        if packet.container_id == 0 {
+            write_inventory_content(state, writer).await?;
+        } else if let Some(ActiveContainer::Furnace(furnace)) = state.active_container.take() {
+            write_furnace_content(state, writer, &furnace).await?;
+            state.active_container = Some(ActiveContainer::Furnace(furnace));
+        }
+        return Ok(());
+    }
+
+    if packet.container_id != 0 {
+        let Some(active) = state.active_container.take() else {
+            write_inventory_content(state, writer).await?;
+            return Ok(());
+        };
+        match active {
+            ActiveContainer::Furnace(furnace) if furnace.container_id == packet.container_id => {
+                let furnace =
+                    handle_furnace_container_click(state, writer, furnace, packet).await?;
+                state.active_container = Some(ActiveContainer::Furnace(furnace));
+            }
+            other => {
+                debug!(
+                    container_id = packet.container_id,
+                    active_id = other.container_id(),
+                    "container click for inactive container ignored"
+                );
+                state.active_container = Some(other);
+            }
+        }
+        return Ok(());
+    }
+
+    if packet.state_id != state.inventory_state_id {
+        debug!(
+            client_state = packet.state_id,
+            server_state = state.inventory_state_id,
+            "container click resynced stale state"
+        );
+        write_inventory_content(state, writer).await?;
+        return Ok(());
+    }
+
+    let changed = match packet.container_input {
+        ContainerInput::Pickup if packet.slot_num >= 0 => {
+            apply_pickup_click(state, packet.slot_num as usize, packet.button_num)
+        }
+        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+            apply_quick_move_click(state, packet.slot_num as usize)
+        }
+        _ => false,
+    };
+
+    if !changed {
+        debug!(
+            slot = packet.slot_num,
+            button = packet.button_num,
+            input = ?packet.container_input,
+            "container click unsupported or no-op; resyncing"
+        );
+    }
+    write_inventory_content(state, writer).await
+}
+
 async fn pickup_nearby_items<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2853,7 +4594,7 @@ where
         let original_count = stack.count;
         let (remaining, changed) = state
             .inventory
-            .merge_stack(ItemStack::new(stack.item_id, stack.count));
+            .merge_pickup_stack(ItemStack::new(stack.item_id, stack.count));
         if changed.is_empty() {
             continue;
         }
@@ -2875,6 +4616,106 @@ where
     Ok(())
 }
 
+async fn handle_interact(
+    state: &mut InteractionState,
+    packet: ServerboundInteract,
+) -> Result<(), ConnectionError> {
+    state.pending_break = None;
+    debug!(entity_id = packet.entity_id, "entity interaction ignored");
+    Ok(())
+}
+
+async fn handle_attack<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    survival_state: SurvivalState,
+    player_pose: PlayerPose,
+    packet: ServerboundAttack,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    state.pending_break = None;
+    if game_mode == GameMode::Survival && survival_state.is_dead() {
+        debug!(
+            entity_id = packet.entity_id,
+            "entity attack ignored for dead player"
+        );
+        return Ok(());
+    }
+    if matches!(game_mode, GameMode::Spectator) {
+        debug!(
+            entity_id = packet.entity_id,
+            "entity attack ignored in spectator"
+        );
+        return Ok(());
+    }
+
+    let entity_id = EntityId(packet.entity_id);
+    let Some(entity) = state.sessions.server_entity_snapshot(entity_id) else {
+        debug!(
+            entity_id = packet.entity_id,
+            "entity attack ignored for unknown entity"
+        );
+        return Ok(());
+    };
+    if game_mode == GameMode::Survival
+        && !within_entity_reach(player_pose, entity.position, game_mode)
+    {
+        debug!(
+            entity_id = packet.entity_id,
+            "survival entity attack ignored: target out of reach"
+        );
+        return Ok(());
+    }
+    if entity.item_stack.is_some() {
+        return Ok(());
+    }
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+
+    let Some(damage) = state
+        .sessions
+        .damage_server_entity(entity_id, held_attack_damage(state))
+    else {
+        debug!(
+            entity_id = packet.entity_id,
+            "entity attack ignored for non-living entity"
+        );
+        return Ok(());
+    };
+    if !damage.killed {
+        debug!(
+            entity_id = packet.entity_id,
+            health = damage.snapshot.health,
+            "entity attack damaged target"
+        );
+        return Ok(());
+    }
+
+    let Some((entity, despawn)) = state.sessions.remove_server_entity(entity_id) else {
+        debug!(
+            entity_id = packet.entity_id,
+            "killed entity disappeared before despawn"
+        );
+        return Ok(());
+    };
+    dispatch_visibility_commands(despawn);
+
+    if let (Some(drop), Some(entity_type_id)) = (
+        passive_mob_drop_stack(state, &entity.type_name),
+        item_entity_type_id(&state.entity_types),
+    ) {
+        dispatch_visibility_commands(state.sessions.spawn_item_drop(
+            entity_type_id,
+            entity.position,
+            entity_item_stack(drop),
+        ));
+        pickup_nearby_items(state, writer, player_pose).await?;
+    }
+    Ok(())
+}
+
 async fn complete_block_break<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2882,7 +4723,7 @@ async fn complete_block_break<W>(
     position: i64,
     drop_items: bool,
     player_pose: PlayerPose,
-) -> Result<(), ConnectionError>
+) -> Result<bool, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
@@ -2892,6 +4733,7 @@ where
 
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
     let prev = apply_block_edit(state, writer, sequence, x, y, z, replacement).await?;
+    let changed = prev.is_some();
     if drop_items
         && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
         && let Some(drop) = block_drop_stack(state, prev)
@@ -2903,7 +4745,7 @@ where
         ));
         pickup_nearby_items(state, writer, player_pose).await?;
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
@@ -2948,6 +4790,17 @@ where
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
+    if game_mode == GameMode::Survival
+        && !within_block_reach(player_pose, action.position, game_mode)
+    {
+        state.pending_break = None;
+        debug!(
+            sequence = action.sequence,
+            "survival block break ignored: target out of reach"
+        );
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+
     match game_mode {
         GameMode::Creative => {
             state.pending_break = None;
@@ -2963,6 +4816,7 @@ where
                 player_pose,
             )
             .await
+            .map(|_| ())
         }
         GameMode::Survival => match action.action {
             PlayerActionKind::StartDestroyBlock => {
@@ -2988,7 +4842,7 @@ where
                 });
                 state.pending_break = None;
                 if can_complete {
-                    complete_block_break(
+                    let changed = complete_block_break(
                         state,
                         writer,
                         action.sequence,
@@ -2996,7 +4850,12 @@ where
                         true,
                         player_pose,
                     )
-                    .await
+                    .await?;
+                    if changed {
+                        damage_held_tool_after_mining(state, writer).await
+                    } else {
+                        Ok(())
+                    }
                 } else {
                     debug!(
                         sequence = action.sequence,
@@ -3460,18 +5319,18 @@ fn break_replacement_from_neighbours(
     }
 }
 
-/// M6.f: handle a serverbound `UseItemOn`. Resolves the placed
-/// block via the player's currently-held hotbar slot through the
-/// item→block table. Drops the placement silently (still acking) if
-/// the held stack is empty, if the held item has no block mapping
-/// (e.g. food, tool), or if the target cell is non-air. On a
-/// successful placement decrements the held stack's count and emits
-/// `ContainerSetSlot` so the client sees the new count.
+/// M6.f/M23 follow-up: handle a serverbound `UseItemOn`. Resolves the placed
+/// block via the player's currently-held hotbar slot through the item→block
+/// table. Drops the placement silently (still acking) if the held stack is
+/// empty, if the held item has no block mapping (e.g. food, tool), or if the
+/// target cell is non-air. On a successful placement decrements the held stack's
+/// count and emits `ContainerSetSlot` so the client sees the new count.
 async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
     survival_state: SurvivalState,
+    player_pose: PlayerPose,
     action: ServerboundUseItemOn,
 ) -> Result<(), ConnectionError>
 where
@@ -3493,11 +5352,29 @@ where
         return Ok(());
     }
 
-    if game_mode != GameMode::Creative {
+    if !matches!(game_mode, GameMode::Creative | GameMode::Survival) {
         debug!(
             mode = ?game_mode,
             sequence = action.sequence,
-            "block placement denied outside creative"
+            "block placement denied outside creative/survival"
+        );
+        write_packet(
+            writer,
+            &BlockChangedAck {
+                sequence: action.sequence,
+            },
+            state.compression,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if game_mode == GameMode::Survival
+        && !within_block_reach(player_pose, action.position, game_mode)
+    {
+        debug!(
+            sequence = action.sequence,
+            "survival block placement ignored: target out of reach"
         );
         write_packet(
             writer,
@@ -3511,6 +5388,10 @@ where
     }
 
     let (cx, cy, cz) = unpack_block_pos(action.position);
+    if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
+
     let (dx, dy, dz) = action.direction.normal();
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
 
@@ -4055,6 +5936,8 @@ async fn play_loop<R, W>(
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
     mut player_pose: PlayerPose,
+    respawn_pose: PlayerPose,
+    respawn: ClientboundRespawn,
     permissions: CommandPermissions,
     mut survival_state: SurvivalState,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
@@ -4069,10 +5952,17 @@ where
     // race-send a keepalive before the client has processed initial
     // Play packets and the first chunk.
     ticker.tick().await;
+    let mut survival_ticker = interval(Duration::from_secs(1));
+    survival_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    survival_ticker.tick().await;
+    let mut furnace_ticker = interval(ENTITY_TICK_PERIOD);
+    furnace_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    furnace_ticker.tick().await;
 
     let mut next_id: i64 = 0;
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
+    let mut survival_tick: u32 = 0;
     let mut game_mode = GameMode::Survival;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
 
@@ -4168,6 +6058,24 @@ where
                 )
                 .await?;
             }
+            _ = survival_ticker.tick() => {
+                if game_mode == GameMode::Survival {
+                    survival_tick = survival_tick.wrapping_add(1);
+                    if survival_state.tick_health(survival_tick) {
+                        if survival_state.is_dead()
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            state.pending_break = None;
+                        }
+                        write_packet(writer, &survival_state.as_packet(), compression).await?;
+                    }
+                }
+            }
+            _ = furnace_ticker.tick() => {
+                if let Some(state) = interaction.as_deref_mut() {
+                    tick_active_container(state, writer).await?;
+                }
+            }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;
                 if frame.id == ServerboundKeepAlive::ID {
@@ -4247,7 +6155,15 @@ where
                     let mut body = frame.body;
                     let use_on = ServerboundUseItemOn::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_use_item_on(state, writer, game_mode, survival_state, use_on).await?;
+                        handle_use_item_on(
+                            state,
+                            writer,
+                            game_mode,
+                            survival_state,
+                            player_pose,
+                            use_on,
+                        )
+                        .await?;
                     } else {
                         debug!(
                             sequence = use_on.sequence,
@@ -4266,6 +6182,78 @@ where
                             "UseItem ignored — no world configured"
                         );
                     }
+                } else if frame.id == ServerboundAttack::ID {
+                    let mut body = frame.body;
+                    let attack = ServerboundAttack::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_attack(state, writer, game_mode, survival_state, player_pose, attack)
+                            .await?;
+                    } else {
+                        debug!(
+                            entity_id = attack.entity_id,
+                            "Attack ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundInteract::ID {
+                    let mut body = frame.body;
+                    let interact = ServerboundInteract::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_interact(state, interact).await?;
+                    } else {
+                        debug!(
+                            entity_id = interact.entity_id,
+                            "Interact ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundPlaceRecipe::ID {
+                    let mut body = frame.body;
+                    let recipe = ServerboundPlaceRecipe::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_place_recipe(state, writer, game_mode, survival_state, recipe).await?;
+                    } else {
+                        debug!(
+                            recipe = recipe.recipe_display_id,
+                            "PlaceRecipe ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundContainerClick::ID {
+                    let mut body = frame.body;
+                    let click = ServerboundContainerClick::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_container_click(state, writer, game_mode, survival_state, click).await?;
+                    } else {
+                        debug!(
+                            container_id = click.container_id,
+                            slot = click.slot_num,
+                            "ContainerClick ignored — no world configured"
+                        );
+                    }
+                } else if frame.id == ServerboundContainerClose::ID {
+                    let mut body = frame.body;
+                    let close = ServerboundContainerClose::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        let should_store = state
+                                .active_container
+                                .as_ref()
+                                .is_some_and(|active| active.container_id() == close.container_id);
+                        if should_store {
+                            store_active_container(state);
+                        }
+                    }
+                    debug!(container_id = close.container_id, "container close acknowledged");
+                } else if frame.id == ServerboundRecipeBookChangeSettings::ID {
+                    let mut body = frame.body;
+                    let settings = ServerboundRecipeBookChangeSettings::decode(&mut body)?;
+                    debug!(
+                        book_type = ?settings.book_type,
+                        open = settings.is_open,
+                        filtering = settings.is_filtering,
+                        "recipe book settings noted"
+                    );
+                } else if frame.id == ServerboundRecipeBookSeenRecipe::ID {
+                    let mut body = frame.body;
+                    let seen = ServerboundRecipeBookSeenRecipe::decode(&mut body)?;
+                    debug!(recipe = seen.recipe_display_id, "recipe book seen recipe noted");
                 } else if frame.id == ServerboundSetCarriedItem::ID {
                     let mut body = frame.body;
                     let pick = ServerboundSetCarriedItem::decode(&mut body)?;
@@ -4275,6 +6263,21 @@ where
                         state.selected_hotbar_slot = slot;
                         debug!(slot, "hotbar selection updated");
                     }
+                } else if frame.id == ServerboundClientCommand::ID {
+                    let mut body = frame.body;
+                    let command = ServerboundClientCommand::decode(&mut body)?;
+                    handle_client_command(
+                        writer,
+                        compression,
+                        interaction.as_deref_mut(),
+                        &mut player_pose,
+                        respawn_pose,
+                        &mut survival_state,
+                        &respawn,
+                        command,
+                    )
+                    .await?;
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundChatCommand::ID {
                     let mut body = frame.body;
                     let command = ServerboundChatCommand::decode(&mut body)?;
@@ -4434,7 +6437,14 @@ where
 
     match command {
         DebugCommand::Survival(command) => {
-            let result = apply_survival_command(writer, compression, survival_state, command).await;
+            let result = apply_survival_command(
+                writer,
+                compression,
+                survival_state,
+                interaction.as_deref_mut(),
+                command,
+            )
+            .await;
             if survival_state.is_dead()
                 && let Some(state) = interaction.as_mut()
             {
@@ -4481,13 +6491,22 @@ async fn apply_survival_command<W>(
     writer: &mut W,
     compression: Compression,
     state: &mut SurvivalState,
+    mut interaction: Option<&mut InteractionState>,
     command: SurvivalCommand,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    let mut armor_changed = Vec::new();
     match command {
-        SurvivalCommand::Damage(amount) => state.apply_damage(amount),
+        SurvivalCommand::Damage(amount) => {
+            state.apply_damage(survival_damage_after_armor(interaction.as_deref(), amount));
+            if amount > 0.0
+                && let Some(interaction) = interaction.as_deref_mut()
+            {
+                armor_changed = damage_equipped_armor(interaction);
+            }
+        }
         SurvivalCommand::Heal(amount) => state.heal(amount),
         SurvivalCommand::Feed { food, saturation } => state.add_food(food, saturation),
         SurvivalCommand::Exhaust(amount) => state.add_exhaustion(amount),
@@ -4495,7 +6514,13 @@ where
     if state.is_dead() {
         debug!("player survival state reached death threshold");
     }
-    write_packet(writer, &state.as_packet(), compression).await
+    write_packet(writer, &state.as_packet(), compression).await?;
+    if !armor_changed.is_empty()
+        && let Some(interaction) = interaction
+    {
+        write_inventory_slot_updates(interaction, writer, armor_changed).await?;
+    }
+    Ok(())
 }
 
 async fn apply_game_mode<W>(
@@ -4526,6 +6551,57 @@ where
     )
     .await?;
     write_packet(writer, &player_abilities_for_mode(requested), compression).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_command<W>(
+    writer: &mut W,
+    compression: Compression,
+    interaction: Option<&mut InteractionState>,
+    player_pose: &mut PlayerPose,
+    respawn_pose: PlayerPose,
+    survival_state: &mut SurvivalState,
+    respawn: &ClientboundRespawn,
+    command: ServerboundClientCommand,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    match command.action {
+        ClientCommandAction::PerformRespawn => {
+            if !survival_state.is_dead() {
+                return Ok(());
+            }
+            *survival_state = SurvivalState::FULL;
+            if let Some(state) = interaction {
+                state.pending_break = None;
+            }
+            *player_pose = respawn_pose;
+            write_packet(writer, respawn, compression).await?;
+            write_packet(
+                writer,
+                &SynchronizePlayerPosition {
+                    teleport_id: 2,
+                    x: player_pose.x,
+                    y: player_pose.y,
+                    z: player_pose.z,
+                    dx: 0.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                    yaw: player_pose.yaw,
+                    pitch: player_pose.pitch,
+                    relative_flags: 0,
+                },
+                compression,
+            )
+            .await?;
+            write_packet(writer, &survival_state.as_packet(), compression).await
+        }
+        ClientCommandAction::RequestStats | ClientCommandAction::RequestGameruleValues => {
+            debug!(action = ?command.action, "client command ignored");
+            Ok(())
+        }
+    }
 }
 
 fn player_abilities_for_mode(mode: GameMode) -> ClientboundPlayerAbilities {
@@ -4700,6 +6776,282 @@ mod tests {
         assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
         assert_eq!(inventory.slots[9], ItemStack::new(42, 2));
         assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn inventory_merge_keeps_different_damage_components_separate() {
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[10] = ItemStack::new(42, 1).with_damage(1);
+
+        let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 1).with_damage(2));
+
+        assert!(remaining.is_empty());
+        assert_eq!(inventory.slots[10], ItemStack::new(42, 1).with_damage(1));
+        assert_eq!(inventory.slots[9], ItemStack::new(42, 1).with_damage(2));
+        assert_eq!(changed, vec![(9, ItemStack::new(42, 1).with_damage(2))]);
+    }
+
+    #[test]
+    fn pickup_merge_prefers_hotbar_for_new_stacks() {
+        let mut inventory = PlayerInventory::empty();
+
+        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3));
+
+        assert!(remaining.is_empty());
+        assert_eq!(inventory.slots[36], ItemStack::new(42, 3));
+        assert_eq!(changed, vec![(36, ItemStack::new(42, 3))]);
+    }
+
+    #[test]
+    fn pickup_merge_prefers_existing_stacks_before_empty_hotbar() {
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[10] = ItemStack::new(42, 63);
+
+        let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3));
+
+        assert!(remaining.is_empty());
+        assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
+        assert_eq!(inventory.slots[36], ItemStack::new(42, 2));
+        assert_eq!(changed.len(), 2);
+    }
+
+    #[test]
+    fn tool_damage_limits_cover_common_fallback_tools() {
+        assert_eq!(max_tool_damage_for_path("wooden_pickaxe"), Some(59));
+        assert_eq!(max_tool_damage_for_path("stone_axe"), Some(131));
+        assert_eq!(max_tool_damage_for_path("iron_shovel"), Some(250));
+        assert_eq!(max_tool_damage_for_path("diamond_sword"), Some(1561));
+        assert_eq!(max_tool_damage_for_path("golden_hoe"), Some(32));
+        assert_eq!(max_tool_damage_for_path("netherite_pickaxe"), Some(2031));
+        assert_eq!(max_tool_damage_for_path("apple"), None);
+    }
+
+    #[test]
+    fn armor_material_rules_match_local_vanilla_basics() {
+        let armor = mc_data::armor::builtin();
+        let iron_chestplate = armor
+            .entry(&mc_data::Identifier::parse("minecraft:iron_chestplate").unwrap())
+            .unwrap();
+        assert_eq!(iron_chestplate.slot, mc_data::armor::ArmorSlot::Chest);
+        assert_eq!(armor_slot_for_kind(iron_chestplate.slot), 6);
+        assert_eq!(iron_chestplate.armor, 6.0);
+        assert_eq!(iron_chestplate.toughness, 0.0);
+        assert_eq!(iron_chestplate.max_damage, 240);
+
+        let diamond_leggings = armor
+            .entry(&mc_data::Identifier::parse("minecraft:diamond_leggings").unwrap())
+            .unwrap();
+        assert_eq!(diamond_leggings.armor, 6.0);
+        assert_eq!(diamond_leggings.toughness, 2.0);
+        assert_eq!(
+            armor.entry(&mc_data::Identifier::parse("minecraft:apple").unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn armor_reduction_uses_vanilla_combat_rule_shape() {
+        let unarmored = armor_reduced_damage(
+            10.0,
+            ArmorStats {
+                armor: 0.0,
+                toughness: 0.0,
+            },
+        );
+        assert!((unarmored - 10.0).abs() < f32::EPSILON);
+
+        let iron_chestplate = armor_reduced_damage(
+            10.0,
+            ArmorStats {
+                armor: 6.0,
+                toughness: 0.0,
+            },
+        );
+        assert!((iron_chestplate - 9.52).abs() < 0.001);
+    }
+
+    #[test]
+    fn survival_periodic_tick_regens_and_starves() {
+        let mut fed = SurvivalState::FULL;
+        fed.apply_damage(2.0);
+        assert!(!fed.tick_health(1));
+        assert!(fed.tick_health(4));
+        assert_eq!(fed.health, 19.0);
+        assert!(fed.food < SurvivalState::MAX_FOOD || fed.saturation < 5.0);
+
+        let mut starving = SurvivalState::FULL;
+        starving.food = 0;
+        starving.saturation = 0.0;
+        assert!(starving.tick_health(4));
+        assert_eq!(starving.health, 19.0);
+    }
+
+    #[test]
+    fn reach_validation_uses_player_eye_position() {
+        let pose = PlayerPose::new(0.0, 64.0, 0.0);
+        assert!(within_block_reach(
+            pose,
+            pack_block_pos(0, 64, 2),
+            GameMode::Survival
+        ));
+        assert!(!within_block_reach(
+            pose,
+            pack_block_pos(0, 64, 8),
+            GameMode::Survival
+        ));
+        assert!(within_entity_reach(
+            pose,
+            Vec3::new(0.0, 65.0, 2.0),
+            GameMode::Survival
+        ));
+        assert!(!within_entity_reach(
+            pose,
+            Vec3::new(0.0, 65.0, 8.0),
+            GameMode::Survival
+        ));
+    }
+
+    #[test]
+    fn survival_block_drops_come_from_repo_loot_data() {
+        let id = |value: &str| mc_data::Identifier::parse(value).unwrap();
+        let loot = mc_data::loot::builtin();
+
+        assert_eq!(
+            loot.block_drop(&id("minecraft:grass_block")),
+            Some(&id("minecraft:dirt"))
+        );
+        assert_eq!(
+            loot.block_drop(&id("minecraft:stone")),
+            Some(&id("minecraft:cobblestone"))
+        );
+        assert_eq!(
+            loot.block_drop(&id("minecraft:coal_ore")),
+            Some(&id("minecraft:coal"))
+        );
+        assert_eq!(
+            loot.block_drop(&id("minecraft:iron_ore")),
+            Some(&id("minecraft:raw_iron"))
+        );
+        assert_eq!(
+            loot.block_drop(&id("minecraft:redstone_ore")),
+            Some(&id("minecraft:redstone"))
+        );
+        assert_eq!(
+            loot.block_drop(&id("minecraft:oak_leaves")),
+            Some(&id("minecraft:apple"))
+        );
+        assert_eq!(loot.block_drop(&id("minecraft:oak_log")), None);
+    }
+
+    #[test]
+    fn passive_mob_drops_come_from_repo_loot_data() {
+        let id = |value: &str| mc_data::Identifier::parse(value).unwrap();
+        let loot = mc_data::loot::builtin();
+
+        assert_eq!(
+            loot.entity_drop(&id("minecraft:cow")),
+            Some(&id("minecraft:beef"))
+        );
+        assert_eq!(
+            loot.entity_drop(&id("minecraft:pig")),
+            Some(&id("minecraft:porkchop"))
+        );
+        assert_eq!(
+            loot.entity_drop(&id("minecraft:chicken")),
+            Some(&id("minecraft:chicken"))
+        );
+        assert_eq!(loot.entity_drop(&id("minecraft:zombie")), None);
+    }
+
+    #[test]
+    fn recipe_ingredient_matching_resolves_item_tags() {
+        use mc_data::items::ItemReport;
+        use mc_data::recipes::{Ingredient, IngredientAlternative};
+
+        let oak_log = mc_data::Identifier::parse("minecraft:oak_log").unwrap();
+        let birch_log = mc_data::Identifier::parse("minecraft:birch_log").unwrap();
+        let apple = mc_data::Identifier::parse("minecraft:apple").unwrap();
+        let logs = mc_data::Identifier::parse("minecraft:logs").unwrap();
+        let items = ItemRegistry::from_report(&[
+            ItemReport {
+                id: oak_log,
+                protocol_id: 10,
+            },
+            ItemReport {
+                id: birch_log,
+                protocol_id: 11,
+            },
+            ItemReport {
+                id: apple,
+                protocol_id: 12,
+            },
+        ]);
+        let tags = TagsData {
+            registries: BTreeMap::from([(
+                mc_data::Identifier::parse("minecraft:item").unwrap(),
+                BTreeMap::from([(logs.clone(), vec![10, 11])]),
+            )]),
+        };
+        let ingredient = Ingredient {
+            alternatives: vec![IngredientAlternative::Tag(logs)],
+        };
+
+        assert!(ingredient_accepts_item(&items, &tags, 10, &ingredient));
+        assert!(ingredient_accepts_item(&items, &tags, 11, &ingredient));
+        assert!(!ingredient_accepts_item(&items, &tags, 12, &ingredient));
+    }
+
+    #[test]
+    fn fallback_recipes_include_tag_driven_survival_basics() {
+        let recipes = fallback_crafting_recipes();
+
+        assert_eq!(recipes[0].id.as_str(), "minecraft:torch");
+        assert_eq!(recipes[1].id.as_str(), "minecraft:oak_planks");
+        assert_eq!(recipes[2].id.as_str(), "minecraft:stick");
+        assert_eq!(recipes[3].id.as_str(), "minecraft:crafting_table");
+        assert!(
+            recipes
+                .iter()
+                .any(|recipe| recipe.id.as_str() == "minecraft:wooden_pickaxe")
+        );
+        assert!(
+            recipes
+                .iter()
+                .any(|recipe| recipe.id.as_str() == "minecraft:stone_pickaxe")
+        );
+        assert!(
+            recipes
+                .iter()
+                .any(|recipe| recipe.id.as_str() == "minecraft:furnace")
+        );
+        assert!(recipes.iter().any(|recipe| matches!(
+            (&recipe.kind, recipe.result.item.as_str()),
+            (
+                mc_data::recipes::RecipeKind::Smelting(_),
+                "minecraft:iron_ingot"
+            )
+        )));
+
+        let mc_data::recipes::RecipeKind::Shapeless(oak_planks) = &recipes[1].kind else {
+            panic!("expected shapeless oak planks recipe");
+        };
+        assert_eq!(
+            oak_planks.ingredients[0].alternatives[0],
+            mc_data::recipes::IngredientAlternative::Tag(
+                mc_data::Identifier::parse("minecraft:oak_logs").unwrap()
+            )
+        );
+    }
+
+    #[test]
+    fn durability_tool_detection_covers_fallback_tool_families() {
+        assert!(is_durability_tool_path("iron_pickaxe"));
+        assert!(is_durability_tool_path("wooden_shovel"));
+        assert!(is_durability_tool_path("diamond_axe"));
+        assert!(is_durability_tool_path("stone_hoe"));
+        assert!(is_durability_tool_path("netherite_sword"));
+        assert!(!is_durability_tool_path("apple"));
+        assert!(!is_durability_tool_path("oak_planks"));
     }
 
     #[test]
