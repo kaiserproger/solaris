@@ -12,6 +12,7 @@ use std::sync::Arc;
 use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
 use mc_data::entity_types::EntityTypeRegistry;
+use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_net::WorldHandle;
@@ -226,6 +227,7 @@ impl ServerConfig {
         tags: Arc<TagsData>,
         block_light: Option<Arc<mc_data::block_light::BlockLightTable>>,
         items: Arc<ItemRegistry>,
+        item_facts: Arc<ItemFactsTable>,
         entity_types: Arc<EntityTypeRegistry>,
         biome_spawns: Arc<BiomeSpawnRules>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
@@ -241,6 +243,7 @@ impl ServerConfig {
             tags,
             block_light,
             items,
+            item_facts,
             entity_types,
             biome_spawns,
             chunk_pipeline: self.chunk_pipeline.to_network(),
@@ -384,6 +387,7 @@ mod tests {
                 stub_tags(),
                 None,
                 Arc::new(ItemRegistry::default()),
+                Arc::new(ItemFactsTable::default()),
                 Arc::new(EntityTypeRegistry::default()),
                 Arc::new(BiomeSpawnRules::default()),
             )
@@ -418,6 +422,7 @@ mod tests {
                 stub_tags(),
                 None,
                 Arc::new(ItemRegistry::default()),
+                Arc::new(ItemFactsTable::default()),
                 Arc::new(EntityTypeRegistry::default()),
                 Arc::new(BiomeSpawnRules::default())
             )

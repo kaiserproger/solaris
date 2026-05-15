@@ -36,6 +36,13 @@ pub struct ItemFactsTable {
 
 impl ItemFactsTable {
     #[must_use]
+    pub fn from_entries(entries: impl IntoIterator<Item = (Identifier, ItemFacts)>) -> Self {
+        Self {
+            items: entries.into_iter().collect(),
+        }
+    }
+
+    #[must_use]
     pub fn get(&self, item: &Identifier) -> Option<&ItemFacts> {
         self.items.get(item)
     }

@@ -140,6 +140,29 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
+    let item_facts_path = cfg
+        .data
+        .vanilla_dir
+        .join("reports/minecraft/components/item");
+    let item_facts = match mc_data::item_components::load_item_facts(&item_facts_path) {
+        Ok(facts) => {
+            tracing::info!(
+                entries = facts.len(),
+                path = %item_facts_path.display(),
+                "item component facts loaded",
+            );
+            Arc::new(facts)
+        }
+        Err(err) => {
+            tracing::warn!(
+                path = %item_facts_path.display(),
+                error = %err,
+                "item component facts load failed; survival item data will use explicit fallbacks",
+            );
+            Arc::new(mc_data::item_components::ItemFactsTable::default())
+        }
+    };
+
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
             ensure_world_region_root(world_dir)?;
@@ -285,6 +308,7 @@ async fn serve(path: &Path) -> Result<()> {
             tags,
             Some(block_light),
             items,
+            item_facts,
             entity_types,
             biome_spawns,
         )

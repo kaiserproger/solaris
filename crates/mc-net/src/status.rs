@@ -86,6 +86,7 @@ mod tests {
             tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
             block_light: None,
             items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+            item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
             entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
             biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: crate::ChunkPipelinePolicy::default(),

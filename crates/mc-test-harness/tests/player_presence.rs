@@ -54,6 +54,7 @@ async fn two_clients_spawn_move_and_despawn_visible_players() {
         tags,
         block_light,
         items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),

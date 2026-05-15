@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use bytes::{Bytes, BytesMut};
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
+use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
@@ -1656,6 +1657,7 @@ where
             carried_item: ItemStack::EMPTY,
             inventory_state_id: 1,
             items: Arc::clone(&config.items),
+            item_facts: Arc::clone(&config.item_facts),
             entity_types: Arc::clone(&config.entity_types),
             item_to_block: ItemToBlockTable::build(&config.items, &config.blocks),
             tags: Arc::clone(&config.tags),
@@ -1726,6 +1728,7 @@ struct InteractionState {
     /// ContainerSetContent on login).
     inventory_state_id: i32,
     items: Arc<ItemRegistry>,
+    item_facts: Arc<ItemFactsTable>,
     entity_types: Arc<EntityTypeRegistry>,
     /// Registry-derived item→default-block resolver. Built once from
     /// vanilla item/block registries at construction time.
@@ -3594,20 +3597,36 @@ fn block_drop_stack(state: &InteractionState, block_state: BlockStateId) -> Opti
     Some(ItemStack::new(item_id, 1))
 }
 
-fn food_rule_for_item(item: &mc_data::Identifier) -> Option<mc_data::food::FoodEntry> {
-    mc_data::food::builtin().entry(item).copied()
+fn food_rule_for_item(
+    item_facts: &ItemFactsTable,
+    item: &mc_data::Identifier,
+) -> Option<(mc_data::food::FoodEntry, Duration)> {
+    if let Some(facts) = item_facts.get(item)
+        && let Some(food) = facts.food
+    {
+        let duration = facts
+            .use_duration_ticks
+            .map(|ticks| Duration::from_millis(u64::from(ticks) * 50))
+            .unwrap_or(DEFAULT_FOOD_USE_DURATION);
+        return Some((food, duration));
+    }
+
+    mc_data::food::builtin()
+        .entry(item)
+        .copied()
+        .map(|food| (food, DEFAULT_FOOD_USE_DURATION))
 }
 
-fn held_food_use(state: &InteractionState) -> Option<(u32, mc_data::food::FoodEntry)> {
+fn held_food_use(state: &InteractionState) -> Option<(u32, mc_data::food::FoodEntry, Duration)> {
     let held = state.inventory.held(state.selected_hotbar_slot);
     if held.is_empty() {
         return None;
     }
-    let rule = state
+    let (rule, duration) = state
         .items
         .name_of(held.item_id)
-        .and_then(food_rule_for_item)?;
-    Some((held.item_id, rule))
+        .and_then(|item| food_rule_for_item(&state.item_facts, item))?;
+    Some((held.item_id, rule, duration))
 }
 
 fn pending_use_matches(state: &InteractionState, pending: &PendingUse) -> bool {
@@ -6302,14 +6321,14 @@ where
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
-    let Some((held_item_id, rule)) = held_food_use(state) else {
+    let Some((held_item_id, rule, required_time)) = held_food_use(state) else {
         return write_block_ack(writer, state.compression, action.sequence).await;
     };
 
     state.pending_break = None;
     state.pending_use = Some(PendingUse {
         started_at: Instant::now(),
-        required_time: DEFAULT_FOOD_USE_DURATION,
+        required_time,
         held_hotbar_slot: state.selected_hotbar_slot,
         held_item_id,
         rule,
@@ -7984,16 +8003,57 @@ mod tests {
 
     #[test]
     fn fallback_food_rules_include_common_edibles() {
+        let item_facts = ItemFactsTable::default();
         assert_eq!(
-            food_rule_for_item(&mc_data::Identifier::parse("minecraft:apple").unwrap()),
-            Some(mc_data::food::FoodEntry {
-                food: 4,
-                saturation: 2.4,
-            })
+            food_rule_for_item(
+                &item_facts,
+                &mc_data::Identifier::parse("minecraft:apple").unwrap()
+            ),
+            Some((
+                mc_data::food::FoodEntry {
+                    food: 4,
+                    saturation: 2.4,
+                },
+                DEFAULT_FOOD_USE_DURATION,
+            ))
         );
         assert_eq!(
-            food_rule_for_item(&mc_data::Identifier::parse("minecraft:dirt").unwrap()),
+            food_rule_for_item(
+                &item_facts,
+                &mc_data::Identifier::parse("minecraft:dirt").unwrap()
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn food_rules_prefer_item_component_facts() {
+        let apple = mc_data::Identifier::parse("minecraft:apple").unwrap();
+        let item_facts = ItemFactsTable::from_entries([(
+            apple.clone(),
+            mc_data::item_components::ItemFacts {
+                max_stack_size: Some(64),
+                max_damage: None,
+                food: Some(mc_data::food::FoodEntry {
+                    food: 7,
+                    saturation: 1.5,
+                }),
+                use_duration_ticks: Some(10),
+                use_action: Some(mc_data::item_components::UseAction::Eat),
+                tool: None,
+                equippable_slot: None,
+            },
+        )]);
+
+        assert_eq!(
+            food_rule_for_item(&item_facts, &apple),
+            Some((
+                mc_data::food::FoodEntry {
+                    food: 7,
+                    saturation: 1.5
+                },
+                Duration::from_millis(500),
+            ))
         );
     }
 

@@ -88,6 +88,7 @@ async fn break_block_round_trips_update_ack_relight() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -291,6 +292,7 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
         tags,
         block_light,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -425,6 +427,7 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         tags,
         block_light: None,
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -563,6 +566,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -726,6 +730,7 @@ async fn survival_can_place_naturally_picked_up_block() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -860,6 +865,7 @@ async fn survival_break_damages_held_tool() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -999,6 +1005,7 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -1160,6 +1167,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -1274,6 +1282,7 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -1523,6 +1532,7 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -1800,6 +1810,7 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -1904,6 +1915,7 @@ async fn survival_armor_slot_reduces_debug_damage() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -2002,6 +2014,20 @@ async fn survival_use_item_eats_apple_and_updates_food() {
     let apple_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
         .expect("apple item");
+    let apple = mc_data::Identifier::parse("minecraft:apple").unwrap();
+    let item_facts = Arc::new(
+        mc_data::item_components::load_item_facts(
+            vanilla_dir.join("reports/minecraft/components/item"),
+        )
+        .expect("item facts load"),
+    );
+    assert!(
+        item_facts
+            .get(&apple)
+            .and_then(|facts| facts.food)
+            .is_some(),
+        "apple food must come from item component reports"
+    );
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -2014,6 +2040,7 @@ async fn survival_use_item_eats_apple_and_updates_food() {
         tags,
         block_light: None,
         items,
+        item_facts,
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -2113,6 +2140,12 @@ async fn survival_use_item_release_cancels_food_use() {
     let apple_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
         .expect("apple item");
+    let item_facts = Arc::new(
+        mc_data::item_components::load_item_facts(
+            vanilla_dir.join("reports/minecraft/components/item"),
+        )
+        .expect("item facts load"),
+    );
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -2125,6 +2158,7 @@ async fn survival_use_item_release_cancels_food_use() {
         tags,
         block_light: None,
         items,
+        item_facts,
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -2220,6 +2254,7 @@ async fn dead_survival_player_cannot_mine_or_eat() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
@@ -2334,6 +2369,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         tags,
         block_light: None,
         items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),

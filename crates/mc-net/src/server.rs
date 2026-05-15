@@ -12,6 +12,7 @@ use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
+use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
@@ -76,6 +77,7 @@ pub struct ServerConfig {
     /// that don't care about inventory; the M6 place flow degrades
     /// gracefully (no item → no placement).
     pub items: Arc<ItemRegistry>,
+    pub item_facts: Arc<ItemFactsTable>,
     pub entity_types: Arc<EntityTypeRegistry>,
     pub biome_spawns: Arc<BiomeSpawnRules>,
     /// M13 chunk-pipeline policy. Early M13 slices keep the existing
