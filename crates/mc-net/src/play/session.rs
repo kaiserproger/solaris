@@ -564,33 +564,45 @@ impl SessionRegistry {
         if !inner.spawned_entity_chunks.insert(chunk) {
             return Vec::new();
         }
+        let mut passive_count = 0_usize;
+        let mut hostile_count = 0_usize;
         for spawn in spawns {
             debug_assert_eq!(spawn.chunk, chunk);
+            if spawn.hostile {
+                if hostile_count >= MAX_HOSTILE_SPAWNS_PER_CHUNK {
+                    continue;
+                }
+            } else if passive_count >= MAX_PASSIVE_SPAWNS_PER_CHUNK {
+                continue;
+            }
+            if !spawn_far_enough_from_players(&inner, spawn.position) {
+                continue;
+            }
             let mut entity = SpawnEntity::new(
                 spawn.entity_type_id,
                 spawn.entity_type_name.clone(),
                 spawn.position,
             );
             entity.uuid = Some(herd_uuid(spawn.chunk, spawn.slot));
-            if spawn.hostile {
-                entity.attributes.set_base(AttributeKind::AttackDamage, 3.0);
-                entity
-                    .attributes
-                    .set_base(AttributeKind::MovementSpeed, 0.23);
-            }
+            apply_entity_facts(&mut entity);
             entity.goal = if spawn.hostile {
                 GoalState::Wander {
-                    speed: 1.25,
+                    speed: HOSTILE_WANDER_SPEED,
                     period_ticks: 20,
                 }
             } else {
                 GoalState::Wander {
-                    speed: 0.8,
+                    speed: PASSIVE_WANDER_SPEED,
                     period_ticks: 80,
                 }
             };
             let id = inner.entities.spawn(entity);
             inner.last_sent_entity_positions.insert(id, spawn.position);
+            if spawn.hostile {
+                hostile_count += 1;
+            } else {
+                passive_count += 1;
+            }
         }
         debug!(
             cx = chunk.0,
@@ -983,8 +995,44 @@ pub(super) fn server_entity_snapshot_from(
     }
 }
 
+fn apply_entity_facts(entity: &mut SpawnEntity) {
+    let Ok(id) = mc_data::Identifier::parse(entity.type_name.clone()) else {
+        return;
+    };
+    let facts = mc_data::entity_types::fallback_entity_type_facts(id, entity.type_id as u32);
+    if let Some(value) = facts.attributes.max_health {
+        entity.attributes.set_base(AttributeKind::MaxHealth, value);
+    }
+    if let Some(value) = facts.attributes.movement_speed {
+        entity
+            .attributes
+            .set_base(AttributeKind::MovementSpeed, value);
+    }
+    if let Some(value) = facts.attributes.follow_range {
+        entity
+            .attributes
+            .set_base(AttributeKind::FollowRange, value);
+    }
+    if let Some(value) = facts.attributes.attack_damage {
+        entity
+            .attributes
+            .set_base(AttributeKind::AttackDamage, value);
+    }
+}
+
 fn server_entity_chunk_pos(entity: &ServerEntitySnapshot) -> (i32, i32) {
     chunk_pos_from_coords(entity.position.x, entity.position.z)
+}
+
+fn spawn_far_enough_from_players(inner: &SessionRegistryInner, position: Vec3) -> bool {
+    let min_distance_sq =
+        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER * MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER;
+    inner.sessions.values().all(|session| {
+        distance_sq(
+            position,
+            Vec3::new(session.pose.x, session.pose.y, session.pose.z),
+        ) > min_distance_sq
+    })
 }
 
 fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
@@ -1038,29 +1086,13 @@ pub(super) fn distance_sq(a: Vec3, b: Vec3) -> f64 {
 }
 
 pub(super) fn entity_aabb(type_name: &str) -> mc_physics::Aabb {
-    match type_name {
-        "minecraft:chicken" => mc_physics::Aabb {
-            half_width: 0.2,
-            height: 0.7,
-        },
-        "minecraft:pig" | "minecraft:sheep" => mc_physics::Aabb {
-            half_width: 0.45,
-            height: 0.9,
-        },
-        "minecraft:cow" => mc_physics::Aabb {
-            half_width: 0.45,
-            height: 1.4,
-        },
-        "minecraft:zombie" => mc_physics::Aabb {
-            half_width: 0.3,
-            height: 1.95,
-        },
-        "minecraft:item" => mc_physics::Aabb {
-            half_width: 0.125,
-            height: 0.25,
-        },
-        _ => mc_physics::Aabb::COW,
-    }
+    let facts = mc_data::Identifier::parse(type_name.to_string())
+        .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))
+        .ok();
+    facts.map_or(mc_physics::Aabb::COW, |facts| mc_physics::Aabb {
+        half_width: facts.dimensions.half_width(),
+        height: facts.dimensions.height,
+    })
 }
 
 fn push_entities_from_player_locked(inner: &mut SessionRegistryInner, pose: PlayerPose) {

@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
-use crate::play::chunk_stream::{passive_chunk_spawns, prioritized_spiral};
+use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::items::ItemReport;
 

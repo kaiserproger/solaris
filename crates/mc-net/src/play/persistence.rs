@@ -330,11 +330,9 @@ pub(crate) fn load_persisted_entities(
         } else {
             None
         };
-        let mut attributes = mc_entity::AttributeSet::vanilla_mob_defaults();
-        if let Some(health) = float_field(fields, "Health") {
-            attributes.set_base(AttributeKind::MaxHealth, health.max(1.0) as f64);
-        }
+        let mut attributes = attributes_from_entity_facts(&parsed, type_id as u32);
         let health = float_field(fields, "Health").unwrap_or(20.0).max(0.0);
+        attributes.set_base(AttributeKind::MaxHealth, health.max(1.0) as f64);
         let id = EntityId(int_field(fields, "SolarisEntityId").unwrap_or(0).max(0));
         let uuid = uuid_field(fields).unwrap_or_else(|| {
             let id = int_field(fields, "SolarisEntityId").unwrap_or(0) as u32 as u128;
@@ -368,6 +366,27 @@ pub(crate) fn load_persisted_entities(
         });
     }
     Ok(entities)
+}
+
+fn attributes_from_entity_facts(
+    id: &mc_data::Identifier,
+    protocol_id: u32,
+) -> mc_entity::AttributeSet {
+    let facts = mc_data::entity_types::fallback_entity_type_facts(id.clone(), protocol_id);
+    let mut attributes = mc_entity::AttributeSet::vanilla_mob_defaults();
+    if let Some(value) = facts.attributes.max_health {
+        attributes.set_base(AttributeKind::MaxHealth, value);
+    }
+    if let Some(value) = facts.attributes.movement_speed {
+        attributes.set_base(AttributeKind::MovementSpeed, value);
+    }
+    if let Some(value) = facts.attributes.follow_range {
+        attributes.set_base(AttributeKind::FollowRange, value);
+    }
+    if let Some(value) = facts.attributes.attack_damage {
+        attributes.set_base(AttributeKind::AttackDamage, value);
+    }
+    attributes
 }
 
 pub(crate) fn save_persisted_entities(
@@ -1006,6 +1025,10 @@ mod tests {
         assert_eq!(loaded[1].type_name, cow.type_name);
         assert_eq!(loaded[1].health, cow.health);
         assert_eq!(loaded[1].position, cow.position);
+        assert_eq!(
+            loaded[1].attributes.base(&AttributeKind::MovementSpeed),
+            Some(0.2)
+        );
     }
 
     #[test]

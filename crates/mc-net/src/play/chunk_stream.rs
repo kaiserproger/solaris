@@ -116,6 +116,14 @@ pub(super) fn passive_chunk_spawns(chunk: (i32, i32)) -> bool {
     h.is_multiple_of(9)
 }
 
+pub(super) fn hostile_chunk_spawns(chunk: (i32, i32)) -> bool {
+    if chunk == (0, 0) {
+        return true;
+    }
+    let h = herd_hash(chunk, 0, 0x484F_5354_494C_4500);
+    h.is_multiple_of(8)
+}
+
 fn herd_hash(chunk: (i32, i32), slot: u8, salt: u64) -> u64 {
     let mut h = salt;
     h ^= (chunk.0 as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -189,7 +197,7 @@ fn plan_hostile_spawns(
     out: &mut Vec<HerdSpawn>,
 ) {
     let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    if chunk_pos != (0, 0) {
+    if !hostile_chunk_spawns(chunk_pos) {
         return;
     }
     let slot_base = out.len() as u8;
@@ -197,35 +205,68 @@ fn plan_hostile_spawns(
     let Some((lx, y, lz)) = herd_spawn_surface(chunk, surface, passable, h) else {
         return;
     };
+    if !hostile_spawn_light_allows(chunk, lx, y, lz, passable) {
+        return;
+    }
     let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
         return;
     };
-    let zombie = Identifier::parse("minecraft:zombie").expect("static identifier");
-    if !rules
+    for (hostile_index, entry) in rules
         .entries(biome, "monster")
         .iter()
-        .any(|entry| entry.entity_type == zombie)
+        .filter(|entry| entity_type_is_hostile(entity_types, &entry.entity_type))
+        .take(3)
+        .enumerate()
     {
-        return;
+        let Some(entity_type_id) = entity_types
+            .id_of(&entry.entity_type)
+            .and_then(|id| i32::try_from(id).ok())
+        else {
+            continue;
+        };
+        let slot = slot_base + hostile_index as u8;
+        let offset = herd_hash(chunk_pos, slot, 0x484F_5354_494C_4500);
+        out.push(HerdSpawn {
+            chunk: chunk_pos,
+            slot,
+            entity_type_id,
+            entity_type_name: entry.entity_type.as_str().to_string(),
+            position: Vec3::new(
+                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.35 + (offset & 3) as f64 * 0.1,
+                f64::from(y + 1),
+                f64::from(chunk.pos.z * 16 + i32::from(lz))
+                    + 0.35
+                    + ((offset >> 2) & 3) as f64 * 0.1,
+            ),
+            hostile: true,
+        });
     }
-    let Some(entity_type_id) = entity_types
-        .id_of(&zombie)
-        .and_then(|id| i32::try_from(id).ok())
-    else {
-        return;
-    };
-    out.push(HerdSpawn {
-        chunk: chunk_pos,
-        slot: slot_base,
-        entity_type_id,
-        entity_type_name: zombie.as_str().to_string(),
-        position: Vec3::new(
-            f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
-            f64::from(y + 1),
-            f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
-        ),
-        hostile: true,
-    });
+}
+
+fn entity_type_is_hostile(
+    entity_types: &mc_data::entity_types::EntityTypeRegistry,
+    entity_type: &Identifier,
+) -> bool {
+    entity_types
+        .facts_of(entity_type)
+        .is_some_and(|facts| facts.category.is_hostile())
+}
+
+fn hostile_spawn_light_allows(
+    chunk: &Chunk,
+    lx: u8,
+    y: i32,
+    lz: u8,
+    passable: &[BlockStateId],
+) -> bool {
+    if (chunk.pos.x, chunk.pos.z) == (0, 0) {
+        return true;
+    }
+    ((y + 3)..=(y + 8).min(mc_world::MAX_Y - 1)).any(|roof_y| {
+        chunk
+            .get_block(lx, roof_y, lz)
+            .is_some_and(|state| !passable.contains(&state))
+    })
 }
 
 fn plan_group_spawns(

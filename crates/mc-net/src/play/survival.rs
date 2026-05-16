@@ -237,7 +237,9 @@ pub(super) fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i
 }
 
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
-    matches!(entity_type, "minecraft:zombie")
+    mc_data::Identifier::parse(entity_type.to_string())
+        .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))
+        .is_ok_and(|facts| facts.category.is_hostile())
 }
 
 pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {

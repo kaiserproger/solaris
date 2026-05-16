@@ -55,9 +55,73 @@ pub struct EntityTypeReport {
     pub protocol_id: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityCategory {
+    Passive,
+    Hostile,
+    Water,
+    Item,
+    Experience,
+    Other,
+}
+
+impl EntityCategory {
+    #[must_use]
+    pub const fn is_hostile(self) -> bool {
+        matches!(self, Self::Hostile)
+    }
+
+    #[must_use]
+    pub const fn is_living(self) -> bool {
+        matches!(self, Self::Passive | Self::Hostile | Self::Water)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityDimensions {
+    pub width: f64,
+    pub height: f64,
+    pub eye_height: Option<f64>,
+}
+
+impl EntityDimensions {
+    #[must_use]
+    pub const fn new(width: f64, height: f64, eye_height: Option<f64>) -> Self {
+        Self {
+            width,
+            height,
+            eye_height,
+        }
+    }
+
+    #[must_use]
+    pub const fn half_width(self) -> f64 {
+        self.width / 2.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct EntityAttributeFacts {
+    pub max_health: Option<f64>,
+    pub movement_speed: Option<f64>,
+    pub follow_range: Option<f64>,
+    pub attack_damage: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntityTypeFacts {
+    pub id: Identifier,
+    pub protocol_id: u32,
+    pub category: EntityCategory,
+    pub dimensions: EntityDimensions,
+    pub tracking_range: Option<u32>,
+    pub attributes: EntityAttributeFacts,
+    pub loot_table: Option<Identifier>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct EntityTypeRegistry {
-    by_name: BTreeMap<Identifier, u32>,
+    by_name: BTreeMap<Identifier, EntityTypeFacts>,
 }
 
 impl EntityTypeRegistry {
@@ -65,14 +129,24 @@ impl EntityTypeRegistry {
     pub fn from_report(report: &[EntityTypeReport]) -> Self {
         let by_name = report
             .iter()
-            .map(|entry| (entry.id.clone(), entry.protocol_id))
+            .map(|entry| {
+                (
+                    entry.id.clone(),
+                    fallback_entity_type_facts(entry.id.clone(), entry.protocol_id),
+                )
+            })
             .collect();
         Self { by_name }
     }
 
     #[must_use]
     pub fn id_of(&self, name: &Identifier) -> Option<u32> {
-        self.by_name.get(name).copied()
+        self.by_name.get(name).map(|facts| facts.protocol_id)
+    }
+
+    #[must_use]
+    pub fn facts_of(&self, name: &Identifier) -> Option<&EntityTypeFacts> {
+        self.by_name.get(name)
     }
 
     #[must_use]
@@ -84,6 +158,147 @@ impl EntityTypeRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
+}
+
+#[must_use]
+pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTypeFacts {
+    let (category, dimensions, tracking_range, attributes, loot_table) = match id.as_str() {
+        "minecraft:chicken" => (
+            EntityCategory::Passive,
+            EntityDimensions::new(0.4, 0.7, Some(0.644)),
+            Some(10),
+            EntityAttributeFacts {
+                max_health: Some(4.0),
+                movement_speed: Some(0.25),
+                follow_range: Some(16.0),
+                attack_damage: Some(0.0),
+            },
+            static_id("minecraft:entities/chicken"),
+        ),
+        "minecraft:pig" => (
+            EntityCategory::Passive,
+            EntityDimensions::new(0.9, 0.9, Some(0.818)),
+            Some(10),
+            EntityAttributeFacts {
+                max_health: Some(10.0),
+                movement_speed: Some(0.25),
+                follow_range: Some(16.0),
+                attack_damage: Some(0.0),
+            },
+            static_id("minecraft:entities/pig"),
+        ),
+        "minecraft:sheep" => (
+            EntityCategory::Passive,
+            EntityDimensions::new(0.9, 0.9, Some(0.818)),
+            Some(10),
+            EntityAttributeFacts {
+                max_health: Some(8.0),
+                movement_speed: Some(0.23),
+                follow_range: Some(16.0),
+                attack_damage: Some(0.0),
+            },
+            static_id("minecraft:entities/sheep"),
+        ),
+        "minecraft:cow" => (
+            EntityCategory::Passive,
+            EntityDimensions::new(0.9, 1.4, Some(1.3)),
+            Some(10),
+            EntityAttributeFacts {
+                max_health: Some(10.0),
+                movement_speed: Some(0.2),
+                follow_range: Some(16.0),
+                attack_damage: Some(0.0),
+            },
+            static_id("minecraft:entities/cow"),
+        ),
+        "minecraft:zombie" => (
+            EntityCategory::Hostile,
+            EntityDimensions::new(0.6, 1.95, Some(1.74)),
+            Some(8),
+            EntityAttributeFacts {
+                max_health: Some(20.0),
+                movement_speed: Some(0.23),
+                follow_range: Some(35.0),
+                attack_damage: Some(3.0),
+            },
+            static_id("minecraft:entities/zombie"),
+        ),
+        "minecraft:skeleton" => (
+            EntityCategory::Hostile,
+            EntityDimensions::new(0.6, 1.99, Some(1.74)),
+            Some(8),
+            EntityAttributeFacts {
+                max_health: Some(20.0),
+                movement_speed: Some(0.25),
+                follow_range: Some(16.0),
+                attack_damage: Some(2.0),
+            },
+            static_id("minecraft:entities/skeleton"),
+        ),
+        "minecraft:spider" => (
+            EntityCategory::Hostile,
+            EntityDimensions::new(1.4, 0.9, Some(0.65)),
+            Some(8),
+            EntityAttributeFacts {
+                max_health: Some(16.0),
+                movement_speed: Some(0.3),
+                follow_range: Some(16.0),
+                attack_damage: Some(2.0),
+            },
+            static_id("minecraft:entities/spider"),
+        ),
+        "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => (
+            EntityCategory::Water,
+            EntityDimensions::new(0.5, 0.3, Some(0.195)),
+            Some(4),
+            EntityAttributeFacts {
+                max_health: Some(3.0),
+                movement_speed: Some(0.7),
+                follow_range: Some(8.0),
+                attack_damage: Some(0.0),
+            },
+            static_id(&format!("minecraft:entities/{}", id.path())),
+        ),
+        "minecraft:item" => (
+            EntityCategory::Item,
+            EntityDimensions::new(0.25, 0.25, None),
+            Some(6),
+            EntityAttributeFacts::default(),
+            None,
+        ),
+        "minecraft:experience_orb" | "minecraft:xp_orb" => (
+            EntityCategory::Experience,
+            EntityDimensions::new(0.5, 0.5, None),
+            Some(6),
+            EntityAttributeFacts::default(),
+            None,
+        ),
+        _ => (
+            EntityCategory::Other,
+            EntityDimensions::new(0.9, 1.4, Some(1.3)),
+            None,
+            EntityAttributeFacts {
+                max_health: Some(20.0),
+                movement_speed: Some(0.25),
+                follow_range: Some(16.0),
+                attack_damage: Some(0.0),
+            },
+            None,
+        ),
+    };
+    EntityTypeFacts {
+        id,
+        protocol_id,
+        category,
+        dimensions,
+        tracking_range,
+        attributes,
+        loot_table,
+    }
+}
+
+fn static_id(value: &str) -> Option<Identifier> {
+    Identifier::parse(value).ok()
 }
 
 #[derive(Deserialize)]
@@ -124,5 +339,46 @@ mod tests {
             Some(30)
         );
         assert_eq!(registry.len(), 2);
+    }
+
+    #[test]
+    fn registry_exposes_m32_entity_facts() {
+        let registry = EntityTypeRegistry::from_report(&[
+            EntityTypeReport {
+                id: Identifier::parse("minecraft:chicken").unwrap(),
+                protocol_id: 10,
+            },
+            EntityTypeReport {
+                id: Identifier::parse("minecraft:skeleton").unwrap(),
+                protocol_id: 20,
+            },
+            EntityTypeReport {
+                id: Identifier::parse("minecraft:item").unwrap(),
+                protocol_id: 30,
+            },
+        ]);
+
+        let chicken = registry
+            .facts_of(&Identifier::parse("minecraft:chicken").unwrap())
+            .unwrap();
+        assert_eq!(chicken.category, EntityCategory::Passive);
+        assert_eq!(chicken.dimensions.width, 0.4);
+        assert_eq!(chicken.attributes.max_health, Some(4.0));
+        assert_eq!(
+            chicken.loot_table.as_ref().map(Identifier::as_str),
+            Some("minecraft:entities/chicken")
+        );
+
+        let skeleton = registry
+            .facts_of(&Identifier::parse("minecraft:skeleton").unwrap())
+            .unwrap();
+        assert!(skeleton.category.is_hostile());
+        assert_eq!(skeleton.attributes.attack_damage, Some(2.0));
+
+        let item = registry
+            .facts_of(&Identifier::parse("minecraft:item").unwrap())
+            .unwrap();
+        assert_eq!(item.category, EntityCategory::Item);
+        assert_eq!(item.dimensions.height, 0.25);
     }
 }

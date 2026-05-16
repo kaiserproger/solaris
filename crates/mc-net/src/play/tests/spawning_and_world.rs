@@ -148,6 +148,153 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
 }
 
 #[test]
+fn hostile_spawn_planner_uses_multiple_monster_facts() {
+    use std::collections::{BTreeMap, HashSet};
+
+    let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
+    let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
+    let skeleton = mc_data::Identifier::parse("minecraft:skeleton").unwrap();
+    let spider = mc_data::Identifier::parse("minecraft:spider").unwrap();
+    let chicken = mc_data::Identifier::parse("minecraft:chicken").unwrap();
+    let rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
+        plains.clone(),
+        BTreeMap::from([(
+            "monster".to_string(),
+            vec![
+                mc_data::biomes::BiomeSpawnEntry {
+                    entity_type: zombie.clone(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                },
+                mc_data::biomes::BiomeSpawnEntry {
+                    entity_type: skeleton.clone(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                },
+                mc_data::biomes::BiomeSpawnEntry {
+                    entity_type: spider.clone(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                },
+                mc_data::biomes::BiomeSpawnEntry {
+                    entity_type: chicken.clone(),
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                },
+            ],
+        )]),
+    )]));
+    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
+        mc_data::entity_types::EntityTypeReport {
+            id: zombie,
+            protocol_id: 1,
+        },
+        mc_data::entity_types::EntityTypeReport {
+            id: skeleton,
+            protocol_id: 2,
+        },
+        mc_data::entity_types::EntityTypeReport {
+            id: spider,
+            protocol_id: 3,
+        },
+        mc_data::entity_types::EntityTypeReport {
+            id: chicken,
+            protocol_id: 4,
+        },
+    ]);
+    let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
+    let passable = vec![mc_world::BlockStateId(0)];
+    let grass = mc_world::BlockStateId(1);
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            let _ = chunk.set_block(lx, 64, lz, grass);
+        }
+    }
+
+    let spawns = plan_passive_herd(&chunk, Some(grass), None, &passable, &rules, &entity_types);
+
+    let spawned_types: HashSet<_> = spawns
+        .iter()
+        .map(|spawn| spawn.entity_type_name.as_str())
+        .collect();
+    assert!(spawned_types.contains("minecraft:zombie"));
+    assert!(spawned_types.contains("minecraft:skeleton"));
+    assert!(spawned_types.contains("minecraft:spider"));
+    assert!(!spawned_types.contains("minecraft:chicken"));
+    assert!(spawns.iter().all(|spawn| spawn.hostile));
+}
+
+#[test]
+fn hostile_spawn_planner_requires_cover_outside_bootstrap_chunk() {
+    use std::collections::BTreeMap;
+
+    let chunk_pos = (1..128)
+        .map(|x| (x, 0))
+        .find(|&chunk| hostile_chunk_spawns(chunk) && passive_chunk_spawns(chunk))
+        .expect("hostile chunk sample");
+    let plains = mc_data::Identifier::parse("minecraft:plains").unwrap();
+    let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
+    let rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
+        plains.clone(),
+        BTreeMap::from([(
+            "monster".to_string(),
+            vec![mc_data::biomes::BiomeSpawnEntry {
+                entity_type: zombie.clone(),
+                min_count: 1,
+                max_count: 1,
+                weight: 1,
+            }],
+        )]),
+    )]));
+    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
+        mc_data::entity_types::EntityTypeReport {
+            id: zombie,
+            protocol_id: 1,
+        },
+    ]);
+    let passable = vec![mc_world::BlockStateId(0)];
+    let grass = mc_world::BlockStateId(1);
+    let stone = mc_world::BlockStateId(2);
+    let mut open = Chunk::empty(
+        ChunkPos {
+            x: chunk_pos.0,
+            z: chunk_pos.1,
+        },
+        mc_world::BlockStateId(0),
+        plains.clone(),
+    );
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            let _ = open.set_block(lx, 64, lz, grass);
+        }
+    }
+    let mut covered = open.clone();
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            let _ = covered.set_block(lx, 67, lz, stone);
+        }
+    }
+
+    let open_spawns = plan_passive_herd(&open, Some(grass), None, &passable, &rules, &entity_types);
+    let covered_spawns = plan_passive_herd(
+        &covered,
+        Some(grass),
+        None,
+        &passable,
+        &rules,
+        &entity_types,
+    );
+
+    assert!(open_spawns.is_empty());
+    assert_eq!(covered_spawns.len(), 1);
+    assert_eq!(covered_spawns[0].entity_type_name, "minecraft:zombie");
+}
+
+#[test]
 fn creative_and_spectator_modes_grant_client_abilities() {
     let creative = player_abilities_for_mode(GameMode::Creative);
     assert!(creative.invulnerable);
@@ -397,6 +544,48 @@ fn hostile_entities_follow_nearby_player_position() {
 
     assert!(zombie.velocity.x > 0.0);
     assert_eq!(zombie.velocity.z, 0.0);
+}
+
+#[test]
+fn chunk_herd_materialization_applies_caps_and_player_distance() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "nearby".to_string(),
+    };
+    let _ = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let spawns = (0..10)
+        .map(|slot| HerdSpawn {
+            chunk: (0, 0),
+            slot,
+            entity_type_id: 1,
+            entity_type_name: if slot < 5 {
+                "minecraft:zombie".to_string()
+            } else {
+                "minecraft:cow".to_string()
+            },
+            position: if slot == 0 {
+                Vec3::new(0.5, DEFAULT_SPAWN_Y, 0.5)
+            } else {
+                Vec3::new(4.5 + f64::from(slot), DEFAULT_SPAWN_Y, 0.5)
+            },
+            hostile: slot < 5,
+        })
+        .collect::<Vec<_>>();
+
+    let _ = registry.ensure_chunk_herd((0, 0), &spawns);
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+
+    assert_eq!(queries.len(), MAX_HOSTILE_SPAWNS_PER_CHUNK + 5);
+    assert!(queries.iter().all(|query| query.position.x != 0.5));
 }
 
 #[test]

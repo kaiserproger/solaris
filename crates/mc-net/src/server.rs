@@ -22,7 +22,7 @@ use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, Phys
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_world::{BlockPos, BlockRegistry, WorldStorage};
+use mc_world::{BlockPos, BlockRegistry, MAX_Y, MIN_Y, WorldStorage};
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, info, warn};
@@ -285,6 +285,7 @@ async fn entity_physics_steps(
 struct EntityPhysicsInput {
     query: play::EntityPhysicsQuery,
     samples: HashMap<BlockPos, BlockMaterial>,
+    complete_samples: bool,
 }
 
 struct SampledPhysicsWorld {
@@ -306,14 +307,23 @@ fn sample_entity_physics_input(
     materials: &BlockMaterialIds,
 ) -> EntityPhysicsInput {
     let mut samples = HashMap::new();
+    let mut complete_samples = true;
     for pos in entity_physics_sample_positions(query) {
-        let material = storage
-            .get_cached_block(pos)
-            .map(|state| materials.classify(state.0))
-            .unwrap_or(BlockMaterial::Air);
+        let material = match storage.get_cached_block(pos) {
+            Some(state) => materials.classify(state.0),
+            None if (MIN_Y..MAX_Y).contains(&pos.y) => {
+                complete_samples = false;
+                BlockMaterial::Air
+            }
+            None => BlockMaterial::Air,
+        };
         samples.insert(pos, material);
     }
-    EntityPhysicsInput { query, samples }
+    EntityPhysicsInput {
+        query,
+        samples,
+        complete_samples,
+    }
 }
 
 fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<BlockPos> {
@@ -347,6 +357,14 @@ fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<Block
 }
 
 fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
+    if !input.complete_samples {
+        return play::EntityPhysicsStep {
+            id: input.query.id,
+            position: input.query.position,
+            velocity: mc_entity::Vec3::ZERO,
+            on_ground: input.query.on_ground,
+        };
+    }
     let mut sampler = SampledPhysicsWorld {
         samples: input.samples,
     };
@@ -657,6 +675,25 @@ mod tests {
         assert_eq!(ids.classify(5), BlockMaterial::Air);
         assert_eq!(ids.classify(6), BlockMaterial::Air);
         assert_eq!(ids.classify(7), BlockMaterial::Air);
+    }
+
+    #[test]
+    fn entity_physics_refuses_unloaded_boundary_samples() {
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(42),
+            position: mc_entity::Vec3::new(15.8, 64.0, 0.5),
+            velocity: mc_entity::Vec3::new(1.0, 0.0, 0.0),
+            aabb: mc_physics::Aabb::COW,
+            on_ground: true,
+        };
+        let step = step_sampled_entity(EntityPhysicsInput {
+            query,
+            samples: HashMap::new(),
+            complete_samples: false,
+        });
+
+        assert_eq!(step.position, query.position);
+        assert_eq!(step.velocity, mc_entity::Vec3::ZERO);
     }
 
     #[tokio::test]
