@@ -309,6 +309,11 @@ impl EntityStore {
         id
     }
 
+    #[must_use]
+    pub fn contains_uuid(&self, uuid: Uuid) -> bool {
+        self.uuids.contains(&uuid)
+    }
+
     pub fn insert_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
         if self.slots_by_id.contains_key(&snapshot.id) {
             return false;

@@ -232,11 +232,9 @@ fn plan_hostile_spawns(
             entity_type_id,
             entity_type_name: entry.entity_type.as_str().to_string(),
             position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.35 + (offset & 3) as f64 * 0.1,
+                f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
                 f64::from(y + 1),
-                f64::from(chunk.pos.z * 16 + i32::from(lz))
-                    + 0.35
-                    + ((offset >> 2) & 3) as f64 * 0.1,
+                f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
             ),
             hostile: true,
         });
@@ -306,11 +304,9 @@ fn plan_group_spawns(
             entity_type_id,
             entity_type_name: entry.entity_type.as_str().to_string(),
             position: Vec3::new(
-                f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.35 + (offset & 3) as f64 * 0.1,
+                f64::from(chunk.pos.x * 16 + i32::from(lx)) + safe_land_spawn_offset(offset),
                 f64::from(y + 1),
-                f64::from(chunk.pos.z * 16 + i32::from(lz))
-                    + 0.35
-                    + ((offset >> 2) & 3) as f64 * 0.1,
+                f64::from(chunk.pos.z * 16 + i32::from(lz)) + safe_land_spawn_offset(offset >> 2),
             ),
             hostile: false,
         });
@@ -430,11 +426,15 @@ fn herd_spawn_surface(
         let Some(y) = herd_surface_y(chunk, lx, lz, surface) else {
             continue;
         };
-        if herd_spawn_clearance(chunk, lx, y + 1, lz, passable) {
+        if herd_spawn_clearance(chunk, lx, y + 1, lz, surface, passable) {
             return Some((lx, y, lz));
         }
     }
     None
+}
+
+fn safe_land_spawn_offset(bits: u64) -> f64 {
+    0.48 + (bits & 3) as f64 * 0.01
 }
 
 fn herd_spawn_clearance(
@@ -442,13 +442,33 @@ fn herd_spawn_clearance(
     lx: u8,
     spawn_y: i32,
     lz: u8,
+    surface: BlockStateId,
     passable: &[BlockStateId],
 ) -> bool {
-    (spawn_y..=spawn_y + 1).all(|y| {
-        chunk
-            .get_block(lx, y, lz)
-            .is_some_and(|state| passable.contains(&state))
-    })
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            let x = i32::from(lx) + dx;
+            let z = i32::from(lz) + dz;
+            if !(0..mc_world::SECTION_DIM as i32).contains(&x)
+                || !(0..mc_world::SECTION_DIM as i32).contains(&z)
+            {
+                return false;
+            }
+            let x = x as u8;
+            let z = z as u8;
+            if chunk.get_block(x, spawn_y - 1, z) != Some(surface) {
+                return false;
+            }
+            if !(spawn_y..=spawn_y + 1).all(|y| {
+                chunk
+                    .get_block(x, y, z)
+                    .is_some_and(|state| passable.contains(&state))
+            }) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(crate) fn passive_entity_passable_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {

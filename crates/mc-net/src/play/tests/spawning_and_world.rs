@@ -39,7 +39,11 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
             protocol_id: 2,
         },
     ]);
-    let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(0),
+        plains.clone(),
+    );
     let passable = vec![mc_world::BlockStateId(0)];
     let grass = mc_world::BlockStateId(1);
     let water = mc_world::BlockStateId(2);
@@ -66,6 +70,29 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     );
     assert!(spawns.iter().all(|spawn| spawn.position.y == 65.0));
     assert!(spawns.iter().all(|spawn| spawn.entity_type_id == 1));
+    assert!(spawns.iter().all(|spawn| {
+        let fx = spawn.position.x.fract();
+        let fz = spawn.position.z.fract();
+        (0.48..=0.51).contains(&fx) && (0.48..=0.51).contains(&fz)
+    }));
+
+    let mut unsupported_chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains.clone());
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            if (lx + lz) % 2 == 0 {
+                let _ = unsupported_chunk.set_block(lx, 64, lz, grass);
+            }
+        }
+    }
+    let unsupported_spawns = plan_passive_herd(
+        &unsupported_chunk,
+        Some(grass),
+        None,
+        &passable,
+        &rules,
+        &entity_types,
+    );
+    assert!(unsupported_spawns.is_empty());
 
     let ocean_rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
         ocean.clone(),
@@ -603,6 +630,45 @@ fn chunk_herd_materialization_applies_caps_and_player_distance() {
 
     assert_eq!(queries.len(), MAX_HOSTILE_SPAWNS_PER_CHUNK + 5);
     assert!(queries.iter().all(|query| query.position.x != 0.5));
+}
+
+#[test]
+fn chunk_herd_materialization_dedupes_restored_herd_uuid() {
+    let registry = SessionRegistry::new();
+    let uuid = herd_uuid((0, 0), 0);
+    let restored = mc_entity::EntitySnapshot {
+        id: EntityId(42),
+        uuid,
+        type_id: 1,
+        type_name: "minecraft:cow".to_string(),
+        position: Vec3::new(20.5, DEFAULT_SPAWN_Y, 0.5),
+        rotation: mc_entity::Rotation::ZERO,
+        velocity: Vec3::ZERO,
+        on_ground: true,
+        item_stack: None,
+        experience_value: None,
+        lifecycle: EntityLifecycle::Alive,
+        health: 10.0,
+        attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+        goal: GoalState::Idle,
+    };
+
+    assert_eq!(registry.restore_persisted_entities([restored]), 1);
+    let _ = registry.ensure_chunk_herd(
+        (0, 0),
+        &[HerdSpawn {
+            chunk: (0, 0),
+            slot: 0,
+            entity_type_id: 1,
+            entity_type_name: "minecraft:cow".to_string(),
+            position: Vec3::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+            hostile: false,
+        }],
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].id, EntityId(42));
 }
 
 #[test]

@@ -2,6 +2,7 @@ use std::fmt;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::Compression as GzipCompression;
 use flate2::read::GzDecoder;
@@ -16,6 +17,7 @@ const SOLARIS_DIR: &str = "solaris";
 const ENTITIES_FILE: &str = "entities.dat";
 const WORLD_FILE: &str = "world.dat";
 const DAMAGE_COMPONENT: &str = "minecraft:damage";
+static TMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorldPersistedMetadata {
@@ -617,7 +619,7 @@ fn write_player_root(
             source,
         })?;
     }
-    let tmp_path = path.with_extension("dat.tmp");
+    let tmp_path = temporary_write_path(path);
     let file = File::create(&tmp_path).map_err(|source| PlayerPersistenceError::Io {
         path: tmp_path.clone(),
         source,
@@ -646,6 +648,16 @@ fn write_player_root(
         path: path.to_path_buf(),
         source,
     })
+}
+
+fn temporary_write_path(path: &Path) -> PathBuf {
+    let counter = TMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("persisted.dat");
+    path.with_file_name(format!("{file_name}.{pid}.{counter}.tmp"))
 }
 
 fn read_pose(fields: &[(String, Tag)]) -> Option<PlayerPose> {
@@ -1056,6 +1068,51 @@ mod tests {
             loaded[1].attributes.base(&AttributeKind::MovementSpeed),
             Some(0.2)
         );
+    }
+
+    #[test]
+    fn concurrent_entity_saves_use_distinct_temp_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let items = items();
+        let entity_types = entity_types();
+        let item = EntitySnapshot {
+            id: EntityId(100),
+            uuid: uuid::Uuid::from_u128(100),
+            type_id: 1,
+            type_name: "minecraft:item".into(),
+            position: Vec3::new(1.0, 65.0, 2.0),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            item_stack: Some(EntityItemStack::new(1, 3)),
+            experience_value: None,
+            lifecycle: EntityLifecycle::Alive,
+            health: 20.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: GoalState::Idle,
+        };
+
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for _ in 0..8 {
+                let root = &root;
+                let items = &items;
+                let item = &item;
+                handles.push(scope.spawn(move || {
+                    for _ in 0..25 {
+                        save_persisted_entities(root, items, std::slice::from_ref(item)).unwrap();
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.join().unwrap();
+            }
+        });
+
+        let loaded = load_persisted_entities(&root, &items, &entity_types).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, item.id);
     }
 
     #[test]

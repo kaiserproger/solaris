@@ -5405,7 +5405,9 @@ where
             game_mode,
         );
         let mut stream_finished = false;
-        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut()) {
+        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
+            && !stream.is_complete()
+        {
             for _ in 0..CHUNK_STREAM_STEPS_PER_TURN {
                 if stream.is_complete() {
                     stream_finished = true;

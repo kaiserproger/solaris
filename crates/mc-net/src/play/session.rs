@@ -581,12 +581,16 @@ impl SessionRegistry {
             if !spawn_far_enough_from_players(&inner, spawn.position) {
                 continue;
             }
+            let uuid = herd_uuid(spawn.chunk, spawn.slot);
+            if inner.entities.contains_uuid(uuid) {
+                continue;
+            }
             let mut entity = SpawnEntity::new(
                 spawn.entity_type_id,
                 spawn.entity_type_name.clone(),
                 spawn.position,
             );
-            entity.uuid = Some(herd_uuid(spawn.chunk, spawn.slot));
+            entity.uuid = Some(uuid);
             apply_entity_facts(&mut entity);
             entity.goal = if spawn.hostile {
                 GoalState::Wander {
