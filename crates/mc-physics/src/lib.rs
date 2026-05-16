@@ -247,16 +247,23 @@ pub fn step_entity<S: BlockSampler>(
     }
     body.velocity.y = body.velocity.y.max(config.terminal_velocity);
 
+    let mut stepped_up = false;
     let dx = body.velocity.x * config.tick_seconds;
     body.position.x += dx;
-    if dx != 0.0 && body_collides_with_solid(body, sampler) {
+    if dx != 0.0
+        && body_collides_with_solid(body, sampler)
+        && !try_step_up(&mut body, sampler, &mut stepped_up)
+    {
         body.position.x -= dx;
         body.velocity.x = 0.0;
     }
 
     let dz = body.velocity.z * config.tick_seconds;
     body.position.z += dz;
-    if dz != 0.0 && body_collides_with_solid(body, sampler) {
+    if dz != 0.0
+        && body_collides_with_solid(body, sampler)
+        && !try_step_up(&mut body, sampler, &mut stepped_up)
+    {
         body.position.z -= dz;
         body.velocity.z = 0.0;
     }
@@ -319,6 +326,24 @@ fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &mut S) 
         }
     }
     false
+}
+
+fn try_step_up<S: BlockSampler>(
+    body: &mut EntityBody,
+    sampler: &mut S,
+    stepped_up: &mut bool,
+) -> bool {
+    if !body.on_ground || *stepped_up {
+        return false;
+    }
+    body.position.y += 1.0;
+    if body_collides_with_solid(*body, sampler) {
+        body.position.y -= 1.0;
+        false
+    } else {
+        *stepped_up = true;
+        true
+    }
 }
 
 fn bbox_columns(body: EntityBody) -> [(i32, i32); 4] {
@@ -412,6 +437,26 @@ mod tests {
 
         assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
         assert_eq!(stepped.velocity.x, 0.0);
+    }
+
+    #[test]
+    fn grounded_body_steps_up_one_block_obstacle() {
+        let mut world = LocalBlocks {
+            solids: vec![GridPos::new(1, 64, 0)],
+            fluids: Vec::new(),
+        };
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::new(20.0, 0.0, 0.0),
+            aabb: Aabb::COW,
+            on_ground: true,
+        };
+
+        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
+
+        assert!(stepped.position.x > body.position.x);
+        assert!(stepped.position.y >= 65.0 - 1.0e-6);
+        assert!(stepped.velocity.x > 0.0);
     }
 
     #[test]

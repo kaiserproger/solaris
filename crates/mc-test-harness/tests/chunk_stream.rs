@@ -349,12 +349,15 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
     let mut saw_new_center = false;
     let mut saw_unload = false;
     let mut saw_new_strip_chunk = false;
+    let mut chunks_after_move = 0usize;
     while !(saw_unload && saw_new_strip_chunk) {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let frame = client
-            .read_frame_with_timeout(remaining)
-            .await
-            .expect("movement replan frames");
+        let frame = match client.read_frame_with_timeout(remaining).await {
+            Ok(frame) => frame,
+            Err(err) => panic!(
+                "movement replan frames: {err}; center={saw_new_center} unload={saw_unload} new_strip={saw_new_strip_chunk} chunks_after_move={chunks_after_move}"
+            ),
+        };
         if frame.id == ClientboundKeepAlive::ID {
             let mut body = frame.body;
             let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
@@ -383,6 +386,7 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         if frame.id != LevelChunkWithLight::ID {
             continue;
         }
+        chunks_after_move += 1;
         let mut body = frame.body;
         let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
         if (pkt.chunk_x, pkt.chunk_z) == (3 + MOVEMENT_VIEW_DISTANCE, 0) {

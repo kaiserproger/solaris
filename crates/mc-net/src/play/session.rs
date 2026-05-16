@@ -510,6 +510,7 @@ impl SessionRegistry {
             return Vec::new();
         };
         session.pose = pose;
+        push_entities_from_player_locked(&mut inner, pose);
         let mut dispatches = refresh_visibility_locked(&mut inner);
         let new_observers = visible_observers_locked(&inner, id);
         let Some(snapshot) = inner
@@ -577,9 +578,16 @@ impl SessionRegistry {
                     .attributes
                     .set_base(AttributeKind::MovementSpeed, 0.23);
             }
-            entity.goal = GoalState::Wander {
-                speed: 0.8,
-                period_ticks: 80,
+            entity.goal = if spawn.hostile {
+                GoalState::Wander {
+                    speed: 1.25,
+                    period_ticks: 20,
+                }
+            } else {
+                GoalState::Wander {
+                    speed: 0.8,
+                    period_ticks: 80,
+                }
             };
             let id = inner.entities.spawn(entity);
             inner.last_sent_entity_positions.insert(id, spawn.position);
@@ -775,6 +783,7 @@ impl SessionRegistry {
         if inner.entities.is_empty() {
             return Vec::new();
         }
+        update_hostile_targets_locked(&mut inner);
         inner.entities.tick_goals(tick);
         inner
             .entities
@@ -783,6 +792,7 @@ impl SessionRegistry {
                 id: entity.id,
                 position: entity.position,
                 velocity: entity.velocity,
+                aabb: entity_aabb(&entity.type_name),
                 on_ground: entity.on_ground,
             })
             .collect()
@@ -977,11 +987,116 @@ fn server_entity_chunk_pos(entity: &ServerEntitySnapshot) -> (i32, i32) {
     chunk_pos_from_coords(entity.position.x, entity.position.z)
 }
 
+fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
+    let players: Vec<_> = inner
+        .sessions
+        .values()
+        .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
+        .collect();
+    if players.is_empty() {
+        return;
+    }
+    let hostiles: Vec<_> = inner
+        .entities
+        .snapshots()
+        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .filter(|entity| is_hostile_entity(&entity.type_name))
+        .collect();
+    for hostile in hostiles {
+        let follow_range = hostile
+            .attributes
+            .base(&AttributeKind::FollowRange)
+            .unwrap_or(16.0);
+        let max_distance_sq = follow_range * follow_range;
+        let target = players
+            .iter()
+            .copied()
+            .filter(|position| distance_sq(*position, hostile.position) <= max_distance_sq)
+            .min_by(|left, right| {
+                distance_sq(*left, hostile.position)
+                    .total_cmp(&distance_sq(*right, hostile.position))
+            });
+        let goal = target.map_or(
+            GoalState::Wander {
+                speed: HOSTILE_FOLLOW_SPEED,
+                period_ticks: 20,
+            },
+            |target| GoalState::FollowPosition {
+                target,
+                speed: HOSTILE_FOLLOW_SPEED,
+            },
+        );
+        let _ = inner.entities.set_goal(hostile.id, goal);
+    }
+}
+
 pub(super) fn distance_sq(a: Vec3, b: Vec3) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     let dz = a.z - b.z;
     dx * dx + dy * dy + dz * dz
+}
+
+pub(super) fn entity_aabb(type_name: &str) -> mc_physics::Aabb {
+    match type_name {
+        "minecraft:chicken" => mc_physics::Aabb {
+            half_width: 0.2,
+            height: 0.7,
+        },
+        "minecraft:pig" | "minecraft:sheep" => mc_physics::Aabb {
+            half_width: 0.45,
+            height: 0.9,
+        },
+        "minecraft:cow" => mc_physics::Aabb {
+            half_width: 0.45,
+            height: 1.4,
+        },
+        "minecraft:zombie" => mc_physics::Aabb {
+            half_width: 0.3,
+            height: 1.95,
+        },
+        "minecraft:item" => mc_physics::Aabb {
+            half_width: 0.125,
+            height: 0.25,
+        },
+        _ => mc_physics::Aabb::COW,
+    }
+}
+
+fn push_entities_from_player_locked(inner: &mut SessionRegistryInner, pose: PlayerPose) {
+    const PLAYER_HALF_WIDTH: f64 = 0.3;
+    let player = Vec3::new(pose.x, pose.y, pose.z);
+    let snapshots: Vec<_> = inner
+        .entities
+        .snapshots()
+        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .filter(|entity| entity.item_stack.is_none())
+        .collect();
+    for entity in snapshots {
+        let aabb = entity_aabb(&entity.type_name);
+        let min_distance = PLAYER_HALF_WIDTH + aabb.half_width;
+        let dx = entity.position.x - player.x;
+        let dz = entity.position.z - player.z;
+        let distance = dx.hypot(dz);
+        if distance >= min_distance || (entity.position.y - player.y).abs() > 1.5 {
+            continue;
+        }
+        let (nx, nz) = if distance > 1.0e-6 {
+            (dx / distance, dz / distance)
+        } else {
+            let yaw = f64::from(pose.yaw).to_radians();
+            (yaw.sin(), -yaw.cos())
+        };
+        let push = min_distance - distance + 0.02;
+        let _ = inner.entities.set_position(
+            entity.id,
+            Vec3::new(
+                entity.position.x + nx * push,
+                entity.position.y,
+                entity.position.z + nz * push,
+            ),
+        );
+    }
 }
 
 fn player_eye_position(pose: PlayerPose) -> Vec3 {
@@ -1002,13 +1117,31 @@ pub(super) fn within_block_reach(pose: PlayerPose, position: i64, game_mode: Gam
     distance_sq(player_eye_position(pose), block_center(position)) <= max * max
 }
 
-pub(super) fn within_entity_reach(pose: PlayerPose, position: Vec3, game_mode: GameMode) -> bool {
+pub(super) fn within_entity_reach(
+    pose: PlayerPose,
+    position: Vec3,
+    aabb: mc_physics::Aabb,
+    game_mode: GameMode,
+) -> bool {
     let max = if game_mode == GameMode::Creative {
         6.0
     } else {
-        4.0
+        5.0
     };
-    distance_sq(player_eye_position(pose), position) <= max * max
+    distance_sq_to_entity_box(player_eye_position(pose), position, aabb) <= max * max
+}
+
+fn distance_sq_to_entity_box(point: Vec3, position: Vec3, aabb: mc_physics::Aabb) -> f64 {
+    let dx = (point.x - position.x).abs() - aabb.half_width;
+    let dz = (point.z - position.z).abs() - aabb.half_width;
+    let dy = if point.y < position.y {
+        position.y - point.y
+    } else if point.y > position.y + aabb.height {
+        point.y - (position.y + aabb.height)
+    } else {
+        0.0
+    };
+    dx.max(0.0).powi(2) + dy.powi(2) + dz.max(0.0).powi(2)
 }
 
 fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {

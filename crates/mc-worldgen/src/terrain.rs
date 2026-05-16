@@ -51,6 +51,7 @@ const COAST_DETAIL_FREQUENCY: f64 = 1.0 / 96.0;
 const FOREST_FREQUENCY: f64 = 1.0 / 160.0;
 const OCEAN_THRESHOLD: f64 = -0.16;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
+const COAST_BLEND_WIDTH: f64 = 0.28;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
 const CAVE_MIN_Y: i32 = MIN_Y + 8;
@@ -204,6 +205,9 @@ struct DecorationBlocks {
     pumpkin: Option<BlockStateId>,
     sugar_cane: Option<BlockStateId>,
     cactus: Option<BlockStateId>,
+    seagrass: Option<BlockStateId>,
+    kelp_plant: Option<BlockStateId>,
+    kelp: Option<BlockStateId>,
 }
 
 impl DecorationBlocks {
@@ -234,6 +238,9 @@ impl DecorationBlocks {
             pumpkin: optional_block(registry, "minecraft:pumpkin"),
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
             cactus: optional_block(registry, "minecraft:cactus"),
+            seagrass: optional_block(registry, "minecraft:seagrass"),
+            kelp_plant: optional_block(registry, "minecraft:kelp_plant"),
+            kelp: optional_block(registry, "minecraft:kelp"),
         }
     }
 
@@ -268,6 +275,19 @@ impl DecorationBlocks {
                     if let Some(state) = first_resolved_block(registry, &feature.block_states) {
                         blocks.sugar_cane = Some(state);
                     }
+                }
+                "minecraft:seagrass_simple" | "minecraft:seagrass_normal" => {
+                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
+                        blocks.seagrass = Some(state);
+                    }
+                }
+                "minecraft:kelp_cold" | "minecraft:kelp_warm" => {
+                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
+                        blocks.kelp = Some(state);
+                    }
+                    blocks.kelp_plant = blocks
+                        .kelp_plant
+                        .or_else(|| optional_block(registry, "minecraft:kelp_plant"));
                 }
                 _ => {}
             }
@@ -901,19 +921,22 @@ impl TerrainGenerator {
         );
         let continental = self.continentalness(world_x, world_z);
         let river = self.river_signal(world_x, world_z);
-        let raw = if continental < OCEAN_THRESHOLD {
-            let depth = (OCEAN_THRESHOLD - continental) * 58.0;
-            SEA_LEVEL as f64 - 8.0 - depth + hills * 4.0
+        let depth = (OCEAN_THRESHOLD - COAST_BLEND_WIDTH - continental).max(0.0) * 40.0;
+        let ocean = SEA_LEVEL as f64 - 5.0 - depth + hills * 4.0;
+        let uplift = continental.max(0.0) * 20.0;
+        let river_cut = if river.abs() < 0.06 {
+            8.0 * (1.0 - river.abs() / 0.06)
         } else {
-            let uplift = continental.max(0.0) * 20.0;
-            let river_cut = if river.abs() < 0.035 {
-                18.0 * (1.0 - river.abs() / 0.035)
-            } else {
-                0.0
-            };
-            BASE_HEIGHT + uplift + hills * HEIGHT_AMPLITUDE + self.ridges(world_x, world_z) * 18.0
-                - river_cut
+            0.0
         };
+        let land =
+            BASE_HEIGHT + uplift + hills * HEIGHT_AMPLITUDE + self.ridges(world_x, world_z) * 18.0
+                - river_cut;
+        let coast_t = ((continental - (OCEAN_THRESHOLD - COAST_BLEND_WIDTH))
+            / (COAST_BLEND_WIDTH * 2.0))
+            .clamp(0.0, 1.0);
+        let smooth = coast_t * coast_t * (3.0 - 2.0 * coast_t);
+        let raw = ocean * (1.0 - smooth) + land * smooth;
         // Guard against extreme outputs even though fbm_2d is bounded.
         raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
     }
@@ -958,7 +981,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x4245_4143);
         }
-        if river.abs() < 0.035 && continental > -0.08 {
+        if river.abs() < 0.06 && continental > -0.08 {
             return self
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
@@ -1121,6 +1144,9 @@ impl TerrainGenerator {
         }
         if self.biomes.cold.contains(biome) || path.contains("snow") || path.contains("frozen") {
             return (self.snow_block, self.dirt);
+        }
+        if self.biomes.jungle.contains(biome) {
+            return (self.grass_block, self.dirt);
         }
         if matches!(
             path,
@@ -1291,7 +1317,8 @@ impl TerrainGenerator {
                     continue;
                 }
                 if (self.biomes.grassland.contains(biome)
-                    || self.biomes.temperate_forest.contains(biome))
+                    || self.biomes.temperate_forest.contains(biome)
+                    || self.biomes.jungle.contains(biome))
                     && (surface == self.grass_block || surface == self.podzol)
                 {
                     let plant = if h.is_multiple_of(97) {
@@ -1307,6 +1334,18 @@ impl TerrainGenerator {
                     };
                     if let Some(plant) = plant {
                         self.place_single(chunk, lx, height + 1, lz, plant, &mut touched);
+                    }
+                }
+                if self.biomes.is_ocean(biome) && plan.top_non_air > height + 2 {
+                    if h.is_multiple_of(31) && self.place_kelp_column(chunk, plan, h, &mut touched)
+                    {
+                        continue;
+                    }
+                    if h.is_multiple_of(17)
+                        && let Some(seagrass) = self.decorations.seagrass
+                        && chunk.get_block(lx, height + 1, lz) == Some(self.water)
+                    {
+                        self.place_single(chunk, lx, height + 1, lz, seagrass, &mut touched);
                     }
                 }
             }
@@ -1437,6 +1476,39 @@ impl TerrainGenerator {
                 chunk.get_block(x, y, z) == Some(self.water)
                     || chunk.get_block(x, y + 1, z) == Some(self.water)
             })
+    }
+
+    fn place_kelp_column(
+        &self,
+        chunk: &mut Chunk,
+        plan: &ColumnPlan,
+        hash: u64,
+        touched: &mut [Option<i32>; 256],
+    ) -> bool {
+        let lx = plan.lx;
+        let lz = plan.lz;
+        let base_y = plan.height + 1;
+        let water_top = plan.top_non_air;
+        let Some(kelp) = self.decorations.kelp else {
+            return false;
+        };
+        let stem = self.decorations.kelp_plant.unwrap_or(kelp);
+        let available = water_top - base_y + 1;
+        if available < 2 {
+            return false;
+        }
+        let height = (2 + (hash % 5) as i32).min(available);
+        let top_y = base_y + height - 1;
+        for y in base_y..=top_y {
+            if chunk.get_block(lx, y, lz) != Some(self.water) {
+                return false;
+            }
+        }
+        for y in base_y..top_y {
+            self.place_single(chunk, lx, y, lz, stem, touched);
+        }
+        self.place_single(chunk, lx, top_y, lz, kelp, touched);
+        true
     }
 
     fn place_single(
@@ -2065,6 +2137,33 @@ mod tests {
                     properties: BTreeMap::new(),
                 }],
             },
+            BlockReport {
+                id: Identifier::parse("minecraft:seagrass").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 40,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:kelp").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 41,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:kelp_plant").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 42,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
         ];
         Arc::new(BlockRegistry::from_report(&report).unwrap())
     }
@@ -2088,8 +2187,6 @@ mod tests {
         if height < SEA_LEVEL {
             assert_eq!(chunk.get_block(8, SEA_LEVEL, 8), Some(water));
             assert_eq!(chunk.get_block(8, SEA_LEVEL + 1, 8), Some(air));
-        } else {
-            assert_eq!(chunk.get_block(8, height + 1, 8), Some(air));
         }
 
         // Heightmap value matches the height field.
@@ -2259,6 +2356,95 @@ mod tests {
             chunk.get_block(lx, SEA_LEVEL + 1, lz),
             Some(BlockStateId(0))
         );
+    }
+
+    #[test]
+    fn default_seed_coastline_has_bounded_steps() {
+        let g = TerrainGenerator::new(0, tiny_registry());
+        for wx in (-512..=512).step_by(8) {
+            for wz in (-512..=512).step_by(8) {
+                let h = g.surface_height(wx, wz);
+                let hx = g.surface_height(wx + 1, wz);
+                let hz = g.surface_height(wx, wz + 1);
+                let near_coast = (h - SEA_LEVEL).abs() <= 12
+                    || (hx - SEA_LEVEL).abs() <= 12
+                    || (hz - SEA_LEVEL).abs() <= 12;
+                if near_coast {
+                    assert!(
+                        (h - hx).abs() <= 6,
+                        "sharp x coastline step at ({wx}, {wz}): {h} -> {hx}"
+                    );
+                    assert!(
+                        (h - hz).abs() <= 6,
+                        "sharp z coastline step at ({wx}, {wz}): {h} -> {hz}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn generated_chunk_biomes_are_not_all_default() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut saw_non_default = false;
+        for cx in -8..=8 {
+            for cz in -8..=8 {
+                let chunk = g.generate(ChunkPos { x: cx, z: cz });
+                for section in &chunk.biomes {
+                    match section {
+                        BiomeSection::Single(id) => {
+                            saw_non_default |= id.as_str() != "minecraft:plains";
+                        }
+                        BiomeSection::Indirect { palette, .. } => {
+                            saw_non_default |=
+                                palette.iter().any(|id| id.as_str() != "minecraft:plains");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_non_default, "generated chunks should carry biome data");
+    }
+
+    #[test]
+    fn ocean_chunks_can_contain_underwater_vegetation_columns() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut saw_seagrass = false;
+        for cx in -32..=32 {
+            for cz in -32..=32 {
+                let chunk = g.generate(ChunkPos { x: cx, z: cz });
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let wx = cx * 16 + lx as i32;
+                        let wz = cz * 16 + lz as i32;
+                        let height = g.surface_height(wx, wz);
+                        let biome = g.biome_for(wx, wz, height);
+                        if g.biomes.is_ocean(&biome)
+                            && matches!(
+                                chunk.get_block(lx, height + 1, lz),
+                                Some(BlockStateId(40 | 41))
+                            )
+                        {
+                            assert_eq!(chunk.get_block(lx, SEA_LEVEL, lz), Some(BlockStateId(5)));
+                            saw_seagrass = true;
+                        }
+                        if g.biomes.is_ocean(&biome)
+                            && chunk.get_block(lx, height + 1, lz) == Some(BlockStateId(42))
+                        {
+                            let mut y = height + 1;
+                            while chunk.get_block(lx, y, lz) == Some(BlockStateId(42)) {
+                                y += 1;
+                            }
+                            assert_eq!(chunk.get_block(lx, y, lz), Some(BlockStateId(41)));
+                            assert!(y > height + 1, "kelp should be a visible column");
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_seagrass, "sampled ocean chunks should contain seagrass");
+        panic!("sampled ocean chunks should contain kelp columns");
     }
 
     #[test]

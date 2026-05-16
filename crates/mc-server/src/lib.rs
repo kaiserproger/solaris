@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(cfg.server.view_distance, 10);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
-        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 64);
+        assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 8);
         assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
         assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 25);

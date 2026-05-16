@@ -18,7 +18,7 @@ use mc_data::items::ItemRegistry;
 use mc_data::loot::LootTables;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
-use mc_physics::{Aabb, BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
+use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
@@ -307,10 +307,10 @@ fn sample_entity_physics_input(
 ) -> EntityPhysicsInput {
     let mut samples = HashMap::new();
     for pos in entity_physics_sample_positions(query) {
-        let material = match storage.get_block(pos) {
-            Ok(Some(state)) => materials.classify(state.0),
-            Ok(None) | Err(_) => BlockMaterial::Air,
-        };
+        let material = storage
+            .get_cached_block(pos)
+            .map(|state| materials.classify(state.0))
+            .unwrap_or(BlockMaterial::Air);
         samples.insert(pos, material);
     }
     EntityPhysicsInput { query, samples }
@@ -321,7 +321,7 @@ fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<Block
     let body = EntityBody {
         position: physics_vec(query.position),
         velocity: physics_vec(query.velocity),
-        aabb: Aabb::COW,
+        aabb: query.aabb,
         on_ground: query.on_ground,
     };
     let next_x = body.position.x + body.velocity.x * config.tick_seconds;
@@ -354,7 +354,7 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
         EntityBody {
             position: physics_vec(input.query.position),
             velocity: physics_vec(input.query.velocity),
-            aabb: Aabb::COW,
+            aabb: input.query.aabb,
             on_ground: input.query.on_ground,
         },
         &mut sampler,

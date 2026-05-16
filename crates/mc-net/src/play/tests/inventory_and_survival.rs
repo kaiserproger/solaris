@@ -224,12 +224,14 @@ fn reach_validation_uses_player_eye_position() {
     ));
     assert!(within_entity_reach(
         pose,
-        Vec3::new(0.0, 65.0, 2.0),
+        Vec3::new(0.0, 64.0, 5.0),
+        entity_aabb("minecraft:zombie"),
         GameMode::Survival
     ));
     assert!(!within_entity_reach(
         pose,
         Vec3::new(0.0, 65.0, 8.0),
+        entity_aabb("minecraft:chicken"),
         GameMode::Survival
     ));
 }

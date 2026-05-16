@@ -192,8 +192,10 @@ async fn serve(path: &Path) -> Result<()> {
                         cfg.server.view_distance,
                         chunk_pipeline.chunk_worker_threads,
                     )?;
+                    tracing::info!("Preparing world... 95% (saving generated chunks)");
                     let flushed = storage.flush_dirty()?;
                     region_count = count_region_files(world_dir);
+                    tracing::info!("Preparing world... 100%");
                     tracing::info!(
                         path = %world_dir.display(),
                         chunks = generated,
@@ -666,6 +668,8 @@ fn generate_spawn_window(
             || generated.is_multiple_of(log_every)
             || last_log.elapsed() >= Duration::from_secs(2)
         {
+            let percent = (generated * 90 / total).min(90);
+            tracing::info!("Preparing world... {percent}%");
             tracing::info!(
                 generated,
                 total,

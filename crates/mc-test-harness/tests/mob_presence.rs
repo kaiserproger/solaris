@@ -7,7 +7,7 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHealth,
-    ConfirmTeleportation, GameEvent, LevelChunkWithLight, LoginPlay, MoveEntityPosRot,
+    ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay, MoveEntityPosRot,
     MovePlayerFlags, RemoveEntities, ServerboundAttack, ServerboundKeepAlive,
     ServerboundMovePlayerPos, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
 };
@@ -168,6 +168,7 @@ async fn survival_attack_passive_mob_drops_food() {
         .await
         .expect("move to mob");
     for _ in 0..10 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
         client
             .write_packet(&ServerboundAttack {
                 entity_id: mob.entity_id,
@@ -304,14 +305,31 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         .expect("move to zombie");
     wait_for_health_below(&mut client, 20.0).await;
 
-    for _ in 0..10 {
+    client
+        .write_packet(&ServerboundAttack {
+            entity_id: zombie.entity_id,
+        })
+        .await
+        .expect("first attack zombie");
+    wait_for_entity_hurt(&mut client, zombie.entity_id).await;
+
+    for _ in 0..8 {
+        tokio::time::sleep(Duration::from_millis(400)).await;
         client
             .write_packet(&ServerboundAttack {
                 entity_id: zombie.entity_id,
             })
             .await
             .expect("attack zombie");
+        wait_for_entity_hurt(&mut client, zombie.entity_id).await;
     }
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    client
+        .write_packet(&ServerboundAttack {
+            entity_id: zombie.entity_id,
+        })
+        .await
+        .expect("lethal attack zombie");
 
     let mut saw_zombie_remove = false;
     let mut saw_rotten_flesh = false;
@@ -337,6 +355,28 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
             if pkt.item_stack.item_id == rotten_flesh_id && pkt.item_stack.count >= 1 {
                 saw_rotten_flesh = true;
+            }
+        }
+    }
+}
+
+async fn wait_for_entity_hurt(client: &mut Client, entity_id: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("wait for entity hurt event");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == EntityEvent::ID {
+            let mut body = frame.body;
+            let pkt = EntityEvent::decode(&mut body).expect("decode EntityEvent");
+            if pkt.entity_id == entity_id && pkt.event_id == 2 {
+                return;
             }
         }
     }

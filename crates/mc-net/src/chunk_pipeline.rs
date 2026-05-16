@@ -25,11 +25,11 @@ pub struct ChunkPipelinePolicy {
 impl Default for ChunkPipelinePolicy {
     fn default() -> Self {
         Self {
-            chunk_send_rate: 64,
+            chunk_send_rate: 16,
             chunk_load_rate: 64,
             chunk_generate_rate: 32,
             chunk_prepare_budget_ms: 0,
-            chunk_prepare_batch_size: 64,
+            chunk_prepare_batch_size: 8,
             chunk_io_threads: 2,
             chunk_worker_threads: default_worker_threads(),
             entity_worker_threads: 2,
@@ -133,6 +133,11 @@ impl ChunkScheduler {
         }
 
         self.finished.retain(|coord| self.desired.contains(coord));
+    }
+
+    #[must_use]
+    pub fn current_generation(&self) -> ChunkPipelineGeneration {
+        ChunkPipelineGeneration(self.generation)
     }
 
     pub fn poll_next(&mut self) -> Option<ChunkRequest> {

@@ -237,6 +237,17 @@ impl WorldStorage {
         Ok(chunk.get_block(local_x, pos.y, local_z))
     }
 
+    /// Read a block only from the resident chunk cache. Unlike `get_block`, this
+    /// never loads, decodes, or generates chunks, so background simulation can
+    /// sample collision without stalling the shared world lock.
+    pub fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        let cpos = chunk_pos_of(pos);
+        let chunk = self.cache.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.get_block(local_x, pos.y, local_z)
+    }
+
     /// Borrow a cached chunk; loads its region on demand.
     pub fn get_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
         self.ensure_chunk(cpos)?;

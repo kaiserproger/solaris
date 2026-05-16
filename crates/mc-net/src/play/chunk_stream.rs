@@ -1,4 +1,5 @@
 use super::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct ChunkBuildTiming {
@@ -31,6 +32,8 @@ pub(super) enum ChunkStreamStep {
     Complete,
 }
 
+const INITIAL_CHUNK_MIN_RING: i32 = 2;
+
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     biomes: Arc<Registry>,
@@ -45,6 +48,7 @@ pub(super) struct ChunkStreamState {
     session_id: SessionId,
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
+    active_generation: Arc<AtomicU64>,
     result_tx: mpsc::Sender<ChunkPrepareResult>,
     result_rx: mpsc::Receiver<ChunkPrepareResult>,
     ready: BTreeMap<u32, ChunkPrepareResult>,
@@ -52,6 +56,7 @@ pub(super) struct ChunkStreamState {
     result_queue_size: usize,
     center_cx: i32,
     center_cz: i32,
+    direction_yaw: f32,
     view_distance: i32,
     scheduler: ChunkScheduler,
     staged: HashSet<(i32, i32)>,
@@ -77,6 +82,7 @@ pub(super) struct ChunkStreamState {
     max_ready: usize,
     last_stop_reason: ChunkPipelineStopReason,
     wait_for_first_chunk: bool,
+    summary_logged: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -138,11 +144,10 @@ pub(super) fn plan_passive_herd(
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
 ) -> Vec<HerdSpawn> {
     let chunk_pos = (chunk.pos.x, chunk.pos.z);
-    if !passive_chunk_spawns(chunk_pos) {
-        return Vec::new();
-    }
     let mut spawns = Vec::new();
-    if let Some(surface) = land_surface {
+    if passive_chunk_spawns(chunk_pos)
+        && let Some(surface) = land_surface
+    {
         plan_group_spawns(
             chunk,
             surface,
@@ -284,10 +289,10 @@ fn plan_water_group_spawns(
     let h = herd_hash(chunk_pos, slot_base, 0x5741_5445_5200_0000);
     let lx = 3 + (h as u8 % 10);
     let lz = 3 + ((h >> 8) as u8 % 10);
-    if chunk.get_block(lx, DEFAULT_SEA_LEVEL, lz) != Some(water) {
+    let Some(spawn_y) = water_spawn_y(chunk, lx, lz, water) else {
         return;
-    }
-    let Some(biome) = chunk_biome_at(chunk, lx, DEFAULT_SEA_LEVEL, lz) else {
+    };
+    let Some(biome) = chunk_biome_at(chunk, lx, spawn_y, lz) else {
         return;
     };
     let Some(entry) = choose_biome_spawn(rules.entries(biome, group), chunk_pos, slot_base) else {
@@ -309,12 +314,18 @@ fn plan_water_group_spawns(
             entity_type_name: entry.entity_type.as_str().to_string(),
             position: Vec3::new(
                 f64::from(chunk.pos.x * 16 + i32::from(lx)) + 0.5,
-                f64::from(DEFAULT_SEA_LEVEL - 2),
+                f64::from(spawn_y),
                 f64::from(chunk.pos.z * 16 + i32::from(lz)) + 0.5,
             ),
             hostile: false,
         });
     }
+}
+
+fn water_spawn_y(chunk: &Chunk, lx: u8, lz: u8, water: mc_world::BlockStateId) -> Option<i32> {
+    (mc_world::MIN_Y..=DEFAULT_SEA_LEVEL)
+        .rev()
+        .find(|&y| chunk.get_block(lx, y, lz) == Some(water))
 }
 
 fn choose_biome_spawn(
@@ -444,11 +455,20 @@ impl ChunkStreamState {
         session_id: SessionId,
         center_cx: i32,
         center_cz: i32,
+        direction_yaw: f32,
         view_distance: i32,
         policy: ChunkPipelinePolicy,
     ) -> Self {
         let vd = view_distance.max(0);
         let (result_tx, result_rx) = mpsc::channel(policy.chunk_result_queue_size);
+        let scheduler = ChunkScheduler::new(prioritized_spiral(
+            center_cx,
+            center_cz,
+            view_distance,
+            direction_yaw,
+        ));
+        let active_generation = Arc::new(AtomicU64::new(scheduler.current_generation().0));
+
         Self {
             world,
             biomes,
@@ -463,6 +483,7 @@ impl ChunkStreamState {
             session_id,
             io_permits: Arc::new(Semaphore::new(policy.chunk_io_threads)),
             cpu_permits: Arc::new(Semaphore::new(policy.chunk_worker_threads)),
+            active_generation,
             result_tx,
             result_rx,
             ready: BTreeMap::new(),
@@ -470,8 +491,9 @@ impl ChunkStreamState {
             result_queue_size: policy.chunk_result_queue_size,
             center_cx,
             center_cz,
+            direction_yaw,
             view_distance,
-            scheduler: ChunkScheduler::new(prioritized_spiral(center_cx, center_cz, view_distance)),
+            scheduler,
             staged: HashSet::new(),
             loaded: HashSet::new(),
             started: Instant::now(),
@@ -495,6 +517,7 @@ impl ChunkStreamState {
             max_ready: 0,
             last_stop_reason: ChunkPipelineStopReason::QueueEmpty,
             wait_for_first_chunk: true,
+            summary_logged: false,
         }
     }
 
@@ -502,8 +525,25 @@ impl ChunkStreamState {
         self.scheduler.is_complete()
     }
 
-    pub(super) fn replan_center(&mut self, center_cx: i32, center_cz: i32) -> Vec<(i32, i32)> {
+    pub(super) fn replan_center(
+        &mut self,
+        center_cx: i32,
+        center_cz: i32,
+        direction_yaw: f32,
+    ) -> Vec<(i32, i32)> {
         if (self.center_cx, self.center_cz) == (center_cx, center_cz) {
+            if (self.direction_yaw - direction_yaw).abs() >= 22.5 && !self.scheduler.is_complete() {
+                self.ready.clear();
+                self.scheduler.replace_view(prioritized_spiral(
+                    center_cx,
+                    center_cz,
+                    self.view_distance,
+                    direction_yaw,
+                ));
+                self.active_generation
+                    .store(self.scheduler.current_generation().0, Ordering::Release);
+            }
+            self.direction_yaw = direction_yaw;
             return Vec::new();
         }
         let desired = desired_chunk_set(center_cx, center_cz, self.view_distance);
@@ -518,9 +558,16 @@ impl ChunkStreamState {
         dispatch_visibility_commands(visibility);
         self.center_cx = center_cx;
         self.center_cz = center_cz;
+        self.direction_yaw = direction_yaw;
         self.ready.clear();
-        self.scheduler
-            .replace_view(prioritized_spiral(center_cx, center_cz, self.view_distance));
+        self.scheduler.replace_view(prioritized_spiral(
+            center_cx,
+            center_cz,
+            self.view_distance,
+            self.direction_yaw,
+        ));
+        self.active_generation
+            .store(self.scheduler.current_generation().0, Ordering::Release);
         self.reset_window_metrics();
         unloads
     }
@@ -548,6 +595,7 @@ impl ChunkStreamState {
         self.max_ready = 0;
         self.last_stop_reason = ChunkPipelineStopReason::QueueEmpty;
         self.wait_for_first_chunk = false;
+        self.summary_logged = false;
     }
 
     pub(super) async fn step<W>(
@@ -558,26 +606,12 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let wait_for_first_chunk =
-            self.wait_for_first_chunk && self.emitted == 0 && self.absent == 0;
+        let initial_target = initial_window_target(self.view_distance);
         self.dispatch_available();
         self.drain_ready();
 
-        let mut made_send_progress = self.emit_ready_batch(writer, light_cache).await?;
-        if !made_send_progress && wait_for_first_chunk {
-            while !self.scheduler.is_complete() {
-                let Some(result) = self.result_rx.recv().await else {
-                    break;
-                };
-                self.accept_result(result);
-                self.drain_ready();
-                if self.emit_ready_batch(writer, light_cache).await? {
-                    made_send_progress = true;
-                    break;
-                }
-            }
-        }
-        if made_send_progress || self.emitted > 0 || self.absent > 0 {
+        let made_send_progress = self.emit_ready_batch(writer, light_cache).await?;
+        if self.emitted + self.absent >= initial_target || self.scheduler.is_complete() {
             self.wait_for_first_chunk = false;
         }
 
@@ -662,6 +696,7 @@ impl ChunkStreamState {
             let entity_types = Arc::clone(&self.entity_types);
             let io_permits = Arc::clone(&self.io_permits);
             let cpu_permits = Arc::clone(&self.cpu_permits);
+            let active_generation = Arc::clone(&self.active_generation);
             let compression = self.compression;
             let tx = self.result_tx.clone();
             tokio::spawn(async move {
@@ -678,6 +713,7 @@ impl ChunkStreamState {
                     compression,
                     io_permits,
                     cpu_permits,
+                    active_generation,
                 )
                 .await;
                 let _ = tx.send(result).await;
@@ -787,7 +823,11 @@ impl ChunkStreamState {
         }
     }
 
-    pub(super) fn log_summary(&self) {
+    pub(super) fn log_summary_once(&mut self) {
+        if self.summary_logged {
+            return;
+        }
+        self.summary_logged = true;
         info!(
             center_cx = self.center_cx,
             center_cz = self.center_cz,
@@ -859,12 +899,37 @@ pub(super) fn spiral_chunks(
     out.into_iter()
 }
 
-fn prioritized_spiral(
+pub(super) fn prioritized_spiral(
     center_x: i32,
     center_z: i32,
     view_distance: i32,
+    direction_yaw: f32,
 ) -> impl Iterator<Item = (i32, i32, ChunkPriority)> {
-    spiral_chunks(center_x, center_z, view_distance)
+    let mut chunks: Vec<_> = spiral_chunks(center_x, center_z, view_distance).collect();
+    let (forward_x, forward_z) = yaw_forward(direction_yaw);
+    chunks.sort_by(|&(left_x, left_z), &(right_x, right_z)| {
+        let left_dx = left_x - center_x;
+        let left_dz = left_z - center_z;
+        let right_dx = right_x - center_x;
+        let right_dz = right_z - center_z;
+        let left_ring = left_dx.abs().max(left_dz.abs());
+        let right_ring = right_dx.abs().max(right_dz.abs());
+        left_ring
+            .cmp(&right_ring)
+            .then_with(|| {
+                directional_score(right_dx, right_dz, forward_x, forward_z)
+                    .total_cmp(&directional_score(left_dx, left_dz, forward_x, forward_z))
+            })
+            .then_with(|| {
+                directional_lateral(left_dx, left_dz, forward_x, forward_z).total_cmp(
+                    &directional_lateral(right_dx, right_dz, forward_x, forward_z),
+                )
+            })
+            .then_with(|| left_z.cmp(&right_z))
+            .then_with(|| left_x.cmp(&right_x))
+    });
+    chunks
+        .into_iter()
         .enumerate()
         .map(move |(sequence, (cx, cz))| {
             (
@@ -876,6 +941,24 @@ fn prioritized_spiral(
                 },
             )
         })
+}
+
+fn initial_window_target(view_distance: i32) -> usize {
+    let ring = view_distance.clamp(0, INITIAL_CHUNK_MIN_RING) as usize;
+    (2 * ring + 1).pow(2)
+}
+
+fn yaw_forward(yaw: f32) -> (f64, f64) {
+    let radians = f64::from(yaw).to_radians();
+    (-radians.sin(), radians.cos())
+}
+
+fn directional_score(dx: i32, dz: i32, forward_x: f64, forward_z: f64) -> f64 {
+    f64::from(dx) * forward_x + f64::from(dz) * forward_z
+}
+
+fn directional_lateral(dx: i32, dz: i32, forward_x: f64, forward_z: f64) -> f64 {
+    (f64::from(dx) * forward_z - f64::from(dz) * forward_x).abs()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -892,12 +975,18 @@ async fn prepare_chunk_request(
     compression: Compression,
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
+    active_generation: Arc<AtomicU64>,
 ) -> ChunkPrepareResult {
+    if !is_active_request(request, &active_generation) {
+        return stale_chunk_result(request);
+    }
     let (centre, neighbourhood, staged, fetch_ms) = match load_chunk_neighbourhood(
         Arc::clone(&world),
         request.chunk_x,
         request.chunk_z,
         io_permits,
+        request,
+        Arc::clone(&active_generation),
     )
     .await
     {
@@ -921,6 +1010,10 @@ async fn prepare_chunk_request(
         };
     };
 
+    if !is_active_request(request, &active_generation) {
+        return stale_chunk_result(request);
+    }
+
     let cpu_permit = match cpu_permits.acquire_owned().await {
         Ok(permit) => permit,
         Err(_) => {
@@ -932,6 +1025,10 @@ async fn prepare_chunk_request(
             };
         }
     };
+
+    if !is_active_request(request, &active_generation) {
+        return stale_chunk_result(request);
+    }
 
     let outcome = match tokio::task::spawn_blocking(move || {
         let _permit = cpu_permit;
@@ -986,6 +1083,19 @@ async fn prepare_chunk_request(
     }
 }
 
+fn is_active_request(request: ChunkRequest, active_generation: &AtomicU64) -> bool {
+    active_generation.load(Ordering::Acquire) == request.generation.0
+}
+
+fn stale_chunk_result(request: ChunkRequest) -> ChunkPrepareResult {
+    ChunkPrepareResult {
+        request,
+        fetch_ms: 0,
+        staged: Vec::new(),
+        outcome: ChunkPrepareOutcome::Absent,
+    }
+}
+
 type LoadedNeighbourhood = (
     Option<Arc<Chunk>>,
     [[Option<Arc<Chunk>>; 3]; 3],
@@ -998,11 +1108,29 @@ async fn load_chunk_neighbourhood(
     cx: i32,
     cz: i32,
     io_permits: Arc<Semaphore>,
+    request: ChunkRequest,
+    active_generation: Arc<AtomicU64>,
 ) -> Result<LoadedNeighbourhood, String> {
+    if !is_active_request(request, &active_generation) {
+        return Ok((
+            None,
+            std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            Vec::new(),
+            0,
+        ));
+    }
     let _permit = io_permits
         .acquire_owned()
         .await
         .map_err(|_| "IO worker pool closed".to_string())?;
+    if !is_active_request(request, &active_generation) {
+        return Ok((
+            None,
+            std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            Vec::new(),
+            0,
+        ));
+    }
     let fetch_started = Instant::now();
     let mut neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
         std::array::from_fn(|_| std::array::from_fn(|_| None));
@@ -1010,6 +1138,14 @@ async fn load_chunk_neighbourhood(
     let mut staged = Vec::new();
 
     let mut storage = world.lock().await;
+    if !is_active_request(request, &active_generation) {
+        return Ok((
+            None,
+            neighbourhood,
+            staged,
+            fetch_started.elapsed().as_millis() as u64,
+        ));
+    }
     for (dz, row) in neighbourhood.iter_mut().enumerate() {
         for (dx, slot) in row.iter_mut().enumerate() {
             let ncx = cx + (dx as i32 - 1);

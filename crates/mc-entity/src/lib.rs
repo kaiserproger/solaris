@@ -220,6 +220,7 @@ pub enum GoalState {
     Idle,
     Wander { speed: f64, period_ticks: u32 },
     FollowTarget { target: EntityId, speed: f64 },
+    FollowPosition { target: Vec3, speed: f64 },
 }
 
 /// Dense entity storage. Hot state is kept in parallel vectors so later
@@ -450,6 +451,18 @@ impl EntityStore {
                         })
                         .unwrap_or(Vec3::ZERO)
                         .horizontal_normalized();
+                    self.velocities[slot].x = velocity.x * speed;
+                    self.velocities[slot].z = velocity.z * speed;
+                    self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
+                    self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                }
+                GoalState::FollowPosition { target, speed } => {
+                    let velocity = Vec3 {
+                        x: target.x - self.positions[slot].x,
+                        y: 0.0,
+                        z: target.z - self.positions[slot].z,
+                    }
+                    .horizontal_normalized();
                     self.velocities[slot].x = velocity.x * speed;
                     self.velocities[slot].z = velocity.z * speed;
                     self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
@@ -700,5 +713,24 @@ mod tests {
         let velocity = store.snapshot(follower).unwrap().velocity;
         assert!((velocity.x - 0.3).abs() < 0.000_001);
         assert!((velocity.z - 0.4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn follow_position_sets_horizontal_velocity() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(0.0, 65.0, 4.0),
+                speed: 0.5,
+            },
+        );
+
+        store.tick_goals(1);
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(velocity.x, 0.0);
+        assert!((velocity.z - 0.5).abs() < 0.000_001);
     }
 }

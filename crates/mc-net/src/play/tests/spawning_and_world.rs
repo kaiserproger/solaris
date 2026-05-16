@@ -80,7 +80,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
         )]),
     )]));
     let mut ocean_chunk =
-        Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), ocean);
+        Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), ocean.clone());
     for lx in 3..=12 {
         for lz in 3..=12 {
             let _ = ocean_chunk.set_block(lx, DEFAULT_SEA_LEVEL, lz, water);
@@ -101,11 +101,50 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
             .iter()
             .all(|spawn| spawn.entity_type_name == "minecraft:cod")
     );
+    assert!(spawns.iter().all(|spawn| {
+        let lx = spawn.position.x.floor() as u8;
+        let lz = spawn.position.z.floor() as u8;
+        ocean_chunk.get_block(lx, spawn.position.y as i32, lz) == Some(water)
+    }));
+
+    let water_only_chunk_pos = (1..64)
+        .map(|x| (x, 0))
+        .find(|&pos| !passive_chunk_spawns(pos))
+        .expect("non-passive chunk sample");
+    let mut water_only_chunk = Chunk::empty(
+        ChunkPos {
+            x: water_only_chunk_pos.0,
+            z: water_only_chunk_pos.1,
+        },
+        mc_world::BlockStateId(0),
+        ocean,
+    );
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            let _ = water_only_chunk.set_block(lx, DEFAULT_SEA_LEVEL, lz, water);
+        }
+    }
+
+    let spawns = plan_passive_herd(
+        &water_only_chunk,
+        Some(grass),
+        Some(water),
+        &passable,
+        &ocean_rules,
+        &entity_types,
+    );
+
     assert!(
         spawns
             .iter()
-            .all(|spawn| spawn.position.y < f64::from(DEFAULT_SEA_LEVEL))
+            .any(|spawn| spawn.entity_type_name == "minecraft:cod"),
+        "water mobs should not be throttled by sparse land passive spawning"
     );
+    assert!(spawns.iter().all(|spawn| {
+        let lx = (spawn.position.x.floor() as i32 - water_only_chunk.pos.x * 16) as u8;
+        let lz = (spawn.position.z.floor() as i32 - water_only_chunk.pos.z * 16) as u8;
+        water_only_chunk.get_block(lx, spawn.position.y as i32, lz) == Some(water)
+    }));
 }
 
 #[test]
@@ -320,6 +359,44 @@ fn session_registry_invalidates_multiple_prepared_chunks() {
 
     assert!(registry.prepared_chunk((0, 0)).is_none());
     assert!(registry.prepared_chunk((1, 0)).is_none());
+}
+
+#[test]
+fn hostile_entities_follow_nearby_player_position() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "target".to_string(),
+    };
+    let _ = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(4.5, DEFAULT_SPAWN_Y + 1.0, 0.5),
+    );
+    let _ = registry.ensure_chunk_herd(
+        (0, 0),
+        &[HerdSpawn {
+            chunk: (0, 0),
+            slot: 0,
+            entity_type_id: 1,
+            entity_type_name: "minecraft:zombie".to_string(),
+            position: Vec3::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+            hostile: true,
+        }],
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    let zombie = queries
+        .iter()
+        .find(|query| query.position.x == 0.5 && query.position.z == 0.5)
+        .expect("zombie physics query");
+
+    assert!(zombie.velocity.x > 0.0);
+    assert_eq!(zombie.velocity.z, 0.0);
 }
 
 #[test]
@@ -604,6 +681,28 @@ fn spiral_chunks_ring_order_monotonic() {
         );
         last_ring = r;
     }
+}
+
+#[test]
+fn prioritized_spiral_prefers_player_look_direction_within_ring() {
+    let south: Vec<_> = prioritized_spiral(0, 0, 2, 0.0)
+        .map(|(cx, cz, _)| (cx, cz))
+        .collect();
+    assert_eq!(south[0], (0, 0));
+    assert_eq!(south[1], (0, 1));
+    assert!(
+        south.iter().position(|chunk| *chunk == (0, 1)).unwrap()
+            < south.iter().position(|chunk| *chunk == (0, -1)).unwrap()
+    );
+
+    let west: Vec<_> = prioritized_spiral(0, 0, 2, 90.0)
+        .map(|(cx, cz, _)| (cx, cz))
+        .collect();
+    assert_eq!(west[1], (-1, 0));
+    assert!(
+        west.iter().position(|chunk| *chunk == (-1, 0)).unwrap()
+            < west.iter().position(|chunk| *chunk == (1, 0)).unwrap()
+    );
 }
 
 #[test]

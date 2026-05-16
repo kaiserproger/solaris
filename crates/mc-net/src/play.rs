@@ -43,7 +43,7 @@ use mc_protocol::packets::play::{
     ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData,
     ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundTakeItemEntity, ConfirmTeleportation,
     ContainerInput, Direction, EntityAnimation, EntityAnimationAction, EntityDataValue,
-    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
+    EntityEvent, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
     ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
     MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
     PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
@@ -126,7 +126,7 @@ use persistence::{PlayerPersistedState, load_player_state, save_player_state};
 use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
-    ServerEntitySnapshot, SessionId, dispatch_visibility_commands, within_block_reach,
+    ServerEntitySnapshot, SessionId, dispatch_visibility_commands, entity_aabb, within_block_reach,
     within_entity_reach,
 };
 #[cfg(test)]
@@ -186,7 +186,11 @@ const FURNACE_FUEL_TICKS: i16 = 1600;
 const DEFAULT_FURNACE_COOK_TICKS: i16 = 200;
 const DEFAULT_FOOD_USE_DURATION: Duration = Duration::from_millis(1_600);
 const HOSTILE_MELEE_RANGE: f64 = 1.8;
+const HOSTILE_MELEE_VERTICAL_REACH: f64 = 2.25;
 const HOSTILE_MELEE_COOLDOWN: Duration = Duration::from_secs(1);
+const HOSTILE_FOLLOW_SPEED: f64 = 1.25;
+const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
+const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
 const FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
 const LAVA_FLOW_DELAY_TICKS: u64 = 30;
@@ -242,6 +246,7 @@ pub(crate) struct EntityPhysicsQuery {
     pub id: EntityId,
     pub position: Vec3,
     pub velocity: Vec3,
+    pub aabb: mc_physics::Aabb,
     pub on_ground: bool,
 }
 
@@ -504,6 +509,7 @@ where
             session_id,
             spawn_cx,
             spawn_cz,
+            initial_pose.yaw,
             config.view_distance,
             config.chunk_pipeline,
         ))
@@ -517,7 +523,7 @@ where
         if let Some(stream) = chunk_stream.as_mut()
             && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
         {
-            stream.log_summary();
+            stream.log_summary_once();
         }
 
         // 6. Seed an empty server-authoritative player inventory. Test
@@ -581,6 +587,7 @@ where
             pending_break: None,
             pending_use: None,
             last_hostile_damage_at: None,
+            last_entity_attack_at: None,
             fluid_schedule_tick: 0,
         });
         play_loop(
@@ -670,6 +677,7 @@ struct InteractionState {
     pending_break: Option<PendingBreak>,
     pending_use: Option<PendingUse>,
     last_hostile_damage_at: Option<Instant>,
+    last_entity_attack_at: Option<Instant>,
     fluid_schedule_tick: u64,
 }
 
@@ -2971,7 +2979,12 @@ where
         return Ok(());
     };
     if game_mode == GameMode::Survival
-        && !within_entity_reach(player_pose, entity.position, game_mode)
+        && !within_entity_reach(
+            player_pose,
+            entity.position,
+            entity_aabb(&entity.type_name),
+            game_mode,
+        )
     {
         debug!(
             entity_id = packet.entity_id,
@@ -2980,6 +2993,18 @@ where
         return Ok(());
     }
     if entity.item_stack.is_some() {
+        return Ok(());
+    }
+    let now = Instant::now();
+    if game_mode == GameMode::Survival
+        && state
+            .last_entity_attack_at
+            .is_some_and(|last| now.duration_since(last) < PLAYER_ENTITY_ATTACK_COOLDOWN)
+    {
+        debug!(
+            entity_id = packet.entity_id,
+            "entity attack ignored during cooldown"
+        );
         return Ok(());
     }
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
@@ -2994,7 +3019,17 @@ where
         );
         return Ok(());
     };
+    state.last_entity_attack_at = Some(now);
     if !damage.killed {
+        write_packet(
+            writer,
+            &EntityEvent {
+                entity_id: packet.entity_id,
+                event_id: 2,
+            },
+            state.compression,
+        )
+        .await?;
         debug!(
             entity_id = packet.entity_id,
             health = damage.snapshot.health,
@@ -5088,14 +5123,26 @@ where
         return Ok(());
     }
     let player_position = Vec3::new(player_pose.x, player_pose.y, player_pose.z);
-    let Some(_hostile) = state
+    let Some(hostile) = state
         .sessions
-        .nearby_hostile_entities(player_position, HOSTILE_MELEE_RANGE)
+        .nearby_hostile_entities(
+            player_position,
+            HOSTILE_MELEE_RANGE + HOSTILE_MELEE_VERTICAL_REACH,
+        )
         .into_iter()
-        .next()
+        .find(|hostile| hostile_can_melee_player(hostile, player_position))
     else {
         return Ok(());
     };
+    write_packet(
+        writer,
+        &EntityAnimation {
+            entity_id: hostile.id.0,
+            action: EntityAnimationAction::SwingMainHand,
+        },
+        state.compression,
+    )
+    .await?;
     let damage = survival_damage_after_armor(Some(state), 3.0);
     let was_dead = survival_state.is_dead();
     survival_state.apply_damage(damage);
@@ -5113,6 +5160,32 @@ where
     Ok(())
 }
 
+fn hostile_can_melee_player(hostile: &ServerEntitySnapshot, player_position: Vec3) -> bool {
+    if (player_position.y - hostile.position.y).abs() > HOSTILE_MELEE_VERTICAL_REACH {
+        return false;
+    }
+    let to_player = Vec3::new(
+        player_position.x - hostile.position.x,
+        0.0,
+        player_position.z - hostile.position.z,
+    );
+    let distance = (to_player.x * to_player.x + to_player.z * to_player.z).sqrt();
+    if distance > HOSTILE_MELEE_RANGE {
+        return false;
+    }
+    if distance < 0.05 {
+        return true;
+    }
+    let speed =
+        (hostile.velocity.x * hostile.velocity.x + hostile.velocity.z * hostile.velocity.z).sqrt();
+    if speed < 0.01 {
+        return false;
+    }
+    let dot =
+        (hostile.velocity.x * to_player.x + hostile.velocity.z * to_player.z) / (speed * distance);
+    dot > 0.35
+}
+
 async fn replan_after_movement<W>(
     writer: &mut W,
     compression: Compression,
@@ -5120,11 +5193,15 @@ async fn replan_after_movement<W>(
     interaction: Option<&mut InteractionState>,
     old_center: (i32, i32),
     new_center: (i32, i32),
+    direction_yaw: f32,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
     if old_center == new_center {
+        if let Some(stream) = chunk_stream.as_mut() {
+            let _ = stream.replan_center(new_center.0, new_center.1, direction_yaw);
+        }
         return Ok(());
     }
     write_packet(
@@ -5137,7 +5214,7 @@ where
     )
     .await?;
     if let Some(stream) = chunk_stream.as_mut() {
-        let unloads = stream.replan_center(new_center.0, new_center.1);
+        let unloads = stream.replan_center(new_center.0, new_center.1, direction_yaw);
         let mut interaction = interaction;
         for (chunk_x, chunk_z) in unloads {
             if let Some(state) = interaction.as_deref_mut() {
@@ -5232,22 +5309,29 @@ where
             game_mode,
         );
         let mut stream_finished = false;
-        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
-            && !stream.is_complete()
-        {
-            match stream.step(writer, &mut state.light_cache).await? {
-                ChunkStreamStep::Progress => {
-                    stream_finished = stream.is_complete();
-                    tokio::task::yield_now().await;
-                }
-                ChunkStreamStep::Complete => {
+        if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut()) {
+            for _ in 0..CHUNK_STREAM_STEPS_PER_TURN {
+                if stream.is_complete() {
                     stream_finished = true;
+                    break;
+                }
+                match stream.step(writer, &mut state.light_cache).await? {
+                    ChunkStreamStep::Progress => {
+                        stream_finished = stream.is_complete();
+                        if !stream_finished {
+                            tokio::task::yield_now().await;
+                        }
+                    }
+                    ChunkStreamStep::Complete => {
+                        stream_finished = true;
+                        break;
+                    }
                 }
             }
         }
         if stream_finished {
-            if let Some(stream) = chunk_stream.as_ref() {
-                stream.log_summary();
+            if let Some(stream) = chunk_stream.as_mut() {
+                stream.log_summary_once();
             }
             last_response_at = Instant::now();
             pending_id = None;
@@ -5440,7 +5524,16 @@ where
                     }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                    replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
+                    replan_after_movement(
+                        writer,
+                        compression,
+                        &mut chunk_stream,
+                        interaction.as_deref_mut(),
+                        old_center,
+                        new_center,
+                        player_pose.yaw,
+                    )
+                    .await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
@@ -5459,7 +5552,16 @@ where
                     }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                    replan_after_movement(writer, compression, &mut chunk_stream, interaction.as_deref_mut(), old_center, new_center).await?;
+                    replan_after_movement(
+                        writer,
+                        compression,
+                        &mut chunk_stream,
+                        interaction.as_deref_mut(),
+                        old_center,
+                        new_center,
+                        player_pose.yaw,
+                    )
+                    .await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerRot::decode(&mut body)?;
@@ -5467,6 +5569,17 @@ where
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
+                    let center = player_pose.chunk_pos();
+                    replan_after_movement(
+                        writer,
+                        compression,
+                        &mut chunk_stream,
+                        interaction.as_deref_mut(),
+                        center,
+                        center,
+                        player_pose.yaw,
+                    )
+                    .await?;
                 } else if frame.id == ServerboundMovePlayerStatusOnly::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerStatusOnly::decode(&mut body)?;

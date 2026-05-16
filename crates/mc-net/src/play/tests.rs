@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::BTreeMap;
 
+use crate::play::chunk_stream::{passive_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::items::ItemReport;
 
@@ -753,6 +754,56 @@ fn door_half_state_builds_two_block_placement_states() {
         Some(mc_world::BlockStateId(4))
     );
     assert_eq!(horizontal_facing_from_yaw(180.0), "north");
+}
+
+#[test]
+fn hostile_melee_requires_moving_toward_player() {
+    let hostile = |velocity: Vec3| ServerEntitySnapshot {
+        id: mc_entity::EntityId(7),
+        uuid: uuid::Uuid::nil(),
+        type_id: 1,
+        type_name: "minecraft:zombie".into(),
+        position: Vec3::ZERO,
+        rotation: mc_entity::Rotation::ZERO,
+        velocity,
+        on_ground: true,
+        item_stack: None,
+    };
+    let player = Vec3::new(1.0, 0.0, 0.0);
+
+    assert!(hostile_can_melee_player(
+        &hostile(Vec3::new(0.2, 0.0, 0.0)),
+        player
+    ));
+    assert!(!hostile_can_melee_player(
+        &hostile(Vec3::new(-0.2, 0.0, 0.0)),
+        player
+    ));
+    assert!(!hostile_can_melee_player(&hostile(Vec3::ZERO), player));
+}
+
+#[test]
+fn hostile_melee_reaches_player_one_block_above() {
+    let hostile = ServerEntitySnapshot {
+        id: mc_entity::EntityId(7),
+        uuid: uuid::Uuid::nil(),
+        type_id: 1,
+        type_name: "minecraft:zombie".into(),
+        position: Vec3::new(0.0, 64.0, 0.0),
+        rotation: mc_entity::Rotation::ZERO,
+        velocity: Vec3::new(0.2, 0.0, 0.0),
+        on_ground: true,
+        item_stack: None,
+    };
+
+    assert!(hostile_can_melee_player(
+        &hostile,
+        Vec3::new(1.0, 65.0, 0.0)
+    ));
+    assert!(!hostile_can_melee_player(
+        &hostile,
+        Vec3::new(1.0, 67.0, 0.0)
+    ));
 }
 
 include!("tests/inventory_and_survival.rs");
