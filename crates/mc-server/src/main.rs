@@ -441,6 +441,24 @@ fn load_structure_rules(
         tracing::warn!(path = %root.display(), "no usable plains village templates loaded");
         return Ok(mc_worldgen::StructureRules::none());
     }
+    let structure_sets = match mc_data::worldgen_structures::load_structure_set_facts(
+        vanilla_dir.join("data/minecraft/worldgen"),
+    ) {
+        Ok(facts) => {
+            tracing::info!(
+                sets = facts.len(),
+                "worldgen structure-set facts loaded for Solaris structure policy",
+            );
+            Some(facts)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "structure-set facts unavailable; using fallback structure spacing",
+            );
+            None
+        }
+    };
     let template_count = templates.len();
     let block_count: usize = templates
         .iter()
@@ -452,9 +470,11 @@ fn load_structure_rules(
         blocks = block_count,
         "plains village templates loaded",
     );
-    Ok(mc_worldgen::StructureRules::plains_village_markers(
-        templates,
-    ))
+    let mut rules = mc_worldgen::StructureRules::plains_village_markers(templates);
+    if let Some(structure_sets) = structure_sets.as_ref() {
+        rules = rules.with_structure_set_facts(structure_sets);
+    }
+    Ok(rules)
 }
 
 fn collect_nbt_templates(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -605,21 +625,27 @@ fn generate_spawn_window(
     let positions = Arc::new(positions);
     let next = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = std::sync::mpsc::channel();
+    let batch_size = 8usize.min(total);
     for _ in 0..workers {
         let positions = Arc::clone(&positions);
         let next = Arc::clone(&next);
         let tx = tx.clone();
         let generator = Arc::clone(&generator);
         std::thread::spawn(move || {
+            let mut batch = Vec::with_capacity(batch_size);
             loop {
                 let idx = next.fetch_add(1, Ordering::Relaxed);
                 let Some(&pos) = positions.get(idx) else {
                     break;
                 };
                 let chunk = generator.generate(pos);
-                if tx.send((pos, chunk)).is_err() {
+                batch.push((pos, chunk));
+                if batch.len() >= batch_size && tx.send(std::mem::take(&mut batch)).is_err() {
                     break;
                 }
+            }
+            if !batch.is_empty() {
+                let _ = tx.send(batch);
             }
         });
     }
@@ -629,11 +655,13 @@ fn generate_spawn_window(
     let mut last_log = Instant::now();
     let log_every = (total / 20).max(64);
     let mut generated = 0usize;
-    for (pos, chunk) in rx {
-        storage
-            .insert_generated_chunk(pos, chunk)
-            .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))?;
-        generated += 1;
+    for batch in rx {
+        for (pos, chunk) in batch {
+            storage
+                .insert_generated_chunk(pos, chunk)
+                .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))?;
+            generated += 1;
+        }
         if generated == total
             || generated.is_multiple_of(log_every)
             || last_log.elapsed() >= Duration::from_secs(2)
@@ -648,6 +676,15 @@ fn generate_spawn_window(
         }
     }
 
+    let elapsed = started.elapsed();
+    let chunks_per_second = generated as f64 / elapsed.as_secs_f64().max(0.001);
+    tracing::info!(
+        generated,
+        total,
+        elapsed_ms = elapsed.as_millis(),
+        chunks_per_second,
+        "empty world pre-generation finished",
+    );
     Ok(generated)
 }
 

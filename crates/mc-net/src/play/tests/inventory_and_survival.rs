@@ -485,8 +485,11 @@ fn fallback_mining_rules_use_block_family_and_matching_tool() {
             < fallback_mining_time("dirt", None)
     );
     assert_eq!(
+        fallback_mining_time("podzol", None),
+        Duration::from_millis(200)
+    );
+    assert_eq!(
         fallback_mining_time("unknown_custom_block", None),
         Duration::from_millis(800)
     );
 }
-

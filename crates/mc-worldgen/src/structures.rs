@@ -4,6 +4,7 @@ use std::path::Path;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use mc_data::Identifier;
+use mc_data::worldgen_structures::StructureSetFacts;
 use mc_nbt::{ListTag, Tag};
 use mc_world::{BlockRegistry, BlockStateId};
 use thiserror::Error;
@@ -134,6 +135,27 @@ impl StructureRules {
             separation_chunks: 8,
             salt: 10_387_312,
         }
+    }
+
+    #[must_use]
+    pub fn with_structure_set_facts(mut self, facts: &[StructureSetFacts]) -> Self {
+        let Some(villages) = facts.iter().find(|set| {
+            set.structures
+                .iter()
+                .any(|structure| structure.as_str() == "minecraft:village_plains")
+        }) else {
+            return self;
+        };
+        if let Some(spacing) = villages.spacing {
+            self.grid_chunks = spacing.max(1);
+        }
+        if let Some(separation) = villages.separation {
+            self.separation_chunks = separation.max(0).min(self.grid_chunks - 1);
+        }
+        if let Some(salt) = villages.salt {
+            self.salt = salt;
+        }
+        self
     }
 
     #[must_use]
@@ -405,5 +427,31 @@ mod tests {
         assert_eq!(rules.templates().len(), 2);
         assert_eq!(rules.grid_chunks(), 34);
         assert_eq!(rules.separation_chunks(), 8);
+    }
+
+    #[test]
+    fn structure_set_facts_adjust_plains_village_spacing() {
+        let template = StructureTemplate::new(
+            [1, 1, 1],
+            vec![TemplateBlock {
+                pos: [0, 0, 0],
+                state: BlockStateId(1),
+            }],
+        );
+        let facts = vec![StructureSetFacts {
+            id: Identifier::parse("minecraft:villages").unwrap(),
+            structures: vec![Identifier::parse("minecraft:village_plains").unwrap()],
+            placement_type: Some(Identifier::parse("minecraft:random_spread").unwrap()),
+            spacing: Some(20),
+            separation: Some(5),
+            salt: Some(1234),
+        }];
+
+        let rules =
+            StructureRules::plains_village_markers(vec![template]).with_structure_set_facts(&facts);
+
+        assert_eq!(rules.grid_chunks(), 20);
+        assert_eq!(rules.separation_chunks(), 5);
+        assert_eq!(rules.salt(), 1234);
     }
 }

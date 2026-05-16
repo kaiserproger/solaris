@@ -57,6 +57,8 @@ const CAVE_MIN_Y: i32 = MIN_Y + 8;
 const CAVE_SURFACE_CLEARANCE: i32 = 24;
 const CAVE_FREQUENCY: f64 = 1.0 / 34.0;
 const CAVE_THRESHOLD: f64 = 0.24;
+const CAVE_BRANCH_FREQUENCY: f64 = 1.0 / 58.0;
+const CAVE_BRANCH_THRESHOLD: f64 = 0.32;
 const DEEPSLATE_TOP_Y: i32 = 0;
 const DEEPSLATE_SOLID_Y: i32 = -8;
 const COAL_MIN_Y: i32 = 0;
@@ -132,6 +134,16 @@ const OVERWORLD_BIOME_IDS: &[&str] = &[
     "minecraft:deep_dark",
 ];
 
+pub const GENERATION_STAGE_ORDER: &[&str] = &[
+    "base_terrain_and_surfaces",
+    "caves_and_ores",
+    "biome_assignment",
+    "surface_decorations",
+    "structures",
+    "heightmap_refresh",
+    "persistence_or_streaming",
+];
+
 /// Hill-noise terrain. Holds the resolved state ids of the four
 /// block types it emits so `generate` is allocation-free past the
 /// `Chunk::empty` it returns.
@@ -143,6 +155,10 @@ pub struct TerrainGenerator {
     dirt: BlockStateId,
     grass_block: BlockStateId,
     sand: BlockStateId,
+    red_sand: BlockStateId,
+    gravel: BlockStateId,
+    podzol: BlockStateId,
+    snow_block: BlockStateId,
     deepslate: BlockStateId,
     water: BlockStateId,
     biomes: BiomeRules,
@@ -156,9 +172,30 @@ pub struct TerrainGenerator {
 }
 
 #[derive(Clone)]
+struct ColumnPlan {
+    lx: u8,
+    lz: u8,
+    wx: i32,
+    wz: i32,
+    height: i32,
+    top_non_air: i32,
+    dirt_start: i32,
+    biome: Identifier,
+    surface: BlockStateId,
+    fill: BlockStateId,
+    hash: u64,
+}
+
+#[derive(Clone)]
 struct DecorationBlocks {
     oak_log: Option<BlockStateId>,
     oak_leaves: Option<BlockStateId>,
+    forest_log: Option<BlockStateId>,
+    forest_leaves: Option<BlockStateId>,
+    cold_log: Option<BlockStateId>,
+    cold_leaves: Option<BlockStateId>,
+    jungle_log: Option<BlockStateId>,
+    jungle_leaves: Option<BlockStateId>,
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
@@ -174,6 +211,18 @@ impl DecorationBlocks {
         Self {
             oak_log: optional_block(registry, "minecraft:oak_log"),
             oak_leaves: optional_block(registry, "minecraft:oak_leaves"),
+            forest_log: optional_block(registry, "minecraft:birch_log")
+                .or_else(|| optional_block(registry, "minecraft:oak_log")),
+            forest_leaves: optional_block(registry, "minecraft:birch_leaves")
+                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
+            cold_log: optional_block(registry, "minecraft:spruce_log")
+                .or_else(|| optional_block(registry, "minecraft:oak_log")),
+            cold_leaves: optional_block(registry, "minecraft:spruce_leaves")
+                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
+            jungle_log: optional_block(registry, "minecraft:jungle_log")
+                .or_else(|| optional_block(registry, "minecraft:oak_log")),
+            jungle_leaves: optional_block(registry, "minecraft:jungle_leaves")
+                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
@@ -215,7 +264,31 @@ impl DecorationBlocks {
                         blocks.cactus = Some(state);
                     }
                 }
+                "minecraft:patch_sugar_cane" | "minecraft:sugar_cane" => {
+                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
+                        blocks.sugar_cane = Some(state);
+                    }
+                }
                 _ => {}
+            }
+            let placed = feature.placed_feature.as_str();
+            if placed.contains("trees") || placed.contains("tree") {
+                let log = first_resolved_block_with_suffix(registry, &feature.block_states, "_log");
+                let leaves =
+                    first_resolved_block_with_suffix(registry, &feature.block_states, "_leaves");
+                if placed.contains("jungle") {
+                    blocks.jungle_log = log.or(blocks.jungle_log);
+                    blocks.jungle_leaves = leaves.or(blocks.jungle_leaves);
+                } else if placed.contains("taiga") || placed.contains("spruce") {
+                    blocks.cold_log = log.or(blocks.cold_log);
+                    blocks.cold_leaves = leaves.or(blocks.cold_leaves);
+                } else if placed.contains("forest") || placed.contains("birch") {
+                    blocks.forest_log = log.or(blocks.forest_log);
+                    blocks.forest_leaves = leaves.or(blocks.forest_leaves);
+                } else {
+                    blocks.oak_log = log.or(blocks.oak_log);
+                    blocks.oak_leaves = leaves.or(blocks.oak_leaves);
+                }
             }
         }
         blocks
@@ -365,8 +438,9 @@ pub struct OreRule {
 }
 
 impl OreRule {
+    #[cfg(test)]
     fn matches(&self, h: u64, y: i32, biome: &Identifier) -> bool {
-        self.y.contains(y)
+        (self.y.min..=self.y.max).contains(&y)
             && self.biomes.matches(biome)
             && h.is_multiple_of(self.spacing.at_y(y, self.y))
     }
@@ -382,10 +456,6 @@ impl YRange {
     #[must_use]
     pub const fn new(min: i32, max: i32) -> Self {
         Self { min, max }
-    }
-
-    fn contains(&self, y: i32) -> bool {
-        (self.min..=self.max).contains(&y)
     }
 }
 
@@ -461,6 +531,16 @@ fn optional_block(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> 
 
 fn first_resolved_block(registry: &BlockRegistry, ids: &[Identifier]) -> Option<BlockStateId> {
     ids.iter()
+        .find_map(|id| registry.block(id).map(|block| block.default))
+}
+
+fn first_resolved_block_with_suffix(
+    registry: &BlockRegistry,
+    ids: &[Identifier],
+    suffix: &str,
+) -> Option<BlockStateId> {
+    ids.iter()
+        .filter(|id| id.path().ends_with(suffix))
         .find_map(|id| registry.block(id).map(|block| block.default))
 }
 
@@ -781,6 +861,10 @@ impl TerrainGenerator {
             dirt: resolve_block(registry.as_ref(), "minecraft:dirt"),
             grass_block: resolve_block(registry.as_ref(), "minecraft:grass_block"),
             sand: resolve_block_or(registry.as_ref(), "minecraft:sand", stone),
+            red_sand: resolve_block_or(registry.as_ref(), "minecraft:red_sand", stone),
+            gravel: resolve_block_or(registry.as_ref(), "minecraft:gravel", stone),
+            podzol: resolve_block_or(registry.as_ref(), "minecraft:podzol", stone),
+            snow_block: resolve_block_or(registry.as_ref(), "minecraft:snow_block", stone),
             deepslate: resolve_block_or(registry.as_ref(), "minecraft:deepslate", stone),
             water: resolve_block_or(registry.as_ref(), "minecraft:water", air),
             biomes,
@@ -974,60 +1058,97 @@ impl TerrainGenerator {
         )
     }
 
-    fn fill_column(
-        &self,
-        chunk: &mut Chunk,
-        lx: u8,
-        lz: u8,
-        height: i32,
-        biome: &Identifier,
-    ) -> i32 {
-        let _ = chunk.set_block(lx, MIN_Y, lz, self.bedrock);
-        let dirt_start = (height - DIRT_DEPTH).max(MIN_Y + 1);
-        for y in (MIN_Y + 1)..dirt_start {
-            let _ = chunk.set_block(lx, y, lz, self.base_stone_for_y(lx, y, lz, chunk.pos));
-        }
-        let surface = if self.biomes.is_surface_water(biome) || self.biomes.is_beach_or_shore(biome)
-        {
-            self.sand
+    fn plan_column(&self, pos: ChunkPos, lx: u8, lz: u8) -> ColumnPlan {
+        let wx = pos.x * 16 + lx as i32;
+        let wz = pos.z * 16 + lz as i32;
+        let height = self.surface_height(wx, wz);
+        let biome = self.biome_for(wx, wz, height);
+        let (surface, fill) = self.surface_materials(&biome);
+        let top_non_air = if height < SEA_LEVEL || self.biomes.is_river(&biome) {
+            SEA_LEVEL
         } else {
-            self.grass_block
+            height
         };
-        let fill = if surface == self.sand {
-            self.sand
-        } else {
-            self.dirt
-        };
-        for y in dirt_start..height {
-            let _ = chunk.set_block(lx, y, lz, fill);
+        ColumnPlan {
+            lx,
+            lz,
+            wx,
+            wz,
+            height,
+            top_non_air,
+            dirt_start: (height - DIRT_DEPTH).max(MIN_Y + 1),
+            biome,
+            surface,
+            fill,
+            hash: feature_hash(self.seed, wx, height, wz, 0xDEC0_0001),
         }
-        let _ = chunk.set_block(lx, height, lz, surface);
-        let mut top_non_air = height;
-        if height < SEA_LEVEL || self.biomes.is_river(biome) {
-            for y in (height + 1)..=SEA_LEVEL {
-                let _ = chunk.set_block(lx, y, lz, self.water);
-            }
-            top_non_air = SEA_LEVEL;
-        }
-        // Air above stays as-is from Chunk::empty.
-        let _ = self.air;
-        top_non_air
     }
 
-    fn assign_biomes(&self, chunk: &mut Chunk, column_heights: &[i32; 256]) {
-        let pos = chunk.pos;
+    fn fill_column(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
+        let _ = chunk.set_block(plan.lx, MIN_Y, plan.lz, self.bedrock);
+        for y in (MIN_Y + 1)..plan.dirt_start {
+            let _ = chunk.set_block(
+                plan.lx,
+                y,
+                plan.lz,
+                self.base_stone_for_y(plan.lx, y, plan.lz, chunk.pos),
+            );
+        }
+        for y in plan.dirt_start..plan.height {
+            let _ = chunk.set_block(plan.lx, y, plan.lz, plan.fill);
+        }
+        let _ = chunk.set_block(plan.lx, plan.height, plan.lz, plan.surface);
+        if plan.top_non_air > plan.height {
+            for y in (plan.height + 1)..=plan.top_non_air {
+                let _ = chunk.set_block(plan.lx, y, plan.lz, self.water);
+            }
+        }
+    }
+
+    fn surface_materials(&self, biome: &Identifier) -> (BlockStateId, BlockStateId) {
+        let path = biome.path();
+        if self.biomes.is_surface_water(biome) || self.biomes.is_beach_or_shore(biome) {
+            return (self.sand, self.sand);
+        }
+        if path.contains("badlands") {
+            return (self.red_sand, self.red_sand);
+        }
+        if path == "desert" {
+            return (self.sand, self.sand);
+        }
+        if self.biomes.mountain.contains(biome) || path.contains("stony") {
+            return (self.gravel, self.stone);
+        }
+        if self.biomes.cold.contains(biome) || path.contains("snow") || path.contains("frozen") {
+            return (self.snow_block, self.dirt);
+        }
+        if matches!(
+            path,
+            "birch_forest"
+                | "old_growth_birch_forest"
+                | "dark_forest"
+                | "pale_garden"
+                | "old_growth_pine_taiga"
+                | "old_growth_spruce_taiga"
+        ) || path.contains("taiga")
+        {
+            return (self.podzol, self.dirt);
+        }
+        (self.grass_block, self.dirt)
+    }
+
+    fn assign_biomes(&self, chunk: &mut Chunk, columns: &[ColumnPlan; 256]) {
         for (section_idx, section) in chunk.biomes.iter_mut().enumerate() {
-            let mut palette: Vec<Identifier> = Vec::new();
+            let mut palette: Vec<Identifier> = Vec::with_capacity(4);
             let mut indices = PackedBitArray::zeroed(6, BIOME_VOLUME);
             for cy in 0..BIOME_DIM {
                 for cz in 0..BIOME_DIM {
                     for cx in 0..BIOME_DIM {
                         let lx = cx * 4 + 2;
                         let lz = cz * 4 + 2;
-                        let wx = pos.x * 16 + lx as i32;
-                        let wz = pos.z * 16 + lz as i32;
+                        let column = &columns[lz * 16 + lx];
                         let y = MIN_Y + section_idx as i32 * 16 + cy as i32 * 4 + 2;
-                        let biome = self.biome_for_cell(wx, y, wz, column_heights[lz * 16 + lx]);
+                        let biome = self.biome_for_cell(column.wx, y, column.wz, column.height);
                         let palette_idx = palette
                             .iter()
                             .position(|entry| entry == &biome)
@@ -1048,29 +1169,58 @@ impl TerrainGenerator {
         }
     }
 
-    fn apply_features(&self, chunk: &mut Chunk, lx: u8, lz: u8, height: i32) {
-        let wx = chunk.pos.x * 16 + lx as i32;
-        let wz = chunk.pos.z * 16 + lz as i32;
-        let cave_max_y = (height - CAVE_SURFACE_CLEARANCE).max(CAVE_MIN_Y);
-        for y in (MIN_Y + 1)..height {
-            if y >= CAVE_MIN_Y && y <= cave_max_y && self.is_cave_cell(wx, y, wz) {
-                let _ = chunk.set_block(lx, y, lz, self.air);
+    fn apply_features(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
+        if plan.dirt_start <= MIN_Y + 1 {
+            return;
+        }
+        self.apply_caves(chunk, plan);
+        self.apply_ores(chunk, plan);
+    }
+
+    fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
+        let cave_max_y = (plan.height - CAVE_SURFACE_CLEARANCE).min(plan.dirt_start - 1);
+        if cave_max_y < CAVE_MIN_Y {
+            return;
+        }
+        let mut y = CAVE_MIN_Y;
+        while y <= cave_max_y {
+            if self.is_cave_cell(plan.wx, y, plan.wz) {
+                let end = (y + 1).min(cave_max_y);
+                for carve_y in y..=end {
+                    let _ = chunk.set_block(plan.lx, carve_y, plan.lz, self.air);
+                }
+            }
+            y += 2;
+        }
+    }
+
+    fn apply_ores(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
+        let ore_max_y = plan.dirt_start - 1;
+        if ore_max_y <= MIN_Y {
+            return;
+        }
+        for rule in self.ores.rules() {
+            if !rule.biomes.matches(&plan.biome) {
                 continue;
             }
-
-            if matches!(chunk.get_block(lx, y, lz), Some(state) if state == self.stone || state == self.deepslate)
-            {
-                let biome = self.biome_for(wx, wz, height);
-                let ore = self.ore_for(
-                    wx,
-                    y,
-                    wz,
-                    chunk.get_block(lx, y, lz).unwrap_or(self.stone),
-                    &biome,
-                );
-                if ore != self.stone && ore != self.deepslate {
-                    let _ = chunk.set_block(lx, y, lz, ore);
+            let min_y = rule.y.min.max(MIN_Y + 1);
+            let max_y = rule.y.max.min(ore_max_y);
+            if min_y > max_y {
+                continue;
+            }
+            for y in min_y..=max_y {
+                let h = feature_hash(self.seed, plan.wx, y, plan.wz, 0x0A_E0);
+                if !h.is_multiple_of(rule.spacing.at_y(y, rule.y)) {
+                    continue;
                 }
+                let Some(base) = chunk.get_block(plan.lx, y, plan.lz) else {
+                    continue;
+                };
+                if base != self.stone && base != self.deepslate {
+                    continue;
+                }
+                let ore = self.ore_variant(base, rule.normal, rule.deepslate);
+                let _ = chunk.set_block(plan.lx, y, plan.lz, ore);
             }
         }
     }
@@ -1098,44 +1248,51 @@ impl TerrainGenerator {
         }
     }
 
-    fn apply_decorations(&self, chunk: &mut Chunk, column_heights: &[i32; 256]) {
-        let mut touched = [false; 256];
+    fn apply_decorations(&self, chunk: &mut Chunk, columns: &[ColumnPlan; 256]) {
+        let mut touched = [None; 256];
         for lz in 0..16u8 {
             for lx in 0..16u8 {
                 let idx = lz as usize * 16 + lx as usize;
-                let height = column_heights[idx];
+                let plan = &columns[idx];
+                let height = plan.height;
                 if height <= MIN_Y || height + 8 >= MAX_Y {
                     continue;
                 }
-                let wx = chunk.pos.x * 16 + lx as i32;
-                let wz = chunk.pos.z * 16 + lz as i32;
-                let biome = self.biome_for(wx, wz, height);
-                let surface = chunk.get_block(lx, height, lz).unwrap_or(self.air);
-                let h = feature_hash(self.seed, wx, height, wz, 0xDEC0_0001);
+                let biome = &plan.biome;
+                let surface = plan.surface;
+                let h = plan.hash;
 
-                if (self.biomes.temperate_forest.contains(&biome)
-                    || self.biomes.jungle.contains(&biome))
+                if (self.biomes.temperate_forest.contains(biome)
+                    || self.biomes.cold.contains(biome)
+                    || self.biomes.jungle.contains(biome))
                     && h.is_multiple_of(83)
-                    && self.place_tree(chunk, lx, height + 1, lz, &mut touched)
+                    && self.place_tree(
+                        chunk,
+                        lx,
+                        height + 1,
+                        lz,
+                        self.tree_blocks_for_biome(biome),
+                        &mut touched,
+                    )
                 {
                     continue;
                 }
-                if self.biomes.hot_dry.contains(&biome)
+                if self.biomes.hot_dry.contains(biome)
                     && surface == self.sand
                     && h.is_multiple_of(47)
                     && self.place_cactus(chunk, lx, height + 1, lz, &mut touched)
                 {
                     continue;
                 }
-                if (self.biomes.beach.contains(&biome) || self.biomes.river.contains(&biome))
+                if (self.biomes.beach.contains(biome) || self.biomes.river.contains(biome))
                     && h.is_multiple_of(29)
                     && self.place_sugar_cane(chunk, lx, height + 1, lz, &mut touched)
                 {
                     continue;
                 }
-                if (self.biomes.grassland.contains(&biome)
-                    || self.biomes.temperate_forest.contains(&biome))
-                    && surface == self.grass_block
+                if (self.biomes.grassland.contains(biome)
+                    || self.biomes.temperate_forest.contains(biome))
+                    && (surface == self.grass_block || surface == self.podzol)
                 {
                     let plant = if h.is_multiple_of(97) {
                         self.decorations.pumpkin
@@ -1156,8 +1313,8 @@ impl TerrainGenerator {
         }
         for lz in 0..16u8 {
             for lx in 0..16u8 {
-                if touched[lz as usize * 16 + lx as usize] {
-                    self.refresh_structure_column(chunk, lx, lz);
+                if let Some(top) = touched[lz as usize * 16 + lx as usize] {
+                    self.refresh_known_top_column(chunk, lx, lz, top);
                 }
             }
         }
@@ -1169,10 +1326,10 @@ impl TerrainGenerator {
         lx: u8,
         base_y: i32,
         lz: u8,
-        touched: &mut [bool; 256],
+        blocks: (Option<BlockStateId>, Option<BlockStateId>),
+        touched: &mut [Option<i32>; 256],
     ) -> bool {
-        let (Some(log), Some(leaves)) = (self.decorations.oak_log, self.decorations.oak_leaves)
-        else {
+        let (Some(log), Some(leaves)) = blocks else {
             return false;
         };
         if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || base_y + 5 >= MAX_Y {
@@ -1204,13 +1361,28 @@ impl TerrainGenerator {
         true
     }
 
+    fn tree_blocks_for_biome(
+        &self,
+        biome: &Identifier,
+    ) -> (Option<BlockStateId>, Option<BlockStateId>) {
+        if self.biomes.jungle.contains(biome) {
+            (self.decorations.jungle_log, self.decorations.jungle_leaves)
+        } else if self.biomes.cold.contains(biome) || biome.path().contains("taiga") {
+            (self.decorations.cold_log, self.decorations.cold_leaves)
+        } else if self.biomes.temperate_forest.contains(biome) {
+            (self.decorations.forest_log, self.decorations.forest_leaves)
+        } else {
+            (self.decorations.oak_log, self.decorations.oak_leaves)
+        }
+    }
+
     fn place_cactus(
         &self,
         chunk: &mut Chunk,
         lx: u8,
         base_y: i32,
         lz: u8,
-        touched: &mut [bool; 256],
+        touched: &mut [Option<i32>; 256],
     ) -> bool {
         let Some(cactus) = self.decorations.cactus else {
             return false;
@@ -1234,7 +1406,7 @@ impl TerrainGenerator {
         lx: u8,
         base_y: i32,
         lz: u8,
-        touched: &mut [bool; 256],
+        touched: &mut [Option<i32>; 256],
     ) -> bool {
         let Some(sugar_cane) = self.decorations.sugar_cane else {
             return false;
@@ -1257,10 +1429,13 @@ impl TerrainGenerator {
             .any(|(dx, dz)| {
                 let x = lx as i8 + dx;
                 let z = lz as i8 + dz;
-                (0..16).contains(&x)
-                    && (0..16).contains(&z)
-                    && (chunk.get_block(x as u8, y, z as u8) == Some(self.water)
-                        || chunk.get_block(x as u8, y + 1, z as u8) == Some(self.water))
+                if !(0..16).contains(&x) || !(0..16).contains(&z) {
+                    return false;
+                }
+                let x = x as u8;
+                let z = z as u8;
+                chunk.get_block(x, y, z) == Some(self.water)
+                    || chunk.get_block(x, y + 1, z) == Some(self.water)
             })
     }
 
@@ -1271,11 +1446,28 @@ impl TerrainGenerator {
         y: i32,
         lz: u8,
         state: BlockStateId,
-        touched: &mut [bool; 256],
+        touched: &mut [Option<i32>; 256],
     ) {
         if chunk.set_block(lx, y, lz, state).is_some() {
-            touched[lz as usize * 16 + lx as usize] = true;
+            let touched = &mut touched[lz as usize * 16 + lx as usize];
+            *touched = Some(touched.map_or(y, |top| top.max(y)));
         }
+    }
+
+    fn refresh_known_top_column(&self, chunk: &mut Chunk, lx: u8, lz: u8, top: i32) {
+        let current = chunk
+            .heightmaps
+            .get("MOTION_BLOCKING")
+            .map(|heightmap| heightmap.get(lx, lz) as i32 + MIN_Y - 1)
+            .unwrap_or(MIN_Y);
+        let value = (top.max(current) + 1 - MIN_Y) as u32;
+        if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
+            mb.set(lx, lz, value);
+        }
+        if let Some(ws) = chunk.heightmaps.get_mut("WORLD_SURFACE") {
+            ws.set(lx, lz, value);
+        }
+        chunk.highest_opaque.set(lx, lz, value);
     }
 
     fn apply_structure_cell(
@@ -1365,9 +1557,25 @@ impl TerrainGenerator {
             3,
             0.55,
         );
-        n > CAVE_THRESHOLD
+        let branch = fbm_2d(
+            (x as f64 + y as f64 * 0.41) * CAVE_BRANCH_FREQUENCY,
+            z as f64 * CAVE_BRANCH_FREQUENCY,
+            self.seed ^ 0x4252_414E_4348,
+            2,
+            0.5,
+        );
+        let room = feature_hash(
+            self.seed,
+            x.div_euclid(4),
+            y.div_euclid(3),
+            z.div_euclid(4),
+            0xC4A7,
+        )
+        .is_multiple_of(211);
+        n > CAVE_THRESHOLD || branch > CAVE_BRANCH_THRESHOLD || room
     }
 
+    #[cfg(test)]
     fn ore_for(
         &self,
         x: i32,
@@ -1459,32 +1667,29 @@ impl ChunkGenerator for TerrainGenerator {
         chunk
             .heightmaps
             .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
-        let mut column_heights = [MIN_Y; 256];
+        let columns = std::array::from_fn(|idx| {
+            let lx = (idx % 16) as u8;
+            let lz = (idx / 16) as u8;
+            self.plan_column(pos, lx, lz)
+        });
 
-        for lz in 0..16u8 {
-            for lx in 0..16u8 {
-                let wx = pos.x * 16 + lx as i32;
-                let wz = pos.z * 16 + lz as i32;
-                let height = self.surface_height(wx, wz);
-                let biome = self.biome_for(wx, wz, height);
-                let top_non_air = self.fill_column(&mut chunk, lx, lz, height, &biome);
-                column_heights[lz as usize * 16 + lx as usize] = height;
-                self.apply_features(&mut chunk, lx, lz, height);
-                // Heightmap value: Y of the first air cell above the
-                // top non-air block, expressed as `(top + 1) - MIN_Y`.
-                let world_surface = (top_non_air + 1 - MIN_Y) as u32;
-                let motion_blocking = (height + 1 - MIN_Y) as u32;
-                if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
-                    mb.set(lx, lz, motion_blocking);
-                }
-                if let Some(ws) = chunk.heightmaps.get_mut("WORLD_SURFACE") {
-                    ws.set(lx, lz, world_surface);
-                }
-                chunk.highest_opaque.set(lx, lz, motion_blocking);
+        for plan in &columns {
+            self.fill_column(&mut chunk, plan);
+            self.apply_features(&mut chunk, plan);
+            // Heightmap value: Y of the first air cell above the
+            // top non-air block, expressed as `(top + 1) - MIN_Y`.
+            let world_surface = (plan.top_non_air + 1 - MIN_Y) as u32;
+            let motion_blocking = (plan.height + 1 - MIN_Y) as u32;
+            if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
+                mb.set(plan.lx, plan.lz, motion_blocking);
             }
+            if let Some(ws) = chunk.heightmaps.get_mut("WORLD_SURFACE") {
+                ws.set(plan.lx, plan.lz, world_surface);
+            }
+            chunk.highest_opaque.set(plan.lx, plan.lz, motion_blocking);
         }
-        self.assign_biomes(&mut chunk, &column_heights);
-        self.apply_decorations(&mut chunk, &column_heights);
+        self.assign_biomes(&mut chunk, &columns);
+        self.apply_decorations(&mut chunk, &columns);
         self.apply_structures(&mut chunk);
         chunk.status = "minecraft:full".into();
         chunk.dirty = true;
@@ -1806,6 +2011,60 @@ mod tests {
                     properties: BTreeMap::new(),
                 }],
             },
+            BlockReport {
+                id: Identifier::parse("minecraft:red_sand").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 34,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:gravel").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 35,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:podzol").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 36,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:snow_block").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 37,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:birch_log").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 38,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:birch_leaves").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 39,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
         ];
         Arc::new(BlockRegistry::from_report(&report).unwrap())
     }
@@ -1816,18 +2075,16 @@ mod tests {
         let chunk = g.generate(ChunkPos { x: 0, z: 0 });
         let air = BlockStateId(0);
         let bedrock = BlockStateId(1);
-        let grass = BlockStateId(4);
         let water = BlockStateId(5);
-        let sand = BlockStateId(14);
 
         // Bedrock at MIN_Y.
         assert_eq!(chunk.get_block(8, MIN_Y, 8), Some(bedrock));
         // Find the terrain surface. Biome selection decides whether it
-        // is grassland or a water/coast sand surface.
+        // is grassland, forest, cold, dry, mountain, or water/coast material.
         let height = g.surface_height(8, 8);
-        assert!(
-            matches!(chunk.get_block(8, height, 8), Some(state) if state == grass || state == sand)
-        );
+        let biome = g.biome_for(8, 8, height);
+        let (surface, _) = g.surface_materials(&biome);
+        assert!(matches!(chunk.get_block(8, height, 8), Some(state) if state == surface));
         if height < SEA_LEVEL {
             assert_eq!(chunk.get_block(8, SEA_LEVEL, 8), Some(water));
             assert_eq!(chunk.get_block(8, SEA_LEVEL + 1, 8), Some(air));
@@ -1929,12 +2186,10 @@ mod tests {
             x: 1_000,
             z: -1_000,
         });
-        let grass = BlockStateId(4);
-        let sand = BlockStateId(14);
         let height = g.surface_height(1_000 * 16 + 8, -1_000 * 16 + 8);
-        assert!(
-            matches!(chunk.get_block(8, height, 8), Some(state) if state == grass || state == sand)
-        );
+        let biome = g.biome_for(1_000 * 16 + 8, -1_000 * 16 + 8, height);
+        let (surface, _) = g.surface_materials(&biome);
+        assert!(matches!(chunk.get_block(8, height, 8), Some(state) if state == surface));
         assert_eq!(chunk.status, "minecraft:full");
     }
 
@@ -2003,6 +2258,41 @@ mod tests {
         assert_eq!(
             chunk.get_block(lx, SEA_LEVEL + 1, lz),
             Some(BlockStateId(0))
+        );
+    }
+
+    #[test]
+    fn biome_surface_rules_are_visibly_distinct() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let cases = [
+            ("minecraft:plains", BlockStateId(4), BlockStateId(3)),
+            ("minecraft:birch_forest", BlockStateId(36), BlockStateId(3)),
+            ("minecraft:badlands", BlockStateId(34), BlockStateId(34)),
+            ("minecraft:desert", BlockStateId(14), BlockStateId(14)),
+            ("minecraft:jagged_peaks", BlockStateId(35), BlockStateId(2)),
+            ("minecraft:snowy_plains", BlockStateId(37), BlockStateId(3)),
+            ("minecraft:beach", BlockStateId(14), BlockStateId(14)),
+        ];
+
+        for (biome, surface, fill) in cases {
+            let biome = Identifier::parse(biome).unwrap();
+            assert_eq!(g.surface_materials(&biome), (surface, fill));
+        }
+    }
+
+    #[test]
+    fn generation_stage_order_is_explicit() {
+        assert_eq!(
+            GENERATION_STAGE_ORDER,
+            &[
+                "base_terrain_and_surfaces",
+                "caves_and_ores",
+                "biome_assignment",
+                "surface_decorations",
+                "structures",
+                "heightmap_refresh",
+                "persistence_or_streaming",
+            ]
         );
     }
 
@@ -2105,6 +2395,54 @@ mod tests {
         }
 
         panic!("sampled chunks should contain a grass decoration from feature facts");
+    }
+
+    #[test]
+    fn feature_facts_drive_tree_blocks() {
+        let registry = tiny_registry();
+        let features = vec![WorldgenFeatureFacts {
+            placed_feature: Identifier::parse("minecraft:trees_flower_forest").unwrap(),
+            configured_feature: Identifier::parse("minecraft:test_tree").unwrap(),
+            configured_type: Identifier::parse("minecraft:tree").unwrap(),
+            placement: mc_data::worldgen_features::FeaturePlacementFacts::default(),
+            block_states: vec![
+                Identifier::parse("minecraft:birch_log").unwrap(),
+                Identifier::parse("minecraft:birch_leaves").unwrap(),
+            ],
+            tags: vec![],
+        }];
+        let g = TerrainGenerator::new(42, registry).with_feature_facts(&features);
+        let expected_log = BlockStateId(38);
+        let expected_leaves = BlockStateId(39);
+
+        for cx in -16..=16 {
+            for cz in -16..=16 {
+                let chunk = g.generate(ChunkPos { x: cx, z: cz });
+                for lx in 2..=13u8 {
+                    for lz in 2..=13u8 {
+                        let wx = cx * 16 + lx as i32;
+                        let wz = cz * 16 + lz as i32;
+                        let height = g.surface_height(wx, wz);
+                        let biome = g.biome_for(wx, wz, height);
+                        if !g.biomes.temperate_forest.contains(&biome) {
+                            continue;
+                        }
+                        let h = feature_hash(g.seed, wx, height, wz, 0xDEC0_0001);
+                        if h.is_multiple_of(83)
+                            && chunk.get_block(lx, height + 1, lz) == Some(expected_log)
+                        {
+                            assert_eq!(
+                                chunk.get_block(lx + 1, height + 4, lz),
+                                Some(expected_leaves)
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        panic!("sampled chunks should contain a data-fed forest tree");
     }
 
     #[test]
@@ -2601,5 +2939,27 @@ mod tests {
             saw_deepslate,
             "expected deepslate below the transition band"
         );
+    }
+
+    #[test]
+    #[ignore = "debug-build throughput probe for M31 closeout"]
+    fn generated_spawn_window_debug_budget_reports_throughput() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let started = std::time::Instant::now();
+        let mut chunks = 0usize;
+        for x in -2..=2 {
+            for z in -2..=2 {
+                let chunk = g.generate(ChunkPos { x, z });
+                assert_eq!(chunk.status, "minecraft:full");
+                chunks += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        let chunks_per_second = chunks as f64 / elapsed.as_secs_f64().max(0.001);
+        eprintln!(
+            "generated {chunks} chunks in {elapsed_ms} ms ({chunks_per_second:.1} chunks/s)",
+            elapsed_ms = elapsed.as_millis()
+        );
+        assert!(elapsed < std::time::Duration::from_secs(10));
     }
 }

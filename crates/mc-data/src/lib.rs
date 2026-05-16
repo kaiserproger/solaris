@@ -45,6 +45,7 @@ pub mod tags;
 pub mod worldgen_features;
 pub mod worldgen_inventory;
 pub mod worldgen_ores;
+pub mod worldgen_structures;
 
 pub use identifier::{Identifier, IdentifierError};
 

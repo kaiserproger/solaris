@@ -284,6 +284,10 @@ mod tests {
             loot.block_drop(&Identifier::parse("minecraft:stone").unwrap()),
             Some(&Identifier::parse("minecraft:cobblestone").unwrap())
         );
+        assert_eq!(
+            loot.block_drop(&Identifier::parse("minecraft:podzol").unwrap()),
+            Some(&Identifier::parse("minecraft:dirt").unwrap())
+        );
     }
 
     #[test]

@@ -116,7 +116,7 @@ const FALLBACK_MINING_RULES: &[MiningRule] = &[
         tool_suffix: Some("_shovel"),
     },
     MiningRule {
-        block_path_contains: &["leaves", "grass", "flower"],
+        block_path_contains: &["leaves", "grass", "flower", "podzol"],
         base_time: SURVIVAL_MINING_FALLBACK_TIME,
         tool_suffix: None,
     },

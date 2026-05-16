@@ -32,6 +32,7 @@
     "minecraft:iron_ore": "minecraft:raw_iron",
     "minecraft:lapis_ore": "minecraft:lapis_lazuli",
     "minecraft:oak_leaves": "minecraft:apple",
+    "minecraft:podzol": "minecraft:dirt",
     "minecraft:redstone_ore": "minecraft:redstone",
     "minecraft:stone": "minecraft:cobblestone"
   }
