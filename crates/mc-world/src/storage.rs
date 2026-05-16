@@ -60,6 +60,7 @@ pub enum WorldError {
 
 /// Read-only handle to a world's chunk data.
 pub struct WorldStorage {
+    world_root: Option<PathBuf>,
     region_root: PathBuf,
     registry: Arc<BlockRegistry>,
     /// LRU of fully decoded chunks, keyed by chunk position.
@@ -140,6 +141,7 @@ impl WorldStorage {
         };
 
         Ok(Self {
+            world_root: Some(dir.to_path_buf()),
             region_root,
             registry,
             cache: HashMap::new(),
@@ -164,6 +166,7 @@ impl WorldStorage {
     #[must_use]
     pub fn in_memory_with_capacity(registry: Arc<BlockRegistry>, capacity: usize) -> Self {
         Self {
+            world_root: None,
             region_root: PathBuf::new(),
             registry,
             cache: HashMap::new(),
@@ -213,6 +216,11 @@ impl WorldStorage {
     #[must_use]
     pub fn registry_arc(&self) -> Arc<BlockRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    #[must_use]
+    pub fn world_root(&self) -> Option<&Path> {
+        self.world_root.as_deref()
     }
 
     /// Look up the block at an absolute world position. Returns

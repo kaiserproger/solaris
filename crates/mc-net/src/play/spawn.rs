@@ -46,6 +46,7 @@ pub(super) fn spawn_y_from_chunk(
 /// `(chunk_x, chunk_z)` for the constant spawn point. Implemented as a
 /// fn rather than inlined so the math is unit-testable and so M3.e can
 /// share the formula when it computes the view-distance ring.
+#[cfg(test)]
 pub(super) fn spawn_chunk_pos() -> (i32, i32) {
     chunk_pos_from_coords(SPAWN_X, SPAWN_Z)
 }

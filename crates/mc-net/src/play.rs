@@ -30,8 +30,8 @@ use mc_data::items::ItemRegistry;
 use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
-    AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntityStore, GoalState, SpawnEntity,
-    Vec3,
+    AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, EntityStore,
+    GoalState, SpawnEntity, Vec3,
 };
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
@@ -83,6 +83,7 @@ mod commands;
 mod containers;
 mod inventory;
 mod item_blocks;
+pub(crate) mod persistence;
 mod recipes;
 mod session;
 mod spawn;
@@ -121,13 +122,16 @@ use inventory::{
     item_max_stack, survival_damage_after_armor,
 };
 use item_blocks::{ItemToBlockTable, fallback_crafting_recipes};
+use persistence::{PlayerPersistedState, load_player_state, save_player_state};
 use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
     ServerEntitySnapshot, SessionId, dispatch_visibility_commands, within_block_reach,
     within_entity_reach,
 };
-use spawn::{chunk_pos_from_coords, spawn_chunk_pos, spawn_dimension, spawn_position};
+#[cfg(test)]
+use spawn::spawn_chunk_pos;
+use spawn::{chunk_pos_from_coords, spawn_dimension, spawn_position};
 #[cfg(test)]
 use spawn::{pack_block_pos, spawn_y_from_chunk};
 use survival::{
@@ -335,8 +339,36 @@ where
     );
 
     let (spawn_x, spawn_y, spawn_z) = spawn_position(config).await;
+    let default_spawn_pose = PlayerPose::new(spawn_x, spawn_y, spawn_z);
+    let world_root = if let Some(world) = config.world.as_ref() {
+        let storage = world.lock().await;
+        storage.world_root().map(std::path::Path::to_path_buf)
+    } else {
+        None
+    };
+    let default_player_state = PlayerPersistedState::new_default(default_spawn_pose);
+    let player_state = if let Some(root) = world_root.as_deref() {
+        match load_player_state(
+            root,
+            profile.uuid,
+            &config.items,
+            default_player_state.clone(),
+        ) {
+            Ok(Some(state)) => {
+                info!(player = %profile.name, state = %state, "loaded player state");
+                state
+            }
+            Ok(None) => default_player_state,
+            Err(err) => {
+                warn!(player = %profile.name, error = %err, "player state load failed; using defaults");
+                default_player_state
+            }
+        }
+    } else {
+        default_player_state
+    };
 
-    let (spawn_cx, spawn_cz) = spawn_chunk_pos();
+    let (spawn_cx, spawn_cz) = player_state.pose.chunk_pos();
     let (outbound_tx, outbound_rx) =
         mpsc::channel(config.chunk_pipeline.chunk_result_queue_size.max(16));
     let initial_desired = if config.world.is_some() {
@@ -344,7 +376,7 @@ where
     } else {
         HashSet::new()
     };
-    let initial_pose = PlayerPose::new(spawn_x, spawn_y, spawn_z);
+    let initial_pose = player_state.pose;
     let (session_id, visibility) = sessions.register(
         profile,
         (spawn_cx, spawn_cz),
@@ -368,7 +400,7 @@ where
         dimension_type_id: dim_id,
         dimension_name: dim_name.clone(),
         hashed_seed: 0,
-        game_mode: 0, // survival
+        game_mode: player_state.game_mode.id() as u8,
         previous_game_mode: -1,
         is_debug: false,
         is_flat: false,
@@ -401,14 +433,14 @@ where
         writer,
         &SynchronizePlayerPosition {
             teleport_id: 1,
-            x: spawn_x,
-            y: spawn_y,
-            z: spawn_z,
+            x: initial_pose.x,
+            y: initial_pose.y,
+            z: initial_pose.z,
             dx: 0.0,
             dy: 0.0,
             dz: 0.0,
-            yaw: 0.0,
-            pitch: 0.0,
+            yaw: initial_pose.yaw,
+            pitch: initial_pose.pitch,
             relative_flags: 0,
         },
         compression,
@@ -479,6 +511,8 @@ where
     if config.world.is_some() && chunk_stream.is_none() {
         warn!("worldgen/biome registry missing; skipping chunk emission");
     }
+    let player_save_state = Arc::new(Mutex::new(player_state.clone()));
+    sessions.register_player_persistence(session_id, Arc::clone(&player_save_state));
     let result = async {
         if let Some(stream) = chunk_stream.as_mut()
             && stream.step(writer, &mut light_cache).await? == ChunkStreamStep::Complete
@@ -489,8 +523,15 @@ where
         // 6. Seed an empty server-authoritative player inventory. Test
         //    and dev-only inventory mutation goes through explicit
         //    debug commands; normal survival no longer gets a starter kit.
-        let initial_inventory = PlayerInventory::empty();
-        write_packet(writer, &ClientboundSetHeldSlot { slot: 0 }, compression).await?;
+        let initial_inventory = player_state.inventory.clone();
+        write_packet(
+            writer,
+            &ClientboundSetHeldSlot {
+                slot: i32::from(player_state.selected_hotbar_slot),
+            },
+            compression,
+        )
+        .await?;
         write_packet(
             writer,
             &ClientboundContainerSetContent {
@@ -524,7 +565,7 @@ where
             workspace: LightWorkspace::new(),
             light_cache: std::mem::take(&mut light_cache),
             compression,
-            selected_hotbar_slot: 0,
+            selected_hotbar_slot: player_state.selected_hotbar_slot,
             inventory: initial_inventory,
             carried_item: ItemStack::EMPTY,
             inventory_state_id: 1,
@@ -552,15 +593,28 @@ where
             Arc::clone(&sessions),
             session_id,
             initial_pose,
-            initial_pose,
+            player_state.spawn.pose(),
             respawn,
             CommandPermissions::for_local_dev_profile(profile),
-            SurvivalState::FULL,
+            player_state.survival,
+            player_state.game_mode,
+            Some(Arc::clone(&player_save_state)),
             outbound_rx,
         )
         .await
     }
     .await;
+
+    if let Some(root) = world_root.as_deref() {
+        let snapshot = player_save_state
+            .lock()
+            .expect("player persistence state poisoned")
+            .clone();
+        match save_player_state(root, profile.uuid, &config.items, &snapshot) {
+            Ok(()) => info!(player = %profile.name, state = %snapshot, "saved player state"),
+            Err(err) => warn!(player = %profile.name, error = %err, "player state save failed"),
+        }
+    }
 
     dispatch_visibility_commands(sessions.unregister(session_id));
     result
@@ -5105,6 +5159,28 @@ where
     Ok(())
 }
 
+fn sync_player_persistence(
+    player_save_state: &Option<Arc<Mutex<PlayerPersistedState>>>,
+    pose: PlayerPose,
+    interaction: Option<&InteractionState>,
+    survival: SurvivalState,
+    game_mode: GameMode,
+) {
+    let Some(player_save_state) = player_save_state else {
+        return;
+    };
+    let mut state = player_save_state
+        .lock()
+        .expect("player persistence state poisoned");
+    state.pose = pose;
+    state.survival = survival;
+    state.game_mode = game_mode;
+    if let Some(interaction) = interaction {
+        state.inventory = interaction.inventory.clone();
+        state.selected_hotbar_slot = interaction.selected_hotbar_slot;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
@@ -5120,6 +5196,8 @@ async fn play_loop<R, W>(
     respawn: ClientboundRespawn,
     permissions: CommandPermissions,
     mut survival_state: SurvivalState,
+    mut game_mode: GameMode,
+    player_save_state: Option<Arc<Mutex<PlayerPersistedState>>>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
 ) -> Result<(), ConnectionError>
 where
@@ -5143,10 +5221,16 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut survival_tick: u32 = 0;
-    let mut game_mode = GameMode::Survival;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
 
     loop {
+        sync_player_persistence(
+            &player_save_state,
+            player_pose,
+            interaction.as_deref(),
+            survival_state,
+            game_mode,
+        );
         let mut stream_finished = false;
         if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
             && !stream.is_complete()

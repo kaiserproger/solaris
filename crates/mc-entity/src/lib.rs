@@ -303,6 +303,29 @@ impl EntityStore {
         id
     }
 
+    pub fn insert_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
+        if self.slots_by_id.contains_key(&snapshot.id) {
+            return false;
+        }
+        let slot = self.ids.len();
+        self.next_id = self.next_id.max(snapshot.id.0);
+        self.slots_by_id.insert(snapshot.id, slot);
+        self.ids.push(snapshot.id);
+        self.uuids.push(snapshot.uuid);
+        self.type_ids.push(snapshot.type_id);
+        self.type_names.push(snapshot.type_name);
+        self.positions.push(snapshot.position);
+        self.rotations.push(snapshot.rotation);
+        self.velocities.push(snapshot.velocity);
+        self.on_ground.push(snapshot.on_ground);
+        self.item_stacks.push(snapshot.item_stack);
+        self.lifecycles.push(snapshot.lifecycle);
+        self.healths.push(snapshot.health);
+        self.attributes.push(snapshot.attributes);
+        self.goals.push(snapshot.goal);
+        true
+    }
+
     #[must_use]
     pub fn contains(&self, id: EntityId) -> bool {
         self.slots_by_id.contains_key(&id)

@@ -348,7 +348,6 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
 
-    let world_for_shutdown = net_world_clone(&world);
     let net = cfg
         .to_network(
             data,
@@ -372,10 +371,11 @@ async fn serve(path: &Path) -> Result<()> {
         "Solaris starting",
     );
 
-    // M6.b: race the network listener against a Ctrl-C signal. On
-    // signal, stop the listener, take the world mutex exclusively,
-    // and flush every dirty chunk back to disk before returning.
-    let run_fut = mc_net::run(net);
+    // M29.f: race the network listener against a Ctrl-C signal. On
+    // signal, run the shared save-all path before returning.
+    let bound = mc_net::bind(net).await.context("network bind")?;
+    let save_handle = bound.save_handle();
+    let run_fut = bound.serve();
     let shutdown = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
@@ -389,20 +389,24 @@ async fn serve(path: &Path) -> Result<()> {
         }
         () = shutdown => {
             tracing::info!("shutdown signal received");
-            if let Some(world) = world_for_shutdown {
-                let mut guard = world.lock().await;
-                match guard.flush_dirty() {
-                    Ok(n) => tracing::info!(flushed = n, "shutdown: flushed dirty chunks"),
-                    Err(err) => tracing::error!(error = %err, "shutdown: flush_dirty failed"),
+            let report = save_handle.save_all().await;
+            if report.is_ok() {
+                tracing::info!(
+                    players = report.players_saved,
+                    entities = report.entities_saved,
+                    chunks = report.chunks_flushed,
+                    world_metadata = report.world_metadata_saved,
+                    "shutdown: save-all complete"
+                );
+            } else {
+                for error in &report.errors {
+                    tracing::error!(%error, "shutdown: save-all error");
                 }
+                anyhow::bail!("shutdown save-all failed with {} error(s)", report.errors.len());
             }
             Ok(())
         }
     }
-}
-
-fn net_world_clone(world: &Option<mc_net::WorldHandle>) -> Option<mc_net::WorldHandle> {
-    world.as_ref().map(Arc::clone)
 }
 
 fn load_structure_rules(

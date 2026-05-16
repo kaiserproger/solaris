@@ -115,6 +115,8 @@ struct SessionRegistryInner {
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
     chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
+    player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
+    world_time: u64,
 }
 
 impl Default for SessionRegistryInner {
@@ -129,6 +131,8 @@ impl Default for SessionRegistryInner {
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
             chest_viewers: HashMap::new(),
+            player_persistence: HashMap::new(),
+            world_time: 0,
         }
     }
 }
@@ -142,6 +146,59 @@ impl SessionRegistry {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn set_world_time(&self, world_time: u64) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        inner.world_time = world_time;
+    }
+
+    pub(crate) fn advance_world_time(&self, ticks: u64) -> u64 {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        inner.world_time = inner.world_time.wrapping_add(ticks);
+        inner.world_time
+    }
+
+    pub(crate) fn world_time(&self) -> u64 {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner.world_time
+    }
+
+    pub(super) fn register_player_persistence(
+        &self,
+        id: SessionId,
+        state: Arc<Mutex<PlayerPersistedState>>,
+    ) {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        inner.player_persistence.insert(id, state);
+    }
+
+    pub(crate) fn persisted_player_states(&self) -> Vec<(uuid::Uuid, PlayerPersistedState)> {
+        let entries = {
+            let inner = self.inner.lock().expect("session registry poisoned");
+            inner
+                .sessions
+                .iter()
+                .filter_map(|(id, session)| {
+                    inner
+                        .player_persistence
+                        .get(id)
+                        .map(|state| (session.uuid, Arc::clone(state)))
+                })
+                .collect::<Vec<_>>()
+        };
+        entries
+            .into_iter()
+            .map(|(uuid, state)| {
+                (
+                    uuid,
+                    state
+                        .lock()
+                        .expect("player persistence state poisoned")
+                        .clone(),
+                )
+            })
+            .collect()
     }
 
     pub(super) fn register(
@@ -202,6 +259,7 @@ impl SessionRegistry {
         for viewers in inner.chest_viewers.values_mut() {
             viewers.remove(&id);
         }
+        inner.player_persistence.remove(&id);
         inner
             .furnace_viewers
             .retain(|_, viewers| !viewers.is_empty());
@@ -727,6 +785,31 @@ impl SessionRegistry {
                 velocity: entity.velocity,
                 on_ground: entity.on_ground,
             })
+            .collect()
+    }
+
+    pub(crate) fn restore_persisted_entities(
+        &self,
+        entities: impl IntoIterator<Item = mc_entity::EntitySnapshot>,
+    ) -> usize {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut restored = 0;
+        for entity in entities {
+            let chunk = server_entity_chunk_pos(&server_entity_snapshot_from(entity.clone()));
+            if inner.entities.insert_snapshot(entity) {
+                inner.spawned_entity_chunks.insert(chunk);
+                restored += 1;
+            }
+        }
+        restored
+    }
+
+    pub(crate) fn persisted_entity_snapshots(&self) -> Vec<mc_entity::EntitySnapshot> {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .entities
+            .snapshots()
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .collect()
     }
 

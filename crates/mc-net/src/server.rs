@@ -105,10 +105,46 @@ pub struct BoundServer {
     sessions: Arc<play::SessionRegistry>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SaveAllReport {
+    pub players_saved: usize,
+    pub entities_saved: usize,
+    pub chunks_flushed: usize,
+    pub world_metadata_saved: bool,
+    pub errors: Vec<String>,
+}
+
+impl SaveAllReport {
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+#[derive(Clone)]
+pub struct SaveHandle {
+    config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
+}
+
+impl SaveHandle {
+    pub async fn save_all(&self) -> SaveAllReport {
+        save_all(&self.config, &self.sessions).await
+    }
+}
+
 impl BoundServer {
     /// The socket address the listener is bound to.
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
         self.listener.local_addr()
+    }
+
+    #[must_use]
+    pub fn save_handle(&self) -> SaveHandle {
+        SaveHandle {
+            config: Arc::clone(&self.config),
+            sessions: Arc::clone(&self.sessions),
+        }
     }
 
     /// Accept connections forever, spawning a per-connection task each
@@ -123,6 +159,12 @@ impl BoundServer {
         );
         let config = self.config;
         let sessions = self.sessions;
+        let entity_world_root = if let Some(world) = config.world.as_ref() {
+            let storage = world.lock().await;
+            storage.world_root().map(std::path::Path::to_path_buf)
+        } else {
+            None
+        };
         let entity_sessions = Arc::clone(&sessions);
         let entity_config = Arc::clone(&config);
         let entity_cpu_permits =
@@ -134,11 +176,31 @@ impl BoundServer {
             loop {
                 ticker.tick().await;
                 tick = tick.wrapping_add(1);
+                let world_time = entity_sessions.advance_world_time(1);
                 let queries = entity_sessions.tick_entities_and_collect_physics_queries(tick);
                 let steps =
                     entity_physics_steps(&entity_config, Arc::clone(&entity_cpu_permits), &queries)
                         .await;
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
+                if tick.is_multiple_of(20)
+                    && let Some(root) = entity_world_root.as_deref()
+                {
+                    let snapshots = entity_sessions.persisted_entity_snapshots();
+                    if let Err(err) = play::persistence::save_persisted_entities(
+                        root,
+                        &entity_config.items,
+                        &snapshots,
+                    ) {
+                        warn!(error = %err, "persisted entity save failed");
+                    }
+                    let metadata = play::persistence::WorldPersistedMetadata {
+                        world_time,
+                        world_identity: play::persistence::world_identity(root),
+                    };
+                    if let Err(err) = play::persistence::save_world_metadata(root, &metadata) {
+                        warn!(error = %err, "world metadata save failed");
+                    }
+                }
                 play::run_random_ticks(&entity_config, &entity_sessions, tick).await;
                 play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
             }
@@ -351,11 +413,105 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     let listener = TcpListener::bind(config.bind_address).await?;
+    let sessions = Arc::new(play::SessionRegistry::new());
+    if let Some(world) = config.world.as_ref() {
+        let world_root = {
+            let storage = world.lock().await;
+            storage.world_root().map(std::path::Path::to_path_buf)
+        };
+        if let Some(root) = world_root.as_deref() {
+            match play::persistence::load_world_metadata(root) {
+                Ok(Some(metadata)) => {
+                    let expected = play::persistence::world_identity(root);
+                    if !metadata.world_identity.is_empty() && metadata.world_identity != expected {
+                        warn!(
+                            stored = %metadata.world_identity,
+                            expected = %expected,
+                            "world metadata identity mismatch"
+                        );
+                    }
+                    sessions.set_world_time(metadata.world_time);
+                    info!(world_time = metadata.world_time, "loaded world metadata");
+                }
+                Ok(None) => {}
+                Err(err) => warn!(error = %err, "world metadata load failed"),
+            }
+            match play::persistence::load_persisted_entities(
+                root,
+                &config.items,
+                &config.entity_types,
+            ) {
+                Ok(entities) => {
+                    let restored = sessions.restore_persisted_entities(entities);
+                    if restored > 0 {
+                        info!(restored, "loaded persisted entities");
+                    }
+                }
+                Err(err) => warn!(error = %err, "persisted entity load failed"),
+            }
+        }
+    }
     Ok(BoundServer {
         listener,
         config: Arc::new(config),
-        sessions: Arc::new(play::SessionRegistry::new()),
+        sessions,
     })
+}
+
+pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -> SaveAllReport {
+    let mut report = SaveAllReport {
+        players_saved: 0,
+        entities_saved: 0,
+        chunks_flushed: 0,
+        world_metadata_saved: false,
+        errors: Vec::new(),
+    };
+    let Some(world) = config.world.as_ref() else {
+        return report;
+    };
+    let root = {
+        let storage = world.lock().await;
+        storage.world_root().map(std::path::Path::to_path_buf)
+    };
+    let Some(root) = root else {
+        return report;
+    };
+
+    for (uuid, player) in sessions.persisted_player_states() {
+        match play::persistence::save_player_state(&root, uuid, &config.items, &player) {
+            Ok(()) => report.players_saved += 1,
+            Err(err) => report
+                .errors
+                .push(format!("player {uuid}: save failed: {err}")),
+        }
+    }
+
+    let entities = sessions.persisted_entity_snapshots();
+    report.entities_saved = entities.len();
+    if let Err(err) = play::persistence::save_persisted_entities(&root, &config.items, &entities) {
+        report.errors.push(format!("entities: save failed: {err}"));
+    }
+
+    let metadata = play::persistence::WorldPersistedMetadata {
+        world_time: sessions.world_time(),
+        world_identity: play::persistence::world_identity(&root),
+    };
+    match play::persistence::save_world_metadata(&root, &metadata) {
+        Ok(()) => report.world_metadata_saved = true,
+        Err(err) => report
+            .errors
+            .push(format!("world metadata: save failed: {err}")),
+    }
+
+    let mut storage = world.lock().await;
+    match storage.flush_dirty() {
+        Ok(flushed) => report.chunks_flushed = flushed,
+        Err(err) => report
+            .errors
+            .push(format!("dirty chunks: flush failed: {err}")),
+    }
+
+    report
 }
 
 /// Convenience for the binary: `bind` followed by `serve`.
@@ -501,5 +657,83 @@ mod tests {
         assert_eq!(ids.classify(5), BlockMaterial::Air);
         assert_eq!(ids.classify(6), BlockMaterial::Air);
         assert_eq!(ids.classify(7), BlockMaterial::Air);
+    }
+
+    #[tokio::test]
+    async fn save_all_writes_entities_and_world_metadata_to_real_storage() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                protocol_id: 1,
+            },
+        ]));
+        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
+            mc_data::entity_types::EntityTypeReport {
+                id: Identifier::parse("minecraft:item").unwrap(),
+                protocol_id: 1,
+            },
+        ]));
+        let world = Arc::new(Mutex::new(
+            WorldStorage::open(tmp.path(), Arc::clone(&blocks))
+                .unwrap()
+                .with_item_registry(Arc::clone(&items)),
+        ));
+        let sessions = play::SessionRegistry::new();
+        sessions.set_world_time(42);
+        sessions.restore_persisted_entities([mc_entity::EntitySnapshot {
+            id: mc_entity::EntityId(1_000_001),
+            uuid: uuid::Uuid::from_u128(1),
+            type_id: 1,
+            type_name: "minecraft:item".into(),
+            position: mc_entity::Vec3::new(1.0, 2.0, 3.0),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: mc_entity::Vec3::ZERO,
+            on_ground: true,
+            item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
+            lifecycle: mc_entity::EntityLifecycle::Alive,
+            health: 20.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: mc_entity::GoalState::Idle,
+        }]);
+        let config = ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: "test".into(),
+            max_players: 1,
+            view_distance: 2,
+            data: Arc::new(mc_data::testing::stub()),
+            blocks,
+            world: Some(world),
+            tags: Arc::new(mc_data::tags::TagsData::default()),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items: Arc::clone(&items),
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            entity_types: Arc::clone(&entity_types),
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: ChunkPipelinePolicy::default(),
+            random_tick: play::RandomTickPolicy::default(),
+        };
+
+        let report = save_all(&config, &sessions).await;
+
+        assert!(report.is_ok(), "save-all errors: {:?}", report.errors);
+        assert_eq!(report.entities_saved, 1);
+        assert!(report.world_metadata_saved);
+        let entities =
+            play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(
+            entities[0].item_stack,
+            Some(mc_entity::EntityItemStack::new(1, 2))
+        );
+        let metadata = play::persistence::load_world_metadata(tmp.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.world_time, 42);
     }
 }
