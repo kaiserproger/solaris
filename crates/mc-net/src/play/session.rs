@@ -48,6 +48,28 @@ pub(super) struct SessionRecipient {
     pub(super) tx: mpsc::Sender<OutboundCommand>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SessionAdmissionError {
+    ServerFull { active: usize, max: usize },
+    DuplicateProfile { existing_session: SessionId },
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ClaimedPickup {
+    pub(super) stack: EntityItemStack,
+    pub(super) dispatches: Vec<VisibilityDispatch>,
+}
+
+pub(super) struct SessionRegistration<'a> {
+    pub(super) profile: &'a LoggedInProfile,
+    pub(super) center: (i32, i32),
+    pub(super) view_distance: i32,
+    pub(super) desired: HashSet<(i32, i32)>,
+    pub(super) tx: mpsc::Sender<OutboundCommand>,
+    pub(super) pose: PlayerPose,
+    pub(super) max_sessions: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct VisibilityDispatch {
     pub(crate) recipient: SessionRecipient,
@@ -204,6 +226,7 @@ impl SessionRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub(super) fn register(
         &self,
         profile: &LoggedInProfile,
@@ -213,42 +236,77 @@ impl SessionRegistry {
         tx: mpsc::Sender<OutboundCommand>,
         pose: PlayerPose,
     ) -> (SessionId, Vec<VisibilityDispatch>) {
+        self.try_register(SessionRegistration {
+            profile,
+            center,
+            view_distance,
+            desired,
+            tx,
+            pose,
+            max_sessions: usize::MAX,
+        })
+        .expect("unbounded session registration should not fail")
+    }
+
+    pub(super) fn try_register(
+        &self,
+        registration: SessionRegistration<'_>,
+    ) -> Result<(SessionId, Vec<VisibilityDispatch>), SessionAdmissionError> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
+        if inner.sessions.len() >= registration.max_sessions {
+            return Err(SessionAdmissionError::ServerFull {
+                active: inner.sessions.len(),
+                max: registration.max_sessions,
+            });
+        }
+        if let Some((&existing_session, _)) = inner.sessions.iter().find(|(_, session)| {
+            session.uuid == registration.profile.uuid
+                || session
+                    .name
+                    .eq_ignore_ascii_case(&registration.profile.name)
+        }) {
+            return Err(SessionAdmissionError::DuplicateProfile { existing_session });
+        }
         inner.next_id = inner.next_id.wrapping_add(1).max(1);
         let id = inner.next_id;
         let entity_id = i32::try_from(id).unwrap_or(i32::MAX);
-        for &chunk in &desired {
+        for &chunk in &registration.desired {
             inner.tickets.entry(chunk).or_default().insert(id);
         }
         inner.sessions.insert(
             id,
             PlaySession {
-                name: profile.name.clone(),
-                uuid: profile.uuid,
+                name: registration.profile.name.clone(),
+                uuid: registration.profile.uuid,
                 entity_id,
-                pose,
-                center,
-                view_distance,
-                desired,
+                pose: registration.pose,
+                center: registration.center,
+                view_distance: registration.view_distance,
+                desired: registration.desired,
                 loaded: HashSet::new(),
                 visible_players: HashSet::new(),
                 visible_entities: HashSet::new(),
-                tx,
+                tx: registration.tx,
             },
         );
         let dispatches = refresh_visibility_locked(&mut inner);
         debug!(
             session_id = id,
             entity_id,
-            player = %profile.name,
-            center_cx = center.0,
-            center_cz = center.1,
-            view_distance,
+            player = %registration.profile.name,
+            center_cx = registration.center.0,
+            center_cz = registration.center.1,
+            view_distance = registration.view_distance,
             sessions = inner.sessions.len(),
             tickets = inner.tickets.len(),
             "play session registered"
         );
-        (id, dispatches)
+        Ok((id, dispatches))
+    }
+
+    pub(super) fn active_session_count(&self) -> usize {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner.sessions.len()
     }
 
     pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
@@ -752,35 +810,72 @@ impl SessionRegistry {
         Some(damage)
     }
 
-    pub(super) fn update_item_stack(
+    pub(super) fn claim_item_pickup(
         &self,
         entity_id: EntityId,
-        stack: EntityItemStack,
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
-        if !inner.entities.set_item_stack(entity_id, Some(stack)) {
-            return Vec::new();
+        collector_session: SessionId,
+        max_count: i32,
+    ) -> Option<ClaimedPickup> {
+        if max_count <= 0 {
+            return None;
         }
-        let Some(snapshot) = inner
-            .entities
-            .snapshot(entity_id)
-            .map(server_entity_snapshot_from)
-        else {
-            return Vec::new();
-        };
-        visible_entity_observers_locked(&inner, entity_id)
-            .into_iter()
-            .filter_map(|observer_id| {
-                let observer = inner.sessions.get(&observer_id)?;
-                Some(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::UpdateEntityData(snapshot.clone()),
-                })
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let snapshot = inner.entities.snapshot(entity_id)?;
+        if snapshot.lifecycle != EntityLifecycle::Alive {
+            return None;
+        }
+        let mut stack = snapshot.item_stack?;
+        if stack.count <= 0 {
+            return None;
+        }
+        let picked_count = stack.count.min(max_count);
+        let picked = EntityItemStack::new(stack.item_id, picked_count);
+        stack.count -= picked_count;
+
+        if stack.count <= 0 {
+            let snapshot = inner
+                .entities
+                .remove(entity_id)
+                .map(server_entity_snapshot_from)?;
+            inner.last_sent_entity_positions.remove(&entity_id);
+            inner.last_entity_damage_ticks.remove(&entity_id);
+            let dispatches = picked_entity_dispatches_locked(
+                &mut inner,
+                entity_id,
+                collector_session,
+                picked_count,
+                snapshot,
+            );
+            Some(ClaimedPickup {
+                stack: picked,
+                dispatches,
             })
-            .collect()
+        } else {
+            if !inner.entities.set_item_stack(entity_id, Some(stack)) {
+                return None;
+            }
+            let snapshot = inner
+                .entities
+                .snapshot(entity_id)
+                .map(server_entity_snapshot_from)?;
+            let dispatches = visible_entity_observers_locked(&inner, entity_id)
+                .into_iter()
+                .filter_map(|observer_id| {
+                    let observer = inner.sessions.get(&observer_id)?;
+                    Some(VisibilityDispatch {
+                        recipient: SessionRecipient {
+                            id: observer_id,
+                            tx: observer.tx.clone(),
+                        },
+                        command: OutboundCommand::UpdateEntityData(snapshot.clone()),
+                    })
+                })
+                .collect();
+            Some(ClaimedPickup {
+                stack: picked,
+                dispatches,
+            })
+        }
     }
 
     pub(super) fn remove_server_entity(
@@ -815,43 +910,21 @@ impl SessionRegistry {
         entity_id: EntityId,
         collector_session: SessionId,
         amount: i32,
-    ) -> Vec<VisibilityDispatch> {
+    ) -> Option<Vec<VisibilityDispatch>> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
-        let Some(snapshot) = inner
+        let snapshot = inner
             .entities
             .remove(entity_id)
-            .map(server_entity_snapshot_from)
-        else {
-            return Vec::new();
-        };
+            .map(server_entity_snapshot_from)?;
         inner.last_sent_entity_positions.remove(&entity_id);
-        let collector_entity_id = inner
-            .sessions
-            .get(&collector_session)
-            .map(|session| session.entity_id)
-            .unwrap_or_default();
-        let mut dispatches = Vec::new();
-        for (&observer_id, observer) in &mut inner.sessions {
-            if observer.visible_entities.remove(&entity_id) {
-                let recipient = SessionRecipient {
-                    id: observer_id,
-                    tx: observer.tx.clone(),
-                };
-                dispatches.push(VisibilityDispatch {
-                    recipient: recipient.clone(),
-                    command: OutboundCommand::TakeItemEntity {
-                        item_entity_id: entity_id.0,
-                        player_entity_id: collector_entity_id,
-                        amount,
-                    },
-                });
-                dispatches.push(VisibilityDispatch {
-                    recipient,
-                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
-                });
-            }
-        }
-        dispatches
+        inner.last_entity_damage_ticks.remove(&entity_id);
+        Some(picked_entity_dispatches_locked(
+            &mut inner,
+            entity_id,
+            collector_session,
+            amount,
+            snapshot,
+        ))
     }
 
     pub(crate) fn tick_entities_and_collect_physics_queries(
@@ -1399,6 +1472,42 @@ pub(super) fn dispatch_visibility_commands(dispatches: Vec<VisibilityDispatch>) 
     }
 }
 
+fn picked_entity_dispatches_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    collector_session: SessionId,
+    amount: i32,
+    snapshot: ServerEntitySnapshot,
+) -> Vec<VisibilityDispatch> {
+    let collector_entity_id = inner
+        .sessions
+        .get(&collector_session)
+        .map(|session| session.entity_id)
+        .unwrap_or_default();
+    let mut dispatches = Vec::new();
+    for (&observer_id, observer) in &mut inner.sessions {
+        if observer.visible_entities.remove(&entity_id) {
+            let recipient = SessionRecipient {
+                id: observer_id,
+                tx: observer.tx.clone(),
+            };
+            dispatches.push(VisibilityDispatch {
+                recipient: recipient.clone(),
+                command: OutboundCommand::TakeItemEntity {
+                    item_entity_id: entity_id.0,
+                    player_entity_id: collector_entity_id,
+                    amount,
+                },
+            });
+            dispatches.push(VisibilityDispatch {
+                recipient,
+                command: OutboundCommand::DespawnEntity(snapshot.clone()),
+            });
+        }
+    }
+    dispatches
+}
+
 fn remove_ticket(
     tickets: &mut HashMap<(i32, i32), HashSet<SessionId>>,
     chunk: (i32, i32),
@@ -1417,6 +1526,115 @@ fn remove_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::sync::mpsc;
+
+    fn profile(name: &str) -> LoggedInProfile {
+        LoggedInProfile {
+            uuid: crate::login::offline_uuid(name),
+            name: name.to_string(),
+        }
+    }
+
+    fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
+        let (tx, _rx) = mpsc::channel(8);
+        let (id, _) = registry.register(
+            &profile(name),
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        id
+    }
+
+    fn registration<'a>(
+        profile: &'a LoggedInProfile,
+        tx: mpsc::Sender<OutboundCommand>,
+        max_sessions: usize,
+    ) -> SessionRegistration<'a> {
+        SessionRegistration {
+            profile,
+            center: (0, 0),
+            view_distance: 2,
+            desired: HashSet::new(),
+            tx,
+            pose: PlayerPose::new(0.5, 64.0, 0.5),
+            max_sessions,
+        }
+    }
+
+    #[test]
+    fn try_register_enforces_max_sessions() {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let full_alice = profile("FullAlice");
+        let first = registry.try_register(registration(&full_alice, tx, 1));
+        assert!(first.is_ok());
+
+        let (tx, _rx) = mpsc::channel(8);
+        let full_bob = profile("FullBob");
+        let second = registry.try_register(registration(&full_bob, tx, 1));
+        assert!(matches!(
+            second,
+            Err(SessionAdmissionError::ServerFull { active: 1, max: 1 })
+        ));
+    }
+
+    #[test]
+    fn try_register_rejects_duplicate_profile_until_unregister() {
+        let registry = SessionRegistry::new();
+        let first_id = register_test_session(&registry, "DupAlice");
+        let (tx, _rx) = mpsc::channel(8);
+
+        let dup_alice = profile("DupAlice");
+        let duplicate = registry.try_register(registration(&dup_alice, tx, 8));
+
+        assert!(matches!(
+            duplicate,
+            Err(SessionAdmissionError::DuplicateProfile { existing_session })
+                if existing_session == first_id
+        ));
+        let _ = registry.unregister(first_id);
+
+        let (tx, _rx) = mpsc::channel(8);
+        let dup_alice = profile("DupAlice");
+        assert!(
+            registry
+                .try_register(registration(&dup_alice, tx, 8))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn item_pickup_claims_entity_once() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "PickupAlice");
+        let bob = register_test_session(&registry, "PickupBob");
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
+
+        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
+        assert_eq!(claimed.stack, EntityItemStack::new(42, 3));
+        assert!(registry.claim_item_pickup(entity_id, bob, 3).is_none());
+        assert!(
+            registry
+                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn xp_pickup_removal_succeeds_once() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "XpAlice");
+        let bob = register_test_session(&registry, "XpBob");
+        registry.spawn_xp_orb(99, Vec3::new(1.0, 64.0, 1.0), 5);
+        let entity_id = registry.nearby_experience_entities(Vec3::new(1.0, 64.0, 1.0), 2.25)[0].id;
+
+        assert!(registry.remove_picked_item(entity_id, alice, 5).is_some());
+        assert!(registry.remove_picked_item(entity_id, bob, 5).is_none());
+    }
 
     #[test]
     fn damage_server_entity_respects_hurt_invulnerability_ticks() {

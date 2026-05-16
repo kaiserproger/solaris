@@ -31,17 +31,22 @@ use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, S
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
     ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay,
-    ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
+    PlayDisconnect, ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk,
+    SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
 
 async fn start_server() -> SocketAddr {
+    start_server_with_max(8).await
+}
+
+async fn start_server_with_max(max_players: u32) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.g play".into(),
-        max_players: 8,
+        max_players,
         view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
         blocks: std::sync::Arc::new(
@@ -287,6 +292,44 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
 
     // Now drop the client; the server task will see EOF and exit.
     drop(stream);
+}
+
+#[tokio::test]
+async fn play_state_rejects_second_client_when_server_is_full() {
+    let addr = start_server_with_max(1).await;
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    let mut first_buf = BytesMut::with_capacity(8192);
+    let first_compression = drive_to_play(&mut first, &mut first_buf, addr, "FullFirst").await;
+    let first_frame = read_one_frame(&mut first, &mut first_buf, first_compression).await;
+    assert_eq!(first_frame.id, LoginPlay::ID);
+
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    let mut second_buf = BytesMut::with_capacity(8192);
+    let second_compression = drive_to_play(&mut second, &mut second_buf, addr, "FullSecond").await;
+    let second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
+    assert_eq!(second_frame.id, PlayDisconnect::ID);
+
+    drop(first);
+    drop(second);
+}
+
+#[tokio::test]
+async fn play_state_rejects_duplicate_offline_profile() {
+    let addr = start_server().await;
+    let mut first = TcpStream::connect(addr).await.unwrap();
+    let mut first_buf = BytesMut::with_capacity(8192);
+    let first_compression = drive_to_play(&mut first, &mut first_buf, addr, "DupProfile").await;
+    let first_frame = read_one_frame(&mut first, &mut first_buf, first_compression).await;
+    assert_eq!(first_frame.id, LoginPlay::ID);
+
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    let mut second_buf = BytesMut::with_capacity(8192);
+    let second_compression = drive_to_play(&mut second, &mut second_buf, addr, "DupProfile").await;
+    let second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
+    assert_eq!(second_frame.id, PlayDisconnect::ID);
+
+    drop(first);
+    drop(second);
 }
 
 #[tokio::test]

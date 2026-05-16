@@ -45,9 +45,9 @@ use mc_protocol::packets::play::{
     ConfirmTeleportation, ContainerInput, Direction, EntityAnimation, EntityAnimationAction,
     EntityDataValue, EntityEvent, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent,
     GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
-    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
-    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
+    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
+    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation,
+    RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
     ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
     ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
     ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerClick,
@@ -132,8 +132,8 @@ use persistence::{PlayerPersistedState, XpState, load_player_state, save_player_
 use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
-    ServerEntitySnapshot, SessionId, dispatch_visibility_commands, entity_aabb, within_block_reach,
-    within_entity_reach,
+    ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration,
+    dispatch_visibility_commands, entity_aabb, within_block_reach, within_entity_reach,
 };
 #[cfg(test)]
 use spawn::spawn_chunk_pos;
@@ -187,6 +187,35 @@ const CHEST_MENU_TYPE_ID: i32 = 2;
 const DOUBLE_CHEST_MENU_TYPE_ID: i32 = 5;
 const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;
 const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
+
+struct RegisteredSessionCleanup {
+    sessions: Arc<SessionRegistry>,
+    session_id: SessionId,
+    active: bool,
+}
+
+impl RegisteredSessionCleanup {
+    fn new(sessions: Arc<SessionRegistry>, session_id: SessionId) -> Self {
+        Self {
+            sessions,
+            session_id,
+            active: true,
+        }
+    }
+
+    fn unregister(mut self) {
+        self.active = false;
+        dispatch_visibility_commands(self.sessions.unregister(self.session_id));
+    }
+}
+
+impl Drop for RegisteredSessionCleanup {
+    fn drop(&mut self) {
+        if self.active {
+            dispatch_visibility_commands(self.sessions.unregister(self.session_id));
+        }
+    }
+}
 const FURNACE_MENU_TYPE_ID: i32 = 14;
 const FURNACE_CONTAINER_ID_MIN: i32 = 1;
 const FURNACE_CONTAINER_ID_MAX: i32 = 100;
@@ -397,14 +426,48 @@ where
         HashSet::new()
     };
     let initial_pose = player_state.pose;
-    let (session_id, visibility) = sessions.register(
+    let (session_id, visibility) = match sessions.try_register(SessionRegistration {
         profile,
-        (spawn_cx, spawn_cz),
-        config.view_distance,
-        initial_desired,
-        outbound_tx,
-        initial_pose,
-    );
+        center: (spawn_cx, spawn_cz),
+        view_distance: config.view_distance,
+        desired: initial_desired,
+        tx: outbound_tx,
+        pose: initial_pose,
+        max_sessions: config.max_players as usize,
+    }) {
+        Ok(registered) => registered,
+        Err(err) => {
+            let reason = session_admission_message(&err);
+            match &err {
+                SessionAdmissionError::ServerFull { active, max } => warn!(
+                    player = %profile.name,
+                    uuid = %profile.uuid,
+                    active_sessions = *active,
+                    max_sessions = *max,
+                    reason,
+                    "play session rejected"
+                ),
+                SessionAdmissionError::DuplicateProfile { existing_session } => warn!(
+                    player = %profile.name,
+                    uuid = %profile.uuid,
+                    existing_session = *existing_session,
+                    active_sessions = sessions.active_session_count(),
+                    reason,
+                    "play session rejected"
+                ),
+            }
+            write_packet(
+                writer,
+                &PlayDisconnect {
+                    reason_nbt: text_component_nbt(reason),
+                },
+                compression,
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let session_cleanup = RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id);
 
     let permissions = config.command_permissions.permissions_for(profile);
 
@@ -644,7 +707,7 @@ where
         }
     }
 
-    dispatch_visibility_commands(sessions.unregister(session_id));
+    session_cleanup.unregister();
     result
 }
 
@@ -1435,23 +1498,6 @@ async fn load_chest_view(
         chests.push(chest);
     }
     Ok(ChestView { chests })
-}
-
-async fn save_chest_view(
-    state: &InteractionState,
-    window: &ChestWindow,
-    view: &ChestView,
-) -> Result<(), ConnectionError> {
-    let mut storage = state.world.lock().await;
-    for (&position, chest) in window.positions.iter().zip(&view.chests) {
-        storage
-            .set_chest_block_entity(position, chest.clone())
-            .map_err(|err| {
-                warn!(error = %err, ?position, "chest state write failed");
-                err
-            })?;
-    }
-    Ok(())
 }
 
 async fn write_furnace_data<W>(
@@ -2532,46 +2578,73 @@ async fn handle_chest_container_click<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut view = load_chest_view(state, &window).await?;
-    if packet.state_id != window.state_id {
-        write_chest_content(state, writer, &window, &view).await?;
-        return Ok(window);
-    }
+    let mut view;
     let mut dropped = None;
-    let changed = match packet.container_input {
-        ContainerInput::Pickup if packet.slot_num >= 0 => apply_chest_pickup_click(
-            state,
-            &mut view,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-            apply_chest_quick_move_click(state, &mut view, packet.slot_num as usize)
+    let changed;
+    {
+        let world = Arc::clone(&state.world);
+        let mut storage = world.lock().await;
+        let mut chests = Vec::with_capacity(window.positions.len());
+        for &position in &window.positions {
+            let chest = storage
+                .chest_block_entity(position)
+                .map_err(|err| {
+                    warn!(error = %err, ?position, "chest state read failed");
+                    err
+                })?
+                .unwrap_or_default();
+            chests.push(chest);
         }
-        ContainerInput::Swap if packet.slot_num >= 0 => apply_chest_swap_click(
-            state,
-            &mut view,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::Throw if packet.slot_num >= 0 => {
-            if item_entity_type_id(&state.entity_types).is_some() {
-                dropped = apply_chest_throw_click(
-                    state,
-                    &mut view,
-                    packet.slot_num as usize,
-                    packet.button_num,
-                );
-                dropped.is_some()
-            } else {
-                false
+        view = ChestView { chests };
+        if packet.state_id != window.state_id {
+            drop(storage);
+            write_chest_content(state, writer, &window, &view).await?;
+            return Ok(window);
+        }
+        changed = match packet.container_input {
+            ContainerInput::Pickup if packet.slot_num >= 0 => apply_chest_pickup_click(
+                state,
+                &mut view,
+                packet.slot_num as usize,
+                packet.button_num,
+            ),
+            ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+                apply_chest_quick_move_click(state, &mut view, packet.slot_num as usize)
+            }
+            ContainerInput::Swap if packet.slot_num >= 0 => apply_chest_swap_click(
+                state,
+                &mut view,
+                packet.slot_num as usize,
+                packet.button_num,
+            ),
+            ContainerInput::Throw if packet.slot_num >= 0 => {
+                if item_entity_type_id(&state.entity_types).is_some() {
+                    dropped = apply_chest_throw_click(
+                        state,
+                        &mut view,
+                        packet.slot_num as usize,
+                        packet.button_num,
+                    );
+                    dropped.is_some()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if changed {
+            window.state_id = window.state_id.wrapping_add(1);
+            for (&position, chest) in window.positions.iter().zip(&view.chests) {
+                storage
+                    .set_chest_block_entity(position, chest.clone())
+                    .map_err(|err| {
+                        warn!(error = %err, ?position, "chest state write failed");
+                        err
+                    })?;
             }
         }
-        _ => false,
-    };
+    }
     if changed {
-        window.state_id = window.state_id.wrapping_add(1);
-        save_chest_view(state, &window, &view).await?;
         dispatch_visibility_commands(state.sessions.chest_slot_dispatches(
             window.position(),
             state.session_id,
@@ -2595,61 +2668,66 @@ async fn handle_furnace_container_click<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let mut furnace = {
-        let mut storage = state.world.lock().await;
-        storage
+    let mut furnace;
+    let mut dropped = None;
+    let changed;
+    {
+        let world = Arc::clone(&state.world);
+        let mut storage = world.lock().await;
+        furnace = storage
             .furnace_block_entity(window.position)
             .map_err(|err| {
                 warn!(error = %err, ?window.position, "furnace state read failed");
                 err
             })?
-    }
-    .unwrap_or_default();
-    if packet.state_id != window.state_id {
-        write_furnace_content(state, writer, &window, &furnace).await?;
-        return Ok(window);
-    }
-    let mut dropped = None;
-    let changed = match packet.container_input {
-        ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
-            state,
-            &mut furnace,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-            apply_furnace_quick_move_click(state, &mut furnace, packet.slot_num as usize)
+            .unwrap_or_default();
+        if packet.state_id != window.state_id {
+            drop(storage);
+            write_furnace_content(state, writer, &window, &furnace).await?;
+            return Ok(window);
         }
-        ContainerInput::Swap if packet.slot_num >= 0 => apply_furnace_swap_click(
-            state,
-            &mut furnace,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::Throw if packet.slot_num >= 0 => {
-            if item_entity_type_id(&state.entity_types).is_some() {
-                dropped = apply_furnace_throw_click(
-                    state,
-                    &mut furnace,
-                    packet.slot_num as usize,
-                    packet.button_num,
-                );
-                dropped.is_some()
-            } else {
-                false
+        changed = match packet.container_input {
+            ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
+                state,
+                &mut furnace,
+                packet.slot_num as usize,
+                packet.button_num,
+            ),
+            ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
+                apply_furnace_quick_move_click(state, &mut furnace, packet.slot_num as usize)
             }
+            ContainerInput::Swap if packet.slot_num >= 0 => apply_furnace_swap_click(
+                state,
+                &mut furnace,
+                packet.slot_num as usize,
+                packet.button_num,
+            ),
+            ContainerInput::Throw if packet.slot_num >= 0 => {
+                if item_entity_type_id(&state.entity_types).is_some() {
+                    dropped = apply_furnace_throw_click(
+                        state,
+                        &mut furnace,
+                        packet.slot_num as usize,
+                        packet.button_num,
+                    );
+                    dropped.is_some()
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        };
+        if changed {
+            window.state_id = window.state_id.wrapping_add(1);
+            storage
+                .set_furnace_block_entity(window.position, furnace.clone())
+                .map_err(|err| {
+                    warn!(error = %err, ?window.position, "furnace state write failed");
+                    err
+                })?;
         }
-        _ => false,
-    };
+    }
     if changed {
-        window.state_id = window.state_id.wrapping_add(1);
-        let mut storage = state.world.lock().await;
-        storage
-            .set_furnace_block_entity(window.position, furnace.clone())
-            .map_err(|err| {
-                warn!(error = %err, ?window.position, "furnace state write failed");
-                err
-            })?;
         dispatch_visibility_commands(state.sessions.furnace_slot_dispatches(
             window.position,
             state.session_id,
@@ -2974,27 +3052,32 @@ where
         let Some(stack) = entity.item_stack else {
             continue;
         };
-        let original_count = stack.count;
-        let stack = ItemStack::new(stack.item_id, stack.count);
-        let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
-        let (remaining, changed) = state.inventory.merge_pickup_stack(stack, max_stack);
+        let probe = ItemStack::new(stack.item_id, stack.count);
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
+        let (remaining, changed) = state.inventory.clone().merge_pickup_stack(probe, max_stack);
+        let requested = stack.count - remaining.count;
+        if requested <= 0 || changed.is_empty() {
+            continue;
+        }
+        let Some(claimed) =
+            state
+                .sessions
+                .claim_item_pickup(entity.id, state.session_id, requested)
+        else {
+            continue;
+        };
+        let picked = ItemStack::new(claimed.stack.item_id, claimed.stack.count);
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &picked);
+        let (remaining, changed) = state.inventory.merge_pickup_stack(picked, max_stack);
+        debug_assert!(
+            remaining.is_empty(),
+            "claimed pickup should fit probed inventory space"
+        );
         if changed.is_empty() {
             continue;
         }
         write_inventory_slot_updates(state, writer, changed).await?;
-        if remaining.is_empty() {
-            dispatch_visibility_commands(state.sessions.remove_picked_item(
-                entity.id,
-                state.session_id,
-                original_count,
-            ));
-        } else {
-            dispatch_visibility_commands(
-                state
-                    .sessions
-                    .update_item_stack(entity.id, entity_item_stack(remaining)),
-            );
-        }
+        dispatch_visibility_commands(claimed.dispatches);
     }
     Ok(())
 }
@@ -3017,11 +3100,14 @@ where
         let Some(value) = entity.experience_value else {
             continue;
         };
-        dispatch_visibility_commands(state.sessions.remove_picked_item(
-            entity.id,
-            state.session_id,
-            value,
-        ));
+        let Some(dispatches) =
+            state
+                .sessions
+                .remove_picked_item(entity.id, state.session_id, value)
+        else {
+            continue;
+        };
+        dispatch_visibility_commands(dispatches);
         changed |= xp_state.add_points(value);
     }
     if changed {
@@ -6299,6 +6385,13 @@ fn text_component_nbt(text: &str) -> Vec<u8> {
     )
     .expect("text component is valid NBT");
     out
+}
+
+fn session_admission_message(error: &SessionAdmissionError) -> &'static str {
+    match error {
+        SessionAdmissionError::ServerFull { .. } => "Server is full",
+        SessionAdmissionError::DuplicateProfile { .. } => "This player is already connected",
+    }
 }
 
 fn command_error_message(error: CommandError) -> &'static str {
