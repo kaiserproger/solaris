@@ -6,6 +6,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use bytes::BytesMut;
 use mc_data::Identifier;
@@ -90,6 +91,31 @@ impl CommandPermissionConfig {
 pub struct ShutdownHandle {
     requested: Arc<AtomicBool>,
     notify: Arc<Notify>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeMetricsPolicy {
+    pub log_interval_ticks: u64,
+    pub slow_tick_ms: u64,
+}
+
+impl Default for RuntimeMetricsPolicy {
+    fn default() -> Self {
+        Self {
+            log_interval_ticks: 100,
+            slow_tick_ms: 50,
+        }
+    }
+}
+
+impl RuntimeMetricsPolicy {
+    #[must_use]
+    pub fn normalized(self) -> Self {
+        Self {
+            log_interval_ticks: self.log_interval_ticks.max(1),
+            slow_tick_ms: self.slow_tick_ms,
+        }
+    }
 }
 
 impl ShutdownHandle {
@@ -249,17 +275,35 @@ impl BoundServer {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let metrics_policy = RuntimeMetricsPolicy::default().normalized();
+            let simulation_policy = entity_config.random_tick.normalized();
             let mut tick = 0_u64;
             loop {
                 ticker.tick().await;
+                let tick_started = Instant::now();
                 tick = tick.wrapping_add(1);
+
+                let started = Instant::now();
                 let world_time = entity_sessions.advance_world_time(1);
+                let world_time_us = elapsed_us(started);
+
+                let started = Instant::now();
                 let queries = entity_sessions.tick_entities_and_collect_physics_queries(tick);
+                let entity_goals_us = elapsed_us(started);
+
+                let started = Instant::now();
                 let steps =
                     entity_physics_steps(&entity_config, Arc::clone(&entity_cpu_permits), &queries)
                         .await;
+                let entity_physics_us = elapsed_us(started);
+
+                let started = Instant::now();
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
-                if tick.is_multiple_of(20)
+                let entity_dispatch_us = elapsed_us(started);
+
+                let started = Instant::now();
+                let mut entity_save_us = 0;
+                if tick.is_multiple_of(simulation_policy.save_interval_ticks)
                     && let Some(root) = entity_world_root.as_deref()
                 {
                     let snapshots = entity_sessions.persisted_entity_snapshots();
@@ -277,9 +321,82 @@ impl BoundServer {
                     if let Err(err) = play::persistence::save_world_metadata(root, &metadata) {
                         warn!(error = %err, "world metadata save failed");
                     }
+                    entity_save_us = elapsed_us(started);
                 }
-                play::run_random_ticks(&entity_config, &entity_sessions, tick).await;
-                play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
+
+                let started = Instant::now();
+                let random_tick =
+                    play::run_random_ticks(&entity_config, &entity_sessions, tick).await;
+                let random_tick_us = elapsed_us(started);
+
+                let started = Instant::now();
+                let fluid_tick =
+                    play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
+                let fluid_tick_us = elapsed_us(started);
+
+                let tick_us = elapsed_us(tick_started);
+                if should_log_runtime_metrics(tick, tick_us, metrics_policy) {
+                    let pressure = entity_sessions.pressure_snapshot();
+                    if is_slow_tick(tick_us, metrics_policy) {
+                        warn!(
+                            tick,
+                            world_time,
+                            tick_us,
+                            world_time_us,
+                            entity_goals_us,
+                            entity_physics_us,
+                            entity_dispatch_us,
+                            entity_save_us,
+                            random_tick_us,
+                            fluid_tick_us,
+                            entity_queries = queries.len(),
+                            entity_steps = steps.len(),
+                            random_sampled = random_tick.sampled,
+                            random_eligible = random_tick.eligible,
+                            random_applied = random_tick.applied,
+                            fluid_drained = fluid_tick.drained,
+                            fluid_applied = fluid_tick.applied,
+                            fluid_budget = fluid_tick.budget,
+                            fluid_budget_exhausted = fluid_tick.budget_exhausted,
+                            sessions = pressure.sessions,
+                            ticketed_chunks = pressure.ticketed_chunks,
+                            prepared_chunks = pressure.prepared_chunks,
+                            server_entities = pressure.server_entities,
+                            furnace_viewer_sets = pressure.furnace_viewer_sets,
+                            chest_viewer_sets = pressure.chest_viewer_sets,
+                            "runtime tick exceeded performance budget"
+                        );
+                    } else {
+                        info!(
+                            tick,
+                            world_time,
+                            tick_us,
+                            world_time_us,
+                            entity_goals_us,
+                            entity_physics_us,
+                            entity_dispatch_us,
+                            entity_save_us,
+                            random_tick_us,
+                            fluid_tick_us,
+                            entity_queries = queries.len(),
+                            entity_steps = steps.len(),
+                            random_sampled = random_tick.sampled,
+                            random_eligible = random_tick.eligible,
+                            random_applied = random_tick.applied,
+                            fluid_drained = fluid_tick.drained,
+                            fluid_applied = fluid_tick.applied,
+                            fluid_budget = fluid_tick.budget,
+                            fluid_budget_exhausted = fluid_tick.budget_exhausted,
+                            sessions = pressure.sessions,
+                            ticketed_chunks = pressure.ticketed_chunks,
+                            prepared_chunks = pressure.prepared_chunks,
+                            server_entities = pressure.server_entities,
+                            furnace_viewer_sets = pressure.furnace_viewer_sets,
+                            chest_viewer_sets = pressure.chest_viewer_sets,
+                            "runtime tick metrics"
+                        );
+                    }
+                }
             }
         });
         tokio::spawn(run_console_commands(
@@ -313,6 +430,18 @@ impl BoundServer {
             });
         }
     }
+}
+
+fn elapsed_us(started: Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn should_log_runtime_metrics(tick: u64, tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
+    tick.is_multiple_of(policy.log_interval_ticks) || is_slow_tick(tick_us, policy)
+}
+
+fn is_slow_tick(tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
+    policy.slow_tick_ms > 0 && tick_us >= policy.slow_tick_ms.saturating_mul(1_000)
 }
 
 async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::SessionRegistry>) {
@@ -689,8 +818,24 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     }
 
     let mut storage = world.lock().await;
+    let storage_before = storage.stats();
+    let flush_started = Instant::now();
     match storage.flush_dirty() {
-        Ok(flushed) => report.chunks_flushed = flushed,
+        Ok(flushed) => {
+            report.chunks_flushed = flushed;
+            let storage_after = storage.stats();
+            info!(
+                flushed,
+                flush_us = elapsed_us(flush_started),
+                chunk_cache_len = storage_after.chunk_cache_len,
+                chunk_cache_capacity = storage_after.chunk_cache_capacity,
+                region_cache_len = storage_after.region_cache_len,
+                region_cache_capacity = storage_after.region_cache_capacity,
+                dirty_before = storage_before.dirty_chunks,
+                dirty_after = storage_after.dirty_chunks,
+                "world storage save pressure"
+            );
+        }
         Err(err) => report
             .errors
             .push(format!("dirty chunks: flush failed: {err}")),
@@ -739,6 +884,7 @@ async fn handle_connection(
                 &mut reader,
                 &mut writer,
                 &mut buf,
+                config.chunk_pipeline.compression_threshold,
                 &mut compression,
                 config.chunk_pipeline.compression_level,
             )
@@ -774,6 +920,30 @@ mod tests {
     use std::collections::BTreeMap;
 
     type StateSpec<'a> = (u32, bool, &'a [(&'a str, &'a str)]);
+
+    #[test]
+    fn runtime_metrics_policy_normalizes_log_interval() {
+        let policy = RuntimeMetricsPolicy {
+            log_interval_ticks: 0,
+            slow_tick_ms: 0,
+        }
+        .normalized();
+
+        assert_eq!(policy.log_interval_ticks, 1);
+        assert_eq!(policy.slow_tick_ms, 0);
+    }
+
+    #[test]
+    fn runtime_metrics_logging_respects_interval_and_slow_budget() {
+        let policy = RuntimeMetricsPolicy {
+            log_interval_ticks: 5,
+            slow_tick_ms: 50,
+        };
+
+        assert!(should_log_runtime_metrics(10, 1, policy));
+        assert!(should_log_runtime_metrics(11, 50_000, policy));
+        assert!(!should_log_runtime_metrics(11, 49_999, policy));
+    }
 
     fn report(id: &str, props: &[(&str, &[&str])], states: &[StateSpec<'_>]) -> BlockReport {
         BlockReport {

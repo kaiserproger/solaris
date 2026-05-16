@@ -17,7 +17,7 @@
 //! M1.g bar; chunk streaming is M2-M3 territory.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -235,7 +235,7 @@ const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
-const FLUID_TICK_BUDGET: usize = 256;
+const DEFAULT_FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
 const LAVA_FLOW_DELAY_TICKS: u64 = 30;
 
@@ -246,6 +246,8 @@ pub const DEFAULT_VIEW_DISTANCE: i32 = 10;
 pub struct RandomTickPolicy {
     pub random_tick_speed: u32,
     pub chunk_budget: usize,
+    pub fluid_tick_budget: usize,
+    pub save_interval_ticks: u64,
     pub seed: u64,
 }
 
@@ -254,6 +256,8 @@ impl Default for RandomTickPolicy {
         Self {
             random_tick_speed: 3,
             chunk_budget: 64,
+            fluid_tick_budget: DEFAULT_FLUID_TICK_BUDGET,
+            save_interval_ticks: 20,
             seed: 0,
         }
     }
@@ -265,6 +269,8 @@ impl RandomTickPolicy {
         Self {
             random_tick_speed: self.random_tick_speed,
             chunk_budget: self.chunk_budget.max(1),
+            fluid_tick_budget: self.fluid_tick_budget.max(1),
+            save_interval_ticks: self.save_interval_ticks.max(1),
             seed: self.seed,
         }
     }
@@ -273,6 +279,21 @@ impl RandomTickPolicy {
     pub fn is_enabled(self) -> bool {
         self.random_tick_speed > 0 && self.chunk_budget > 0
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RandomTickReport {
+    pub(crate) sampled: usize,
+    pub(crate) eligible: usize,
+    pub(crate) applied: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScheduledFluidTickReport {
+    pub(crate) drained: usize,
+    pub(crate) applied: usize,
+    pub(crate) budget: usize,
+    pub(crate) budget_exhausted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -3482,18 +3503,18 @@ pub(crate) async fn run_random_ticks(
     config: &ServerConfig,
     sessions: &SessionRegistry,
     world_tick: u64,
-) {
+) -> RandomTickReport {
     let policy = config.random_tick.normalized();
     let Some(world) = config.world.as_ref() else {
-        return;
+        return RandomTickReport::default();
     };
     let ticketed_chunks = sessions.ticketed_chunks_sorted();
     if ticketed_chunks.is_empty() {
-        return;
+        return RandomTickReport::default();
     }
     let samples = sample_random_tick_positions(policy, world_tick, &ticketed_chunks);
     if samples.is_empty() {
-        return;
+        return RandomTickReport::default();
     }
 
     let table = config.block_light.as_deref();
@@ -3546,19 +3567,31 @@ pub(crate) async fn run_random_ticks(
             "random tick sampled eligible blocks"
         );
     }
+    RandomTickReport {
+        sampled,
+        eligible,
+        applied: outcome.applied.len(),
+    }
 }
 
 pub(crate) async fn run_scheduled_fluid_ticks(
     config: &ServerConfig,
     sessions: &SessionRegistry,
     world_tick: u64,
-) {
+) -> ScheduledFluidTickReport {
+    let policy = config.random_tick.normalized();
     let Some(world) = config.world.as_ref() else {
-        return;
+        return ScheduledFluidTickReport {
+            budget: policy.fluid_tick_budget,
+            ..ScheduledFluidTickReport::default()
+        };
     };
     let ticketed_chunks = sessions.ticketed_chunks_sorted();
     if ticketed_chunks.is_empty() {
-        return;
+        return ScheduledFluidTickReport {
+            budget: policy.fluid_tick_budget,
+            ..ScheduledFluidTickReport::default()
+        };
     }
 
     let table = config.block_light.as_deref();
@@ -3567,11 +3600,11 @@ pub(crate) async fn run_scheduled_fluid_ticks(
     {
         let mut storage = world.lock().await;
         for &(cx, cz) in &ticketed_chunks {
-            if drained >= FLUID_TICK_BUDGET {
+            if drained >= policy.fluid_tick_budget {
                 break;
             }
             let cpos = ChunkPos { x: cx, z: cz };
-            let remaining = FLUID_TICK_BUDGET - drained;
+            let remaining = policy.fluid_tick_budget - drained;
             let due = match storage.drain_due_fluid_ticks(cpos, world_tick, remaining) {
                 Ok(due) => due,
                 Err(err) => {
@@ -3610,6 +3643,15 @@ pub(crate) async fn run_scheduled_fluid_ticks(
             &outcome.applied,
         );
     }
+    let budget_exhausted = drained >= policy.fluid_tick_budget;
+    if budget_exhausted {
+        warn!(
+            world_tick,
+            drained,
+            budget = policy.fluid_tick_budget,
+            "scheduled fluid tick budget exhausted"
+        );
+    }
 
     if !outcome.applied.is_empty() {
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
@@ -3628,6 +3670,12 @@ pub(crate) async fn run_scheduled_fluid_ticks(
             applied = outcome.applied.len(),
             "scheduled fluid ticks applied edits"
         );
+    }
+    ScheduledFluidTickReport {
+        drained,
+        applied: outcome.applied.len(),
+        budget: policy.fluid_tick_budget,
+        budget_exhausted,
     }
 }
 
@@ -5491,6 +5539,51 @@ fn sync_player_persistence(
     }
 }
 
+async fn recv_outbound_command(
+    rx: &mut mpsc::Receiver<OutboundCommand>,
+    pending: &mut VecDeque<OutboundCommand>,
+) -> Option<OutboundCommand> {
+    if let Some(command) = pending.pop_front() {
+        Some(command)
+    } else {
+        rx.recv().await
+    }
+}
+
+fn collect_block_delta_batch(
+    mut deltas: Vec<BlockDelta>,
+    rx: &mut mpsc::Receiver<OutboundCommand>,
+    pending: &mut VecDeque<OutboundCommand>,
+) -> Vec<BlockDelta> {
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            OutboundCommand::BlockDeltas(mut more) => deltas.append(&mut more),
+            other => {
+                pending.push_back(other);
+                break;
+            }
+        }
+    }
+    deltas
+}
+
+fn collect_light_update_batch(
+    mut updates: Vec<OutboundLightUpdate>,
+    rx: &mut mpsc::Receiver<OutboundCommand>,
+    pending: &mut VecDeque<OutboundCommand>,
+) -> Vec<OutboundLightUpdate> {
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            OutboundCommand::LightUpdates(mut more) => updates.append(&mut more),
+            other => {
+                pending.push_back(other);
+                break;
+            }
+        }
+    }
+    updates
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
@@ -5536,6 +5629,7 @@ where
     let mut survival_tick: u32 = 0;
     let mut client_brand: Option<String> = None;
     let mut client_preferences: Option<ClientPreferences> = None;
+    let mut pending_outbound = VecDeque::new();
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
@@ -5586,13 +5680,15 @@ where
 
         tokio::select! {
             biased;
-            command = outbound_rx.recv() => {
+            command = recv_outbound_command(&mut outbound_rx, &mut pending_outbound) => {
                 match command {
                     Some(OutboundCommand::BlockDeltas(deltas)) => {
+                        let deltas = collect_block_delta_batch(deltas, &mut outbound_rx, &mut pending_outbound);
                         send_block_deltas(writer, compression, &deltas).await?;
                     }
                     Some(OutboundCommand::LightUpdates(updates)) => {
                         if let Some(state) = interaction.as_deref_mut() {
+                            let updates = collect_light_update_batch(updates, &mut outbound_rx, &mut pending_outbound);
                             send_light_updates(state, writer, &updates).await?;
                         }
                     }

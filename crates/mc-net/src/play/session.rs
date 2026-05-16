@@ -54,6 +54,16 @@ pub(super) enum SessionAdmissionError {
     DuplicateProfile { existing_session: SessionId },
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SessionPressureSnapshot {
+    pub(crate) sessions: usize,
+    pub(crate) ticketed_chunks: usize,
+    pub(crate) prepared_chunks: usize,
+    pub(crate) server_entities: usize,
+    pub(crate) furnace_viewer_sets: usize,
+    pub(crate) chest_viewer_sets: usize,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct ClaimedPickup {
     pub(super) stack: EntityItemStack,
@@ -307,6 +317,18 @@ impl SessionRegistry {
     pub(super) fn active_session_count(&self) -> usize {
         let inner = self.inner.lock().expect("session registry poisoned");
         inner.sessions.len()
+    }
+
+    pub(crate) fn pressure_snapshot(&self) -> SessionPressureSnapshot {
+        let inner = self.inner.lock().expect("session registry poisoned");
+        SessionPressureSnapshot {
+            sessions: inner.sessions.len(),
+            ticketed_chunks: inner.tickets.len(),
+            prepared_chunks: inner.prepared.len(),
+            server_entities: inner.entities.len(),
+            furnace_viewer_sets: inner.furnace_viewers.len(),
+            chest_viewer_sets: inner.chest_viewers.len(),
+        }
     }
 
     pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {

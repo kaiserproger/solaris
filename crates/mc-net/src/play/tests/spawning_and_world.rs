@@ -752,6 +752,8 @@ fn random_tick_sampling_is_deterministic_for_seed_tick_and_chunks() {
     let policy = RandomTickPolicy {
         random_tick_speed: 2,
         chunk_budget: 2,
+        fluid_tick_budget: 256,
+        save_interval_ticks: 20,
         seed: 99,
     };
     let chunks = vec![(0, 0), (1, 0), (2, 0)];
@@ -770,6 +772,8 @@ fn random_tick_sampling_rotates_chunk_budget() {
     let policy = RandomTickPolicy {
         random_tick_speed: 1,
         chunk_budget: 2,
+        fluid_tick_budget: 256,
+        save_interval_ticks: 20,
         seed: 0,
     };
     let chunks = vec![(0, 0), (1, 0), (2, 0)];
@@ -792,10 +796,60 @@ fn random_tick_speed_zero_disables_sampling() {
     let policy = RandomTickPolicy {
         random_tick_speed: 0,
         chunk_budget: 2,
+        fluid_tick_budget: 256,
+        save_interval_ticks: 20,
         seed: 0,
     };
 
     assert!(sample_random_tick_positions(policy, 0, &[(0, 0)]).is_empty());
+}
+
+#[test]
+fn simulation_tick_policy_normalizes_deferred_work_budgets() {
+    let policy = RandomTickPolicy {
+        random_tick_speed: 0,
+        chunk_budget: 0,
+        fluid_tick_budget: 0,
+        save_interval_ticks: 0,
+        seed: 0,
+    }
+    .normalized();
+
+    assert_eq!(policy.chunk_budget, 1);
+    assert_eq!(policy.fluid_tick_budget, 1);
+    assert_eq!(policy.save_interval_ticks, 1);
+}
+
+#[test]
+fn outbound_block_delta_batching_preserves_next_different_command() {
+    let (tx, mut rx) = mpsc::channel(8);
+    tx.try_send(OutboundCommand::BlockDeltas(vec![BlockDelta {
+        x: 1,
+        y: 2,
+        z: 3,
+        state_id: BlockStateId(4),
+    }]))
+    .unwrap();
+    tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 9 })
+        .unwrap();
+    let mut pending = std::collections::VecDeque::new();
+
+    let batched = collect_block_delta_batch(
+        vec![BlockDelta {
+            x: 0,
+            y: 0,
+            z: 0,
+            state_id: BlockStateId(1),
+        }],
+        &mut rx,
+        &mut pending,
+    );
+
+    assert_eq!(batched.len(), 2);
+    assert!(matches!(
+        pending.pop_front(),
+        Some(OutboundCommand::AnimatePlayer { entity_id: 9 })
+    ));
 }
 
 #[test]

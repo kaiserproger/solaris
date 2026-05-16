@@ -86,6 +86,15 @@ pub struct WorldStorage {
     generator: Option<Arc<dyn ChunkGenerator>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WorldStorageStats {
+    pub chunk_cache_len: usize,
+    pub chunk_cache_capacity: usize,
+    pub region_cache_len: usize,
+    pub region_cache_capacity: usize,
+    pub dirty_chunks: usize,
+}
+
 impl WorldStorage {
     /// Open a world directory. Tries the 1.20+ layout
     /// (`dimensions/minecraft/overworld/region/`) first, falls back
@@ -666,6 +675,17 @@ impl WorldStorage {
         self.region_capacity
     }
 
+    #[must_use]
+    pub fn stats(&self) -> WorldStorageStats {
+        WorldStorageStats {
+            chunk_cache_len: self.cache.len(),
+            chunk_cache_capacity: self.capacity,
+            region_cache_len: self.regions.len(),
+            region_cache_capacity: self.region_capacity,
+            dirty_chunks: self.dirty_count(),
+        }
+    }
+
     /// M6.b: write every dirty chunk in the cache back to its
     /// `.mca` region file. Returns the number of chunks flushed.
     /// Groups dirty chunks by region so each `r.X.Z.mca` is rewritten
@@ -703,14 +723,21 @@ impl WorldStorage {
     ) -> Result<usize, WorldError> {
         let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
         // Load existing payloads (if any) so unmodified slots survive.
-        let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if region_path.is_file() {
-            read_region(&region_path)?
-                .into_iter()
-                .map(|p| ((p.local_x, p.local_z), p))
-                .collect()
-        } else {
-            HashMap::new()
-        };
+        let mut by_slot: HashMap<(u8, u8), ChunkPayload> =
+            if let Some(region) = self.regions.get(&(rx, rz)) {
+                region
+                    .values()
+                    .cloned()
+                    .map(|p| ((p.local_x, p.local_z), p))
+                    .collect()
+            } else if region_path.is_file() {
+                read_region(&region_path)?
+                    .into_iter()
+                    .map(|p| ((p.local_x, p.local_z), p))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -849,6 +876,27 @@ mod tests {
         let world = WorldStorage::open_with_region_capacity(tmp.path(), registry, 7).unwrap();
 
         assert_eq!(world.region_cache_capacity(), 7);
+    }
+
+    #[test]
+    fn storage_stats_report_cache_and_dirty_pressure() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 2);
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+
+        let stats = world.stats();
+
+        assert_eq!(stats.chunk_cache_len, 1);
+        assert_eq!(stats.chunk_cache_capacity, 2);
+        assert_eq!(stats.region_cache_len, 0);
+        assert_eq!(stats.region_cache_capacity, 4);
+        assert_eq!(stats.dirty_chunks, 1);
     }
 
     #[test]

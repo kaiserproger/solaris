@@ -55,6 +55,7 @@ pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
     buf: &mut BytesMut,
+    compression_threshold: i32,
     compression: &mut Compression,
     compression_level: Option<u32>,
 ) -> Result<LoggedInProfile, ConnectionError>
@@ -72,19 +73,18 @@ where
     let name = login_start.name;
     info!(player = %name, %uuid, "offline login");
 
+    let compression_threshold = compression_threshold.max(0);
     write_packet(
         writer,
         &SetCompression {
-            threshold: LOGIN_COMPRESSION_THRESHOLD,
+            threshold: compression_threshold,
         },
         Compression::Disabled,
     )
     .await?;
     *compression = match compression_level {
-        Some(level) => {
-            Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize).with_level(level)
-        }
-        None => Compression::Threshold(LOGIN_COMPRESSION_THRESHOLD as usize),
+        Some(level) => Compression::Threshold(compression_threshold as usize).with_level(level),
+        None => Compression::Threshold(compression_threshold as usize),
     };
 
     let success = LoginSuccess {

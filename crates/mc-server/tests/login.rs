@@ -25,6 +25,10 @@ use tokio::net::TcpStream;
 use uuid::Uuid;
 
 async fn start_server() -> SocketAddr {
+    start_server_with_policy(mc_net::ChunkPipelinePolicy::default()).await
+}
+
+async fn start_server_with_policy(chunk_pipeline: mc_net::ChunkPipelinePolicy) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.d login".into(),
@@ -44,7 +48,7 @@ async fn start_server() -> SocketAddr {
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         shutdown: mc_net::ShutdownHandle::default(),
@@ -55,6 +59,35 @@ async fn start_server() -> SocketAddr {
         let _ = bound.serve().await;
     });
     addr
+}
+
+async fn drive_to_set_compression(addr: SocketAddr, name: &str) -> SetCompression {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    write_frame(
+        &mut stream,
+        &Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            server_address: "127.0.0.1".into(),
+            server_port: addr.port(),
+            next_state: NextState::Login,
+        },
+        Compression::Disabled,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &LoginStart {
+            name: name.into(),
+            player_uuid: Uuid::nil(),
+        },
+        Compression::Disabled,
+    )
+    .await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, SetCompression::ID);
+    SetCompression::decode(&mut frame.body).unwrap()
 }
 
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
@@ -139,6 +172,19 @@ async fn login_offline_flow_completes() {
         "server should advertise Known Packs once Configuration begins"
     );
     let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+}
+
+#[tokio::test]
+async fn login_uses_configured_compression_threshold() {
+    let addr = start_server_with_policy(mc_net::ChunkPipelinePolicy {
+        compression_threshold: 128,
+        ..mc_net::ChunkPipelinePolicy::default()
+    })
+    .await;
+
+    let set_compression = drive_to_set_compression(addr, "ThresholdProbe").await;
+
+    assert_eq!(set_compression.threshold, 128);
 }
 
 #[tokio::test]

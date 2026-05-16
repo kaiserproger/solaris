@@ -49,6 +49,8 @@ pub struct ServerSection {
     pub max_players: u32,
     #[serde(default = "default_view_distance")]
     pub view_distance: i32,
+    #[serde(default = "default_view_distance")]
+    pub simulation_distance: i32,
 }
 
 /// Network-level server settings.
@@ -108,6 +110,8 @@ pub struct ChunkPipelineSection {
     pub chunk_result_queue_size: usize,
     #[serde(default = "default_region_cache_size")]
     pub region_cache_size: usize,
+    #[serde(default = "default_compression_threshold")]
+    pub compression_threshold: i32,
     #[serde(default)]
     pub compression_level: Option<u32>,
 }
@@ -118,6 +122,10 @@ pub struct SimulationSection {
     pub random_tick_speed: u32,
     #[serde(default = "default_random_tick_chunk_budget")]
     pub random_tick_chunk_budget: usize,
+    #[serde(default = "default_scheduled_fluid_tick_budget")]
+    pub scheduled_fluid_tick_budget: usize,
+    #[serde(default = "default_save_interval_ticks")]
+    pub save_interval_ticks: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,6 +151,8 @@ impl Default for SimulationSection {
         Self {
             random_tick_speed: policy.random_tick_speed,
             random_tick_chunk_budget: policy.chunk_budget,
+            scheduled_fluid_tick_budget: policy.fluid_tick_budget,
+            save_interval_ticks: policy.save_interval_ticks,
         }
     }
 }
@@ -153,6 +163,8 @@ impl SimulationSection {
         mc_net::RandomTickPolicy {
             random_tick_speed: self.random_tick_speed,
             chunk_budget: self.random_tick_chunk_budget.max(1),
+            fluid_tick_budget: self.scheduled_fluid_tick_budget.max(1),
+            save_interval_ticks: self.save_interval_ticks.max(1),
             seed: seed as u64,
         }
     }
@@ -172,6 +184,7 @@ impl Default for ChunkPipelineSection {
             entity_worker_threads_percent: default_entity_worker_threads_percent(),
             chunk_result_queue_size: policy.chunk_result_queue_size,
             region_cache_size: policy.region_cache_size,
+            compression_threshold: policy.compression_threshold,
             compression_level: policy.compression_level,
         }
     }
@@ -192,6 +205,7 @@ impl ChunkPipelineSection {
             entity_worker_threads: threads_from_percent(cores, self.entity_worker_threads_percent),
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
+            compression_threshold: self.compression_threshold.max(0),
             compression_level: self.compression_level.map(|level| level.min(9)),
         }
     }
@@ -267,12 +281,24 @@ fn default_region_cache_size() -> usize {
     mc_net::ChunkPipelinePolicy::default().region_cache_size
 }
 
+fn default_compression_threshold() -> i32 {
+    mc_net::ChunkPipelinePolicy::default().compression_threshold
+}
+
 fn default_random_tick_speed() -> u32 {
     mc_net::RandomTickPolicy::default().random_tick_speed
 }
 
 fn default_random_tick_chunk_budget() -> usize {
     mc_net::RandomTickPolicy::default().chunk_budget
+}
+
+fn default_scheduled_fluid_tick_budget() -> usize {
+    mc_net::RandomTickPolicy::default().fluid_tick_budget
+}
+
+fn default_save_interval_ticks() -> u64 {
+    mc_net::RandomTickPolicy::default().save_interval_ticks
 }
 
 fn default_allow_local_dev_operators() -> bool {
@@ -347,6 +373,7 @@ mod tests {
         assert_eq!(cfg.server.name, "S");
         assert_eq!(cfg.server.max_players, 20);
         assert_eq!(cfg.server.view_distance, 10);
+        assert_eq!(cfg.server.simulation_distance, 10);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 8);
@@ -355,6 +382,8 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 25);
         assert_eq!(cfg.simulation.random_tick_speed, 3);
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
+        assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 256);
+        assert_eq!(cfg.simulation.save_interval_ticks, 20);
     }
 
     #[test]
@@ -379,6 +408,7 @@ mod tests {
             entity_worker_threads_percent = 30
             chunk_result_queue_size = 9
             region_cache_size = 7
+            compression_threshold = 128
             compression_level = 6
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
@@ -392,6 +422,7 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 30);
         assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
         assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
+        assert_eq!(cfg.chunk_pipeline.compression_threshold, 128);
         assert_eq!(cfg.chunk_pipeline.compression_level, Some(6));
     }
 
@@ -408,6 +439,7 @@ mod tests {
             entity_worker_threads_percent: 0,
             chunk_result_queue_size: 0,
             region_cache_size: 0,
+            compression_threshold: -1,
             compression_level: Some(99),
         };
         let policy = section.to_network();
@@ -420,6 +452,7 @@ mod tests {
         assert_eq!(policy.entity_worker_threads, 1);
         assert_eq!(policy.chunk_result_queue_size, 1);
         assert_eq!(policy.region_cache_size, 1);
+        assert_eq!(policy.compression_threshold, 0);
         assert_eq!(policy.compression_level, Some(9));
     }
 
@@ -437,11 +470,15 @@ mod tests {
             [simulation]
             random_tick_speed = 7
             random_tick_chunk_budget = 11
+            scheduled_fluid_tick_budget = 13
+            save_interval_ticks = 40
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
         assert_eq!(cfg.simulation.random_tick_speed, 7);
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 11);
+        assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 13);
+        assert_eq!(cfg.simulation.save_interval_ticks, 40);
     }
 
     #[test]
@@ -449,11 +486,15 @@ mod tests {
         let section = SimulationSection {
             random_tick_speed: 0,
             random_tick_chunk_budget: 0,
+            scheduled_fluid_tick_budget: 0,
+            save_interval_ticks: 0,
         };
         let policy = section.to_network(42);
 
         assert_eq!(policy.random_tick_speed, 0);
         assert_eq!(policy.chunk_budget, 1);
+        assert_eq!(policy.fluid_tick_budget, 1);
+        assert_eq!(policy.save_interval_ticks, 1);
         assert_eq!(policy.seed, 42);
     }
 
@@ -482,6 +523,7 @@ mod tests {
             motd = "Howdy"
             max_players = 50
             view_distance = 7
+            simulation_distance = 5
 
             [network]
             bind_address = "127.0.0.1"
@@ -511,6 +553,7 @@ mod tests {
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
         assert_eq!(net.view_distance, 7);
+        assert_eq!(cfg.server.simulation_distance, 5);
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
         assert_eq!(net.chunk_pipeline.region_cache_size, 4);

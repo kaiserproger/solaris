@@ -19,6 +19,7 @@ pub struct ChunkPipelinePolicy {
     pub entity_worker_threads: usize,
     pub chunk_result_queue_size: usize,
     pub region_cache_size: usize,
+    pub compression_threshold: i32,
     pub compression_level: Option<u32>,
 }
 
@@ -35,6 +36,7 @@ impl Default for ChunkPipelinePolicy {
             entity_worker_threads: 2,
             chunk_result_queue_size: 64,
             region_cache_size: 4,
+            compression_threshold: crate::login::LOGIN_COMPRESSION_THRESHOLD,
             compression_level: None,
         }
     }
