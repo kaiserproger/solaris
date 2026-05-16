@@ -418,6 +418,13 @@ High-level plan; details go in separate milestone docs as we approach each one. 
 - **M23: Developer documentation + plugin API stable**
 - **M24: 1.0 release**
 
+### Active post-M34 hardening note
+
+The per-milestone docs are authoritative after the original roadmap. M39 is
+reserved for server-wide lock mitigation: make Solaris as lock-free as practical,
+remove long global critical sections, and move blocking world/storage/session
+work behind queues, snapshots, sharding, or actor-style ownership where it fits.
+
 ### 9.1 Critical gates
 
 **After M3:** if the client doesn't connect reliably or performance is dismal — STOP, reconsider the architecture. Do not move forward on a rotten foundation.

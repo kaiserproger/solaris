@@ -11,6 +11,8 @@ pub(super) async fn connect_to_play(
         .await
         .expect("drive configuration");
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");

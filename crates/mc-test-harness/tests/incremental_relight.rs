@@ -86,6 +86,8 @@ async fn incremental_relight_wire_matches_full_recompute() {
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -104,6 +106,8 @@ async fn incremental_relight_wire_matches_full_recompute() {
         .expect("drive configuration");
 
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);

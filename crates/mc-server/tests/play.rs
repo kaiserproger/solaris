@@ -29,9 +29,9 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    ClientboundContainerSetContent, ClientboundKeepAlive, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay, ServerboundChatCommand,
-    ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
+    ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
+    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay,
+    ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -59,6 +59,8 @@ async fn start_server() -> SocketAddr {
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -186,6 +188,19 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
+        ClientboundCommands::ID,
+        "expected Commands after Login"
+    );
+    let commands = ClientboundCommands::decode(&mut frame.body).unwrap();
+    assert!(
+        !commands.nodes[commands.root_index as usize]
+            .children
+            .is_empty()
+    );
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
         SynchronizePlayerPosition::ID,
         "expected Synchronize Player Position"
     );
@@ -288,7 +303,7 @@ async fn play_state_handles_serverbound_keepalive_echo() {
 
     // Drain Play entry burst. With world = None the chunk packet itself
     // is intentionally not emitted.
-    for _ in 0..7 {
+    for _ in 0..9 {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 
@@ -322,7 +337,7 @@ async fn play_state_survival_damage_command_updates_health() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "DamageCmd").await;
 
-    for _ in 0..7 {
+    for _ in 0..9 {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 

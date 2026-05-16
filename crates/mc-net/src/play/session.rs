@@ -656,6 +656,20 @@ impl SessionRegistry {
         refresh_visibility_locked(&mut inner)
     }
 
+    pub(super) fn spawn_command_entity(
+        &self,
+        entity_type_id: i32,
+        entity_type_name: String,
+        position: Vec3,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
+        apply_entity_facts(&mut entity);
+        let id = inner.entities.spawn(entity);
+        inner.last_sent_entity_positions.insert(id, position);
+        refresh_visibility_locked(&mut inner)
+    }
+
     pub(super) fn nearby_item_entities(
         &self,
         position: Vec3,

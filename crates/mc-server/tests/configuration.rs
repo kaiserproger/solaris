@@ -15,11 +15,12 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, ServerboundKnownPacks, UpdateTags,
+    RegistryData, ServerboundClientInformation, ServerboundKnownPacks, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::LoginPlay;
+use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -46,6 +47,8 @@ async fn start_server() -> SocketAddr {
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -247,10 +250,26 @@ async fn configuration_skips_unexpected_packets() {
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
 
-    // Send a "Client Information"-shaped junk frame with serverbound id
-    // 0x00 in Configuration. The handler should ignore it.
-    let junk = encode_frame(0x00, &[0u8; 4], compression).unwrap();
-    stream.write_all(&junk).await.unwrap();
+    // Send valid Client Information before Known Packs. The handler should
+    // decode and ignore it while waiting for the expected response.
+    write_frame(
+        &mut stream,
+        &ServerboundClientInformation {
+            information: ClientInformation {
+                language: "en_us".to_string(),
+                view_distance: 8,
+                chat_visibility: ChatVisibility::Full,
+                chat_colors: true,
+                model_customisation: 0x7f,
+                main_hand: MainHand::Right,
+                text_filtering_enabled: false,
+                allows_listing: true,
+                particle_status: ParticleStatus::All,
+            },
+        },
+        compression,
+    )
+    .await;
 
     // Now send the real Known Packs response.
     write_frame(
@@ -280,10 +299,26 @@ async fn configuration_skips_unexpected_packets() {
     assert_eq!(frame.id, FinishConfiguration::ID);
     let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 
-    // Send another junk frame before the ack — handler should ignore it
-    // too while waiting for AcknowledgeFinishConfiguration.
-    let junk = encode_frame(0x02, &[1, 2, 3], compression).unwrap();
-    stream.write_all(&junk).await.unwrap();
+    // Send another valid-but-out-of-order Client Information before the ack —
+    // handler should ignore it too while waiting for AcknowledgeFinishConfiguration.
+    write_frame(
+        &mut stream,
+        &ServerboundClientInformation {
+            information: ClientInformation {
+                language: "en_us".to_string(),
+                view_distance: 8,
+                chat_visibility: ChatVisibility::Full,
+                chat_colors: true,
+                model_customisation: 0x7f,
+                main_hand: MainHand::Right,
+                text_filtering_enabled: false,
+                allows_listing: true,
+                particle_status: ParticleStatus::All,
+            },
+        },
+        compression,
+    )
+    .await;
 
     write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
     // Same as above: verify the state transition by waiting for the

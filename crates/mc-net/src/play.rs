@@ -41,23 +41,23 @@ use mc_protocol::packets::play::{
     ClientboundCommandSuggestions, ClientboundContainerSetContent, ClientboundContainerSetData,
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn,
     ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
-    Direction, EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent,
-    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
-    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
-    PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
-    ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
-    ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
-    ServerboundCommandSuggestion, ServerboundContainerClick, ServerboundContainerClose,
-    ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerLoaded,
-    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
-    ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTakeItemEntity,
+    ConfirmTeleportation, ContainerInput, Direction, EntityAnimation, EntityAnimationAction,
+    EntityDataValue, EntityEvent, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent,
+    GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
+    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions,
+    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities,
+    RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
+    ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
+    ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
+    ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerClick,
+    ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
+    ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe,
+    ServerboundResourcePack, ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_world::light::{
@@ -83,7 +83,7 @@ use crate::{
 
 mod block_wire;
 mod chunk_stream;
-mod commands;
+pub(crate) mod commands;
 mod containers;
 mod inventory;
 mod item_blocks;
@@ -110,9 +110,11 @@ use chunk_stream::{
     ChunkStreamState, ChunkStreamStep, PreparedChunkFrame, desired_chunk_set, herd_uuid,
 };
 use commands::{
-    CommandPermissions, DebugCommand, SurvivalCommand, parse_debug_command, parse_gamemode_command,
-    player_abilities_for_mode,
+    AdminCommand, CommandError, CommandPermissions, DebugCommand, SurvivalCommand,
+    command_suggestions, command_tree_packet, parse_admin_command, player_abilities_for_mode,
 };
+#[cfg(test)]
+use commands::{parse_debug_command, parse_gamemode_command};
 use containers::{
     ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceWindow,
     chest_menu_title_nbt, crafting_menu_title_nbt, find_smelting_recipe_for_item,
@@ -404,6 +406,8 @@ where
         initial_pose,
     );
 
+    let permissions = config.command_permissions.permissions_for(profile);
+
     // 1. Login (Play).
     let login = LoginPlay {
         entity_id: i32::try_from(session_id).unwrap_or(i32::MAX),
@@ -441,6 +445,7 @@ where
         data_to_keep: 0,
     };
     write_packet(writer, &login, compression).await?;
+    write_packet(writer, &command_tree_packet(permissions), compression).await?;
     dispatch_visibility_commands(visibility);
 
     // 2. Synchronize Player Position. teleport_id=1; we'll watch for
@@ -611,11 +616,12 @@ where
             interaction.as_mut(),
             chunk_stream,
             Arc::clone(&sessions),
+            config,
             session_id,
             initial_pose,
             player_state.spawn.pose(),
             respawn,
-            CommandPermissions::for_local_dev_profile(profile),
+            permissions,
             player_state.survival,
             player_state.xp,
             player_state.game_mode,
@@ -5408,6 +5414,7 @@ async fn play_loop<R, W>(
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
     sessions: Arc<SessionRegistry>,
+    config: &ServerConfig,
     session_id: SessionId,
     mut player_pose: PlayerPose,
     respawn_pose: PlayerPose,
@@ -5993,19 +6000,27 @@ where
                 } else if frame.id == ServerboundCommandSuggestion::ID {
                     let mut body = frame.body;
                     let request = ServerboundCommandSuggestion::decode(&mut body)?;
-                    let start = request.command.chars().count().min(i32::MAX as usize) as i32;
+                    let suggestions = command_suggestions(&request.command, permissions);
                     debug!(
                         request_id = request.id,
                         command = %request.command,
-                        "command suggestions requested; replying with empty list"
+                        count = suggestions.suggestions.len(),
+                        "command suggestions requested"
                     );
                     write_packet(
                         writer,
                         &ClientboundCommandSuggestions {
                             id: request.id,
-                            start,
-                            length: 0,
-                            suggestions: Vec::new(),
+                            start: suggestions.start,
+                            length: suggestions.length,
+                            suggestions: suggestions
+                                .suggestions
+                                .into_iter()
+                                .map(|text| mc_protocol::packets::play::CommandSuggestionEntry {
+                                    text,
+                                    tooltip_nbt: None,
+                                })
+                                .collect(),
                         },
                         compression,
                     )
@@ -6013,25 +6028,21 @@ where
                 } else if frame.id == ServerboundChatCommand::ID {
                     let mut body = frame.body;
                     let command = ServerboundChatCommand::decode(&mut body)?;
-                    if let Some(mode) = parse_gamemode_command(&command.command) {
-                        if let Some(state) = interaction.as_deref_mut() {
-                            state.pending_break = None;
-                            state.pending_use = None;
-                        }
-                        apply_game_mode(writer, compression, &mut game_mode, mode, permissions).await?;
-                    } else if let Some(command) = parse_debug_command(&command.command) {
-                        apply_debug_command(
-                            writer,
-                            compression,
-                            &mut survival_state,
-                            interaction.as_deref_mut(),
-                            player_pose,
-                            command,
-                            permissions,
-                        ).await?;
-                    } else {
-                        debug!(command = %command.command, "unsupported command ignored");
-                    }
+                    execute_player_command(
+                        writer,
+                        compression,
+                        &command.command,
+                        permissions,
+                        &mut game_mode,
+                        &mut survival_state,
+                        config,
+                        &sessions,
+                        session_id,
+                        interaction.as_deref_mut(),
+                        &mut player_pose,
+                        &mut chunk_stream,
+                    )
+                    .await?;
                 } else if frame.id == ServerboundChangeGameMode::ID {
                     let mut body = frame.body;
                     let command = ServerboundChangeGameMode::decode(&mut body)?;
@@ -6049,6 +6060,252 @@ where
             }
             _ = tokio::time::sleep(Duration::from_millis(1)), if chunk_stream.as_ref().is_some_and(|stream| !stream.is_complete()) => {}
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_player_command<W>(
+    writer: &mut W,
+    compression: Compression,
+    raw: &str,
+    permissions: CommandPermissions,
+    game_mode: &mut GameMode,
+    survival_state: &mut SurvivalState,
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    session_id: SessionId,
+    mut interaction: Option<&mut InteractionState>,
+    player_pose: &mut PlayerPose,
+    chunk_stream: &mut Option<ChunkStreamState>,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let command = match parse_admin_command(raw, permissions) {
+        Ok(command) => command,
+        Err(err) => {
+            send_command_feedback(writer, compression, command_error_message(err)).await?;
+            debug!(command = %raw, error = ?err, "command rejected");
+            return Ok(());
+        }
+    };
+
+    match command {
+        AdminCommand::GameMode(mode) => {
+            if let Some(state) = interaction.as_deref_mut() {
+                state.pending_break = None;
+                state.pending_use = None;
+            }
+            apply_game_mode(writer, compression, game_mode, mode, permissions).await?;
+            send_command_feedback(writer, compression, &format!("Set game mode to {mode:?}")).await
+        }
+        AdminCommand::Give { item, count } => {
+            match apply_give_command(writer, interaction.as_deref_mut(), &item, count).await? {
+                Ok(message) => send_command_feedback(writer, compression, &message).await,
+                Err(message) => send_command_feedback(writer, compression, message).await,
+            }
+        }
+        AdminCommand::SaveAll => {
+            let report = crate::server::save_all(config, sessions).await;
+            if report.is_ok() {
+                send_command_feedback(
+                    writer,
+                    compression,
+                    &format!(
+                        "Saved {} players, {} entities, {} chunks",
+                        report.players_saved, report.entities_saved, report.chunks_flushed
+                    ),
+                )
+                .await
+            } else {
+                warn!(errors = report.errors.len(), "save-all command failed");
+                send_command_feedback(writer, compression, "Save-all failed; see server log").await
+            }
+        }
+        AdminCommand::Stop => {
+            let report = crate::server::save_all(config, sessions).await;
+            if report.is_ok() {
+                send_command_feedback(writer, compression, "Saved all state; stopping server")
+                    .await?;
+                config.shutdown.request();
+            } else {
+                warn!(errors = report.errors.len(), "stop command save-all failed");
+                send_command_feedback(writer, compression, "Stop aborted: save-all failed").await?;
+            }
+            Ok(())
+        }
+        AdminCommand::Teleport { x, y, z } => {
+            let old_center = player_pose.chunk_pos();
+            player_pose.x = x;
+            player_pose.y = y;
+            player_pose.z = z;
+            if let Some(state) = interaction.as_deref_mut() {
+                state.pending_break = None;
+                state.pending_use = None;
+            }
+            let new_center = player_pose.chunk_pos();
+            dispatch_visibility_commands(sessions.update_pose(session_id, *player_pose));
+            write_packet(
+                writer,
+                &SynchronizePlayerPosition {
+                    teleport_id: 3,
+                    x,
+                    y,
+                    z,
+                    dx: 0.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                    yaw: player_pose.yaw,
+                    pitch: player_pose.pitch,
+                    relative_flags: 0,
+                },
+                compression,
+            )
+            .await?;
+            replan_after_movement(
+                writer,
+                compression,
+                chunk_stream,
+                interaction.as_deref_mut(),
+                old_center,
+                new_center,
+                player_pose.yaw,
+            )
+            .await?;
+            send_command_feedback(writer, compression, &format!("Teleported to {x} {y} {z}")).await
+        }
+        AdminCommand::Kill => {
+            let was_dead = survival_state.is_dead();
+            survival_state.apply_damage(10000.0);
+            write_packet(writer, &survival_state.as_packet(), compression).await?;
+            if !was_dead
+                && survival_state.is_dead()
+                && let Some(state) = interaction.as_deref_mut()
+            {
+                state.pending_break = None;
+                state.pending_use = None;
+                drop_inventory_on_death(state, writer, *player_pose).await?;
+            }
+            send_command_feedback(writer, compression, "Killed player").await
+        }
+        AdminCommand::Summon { entity, x, y, z } => {
+            let Some(state) = interaction.as_deref_mut() else {
+                send_command_feedback(
+                    writer,
+                    compression,
+                    "Cannot summon before play state is ready",
+                )
+                .await?;
+                return Ok(());
+            };
+            let Some(entity_type_id) = state.entity_types.id_of(&entity) else {
+                send_command_feedback(writer, compression, "Unknown entity type").await?;
+                return Ok(());
+            };
+            let position = Vec3::new(
+                x.unwrap_or(player_pose.x),
+                y.unwrap_or(player_pose.y),
+                z.unwrap_or(player_pose.z),
+            );
+            dispatch_visibility_commands(sessions.spawn_command_entity(
+                i32::try_from(entity_type_id).unwrap_or(i32::MAX),
+                entity.to_string(),
+                position,
+            ));
+            send_command_feedback(writer, compression, &format!("Summoned {entity}")).await
+        }
+        AdminCommand::TimeSet(time) => {
+            sessions.set_world_time(time);
+            write_packet(
+                writer,
+                &ClientboundSetTime {
+                    game_time: i64::try_from(time).unwrap_or(i64::MAX),
+                },
+                compression,
+            )
+            .await?;
+            send_command_feedback(writer, compression, &format!("Set time to {time}")).await
+        }
+        AdminCommand::Debug(command) => {
+            apply_debug_command(
+                writer,
+                compression,
+                survival_state,
+                interaction,
+                *player_pose,
+                command,
+                permissions,
+            )
+            .await?;
+            send_command_feedback(writer, compression, "Debug command executed").await
+        }
+    }
+}
+
+async fn apply_give_command<W>(
+    writer: &mut W,
+    interaction: Option<&mut InteractionState>,
+    item: &Identifier,
+    count: i32,
+) -> Result<Result<String, &'static str>, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(state) = interaction else {
+        debug!(%item, count, "give command rejected: no interaction state");
+        return Ok(Err("Cannot give items before play state is ready"));
+    };
+    let Some(item_id) = state.items.id_of(item) else {
+        debug!(%item, "give command rejected: item not in registry");
+        return Ok(Err("Unknown item"));
+    };
+    let stack = ItemStack::new(item_id, count);
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
+    let mut candidate = state.inventory.clone();
+    let (leftover, changed) = candidate.merge_stack(stack, max_stack);
+    if !leftover.is_empty() {
+        debug!(%item, count, "give command rejected: inventory full");
+        return Ok(Err("Not enough inventory space"));
+    }
+    state.inventory = candidate;
+    write_inventory_slot_updates(state, writer, changed).await?;
+    Ok(Ok(format!("Gave {count} of {item}")))
+}
+
+async fn send_command_feedback<W>(
+    writer: &mut W,
+    compression: Compression,
+    message: &str,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundSystemChat {
+            content_nbt: text_component_nbt(message),
+            overlay: false,
+        },
+        compression,
+    )
+    .await
+}
+
+fn text_component_nbt(text: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    mc_nbt::write_network(
+        &mut out,
+        &Tag::Compound(vec![("text".to_string(), Tag::String(text.to_string()))]),
+    )
+    .expect("text component is valid NBT");
+    out
+}
+
+fn command_error_message(error: CommandError) -> &'static str {
+    match error {
+        CommandError::Unknown => "Unknown command",
+        CommandError::PermissionDenied => "You do not have permission to use that command",
+        CommandError::Usage(usage) => usage,
     }
 }
 

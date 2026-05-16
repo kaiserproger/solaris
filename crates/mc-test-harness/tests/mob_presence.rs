@@ -8,8 +8,9 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundSetHealth,
     ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay, MoveEntityPosRot,
-    MovePlayerFlags, RemoveEntities, ServerboundAttack, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    MovePlayerFlags, RemoveEntities, ServerboundAttack, ServerboundChatCommand,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk, SetEntityMotion,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -72,6 +73,8 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -143,6 +146,8 @@ async fn two_clients_receive_same_server_owned_mob() {
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -222,6 +227,8 @@ async fn survival_attack_passive_mob_drops_food() {
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -360,6 +367,8 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -368,7 +377,12 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
     });
 
     let (mut client, _) = connect_to_play(addr, "M24Zombie").await;
-    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "summon minecraft:zombie".to_string(),
+        })
+        .await
+        .expect("summon zombie");
     let zombie = wait_for_zombie_spawn(&mut client, zombie_type_id).await;
     client
         .write_packet(&ServerboundMovePlayerPos {
@@ -469,6 +483,8 @@ async fn connect_to_play(
         .await
         .expect("drive configuration");
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");

@@ -94,6 +94,8 @@ mod tests {
             biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: crate::ChunkPipelinePolicy::default(),
             random_tick: crate::RandomTickPolicy::default(),
+            command_permissions: crate::CommandPermissionConfig::new(Vec::<String>::new(), true),
+            shutdown: crate::ShutdownHandle::default(),
         };
         let json = build_status_json(&cfg);
         // Parse it back to make sure the value is a well-formed object.

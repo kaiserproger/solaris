@@ -487,6 +487,19 @@ fn serverbound_change_game_mode_id_and_layout_match_javap() {
 }
 
 #[test]
+fn clientbound_set_time_id_and_empty_clock_map_layout_match_javap() {
+    assert_eq!(ClientboundSetTime::ID, 0x71);
+    let packet = ClientboundSetTime { game_time: 6000 };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, [6000_i64.to_be_bytes().as_slice(), &[0]].concat());
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ClientboundSetTime::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn serverbound_chat_command_id_and_layout_match_javap() {
     assert_eq!(ServerboundChatCommand::ID, 0x07);
     let packet = ServerboundChatCommand {
@@ -551,6 +564,56 @@ fn command_suggestion_packets_match_local_decompiled_sources() {
         ClientboundCommandSuggestions::decode(&mut cursor).unwrap(),
         response
     );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn clientbound_commands_literal_and_greedy_string_tree_matches_javap_layout() {
+    assert_eq!(ClientboundCommands::ID, 0x10);
+    let packet = ClientboundCommands {
+        nodes: vec![
+            CommandNode::root(vec![1, 3]),
+            CommandNode::literal("gamemode", vec![2], false).restricted(true),
+            CommandNode::literal("creative", Vec::new(), true).restricted(true),
+            CommandNode::literal("give", vec![4], false).restricted(true),
+            CommandNode::argument(
+                "args",
+                CommandArgumentParser::String(CommandStringKind::GreedyPhrase),
+                Vec::new(),
+                true,
+            )
+            .restricted(true),
+        ],
+        root_index: 0,
+    };
+
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf[0], 5); // node list length
+    assert_eq!(buf[1], 0); // root flags
+    assert_eq!(buf[2], 2); // root child count
+    assert_eq!(buf[3], 1);
+    assert_eq!(buf[4], 3);
+    assert_eq!(buf[5], 0x21); // restricted literal, not executable
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ClientboundCommands::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn clientbound_system_chat_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ClientboundSystemChat::ID, 0x79);
+    let packet = ClientboundSystemChat {
+        content_nbt: vec![0x0A, 0x00],
+        overlay: false,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0x0A, 0x00, 0x00]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ClientboundSystemChat::decode(&mut cursor).unwrap(), packet);
     assert!(cursor.is_empty());
 }
 

@@ -37,6 +37,8 @@ const MAX_ENTITY_DATA_VALUES: usize = 64;
 const MAX_CONTAINER_CLICK_CHANGED_SLOTS: usize = 128;
 const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
 const MAX_COMMAND_LEN: usize = 32_767;
+const MAX_COMMAND_NODE_COUNT: usize = 1024;
+const MAX_COMMAND_CHILD_COUNT: usize = 1024;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
 pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
@@ -626,6 +628,33 @@ impl Packet for GameEvent {
             event: buf.read_u8()?,
             value: buf.read_f32()?,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundSetTime {
+    pub game_time: i64,
+}
+
+impl Packet for ClientboundSetTime {
+    // `.analysis/protocol-dump.txt` / `GameProtocols`: game
+    // CLIENTBOUND_SET_TIME is clientbound registration index 113, wire id 0x71.
+    // 26.1's `ClientboundSetTimePacket` writes `long gameTime` followed by a
+    // map of clock updates. Solaris emits an empty map for its single backed
+    // world-time value.
+    const ID: i32 = 0x71;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.game_time);
+        buf.write_varint(0);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let game_time = buf.read_i64()?;
+        let clock_update_count = read_count(buf, 0)?;
+        debug_assert_eq!(clock_update_count, 0);
+        Ok(Self { game_time })
     }
 }
 
@@ -1799,6 +1828,90 @@ pub struct ClientboundCommandSuggestions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundCommands {
+    pub nodes: Vec<CommandNode>,
+    pub root_index: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandNode {
+    pub kind: CommandNodeKind,
+    pub children: Vec<i32>,
+    pub executable: bool,
+    pub restricted: bool,
+    pub redirect: Option<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandNodeKind {
+    Root,
+    Literal(String),
+    Argument {
+        name: String,
+        parser: CommandArgumentParser,
+        suggestions: Option<Identifier>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandArgumentParser {
+    String(CommandStringKind),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandStringKind {
+    SingleWord,
+    QuotablePhrase,
+    GreedyPhrase,
+}
+
+impl CommandNode {
+    pub fn root(children: Vec<i32>) -> Self {
+        Self {
+            kind: CommandNodeKind::Root,
+            children,
+            executable: false,
+            restricted: false,
+            redirect: None,
+        }
+    }
+
+    pub fn literal(name: impl Into<String>, children: Vec<i32>, executable: bool) -> Self {
+        Self {
+            kind: CommandNodeKind::Literal(name.into()),
+            children,
+            executable,
+            restricted: false,
+            redirect: None,
+        }
+    }
+
+    pub fn argument(
+        name: impl Into<String>,
+        parser: CommandArgumentParser,
+        children: Vec<i32>,
+        executable: bool,
+    ) -> Self {
+        Self {
+            kind: CommandNodeKind::Argument {
+                name: name.into(),
+                parser,
+                suggestions: None,
+            },
+            children,
+            executable,
+            restricted: false,
+            redirect: None,
+        }
+    }
+
+    pub fn restricted(mut self, restricted: bool) -> Self {
+        self.restricted = restricted;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSuggestionEntry {
     pub text: String,
     pub tooltip_nbt: Option<Vec<u8>>,
@@ -1851,6 +1964,197 @@ impl Packet for ClientboundCommandSuggestions {
             start,
             length,
             suggestions,
+        })
+    }
+}
+
+impl Packet for ClientboundCommands {
+    // `.analysis/protocol-dump.txt` / `GameProtocols`: game
+    // CLIENTBOUND_COMMANDS is clientbound registration index 16, wire id 0x10.
+    // `ClientboundCommandsPacket` writes a list of nodes followed by rootIndex;
+    // each node is flags, VarInt child array, optional redirect, then the
+    // literal or argument payload selected by flags & 3.
+    const ID: i32 = 0x10;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_count(buf, self.nodes.len())?;
+        for node in &self.nodes {
+            node.encode(buf)?;
+        }
+        buf.write_varint(self.root_index);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = read_count(buf, MAX_COMMAND_NODE_COUNT)?;
+        let mut nodes = Vec::with_capacity(count);
+        for _ in 0..count {
+            nodes.push(CommandNode::decode(buf)?);
+        }
+        Ok(Self {
+            nodes,
+            root_index: buf.read_varint()?,
+        })
+    }
+}
+
+impl CommandNode {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        let mut flags = match self.kind {
+            CommandNodeKind::Root => 0,
+            CommandNodeKind::Literal(_) => 1,
+            CommandNodeKind::Argument { .. } => 2,
+        };
+        if self.executable {
+            flags |= 4;
+        }
+        if self.redirect.is_some() {
+            flags |= 8;
+        }
+        if matches!(
+            self.kind,
+            CommandNodeKind::Argument {
+                suggestions: Some(_),
+                ..
+            }
+        ) {
+            flags |= 16;
+        }
+        if self.restricted {
+            flags |= 32;
+        }
+
+        buf.put_u8(flags);
+        write_count(buf, self.children.len())?;
+        for &child in &self.children {
+            buf.write_varint(child);
+        }
+        if let Some(redirect) = self.redirect {
+            buf.write_varint(redirect);
+        }
+        match &self.kind {
+            CommandNodeKind::Root => {}
+            CommandNodeKind::Literal(name) => buf.write_string(name, MAX_COMMAND_LEN)?,
+            CommandNodeKind::Argument {
+                name,
+                parser,
+                suggestions,
+            } => {
+                buf.write_string(name, MAX_COMMAND_LEN)?;
+                parser.encode(buf);
+                if let Some(suggestions) = suggestions {
+                    buf.write_identifier(suggestions);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let flags = buf.read_u8()?;
+        let child_count = read_count(buf, MAX_COMMAND_CHILD_COUNT)?;
+        let mut children = Vec::with_capacity(child_count);
+        for _ in 0..child_count {
+            children.push(buf.read_varint()?);
+        }
+        let redirect = if flags & 8 != 0 {
+            Some(buf.read_varint()?)
+        } else {
+            None
+        };
+        let suggestions = flags & 16 != 0;
+        let kind = match flags & 3 {
+            0 => CommandNodeKind::Root,
+            1 => CommandNodeKind::Literal(buf.read_string(MAX_COMMAND_LEN)?),
+            2 => {
+                let name = buf.read_string(MAX_COMMAND_LEN)?;
+                let parser = CommandArgumentParser::decode(buf)?;
+                let suggestions = suggestions.then(|| buf.read_identifier()).transpose()?;
+                CommandNodeKind::Argument {
+                    name,
+                    parser,
+                    suggestions,
+                }
+            }
+            _ => return Err(CodecError::NotSupported("unknown command node type")),
+        };
+        Ok(Self {
+            kind,
+            children,
+            executable: flags & 4 != 0,
+            restricted: flags & 32 != 0,
+            redirect,
+        })
+    }
+}
+
+impl CommandArgumentParser {
+    const BRIGADIER_STRING_ID: i32 = 5;
+
+    fn encode<B: BufMut>(self, buf: &mut B) {
+        match self {
+            Self::String(kind) => {
+                buf.write_varint(Self::BRIGADIER_STRING_ID);
+                buf.write_varint(kind as i32);
+            }
+        }
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        match buf.read_varint()? {
+            Self::BRIGADIER_STRING_ID => Ok(Self::String(CommandStringKind::decode(buf)?)),
+            _ => Err(CodecError::NotSupported(
+                "unsupported command argument parser",
+            )),
+        }
+    }
+}
+
+impl CommandStringKind {
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        match buf.read_varint()? {
+            0 => Ok(Self::SingleWord),
+            1 => Ok(Self::QuotablePhrase),
+            2 => Ok(Self::GreedyPhrase),
+            _ => Err(CodecError::NotSupported(
+                "unsupported brigadier string kind",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundSystemChat {
+    pub content_nbt: Vec<u8>,
+    pub overlay: bool,
+}
+
+impl Packet for ClientboundSystemChat {
+    // `.analysis/protocol-dump.txt` / `GameProtocols`: game
+    // CLIENTBOUND_SYSTEM_CHAT is clientbound registration index 121, wire id
+    // 0x79. `ClientboundSystemChatPacket` writes trusted Component NBT then a
+    // bool overlay flag.
+    const ID: i32 = 0x79;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.put_slice(&self.content_nbt);
+        buf.write_bool(self.overlay);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        if buf.remaining() < 2 {
+            return Err(CodecError::Underflow {
+                needed: 2 - buf.remaining(),
+                available: buf.remaining(),
+            });
+        }
+        let content_len = buf.remaining() - 1;
+        let mut content_nbt = vec![0; content_len];
+        buf.copy_to_slice(&mut content_nbt);
+        Ok(Self {
+            content_nbt,
+            overlay: buf.read_bool()?,
         })
     }
 }

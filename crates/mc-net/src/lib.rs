@@ -25,7 +25,9 @@ pub use chunk_pipeline::{
 pub use error::ConnectionError;
 pub use login::offline_uuid;
 pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
-pub use server::{BoundServer, ServerConfig, WorldHandle, bind, run};
+pub use server::{
+    BoundServer, CommandPermissionConfig, ServerConfig, ShutdownHandle, WorldHandle, bind, run,
+};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -36,6 +36,8 @@ pub struct ServerConfig {
     pub chunk_pipeline: ChunkPipelineSection,
     #[serde(default)]
     pub simulation: SimulationSection,
+    #[serde(default)]
+    pub admin: AdminSection,
 }
 
 /// Identity-level server settings.
@@ -116,6 +118,23 @@ pub struct SimulationSection {
     pub random_tick_speed: u32,
     #[serde(default = "default_random_tick_chunk_budget")]
     pub random_tick_chunk_budget: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminSection {
+    #[serde(default)]
+    pub operators: Vec<String>,
+    #[serde(default = "default_allow_local_dev_operators")]
+    pub allow_local_dev_operators: bool,
+}
+
+impl Default for AdminSection {
+    fn default() -> Self {
+        Self {
+            operators: Vec::new(),
+            allow_local_dev_operators: default_allow_local_dev_operators(),
+        }
+    }
 }
 
 impl Default for SimulationSection {
@@ -256,6 +275,10 @@ fn default_random_tick_chunk_budget() -> usize {
     mc_net::RandomTickPolicy::default().chunk_budget
 }
 
+fn default_allow_local_dev_operators() -> bool {
+    true
+}
+
 impl ServerConfig {
     /// Convert a parsed TOML config into the network-layer
     /// [`mc_net::ServerConfig`], using the pre-loaded vanilla data,
@@ -296,6 +319,11 @@ impl ServerConfig {
             biome_spawns,
             chunk_pipeline: self.chunk_pipeline.to_network(),
             random_tick: self.simulation.to_network(self.data.seed),
+            command_permissions: mc_net::CommandPermissionConfig::new(
+                self.admin.operators.clone(),
+                self.admin.allow_local_dev_operators,
+            ),
+            shutdown: mc_net::ShutdownHandle::default(),
         })
     }
 }

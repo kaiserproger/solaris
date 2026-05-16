@@ -98,6 +98,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -117,6 +119,8 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
 
     // Spawn burst, in the order `mc_net::play::handle` emits it.
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
@@ -305,6 +309,8 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: policy,
         random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -323,6 +329,8 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         .expect("drive configuration");
 
     let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let center: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
@@ -333,6 +341,33 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         })
         .await
         .expect("ack teleport");
+
+    let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                initial_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("initial spawn chunk before movement");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id != LevelChunkWithLight::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
+        if (pkt.chunk_x, pkt.chunk_z) == (0, 0) {
+            break;
+        }
+    }
 
     client
         .write_packet(&ServerboundMovePlayerPos {

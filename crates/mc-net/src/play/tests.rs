@@ -205,15 +205,99 @@ fn debug_commands_parse_survival_mutations_and_give() {
 }
 
 #[test]
+fn admin_dispatcher_parses_slash_commands_and_permissions() {
+    let op = CommandPermissions { op: true };
+    let not_op = CommandPermissions { op: false };
+
+    assert_eq!(
+        parse_admin_command("/gamemode creative", op),
+        Ok(AdminCommand::GameMode(GameMode::Creative))
+    );
+    assert_eq!(
+        parse_admin_command("give minecraft:dirt 12", op),
+        Ok(AdminCommand::Give {
+            item: mc_data::Identifier::parse("minecraft:dirt").unwrap(),
+            count: 12,
+        })
+    );
+    assert_eq!(
+        parse_admin_command("/tp 1.5 70 -2", op),
+        Ok(AdminCommand::Teleport {
+            x: 1.5,
+            y: 70.0,
+            z: -2.0,
+        })
+    );
+    assert_eq!(
+        parse_admin_command("/summon minecraft:zombie", op),
+        Ok(AdminCommand::Summon {
+            entity: mc_data::Identifier::parse("minecraft:zombie").unwrap(),
+            x: None,
+            y: None,
+            z: None,
+        })
+    );
+    assert_eq!(parse_admin_command("/kill", op), Ok(AdminCommand::Kill));
+    assert_eq!(
+        parse_admin_command("/gamemode creative", not_op),
+        Err(CommandError::PermissionDenied)
+    );
+    assert_eq!(
+        parse_admin_command("/gamemode", op),
+        Err(CommandError::Usage(
+            "Usage: /gamemode <survival|creative|adventure|spectator>"
+        ))
+    );
+    assert_eq!(
+        parse_admin_command("/doesnotexist", op),
+        Err(CommandError::Unknown)
+    );
+}
+
+#[test]
+fn command_tree_and_suggestions_are_permission_aware() {
+    let op = CommandPermissions { op: true };
+    let not_op = CommandPermissions { op: false };
+
+    let tree = command_tree_packet(op);
+    assert_eq!(tree.root_index, 0);
+    assert_eq!(
+        tree.nodes[0].children,
+        vec![1, 6, 8, 10, 11, 12, 13, 15, 17]
+    );
+    assert_eq!(
+        command_tree_packet(not_op).nodes[0].children,
+        Vec::<i32>::new()
+    );
+
+    let root = command_suggestions("/g", op);
+    assert_eq!(root.start, 1);
+    assert_eq!(root.length, 1);
+    assert_eq!(
+        root.suggestions,
+        vec!["gamemode".to_string(), "give".to_string()]
+    );
+
+    let modes = command_suggestions("/gamemode c", op);
+    assert_eq!(modes.start, 10);
+    assert_eq!(modes.length, 1);
+    assert_eq!(modes.suggestions, vec!["creative".to_string()]);
+
+    assert!(command_suggestions("/g", not_op).suggestions.is_empty());
+}
+
+#[test]
 fn local_dev_profiles_are_op_capable_for_now() {
     let profile = LoggedInProfile {
         uuid: uuid::Uuid::nil(),
         name: "op_probe".to_string(),
     };
 
-    let permissions = CommandPermissions::for_local_dev_profile(&profile);
+    let permissions = crate::server::CommandPermissionConfig::new(Vec::<String>::new(), true)
+        .permissions_for(&profile);
 
     assert!(permissions.can_change_game_mode());
+    assert!(permissions.can_use_admin_commands());
 }
 
 #[test]

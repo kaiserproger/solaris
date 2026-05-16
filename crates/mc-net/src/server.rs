@@ -1,10 +1,11 @@
 //! TCP listener, accept loop, and the per-connection state-machine entry
 //! point.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use bytes::BytesMut;
 use mc_data::Identifier;
@@ -23,14 +24,87 @@ use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_world::{BlockPos, BlockRegistry, MAX_Y, MIN_Y, WorldStorage};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::ChunkPipelinePolicy;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
+
+#[derive(Debug, Clone, Default)]
+pub struct CommandPermissionConfig {
+    operators: BTreeSet<String>,
+    allow_local_dev_operators: bool,
+}
+
+impl CommandPermissionConfig {
+    #[must_use]
+    pub fn new<I, S>(operators: I, allow_local_dev_operators: bool) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            operators: operators
+                .into_iter()
+                .map(Into::into)
+                .map(|entry| entry.to_ascii_lowercase())
+                .collect(),
+            allow_local_dev_operators,
+        }
+    }
+
+    #[must_use]
+    pub fn from_operators<I, S>(operators: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self::new(operators, false)
+    }
+
+    #[must_use]
+    pub(crate) fn permissions_for(
+        &self,
+        profile: &login::LoggedInProfile,
+    ) -> play::commands::CommandPermissions {
+        play::commands::CommandPermissions::from_op(self.is_operator(profile))
+    }
+
+    #[must_use]
+    fn is_operator(&self, profile: &login::LoggedInProfile) -> bool {
+        if self.operators.is_empty() && self.allow_local_dev_operators {
+            return true;
+        }
+        self.operators.contains(&profile.name.to_ascii_lowercase())
+            || self
+                .operators
+                .contains(&profile.uuid.to_string().to_ascii_lowercase())
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct ShutdownHandle {
+    requested: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ShutdownHandle {
+    pub fn request(&self) {
+        self.requested.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    async fn notified(&self) {
+        if self.requested.load(Ordering::SeqCst) {
+            return;
+        }
+        self.notify.notified().await;
+    }
+}
 
 /// Shared, mutably-accessible handle to the world.
 ///
@@ -91,6 +165,8 @@ pub struct ServerConfig {
     /// scheduler and worker-pool stages have one runtime source of truth.
     pub chunk_pipeline: ChunkPipelinePolicy,
     pub random_tick: play::RandomTickPolicy,
+    pub command_permissions: CommandPermissionConfig,
+    pub shutdown: ShutdownHandle,
 }
 
 /// A listener that has been successfully bound but is not yet serving.
@@ -159,6 +235,7 @@ impl BoundServer {
         );
         let config = self.config;
         let sessions = self.sessions;
+        let shutdown = config.shutdown.clone();
         let entity_world_root = if let Some(world) = config.world.as_ref() {
             let storage = world.lock().await;
             storage.world_root().map(std::path::Path::to_path_buf)
@@ -205,8 +282,18 @@ impl BoundServer {
                 play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
             }
         });
+        tokio::spawn(run_console_commands(
+            Arc::clone(&config),
+            Arc::clone(&sessions),
+        ));
         loop {
-            let (socket, peer) = self.listener.accept().await?;
+            let (socket, peer) = tokio::select! {
+                result = self.listener.accept() => result?,
+                () = shutdown.notified() => {
+                    info!("shutdown requested; listener stopping");
+                    return Ok(());
+                }
+            };
             debug!(%peer, "accepted connection");
             let config = config.clone();
             let sessions = Arc::clone(&sessions);
@@ -225,6 +312,81 @@ impl BoundServer {
                 }
             });
         }
+    }
+}
+
+async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::SessionRegistry>) {
+    let stdin = BufReader::new(tokio::io::stdin());
+    let mut lines = stdin.lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => return,
+            Err(err) => {
+                warn!(error = %err, "console command input failed");
+                return;
+            }
+        };
+        let raw = line.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        match play::commands::parse_admin_command(raw, play::commands::CommandPermissions::CONSOLE)
+        {
+            Ok(play::commands::AdminCommand::SaveAll) => {
+                let report = save_all(&config, &sessions).await;
+                log_save_report("console save-all", &report);
+            }
+            Ok(play::commands::AdminCommand::Stop) => {
+                let report = save_all(&config, &sessions).await;
+                log_save_report("console stop", &report);
+                if report.is_ok() {
+                    config.shutdown.request();
+                    return;
+                }
+            }
+            Ok(play::commands::AdminCommand::TimeSet(time)) => {
+                sessions.set_world_time(time);
+                info!(time, "console set world time");
+            }
+            Ok(command) => {
+                warn!(
+                    ?command,
+                    "console command requires a player source in this M35 slice"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    error = console_command_error(error),
+                    "console command rejected"
+                );
+            }
+        }
+    }
+}
+
+fn log_save_report(context: &'static str, report: &SaveAllReport) {
+    if report.is_ok() {
+        info!(
+            players = report.players_saved,
+            entities = report.entities_saved,
+            chunks = report.chunks_flushed,
+            world_metadata = report.world_metadata_saved,
+            %context,
+            "save-all complete"
+        );
+    } else {
+        for error in &report.errors {
+            warn!(%context, %error, "save-all error");
+        }
+    }
+}
+
+fn console_command_error(error: play::commands::CommandError) -> &'static str {
+    match error {
+        play::commands::CommandError::Unknown => "unknown command",
+        play::commands::CommandError::PermissionDenied => "permission denied",
+        play::commands::CommandError::Usage(usage) => usage,
     }
 }
 
@@ -812,6 +974,8 @@ mod tests {
             biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
+            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), true),
+            shutdown: ShutdownHandle::default(),
         };
 
         let report = save_all(&config, &sessions).await;
