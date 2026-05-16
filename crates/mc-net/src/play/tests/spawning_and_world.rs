@@ -334,6 +334,23 @@ fn full_survival_state_maps_to_health_packet() {
 }
 
 #[test]
+fn fall_damage_starts_after_three_blocks_on_landing() {
+    let mut old_pose = PlayerPose::new(0.0, 70.0, 0.0);
+    old_pose.flags = MovePlayerFlags::new(false, false);
+    let mut landing = PlayerPose::new(0.0, 65.5, 0.0);
+    landing.flags = MovePlayerFlags::new(true, false);
+
+    assert_eq!(fall_damage_amount(old_pose, landing), 1.0);
+
+    let mut short_landing = PlayerPose::new(0.0, 67.5, 0.0);
+    short_landing.flags = MovePlayerFlags::new(true, false);
+    assert_eq!(fall_damage_amount(old_pose, short_landing), 0.0);
+
+    old_pose.flags = MovePlayerFlags::new(true, false);
+    assert_eq!(fall_damage_amount(old_pose, landing), 0.0);
+}
+
+#[test]
 fn survival_damage_heal_and_death_are_clamped() {
     let mut state = SurvivalState::FULL;
 

@@ -67,6 +67,11 @@ pub struct ItemFacts {
     pub use_action: Option<UseAction>,
     pub tool: Option<ToolFacts>,
     pub equippable_slot: Option<String>,
+    pub weapon: bool,
+    pub weapon_damage_per_attack: Option<u32>,
+    pub attack_damage_modifier: Option<f32>,
+    pub attack_speed_modifier: Option<f32>,
+    pub armor: Option<ItemArmorFacts>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +85,13 @@ pub enum UseAction {
 pub struct ToolFacts {
     pub default_mining_speed: Option<f32>,
     pub damage_per_block: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ItemArmorFacts {
+    pub slot: String,
+    pub armor: f32,
+    pub toughness: f32,
 }
 
 pub fn load_item_facts(
@@ -181,6 +193,10 @@ struct RawComponents {
     tool: Option<RawTool>,
     #[serde(rename = "minecraft:equippable")]
     equippable: Option<RawEquippable>,
+    #[serde(rename = "minecraft:weapon")]
+    weapon: Option<RawWeapon>,
+    #[serde(default, rename = "minecraft:attribute_modifiers")]
+    attribute_modifiers: Vec<RawAttributeModifier>,
 }
 
 impl RawItemComponents {
@@ -192,7 +208,27 @@ impl RawItemComponents {
             consumable,
             tool,
             equippable,
+            weapon,
+            attribute_modifiers,
         } = self.components;
+        let attack_damage_modifier =
+            find_mainhand_add_modifier(&attribute_modifiers, "minecraft:attack_damage");
+        let attack_speed_modifier =
+            find_mainhand_add_modifier(&attribute_modifiers, "minecraft:attack_speed");
+        let armor = equippable.as_ref().and_then(|raw| {
+            let armor = find_slot_add_modifier(&attribute_modifiers, "minecraft:armor", &raw.slot)?;
+            let toughness = find_slot_add_modifier(
+                &attribute_modifiers,
+                "minecraft:armor_toughness",
+                &raw.slot,
+            )
+            .unwrap_or(0.0);
+            Some(ItemArmorFacts {
+                slot: raw.slot.clone(),
+                armor,
+                toughness,
+            })
+        });
         let use_duration_ticks = consumable.as_ref().map(|raw| {
             ((raw.consume_seconds.unwrap_or(DEFAULT_CONSUME_SECONDS) * 20.0).round()) as u32
         });
@@ -217,6 +253,11 @@ impl RawItemComponents {
                 damage_per_block: raw.damage_per_block,
             }),
             equippable_slot: equippable.map(|raw| raw.slot),
+            weapon: weapon.is_some(),
+            weapon_damage_per_attack: weapon.map(|raw| raw.item_damage_per_attack.unwrap_or(1)),
+            attack_damage_modifier,
+            attack_speed_modifier,
+            armor,
         }
     }
 }
@@ -242,6 +283,46 @@ struct RawTool {
 #[derive(Deserialize)]
 struct RawEquippable {
     slot: String,
+}
+
+#[derive(Deserialize)]
+struct RawWeapon {
+    item_damage_per_attack: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawAttributeModifier {
+    #[serde(rename = "type")]
+    kind: String,
+    amount: f32,
+    operation: String,
+    slot: Option<String>,
+}
+
+fn find_mainhand_add_modifier(modifiers: &[RawAttributeModifier], kind: &str) -> Option<f32> {
+    find_slot_add_modifier(modifiers, kind, "mainhand")
+}
+
+fn find_slot_add_modifier(
+    modifiers: &[RawAttributeModifier],
+    kind: &str,
+    slot: &str,
+) -> Option<f32> {
+    modifiers
+        .iter()
+        .find(|modifier| {
+            normalize_id(&modifier.kind) == normalize_id(kind)
+                && normalize_id(&modifier.operation) == "add_value"
+                && modifier
+                    .slot
+                    .as_deref()
+                    .is_some_and(|value| normalize_id(value) == normalize_id(slot))
+        })
+        .map(|modifier| modifier.amount)
+}
+
+fn normalize_id(value: &str) -> &str {
+    value.strip_prefix("minecraft:").unwrap_or(value)
 }
 
 #[cfg(test)]
@@ -274,6 +355,58 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::write(
+            tmp.path().join("diamond_sword.json"),
+            r#"{
+              "components": {
+                "minecraft:max_damage": 1561,
+                "minecraft:max_stack_size": 1,
+                "minecraft:attribute_modifiers": [
+                  {
+                    "type": "minecraft:attack_damage",
+                    "amount": 6.0,
+                    "id": "minecraft:base_attack_damage",
+                    "operation": "add_value",
+                    "slot": "mainhand"
+                  },
+                  {
+                    "type": "minecraft:attack_speed",
+                    "amount": -2.4,
+                    "id": "minecraft:base_attack_speed",
+                    "operation": "add_value",
+                    "slot": "mainhand"
+                  }
+                ],
+                "minecraft:weapon": {}
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join("iron_chestplate.json"),
+            r#"{
+              "components": {
+                "minecraft:max_damage": 240,
+                "minecraft:max_stack_size": 1,
+                "minecraft:equippable": { "slot": "chest" },
+                "minecraft:attribute_modifiers": [
+                  {
+                    "type": "minecraft:armor",
+                    "amount": 6.0,
+                    "operation": "add_value",
+                    "slot": "chest"
+                  },
+                  {
+                    "type": "minecraft:armor_toughness",
+                    "amount": 0.0,
+                    "operation": "add_value",
+                    "slot": "chest"
+                  }
+                ]
+              }
+            }"#,
+        )
+        .unwrap();
 
         let facts = load_item_facts(tmp.path()).unwrap();
 
@@ -297,6 +430,29 @@ mod tests {
         assert_eq!(helmet.max_damage, Some(165));
         assert_eq!(helmet.max_stack_size, Some(1));
         assert_eq!(helmet.equippable_slot.as_deref(), Some("head"));
+
+        let sword = facts
+            .get(&Identifier::parse("minecraft:diamond_sword").unwrap())
+            .unwrap();
+        assert_eq!(sword.max_damage, Some(1561));
+        assert!(sword.weapon);
+        assert_eq!(sword.weapon_damage_per_attack, Some(1));
+        assert_eq!(sword.attack_damage_modifier, Some(6.0));
+        assert_eq!(sword.attack_speed_modifier, Some(-2.4));
+
+        let chestplate = facts
+            .get(&Identifier::parse("minecraft:iron_chestplate").unwrap())
+            .unwrap();
+        assert_eq!(chestplate.max_damage, Some(240));
+        assert_eq!(chestplate.equippable_slot.as_deref(), Some("chest"));
+        assert_eq!(
+            chestplate.armor,
+            Some(ItemArmorFacts {
+                slot: "chest".to_string(),
+                armor: 6.0,
+                toughness: 0.0,
+            })
+        );
     }
 
     #[test]
@@ -339,6 +495,53 @@ mod tests {
             Some(FoodEntry {
                 food: 5,
                 saturation: 6.0
+            })
+        );
+    }
+
+    #[test]
+    fn loads_real_combat_components_when_present() {
+        let path = workspace_path("data/vanilla/reports/minecraft/components/item");
+        if !path.is_dir() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let facts = load_item_facts(path).unwrap();
+
+        let sword = facts
+            .get(&Identifier::parse("minecraft:diamond_sword").unwrap())
+            .unwrap();
+        assert_eq!(sword.max_damage, Some(1561));
+        assert!(sword.weapon);
+        assert_eq!(sword.weapon_damage_per_attack, Some(1));
+        assert_eq!(sword.attack_damage_modifier, Some(6.0));
+        assert!(sword.attack_speed_modifier.is_some());
+
+        let axe = facts
+            .get(&Identifier::parse("minecraft:iron_axe").unwrap())
+            .unwrap();
+        assert!(axe.weapon);
+        assert_eq!(axe.weapon_damage_per_attack, Some(2));
+        assert_eq!(axe.attack_damage_modifier, Some(8.0));
+
+        let bow = facts
+            .get(&Identifier::parse("minecraft:bow").unwrap())
+            .unwrap();
+        assert_eq!(bow.max_damage, Some(384));
+        assert_eq!(bow.max_stack_size, Some(1));
+
+        let chestplate = facts
+            .get(&Identifier::parse("minecraft:iron_chestplate").unwrap())
+            .unwrap();
+        assert_eq!(chestplate.max_damage, Some(240));
+        assert_eq!(chestplate.equippable_slot.as_deref(), Some("chest"));
+        assert_eq!(
+            chestplate.armor,
+            Some(ItemArmorFacts {
+                slot: "chest".to_string(),
+                armor: 6.0,
+                toughness: 0.0,
             })
         );
     }

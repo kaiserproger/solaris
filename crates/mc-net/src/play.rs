@@ -41,20 +41,21 @@ use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
     ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
     ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundTakeItemEntity, ConfirmTeleportation,
-    ContainerInput, Direction, EntityAnimation, EntityAnimationAction, EntityDataValue,
-    EntityEvent, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
-    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
-    PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
-    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
-    ServerboundChatCommand, ServerboundClientCommand, ServerboundContainerClick,
-    ServerboundContainerClose, ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundRecipeBookChangeSettings,
-    ServerboundRecipeBookSeenRecipe, ServerboundSetCarriedItem, ServerboundUseItem,
-    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot,
+    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
+    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPositionSync, EntityVec3,
+    ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack,
+    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags,
+    PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
+    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
+    ServerboundAttack, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientCommand,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
+    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
+    ServerboundPlayerAction, ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe,
+    ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
@@ -122,7 +123,7 @@ use inventory::{
     item_max_stack, survival_damage_after_armor,
 };
 use item_blocks::{ItemToBlockTable, fallback_crafting_recipes};
-use persistence::{PlayerPersistedState, load_player_state, save_player_state};
+use persistence::{PlayerPersistedState, XpState, load_player_state, save_player_state};
 use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
@@ -136,12 +137,15 @@ use spawn::{chunk_pos_from_coords, spawn_dimension, spawn_position};
 use spawn::{pack_block_pos, spawn_y_from_chunk};
 use survival::{
     PendingBreak, PendingUse, SurvivalState, block_drop_stack, damage_held_tool_after_mining,
-    entity_item_stack, held_attack_damage, held_food_use, held_item_id, is_hostile_entity,
-    item_entity_type_id, max_tool_damage_for_path, mining_time_for_target, mob_drop_stack,
-    pending_break_is_complete, pending_break_matches, pending_use_is_complete, pending_use_matches,
+    damage_held_weapon_after_attack, entity_item_stack, held_attack_damage, held_food_use,
+    held_item_id, is_hostile_entity, item_entity_type_id, max_tool_damage_for_path,
+    mining_time_for_target, mob_drop_stack, mob_xp_value, pending_break_is_complete,
+    pending_break_matches, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
 };
 #[cfg(test)]
-use survival::{fallback_mining_time, food_rule_for_item, is_durability_tool_path};
+use survival::{
+    attack_damage_for_item, fallback_mining_time, food_rule_for_item, is_durability_tool_path,
+};
 use wire_entities::{
     send_entity_data, send_entity_despawn, send_entity_relative_move, send_entity_spawn,
     send_player_animation, send_player_despawn, send_player_move, send_player_spawn,
@@ -195,6 +199,7 @@ const MAX_PASSIVE_SPAWNS_PER_CHUNK: usize = 6;
 const MAX_HOSTILE_SPAWNS_PER_CHUNK: usize = 3;
 const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
+const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
 const FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
@@ -609,6 +614,7 @@ where
             respawn,
             CommandPermissions::for_local_dev_profile(profile),
             player_state.survival,
+            player_state.xp,
             player_state.game_mode,
             Some(Arc::clone(&player_save_state)),
             outbound_rx,
@@ -2939,6 +2945,37 @@ where
     Ok(())
 }
 
+async fn pickup_nearby_xp<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    xp_state: &mut XpState,
+    player_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let player_position = Vec3::new(player_pose.x, player_pose.y, player_pose.z);
+    let candidates = state
+        .sessions
+        .nearby_experience_entities(player_position, 2.25);
+    let mut changed = false;
+    for entity in candidates {
+        let Some(value) = entity.experience_value else {
+            continue;
+        };
+        dispatch_visibility_commands(state.sessions.remove_picked_item(
+            entity.id,
+            state.session_id,
+            value,
+        ));
+        changed |= xp_state.add_points(value);
+    }
+    if changed {
+        write_packet(writer, &xp_state.as_packet(), state.compression).await?;
+    }
+    Ok(())
+}
+
 async fn handle_interact(
     state: &mut InteractionState,
     packet: ServerboundInteract,
@@ -2953,6 +2990,7 @@ async fn handle_attack<W>(
     writer: &mut W,
     game_mode: GameMode,
     survival_state: SurvivalState,
+    xp_state: &mut XpState,
     player_pose: PlayerPose,
     packet: ServerboundAttack,
 ) -> Result<(), ConnectionError>
@@ -3013,6 +3051,7 @@ where
         return Ok(());
     }
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+    state.last_entity_attack_at = Some(now);
 
     let Some(damage) = state
         .sessions
@@ -3024,7 +3063,7 @@ where
         );
         return Ok(());
     };
-    state.last_entity_attack_at = Some(now);
+    damage_held_weapon_after_attack(state, writer).await?;
     if !damage.killed {
         write_packet(
             writer,
@@ -3062,6 +3101,14 @@ where
             entity_item_stack(drop),
         ));
         pickup_nearby_items(state, writer, player_pose).await?;
+    }
+    if let Some(entity_type_id) = xp_orb_entity_type_id(&state.entity_types) {
+        dispatch_visibility_commands(state.sessions.spawn_xp_orb(
+            entity_type_id,
+            entity.position,
+            mob_xp_value(&entity.type_name),
+        ));
+        pickup_nearby_xp(state, writer, xp_state, player_pose).await?;
     }
     Ok(())
 }
@@ -4125,6 +4172,45 @@ where
         .await?;
     }
     Ok(())
+}
+
+async fn apply_fall_damage<W>(
+    state: Option<&mut InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    survival_state: &mut SurvivalState,
+    old_pose: PlayerPose,
+    new_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if old_pose.flags.on_ground || !new_pose.flags.on_ground {
+        return Ok(());
+    }
+    let damage = fall_damage_amount(old_pose, new_pose);
+    if damage <= 0.0 || survival_state.is_dead() {
+        return Ok(());
+    }
+    let was_dead = survival_state.is_dead();
+    survival_state.apply_damage(damage);
+    write_packet(writer, &survival_state.as_packet(), compression).await?;
+    if !was_dead
+        && survival_state.is_dead()
+        && let Some(state) = state
+    {
+        state.pending_break = None;
+        state.pending_use = None;
+        drop_inventory_on_death(state, writer, new_pose).await?;
+    }
+    Ok(())
+}
+
+fn fall_damage_amount(old_pose: PlayerPose, new_pose: PlayerPose) -> f32 {
+    if old_pose.flags.on_ground || !new_pose.flags.on_ground {
+        return 0.0;
+    }
+    ((old_pose.y - new_pose.y).max(0.0) - 3.0).floor().max(0.0) as f32
 }
 
 async fn interact_with_toggle_block<W>(
@@ -5246,6 +5332,7 @@ fn sync_player_persistence(
     pose: PlayerPose,
     interaction: Option<&InteractionState>,
     survival: SurvivalState,
+    xp: XpState,
     game_mode: GameMode,
 ) {
     let Some(player_save_state) = player_save_state else {
@@ -5256,6 +5343,7 @@ fn sync_player_persistence(
         .expect("player persistence state poisoned");
     state.pose = pose;
     state.survival = survival;
+    state.xp = xp;
     state.game_mode = game_mode;
     if let Some(interaction) = interaction {
         state.inventory = interaction.inventory.clone();
@@ -5278,6 +5366,7 @@ async fn play_loop<R, W>(
     respawn: ClientboundRespawn,
     permissions: CommandPermissions,
     mut survival_state: SurvivalState,
+    mut xp_state: XpState,
     mut game_mode: GameMode,
     player_save_state: Option<Arc<Mutex<PlayerPersistedState>>>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
@@ -5304,6 +5393,7 @@ where
     let mut pending_id: Option<i64> = None;
     let mut survival_tick: u32 = 0;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
+    write_packet(writer, &xp_state.as_packet(), compression).await?;
 
     loop {
         sync_player_persistence(
@@ -5311,6 +5401,7 @@ where
             player_pose,
             interaction.as_deref(),
             survival_state,
+            xp_state.clone(),
             game_mode,
         );
         let mut stream_finished = false;
@@ -5492,6 +5583,7 @@ where
                     tick_active_container(state, writer).await?;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                     tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
+                    pickup_nearby_xp(state, writer, &mut xp_state, player_pose).await?;
                 }
             }
             result = read_frame(reader, buf, compression) => {
@@ -5527,6 +5619,17 @@ where
                     {
                         maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
                     }
+                    if game_mode == GameMode::Survival {
+                        apply_fall_damage(
+                            interaction.as_deref_mut(),
+                            writer,
+                            compression,
+                            &mut survival_state,
+                            old_pose,
+                            player_pose,
+                        )
+                        .await?;
+                    }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                     replan_after_movement(
@@ -5554,6 +5657,17 @@ where
                         && let Some(state) = interaction.as_deref_mut()
                     {
                         maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
+                    }
+                    if game_mode == GameMode::Survival {
+                        apply_fall_damage(
+                            interaction.as_deref_mut(),
+                            writer,
+                            compression,
+                            &mut survival_state,
+                            old_pose,
+                            player_pose,
+                        )
+                        .await?;
                     }
                     let new_center = player_pose.chunk_pos();
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
@@ -5645,7 +5759,15 @@ where
                     let mut body = frame.body;
                     let attack = ServerboundAttack::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_attack(state, writer, game_mode, survival_state, player_pose, attack)
+                        handle_attack(
+                            state,
+                            writer,
+                            game_mode,
+                            survival_state,
+                            &mut xp_state,
+                            player_pose,
+                            attack,
+                        )
                             .await?;
                     } else {
                         debug!(

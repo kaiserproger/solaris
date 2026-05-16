@@ -26,14 +26,21 @@
     "minecraft:deepslate_lapis_ore": "minecraft:lapis_lazuli",
     "minecraft:deepslate_redstone_ore": "minecraft:redstone",
     "minecraft:diamond_ore": "minecraft:diamond",
+    "minecraft:acacia_log": "minecraft:acacia_log",
+    "minecraft:birch_log": "minecraft:birch_log",
+    "minecraft:cherry_log": "minecraft:cherry_log",
+    "minecraft:dark_oak_log": "minecraft:dark_oak_log",
     "minecraft:emerald_ore": "minecraft:emerald",
     "minecraft:gold_ore": "minecraft:raw_gold",
     "minecraft:grass_block": "minecraft:dirt",
     "minecraft:iron_ore": "minecraft:raw_iron",
+    "minecraft:jungle_log": "minecraft:jungle_log",
     "minecraft:lapis_ore": "minecraft:lapis_lazuli",
     "minecraft:oak_leaves": "minecraft:apple",
+    "minecraft:oak_log": "minecraft:oak_log",
     "minecraft:podzol": "minecraft:dirt",
     "minecraft:redstone_ore": "minecraft:redstone",
+    "minecraft:spruce_log": "minecraft:spruce_log",
     "minecraft:stone": "minecraft:cobblestone"
   }
 }

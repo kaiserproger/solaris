@@ -646,6 +646,13 @@ pub struct ClientboundSetHealth {
     pub saturation: f32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientboundSetExperience {
+    pub experience_progress: f32,
+    pub total_experience: i32,
+    pub experience_level: i32,
+}
+
 impl Packet for ClientboundSetHealth {
     // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_HEALTH is
     // game-CB index 104 = wire id 0x68. `javap -p -c
@@ -664,6 +671,28 @@ impl Packet for ClientboundSetHealth {
             health: buf.read_f32()?,
             food: buf.read_varint()?,
             saturation: buf.read_f32()?,
+        })
+    }
+}
+
+impl Packet for ClientboundSetExperience {
+    // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_EXPERIENCE
+    // is game-CB index 103 = wire id 0x67. `javap` shows f32 progress,
+    // VarInt total experience, VarInt level.
+    const ID: i32 = 0x67;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f32(self.experience_progress);
+        buf.write_varint(self.total_experience);
+        buf.write_varint(self.experience_level);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            experience_progress: buf.read_f32()?,
+            total_experience: buf.read_varint()?,
+            experience_level: buf.read_varint()?,
         })
     }
 }

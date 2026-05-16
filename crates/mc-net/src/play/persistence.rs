@@ -42,6 +42,26 @@ impl Default for XpState {
     }
 }
 
+impl XpState {
+    pub(super) fn add_points(&mut self, points: i32) -> bool {
+        if points <= 0 {
+            return false;
+        }
+        self.total = self.total.saturating_add(points).max(0);
+        self.level = self.total / 7;
+        self.progress = (self.total % 7) as f32 / 7.0;
+        true
+    }
+
+    pub(super) const fn as_packet(&self) -> ClientboundSetExperience {
+        ClientboundSetExperience {
+            experience_progress: self.progress,
+            total_experience: self.total,
+            experience_level: self.level,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct SpawnState {
     pub(super) x: i32,
@@ -330,6 +350,7 @@ pub(crate) fn load_persisted_entities(
         } else {
             None
         };
+        let experience_value = int_field(fields, "Value").filter(|value| *value > 0);
         let mut attributes = attributes_from_entity_facts(&parsed, type_id as u32);
         let health = float_field(fields, "Health").unwrap_or(20.0).max(0.0);
         attributes.set_base(AttributeKind::MaxHealth, health.max(1.0) as f64);
@@ -352,10 +373,11 @@ pub(crate) fn load_persisted_entities(
             velocity: Vec3::new(motion[0], motion[1], motion[2]),
             on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0,
             item_stack,
+            experience_value,
             lifecycle: EntityLifecycle::Alive,
             health,
             attributes,
-            goal: if type_name == "minecraft:item" {
+            goal: if type_name == "minecraft:item" || experience_value.is_some() {
                 GoalState::Idle
             } else {
                 GoalState::Wander {
@@ -493,6 +515,9 @@ fn entity_tag(
         let item = entity_item_stack_tag(items, stack)?;
         fields.push(("Item".into(), item));
         fields.push(("PickupDelay".into(), Tag::Short(0)));
+    }
+    if let Some(value) = entity.experience_value {
+        fields.push(("Value".into(), Tag::Int(value.max(0))));
     }
     Ok(Tag::Compound(fields))
 }
@@ -984,6 +1009,7 @@ mod tests {
             velocity: Vec3::new(0.1, 0.2, 0.3),
             on_ground: false,
             item_stack: Some(EntityItemStack::new(1, 3)),
+            experience_value: None,
             lifecycle: EntityLifecycle::Alive,
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
@@ -1003,6 +1029,7 @@ mod tests {
             velocity: Vec3::ZERO,
             on_ground: true,
             item_stack: None,
+            experience_value: None,
             lifecycle: EntityLifecycle::Alive,
             health: 13.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
@@ -1028,6 +1055,26 @@ mod tests {
         assert_eq!(
             loaded[1].attributes.base(&AttributeKind::MovementSpeed),
             Some(0.2)
+        );
+    }
+
+    #[test]
+    fn xp_state_adds_points_and_maps_to_wire_packet() {
+        let mut xp = XpState::default();
+
+        assert!(!xp.add_points(0));
+        assert!(xp.add_points(9));
+
+        assert_eq!(xp.total, 9);
+        assert_eq!(xp.level, 1);
+        assert!((xp.progress - (2.0 / 7.0)).abs() < f32::EPSILON);
+        assert_eq!(
+            xp.as_packet(),
+            ClientboundSetExperience {
+                experience_progress: 2.0 / 7.0,
+                total_experience: 9,
+                experience_level: 1,
+            }
         );
     }
 

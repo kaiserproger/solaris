@@ -265,7 +265,10 @@ fn survival_block_drops_come_from_repo_loot_data() {
         loot.block_drop(&id("minecraft:oak_leaves")),
         Some(&id("minecraft:apple"))
     );
-    assert_eq!(loot.block_drop(&id("minecraft:oak_log")), None);
+    assert_eq!(
+        loot.block_drop(&id("minecraft:oak_log")),
+        Some(&id("minecraft:oak_log"))
+    );
 }
 
 #[test]
@@ -423,6 +426,7 @@ fn food_rules_prefer_item_component_facts() {
             use_action: Some(mc_data::item_components::UseAction::Eat),
             tool: None,
             equippable_slot: None,
+            ..mc_data::item_components::ItemFacts::default()
         },
     )]);
 
@@ -468,6 +472,35 @@ fn item_max_stack_prefers_component_facts() {
         item_max_stack(&facts, &items, &ItemStack::new(1, 1).with_damage(3)),
         1
     );
+}
+
+#[test]
+fn attack_damage_prefers_item_component_modifiers() {
+    use mc_data::items::ItemReport;
+
+    let sword = mc_data::Identifier::parse("minecraft:diamond_sword").unwrap();
+    let stick = mc_data::Identifier::parse("minecraft:stick").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: sword.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: stick,
+            protocol_id: 2,
+        },
+    ]);
+    let facts = ItemFactsTable::from_entries([(
+        sword,
+        mc_data::item_components::ItemFacts {
+            attack_damage_modifier: Some(6.0),
+            ..Default::default()
+        },
+    )]);
+
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(1)), 7.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(2)), 2.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, None), 2.0);
 }
 
 #[test]

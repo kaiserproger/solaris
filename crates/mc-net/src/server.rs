@@ -730,6 +730,7 @@ mod tests {
             velocity: mc_entity::Vec3::ZERO,
             on_ground: true,
             item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
+            experience_value: None,
             lifecycle: mc_entity::EntityLifecycle::Alive,
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),

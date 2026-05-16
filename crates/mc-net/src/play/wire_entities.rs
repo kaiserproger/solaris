@@ -179,7 +179,7 @@ where
             pitch: entity.rotation.pitch,
             yaw: entity.rotation.yaw,
             head_yaw: entity.rotation.head_yaw,
-            data: 0,
+            data: entity.experience_value.unwrap_or(0),
         },
         compression,
     )

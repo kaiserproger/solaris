@@ -74,6 +74,7 @@ pub(super) struct ServerEntitySnapshot {
     pub(super) velocity: Vec3,
     pub(super) on_ground: bool,
     pub(super) item_stack: Option<EntityItemStack>,
+    pub(super) experience_value: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -112,6 +113,7 @@ struct SessionRegistryInner {
     prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
     entities: EntityStore,
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
+    last_entity_damage_ticks: HashMap<EntityId, u64>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
     chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
@@ -128,6 +130,7 @@ impl Default for SessionRegistryInner {
             prepared: HashMap::new(),
             entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
             last_sent_entity_positions: HashMap::new(),
+            last_entity_damage_ticks: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
             chest_viewers: HashMap::new(),
@@ -631,6 +634,24 @@ impl SessionRegistry {
         refresh_visibility_locked(&mut inner)
     }
 
+    pub(super) fn spawn_xp_orb(
+        &self,
+        entity_type_id: i32,
+        position: Vec3,
+        value: i32,
+    ) -> Vec<VisibilityDispatch> {
+        if value <= 0 {
+            return Vec::new();
+        }
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:experience_orb", position);
+        entity.experience_value = Some(value);
+        entity.velocity = Vec3::new(0.0, 0.08, 0.0);
+        let id = inner.entities.spawn(entity);
+        inner.last_sent_entity_positions.insert(id, position);
+        refresh_visibility_locked(&mut inner)
+    }
+
     pub(super) fn nearby_item_entities(
         &self,
         position: Vec3,
@@ -643,6 +664,23 @@ impl SessionRegistry {
             .snapshots()
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .filter(|entity| entity.item_stack.is_some())
+            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+            .map(server_entity_snapshot_from)
+            .collect()
+    }
+
+    pub(super) fn nearby_experience_entities(
+        &self,
+        position: Vec3,
+        radius: f64,
+    ) -> Vec<ServerEntitySnapshot> {
+        let radius_sq = radius * radius;
+        let inner = self.inner.lock().expect("session registry poisoned");
+        inner
+            .entities
+            .snapshots()
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .filter(|entity| entity.experience_value.is_some())
             .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
             .map(server_entity_snapshot_from)
             .collect()
@@ -683,7 +721,17 @@ impl SessionRegistry {
         amount: f32,
     ) -> Option<mc_entity::EntityDamage> {
         let mut inner = self.inner.lock().expect("session registry poisoned");
-        inner.entities.damage(entity_id, amount)
+        let world_time = inner.world_time;
+        if inner
+            .last_entity_damage_ticks
+            .get(&entity_id)
+            .is_some_and(|last| world_time.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
+        {
+            return None;
+        }
+        let damage = inner.entities.damage(entity_id, amount)?;
+        inner.last_entity_damage_ticks.insert(entity_id, world_time);
+        Some(damage)
     }
 
     pub(super) fn update_item_stack(
@@ -727,6 +775,7 @@ impl SessionRegistry {
             .remove(entity_id)
             .map(server_entity_snapshot_from)?;
         inner.last_sent_entity_positions.remove(&entity_id);
+        inner.last_entity_damage_ticks.remove(&entity_id);
 
         let mut dispatches = Vec::new();
         for (&observer_id, observer) in &mut inner.sessions {
@@ -992,6 +1041,7 @@ pub(super) fn server_entity_snapshot_from(
         velocity: entity.velocity,
         on_ground: entity.on_ground,
         item_stack: entity.item_stack,
+        experience_value: entity.experience_value,
     }
 }
 
@@ -1344,4 +1394,48 @@ fn remove_ticket(
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn damage_server_entity_respects_hurt_invulnerability_ticks() {
+        let registry = SessionRegistry::new();
+        let entity_id = {
+            let mut inner = registry.inner.lock().expect("session registry poisoned");
+            inner
+                .entities
+                .spawn(SpawnEntity::new(1, "minecraft:zombie", Vec3::ZERO))
+        };
+
+        let first = registry.damage_server_entity(entity_id, 5.0).unwrap();
+        assert_eq!(first.snapshot.health, 15.0);
+        assert!(registry.damage_server_entity(entity_id, 5.0).is_none());
+
+        registry.advance_world_time(ENTITY_HURT_INVULNERABLE_TICKS - 1);
+        assert!(registry.damage_server_entity(entity_id, 5.0).is_none());
+
+        registry.advance_world_time(1);
+        let second = registry.damage_server_entity(entity_id, 5.0).unwrap();
+        assert_eq!(second.snapshot.health, 10.0);
+    }
+
+    #[test]
+    fn xp_orbs_are_spawned_and_found_by_pickup_radius() {
+        let registry = SessionRegistry::new();
+
+        registry.spawn_xp_orb(99, Vec3::new(1.0, 64.0, 1.0), 5);
+
+        let nearby = registry.nearby_experience_entities(Vec3::new(1.5, 64.0, 1.0), 2.25);
+        assert_eq!(nearby.len(), 1);
+        assert_eq!(nearby[0].type_name, "minecraft:experience_orb");
+        assert_eq!(nearby[0].experience_value, Some(5));
+        assert!(
+            registry
+                .nearby_experience_entities(Vec3::new(10.0, 64.0, 10.0), 2.25)
+                .is_empty()
+        );
+    }
 }

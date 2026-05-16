@@ -545,6 +545,28 @@ fn set_health_id_and_wire_layout_match_javap() {
 }
 
 #[test]
+fn set_experience_id_and_wire_layout_match_javap() {
+    assert_eq!(ClientboundSetExperience::ID, 0x67);
+    let packet = ClientboundSetExperience {
+        experience_progress: 0.5,
+        total_experience: 9,
+        experience_level: 1,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(&buf[0..4], &0.5_f32.to_be_bytes());
+    assert_eq!(buf[4], 9);
+    assert_eq!(buf[5], 1);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundSetExperience::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn remove_player_packets_round_trip() {
     let uuid = Uuid::from_u128(0x00112233445566778899aabbccddeeff);
     round_trip(RemoveEntities {

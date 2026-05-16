@@ -1178,31 +1178,67 @@ async fn load_chunk_neighbourhood(
     let mut centre = None;
     let mut staged = Vec::new();
 
-    let mut storage = world.lock().await;
-    if !is_active_request(request, &active_generation) {
-        return Ok((
-            None,
-            neighbourhood,
-            staged,
-            fetch_started.elapsed().as_millis() as u64,
-        ));
-    }
-    for (dz, row) in neighbourhood.iter_mut().enumerate() {
-        for (dx, slot) in row.iter_mut().enumerate() {
-            let ncx = cx + (dx as i32 - 1);
-            let ncz = cz + (dz as i32 - 1);
-            match storage.get_chunk(ChunkPos { x: ncx, z: ncz }) {
-                Ok(Some(chunk)) => {
-                    let chunk = Arc::new(chunk.clone());
-                    if dx == 1 && dz == 1 {
-                        centre = Some(Arc::clone(&chunk));
-                    }
-                    *slot = Some(chunk);
+    let generator = {
+        let mut storage = world.lock().await;
+        if !is_active_request(request, &active_generation) {
+            return Ok((
+                None,
+                neighbourhood,
+                staged,
+                fetch_started.elapsed().as_millis() as u64,
+            ));
+        }
+        match storage.get_chunk_without_generation(ChunkPos { x: cx, z: cz }) {
+            Ok(Some(chunk)) => {
+                let chunk = Arc::new(chunk);
+                centre = Some(Arc::clone(&chunk));
+                neighbourhood[1][1] = Some(chunk);
+                staged.push((cx, cz));
+            }
+            Ok(None) => {}
+            Err(err) => warn!(cx, cz, error = %err, "chunk read failed; skipping"),
+        }
+        for (dz, row) in neighbourhood.iter_mut().enumerate() {
+            for (dx, slot) in row.iter_mut().enumerate() {
+                if dx == 1 && dz == 1 {
+                    continue;
+                }
+                let ncx = cx + (dx as i32 - 1);
+                let ncz = cz + (dz as i32 - 1);
+                if let Some(chunk) = storage.cached_chunk(ChunkPos { x: ncx, z: ncz }) {
+                    *slot = Some(Arc::new(chunk));
                     staged.push((ncx, ncz));
                 }
-                Ok(None) => {}
-                Err(err) => warn!(cx = ncx, cz = ncz, error = %err, "chunk read failed; skipping"),
             }
+        }
+        storage.generator()
+    };
+
+    if centre.is_none()
+        && let Some(generator) = generator
+    {
+        let mut chunk = generator.generate(ChunkPos { x: cx, z: cz });
+        chunk.dirty = true;
+        let chunk = {
+            let mut storage = world.lock().await;
+            if !is_active_request(request, &active_generation) {
+                return Ok((
+                    None,
+                    neighbourhood,
+                    staged,
+                    fetch_started.elapsed().as_millis() as u64,
+                ));
+            }
+            if let Err(err) = storage.insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
+                warn!(cx, cz, error = %err, "generated chunk insert failed; skipping");
+            }
+            storage.cached_chunk(ChunkPos { x: cx, z: cz })
+        };
+        if let Some(chunk) = chunk {
+            let chunk = Arc::new(chunk);
+            centre = Some(Arc::clone(&chunk));
+            neighbourhood[1][1] = Some(chunk);
+            staged.push((cx, cz));
         }
     }
 

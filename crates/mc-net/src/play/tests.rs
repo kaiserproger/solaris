@@ -768,6 +768,7 @@ fn hostile_melee_requires_moving_toward_player() {
         velocity,
         on_ground: true,
         item_stack: None,
+        experience_value: None,
     };
     let player = Vec3::new(1.0, 0.0, 0.0);
 
@@ -794,6 +795,7 @@ fn hostile_melee_reaches_player_one_block_above() {
         velocity: Vec3::new(0.2, 0.0, 0.0),
         on_ground: true,
         item_stack: None,
+        experience_value: None,
     };
 
     assert!(hostile_can_melee_player(

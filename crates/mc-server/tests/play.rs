@@ -234,6 +234,12 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!(inventory.items.len(), 46);
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    for _ in 0..64 {
+        if frame.id == ClientboundSetHealth::ID {
+            break;
+        }
+        frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
     assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
     let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
     assert_eq!(health.health, 20.0);
@@ -330,6 +336,12 @@ async fn play_state_survival_damage_command_updates_health() {
     .await;
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    for _ in 0..64 {
+        if frame.id == ClientboundSetHealth::ID {
+            break;
+        }
+        frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
     assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
     let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
     assert_eq!(health.health, 12.5);

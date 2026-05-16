@@ -236,6 +236,19 @@ pub(super) fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i
         .and_then(|id| i32::try_from(id).ok())
 }
 
+pub(super) fn xp_orb_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let xp = mc_data::Identifier::parse("minecraft:experience_orb").expect("static identifier");
+    entity_types
+        .id_of(&xp)
+        .and_then(|id| i32::try_from(id).ok())
+        .or_else(|| {
+            let legacy = mc_data::Identifier::parse("minecraft:xp_orb").expect("static identifier");
+            entity_types
+                .id_of(&legacy)
+                .and_then(|id| i32::try_from(id).ok())
+        })
+}
+
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
     mc_data::Identifier::parse(entity_type.to_string())
         .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))
@@ -250,6 +263,14 @@ pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Opt
         .or_else(|| mc_data::loot::builtin().entity_drop(&entity))?;
     let item_id = state.items.id_of(item)?;
     Some(ItemStack::new(item_id, 1))
+}
+
+pub(super) fn mob_xp_value(entity_type: &str) -> i32 {
+    match entity_type {
+        "minecraft:zombie" | "minecraft:skeleton" | "minecraft:spider" => 5,
+        "minecraft:cow" | "minecraft:pig" | "minecraft:sheep" | "minecraft:chicken" => 1,
+        _ => 0,
+    }
 }
 
 pub(super) fn block_drop_stack(
@@ -315,13 +336,28 @@ pub(super) fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
 
 pub(super) fn held_attack_damage(state: &InteractionState) -> f32 {
     let held = state.inventory.held(state.selected_hotbar_slot);
-    let Some(path) = (!held.is_empty())
-        .then(|| state.items.name_of(held.item_id))
-        .flatten()
-        .map(|id| id.path())
-    else {
+    attack_damage_for_item(
+        &state.item_facts,
+        &state.items,
+        (!held.is_empty()).then_some(held.item_id),
+    )
+}
+
+pub(super) fn attack_damage_for_item(
+    item_facts: &ItemFactsTable,
+    items: &ItemRegistry,
+    item_id: Option<u32>,
+) -> f32 {
+    let Some(item) = item_id.and_then(|item_id| items.name_of(item_id)) else {
         return 2.0;
     };
+    if let Some(modifier) = item_facts
+        .get(item)
+        .and_then(|facts| facts.attack_damage_modifier)
+    {
+        return (1.0 + modifier).max(0.0);
+    }
+    let path = item.path();
     if path.ends_with("_sword") {
         8.0
     } else if path.ends_with("_axe") {
@@ -385,6 +421,43 @@ fn damage_held_tool_stack(state: &mut InteractionState) -> Option<(usize, ItemSt
     Some((wire_slot, held.clone()))
 }
 
+fn damage_held_weapon_stack(state: &mut InteractionState) -> Option<(usize, ItemStack)> {
+    let hotbar_slot = state.selected_hotbar_slot;
+    let wire_slot = PlayerInventory::HOTBAR_BASE + hotbar_slot as usize;
+    let (max_damage, damage_per_attack) = {
+        let held = state.inventory.held(hotbar_slot);
+        if held.is_empty() {
+            return None;
+        }
+        let item = state.items.name_of(held.item_id)?;
+        let facts = state.item_facts.get(item);
+        let is_weapon = facts.is_some_and(|facts| facts.weapon);
+        let is_tool = is_durability_tool_path(item.path());
+        if !is_weapon && !is_tool {
+            return None;
+        }
+        let max_damage = facts
+            .and_then(|facts| facts.max_damage)
+            .and_then(|value| i32::try_from(value).ok())
+            .or_else(|| max_tool_damage_for_path(item.path()))?;
+        let damage_per_attack = facts
+            .and_then(|facts| facts.weapon_damage_per_attack)
+            .unwrap_or(1)
+            .max(1);
+        (max_damage, damage_per_attack)
+    };
+
+    let held = state.inventory.held_mut(hotbar_slot);
+    let damage_per_attack = i32::try_from(damage_per_attack).unwrap_or(i32::MAX);
+    let new_damage = held.damage.unwrap_or(0).saturating_add(damage_per_attack);
+    if new_damage >= max_damage {
+        *held = ItemStack::EMPTY;
+    } else {
+        held.damage = Some(new_damage);
+    }
+    Some((wire_slot, held.clone()))
+}
+
 pub(super) async fn damage_held_tool_after_mining<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -393,6 +466,19 @@ where
     W: AsyncWriteExt + Unpin,
 {
     if let Some(changed) = damage_held_tool_stack(state) {
+        write_inventory_slot_updates(state, writer, vec![changed]).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn damage_held_weapon_after_attack<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(changed) = damage_held_weapon_stack(state) {
         write_inventory_slot_updates(state, writer, vec![changed]).await?;
     }
     Ok(())

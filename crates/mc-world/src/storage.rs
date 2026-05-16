@@ -254,6 +254,28 @@ impl WorldStorage {
         Ok(self.cache.get(&cpos))
     }
 
+    /// Clone a chunk if it is already resident or present on disk, but do not
+    /// invoke the fallback generator. Background chunk streaming uses this to
+    /// keep expensive terrain generation outside the shared world mutex.
+    pub fn get_chunk_without_generation(
+        &mut self,
+        cpos: ChunkPos,
+    ) -> Result<Option<Chunk>, WorldError> {
+        self.ensure_chunk_loaded(cpos, false)?;
+        Ok(self.cache.get(&cpos).cloned())
+    }
+
+    /// Clone a resident chunk without disk IO or generation.
+    #[must_use]
+    pub fn cached_chunk(&self, cpos: ChunkPos) -> Option<Chunk> {
+        self.cache.get(&cpos).cloned()
+    }
+
+    #[must_use]
+    pub fn generator(&self) -> Option<Arc<dyn ChunkGenerator>> {
+        self.generator.as_ref().map(Arc::clone)
+    }
+
     /// Apply a block change at world-space `pos`, refreshing every
     /// heightmap currently attached to the affected chunk. Returns
     /// the previous state, or `None` if the chunk is genuinely
@@ -507,6 +529,14 @@ impl WorldStorage {
     }
 
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
+        self.ensure_chunk_loaded(cpos, true)
+    }
+
+    fn ensure_chunk_loaded(
+        &mut self,
+        cpos: ChunkPos,
+        allow_generation: bool,
+    ) -> Result<Option<&Chunk>, WorldError> {
         if self.cache.contains_key(&cpos) {
             self.touch(cpos);
             return Ok(self.cache.get(&cpos));
@@ -528,7 +558,7 @@ impl WorldStorage {
         }
 
         // M7: no on-disk chunk → ask the generator (if any).
-        if let Some(generator) = self.generator.as_ref().map(Arc::clone) {
+        if allow_generation && let Some(generator) = self.generator.as_ref().map(Arc::clone) {
             let mut chunk = generator.generate(cpos);
             chunk.dirty = true; // belt-and-braces; generator already sets this
             self.insert_chunk(cpos, chunk)?;
@@ -1436,6 +1466,59 @@ mod tests {
         let chunk = world.get_chunk(cpos).unwrap().expect("generator ran");
         assert_eq!(chunk.get_block(0, 0, 0), Some(BlockStateId(42)));
         assert!(chunk.dirty);
+    }
+
+    #[test]
+    fn chunk_lookup_without_generation_does_not_run_generator() {
+        use crate::chunk::ChunkGenerator;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingGen {
+            calls: Arc<AtomicUsize>,
+        }
+
+        impl ChunkGenerator for CountingGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Chunk::empty(
+                    pos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                )
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = Arc::new(
+            BlockRegistry::from_report(&[mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            }])
+            .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut world = WorldStorage::open_with_capacity(tmp.path(), registry, 4)
+            .unwrap()
+            .with_generator(Arc::new(CountingGen {
+                calls: Arc::clone(&calls),
+            }));
+
+        assert!(
+            world
+                .get_chunk_without_generation(ChunkPos { x: 4, z: 4 })
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        assert!(world.get_chunk(ChunkPos { x: 4, z: 4 }).unwrap().is_some());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     /// Bench-style coverage of the M3.e load pattern: stream the
