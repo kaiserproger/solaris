@@ -10,10 +10,10 @@ port = 25565
 [data]
 vanilla_dir = "data/vanilla"
 world_dir = ".analysis/test-world"
-# M7: world seed for the baseline terrain generator. Chunks already
-# on disk in `world_dir` are preferred over generated ones, so the
-# seed only matters for chunks the player walks into for the first
-# time. Defaults to 0.
+# World seed for deterministic Solaris generation. Chunks already on
+# disk in `world_dir` win over fallback generation, so changing this
+# affects only missing chunks unless the world is regenerated. Defaults
+# to 0 when omitted.
 seed = 0
 
 [simulation]

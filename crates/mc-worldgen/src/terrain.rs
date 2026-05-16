@@ -21,6 +21,7 @@ use std::sync::Arc;
 
 use mc_data::Identifier;
 use mc_data::biomes::BiomeWorldgenData;
+use mc_data::worldgen_features::{FeatureCount, WorldgenFeatureFacts};
 use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
 use mc_world::chunk::{Chunk, ChunkPos, Heightmap, MAX_Y, MIN_Y};
 use mc_world::{
@@ -154,13 +155,15 @@ pub struct TerrainGenerator {
     registry: Arc<BlockRegistry>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DecorationBlocks {
     oak_log: Option<BlockStateId>,
     oak_leaves: Option<BlockStateId>,
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
+    flower_patch: Vec<BlockStateId>,
+    grass_patch_spacing: u64,
     pumpkin: Option<BlockStateId>,
     sugar_cane: Option<BlockStateId>,
     cactus: Option<BlockStateId>,
@@ -174,10 +177,48 @@ impl DecorationBlocks {
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
+            flower_patch: ["minecraft:dandelion", "minecraft:poppy"]
+                .into_iter()
+                .filter_map(|name| optional_block(registry, name))
+                .collect(),
+            grass_patch_spacing: 11,
             pumpkin: optional_block(registry, "minecraft:pumpkin"),
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
             cactus: optional_block(registry, "minecraft:cactus"),
         }
+    }
+
+    fn from_feature_facts(registry: &BlockRegistry, features: &[WorldgenFeatureFacts]) -> Self {
+        let mut blocks = Self::new(registry);
+        for feature in features {
+            match feature.placed_feature.as_str() {
+                "minecraft:patch_grass_plain" => {
+                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
+                        blocks.short_grass = Some(state);
+                    }
+                    if let Some(spacing) = feature.placement.count.map(|count| {
+                        decoration_spacing_from_count(count, blocks.grass_patch_spacing)
+                    }) {
+                        blocks.grass_patch_spacing = spacing;
+                    }
+                }
+                "minecraft:flower_plain" => {
+                    let states = resolve_blocks(registry, &feature.block_states);
+                    if !states.is_empty() {
+                        blocks.flower_patch = states;
+                        blocks.dandelion = blocks.flower_patch.first().copied();
+                        blocks.poppy = blocks.flower_patch.get(1).copied().or(blocks.dandelion);
+                    }
+                }
+                "minecraft:patch_cactus" => {
+                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
+                        blocks.cactus = Some(state);
+                    }
+                }
+                _ => {}
+            }
+        }
+        blocks
     }
 }
 
@@ -416,6 +457,29 @@ fn resolve_block_or(registry: &BlockRegistry, name: &str, fallback: BlockStateId
 fn optional_block(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> {
     let id = Identifier::parse(name).expect("static identifier");
     registry.block(&id).map(|b| b.default)
+}
+
+fn first_resolved_block(registry: &BlockRegistry, ids: &[Identifier]) -> Option<BlockStateId> {
+    ids.iter()
+        .find_map(|id| registry.block(id).map(|block| block.default))
+}
+
+fn resolve_blocks(registry: &BlockRegistry, ids: &[Identifier]) -> Vec<BlockStateId> {
+    ids.iter()
+        .filter_map(|id| registry.block(id).map(|block| block.default))
+        .collect()
+}
+
+fn decoration_spacing_from_count(count: FeatureCount, fallback: u64) -> u64 {
+    let count = match count {
+        FeatureCount::Constant(count) => count,
+        FeatureCount::Uniform { min, max } => min.saturating_add(max) / 2,
+    };
+    if count == 0 {
+        fallback
+    } else {
+        (256 / count).clamp(3, 29) as u64
+    }
 }
 
 #[derive(Clone)]
@@ -730,6 +794,12 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_structures(mut self, structures: StructureRules) -> Self {
         self.structures = structures;
+        self
+    }
+
+    #[must_use]
+    pub fn with_feature_facts(mut self, features: &[WorldgenFeatureFacts]) -> Self {
+        self.decorations = DecorationBlocks::from_feature_facts(self.registry.as_ref(), features);
         self
     }
 
@@ -1073,7 +1143,7 @@ impl TerrainGenerator {
                         self.decorations.dandelion
                     } else if h.is_multiple_of(41) {
                         self.decorations.poppy
-                    } else if h.is_multiple_of(11) {
+                    } else if h.is_multiple_of(self.decorations.grass_patch_spacing) {
                         self.decorations.short_grass
                     } else {
                         None
@@ -1789,6 +1859,70 @@ mod tests {
     }
 
     #[test]
+    fn different_seeds_change_generated_chunks() {
+        let a = TerrainGenerator::new(0, tiny_registry());
+        let b = TerrainGenerator::new(1, tiny_registry());
+        let positions = [
+            ChunkPos { x: 0, z: 0 },
+            ChunkPos { x: 5, z: -3 },
+            ChunkPos { x: -12, z: 8 },
+        ];
+
+        for pos in positions {
+            let chunk_a = a.generate(pos);
+            let chunk_b = b.generate(pos);
+            for y in MIN_Y..=96 {
+                for x in 0..16u8 {
+                    for z in 0..16u8 {
+                        if chunk_a.get_block(x, y, z) != chunk_b.get_block(x, y, z) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        panic!("different world seeds should alter at least one sampled generated chunk");
+    }
+
+    #[test]
+    fn persisted_chunk_edit_wins_after_seed_change() {
+        let registry = tiny_registry();
+        let generator_a = Arc::new(TerrainGenerator::new(0, Arc::clone(&registry)));
+        let generator_b = Arc::new(TerrainGenerator::new(1, Arc::clone(&registry)));
+        let cpos = ChunkPos { x: 5, z: -3 };
+        let world_x = cpos.x * 16 + 8;
+        let world_z = cpos.z * 16 + 8;
+        let edit_pos = mc_world::chunk::BlockPos {
+            x: world_x,
+            y: generator_a.surface_height(world_x, world_z) + 1,
+            z: world_z,
+        };
+        let marker = BlockStateId(25);
+        let root = unique_temp_world_dir();
+        std::fs::create_dir_all(root.join("region")).unwrap();
+
+        let mut storage = mc_world::WorldStorage::open(&root, Arc::clone(&registry))
+            .unwrap()
+            .with_generator(Arc::clone(&generator_a) as Arc<dyn ChunkGenerator>);
+        assert_ne!(
+            storage.get_block(edit_pos).unwrap(),
+            Some(marker),
+            "generated fallback should not already contain the edit marker"
+        );
+        storage.set_block_at(edit_pos, marker).unwrap().unwrap();
+        assert!(storage.flush_dirty().unwrap() >= 1);
+        drop(storage);
+
+        let mut reopened = mc_world::WorldStorage::open(&root, Arc::clone(&registry))
+            .unwrap()
+            .with_generator(Arc::clone(&generator_b) as Arc<dyn ChunkGenerator>);
+        assert_eq!(reopened.get_block(edit_pos).unwrap(), Some(marker));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn far_chunks_still_have_terrain() {
         let g = TerrainGenerator::new(1234, tiny_registry());
         let chunk = g.generate(ChunkPos {
@@ -1919,6 +2053,58 @@ mod tests {
             saw_decoration,
             "sampled chunks should contain surface decorations"
         );
+    }
+
+    #[test]
+    fn feature_facts_drive_grass_decoration_block() {
+        let registry = tiny_registry();
+        let poppy = Identifier::parse("minecraft:poppy").unwrap();
+        let features = vec![WorldgenFeatureFacts {
+            placed_feature: Identifier::parse("minecraft:patch_grass_plain").unwrap(),
+            configured_feature: Identifier::parse("minecraft:test_patch_grass").unwrap(),
+            configured_type: Identifier::parse("minecraft:simple_block").unwrap(),
+            placement: mc_data::worldgen_features::FeaturePlacementFacts {
+                count: Some(FeatureCount::Constant(32)),
+                has_biome_filter: true,
+                ..Default::default()
+            },
+            block_states: vec![poppy],
+            tags: vec![],
+        }];
+        let g = TerrainGenerator::new(42, registry).with_feature_facts(&features);
+        let grass = BlockStateId(4);
+        let data_fed_plant = BlockStateId(30);
+
+        for cx in -8..=8 {
+            for cz in -8..=8 {
+                let chunk = g.generate(ChunkPos { x: cx, z: cz });
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let wx = cx * 16 + lx as i32;
+                        let wz = cz * 16 + lz as i32;
+                        let height = g.surface_height(wx, wz);
+                        let biome = g.biome_for(wx, wz, height);
+                        if !(g.biomes.grassland.contains(&biome)
+                            || g.biomes.temperate_forest.contains(&biome))
+                            || chunk.get_block(lx, height, lz) != Some(grass)
+                        {
+                            continue;
+                        }
+                        let h = feature_hash(g.seed, wx, height, wz, 0xDEC0_0001);
+                        if h.is_multiple_of(8)
+                            && !h.is_multiple_of(97)
+                            && !h.is_multiple_of(37)
+                            && !h.is_multiple_of(41)
+                        {
+                            assert_eq!(chunk.get_block(lx, height + 1, lz), Some(data_fed_plant));
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+
+        panic!("sampled chunks should contain a grass decoration from feature facts");
     }
 
     #[test]

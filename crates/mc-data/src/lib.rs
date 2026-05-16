@@ -42,6 +42,8 @@ pub mod items;
 pub mod loot;
 pub mod recipes;
 pub mod tags;
+pub mod worldgen_features;
+pub mod worldgen_inventory;
 pub mod worldgen_ores;
 
 pub use identifier::{Identifier, IdentifierError};

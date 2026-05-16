@@ -550,10 +550,30 @@ fn build_terrain_generator(
         }
     };
 
-    Arc::new(
-        mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores)
-            .with_structures(structure_rules),
-    )
+    let feature_facts = match mc_data::worldgen_features::load_feature_facts(
+        vanilla_dir.join("data/minecraft/worldgen"),
+    ) {
+        Ok(features) => {
+            tracing::info!(
+                features = features.len(),
+                "worldgen feature facts loaded for Solaris decoration policy",
+            );
+            Some(features)
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                "worldgen feature fact load failed; using Solaris fallback decorations",
+            );
+            None
+        }
+    };
+
+    let mut generator = mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores);
+    if let Some(feature_facts) = feature_facts.as_ref() {
+        generator = generator.with_feature_facts(feature_facts);
+    }
+    Arc::new(generator.with_structures(structure_rules))
 }
 
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
