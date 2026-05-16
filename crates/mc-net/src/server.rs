@@ -309,13 +309,18 @@ fn sample_entity_physics_input(
     let mut samples = HashMap::new();
     let mut complete_samples = true;
     for pos in entity_physics_sample_positions(query) {
-        let material = match storage.get_cached_block(pos) {
-            Some(state) => materials.classify(state.0),
-            None if (MIN_Y..MAX_Y).contains(&pos.y) => {
+        let material = match storage.get_block(pos) {
+            Ok(Some(state)) => materials.classify(state.0),
+            Ok(None) if (MIN_Y..MAX_Y).contains(&pos.y) => {
                 complete_samples = false;
                 BlockMaterial::Air
             }
-            None => BlockMaterial::Air,
+            Ok(None) => BlockMaterial::Air,
+            Err(_) if (MIN_Y..MAX_Y).contains(&pos.y) => {
+                complete_samples = false;
+                BlockMaterial::Air
+            }
+            Err(_) => BlockMaterial::Air,
         };
         samples.insert(pos, material);
     }
@@ -694,6 +699,58 @@ mod tests {
 
         assert_eq!(step.position, query.position);
         assert_eq!(step.velocity, mc_entity::Vec3::ZERO);
+    }
+
+    struct FlatGenerator {
+        air: mc_world::BlockStateId,
+        ground: mc_world::BlockStateId,
+        biome: Identifier,
+    }
+
+    impl mc_world::ChunkGenerator for FlatGenerator {
+        fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+            let mut chunk = mc_world::Chunk::empty(pos, self.air, self.biome.clone());
+            for x in 0..mc_world::SECTION_DIM as u8 {
+                for z in 0..mc_world::SECTION_DIM as u8 {
+                    let _ = chunk.set_block(x, 63, z, self.ground);
+                }
+            }
+            chunk
+        }
+    }
+
+    #[test]
+    fn entity_physics_samples_generated_chunks_instead_of_freezing() {
+        let registry = Arc::new(
+            BlockRegistry::from_report(&[
+                report("minecraft:air", &[], &[(0, true, &[])]),
+                report("minecraft:stone", &[], &[(1, true, &[])]),
+            ])
+            .unwrap(),
+        );
+        let materials = material_ids(&registry);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut storage = WorldStorage::in_memory(Arc::clone(&registry)).with_generator(Arc::new(
+            FlatGenerator {
+                air: mc_world::BlockStateId(0),
+                ground: mc_world::BlockStateId(1),
+                biome,
+            },
+        ));
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(42),
+            position: mc_entity::Vec3::new(0.5, 66.0, 0.5),
+            velocity: mc_entity::Vec3::ZERO,
+            aabb: mc_physics::Aabb::COW,
+            on_ground: false,
+        };
+
+        let input = sample_entity_physics_input(query, &mut storage, &materials);
+        assert!(input.complete_samples);
+        let step = step_sampled_entity(input);
+
+        assert!(step.position.y < query.position.y);
+        assert!(step.velocity.y < 0.0);
     }
 
     #[tokio::test]

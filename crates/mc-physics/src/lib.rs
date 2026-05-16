@@ -14,6 +14,7 @@ pub const GROUND_FRICTION: f64 = 0.6;
 pub const AIR_DRAG: f64 = 0.98;
 pub const WATER_DRAG: f64 = 0.8;
 pub const WATER_BUOYANCY_BLOCKS_PER_SECOND_SQUARED: f64 = 7.0;
+pub const STEP_HEIGHT: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 {
@@ -336,9 +337,9 @@ fn try_step_up<S: BlockSampler>(
     if !body.on_ground || *stepped_up {
         return false;
     }
-    body.position.y += 1.0;
+    body.position.y += STEP_HEIGHT;
     if body_collides_with_solid(*body, sampler) {
-        body.position.y -= 1.0;
+        body.position.y -= STEP_HEIGHT;
         false
     } else {
         *stepped_up = true;
@@ -440,7 +441,7 @@ mod tests {
     }
 
     #[test]
-    fn grounded_body_steps_up_one_block_obstacle() {
+    fn grounded_body_does_not_step_up_full_block_obstacle() {
         let mut world = LocalBlocks {
             solids: vec![GridPos::new(1, 64, 0)],
             fluids: Vec::new(),
@@ -454,9 +455,9 @@ mod tests {
 
         let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
 
-        assert!(stepped.position.x > body.position.x);
-        assert!(stepped.position.y >= 65.0 - 1.0e-6);
-        assert!(stepped.velocity.x > 0.0);
+        assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
+        assert!(stepped.position.y < body.position.y + STEP_HEIGHT);
+        assert_eq!(stepped.velocity.x, 0.0);
     }
 
     #[test]
