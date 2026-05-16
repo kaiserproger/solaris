@@ -1,0 +1,397 @@
+use super::*;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct SurvivalState {
+    pub(super) health: f32,
+    pub(super) food: i32,
+    pub(super) saturation: f32,
+    pub(super) exhaustion: f32,
+}
+
+impl SurvivalState {
+    pub(super) const MAX_HEALTH: f32 = 20.0;
+    pub(super) const MAX_FOOD: i32 = 20;
+    const EXHAUSTION_STEP: f32 = 4.0;
+    const HEALTH_TICK_PERIOD: u32 = 4;
+
+    pub(super) const FULL: Self = Self {
+        health: Self::MAX_HEALTH,
+        food: Self::MAX_FOOD,
+        saturation: 5.0,
+        exhaustion: 0.0,
+    };
+
+    pub(super) const fn as_packet(self) -> ClientboundSetHealth {
+        ClientboundSetHealth {
+            health: self.health,
+            food: self.food,
+            saturation: self.saturation,
+        }
+    }
+
+    pub(super) fn apply_damage(&mut self, amount: f32) {
+        self.health = (self.health - amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+    }
+
+    pub(super) fn heal(&mut self, amount: f32) {
+        self.health = (self.health + amount.max(0.0)).clamp(0.0, Self::MAX_HEALTH);
+    }
+
+    pub(super) fn add_food(&mut self, food: i32, saturation: f32) {
+        self.food = (self.food + food).clamp(0, Self::MAX_FOOD);
+        self.saturation = (self.saturation + saturation.max(0.0)).clamp(0.0, self.food as f32);
+    }
+
+    pub(super) fn is_dead(self) -> bool {
+        self.health <= 0.0
+    }
+
+    pub(super) fn add_exhaustion(&mut self, amount: f32) {
+        self.exhaustion = (self.exhaustion + amount.max(0.0)).max(0.0);
+        while self.exhaustion >= Self::EXHAUSTION_STEP {
+            self.exhaustion -= Self::EXHAUSTION_STEP;
+            if self.saturation > 0.0 {
+                self.saturation = (self.saturation - 1.0).max(0.0);
+            } else if self.food > 0 {
+                self.food -= 1;
+            }
+        }
+    }
+
+    pub(super) fn tick_health(&mut self, tick: u32) -> bool {
+        if self.is_dead() || !tick.is_multiple_of(Self::HEALTH_TICK_PERIOD) {
+            return false;
+        }
+        let before = *self;
+        if self.food >= 18 && self.health < Self::MAX_HEALTH {
+            self.heal(1.0);
+            self.add_exhaustion(6.0);
+        } else if self.food == 0 {
+            self.apply_damage(1.0);
+        }
+        *self != before
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct PendingBreak {
+    pub(super) position: i64,
+    pub(super) direction: Direction,
+    pub(super) started_at: Instant,
+    pub(super) required_time: Duration,
+    pub(super) held_hotbar_slot: u8,
+    pub(super) held_item_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PendingUse {
+    pub(super) started_at: Instant,
+    pub(super) required_time: Duration,
+    pub(super) held_hotbar_slot: u8,
+    pub(super) held_item_id: u32,
+    pub(super) rule: mc_data::food::FoodEntry,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MiningRule {
+    block_path_contains: &'static [&'static str],
+    base_time: Duration,
+    tool_suffix: Option<&'static str>,
+}
+
+const FALLBACK_MINING_RULES: &[MiningRule] = &[
+    MiningRule {
+        block_path_contains: &["stone", "ore", "deepslate", "brick"],
+        base_time: Duration::from_millis(1_500),
+        tool_suffix: Some("_pickaxe"),
+    },
+    MiningRule {
+        block_path_contains: &["log", "wood", "planks"],
+        base_time: Duration::from_millis(900),
+        tool_suffix: Some("_axe"),
+    },
+    MiningRule {
+        block_path_contains: &["dirt", "sand", "gravel", "clay", "snow"],
+        base_time: Duration::from_millis(600),
+        tool_suffix: Some("_shovel"),
+    },
+    MiningRule {
+        block_path_contains: &["leaves", "grass", "flower"],
+        base_time: SURVIVAL_MINING_FALLBACK_TIME,
+        tool_suffix: None,
+    },
+];
+
+const UNKNOWN_BLOCK_MINING_RULE: MiningRule = MiningRule {
+    block_path_contains: &[],
+    base_time: Duration::from_millis(800),
+    tool_suffix: None,
+};
+
+pub(super) fn held_item_id(state: &InteractionState) -> Option<u32> {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    (!held.is_empty()).then_some(held.item_id)
+}
+
+pub(super) fn pending_break_matches(
+    state: &InteractionState,
+    pending: &PendingBreak,
+    action: &ServerboundPlayerAction,
+) -> bool {
+    pending.position == action.position
+        && pending.direction == action.direction
+        && pending.held_hotbar_slot == state.selected_hotbar_slot
+        && pending.held_item_id == held_item_id(state)
+}
+
+pub(super) fn pending_break_is_complete(pending: &PendingBreak, now: Instant) -> bool {
+    now.duration_since(pending.started_at) >= pending.required_time
+}
+
+fn fallback_mining_rule(block_path: &str) -> MiningRule {
+    FALLBACK_MINING_RULES
+        .iter()
+        .copied()
+        .find(|rule| {
+            rule.block_path_contains
+                .iter()
+                .any(|needle| block_path.contains(needle))
+        })
+        .unwrap_or(UNKNOWN_BLOCK_MINING_RULE)
+}
+
+fn tool_speed_divisor(tool_path: Option<&str>, required_suffix: Option<&str>) -> u64 {
+    let Some(tool_path) = tool_path else {
+        return 1;
+    };
+    if required_suffix.is_some_and(|suffix| !tool_path.ends_with(suffix)) {
+        return 1;
+    }
+
+    if tool_path.starts_with("golden_") {
+        10
+    } else if tool_path.starts_with("netherite_") {
+        8
+    } else if tool_path.starts_with("diamond_") {
+        6
+    } else if tool_path.starts_with("iron_") {
+        4
+    } else if tool_path.starts_with("stone_") {
+        3
+    } else if tool_path.starts_with("wooden_") {
+        2
+    } else {
+        1
+    }
+}
+
+pub(super) fn fallback_mining_time(block_path: &str, tool_path: Option<&str>) -> Duration {
+    let rule = fallback_mining_rule(block_path);
+    let divisor = tool_speed_divisor(tool_path, rule.tool_suffix);
+    Duration::from_millis((rule.base_time.as_millis() as u64 / divisor).max(100))
+}
+
+fn mining_time_for_block(
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    block_state: BlockStateId,
+    held_item_id: Option<u32>,
+) -> Duration {
+    let Some(block_state) = blocks.by_id(block_state) else {
+        return UNKNOWN_BLOCK_MINING_RULE.base_time;
+    };
+    let tool_path = held_item_id
+        .and_then(|id| items.name_of(id))
+        .map(mc_data::Identifier::path);
+    fallback_mining_time(block_state.block.id.path(), tool_path)
+}
+
+pub(super) async fn mining_time_for_target(state: &InteractionState, position: i64) -> Duration {
+    let (x, y, z) = unpack_block_pos(position);
+    let block_state = {
+        let mut storage = state.world.lock().await;
+        storage
+            .get_block(mc_world::BlockPos { x, y, z })
+            .map_err(|err| {
+                warn!(error = %err, x, y, z, "mining target read failed; using fallback timing");
+            })
+            .ok()
+            .flatten()
+    };
+
+    block_state.map_or(UNKNOWN_BLOCK_MINING_RULE.base_time, |block_state| {
+        mining_time_for_block(
+            &state.blocks,
+            &state.items,
+            block_state,
+            held_item_id(state),
+        )
+    })
+}
+
+pub(super) fn item_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let item = mc_data::Identifier::parse("minecraft:item").expect("static identifier");
+    entity_types
+        .id_of(&item)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
+pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
+    matches!(entity_type, "minecraft:zombie")
+}
+
+pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
+    let entity = Identifier::parse(entity_type.to_string()).ok()?;
+    let item = state
+        .loot
+        .entity_drop(&entity)
+        .or_else(|| mc_data::loot::builtin().entity_drop(&entity))?;
+    let item_id = state.items.id_of(item)?;
+    Some(ItemStack::new(item_id, 1))
+}
+
+pub(super) fn block_drop_stack(
+    state: &InteractionState,
+    block_state: BlockStateId,
+) -> Option<ItemStack> {
+    let block = state.blocks.by_id(block_state)?;
+    let item = state
+        .loot
+        .block_drop(&block.block.id)
+        .or_else(|| mc_data::loot::builtin().block_drop(&block.block.id))
+        .unwrap_or(&block.block.id);
+    let item_id = state.items.id_of(item)?;
+    Some(ItemStack::new(item_id, 1))
+}
+
+pub(super) fn food_rule_for_item(
+    item_facts: &ItemFactsTable,
+    item: &mc_data::Identifier,
+) -> Option<(mc_data::food::FoodEntry, Duration)> {
+    if let Some(facts) = item_facts.get(item)
+        && let Some(food) = facts.food
+    {
+        let duration = facts
+            .use_duration_ticks
+            .map(|ticks| Duration::from_millis(u64::from(ticks) * 50))
+            .unwrap_or(DEFAULT_FOOD_USE_DURATION);
+        return Some((food, duration));
+    }
+
+    mc_data::food::builtin()
+        .entry(item)
+        .copied()
+        .map(|food| (food, DEFAULT_FOOD_USE_DURATION))
+}
+
+pub(super) fn held_food_use(
+    state: &InteractionState,
+) -> Option<(u32, mc_data::food::FoodEntry, Duration)> {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    if held.is_empty() {
+        return None;
+    }
+    let (rule, duration) = state
+        .items
+        .name_of(held.item_id)
+        .and_then(|item| food_rule_for_item(&state.item_facts, item))?;
+    Some((held.item_id, rule, duration))
+}
+
+pub(super) fn pending_use_matches(state: &InteractionState, pending: &PendingUse) -> bool {
+    pending.held_hotbar_slot == state.selected_hotbar_slot
+        && state.inventory.held(pending.held_hotbar_slot).item_id == pending.held_item_id
+}
+
+pub(super) fn pending_use_is_complete(pending: &PendingUse, now: Instant) -> bool {
+    now.duration_since(pending.started_at) >= pending.required_time
+}
+
+pub(super) fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
+    EntityItemStack::new(stack.item_id, stack.count)
+}
+
+pub(super) fn held_attack_damage(state: &InteractionState) -> f32 {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    let Some(path) = (!held.is_empty())
+        .then(|| state.items.name_of(held.item_id))
+        .flatten()
+        .map(|id| id.path())
+    else {
+        return 2.0;
+    };
+    if path.ends_with("_sword") {
+        8.0
+    } else if path.ends_with("_axe") {
+        7.0
+    } else if path.ends_with("_pickaxe") || path.ends_with("_shovel") {
+        4.0
+    } else {
+        2.0
+    }
+}
+
+pub(super) fn is_durability_tool_path(path: &str) -> bool {
+    path.ends_with("_axe")
+        || path.ends_with("_hoe")
+        || path.ends_with("_pickaxe")
+        || path.ends_with("_shovel")
+        || path.ends_with("_sword")
+}
+
+pub(super) fn max_tool_damage_for_path(path: &str) -> Option<i32> {
+    if !is_durability_tool_path(path) {
+        return None;
+    }
+    let max = if path.starts_with("wooden_") {
+        59
+    } else if path.starts_with("stone_") {
+        131
+    } else if path.starts_with("iron_") {
+        250
+    } else if path.starts_with("diamond_") {
+        1561
+    } else if path.starts_with("golden_") {
+        32
+    } else if path.starts_with("netherite_") {
+        2031
+    } else {
+        return None;
+    };
+    Some(max)
+}
+
+fn damage_held_tool_stack(state: &mut InteractionState) -> Option<(usize, ItemStack)> {
+    let hotbar_slot = state.selected_hotbar_slot;
+    let wire_slot = PlayerInventory::HOTBAR_BASE + hotbar_slot as usize;
+    let item_path = {
+        let held = state.inventory.held(hotbar_slot);
+        if held.is_empty() {
+            return None;
+        }
+        state.items.name_of(held.item_id)?.path().to_owned()
+    };
+    let max_damage = max_tool_damage_for_path(&item_path)?;
+
+    let held = state.inventory.held_mut(hotbar_slot);
+    let new_damage = held.damage.unwrap_or(0).saturating_add(1);
+    if new_damage >= max_damage {
+        *held = ItemStack::EMPTY;
+    } else {
+        held.damage = Some(new_damage);
+    }
+    Some((wire_slot, held.clone()))
+}
+
+pub(super) async fn damage_held_tool_after_mining<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(changed) = damage_held_tool_stack(state) {
+        write_inventory_slot_updates(state, writer, vec![changed]).await?;
+    }
+    Ok(())
+}
