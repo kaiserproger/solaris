@@ -101,10 +101,26 @@ pub(super) fn is_furnace_state(
     state: &InteractionState,
     block_state: mc_world::BlockStateId,
 ) -> bool {
+    furnace_menu_title_for_state(state, block_state).is_some()
+}
+
+pub(super) fn furnace_menu_title_for_state(
+    state: &InteractionState,
+    block_state: mc_world::BlockStateId,
+) -> Option<&'static str> {
     state
         .blocks
         .by_id(block_state)
-        .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:furnace")
+        .and_then(|block_state| furnace_menu_title_for_block_id(block_state.block.id.as_str()))
+}
+
+pub(super) fn furnace_menu_title_for_block_id(id: &str) -> Option<&'static str> {
+    match id {
+        "minecraft:furnace" => Some("Furnace"),
+        "minecraft:smoker" => Some("Smoker"),
+        "minecraft:blast_furnace" => Some("Blast Furnace"),
+        _ => None,
+    }
 }
 
 pub(super) fn is_chest_state(
@@ -115,6 +131,16 @@ pub(super) fn is_chest_state(
         .blocks
         .by_id(block_state)
         .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:chest")
+}
+
+pub(super) fn is_barrel_state(
+    state: &InteractionState,
+    block_state: mc_world::BlockStateId,
+) -> bool {
+    state
+        .blocks
+        .by_id(block_state)
+        .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:barrel")
 }
 
 pub(super) fn is_crafting_table_state(
@@ -150,14 +176,11 @@ pub(super) fn is_fuel_item(state: &InteractionState, item_id: u32) -> bool {
     Some(item_id) == coal || Some(item_id) == charcoal
 }
 
-pub(super) fn furnace_menu_title_nbt() -> Vec<u8> {
+pub(super) fn furnace_menu_title_nbt(title: &str) -> Vec<u8> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
-        &Tag::Compound(vec![(
-            "text".to_string(),
-            Tag::String("Furnace".to_string()),
-        )]),
+        &Tag::Compound(vec![("text".to_string(), Tag::String(title.to_string()))]),
     )
     .expect("static text component is valid NBT");
     out
@@ -176,11 +199,11 @@ pub(super) fn crafting_menu_title_nbt() -> Vec<u8> {
     out
 }
 
-pub(super) fn chest_menu_title_nbt() -> Vec<u8> {
+pub(super) fn chest_menu_title_nbt(title: &str) -> Vec<u8> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
-        &Tag::Compound(vec![("text".to_string(), Tag::String("Chest".to_string()))]),
+        &Tag::Compound(vec![("text".to_string(), Tag::String(title.to_string()))]),
     )
     .expect("static text component is valid NBT");
     out

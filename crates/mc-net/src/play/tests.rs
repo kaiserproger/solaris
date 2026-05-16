@@ -364,15 +364,68 @@ fn wheat_seeds_place_wheat_on_farmland_only() {
 
     assert_eq!(table.resolve(50), None);
     assert_eq!(
-        table.resolve_for_use_on(50, farmland_state, Direction::Up, &blocks),
+        table.resolve_for_use_on(&items, 50, farmland_state, Direction::Up, &blocks),
         Some(mc_world::BlockStateId(11))
     );
     assert_eq!(
-        table.resolve_for_use_on(50, farmland_state, Direction::North, &blocks),
+        table.resolve_for_use_on(&items, 50, farmland_state, Direction::North, &blocks),
         None
     );
     assert_eq!(
-        table.resolve_for_use_on(50, dirt_state, Direction::Up, &blocks),
+        table.resolve_for_use_on(&items, 50, dirt_state, Direction::Up, &blocks),
+        None
+    );
+}
+
+#[test]
+fn sign_items_choose_floor_or_wall_sign_for_clicked_face() {
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:oak_sign").unwrap(),
+        protocol_id: 70,
+    }]);
+    let blocks = mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_sign").unwrap(),
+            properties: prop_schema(&[("rotation", &["0"])]),
+            states: vec![state(1, true, &[("rotation", "0")])],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_wall_sign").unwrap(),
+            properties: prop_schema(&[("facing", &["north"])]),
+            states: vec![state(2, true, &[("facing", "north")])],
+        },
+    ])
+    .unwrap();
+
+    assert_eq!(
+        ItemToBlockTable::build(&items, &blocks).resolve_for_use_on(
+            &items,
+            70,
+            mc_world::BlockStateId(0),
+            Direction::Up,
+            &blocks,
+        ),
+        Some(mc_world::BlockStateId(1))
+    );
+    assert_eq!(
+        ItemToBlockTable::build(&items, &blocks).resolve_for_use_on(
+            &items,
+            70,
+            mc_world::BlockStateId(0),
+            Direction::North,
+            &blocks,
+        ),
+        Some(mc_world::BlockStateId(2))
+    );
+    assert_eq!(
+        ItemToBlockTable::build(&items, &blocks).resolve_for_use_on(
+            &items,
+            70,
+            mc_world::BlockStateId(0),
+            Direction::Down,
+            &blocks,
+        ),
         None
     );
 }
@@ -846,6 +899,86 @@ fn door_half_state_builds_two_block_placement_states() {
         Some(mc_world::BlockStateId(4))
     );
     assert_eq!(horizontal_facing_from_yaw(180.0), "north");
+}
+
+#[test]
+fn sign_placement_sets_wall_facing_and_floor_rotation() {
+    let blocks = mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_sign").unwrap(),
+            properties: prop_schema(&[("rotation", &["0", "4"])]),
+            states: vec![
+                state(1, true, &[("rotation", "0")]),
+                state(2, false, &[("rotation", "4")]),
+            ],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_wall_sign").unwrap(),
+            properties: prop_schema(&[("facing", &["north", "east"])]),
+            states: vec![
+                state(3, true, &[("facing", "north")]),
+                state(4, false, &[("facing", "east")]),
+            ],
+        },
+    ])
+    .unwrap();
+    let mut pose = PlayerPose::new(0.5, 64.0, 0.5);
+    pose.yaw = 90.0;
+
+    assert_eq!(
+        sign_placement_state(
+            &blocks,
+            blocks.by_id(mc_world::BlockStateId(1)).unwrap(),
+            pose,
+            Direction::Up,
+        ),
+        Some(mc_world::BlockStateId(2))
+    );
+    assert_eq!(
+        sign_placement_state(
+            &blocks,
+            blocks.by_id(mc_world::BlockStateId(3)).unwrap(),
+            pose,
+            Direction::East,
+        ),
+        Some(mc_world::BlockStateId(4))
+    );
+}
+
+#[test]
+fn bed_respawn_pose_uses_block_above_bed() {
+    let blocks = mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:red_bed").unwrap(),
+            properties: prop_schema(&[("facing", &["north"])]),
+            states: vec![state(1, true, &[("facing", "north")])],
+        },
+    ])
+    .unwrap();
+    let pose = bed_respawn_pose(
+        mc_world::BlockPos { x: 3, y: 64, z: -2 },
+        blocks.by_id(mc_world::BlockStateId(1)).unwrap(),
+    );
+
+    assert_eq!((pose.x, pose.y, pose.z, pose.yaw), (3.5, 65.0, -1.5, 180.0));
+}
+
+#[test]
+fn common_container_paper_cuts_resolve_to_existing_menus() {
+    assert_eq!(
+        super::containers::furnace_menu_title_for_block_id("minecraft:furnace"),
+        Some("Furnace")
+    );
+    assert_eq!(
+        super::containers::furnace_menu_title_for_block_id("minecraft:smoker"),
+        Some("Smoker")
+    );
+    assert_eq!(
+        super::containers::furnace_menu_title_for_block_id("minecraft:blast_furnace"),
+        Some("Blast Furnace")
+    );
 }
 
 #[test]

@@ -213,6 +213,61 @@ fn serverbound_custom_payload_brand_id_and_layout_match_local_decompiled_sources
 }
 
 #[test]
+fn malformed_container_click_rejects_unknown_input_mode() {
+    let mut buf = Vec::new();
+    buf.write_varint(1); // container id
+    buf.write_varint(1); // state id
+    buf.write_i16(0); // slot
+    buf.write_i8(0); // button
+    buf.write_varint(99); // invalid ContainerInput
+
+    let mut cursor: &[u8] = &buf;
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut cursor),
+        Err(CodecError::NotSupported("unknown ContainerInput id"))
+    ));
+}
+
+#[test]
+fn malformed_container_click_rejects_changed_slot_overflow() {
+    let mut buf = Vec::new();
+    buf.write_varint(1);
+    buf.write_varint(1);
+    buf.write_i16(0);
+    buf.write_i8(0);
+    buf.write_varint(ContainerInput::Pickup.as_wire());
+    buf.write_varint((MAX_CONTAINER_CLICK_CHANGED_SLOTS + 1) as i32);
+
+    let mut cursor: &[u8] = &buf;
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut cursor),
+        Err(CodecError::StringTooLong { .. })
+    ));
+}
+
+#[test]
+fn malformed_container_click_rejects_non_positive_actual_stack() {
+    let mut buf = Vec::new();
+    buf.write_varint(1);
+    buf.write_varint(1);
+    buf.write_i16(0);
+    buf.write_i8(0);
+    buf.write_varint(ContainerInput::Pickup.as_wire());
+    buf.write_varint(0); // no changed slots
+    buf.write_bool(true); // carried item is actual
+    buf.write_varint(5); // item id
+    buf.write_varint(0); // invalid count
+
+    let mut cursor: &[u8] = &buf;
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut cursor),
+        Err(CodecError::NotSupported(
+            "HashedStack actual item with non-positive count"
+        ))
+    ));
+}
+
+#[test]
 fn direction_normal_matches_vanilla_axes() {
     assert_eq!(Direction::Down.normal(), (0, -1, 0));
     assert_eq!(Direction::Up.normal(), (0, 1, 0));

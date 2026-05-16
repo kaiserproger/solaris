@@ -57,6 +57,7 @@ impl ItemToBlockTable {
 
     pub(super) fn resolve_for_use_on(
         &self,
+        items: &ItemRegistry,
         item_id: u32,
         clicked_state: mc_world::BlockStateId,
         direction: Direction,
@@ -70,6 +71,9 @@ impl ItemToBlockTable {
                 .find(|entry| entry.item_id == item_id && clicked.block.id == entry.soil_block)
         {
             return Some(entry.crop_state);
+        }
+        if is_sign_item(items, item_id) {
+            return sign_state_for_use_on(items, item_id, direction, blocks);
         }
         self.resolve(item_id)
     }
@@ -101,6 +105,35 @@ impl ItemToBlockTable {
             FluidKind::Lava => self.lava_source,
         }
     }
+}
+
+fn is_sign_item(items: &ItemRegistry, item_id: u32) -> bool {
+    items.name_of(item_id).is_some_and(|item| {
+        let path = item.path();
+        path.ends_with("_sign") && !path.ends_with("_hanging_sign")
+    })
+}
+
+fn sign_state_for_use_on(
+    items: &ItemRegistry,
+    item_id: u32,
+    direction: Direction,
+    blocks: &mc_world::BlockRegistry,
+) -> Option<mc_world::BlockStateId> {
+    let item = items.name_of(item_id)?;
+    let path = item.path();
+    if !path.ends_with("_sign") || path.ends_with("_hanging_sign") {
+        return None;
+    }
+    if direction == Direction::Down {
+        return None;
+    }
+    if direction == Direction::Up {
+        return blocks.block(item).map(|block| block.default);
+    }
+    let wood = path.strip_suffix("_sign")?;
+    let wall = Identifier::parse(format!("{}:{}_wall_sign", item.namespace(), wood)).ok()?;
+    blocks.block(&wall).map(|block| block.default)
 }
 
 fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {

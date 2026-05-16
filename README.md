@@ -6,38 +6,22 @@ Solaris is an authoritative server implementing the vanilla 26.1 Java protocol
 plus a custom protocol extension consumed by a Fabric/NeoForge client mod. See
 [`docs/PROJECT_SPEC.md`](docs/PROJECT_SPEC.md) for the full design document.
 
-**Status:** M11 code complete on `dev/M11-compression-lz4-bulk-edits`,
-awaiting owner review, optional manual gate, merge, and `m11` tag. A
-vanilla 26.1.2 client connecting to Solaris walks the
-full Handshake → Login → Configuration → Play sequence, receives
-the streamed spawn-area chunks lit by `mc_world::light`'s BFS
-engine (M4), can **break and place blocks** (M5), sees those
-edits **persist** across restarts (M6), walks in any direction
-on infinite hill-noise terrain (M7), and the spawn burst starts
-at the player's chunk and fills outwards in chebyshev rings (M8).
-Edits now also drive an **incremental relight** (M9): a single
-break/place runs a bounded BFS over a 3×3-chunk window instead
-of recomputing the full 5-chunk neighbourhood, and emits only
-the `LightUpdate` packets for chunks whose arrays actually
-changed — wire-byte-identical to a fresh full recompute. The
-BFS uses Starlight's early-skip shortcut (skip the opacity
-lookup when the neighbour is already at the best propagatable
-level), cutting block-state reads roughly 5–6× in dense regions.
-M10 adds a light-engine bench harness, packed window-local queues
-for incremental BFS, lazy per-section nibble storage for cached
-light, and a light-table-driven highest-opaque heightmap used for
-adaptive spawn Y and sky-column reseed guarding. M11 enables login
-compression across Configuration and Play, reads LZ4-compressed
-Anvil chunks from vanilla regions, and adds the `SectionBlocksUpdate`
-packet plus a conservative bulk-delta emission seam. Single plains
-biome, no caves / ores / structures; light persistence and survival
-validation remain M12+ polish items.
+**Status:** M38 compatibility polish is implemented locally on top of the local
+M37 performance branch. A vanilla 26.1.2 client can join the overworld survival
+server, stream lit chunks, break/place blocks, use core survival systems,
+persist player/world state, and exercise multiplayer visibility/pickups within
+the current scoped replacement target. See
+[`docs/REPLACEMENT_READINESS.md`](docs/REPLACEMENT_READINESS.md) for supported,
+partial, and deferred compatibility claims.
 
 ## Build
 
 ```sh
-cargo build --release
+cargo build
 ```
+
+Use debug builds for development; release builds are reserved for CI/owner-run
+checks.
 
 ## Prerequisite: vanilla data sidecar
 
@@ -66,12 +50,14 @@ cargo run --bin mc-server -- --check --config example.toml
 cargo run --bin mc-server -- --config example.toml
 ```
 
+Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
+
 ## Test
 
 ```sh
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --check
+cargo fmt --all -- --check
 ```
 
 ## Layout

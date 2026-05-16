@@ -118,8 +118,9 @@ use commands::{parse_debug_command, parse_gamemode_command};
 use containers::{
     ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceWindow,
     chest_menu_title_nbt, crafting_menu_title_nbt, find_smelting_recipe_for_item,
-    furnace_menu_title_nbt, is_chest_state, is_crafting_table_state, is_fuel_item,
-    is_furnace_state, next_container_id, store_active_container,
+    furnace_menu_title_for_state, furnace_menu_title_nbt, is_barrel_state, is_chest_state,
+    is_crafting_table_state, is_fuel_item, is_furnace_state, next_container_id,
+    store_active_container,
 };
 #[cfg(test)]
 use inventory::{ArmorStats, armor_reduced_damage};
@@ -128,7 +129,9 @@ use inventory::{
     item_max_stack, survival_damage_after_armor,
 };
 use item_blocks::{ItemToBlockTable, fallback_crafting_recipes};
-use persistence::{PlayerPersistedState, XpState, load_player_state, save_player_state};
+use persistence::{
+    PlayerPersistedState, SpawnState, XpState, load_player_state, save_player_state,
+};
 use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
@@ -1625,7 +1628,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let position = mc_world::BlockPos { x, y, z };
-    let positions = {
+    let (positions, title) = {
         let mut storage = state.world.lock().await;
         let clicked = storage
             .get_block(position)
@@ -1635,26 +1638,35 @@ where
             })
             .ok()
             .flatten();
-        if !clicked.is_some_and(|block_state| is_chest_state(state, block_state)) {
+        let Some(clicked) = clicked else {
             return Ok(false);
-        }
+        };
+        let title = if is_chest_state(state, clicked) {
+            "Chest"
+        } else if is_barrel_state(state, clicked) {
+            "Barrel"
+        } else {
+            return Ok(false);
+        };
         let mut positions = vec![position];
-        for neighbour in adjacent_chest_positions(position) {
-            let neighbour_state = storage
-                .get_block(neighbour)
-                .map_err(|err| {
-                    warn!(error = %err, ?neighbour, "adjacent chest read failed");
-                    err
-                })
-                .ok()
-                .flatten();
-            if neighbour_state.is_some_and(|block_state| is_chest_state(state, block_state)) {
-                positions.push(neighbour);
-                break;
+        if title == "Chest" {
+            for neighbour in adjacent_chest_positions(position) {
+                let neighbour_state = storage
+                    .get_block(neighbour)
+                    .map_err(|err| {
+                        warn!(error = %err, ?neighbour, "adjacent chest read failed");
+                        err
+                    })
+                    .ok()
+                    .flatten();
+                if neighbour_state.is_some_and(|block_state| is_chest_state(state, block_state)) {
+                    positions.push(neighbour);
+                    break;
+                }
             }
         }
         positions.sort_by_key(|pos| (pos.x, pos.y, pos.z));
-        positions
+        (positions, title)
     };
 
     store_active_container(state);
@@ -1666,7 +1678,7 @@ where
         &ClientboundOpenScreen {
             container_id,
             menu_type: window.menu_type(),
-            title_nbt: chest_menu_title_nbt(),
+            title_nbt: chest_menu_title_nbt(title),
         },
         state.compression,
     )
@@ -1692,20 +1704,27 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let position = mc_world::BlockPos { x, y, z };
-    let clicked = {
+    let title = {
         let mut storage = state.world.lock().await;
-        storage
+        let clicked = storage
             .get_block(position)
             .map_err(|err| {
                 warn!(error = %err, x, y, z, "furnace use target read failed");
                 err
             })
             .ok()
-            .flatten()
+            .flatten();
+        let Some(clicked) = clicked else {
+            return Ok(false);
+        };
+        if !is_furnace_state(state, clicked) {
+            return Ok(false);
+        }
+        let Some(title) = furnace_menu_title_for_state(state, clicked) else {
+            return Ok(false);
+        };
+        title
     };
-    if !clicked.is_some_and(|block_state| is_furnace_state(state, block_state)) {
-        return Ok(false);
-    }
 
     store_active_container(state);
     let container_id = next_container_id(state);
@@ -1723,7 +1742,7 @@ where
         &ClientboundOpenScreen {
             container_id,
             menu_type: FURNACE_MENU_TYPE_ID,
-            title_nbt: furnace_menu_title_nbt(),
+            title_nbt: furnace_menu_title_nbt(title),
         },
         state.compression,
     )
@@ -4401,6 +4420,64 @@ fn fall_damage_amount(old_pose: PlayerPose, new_pose: PlayerPose) -> f32 {
     ((old_pose.y - new_pose.y).max(0.0) - 3.0).floor().max(0.0) as f32
 }
 
+async fn interact_with_bed<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    pos: mc_world::BlockPos,
+    respawn_pose: &mut PlayerPose,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let clicked = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(pos) {
+            Ok(Some(state_id)) => state_id,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "bed use target read failed");
+                return write_block_ack(writer, state.compression, sequence)
+                    .await
+                    .map(|()| true);
+            }
+        }
+    };
+    let Some(block_state) = state.blocks.by_id(clicked) else {
+        return Ok(false);
+    };
+    if !block_state.block.id.path().ends_with("_bed") {
+        return Ok(false);
+    }
+
+    *respawn_pose = bed_respawn_pose(pos, block_state);
+    write_block_ack(writer, state.compression, sequence).await?;
+    send_command_feedback(writer, state.compression, "Respawn point set").await?;
+    Ok(true)
+}
+
+fn bed_respawn_pose(pos: mc_world::BlockPos, state: &mc_world::BlockState) -> PlayerPose {
+    let mut pose = PlayerPose::new(
+        f64::from(pos.x) + 0.5,
+        f64::from(pos.y) + 1.0,
+        f64::from(pos.z) + 0.5,
+    );
+    pose.yaw = block_state_property(state, "facing")
+        .map(yaw_for_horizontal_facing)
+        .unwrap_or(0.0);
+    pose
+}
+
+fn yaw_for_horizontal_facing(facing: &str) -> f32 {
+    match facing {
+        "north" => 180.0,
+        "south" => 0.0,
+        "west" => 90.0,
+        "east" => -90.0,
+        _ => 0.0,
+    }
+}
+
 async fn interact_with_toggle_block<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -4993,6 +5070,7 @@ async fn handle_use_item_on<W>(
     game_mode: GameMode,
     survival_state: SurvivalState,
     player_pose: PlayerPose,
+    respawn_pose: &mut PlayerPose,
     action: ServerboundUseItemOn,
 ) -> Result<(), ConnectionError>
 where
@@ -5058,6 +5136,21 @@ where
         return Ok(());
     }
     if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
+        return Ok(());
+    }
+    if interact_with_bed(
+        state,
+        writer,
+        action.sequence,
+        mc_world::BlockPos {
+            x: cx,
+            y: cy,
+            z: cz,
+        },
+        respawn_pose,
+    )
+    .await?
+    {
         return Ok(());
     }
     if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
@@ -5149,6 +5242,7 @@ where
             None
         } else {
             state.item_to_block.resolve_for_use_on(
+                &state.items,
                 held.item_id,
                 clicked,
                 action.direction,
@@ -5184,6 +5278,7 @@ where
         },
         placed_state,
         player_pose,
+        action.direction,
     )
     .await
     else {
@@ -5225,8 +5320,12 @@ async fn plan_place_block_edits(
     pos: mc_world::BlockPos,
     placed_state: mc_world::BlockStateId,
     player_pose: PlayerPose,
+    direction: Direction,
 ) -> Option<Vec<BlockEdit>> {
     let placed = state.blocks.by_id(placed_state)?;
+    if let Some(new_state) = sign_placement_state(&state.blocks, placed, player_pose, direction) {
+        return Some(vec![BlockEdit { pos, new_state }]);
+    }
     if !placed.block.id.path().ends_with("_door") {
         return Some(vec![BlockEdit {
             pos,
@@ -5258,6 +5357,42 @@ async fn plan_place_block_edits(
             new_state: upper,
         },
     ])
+}
+
+fn sign_placement_state(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    player_pose: PlayerPose,
+    direction: Direction,
+) -> Option<mc_world::BlockStateId> {
+    let path = state.block.id.path();
+    if path.ends_with("_wall_sign") {
+        return direction_to_horizontal_facing(direction)
+            .and_then(|facing| sibling_state_with_property(blocks, state, "facing", facing));
+    }
+    if path.ends_with("_sign") && !path.ends_with("_hanging_sign") {
+        return sibling_state_with_property(
+            blocks,
+            state,
+            "rotation",
+            &sign_rotation_from_yaw(player_pose.yaw).to_string(),
+        );
+    }
+    None
+}
+
+fn direction_to_horizontal_facing(direction: Direction) -> Option<&'static str> {
+    match direction {
+        Direction::North => Some("north"),
+        Direction::South => Some("south"),
+        Direction::West => Some("west"),
+        Direction::East => Some("east"),
+        Direction::Down | Direction::Up => None,
+    }
+}
+
+fn sign_rotation_from_yaw(yaw: f32) -> u8 {
+    ((yaw.rem_euclid(360.0) / 22.5).round() as i32).rem_euclid(16) as u8
 }
 
 fn door_half_state(
@@ -5518,6 +5653,7 @@ where
 fn sync_player_persistence(
     player_save_state: &Option<Arc<Mutex<PlayerPersistedState>>>,
     pose: PlayerPose,
+    respawn_pose: PlayerPose,
     interaction: Option<&InteractionState>,
     survival: SurvivalState,
     xp: XpState,
@@ -5530,6 +5666,7 @@ fn sync_player_persistence(
         .lock()
         .expect("player persistence state poisoned");
     state.pose = pose;
+    state.spawn = SpawnState::from_pose(respawn_pose);
     state.survival = survival;
     state.xp = xp;
     state.game_mode = game_mode;
@@ -5596,7 +5733,7 @@ async fn play_loop<R, W>(
     config: &ServerConfig,
     session_id: SessionId,
     mut player_pose: PlayerPose,
-    respawn_pose: PlayerPose,
+    mut respawn_pose: PlayerPose,
     respawn: ClientboundRespawn,
     permissions: CommandPermissions,
     mut survival_state: SurvivalState,
@@ -5642,6 +5779,7 @@ where
         sync_player_persistence(
             &player_save_state,
             player_pose,
+            respawn_pose,
             interaction.as_deref(),
             survival_state,
             xp_state.clone(),
@@ -5981,6 +6119,7 @@ where
                             game_mode,
                             survival_state,
                             player_pose,
+                            &mut respawn_pose,
                             use_on,
                         )
                         .await?;
