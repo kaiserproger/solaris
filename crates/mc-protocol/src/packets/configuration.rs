@@ -19,7 +19,7 @@
 
 use bytes::{Buf, BufMut};
 
-use super::Packet;
+use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
 
@@ -113,6 +113,72 @@ impl Packet for ServerboundKnownPacks {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             packs: read_known_pack_array(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundClientInformation {
+    pub information: ClientInformation,
+}
+
+impl Packet for ServerboundClientInformation {
+    // `.analysis/protocol-dump.txt`: configuration SERVERBOUND_CLIENT_INFORMATION
+    // is the first serverbound registration, wire id 0x00. Body delegates to
+    // decompiled `ServerboundClientInformationPacket(ClientInformation)`.
+    const ID: i32 = 0x00;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.information.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            information: ClientInformation::decode(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundCustomPayload {
+    pub payload: CustomPayload,
+}
+
+impl Packet for ServerboundCustomPayload {
+    // `.analysis/protocol-dump.txt`: configuration SERVERBOUND_CUSTOM_PAYLOAD
+    // is serverbound registration index 2, wire id 0x02. Body is the common
+    // custom-payload codec from local decompiled sources.
+    const ID: i32 = 0x02;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.payload.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            payload: CustomPayload::decode(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundResourcePack {
+    pub status: ResourcePackStatus,
+}
+
+impl Packet for ServerboundResourcePack {
+    // `.analysis/protocol-dump.txt`: configuration SERVERBOUND_RESOURCE_PACK is
+    // serverbound registration index 6, wire id 0x06. Body is local decompiled
+    // `ServerboundResourcePackPacket(UUID id, Action action)`.
+    const ID: i32 = 0x06;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.status.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            status: ResourcePackStatus::decode(buf)?,
         })
     }
 }
@@ -389,6 +455,99 @@ mod tests {
         round_trip(ServerboundKnownPacks {
             packs: vec![sample_pack(), sample_pack()],
         });
+    }
+
+    fn sample_client_information() -> ClientInformation {
+        ClientInformation {
+            language: "en_us".to_string(),
+            view_distance: 12,
+            chat_visibility: super::super::ChatVisibility::System,
+            chat_colors: true,
+            model_customisation: 0x7f,
+            main_hand: super::super::MainHand::Right,
+            text_filtering_enabled: false,
+            allows_listing: true,
+            particle_status: super::super::ParticleStatus::Decreased,
+        }
+    }
+
+    #[test]
+    fn serverbound_client_information_id_and_layout_match_local_decompiled_sources() {
+        assert_eq!(ServerboundClientInformation::ID, 0x00);
+        let packet = ServerboundClientInformation {
+            information: sample_client_information(),
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x05, b'e', b'n', b'_', b'u', b's', // readUtf(16)
+                12,   // readByte viewDistance
+                1,    // readEnum(ChatVisiblity.SYSTEM)
+                1,    // chatColors
+                0x7f, // readUnsignedByte modelCustomisation
+                1,    // readEnum(HumanoidArm.RIGHT)
+                0,    // textFilteringEnabled
+                1,    // allowsListing
+                1,    // readEnum(ParticleStatus.DECREASED)
+            ]
+        );
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundClientInformation::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_custom_payload_brand_id_and_layout_match_local_decompiled_sources() {
+        assert_eq!(ServerboundCustomPayload::ID, 0x02);
+        let packet = ServerboundCustomPayload {
+            payload: CustomPayload::Brand("vanilla".to_string()),
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x0f, b'm', b'i', b'n', b'e', b'c', b'r', b'a', b'f', b't', b':', b'b', b'r', b'a',
+                b'n', b'd', 0x07, b'v', b'a', b'n', b'i', b'l', b'l', b'a',
+            ]
+        );
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundCustomPayload::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_resource_pack_id_and_layout_match_local_decompiled_sources() {
+        assert_eq!(ServerboundResourcePack::ID, 0x06);
+        let packet = ServerboundResourcePack {
+            status: ResourcePackStatus {
+                id: uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+                action: super::super::ResourcePackAction::Downloaded,
+            },
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff, 0x04,
+            ]
+        );
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ServerboundResourcePack::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
     }
 
     #[test]

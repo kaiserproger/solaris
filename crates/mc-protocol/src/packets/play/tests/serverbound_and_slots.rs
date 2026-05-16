@@ -156,6 +156,63 @@ fn serverbound_use_item_id_and_layout_match_javap() {
 }
 
 #[test]
+fn serverbound_client_information_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ServerboundClientInformation::ID, 0x0E);
+    let packet = ServerboundClientInformation {
+        information: ClientInformation {
+            language: "ru_ru".to_string(),
+            view_distance: 8,
+            chat_visibility: ChatVisibility::Hidden,
+            chat_colors: false,
+            model_customisation: 0x55,
+            main_hand: MainHand::Left,
+            text_filtering_enabled: true,
+            allows_listing: false,
+            particle_status: ParticleStatus::Minimal,
+        },
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            0x05, b'r', b'u', b'_', b'r', b'u', // ClientInformation.readUtf(16)
+            8,    // readByte viewDistance
+            2,    // readEnum(ChatVisiblity.HIDDEN)
+            0,    // chatColors
+            0x55, // readUnsignedByte modelCustomisation
+            0,    // readEnum(HumanoidArm.LEFT)
+            1,    // textFilteringEnabled
+            0,    // allowsListing
+            2,    // readEnum(ParticleStatus.MINIMAL)
+        ]
+    );
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundClientInformation::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_custom_payload_brand_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ServerboundCustomPayload::ID, 0x16);
+    let packet = ServerboundCustomPayload {
+        payload: CustomPayload::Brand("vanilla".to_string()),
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            0x0f, b'm', b'i', b'n', b'e', b'c', b'r', b'a', b'f', b't', b':', b'b', b'r', b'a',
+            b'n', b'd', 0x07, b'v', b'a', b'n', b'i', b'l', b'l', b'a',
+        ]
+    );
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundCustomPayload::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn direction_normal_matches_vanilla_axes() {
     assert_eq!(Direction::Down.normal(), (0, -1, 0));
     assert_eq!(Direction::Up.normal(), (0, 1, 0));

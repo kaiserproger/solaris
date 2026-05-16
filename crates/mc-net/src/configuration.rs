@@ -23,10 +23,12 @@ use mc_data::VanillaData;
 use mc_data::tags::TagsData;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::frame::Compression;
+use mc_protocol::packets::CustomPayload;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, RegistryEntry, ServerboundKnownPacks, UpdateTags, UpdateTagsEntry,
+    RegistryData, RegistryEntry, ServerboundClientInformation, ServerboundCustomPayload,
+    ServerboundKnownPacks, ServerboundResourcePack, UpdateTags, UpdateTagsEntry,
     UpdateTagsRegistry,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -80,6 +82,46 @@ where
             let mut body = frame.body;
             let parsed = ServerboundKnownPacks::decode(&mut body)?;
             break parsed.packs;
+        }
+        if frame.id == ServerboundClientInformation::ID {
+            let mut body = frame.body;
+            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            debug!(
+                language = %information.language,
+                requested_view_distance = information.view_distance,
+                chat_visibility = ?information.chat_visibility,
+                chat_colors = information.chat_colors,
+                model_customisation = information.model_customisation,
+                main_hand = ?information.main_hand,
+                text_filtering_enabled = information.text_filtering_enabled,
+                allows_listing = information.allows_listing,
+                particle_status = ?information.particle_status,
+                "client information noted during Configuration"
+            );
+            continue;
+        }
+        if frame.id == ServerboundCustomPayload::ID {
+            let mut body = frame.body;
+            match ServerboundCustomPayload::decode(&mut body)?.payload {
+                CustomPayload::Brand(brand) => {
+                    debug!(brand = %brand, "client brand noted during Configuration")
+                }
+                CustomPayload::Unknown { channel, payload } => {
+                    debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored");
+                }
+            }
+            continue;
+        }
+        if frame.id == ServerboundResourcePack::ID {
+            let mut body = frame.body;
+            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            debug!(
+                id = %status.id,
+                action = ?status.action,
+                terminal = status.action.is_terminal(),
+                "resource-pack status noted during Configuration"
+            );
+            continue;
         }
         debug!(
             id = format!("{:#04x}", frame.id),
@@ -174,6 +216,39 @@ where
         let frame = read_frame(reader, buf, compression).await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
             break;
+        }
+        if frame.id == ServerboundClientInformation::ID {
+            let mut body = frame.body;
+            let information = ServerboundClientInformation::decode(&mut body)?.information;
+            debug!(
+                language = %information.language,
+                requested_view_distance = information.view_distance,
+                "client information noted while waiting for Configuration ack"
+            );
+            continue;
+        }
+        if frame.id == ServerboundCustomPayload::ID {
+            let mut body = frame.body;
+            match ServerboundCustomPayload::decode(&mut body)?.payload {
+                CustomPayload::Brand(brand) => {
+                    debug!(brand = %brand, "client brand noted while waiting for Configuration ack")
+                }
+                CustomPayload::Unknown { channel, payload } => {
+                    debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored while waiting for ack");
+                }
+            }
+            continue;
+        }
+        if frame.id == ServerboundResourcePack::ID {
+            let mut body = frame.body;
+            let status = ServerboundResourcePack::decode(&mut body)?.status;
+            debug!(
+                id = %status.id,
+                action = ?status.action,
+                terminal = status.action.is_terminal(),
+                "resource-pack status noted while waiting for Configuration ack"
+            );
+            continue;
         }
         debug!(
             id = format!("{:#04x}", frame.id),

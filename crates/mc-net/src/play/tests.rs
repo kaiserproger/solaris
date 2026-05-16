@@ -164,6 +164,14 @@ fn gamemode_command_rejects_unknown_or_extra_args() {
 }
 
 #[test]
+fn client_view_distance_is_clamped_to_server_policy() {
+    assert_eq!(clamp_client_view_distance(12, 8), 8);
+    assert_eq!(clamp_client_view_distance(6, 10), 6);
+    assert_eq!(clamp_client_view_distance(0, 10), 2);
+    assert_eq!(clamp_client_view_distance(-8, 1), 2);
+}
+
+#[test]
 fn debug_commands_parse_survival_mutations_and_give() {
     assert_eq!(
         parse_debug_command("debug survival damage 7.5"),

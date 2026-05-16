@@ -14,7 +14,7 @@ use bytes::{Buf, BufMut};
 use mc_nbt::Tag;
 use uuid::Uuid;
 
-use super::Packet;
+use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
 
@@ -1761,6 +1761,244 @@ impl Packet for ServerboundChatCommand {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             command: buf.read_string(MAX_COMMAND_LEN)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundCommandSuggestion {
+    pub id: i32,
+    pub command: String,
+}
+
+impl Packet for ServerboundCommandSuggestion {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_COMMAND_SUGGESTION is
+    // serverbound registration index 15, wire id 0x0F. Local decompiled source
+    // reads VarInt id then `readUtf(32500)`.
+    const ID: i32 = 0x0F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.id);
+        buf.write_string(&self.command, 32_500)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            id: buf.read_varint()?,
+            command: buf.read_string(32_500)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundCommandSuggestions {
+    pub id: i32,
+    pub start: i32,
+    pub length: i32,
+    pub suggestions: Vec<CommandSuggestionEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandSuggestionEntry {
+    pub text: String,
+    pub tooltip_nbt: Option<Vec<u8>>,
+}
+
+impl Packet for ClientboundCommandSuggestions {
+    // `.analysis/protocol-dump.txt`: game CLIENTBOUND_COMMAND_SUGGESTIONS is
+    // clientbound registration index 15, wire id 0x0F. Local decompiled source
+    // writes VarInt id/start/length and a list of entries. Solaris currently
+    // emits empty lists, so optional component tooltips are not produced.
+    const ID: i32 = 0x0F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.id);
+        buf.write_varint(self.start);
+        buf.write_varint(self.length);
+        write_count(buf, self.suggestions.len())?;
+        for entry in &self.suggestions {
+            buf.write_string(&entry.text, MAX_COMMAND_LEN)?;
+            match &entry.tooltip_nbt {
+                Some(tooltip) => {
+                    buf.write_bool(true);
+                    buf.put_slice(tooltip);
+                }
+                None => buf.write_bool(false),
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let id = buf.read_varint()?;
+        let start = buf.read_varint()?;
+        let length = buf.read_varint()?;
+        let count = read_count(buf, 256)?;
+        let mut suggestions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let text = buf.read_string(MAX_COMMAND_LEN)?;
+            let tooltip_nbt = if buf.read_bool()? {
+                let mut tooltip = vec![0; buf.remaining()];
+                buf.copy_to_slice(&mut tooltip);
+                Some(tooltip)
+            } else {
+                None
+            };
+            suggestions.push(CommandSuggestionEntry { text, tooltip_nbt });
+        }
+        Ok(Self {
+            id,
+            start,
+            length,
+            suggestions,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundChatAck {
+    pub offset: i32,
+}
+
+impl Packet for ServerboundChatAck {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_CHAT_ACK is serverbound
+    // registration index 6, wire id 0x06. Local decompiled source reads one
+    // VarInt offset.
+    const ID: i32 = 0x06;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.offset);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            offset: buf.read_varint()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ServerboundChunkBatchReceived {
+    pub desired_chunks_per_tick: f32,
+}
+
+impl Packet for ServerboundChunkBatchReceived {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_CHUNK_BATCH_RECEIVED is
+    // serverbound registration index 11, wire id 0x0B. Local decompiled source
+    // reads one f32 desiredChunksPerTick.
+    const ID: i32 = 0x0B;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f32(self.desired_chunks_per_tick);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            desired_chunks_per_tick: buf.read_f32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerboundClientTickEnd;
+
+impl Packet for ServerboundClientTickEnd {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_CLIENT_TICK_END is
+    // serverbound registration index 13, wire id 0x0D. Local decompiled source
+    // uses `StreamCodec.unit`, so the body is empty.
+    const ID: i32 = 0x0D;
+
+    fn encode<B: BufMut>(&self, _buf: &mut B) -> Result<(), CodecError> {
+        Ok(())
+    }
+
+    fn decode<B: Buf>(_buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerboundPlayerLoaded;
+
+impl Packet for ServerboundPlayerLoaded {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_PLAYER_LOADED is
+    // serverbound registration index 44, wire id 0x2C. Local decompiled source
+    // uses `StreamCodec.unit`, so the body is empty.
+    const ID: i32 = 0x2C;
+
+    fn encode<B: BufMut>(&self, _buf: &mut B) -> Result<(), CodecError> {
+        Ok(())
+    }
+
+    fn decode<B: Buf>(_buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundResourcePack {
+    pub status: ResourcePackStatus,
+}
+
+impl Packet for ServerboundResourcePack {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_RESOURCE_PACK is
+    // serverbound registration index 49, wire id 0x31. Body is local decompiled
+    // `ServerboundResourcePackPacket(UUID id, Action action)`.
+    const ID: i32 = 0x31;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.status.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            status: ResourcePackStatus::decode(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundClientInformation {
+    pub information: ClientInformation,
+}
+
+impl Packet for ServerboundClientInformation {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_CLIENT_INFORMATION is
+    // serverbound registration index 14, wire id 0x0E. Body delegates to local
+    // decompiled `ServerboundClientInformationPacket(ClientInformation)`.
+    const ID: i32 = 0x0E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.information.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            information: ClientInformation::decode(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundCustomPayload {
+    pub payload: CustomPayload,
+}
+
+impl Packet for ServerboundCustomPayload {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_CUSTOM_PAYLOAD is
+    // serverbound registration index 22, wire id 0x16. Body is the common
+    // custom-payload codec from local decompiled sources.
+    const ID: i32 = 0x16;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.payload.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            payload: CustomPayload::decode(buf)?,
         })
     }
 }

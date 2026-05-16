@@ -36,27 +36,30 @@ use mc_entity::{
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
-use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
-    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
-    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot,
-    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
-    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPositionSync, EntityVec3,
-    ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack,
-    LevelChunkWithLight, LightData, LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags,
-    PlayerActionKind, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
-    ServerboundAttack, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientCommand,
-    ServerboundContainerClick, ServerboundContainerClose, ServerboundInteract,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerPosRot,
-    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
-    ServerboundPlayerAction, ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe,
+    ClientboundCommandSuggestions, ClientboundContainerSetContent, ClientboundContainerSetData,
+    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn,
+    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
+    Direction, EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent,
+    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
+    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInfoActions, PlayerInfoEntry,
+    PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation, RemoveEntities, RotateHead,
+    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
+    ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
+    ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
+    ServerboundCommandSuggestion, ServerboundContainerClick, ServerboundContainerClose,
+    ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerLoaded,
+    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
     ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
     SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
     unpack_block_pos,
 };
+use mc_protocol::packets::{CustomPayload, Packet};
 use mc_world::light::{
     ChunkLight, LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
 };
@@ -618,6 +621,7 @@ where
             player_state.game_mode,
             Some(Arc::clone(&player_save_state)),
             outbound_rx,
+            config.view_distance,
         )
         .await
     }
@@ -690,6 +694,50 @@ struct InteractionState {
     last_hostile_damage_at: Option<Instant>,
     last_entity_attack_at: Option<Instant>,
     fluid_schedule_tick: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClientPreferences {
+    language: String,
+    requested_view_distance: i8,
+    clamped_view_distance: i32,
+    chat_visibility: mc_protocol::packets::ChatVisibility,
+    chat_colors: bool,
+    model_customisation: u8,
+    main_hand: mc_protocol::packets::MainHand,
+    text_filtering_enabled: bool,
+    allows_listing: bool,
+    particle_status: mc_protocol::packets::ParticleStatus,
+    brand: Option<String>,
+}
+
+impl ClientPreferences {
+    fn from_packet(
+        information: mc_protocol::packets::ClientInformation,
+        server_view_distance: i32,
+        brand: Option<String>,
+    ) -> Self {
+        Self {
+            clamped_view_distance: clamp_client_view_distance(
+                information.view_distance,
+                server_view_distance,
+            ),
+            language: information.language,
+            requested_view_distance: information.view_distance,
+            chat_visibility: information.chat_visibility,
+            chat_colors: information.chat_colors,
+            model_customisation: information.model_customisation,
+            main_hand: information.main_hand,
+            text_filtering_enabled: information.text_filtering_enabled,
+            allows_listing: information.allows_listing,
+            particle_status: information.particle_status,
+            brand,
+        }
+    }
+}
+
+fn clamp_client_view_distance(requested: i8, server_view_distance: i32) -> i32 {
+    i32::from(requested).clamp(2, server_view_distance.max(2))
 }
 
 async fn write_block_ack<W>(
@@ -5370,6 +5418,7 @@ async fn play_loop<R, W>(
     mut game_mode: GameMode,
     player_save_state: Option<Arc<Mutex<PlayerPersistedState>>>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
+    server_view_distance: i32,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -5392,10 +5441,17 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut survival_tick: u32 = 0;
+    let mut client_brand: Option<String> = None;
+    let mut client_preferences: Option<ClientPreferences> = None;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
     loop {
+        let _effective_client_view_distance = client_preferences
+            .as_ref()
+            .map_or(server_view_distance, |preferences| {
+                preferences.clamped_view_distance
+            });
         sync_player_persistence(
             &player_save_state,
             player_pose,
@@ -5870,6 +5926,90 @@ where
                     )
                     .await?;
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
+                } else if frame.id == ServerboundClientInformation::ID {
+                    let mut body = frame.body;
+                    let information = ServerboundClientInformation::decode(&mut body)?.information;
+                    let preferences = ClientPreferences::from_packet(
+                        information,
+                        server_view_distance,
+                        client_brand.clone(),
+                    );
+                    debug!(
+                        language = %preferences.language,
+                        requested_view_distance = preferences.requested_view_distance,
+                        clamped_view_distance = preferences.clamped_view_distance,
+                        chat_visibility = ?preferences.chat_visibility,
+                        chat_colors = preferences.chat_colors,
+                        model_customisation = preferences.model_customisation,
+                        main_hand = ?preferences.main_hand,
+                        text_filtering_enabled = preferences.text_filtering_enabled,
+                        allows_listing = preferences.allows_listing,
+                        particle_status = ?preferences.particle_status,
+                        brand = ?preferences.brand,
+                        "client information updated"
+                    );
+                    client_preferences = Some(preferences);
+                } else if frame.id == ServerboundCustomPayload::ID {
+                    let mut body = frame.body;
+                    match ServerboundCustomPayload::decode(&mut body)?.payload {
+                        CustomPayload::Brand(brand) => {
+                            debug!(brand = %brand, "client brand noted");
+                            if let Some(preferences) = client_preferences.as_mut() {
+                                preferences.brand = Some(brand.clone());
+                            }
+                            client_brand = Some(brand);
+                        }
+                        CustomPayload::Unknown { channel, payload } => {
+                            debug!(channel = %channel.as_str(), len = payload.len(), "custom payload ignored");
+                        }
+                    }
+                } else if frame.id == ServerboundResourcePack::ID {
+                    let mut body = frame.body;
+                    let status = ServerboundResourcePack::decode(&mut body)?.status;
+                    debug!(
+                        id = %status.id,
+                        action = ?status.action,
+                        terminal = status.action.is_terminal(),
+                        "resource-pack status noted"
+                    );
+                } else if frame.id == ServerboundChatAck::ID {
+                    let mut body = frame.body;
+                    let ack = ServerboundChatAck::decode(&mut body)?;
+                    debug!(offset = ack.offset, "chat acknowledgement ignored");
+                } else if frame.id == ServerboundChunkBatchReceived::ID {
+                    let mut body = frame.body;
+                    let packet = ServerboundChunkBatchReceived::decode(&mut body)?;
+                    debug!(
+                        desired_chunks_per_tick = packet.desired_chunks_per_tick,
+                        "client chunk-batch preference noted"
+                    );
+                } else if frame.id == ServerboundClientTickEnd::ID {
+                    let mut body = frame.body;
+                    let _ = ServerboundClientTickEnd::decode(&mut body)?;
+                } else if frame.id == ServerboundPlayerLoaded::ID {
+                    let mut body = frame.body;
+                    let _ = ServerboundPlayerLoaded::decode(&mut body)?;
+                    debug!("client reported player loaded");
+                } else if frame.id == ServerboundCommandSuggestion::ID {
+                    let mut body = frame.body;
+                    let request = ServerboundCommandSuggestion::decode(&mut body)?;
+                    let start = request.command.chars().count().min(i32::MAX as usize) as i32;
+                    debug!(
+                        request_id = request.id,
+                        command = %request.command,
+                        "command suggestions requested; replying with empty list"
+                    );
+                    write_packet(
+                        writer,
+                        &ClientboundCommandSuggestions {
+                            id: request.id,
+                            start,
+                            length: 0,
+                            suggestions: Vec::new(),
+                        },
+                        compression,
+                    )
+                    .await?;
                 } else if frame.id == ServerboundChatCommand::ID {
                     let mut body = frame.body;
                     let command = ServerboundChatCommand::decode(&mut body)?;

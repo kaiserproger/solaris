@@ -1,4 +1,5 @@
 use super::*;
+use crate::packets::{ChatVisibility, MainHand, ParticleStatus, ResourcePackAction};
 
 fn round_trip<P: Packet + PartialEq + std::fmt::Debug>(p: P) {
     let mut buf = Vec::new();
@@ -497,6 +498,125 @@ fn serverbound_chat_command_id_and_layout_match_javap() {
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(ServerboundChatCommand::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_chat_ack_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ServerboundChatAck::ID, 0x06);
+    let packet = ServerboundChatAck { offset: 300 };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0xAC, 0x02]);
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundChatAck::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn command_suggestion_packets_match_local_decompiled_sources() {
+    assert_eq!(ServerboundCommandSuggestion::ID, 0x0F);
+    assert_eq!(ClientboundCommandSuggestions::ID, 0x0F);
+
+    let request = ServerboundCommandSuggestion {
+        id: 42,
+        command: "gamemode ".to_string(),
+    };
+    let mut buf = Vec::new();
+    request.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            42, 0x09, b'g', b'a', b'm', b'e', b'm', b'o', b'd', b'e', b' ',
+        ]
+    );
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundCommandSuggestion::decode(&mut cursor).unwrap(),
+        request
+    );
+    assert!(cursor.is_empty());
+
+    let response = ClientboundCommandSuggestions {
+        id: request.id,
+        start: request.command.len() as i32,
+        length: 0,
+        suggestions: Vec::new(),
+    };
+    let mut buf = Vec::new();
+    response.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![42, 9, 0, 0]);
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundCommandSuggestions::decode(&mut cursor).unwrap(),
+        response
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn client_tick_chunk_batch_and_player_loaded_packets_match_local_decompiled_sources() {
+    assert_eq!(ServerboundChunkBatchReceived::ID, 0x0B);
+    assert_eq!(ServerboundClientTickEnd::ID, 0x0D);
+    assert_eq!(ServerboundPlayerLoaded::ID, 0x2C);
+
+    let batch = ServerboundChunkBatchReceived {
+        desired_chunks_per_tick: 12.5,
+    };
+    let mut buf = Vec::new();
+    batch.encode(&mut buf).unwrap();
+    assert_eq!(buf, 12.5_f32.to_be_bytes());
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundChunkBatchReceived::decode(&mut cursor).unwrap(),
+        batch
+    );
+    assert!(cursor.is_empty());
+
+    let mut buf = Vec::new();
+    ServerboundClientTickEnd.encode(&mut buf).unwrap();
+    assert!(buf.is_empty());
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundClientTickEnd::decode(&mut cursor).unwrap(),
+        ServerboundClientTickEnd
+    );
+    assert!(cursor.is_empty());
+
+    let mut buf = Vec::new();
+    ServerboundPlayerLoaded.encode(&mut buf).unwrap();
+    assert!(buf.is_empty());
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundPlayerLoaded::decode(&mut cursor).unwrap(),
+        ServerboundPlayerLoaded
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_resource_pack_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ServerboundResourcePack::ID, 0x31);
+    let packet = ServerboundResourcePack {
+        status: ResourcePackStatus {
+            id: uuid::Uuid::from_u128(0x0011_2233_4455_6677_8899_aabb_ccdd_eeff),
+            action: ResourcePackAction::FailedReload,
+        },
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff, 0x06,
+        ]
+    );
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundResourcePack::decode(&mut cursor).unwrap(),
+        packet
+    );
     assert!(cursor.is_empty());
 }
 
