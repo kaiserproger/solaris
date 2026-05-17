@@ -592,12 +592,21 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
 
     let mut item_entity_id = None;
     let mut dropped_stack = None;
+    let mut drop_visible_at = None;
     let mut slot_stacks = Vec::new();
+    let mut saw_break_update = false;
+    let mut saw_break_ack = false;
     let mut saw_slot = false;
     let mut saw_take = false;
     let mut saw_remove = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(dropped_stack.is_some() && saw_slot && saw_take && saw_remove) {
+    while !(saw_break_update
+        && saw_break_ack
+        && dropped_stack.is_some()
+        && saw_slot
+        && saw_take
+        && saw_remove)
+    {
         let frame = client
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -607,10 +616,25 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == AddEntity::ID {
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode survival BlockUpdate");
+            let (px, py, pz) = unpack_block_pos(pkt.position);
+            if (px, py, pz) == (0, target_y, 0) {
+                saw_break_update = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode survival ack");
+            if pkt.sequence == 32 {
+                saw_break_ack = true;
+            }
+        } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
             let pkt = AddEntity::decode(&mut body).expect("decode item AddEntity");
             if pkt.entity_type_id == item_entity_type {
+                assert!(saw_break_update, "item spawned before break block update");
+                assert!(saw_break_ack, "item spawned before break ack");
                 item_entity_id = Some(pkt.entity_id);
             }
         } else if frame.id == ClientboundSetEntityData::ID {
@@ -633,6 +657,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
                         },
                     );
                     dropped_stack = Some(stack);
+                    drop_visible_at.get_or_insert_with(tokio::time::Instant::now);
                 }
             }
         } else if frame.id == ClientboundContainerSetSlot::ID {
@@ -649,6 +674,13 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
             let mut body = frame.body;
             let pkt = ClientboundTakeItemEntity::decode(&mut body).expect("decode take item");
             if Some(pkt.item_entity_id) == item_entity_id {
+                let visible_for = drop_visible_at
+                    .expect("pickup animation arrived before item metadata")
+                    .elapsed();
+                assert!(
+                    visible_for >= Duration::from_millis(120),
+                    "item pickup arrived before visible window: {visible_for:?}"
+                );
                 assert_eq!(pkt.amount, 1);
                 saw_take = true;
             }
@@ -658,6 +690,13 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
             if let Some(id) = item_entity_id
                 && pkt.entity_ids.contains(&id)
             {
+                let visible_for = drop_visible_at
+                    .expect("item removal arrived before item metadata")
+                    .elapsed();
+                assert!(
+                    visible_for >= Duration::from_millis(120),
+                    "item removal arrived before visible window: {visible_for:?}"
+                );
                 saw_remove = true;
             }
         }

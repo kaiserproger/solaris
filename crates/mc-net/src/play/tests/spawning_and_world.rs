@@ -56,7 +56,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &chunk,
         Some(grass),
-        Some(water),
+        Some(&[water]),
         &passable,
         &rules,
         &entity_types,
@@ -117,7 +117,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &ocean_chunk,
         Some(grass),
-        Some(water),
+        Some(&[water]),
         &passable,
         &ocean_rules,
         &entity_types,
@@ -155,7 +155,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &water_only_chunk,
         Some(grass),
-        Some(water),
+        Some(&[water]),
         &passable,
         &ocean_rules,
         &entity_types,
@@ -171,6 +171,67 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
         let lx = (spawn.position.x.floor() as i32 - water_only_chunk.pos.x * 16) as u8;
         let lz = (spawn.position.z.floor() as i32 - water_only_chunk.pos.z * 16) as u8;
         water_only_chunk.get_block(lx, spawn.position.y as i32, lz) == Some(water)
+    }));
+}
+
+#[test]
+fn water_spawn_planner_uses_mid_column_and_all_water_states() {
+    use std::collections::BTreeMap;
+
+    let ocean = mc_data::Identifier::parse("minecraft:ocean").unwrap();
+    let cod = mc_data::Identifier::parse("minecraft:cod").unwrap();
+    let rules = mc_data::biomes::BiomeSpawnRules::from_entries(BTreeMap::from([(
+        ocean.clone(),
+        BTreeMap::from([(
+            "water_ambient".to_string(),
+            vec![mc_data::biomes::BiomeSpawnEntry {
+                entity_type: cod.clone(),
+                min_count: 1,
+                max_count: 1,
+                weight: 1,
+            }],
+        )]),
+    )]));
+    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
+        mc_data::entity_types::EntityTypeReport {
+            id: cod,
+            protocol_id: 2,
+        },
+    ]);
+    let water_source = mc_world::BlockStateId(2);
+    let water_flowing = mc_world::BlockStateId(3);
+    let mut chunk = Chunk::empty(ChunkPos { x: 1, z: 0 }, mc_world::BlockStateId(0), ocean);
+    for lx in 3..=12 {
+        for lz in 3..=12 {
+            for y in 50_i32..=58 {
+                let state = if y % 2 == 0 {
+                    water_source
+                } else {
+                    water_flowing
+                };
+                let _ = chunk.set_block(lx, y, lz, state);
+            }
+        }
+    }
+
+    let spawns = plan_passive_herd(
+        &chunk,
+        None,
+        Some(&[water_source, water_flowing]),
+        &[mc_world::BlockStateId(0)],
+        &rules,
+        &entity_types,
+    );
+
+    assert!(!spawns.is_empty());
+    assert!(spawns.iter().all(|spawn| (53.0..=55.0).contains(&spawn.position.y)));
+    assert!(spawns.iter().all(|spawn| {
+        let lx = (spawn.position.x.floor() as i32 - chunk.pos.x * 16) as u8;
+        let lz = (spawn.position.z.floor() as i32 - chunk.pos.z * 16) as u8;
+        matches!(
+            chunk.get_block(lx, spawn.position.y as i32, lz),
+            Some(state) if state == water_source || state == water_flowing
+        )
     }));
 }
 
@@ -493,7 +554,7 @@ fn session_registry_drops_prepared_cache_with_last_ticket() {
         &profile,
         (0, 0),
         0,
-        HashSet::from([(0, 0)]),
+        HashSet::from([(0, 0), (1, 0)]),
         tx,
         PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
     );
@@ -560,7 +621,7 @@ fn hostile_entities_follow_nearby_player_position() {
         uuid: uuid::Uuid::nil(),
         name: "target".to_string(),
     };
-    let _ = registry.register(
+    let (session_id, _) = registry.register(
         &profile,
         (0, 0),
         0,
@@ -568,6 +629,8 @@ fn hostile_entities_follow_nearby_player_position() {
         tx,
         PlayerPose::new(4.5, DEFAULT_SPAWN_Y + 1.0, 0.5),
     );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.mark_loaded(session_id, (1, 0));
     let _ = registry.ensure_chunk_herd(
         (0, 0),
         &[HerdSpawn {
@@ -598,14 +661,16 @@ fn chunk_herd_materialization_applies_caps_and_player_distance() {
         uuid: uuid::Uuid::nil(),
         name: "nearby".to_string(),
     };
-    let _ = registry.register(
+    let (session_id, _) = registry.register(
         &profile,
         (0, 0),
         0,
-        HashSet::from([(0, 0)]),
+        HashSet::from([(0, 0), (1, 0)]),
         tx,
         PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
     );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.mark_loaded(session_id, (1, 0));
     let spawns = (0..10)
         .map(|slot| HerdSpawn {
             chunk: (0, 0),
@@ -635,6 +700,21 @@ fn chunk_herd_materialization_applies_caps_and_player_distance() {
 #[test]
 fn chunk_herd_materialization_dedupes_restored_herd_uuid() {
     let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "observer".to_string(),
+    };
+    let (session_id, _) = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0), (1, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.mark_loaded(session_id, (1, 0));
     let uuid = herd_uuid((0, 0), 0);
     let restored = mc_entity::EntitySnapshot {
         id: EntityId(42),
@@ -669,6 +749,89 @@ fn chunk_herd_materialization_dedupes_restored_herd_uuid() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].id, EntityId(42));
+}
+
+#[test]
+fn entity_physics_skips_persisted_entities_without_loaded_players() {
+    let registry = SessionRegistry::new();
+    let restored = mc_entity::EntitySnapshot {
+        id: EntityId(42),
+        uuid: uuid::Uuid::from_u128(42),
+        type_id: 1,
+        type_name: "minecraft:cow".to_string(),
+        position: Vec3::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        rotation: mc_entity::Rotation::ZERO,
+        velocity: Vec3::ZERO,
+        on_ground: true,
+        item_stack: None,
+        experience_value: None,
+        lifecycle: EntityLifecycle::Alive,
+        health: 10.0,
+        attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+        goal: GoalState::Idle,
+    };
+
+    assert_eq!(registry.restore_persisted_entities([restored]), 1);
+
+    assert!(registry.tick_entities_and_collect_physics_queries(1).is_empty());
+}
+
+#[test]
+fn entity_physics_skips_loaded_entities_outside_simulation_distance() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "observer".to_string(),
+    };
+    let (session_id, _) = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0), (20, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.mark_loaded(session_id, (20, 0));
+    let near = mc_entity::EntitySnapshot {
+        id: EntityId(1),
+        uuid: uuid::Uuid::from_u128(1),
+        type_id: 1,
+        type_name: "minecraft:cow".to_string(),
+        position: Vec3::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        rotation: mc_entity::Rotation::ZERO,
+        velocity: Vec3::ZERO,
+        on_ground: true,
+        item_stack: None,
+        experience_value: None,
+        lifecycle: EntityLifecycle::Alive,
+        health: 10.0,
+        attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+        goal: GoalState::Idle,
+    };
+    let far = mc_entity::EntitySnapshot {
+        id: EntityId(2),
+        uuid: uuid::Uuid::from_u128(2),
+        type_id: 1,
+        type_name: "minecraft:cow".to_string(),
+        position: Vec3::new(20.0 * 16.0 + 0.5, DEFAULT_SPAWN_Y, 0.5),
+        rotation: mc_entity::Rotation::ZERO,
+        velocity: Vec3::ZERO,
+        on_ground: true,
+        item_stack: None,
+        experience_value: None,
+        lifecycle: EntityLifecycle::Alive,
+        health: 10.0,
+        attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+        goal: GoalState::Idle,
+    };
+
+    assert_eq!(registry.restore_persisted_entities([near, far]), 2);
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+
+    assert_eq!(queries.len(), 1);
+    assert_eq!(queries[0].id, EntityId(1));
 }
 
 #[test]
@@ -909,9 +1072,8 @@ fn session_registry_spawns_and_despawns_visible_players() {
             x: 48.5,
             y: DEFAULT_SPAWN_Y,
             z: 0.5,
-            yaw: 0.0,
-            pitch: 0.0,
             flags: MovePlayerFlags::new(true, false),
+            ..PlayerPose::new(48.5, DEFAULT_SPAWN_Y, 0.5)
         },
     );
     assert!(dispatches.iter().any(|dispatch| {

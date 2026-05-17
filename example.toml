@@ -1,7 +1,7 @@
 [server]
 name = "solaris-test"
 motd = "First server powered by Solaris: Innovative Minecraft server engine written in Rust"
-view_distance = 16
+view_distance = 8
 
 [network]
 bind_address = "0.0.0.0"
@@ -19,16 +19,19 @@ seed = 0
 [simulation]
 # Random block ticks per active chunk per game tick. Set to 0 to disable
 # random block simulation while keeping scheduled ticks enabled.
-random_tick_speed = 3
+random_tick_speed = 5
 # Maximum active/ticketed chunks sampled per game tick.
-random_tick_chunk_budget = 64
+random_tick_chunk_budget = 32
+# Autosave cadence in game ticks. The debug manual gate uses a longer cadence
+# because large restored entity sets are expensive to serialize every second.
+save_interval_ticks = 1200
 
 [chunk_pipeline]
 # Chunk stream / worker policy. Thread pools are configured as percentages
 # of available CPU cores and resolve to at least one thread each.
-chunk_send_rate = 16
-chunk_load_rate = 64
-chunk_generate_rate = 32
+chunk_send_rate = 8
+chunk_load_rate = 16
+chunk_generate_rate = 16
 chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 8
 chunk_io_threads_percent = 25

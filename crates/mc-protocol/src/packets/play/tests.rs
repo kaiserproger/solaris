@@ -348,6 +348,33 @@ fn set_entity_data_item_stack_layout_matches_javap() {
 }
 
 #[test]
+fn set_entity_data_player_pose_layout_matches_javap() {
+    let packet = ClientboundSetEntityData {
+        entity_id: 7,
+        values: vec![
+            EntityDataValue::Byte {
+                index: ENTITY_DATA_SHARED_FLAGS_INDEX,
+                value: 0x0A,
+            },
+            EntityDataValue::Pose {
+                index: ENTITY_DATA_POSE_INDEX,
+                pose: EntityPose::Swimming,
+            },
+        ],
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![7, 0, 0, 0x0A, 6, 20, 3, 0xFF]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundSetEntityData::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn take_item_entity_layout_matches_javap() {
     let packet = ClientboundTakeItemEntity {
         item_entity_id: 300,
@@ -680,6 +707,49 @@ fn serverbound_resource_pack_id_and_layout_match_local_decompiled_sources() {
         ServerboundResourcePack::decode(&mut cursor).unwrap(),
         packet
     );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_player_command_id_and_layout_match_protocol_dump() {
+    assert_eq!(ServerboundPlayerCommand::ID, 0x2A);
+    let packet = ServerboundPlayerCommand {
+        entity_id: 123,
+        action: PlayerCommandAction::StartSprinting,
+        data: 0,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![123, 3, 0]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundPlayerCommand::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_player_input_id_and_layout_match_javap() {
+    assert_eq!(ServerboundPlayerInput::ID, 0x2B);
+    let packet = ServerboundPlayerInput {
+        input: PlayerInput {
+            forward: true,
+            backward: false,
+            left: false,
+            right: true,
+            jump: true,
+            shift: false,
+            sprint: true,
+        },
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0x59]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundPlayerInput::decode(&mut cursor).unwrap(), packet);
     assert!(cursor.is_empty());
 }
 

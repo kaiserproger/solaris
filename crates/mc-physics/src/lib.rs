@@ -68,14 +68,22 @@ impl BlockMaterial {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockMaterialIds {
     pub air: u32,
-    pub water: Option<u32>,
-    pub lava: Option<u32>,
+    pub water: Vec<u32>,
+    pub lava: Vec<u32>,
     pub passable: Vec<u32>,
 }
 
 impl BlockMaterialIds {
     #[must_use]
-    pub const fn new(air: u32, water: Option<u32>, lava: Option<u32>) -> Self {
+    pub fn new(air: u32, water: Option<u32>, lava: Option<u32>) -> Self {
+        let water = match water {
+            Some(state) => Vec::from([state]),
+            None => Vec::new(),
+        };
+        let lava = match lava {
+            Some(state) => Vec::from([state]),
+            None => Vec::new(),
+        };
         Self {
             air,
             water,
@@ -91,12 +99,28 @@ impl BlockMaterialIds {
     }
 
     #[must_use]
+    pub fn with_water_states(mut self, water: Vec<u32>) -> Self {
+        if !water.is_empty() {
+            self.water = water;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_lava_states(mut self, lava: Vec<u32>) -> Self {
+        if !lava.is_empty() {
+            self.lava = lava;
+        }
+        self
+    }
+
+    #[must_use]
     pub fn classify(&self, state_id: u32) -> BlockMaterial {
         if state_id == self.air {
             BlockMaterial::Air
-        } else if self.water == Some(state_id) {
+        } else if self.water.contains(&state_id) {
             BlockMaterial::Water
-        } else if self.lava == Some(state_id) {
+        } else if self.lava.contains(&state_id) {
             BlockMaterial::Lava
         } else if self.passable.contains(&state_id) {
             BlockMaterial::Air

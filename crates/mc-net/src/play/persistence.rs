@@ -361,6 +361,7 @@ pub(crate) fn load_persisted_entities(
             let id = int_field(fields, "SolarisEntityId").unwrap_or(0) as u32 as u128;
             uuid::Uuid::from_u128(0x5f1a_0000_0000_0000_0000_0000_0000_0000 | id)
         });
+        let aquatic = persisted_entity_type_is_aquatic(type_name);
         entities.push(EntitySnapshot {
             id,
             uuid,
@@ -373,7 +374,7 @@ pub(crate) fn load_persisted_entities(
                 head_yaw: rotation[0],
             },
             velocity: Vec3::new(motion[0], motion[1], motion[2]),
-            on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0,
+            on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0 && !aquatic,
             item_stack,
             experience_value,
             lifecycle: EntityLifecycle::Alive,
@@ -381,6 +382,12 @@ pub(crate) fn load_persisted_entities(
             attributes,
             goal: if type_name == "minecraft:item" || experience_value.is_some() {
                 GoalState::Idle
+            } else if aquatic {
+                GoalState::AquaticWander {
+                    speed: 0.72,
+                    vertical_speed: 0.18,
+                    period_ticks: 45,
+                }
             } else {
                 GoalState::Wander {
                     speed: 0.8,
@@ -390,6 +397,21 @@ pub(crate) fn load_persisted_entities(
         });
     }
     Ok(entities)
+}
+
+fn persisted_entity_type_is_aquatic(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "minecraft:cod"
+            | "minecraft:salmon"
+            | "minecraft:tropical_fish"
+            | "minecraft:pufferfish"
+            | "minecraft:squid"
+            | "minecraft:glow_squid"
+            | "minecraft:dolphin"
+            | "minecraft:axolotl"
+            | "minecraft:turtle"
+    )
 }
 
 fn attributes_from_entity_facts(
@@ -912,6 +934,10 @@ mod tests {
                 id: mc_data::Identifier::parse("minecraft:cow").unwrap(),
                 protocol_id: 2,
             },
+            mc_data::entity_types::EntityTypeReport {
+                id: mc_data::Identifier::parse("minecraft:cod").unwrap(),
+                protocol_id: 3,
+            },
         ];
         EntityTypeRegistry::from_report(&reports)
     }
@@ -1068,6 +1094,35 @@ mod tests {
             loaded[1].attributes.base(&AttributeKind::MovementSpeed),
             Some(0.2)
         );
+    }
+
+    #[test]
+    fn restored_aquatic_entities_keep_aquatic_wander_goal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = items();
+        let entity_types = entity_types();
+        let cod = EntitySnapshot {
+            id: EntityId(102),
+            uuid: uuid::Uuid::from_u128(102),
+            type_id: 3,
+            type_name: "minecraft:cod".into(),
+            position: Vec3::new(1.0, 50.0, 2.0),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            lifecycle: EntityLifecycle::Alive,
+            health: 3.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: GoalState::Idle,
+        };
+
+        save_persisted_entities(tmp.path(), &items, &[cod]).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+
+        assert!(matches!(loaded[0].goal, GoalState::AquaticWander { .. }));
+        assert!(!loaded[0].on_ground);
     }
 
     #[test]

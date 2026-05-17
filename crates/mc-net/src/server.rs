@@ -12,7 +12,7 @@ use bytes::BytesMut;
 use mc_data::Identifier;
 use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
-use mc_data::block_facts::BlockFactsTable;
+use mc_data::block_facts::{BlockFactsTable, FluidKind};
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
@@ -263,7 +263,12 @@ impl BoundServer {
         let sessions = self.sessions;
         let shutdown = config.shutdown.clone();
         let entity_world_root = if let Some(world) = config.world.as_ref() {
-            let storage = world.lock().await;
+            let storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::WorldStorage,
+                "entity world root",
+                Instant::now(),
+                world.lock().await,
+            );
             storage.world_root().map(std::path::Path::to_path_buf)
         } else {
             None
@@ -304,6 +309,7 @@ impl BoundServer {
                 let started = Instant::now();
                 let mut entity_save_us = 0;
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)
+                    && entity_sessions.active_session_count() > 0
                     && let Some(root) = entity_world_root.as_deref()
                 {
                     let snapshots = entity_sessions.persisted_entity_snapshots();
@@ -337,6 +343,7 @@ impl BoundServer {
                 let tick_us = elapsed_us(tick_started);
                 if should_log_runtime_metrics(tick, tick_us, metrics_policy) {
                     let pressure = entity_sessions.pressure_snapshot();
+                    let lock_pressure = crate::lock_metrics::snapshot();
                     if is_slow_tick(tick_us, metrics_policy) {
                         warn!(
                             tick,
@@ -362,12 +369,36 @@ impl BoundServer {
                             ticketed_chunks = pressure.ticketed_chunks,
                             prepared_chunks = pressure.prepared_chunks,
                             server_entities = pressure.server_entities,
+                            entity_spawn_dispatches = pressure.entity_dispatches.spawn,
+                            entity_move_dispatches = pressure.entity_dispatches.move_relative,
+                            entity_data_dispatches = pressure.entity_dispatches.data,
+                            entity_take_dispatches = pressure.entity_dispatches.take,
+                            entity_remove_dispatches = pressure.entity_dispatches.remove,
+                            visibility_command_drops = pressure.visibility_command_drops,
                             furnace_viewer_sets = pressure.furnace_viewer_sets,
                             chest_viewer_sets = pressure.chest_viewer_sets,
+                            world_lock_waits = lock_pressure.world_storage.wait_count,
+                            world_lock_wait_us = lock_pressure.world_storage.wait_us,
+                            world_lock_max_wait_us = lock_pressure.world_storage.max_wait_us,
+                            world_lock_hold_us = lock_pressure.world_storage.hold_us,
+                            world_lock_max_hold_us = lock_pressure.world_storage.max_hold_us,
+                            session_lock_waits = lock_pressure.session_registry.wait_count,
+                            session_lock_wait_us = lock_pressure.session_registry.wait_us,
+                            session_lock_max_wait_us = lock_pressure.session_registry.max_wait_us,
+                            session_lock_hold_us = lock_pressure.session_registry.hold_us,
+                            session_lock_max_hold_us = lock_pressure.session_registry.max_hold_us,
+                            save_flush_lock_wait_us = lock_pressure.save_all_flush.wait_us,
+                            save_flush_lock_hold_us = lock_pressure.save_all_flush.hold_us,
+                            chunk_prepare_lock_wait_us = lock_pressure.chunk_prepare.wait_us,
+                            chunk_prepare_lock_hold_us = lock_pressure.chunk_prepare.hold_us,
+                            player_persistence_lock_wait_us =
+                                lock_pressure.player_persistence.wait_us,
+                            player_persistence_lock_hold_us =
+                                lock_pressure.player_persistence.hold_us,
                             "runtime tick exceeded performance budget"
                         );
                     } else {
-                        info!(
+                        debug!(
                             tick,
                             world_time,
                             tick_us,
@@ -391,8 +422,32 @@ impl BoundServer {
                             ticketed_chunks = pressure.ticketed_chunks,
                             prepared_chunks = pressure.prepared_chunks,
                             server_entities = pressure.server_entities,
+                            entity_spawn_dispatches = pressure.entity_dispatches.spawn,
+                            entity_move_dispatches = pressure.entity_dispatches.move_relative,
+                            entity_data_dispatches = pressure.entity_dispatches.data,
+                            entity_take_dispatches = pressure.entity_dispatches.take,
+                            entity_remove_dispatches = pressure.entity_dispatches.remove,
+                            visibility_command_drops = pressure.visibility_command_drops,
                             furnace_viewer_sets = pressure.furnace_viewer_sets,
                             chest_viewer_sets = pressure.chest_viewer_sets,
+                            world_lock_waits = lock_pressure.world_storage.wait_count,
+                            world_lock_wait_us = lock_pressure.world_storage.wait_us,
+                            world_lock_max_wait_us = lock_pressure.world_storage.max_wait_us,
+                            world_lock_hold_us = lock_pressure.world_storage.hold_us,
+                            world_lock_max_hold_us = lock_pressure.world_storage.max_hold_us,
+                            session_lock_waits = lock_pressure.session_registry.wait_count,
+                            session_lock_wait_us = lock_pressure.session_registry.wait_us,
+                            session_lock_max_wait_us = lock_pressure.session_registry.max_wait_us,
+                            session_lock_hold_us = lock_pressure.session_registry.hold_us,
+                            session_lock_max_hold_us = lock_pressure.session_registry.max_hold_us,
+                            save_flush_lock_wait_us = lock_pressure.save_all_flush.wait_us,
+                            save_flush_lock_hold_us = lock_pressure.save_all_flush.hold_us,
+                            chunk_prepare_lock_wait_us = lock_pressure.chunk_prepare.wait_us,
+                            chunk_prepare_lock_hold_us = lock_pressure.chunk_prepare.hold_us,
+                            player_persistence_lock_wait_us =
+                                lock_pressure.player_persistence.wait_us,
+                            player_persistence_lock_hold_us =
+                                lock_pressure.player_persistence.hold_us,
                             "runtime tick metrics"
                         );
                     }
@@ -530,9 +585,14 @@ async fn entity_physics_steps(
     if queries.is_empty() {
         return Vec::new();
     }
-    let materials = material_ids(&config.blocks);
+    let materials = material_ids(&config.blocks, &config.block_facts);
     let inputs = {
-        let mut storage = world.lock().await;
+        let mut storage = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::WorldStorage,
+            "entity physics sampling",
+            Instant::now(),
+            world.lock().await,
+        );
         queries
             .iter()
             .map(|query| sample_entity_physics_input(*query, &mut storage, &materials))
@@ -600,18 +660,13 @@ fn sample_entity_physics_input(
     let mut samples = HashMap::new();
     let mut complete_samples = true;
     for pos in entity_physics_sample_positions(query) {
-        let material = match storage.get_block(pos) {
-            Ok(Some(state)) => materials.classify(state.0),
-            Ok(None) if (MIN_Y..MAX_Y).contains(&pos.y) => {
+        let material = match storage.get_cached_block(pos) {
+            Some(state) => materials.classify(state.0),
+            None if (MIN_Y..MAX_Y).contains(&pos.y) => {
                 complete_samples = false;
                 BlockMaterial::Air
             }
-            Ok(None) => BlockMaterial::Air,
-            Err(_) if (MIN_Y..MAX_Y).contains(&pos.y) => {
-                complete_samples = false;
-                BlockMaterial::Air
-            }
-            Err(_) => BlockMaterial::Air,
+            None => BlockMaterial::Air,
         };
         samples.insert(pos, material);
     }
@@ -690,7 +745,7 @@ fn entity_vec(vec: mc_physics::Vec3) -> mc_entity::Vec3 {
     mc_entity::Vec3::new(vec.x, vec.y, vec.z)
 }
 
-fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
+fn material_ids(blocks: &BlockRegistry, facts: &BlockFactsTable) -> BlockMaterialIds {
     let state = |name: &str| {
         blocks
             .block(&Identifier::parse(name).expect("static identifier"))
@@ -706,7 +761,25 @@ fn material_ids(blocks: &BlockRegistry) -> BlockMaterialIds {
         state("minecraft:water"),
         state("minecraft:lava"),
     )
+    .with_water_states(fluid_material_states(blocks, facts, FluidKind::Water))
+    .with_lava_states(fluid_material_states(blocks, facts, FluidKind::Lava))
     .with_passable(passable)
+}
+
+fn fluid_material_states(
+    blocks: &BlockRegistry,
+    facts: &BlockFactsTable,
+    kind: FluidKind,
+) -> Vec<u32> {
+    blocks
+        .states()
+        .filter(|state| {
+            facts
+                .fluid(state.id.0)
+                .is_some_and(|fluid| fluid.kind == kind)
+        })
+        .map(|state| state.id.0)
+        .collect()
 }
 
 fn is_client_disconnect(err: &ConnectionError) -> bool {
@@ -730,7 +803,12 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     let sessions = Arc::new(play::SessionRegistry::new());
     if let Some(world) = config.world.as_ref() {
         let world_root = {
-            let storage = world.lock().await;
+            let storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::WorldStorage,
+                "bind world root",
+                Instant::now(),
+                world.lock().await,
+            );
             storage.world_root().map(std::path::Path::to_path_buf)
         };
         if let Some(root) = world_root.as_deref() {
@@ -784,7 +862,12 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
         return report;
     };
     let root = {
-        let storage = world.lock().await;
+        let storage = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::WorldStorage,
+            "save-all world root",
+            Instant::now(),
+            world.lock().await,
+        );
         storage.world_root().map(std::path::Path::to_path_buf)
     };
     let Some(root) = root else {
@@ -817,7 +900,12 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
             .push(format!("world metadata: save failed: {err}")),
     }
 
-    let mut storage = world.lock().await;
+    let mut storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::SaveAllFlush,
+        "save-all dirty flush",
+        Instant::now(),
+        world.lock().await,
+    );
     let storage_before = storage.stats();
     let flush_started = Instant::now();
     match storage.flush_dirty() {
@@ -992,8 +1080,16 @@ mod tests {
         let reports = vec![
             report("minecraft:air", &[], &[(0, true, &[])]),
             report("minecraft:stone", &[], &[(1, true, &[])]),
-            report("minecraft:water", &[], &[(2, true, &[])]),
-            report("minecraft:lava", &[], &[(3, true, &[])]),
+            report(
+                "minecraft:water",
+                &[("level", &["0", "1"])],
+                &[(2, true, &[("level", "0")]), (8, false, &[("level", "1")])],
+            ),
+            report(
+                "minecraft:lava",
+                &[("level", &["0", "1"])],
+                &[(3, true, &[("level", "0")]), (9, false, &[("level", "1")])],
+            ),
             report("minecraft:short_grass", &[], &[(4, true, &[])]),
             report("minecraft:poppy", &[], &[(5, true, &[])]),
             report(
@@ -1003,7 +1099,8 @@ mod tests {
             ),
         ];
         let registry = BlockRegistry::from_report(&reports).unwrap();
-        let ids = material_ids(&registry);
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let ids = material_ids(&registry, &facts);
 
         assert_eq!(ids.classify(1), BlockMaterial::Solid);
         assert_eq!(ids.classify(2), BlockMaterial::Water);
@@ -1012,6 +1109,8 @@ mod tests {
         assert_eq!(ids.classify(5), BlockMaterial::Air);
         assert_eq!(ids.classify(6), BlockMaterial::Air);
         assert_eq!(ids.classify(7), BlockMaterial::Air);
+        assert_eq!(ids.classify(8), BlockMaterial::Water);
+        assert_eq!(ids.classify(9), BlockMaterial::Lava);
     }
 
     #[test]
@@ -1052,7 +1151,7 @@ mod tests {
     }
 
     #[test]
-    fn entity_physics_samples_generated_chunks_instead_of_freezing() {
+    fn entity_physics_uses_only_cached_chunks_for_sampling() {
         let registry = Arc::new(
             BlockRegistry::from_report(&[
                 report("minecraft:air", &[], &[(0, true, &[])]),
@@ -1060,7 +1159,8 @@ mod tests {
             ])
             .unwrap(),
         );
-        let materials = material_ids(&registry);
+        let facts = BlockFactsTable::default();
+        let materials = material_ids(&registry, &facts);
         let biome = Identifier::parse("minecraft:plains").unwrap();
         let mut storage = WorldStorage::in_memory(Arc::clone(&registry)).with_generator(Arc::new(
             FlatGenerator {
@@ -1071,12 +1171,19 @@ mod tests {
         ));
         let query = play::EntityPhysicsQuery {
             id: mc_entity::EntityId(42),
-            position: mc_entity::Vec3::new(0.5, 66.0, 0.5),
+            position: mc_entity::Vec3::new(8.5, 66.0, 8.5),
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
         };
 
+        let input = sample_entity_physics_input(query, &mut storage, &materials);
+        assert!(!input.complete_samples);
+
+        storage
+            .get_chunk(mc_world::ChunkPos { x: 0, z: 0 })
+            .expect("generate spawn chunk")
+            .expect("spawn chunk generated");
         let input = sample_entity_physics_input(query, &mut storage, &materials);
         assert!(input.complete_samples);
         let step = step_sampled_entity(input);

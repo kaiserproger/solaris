@@ -221,9 +221,23 @@ impl AttributeSet {
 #[derive(Debug, Clone, PartialEq)]
 pub enum GoalState {
     Idle,
-    Wander { speed: f64, period_ticks: u32 },
-    FollowTarget { target: EntityId, speed: f64 },
-    FollowPosition { target: Vec3, speed: f64 },
+    Wander {
+        speed: f64,
+        period_ticks: u32,
+    },
+    AquaticWander {
+        speed: f64,
+        vertical_speed: f64,
+        period_ticks: u32,
+    },
+    FollowTarget {
+        target: EntityId,
+        speed: f64,
+    },
+    FollowPosition {
+        target: Vec3,
+        speed: f64,
+    },
 }
 
 /// Dense entity storage. Hot state is kept in parallel vectors so later
@@ -451,6 +465,21 @@ impl EntityStore {
                     self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
                     self.rotations[slot].head_yaw = self.rotations[slot].yaw;
                 }
+                GoalState::AquaticWander {
+                    speed,
+                    vertical_speed,
+                    period_ticks,
+                } => {
+                    let period = u64::from(period_ticks.max(1));
+                    let phase = tick / period;
+                    let angle = deterministic_angle(self.ids[slot], phase);
+                    let vertical_wave = deterministic_wave(self.ids[slot], phase);
+                    self.velocities[slot].x = angle.cos() * speed;
+                    self.velocities[slot].z = angle.sin() * speed;
+                    self.velocities[slot].y = vertical_wave * vertical_speed;
+                    self.on_ground[slot] = false;
+                    self.rotations[slot] = aquatic_rotation_from_velocity(self.velocities[slot]);
+                }
                 GoalState::FollowTarget { target, speed } => {
                     let velocity = self
                         .slots_by_id
@@ -555,6 +584,10 @@ fn deterministic_angle(id: EntityId, phase: u64) -> f64 {
     (mixed as f64 / u64::MAX as f64) * TAU
 }
 
+fn deterministic_wave(id: EntityId, phase: u64) -> f64 {
+    deterministic_angle(id, phase.wrapping_add(0x41)).sin()
+}
+
 fn splitmix64(mut value: u64) -> u64 {
     value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -567,6 +600,21 @@ fn yaw_from_velocity(velocity: Vec3) -> f32 {
         0.0
     } else {
         velocity.z.atan2(velocity.x).to_degrees() as f32 - 90.0
+    }
+}
+
+fn aquatic_rotation_from_velocity(velocity: Vec3) -> Rotation {
+    let yaw = yaw_from_velocity(velocity) + 90.0;
+    let horizontal = velocity.horizontal_len();
+    let pitch = if horizontal <= f64::EPSILON && velocity.y == 0.0 {
+        0.0
+    } else {
+        (-velocity.y).atan2(horizontal).to_degrees() as f32
+    };
+    Rotation {
+        yaw,
+        pitch: pitch.clamp(-35.0, 35.0),
+        head_yaw: yaw,
     }
 }
 
@@ -712,6 +760,27 @@ mod tests {
             a.snapshot(entity_a).unwrap().velocity,
             b.snapshot(entity_b).unwrap().velocity
         );
+    }
+
+    #[test]
+    fn aquatic_wander_sets_3d_motion_and_pitch() {
+        let mut store = EntityStore::new();
+        let mut fish = SpawnEntity::new(2, "minecraft:cod", Vec3::new(0.0, 50.0, 0.0));
+        fish.goal = GoalState::AquaticWander {
+            speed: 0.2,
+            vertical_speed: 0.1,
+            period_ticks: 20,
+        };
+        let id = store.spawn(fish);
+
+        store.tick_goals(40);
+        let snapshot = store.snapshot(id).unwrap();
+
+        assert!(snapshot.velocity.horizontal_len() > 0.0);
+        assert!(snapshot.velocity.y.abs() > 0.0);
+        assert!(!snapshot.on_ground);
+        assert_ne!(snapshot.rotation.pitch, 0.0);
+        assert_eq!(snapshot.rotation.yaw, snapshot.rotation.head_yaw);
     }
 
     #[test]

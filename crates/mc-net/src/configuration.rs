@@ -259,7 +259,7 @@ where
     info!(
         player = %profile.name,
         client_pack_count = client_packs.len(),
-        "configuration complete; Play state not yet implemented (M1.g)"
+        "configuration complete; entering Play state"
     );
 
     Ok(())

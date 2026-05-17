@@ -83,6 +83,7 @@ where
         compression,
     )
     .await?;
+    send_player_data(writer, compression, player).await?;
     send_player_move(writer, compression, player).await
 }
 
@@ -109,6 +110,27 @@ where
         &RotateHead {
             entity_id: player.entity_id,
             head_yaw: player.pose.yaw,
+        },
+        compression,
+    )
+    .await?;
+    send_player_data(writer, compression, player).await?;
+    Ok(())
+}
+
+async fn send_player_data<W>(
+    writer: &mut W,
+    compression: Compression,
+    player: &PlayerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundSetEntityData {
+            entity_id: player.entity_id,
+            values: player.pose.entity_data_values(),
         },
         compression,
     )
@@ -286,7 +308,23 @@ where
         },
         compression,
     )
-    .await
+    .await?;
+    if movement.send_velocity {
+        write_packet(
+            writer,
+            &SetEntityMotion {
+                entity_id: movement.id.0,
+                movement: EntityVec3 {
+                    x: movement.velocity.x,
+                    y: movement.velocity.y,
+                    z: movement.velocity.z,
+                },
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn send_entity_despawn<W>(

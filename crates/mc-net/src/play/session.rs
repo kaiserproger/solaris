@@ -1,4 +1,6 @@
 use super::*;
+use std::sync::MutexGuard;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) type SessionId = u64;
 
@@ -55,6 +57,15 @@ pub(super) enum SessionAdmissionError {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct EntityDispatchCounters {
+    pub(crate) spawn: u64,
+    pub(crate) move_relative: u64,
+    pub(crate) data: u64,
+    pub(crate) take: u64,
+    pub(crate) remove: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SessionPressureSnapshot {
     pub(crate) sessions: usize,
     pub(crate) ticketed_chunks: usize,
@@ -62,7 +73,11 @@ pub(crate) struct SessionPressureSnapshot {
     pub(crate) server_entities: usize,
     pub(crate) furnace_viewer_sets: usize,
     pub(crate) chest_viewer_sets: usize,
+    pub(crate) entity_dispatches: EntityDispatchCounters,
+    pub(crate) visibility_command_drops: u64,
 }
+
+static VISIBILITY_COMMAND_DROPS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct ClaimedPickup {
@@ -113,8 +128,10 @@ pub(super) struct ServerEntitySnapshot {
 pub(super) struct ServerEntityMove {
     pub(super) id: EntityId,
     pub(super) delta: Vec3,
+    pub(super) velocity: Vec3,
     pub(super) rotation: mc_entity::Rotation,
     pub(super) on_ground: bool,
+    pub(super) send_velocity: bool,
 }
 
 #[derive(Debug)]
@@ -146,10 +163,12 @@ struct SessionRegistryInner {
     entities: EntityStore,
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
     last_entity_damage_ticks: HashMap<EntityId, u64>,
+    item_pickup_ready_ticks: HashMap<EntityId, u64>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
     chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
+    entity_dispatches: EntityDispatchCounters,
     world_time: u64,
 }
 
@@ -163,10 +182,12 @@ impl Default for SessionRegistryInner {
             entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
             last_sent_entity_positions: HashMap::new(),
             last_entity_damage_ticks: HashMap::new(),
+            item_pickup_ready_ticks: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
             chest_viewers: HashMap::new(),
             player_persistence: HashMap::new(),
+            entity_dispatches: EntityDispatchCounters::default(),
             world_time: 0,
         }
     }
@@ -183,19 +204,31 @@ impl SessionRegistry {
         Self::default()
     }
 
+    fn lock_inner(
+        &self,
+        operation: &'static str,
+    ) -> crate::lock_metrics::TimedGuard<MutexGuard<'_, SessionRegistryInner>> {
+        crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::SessionRegistry,
+            operation,
+            Instant::now(),
+            self.inner.lock().expect("session registry poisoned"),
+        )
+    }
+
     pub(crate) fn set_world_time(&self, world_time: u64) {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("set world time");
         inner.world_time = world_time;
     }
 
     pub(crate) fn advance_world_time(&self, ticks: u64) -> u64 {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("advance world time");
         inner.world_time = inner.world_time.wrapping_add(ticks);
         inner.world_time
     }
 
     pub(crate) fn world_time(&self) -> u64 {
-        let inner = self.inner.lock().expect("session registry poisoned");
+        let inner = self.lock_inner("read world time");
         inner.world_time
     }
 
@@ -204,13 +237,13 @@ impl SessionRegistry {
         id: SessionId,
         state: Arc<Mutex<PlayerPersistedState>>,
     ) {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("register player persistence");
         inner.player_persistence.insert(id, state);
     }
 
     pub(crate) fn persisted_player_states(&self) -> Vec<(uuid::Uuid, PlayerPersistedState)> {
         let entries = {
-            let inner = self.inner.lock().expect("session registry poisoned");
+            let inner = self.lock_inner("save-all player persistence entries");
             inner
                 .sessions
                 .iter()
@@ -225,13 +258,13 @@ impl SessionRegistry {
         entries
             .into_iter()
             .map(|(uuid, state)| {
-                (
-                    uuid,
-                    state
-                        .lock()
-                        .expect("player persistence state poisoned")
-                        .clone(),
-                )
+                let state = crate::lock_metrics::timed_guard(
+                    crate::lock_metrics::LockMetricKind::PlayerPersistence,
+                    "save-all player persistence snapshot",
+                    Instant::now(),
+                    state.lock().expect("player persistence state poisoned"),
+                );
+                (uuid, (*state).clone())
             })
             .collect()
     }
@@ -262,7 +295,7 @@ impl SessionRegistry {
         &self,
         registration: SessionRegistration<'_>,
     ) -> Result<(SessionId, Vec<VisibilityDispatch>), SessionAdmissionError> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("register play session");
         if inner.sessions.len() >= registration.max_sessions {
             return Err(SessionAdmissionError::ServerFull {
                 active: inner.sessions.len(),
@@ -314,13 +347,13 @@ impl SessionRegistry {
         Ok((id, dispatches))
     }
 
-    pub(super) fn active_session_count(&self) -> usize {
-        let inner = self.inner.lock().expect("session registry poisoned");
+    pub(crate) fn active_session_count(&self) -> usize {
+        let inner = self.lock_inner("active session count");
         inner.sessions.len()
     }
 
     pub(crate) fn pressure_snapshot(&self) -> SessionPressureSnapshot {
-        let inner = self.inner.lock().expect("session registry poisoned");
+        let inner = self.lock_inner("runtime pressure snapshot");
         SessionPressureSnapshot {
             sessions: inner.sessions.len(),
             ticketed_chunks: inner.tickets.len(),
@@ -328,11 +361,13 @@ impl SessionRegistry {
             server_entities: inner.entities.len(),
             furnace_viewer_sets: inner.furnace_viewers.len(),
             chest_viewer_sets: inner.chest_viewers.len(),
+            entity_dispatches: inner.entity_dispatches,
+            visibility_command_drops: VISIBILITY_COMMAND_DROPS.load(Ordering::Relaxed),
         }
     }
 
     pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("unregister play session");
         let Some(session) = inner.sessions.remove(&id) else {
             return Vec::new();
         };
@@ -517,7 +552,7 @@ impl SessionRegistry {
         center: (i32, i32),
         desired: HashSet<(i32, i32)>,
     ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("replace chunk view");
         let (released, acquired, desired_len, view_distance) = {
             let Some(session) = inner.sessions.get_mut(&id) else {
                 return Vec::new();
@@ -561,7 +596,7 @@ impl SessionRegistry {
     }
 
     pub(super) fn mark_loaded(&self, id: SessionId, chunk: (i32, i32)) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("mark chunk loaded");
         if let Some(session) = inner.sessions.get_mut(&id) {
             session.loaded.insert(chunk);
             refresh_visibility_locked(&mut inner)
@@ -575,7 +610,7 @@ impl SessionRegistry {
         id: SessionId,
         chunks: &[(i32, i32)],
     ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("mark chunks unloaded");
         if let Some(session) = inner.sessions.get_mut(&id) {
             for chunk in chunks {
                 session.loaded.remove(chunk);
@@ -587,7 +622,7 @@ impl SessionRegistry {
     }
 
     pub(super) fn update_pose(&self, id: SessionId, pose: PlayerPose) -> Vec<VisibilityDispatch> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("update player pose");
         let old_observers = visible_observers_locked(&inner, id);
         let Some(session) = inner.sessions.get_mut(&id) else {
             return Vec::new();
@@ -677,6 +712,13 @@ impl SessionRegistry {
                     speed: HOSTILE_WANDER_SPEED,
                     period_ticks: 20,
                 }
+            } else if entity_type_is_aquatic(&entity.type_name) {
+                entity.on_ground = false;
+                GoalState::AquaticWander {
+                    speed: PASSIVE_WANDER_SPEED * 0.9,
+                    vertical_speed: 0.18,
+                    period_ticks: 45,
+                }
             } else {
                 GoalState::Wander {
                     speed: PASSIVE_WANDER_SPEED,
@@ -715,6 +757,8 @@ impl SessionRegistry {
         entity.velocity = Vec3::new(0.0, 0.1, 0.0);
         let id = inner.entities.spawn(entity);
         inner.last_sent_entity_positions.insert(id, position);
+        let ready_tick = inner.world_time.saturating_add(ITEM_PICKUP_DELAY_TICKS);
+        inner.item_pickup_ready_ticks.insert(id, ready_tick);
         refresh_visibility_locked(&mut inner)
     }
 
@@ -762,6 +806,7 @@ impl SessionRegistry {
             .snapshots()
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .filter(|entity| entity.item_stack.is_some())
+            .filter(|entity| item_pickup_ready_locked(&inner, entity.id))
             .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
             .map(server_entity_snapshot_from)
             .collect()
@@ -846,6 +891,9 @@ impl SessionRegistry {
         if snapshot.lifecycle != EntityLifecycle::Alive {
             return None;
         }
+        if !item_pickup_ready_locked(&inner, entity_id) {
+            return None;
+        }
         let mut stack = snapshot.item_stack?;
         if stack.count <= 0 {
             return None;
@@ -861,6 +909,7 @@ impl SessionRegistry {
                 .map(server_entity_snapshot_from)?;
             inner.last_sent_entity_positions.remove(&entity_id);
             inner.last_entity_damage_ticks.remove(&entity_id);
+            inner.item_pickup_ready_ticks.remove(&entity_id);
             let dispatches = picked_entity_dispatches_locked(
                 &mut inner,
                 entity_id,
@@ -880,19 +929,21 @@ impl SessionRegistry {
                 .entities
                 .snapshot(entity_id)
                 .map(server_entity_snapshot_from)?;
-            let dispatches = visible_entity_observers_locked(&inner, entity_id)
-                .into_iter()
-                .filter_map(|observer_id| {
-                    let observer = inner.sessions.get(&observer_id)?;
-                    Some(VisibilityDispatch {
-                        recipient: SessionRecipient {
-                            id: observer_id,
-                            tx: observer.tx.clone(),
-                        },
-                        command: OutboundCommand::UpdateEntityData(snapshot.clone()),
+            let dispatches: Vec<VisibilityDispatch> =
+                visible_entity_observers_locked(&inner, entity_id)
+                    .into_iter()
+                    .filter_map(|observer_id| {
+                        let observer = inner.sessions.get(&observer_id)?;
+                        Some(VisibilityDispatch {
+                            recipient: SessionRecipient {
+                                id: observer_id,
+                                tx: observer.tx.clone(),
+                            },
+                            command: OutboundCommand::UpdateEntityData(snapshot.clone()),
+                        })
                     })
-                })
-                .collect();
+                    .collect();
+            record_entity_dispatches_locked(&mut inner, &dispatches);
             Some(ClaimedPickup {
                 stack: picked,
                 dispatches,
@@ -911,6 +962,7 @@ impl SessionRegistry {
             .map(server_entity_snapshot_from)?;
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
+        inner.item_pickup_ready_ticks.remove(&entity_id);
 
         let mut dispatches = Vec::new();
         for (&observer_id, observer) in &mut inner.sessions {
@@ -924,6 +976,7 @@ impl SessionRegistry {
                 });
             }
         }
+        record_entity_dispatches_locked(&mut inner, &dispatches);
         Some((snapshot, dispatches))
     }
 
@@ -933,13 +986,14 @@ impl SessionRegistry {
         collector_session: SessionId,
         amount: i32,
     ) -> Option<Vec<VisibilityDispatch>> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("remove picked item entity");
         let snapshot = inner
             .entities
             .remove(entity_id)
             .map(server_entity_snapshot_from)?;
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
+        inner.item_pickup_ready_ticks.remove(&entity_id);
         Some(picked_entity_dispatches_locked(
             &mut inner,
             entity_id,
@@ -953,16 +1007,47 @@ impl SessionRegistry {
         &self,
         tick: u64,
     ) -> Vec<EntityPhysicsQuery> {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("tick entities");
         if inner.entities.is_empty() {
             return Vec::new();
         }
+        let active_chunks: HashSet<_> = inner
+            .sessions
+            .values()
+            .flat_map(|session| session.loaded.iter().copied())
+            .collect();
+        if active_chunks.is_empty() {
+            return Vec::new();
+        }
+        let player_positions: Vec<_> = inner
+            .sessions
+            .values()
+            .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
+            .collect();
         update_hostile_targets_locked(&mut inner);
         inner.entities.tick_goals(tick);
-        inner
+        let mut candidates: Vec<_> = inner
             .entities
             .snapshots()
-            .map(|entity| EntityPhysicsQuery {
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .filter_map(|entity| {
+                let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
+                if !active_chunks.contains(&chunk)
+                    || !entity_is_near_player_chunk(chunk, &player_positions)
+                {
+                    return None;
+                }
+                Some((
+                    entity_distance_sq_to_players(entity.position, &player_positions),
+                    entity,
+                ))
+            })
+            .collect();
+        candidates.sort_by(|(left, _), (right, _)| left.total_cmp(right));
+        candidates
+            .into_iter()
+            .take(ENTITY_PHYSICS_QUERY_BUDGET_PER_TICK)
+            .map(|(_, entity)| EntityPhysicsQuery {
                 id: entity.id,
                 position: entity.position,
                 velocity: entity.velocity,
@@ -976,7 +1061,7 @@ impl SessionRegistry {
         &self,
         entities: impl IntoIterator<Item = mc_entity::EntitySnapshot>,
     ) -> usize {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("restore persisted entities");
         let mut restored = 0;
         for entity in entities {
             let chunk = server_entity_chunk_pos(&server_entity_snapshot_from(entity.clone()));
@@ -989,7 +1074,7 @@ impl SessionRegistry {
     }
 
     pub(crate) fn persisted_entity_snapshots(&self) -> Vec<mc_entity::EntitySnapshot> {
-        let inner = self.inner.lock().expect("session registry poisoned");
+        let inner = self.lock_inner("persisted entity snapshots");
         inner
             .entities
             .snapshots()
@@ -998,35 +1083,66 @@ impl SessionRegistry {
     }
 
     pub(crate) fn apply_entity_physics_and_dispatch(&self, tick: u64, steps: &[EntityPhysicsStep]) {
-        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut inner = self.lock_inner("apply entity physics");
         if inner.entities.is_empty() {
             return;
         }
-        let old_visible: HashMap<_, _> = inner
-            .entities
-            .snapshots()
-            .map(|entity| {
-                (
-                    entity.id,
-                    visible_entity_observers_locked(&inner, entity.id),
-                )
+        let old_chunks: HashMap<_, _> = steps
+            .iter()
+            .filter_map(|step| {
+                inner.entities.snapshot(step.id).map(|entity| {
+                    (
+                        step.id,
+                        chunk_pos_from_coords(entity.position.x, entity.position.z),
+                    )
+                })
             })
             .collect();
+        let crossed_visibility_boundary = steps.iter().any(|step| {
+            old_chunks.get(&step.id).is_some_and(|old_chunk| {
+                *old_chunk != chunk_pos_from_coords(step.position.x, step.position.z)
+            })
+        });
+        let old_observers_by_entity = if crossed_visibility_boundary {
+            steps
+                .iter()
+                .map(|step| {
+                    (
+                        step.id,
+                        visible_entity_observers_locked(&inner, step.id)
+                            .into_iter()
+                            .collect::<HashSet<_>>(),
+                    )
+                })
+                .collect::<HashMap<_, _>>()
+        } else {
+            HashMap::new()
+        };
         for step in steps {
             let _ = inner.entities.set_position(step.id, step.position);
             let _ = inner.entities.set_velocity(step.id, step.velocity);
             let _ = inner.entities.set_on_ground(step.id, step.on_ground);
         }
-        let mut dispatches = refresh_visibility_locked(&mut inner);
+        let mut dispatches = if crossed_visibility_boundary {
+            refresh_visibility_locked(&mut inner)
+        } else {
+            Vec::new()
+        };
         if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
             drop(inner);
             dispatch_visibility_commands(dispatches);
             return;
         }
 
-        let snapshots: Vec<_> = inner.entities.snapshots().collect();
-        for entity in snapshots {
-            let snapshot = server_entity_snapshot_from(entity);
+        let move_dispatch_start = dispatches.len();
+        for step in steps {
+            let Some(snapshot) = inner
+                .entities
+                .snapshot(step.id)
+                .map(server_entity_snapshot_from)
+            else {
+                continue;
+            };
             let Some(old_position) = inner.last_sent_entity_positions.get(&snapshot.id).copied()
             else {
                 inner
@@ -1042,23 +1158,27 @@ impl SessionRegistry {
             if delta.x == 0.0 && delta.y == 0.0 && delta.z == 0.0 {
                 continue;
             }
-            let new_visible = visible_entity_observers_locked(&inner, snapshot.id);
-            for observer_id in old_visible
-                .get(&snapshot.id)
-                .into_iter()
-                .flat_map(|observers| observers.intersection(&new_visible))
-            {
-                if let Some(observer) = inner.sessions.get(observer_id) {
+            for observer_id in visible_entity_observers_locked(&inner, snapshot.id) {
+                if crossed_visibility_boundary
+                    && !old_observers_by_entity
+                        .get(&snapshot.id)
+                        .is_some_and(|observers| observers.contains(&observer_id))
+                {
+                    continue;
+                }
+                if let Some(observer) = inner.sessions.get(&observer_id) {
                     dispatches.push(VisibilityDispatch {
                         recipient: SessionRecipient {
-                            id: *observer_id,
+                            id: observer_id,
                             tx: observer.tx.clone(),
                         },
                         command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                             id: snapshot.id,
                             delta,
+                            velocity: snapshot.velocity,
                             rotation: snapshot.rotation,
                             on_ground: snapshot.on_ground,
+                            send_velocity: entity_type_is_aquatic(&snapshot.type_name),
                         }),
                     });
                 }
@@ -1067,6 +1187,7 @@ impl SessionRegistry {
                 .last_sent_entity_positions
                 .insert(snapshot.id, snapshot.position);
         }
+        record_entity_dispatches_locked(&mut inner, &dispatches[move_dispatch_start..]);
         drop(inner);
         dispatch_visibility_commands(dispatches);
     }
@@ -1196,6 +1317,44 @@ fn spawn_far_enough_from_players(inner: &SessionRegistryInner, position: Vec3) -
             Vec3::new(session.pose.x, session.pose.y, session.pose.z),
         ) > min_distance_sq
     })
+}
+
+fn item_pickup_ready_locked(inner: &SessionRegistryInner, entity_id: EntityId) -> bool {
+    inner
+        .item_pickup_ready_ticks
+        .get(&entity_id)
+        .is_none_or(|ready_tick| inner.world_time >= *ready_tick)
+}
+
+fn entity_is_near_player_chunk(chunk: (i32, i32), player_positions: &[Vec3]) -> bool {
+    player_positions.iter().any(|position| {
+        let player_chunk = chunk_pos_from_coords(position.x, position.z);
+        (chunk.0 - player_chunk.0).abs() <= ENTITY_SIMULATION_DISTANCE_CHUNKS
+            && (chunk.1 - player_chunk.1).abs() <= ENTITY_SIMULATION_DISTANCE_CHUNKS
+    })
+}
+
+fn entity_distance_sq_to_players(position: Vec3, player_positions: &[Vec3]) -> f64 {
+    player_positions
+        .iter()
+        .map(|player| distance_sq(position, *player))
+        .min_by(f64::total_cmp)
+        .unwrap_or(f64::INFINITY)
+}
+
+fn entity_type_is_aquatic(type_name: &str) -> bool {
+    matches!(
+        type_name,
+        "minecraft:cod"
+            | "minecraft:salmon"
+            | "minecraft:tropical_fish"
+            | "minecraft:pufferfish"
+            | "minecraft:squid"
+            | "minecraft:glow_squid"
+            | "minecraft:dolphin"
+            | "minecraft:axolotl"
+            | "minecraft:turtle"
+    )
 }
 
 fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
@@ -1479,12 +1638,30 @@ fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<Visibility
         }
         observer.visible_entities = desired_entities;
     }
+    record_entity_dispatches_locked(inner, &dispatches);
     dispatches
+}
+
+fn record_entity_dispatches_locked(
+    inner: &mut SessionRegistryInner,
+    dispatches: &[VisibilityDispatch],
+) {
+    for dispatch in dispatches {
+        match dispatch.command {
+            OutboundCommand::SpawnEntity(_) => inner.entity_dispatches.spawn += 1,
+            OutboundCommand::UpdateEntityData(_) => inner.entity_dispatches.data += 1,
+            OutboundCommand::MoveEntityRelative(_) => inner.entity_dispatches.move_relative += 1,
+            OutboundCommand::TakeItemEntity { .. } => inner.entity_dispatches.take += 1,
+            OutboundCommand::DespawnEntity(_) => inner.entity_dispatches.remove += 1,
+            _ => {}
+        }
+    }
 }
 
 pub(super) fn dispatch_visibility_commands(dispatches: Vec<VisibilityDispatch>) {
     for dispatch in dispatches {
         if let Err(err) = dispatch.recipient.tx.try_send(dispatch.command) {
+            VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
             debug!(
                 recipient = dispatch.recipient.id,
                 error = %err,
@@ -1527,6 +1704,7 @@ fn picked_entity_dispatches_locked(
             });
         }
     }
+    record_entity_dispatches_locked(inner, &dispatches);
     dispatches
 }
 
@@ -1634,6 +1812,13 @@ mod tests {
         let alice = register_test_session(&registry, "PickupAlice");
         let bob = register_test_session(&registry, "PickupBob");
         registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        assert!(
+            registry
+                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
+                .is_empty()
+        );
+
+        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
         let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
 
         let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
@@ -1644,6 +1829,112 @@ mod tests {
                 .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn pressure_snapshot_counts_entity_spawn_move_and_pickup_dispatches() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "DispatchAlice");
+        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+
+        let start = registry.pressure_snapshot().entity_dispatches;
+        let spawn_dispatches =
+            registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        assert_eq!(spawn_dispatches.len(), 1);
+
+        let after_spawn = registry.pressure_snapshot().entity_dispatches;
+        assert_eq!(after_spawn.spawn, start.spawn + 1);
+        assert_eq!(after_spawn.move_relative, start.move_relative);
+        assert_eq!(after_spawn.take, start.take);
+        assert_eq!(after_spawn.remove, start.remove);
+
+        let entity_id = {
+            let inner = registry.inner.lock().expect("session registry poisoned");
+            inner
+                .entities
+                .snapshots()
+                .next()
+                .expect("spawned entity")
+                .id
+        };
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.75, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+            }],
+        );
+
+        let after_move = registry.pressure_snapshot().entity_dispatches;
+        assert_eq!(after_move.move_relative, after_spawn.move_relative + 1);
+
+        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
+        assert_eq!(claimed.dispatches.len(), 2);
+
+        let after_pickup = registry.pressure_snapshot().entity_dispatches;
+        assert_eq!(after_pickup.take, after_move.take + 1);
+        assert_eq!(after_pickup.remove, after_move.remove + 1);
+    }
+
+    #[test]
+    fn boundary_spawn_does_not_send_same_tick_relative_move_to_new_observer() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (alice, _) = registry.register(
+            &profile("BoundaryAlice"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(alice, (1, 0)).is_empty());
+        assert!(
+            registry
+                .spawn_command_entity(1, "minecraft:zombie".to_string(), Vec3::new(0.5, 64.0, 0.5))
+                .is_empty()
+        );
+        let entity_id = {
+            let inner = registry.inner.lock().expect("session registry poisoned");
+            inner
+                .entities
+                .snapshots()
+                .next()
+                .expect("spawned entity")
+                .id
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(16.5, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+            }],
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pressure_snapshot_counts_dropped_visibility_commands() {
+        let registry = SessionRegistry::new();
+        let start = registry.pressure_snapshot().visibility_command_drops;
+        let (tx, _rx) = mpsc::channel(1);
+        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+            .expect("fill recipient queue");
+
+        dispatch_visibility_commands(vec![VisibilityDispatch {
+            recipient: SessionRecipient { id: 1, tx },
+            command: OutboundCommand::AnimatePlayer { entity_id: 2 },
+        }]);
+
+        assert!(registry.pressure_snapshot().visibility_command_drops > start);
     }
 
     #[test]

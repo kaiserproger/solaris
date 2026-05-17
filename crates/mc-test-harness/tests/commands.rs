@@ -4,8 +4,9 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundSystemChat, GameEvent, GameMode, LoginPlay,
-    ServerboundChatCommand,
+    ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, ConfirmTeleportation,
+    GameEvent, GameMode, LoginPlay, ServerboundChatCommand, SetCenterChunk,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 
@@ -84,6 +85,49 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
                 ClientboundSystemChat::decode(&mut frame.body.clone()).expect("decode SystemChat");
             assert!(!feedback.content_nbt.is_empty());
             saw_feedback = true;
+        }
+    }
+}
+
+#[tokio::test]
+async fn client_receives_continuing_world_time_updates() {
+    let addr = start_server().await;
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, "M38Time").await.expect("login");
+    client.drive_configuration().await.expect("configuration");
+
+    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: GameEvent = client.read_typed().await.expect("GameEvent");
+    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+
+    let first = next_time_update(&mut client).await;
+    let second = next_time_update(&mut client).await;
+
+    assert!(
+        second.game_time > first.game_time,
+        "world time updates must advance"
+    );
+}
+
+async fn next_time_update(client: &mut Client) -> ClientboundSetTime {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("world time frame");
+        if frame.id == ClientboundSetTime::ID {
+            return ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime");
         }
     }
 }

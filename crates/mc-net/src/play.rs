@@ -42,22 +42,24 @@ use mc_protocol::packets::play::{
     ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn,
     ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
     ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTakeItemEntity,
-    ConfirmTeleportation, ContainerInput, Direction, EntityAnimation, EntityAnimationAction,
-    EntityDataValue, EntityEvent, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent,
-    GameMode, ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate,
-    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
-    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PositionMoveRotation,
-    RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate, ServerboundAttack,
-    ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
+    ConfirmTeleportation, ContainerInput, Direction, ENTITY_DATA_POSE_INDEX,
+    ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction, EntityDataValue,
+    EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
+    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
+    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput,
+    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
+    ServerboundAttack, ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
     ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
     ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
     ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
     ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
-    ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe,
-    ServerboundResourcePack, ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_section_pos,
-    pack_section_relative_pos, unpack_block_pos,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
+    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
+    ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_world::light::{
@@ -183,6 +185,9 @@ const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
+const WORLD_TIME_SYNC_PERIOD: Duration = Duration::from_secs(1);
+const ENTITY_SIMULATION_DISTANCE_CHUNKS: i32 = 8;
+const ENTITY_PHYSICS_QUERY_BUDGET_PER_TICK: usize = 128;
 const SURVIVAL_MINING_FALLBACK_TIME: Duration = Duration::from_millis(200);
 const CRAFTING_MENU_TYPE_ID: i32 = 12;
 const CRAFTING_MENU_SLOT_COUNT: usize = 46;
@@ -237,6 +242,7 @@ const MAX_HOSTILE_SPAWNS_PER_CHUNK: usize = 3;
 const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
+const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
 const DEFAULT_FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
@@ -360,6 +366,12 @@ struct PlayerPose {
     yaw: f32,
     pitch: f32,
     flags: MovePlayerFlags,
+    input: PlayerInput,
+    sprinting: bool,
+    shifting: bool,
+    in_water: bool,
+    eye_in_water: bool,
+    swimming: bool,
 }
 
 impl PlayerPose {
@@ -371,11 +383,51 @@ impl PlayerPose {
             yaw: 0.0,
             pitch: 0.0,
             flags: MovePlayerFlags::new(false, false),
+            input: PlayerInput::default(),
+            sprinting: false,
+            shifting: false,
+            in_water: false,
+            eye_in_water: false,
+            swimming: false,
         }
     }
 
     fn chunk_pos(self) -> (i32, i32) {
         chunk_pos_from_coords(self.x, self.z)
+    }
+
+    fn entity_pose(self) -> EntityPose {
+        if self.swimming {
+            EntityPose::Swimming
+        } else if self.shifting {
+            EntityPose::Crouching
+        } else {
+            EntityPose::Standing
+        }
+    }
+
+    fn shared_flags(self) -> i8 {
+        let mut flags = 0_u8;
+        if self.shifting {
+            flags |= 0x02;
+        }
+        if self.sprinting {
+            flags |= 0x08;
+        }
+        flags as i8
+    }
+
+    fn entity_data_values(self) -> Vec<EntityDataValue> {
+        vec![
+            EntityDataValue::Byte {
+                index: ENTITY_DATA_SHARED_FLAGS_INDEX,
+                value: self.shared_flags(),
+            },
+            EntityDataValue::Pose {
+                index: ENTITY_DATA_POSE_INDEX,
+                pose: self.entity_pose(),
+            },
+        ]
     }
 }
 
@@ -596,6 +648,12 @@ where
     let passive_herd_water = mc_data::Identifier::parse("minecraft:water")
         .ok()
         .and_then(|id| config.blocks.block(&id).map(|block| block.default));
+    let passive_herd_water_states = Arc::new(fluid_state_ids(
+        &config.blocks,
+        &config.block_facts,
+        FluidKind::Water,
+        passive_herd_water,
+    ));
     let passive_herd_passable = Arc::new(passive_entity_passable_blocks(&config.blocks));
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
@@ -605,7 +663,7 @@ where
             Arc::new(biomes.clone()),
             config.block_light.as_ref().map(Arc::clone),
             passive_herd_surface,
-            passive_herd_water,
+            Arc::clone(&passive_herd_water_states),
             Arc::clone(&passive_herd_passable),
             Arc::clone(&config.biome_spawns),
             Arc::clone(&config.entity_types),
@@ -1769,13 +1827,6 @@ where
 {
     state.pending_break = None;
     state.pending_use = None;
-    if packet.container_id != 0 {
-        debug!(
-            container_id = packet.container_id,
-            "place recipe ignored for non-player container"
-        );
-        return Ok(());
-    }
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         debug!(
             recipe = packet.recipe_display_id,
@@ -1796,10 +1847,42 @@ where
         return Ok(());
     };
 
+    let active_crafting = if packet.container_id == 0 {
+        None
+    } else {
+        match state.active_container.take() {
+            Some(ActiveContainer::CraftingTable(window))
+                if window.container_id == packet.container_id =>
+            {
+                Some(window)
+            }
+            Some(active) => {
+                debug!(
+                    container_id = packet.container_id,
+                    active_id = active.container_id(),
+                    "place recipe ignored for inactive container"
+                );
+                state.active_container = Some(active);
+                return Ok(());
+            }
+            None => {
+                debug!(
+                    container_id = packet.container_id,
+                    "place recipe ignored: no active container"
+                );
+                return Ok(());
+            }
+        }
+    };
+
     if let Some(changed) = craft_recipe(state, &recipe, packet.use_max_items) {
         write_inventory_slot_updates(state, writer, changed).await?;
     } else {
         debug!(recipe = %recipe.id, "place recipe ignored: missing ingredients or output space");
+    }
+    if let Some(window) = active_crafting {
+        write_crafting_content(state, writer, &window).await?;
+        state.active_container = Some(ActiveContainer::CraftingTable(window));
     }
     Ok(())
 }
@@ -4331,7 +4414,155 @@ fn farmland_has_nearby_water(
     false
 }
 
+async fn refresh_player_water_state<W>(
+    state: Option<&InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    entity_id: i32,
+    pose: &mut PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let old_pose = pose.entity_pose();
+    let old_flags = pose.shared_flags();
+    if let Some(state) = state {
+        let (in_water, eye_in_water) = player_water_overlap(state, *pose).await;
+        pose.in_water = in_water;
+        pose.eye_in_water = eye_in_water;
+    } else {
+        pose.in_water = false;
+        pose.eye_in_water = false;
+    }
+    pose.swimming = pose.in_water && pose.sprinting && (pose.input.forward || pose.eye_in_water);
+    if old_pose != pose.entity_pose() || old_flags != pose.shared_flags() {
+        write_packet(
+            writer,
+            &ClientboundSetEntityData {
+                entity_id,
+                values: pose.entity_data_values(),
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn player_water_motion(pose: PlayerPose) -> Option<EntityVec3> {
+    if !pose.in_water {
+        return None;
+    }
+
+    let forward = i32::from(pose.input.forward) - i32::from(pose.input.backward);
+    let strafe = i32::from(pose.input.right) - i32::from(pose.input.left);
+    let mut vertical = 0.0;
+    if pose.input.jump {
+        vertical += 1.0;
+    }
+    if pose.input.shift {
+        vertical -= 1.0;
+    }
+    if forward == 0 && strafe == 0 && vertical == 0.0 {
+        return None;
+    }
+
+    let yaw = f64::from(pose.yaw).to_radians();
+    let pitch = f64::from(pose.pitch).to_radians();
+    let forward_x = -yaw.sin();
+    let forward_z = yaw.cos();
+    let right_x = forward_z;
+    let right_z = -forward_x;
+    let mut x = forward_x * f64::from(forward) + right_x * f64::from(strafe);
+    let mut z = forward_z * f64::from(forward) + right_z * f64::from(strafe);
+    let horizontal = x.hypot(z);
+    if horizontal > f64::EPSILON {
+        x /= horizontal;
+        z /= horizontal;
+    }
+
+    let speed = if pose.sprinting { 0.12 } else { 0.06 };
+    let pitch_lift = if forward > 0 && pose.swimming {
+        -pitch.sin() * speed
+    } else {
+        0.0
+    };
+    Some(EntityVec3 {
+        x: x * speed,
+        y: vertical * 0.08 + pitch_lift,
+        z: z * speed,
+    })
+}
+
+async fn send_player_water_motion<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity_id: i32,
+    pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(movement) = player_water_motion(pose) {
+        write_packet(
+            writer,
+            &SetEntityMotion {
+                entity_id,
+                movement,
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn player_water_overlap(state: &InteractionState, pose: PlayerPose) -> (bool, bool) {
+    let half_width = 0.3;
+    let min_x = (pose.x - half_width).floor() as i32;
+    let max_x = (pose.x + half_width).floor() as i32;
+    let min_z = (pose.z - half_width).floor() as i32;
+    let max_z = (pose.z + half_width).floor() as i32;
+    let min_y = pose.y.floor() as i32;
+    let max_y = (pose.y + 1.8).floor() as i32;
+    let eye_pos = mc_world::BlockPos {
+        x: pose.x.floor() as i32,
+        y: (pose.y + 1.62).floor() as i32,
+        z: pose.z.floor() as i32,
+    };
+    let mut in_water = false;
+    let mut eye_in_water = false;
+    let mut storage = state.world.lock().await;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                let pos = mc_world::BlockPos { x, y, z };
+                let water = storage
+                    .get_block(pos)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state_id| state_is_water(&state.block_facts, state_id));
+                in_water |= water;
+                eye_in_water |= water && pos == eye_pos;
+            }
+        }
+    }
+    (in_water, eye_in_water)
+}
+
+fn state_is_water(
+    facts: &mc_data::block_facts::BlockFactsTable,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    facts
+        .fluid(state_id.0)
+        .is_some_and(|fluid| fluid.kind == FluidKind::Water)
+}
+
 fn farmland_trample_pos(old_pose: PlayerPose, new_pose: PlayerPose) -> Option<mc_world::BlockPos> {
+    if old_pose.in_water || new_pose.in_water {
+        return None;
+    }
     if old_pose.flags.on_ground || !new_pose.flags.on_ground || old_pose.y - new_pose.y <= 0.5 {
         return None;
     }
@@ -4392,6 +4623,9 @@ async fn apply_fall_damage<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    if old_pose.in_water || new_pose.in_water {
+        return Ok(());
+    }
     if old_pose.flags.on_ground || !new_pose.flags.on_ground {
         return Ok(());
     }
@@ -4414,6 +4648,9 @@ where
 }
 
 fn fall_damage_amount(old_pose: PlayerPose, new_pose: PlayerPose) -> f32 {
+    if old_pose.in_water || new_pose.in_water {
+        return 0.0;
+    }
     if old_pose.flags.on_ground || !new_pose.flags.on_ground {
         return 0.0;
     }
@@ -4869,6 +5106,31 @@ fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
         .block(&air_id)
         .map(|b| b.default)
         .unwrap_or(mc_world::BlockStateId(0))
+}
+
+fn fluid_state_ids(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    kind: FluidKind,
+    fallback: Option<mc_world::BlockStateId>,
+) -> Vec<mc_world::BlockStateId> {
+    let mut states = blocks
+        .states()
+        .filter(|state| {
+            facts
+                .fluid(state.id.0)
+                .is_some_and(|fluid| fluid.kind == kind)
+        })
+        .map(|state| state.id)
+        .collect::<Vec<_>>();
+    if states.is_empty()
+        && let Some(fallback) = fallback
+    {
+        states.push(fallback);
+    }
+    states.sort_unstable_by_key(|state| state.0);
+    states.dedup();
+    states
 }
 
 async fn break_replacement_state(
@@ -5759,6 +6021,9 @@ where
     let mut furnace_ticker = interval(ENTITY_TICK_PERIOD);
     furnace_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     furnace_ticker.tick().await;
+    let mut world_time_ticker = interval(WORLD_TIME_SYNC_PERIOD);
+    world_time_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    world_time_ticker.tick().await;
 
     let mut next_id: i64 = 0;
     let mut last_response_at = Instant::now();
@@ -5767,6 +6032,7 @@ where
     let mut client_brand: Option<String> = None;
     let mut client_preferences: Option<ClientPreferences> = None;
     let mut pending_outbound = VecDeque::new();
+    send_world_time(writer, compression, &sessions).await?;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
@@ -5968,8 +6234,12 @@ where
                     tick_active_container(state, writer).await?;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                     tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
+                    pickup_nearby_items(state, writer, player_pose).await?;
                     pickup_nearby_xp(state, writer, &mut xp_state, player_pose).await?;
                 }
+            }
+            _ = world_time_ticker.tick() => {
+                send_world_time(writer, compression, &sessions).await?;
             }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;
@@ -5999,6 +6269,14 @@ where
                     player_pose.y = movement.y;
                     player_pose.z = movement.z;
                     player_pose.flags = movement.flags;
+                    refresh_player_water_state(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        session_id as i32,
+                        &mut player_pose,
+                    )
+                    .await?;
                     if game_mode == GameMode::Survival
                         && let Some(state) = interaction.as_deref_mut()
                     {
@@ -6038,6 +6316,14 @@ where
                     player_pose.yaw = movement.yaw;
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
+                    refresh_player_water_state(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        session_id as i32,
+                        &mut player_pose,
+                    )
+                    .await?;
                     if game_mode == GameMode::Survival
                         && let Some(state) = interaction.as_deref_mut()
                     {
@@ -6109,6 +6395,44 @@ where
                             "PlayerAction ignored — no world configured"
                         );
                     }
+                } else if frame.id == ServerboundPlayerCommand::ID {
+                    let mut body = frame.body;
+                    let command = ServerboundPlayerCommand::decode(&mut body)?;
+                    match command.action {
+                        PlayerCommandAction::StartSprinting => player_pose.sprinting = true,
+                        PlayerCommandAction::StopSprinting => player_pose.sprinting = false,
+                        PlayerCommandAction::PressShiftKey => player_pose.shifting = true,
+                        PlayerCommandAction::ReleaseShiftKey => player_pose.shifting = false,
+                        _ => {}
+                    }
+                    refresh_player_water_state(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        session_id as i32,
+                        &mut player_pose,
+                    )
+                    .await?;
+                    send_player_water_motion(writer, compression, session_id as i32, player_pose)
+                        .await?;
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
+                } else if frame.id == ServerboundPlayerInput::ID {
+                    let mut body = frame.body;
+                    let input = ServerboundPlayerInput::decode(&mut body)?.input;
+                    player_pose.input = input;
+                    player_pose.sprinting = input.sprint;
+                    player_pose.shifting = input.shift;
+                    refresh_player_water_state(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        session_id as i32,
+                        &mut player_pose,
+                    )
+                    .await?;
+                    send_player_water_motion(writer, compression, session_id as i32, player_pose)
+                        .await?;
+                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundUseItemOn::ID {
                     let mut body = frame.body;
                     let use_on = ServerboundUseItemOn::decode(&mut body)?;
@@ -6537,14 +6861,7 @@ where
         }
         AdminCommand::TimeSet(time) => {
             sessions.set_world_time(time);
-            write_packet(
-                writer,
-                &ClientboundSetTime {
-                    game_time: i64::try_from(time).unwrap_or(i64::MAX),
-                },
-                compression,
-            )
-            .await?;
+            send_world_time(writer, compression, sessions).await?;
             send_command_feedback(writer, compression, &format!("Set time to {time}")).await
         }
         AdminCommand::Debug(command) => {
@@ -6606,6 +6923,25 @@ where
         &ClientboundSystemChat {
             content_nbt: text_component_nbt(message),
             overlay: false,
+        },
+        compression,
+    )
+    .await
+}
+
+async fn send_world_time<W>(
+    writer: &mut W,
+    compression: Compression,
+    sessions: &SessionRegistry,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let time = sessions.world_time();
+    write_packet(
+        writer,
+        &ClientboundSetTime {
+            game_time: i64::try_from(time).unwrap_or(i64::MAX),
         },
         compression,
     )

@@ -13,6 +13,7 @@ mod chunk_pipeline;
 mod configuration;
 mod connection;
 mod error;
+mod lock_metrics;
 mod login;
 mod play;
 mod server;

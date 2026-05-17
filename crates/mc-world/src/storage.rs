@@ -1596,6 +1596,22 @@ mod tests {
             }
         };
 
+        for cz in 0..=10 {
+            for cx in 0..=10 {
+                if world
+                    .get_chunk_without_generation(ChunkPos { x: cx, z: cz })
+                    .unwrap()
+                    .is_none()
+                {
+                    eprintln!(
+                        "skipping: {} does not contain required vd=10 chunk ({cx}, {cz})",
+                        world_dir.display()
+                    );
+                    return;
+                }
+            }
+        }
+
         let started = std::time::Instant::now();
         let mut hit = 0usize;
         for cz in 0..=10 {

@@ -40,6 +40,10 @@ const MAX_COMMAND_LEN: usize = 32_767;
 const MAX_COMMAND_NODE_COUNT: usize = 1024;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
+pub const ENTITY_DATA_BYTE_SERIALIZER_ID: i32 = 0;
+pub const ENTITY_DATA_POSE_SERIALIZER_ID: i32 = 20;
+pub const ENTITY_DATA_SHARED_FLAGS_INDEX: u8 = 0;
+pub const ENTITY_DATA_POSE_INDEX: u8 = 6;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
 pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
 
@@ -1242,16 +1246,28 @@ impl Packet for SetEntityMotion {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityDataValue {
+    Byte { index: u8, value: i8 },
     ItemStack { index: u8, stack: ItemStack },
+    Pose { index: u8, pose: EntityPose },
 }
 
 impl EntityDataValue {
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         match self {
+            Self::Byte { index, value } => {
+                buf.write_u8(*index);
+                buf.write_varint(ENTITY_DATA_BYTE_SERIALIZER_ID);
+                buf.write_i8(*value);
+            }
             Self::ItemStack { index, stack } => {
                 buf.write_u8(*index);
                 buf.write_varint(ENTITY_DATA_ITEM_STACK_SERIALIZER_ID);
                 stack.encode(buf)?;
+            }
+            Self::Pose { index, pose } => {
+                buf.write_u8(*index);
+                buf.write_varint(ENTITY_DATA_POSE_SERIALIZER_ID);
+                buf.write_varint(*pose as i32);
             }
         }
         Ok(())
@@ -1259,12 +1275,73 @@ impl EntityDataValue {
 
     fn decode<B: Buf>(index: u8, serializer_id: i32, buf: &mut B) -> Result<Self, CodecError> {
         match serializer_id {
+            ENTITY_DATA_BYTE_SERIALIZER_ID => Ok(Self::Byte {
+                index,
+                value: buf.read_i8()?,
+            }),
             ENTITY_DATA_ITEM_STACK_SERIALIZER_ID => Ok(Self::ItemStack {
                 index,
                 stack: ItemStack::decode(buf)?,
             }),
+            ENTITY_DATA_POSE_SERIALIZER_ID => Ok(Self::Pose {
+                index,
+                pose: EntityPose::from_wire(buf.read_varint()?)?,
+            }),
             _ => Err(CodecError::NotSupported("entity data serializer")),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityPose {
+    Standing = 0,
+    FallFlying = 1,
+    Sleeping = 2,
+    Swimming = 3,
+    SpinAttack = 4,
+    Crouching = 5,
+    LongJumping = 6,
+    Dying = 7,
+    Croaking = 8,
+    UsingTongue = 9,
+    Sitting = 10,
+    Roaring = 11,
+    Sniffing = 12,
+    Emerging = 13,
+    Digging = 14,
+    Sliding = 15,
+    Shooting = 16,
+    Inhaling = 17,
+}
+
+impl EntityPose {
+    fn from_wire(value: i32) -> Result<Self, CodecError> {
+        Ok(match value {
+            0 => Self::Standing,
+            1 => Self::FallFlying,
+            2 => Self::Sleeping,
+            3 => Self::Swimming,
+            4 => Self::SpinAttack,
+            5 => Self::Crouching,
+            6 => Self::LongJumping,
+            7 => Self::Dying,
+            8 => Self::Croaking,
+            9 => Self::UsingTongue,
+            10 => Self::Sitting,
+            11 => Self::Roaring,
+            12 => Self::Sniffing,
+            13 => Self::Emerging,
+            14 => Self::Digging,
+            15 => Self::Sliding,
+            16 => Self::Shooting,
+            17 => Self::Inhaling,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 17,
+                });
+            }
+        })
     }
 }
 
@@ -2875,6 +2952,132 @@ pub struct ServerboundPlayerAction {
     pub position: i64,
     pub direction: Direction,
     pub sequence: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerCommandAction {
+    PressShiftKey = 0,
+    ReleaseShiftKey = 1,
+    StopSleeping = 2,
+    StartSprinting = 3,
+    StopSprinting = 4,
+    StartRidingJump = 5,
+    StopRidingJump = 6,
+    OpenInventory = 7,
+    StartFallFlying = 8,
+}
+
+impl PlayerCommandAction {
+    fn from_wire(value: i32) -> Result<Self, CodecError> {
+        Ok(match value {
+            0 => Self::PressShiftKey,
+            1 => Self::ReleaseShiftKey,
+            2 => Self::StopSleeping,
+            3 => Self::StartSprinting,
+            4 => Self::StopSprinting,
+            5 => Self::StartRidingJump,
+            6 => Self::StopRidingJump,
+            7 => Self::OpenInventory,
+            8 => Self::StartFallFlying,
+            other => {
+                return Err(CodecError::StringTooLong {
+                    len: other as usize,
+                    max: 8,
+                });
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundPlayerCommand {
+    pub entity_id: i32,
+    pub action: PlayerCommandAction,
+    pub data: i32,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlayerInput {
+    pub forward: bool,
+    pub backward: bool,
+    pub left: bool,
+    pub right: bool,
+    pub jump: bool,
+    pub shift: bool,
+    pub sprint: bool,
+}
+
+impl PlayerInput {
+    #[must_use]
+    pub const fn from_flags(flags: u8) -> Self {
+        Self {
+            forward: flags & 0x01 != 0,
+            backward: flags & 0x02 != 0,
+            left: flags & 0x04 != 0,
+            right: flags & 0x08 != 0,
+            jump: flags & 0x10 != 0,
+            shift: flags & 0x20 != 0,
+            sprint: flags & 0x40 != 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn flags(self) -> u8 {
+        (self.forward as u8)
+            | ((self.backward as u8) << 1)
+            | ((self.left as u8) << 2)
+            | ((self.right as u8) << 3)
+            | ((self.jump as u8) << 4)
+            | ((self.shift as u8) << 5)
+            | ((self.sprint as u8) << 6)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerboundPlayerInput {
+    pub input: PlayerInput,
+}
+
+impl Packet for ServerboundPlayerInput {
+    // `.analysis/protocol-dump.txt`: SERVERBOUND_PLAYER_INPUT follows
+    // SERVERBOUND_PLAYER_COMMAND at game-SB index 43, wire id 0x2B. `javap -p -c`
+    // of `ServerboundPlayerInputPacket` and `Input$1` shows one signed byte bitset:
+    // forward, backward, left, right, jump, shift, sprint.
+    const ID: i32 = 0x2B;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_u8(self.input.flags());
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            input: PlayerInput::from_flags(buf.read_u8()?),
+        })
+    }
+}
+
+impl Packet for ServerboundPlayerCommand {
+    // `.analysis/protocol-dump.txt`: game SERVERBOUND_PLAYER_COMMAND is
+    // serverbound registration index 42, wire id 0x2A. The packet record fields
+    // are `int id`, `Action action`, then `int data`; vanilla writes all three as
+    // VarInts.
+    const ID: i32 = 0x2A;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_varint(self.action as i32);
+        buf.write_varint(self.data);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            action: PlayerCommandAction::from_wire(buf.read_varint()?)?,
+            data: buf.read_varint()?,
+        })
+    }
 }
 
 impl Packet for ServerboundPlayerAction {
