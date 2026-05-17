@@ -518,18 +518,25 @@ fn spawn_y_uses_chunk_heightmap_without_block_light_table() {
 }
 
 #[test]
-fn underwater_break_refills_target_with_water() {
-    let air = mc_world::BlockStateId(0);
-    let water = mc_world::BlockStateId(2);
-    let stone = mc_world::BlockStateId(1);
+fn break_replacement_next_to_water_uses_flowing_state() {
+    let facts = fluid_test_facts();
+    let registry = Arc::new(fluid_test_registry());
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let target = mc_world::BlockPos { x: 8, y: 63, z: 0 };
+    let plains = Identifier::parse("minecraft:plains").unwrap();
+    world
+        .insert_generated_chunk(
+            mc_world::ChunkPos { x: 0, z: 0 },
+            Chunk::empty(mc_world::ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains),
+        )
+        .unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { x: 7, y: 63, z: 0 }, mc_world::BlockStateId(2))
+        .unwrap();
 
     assert_eq!(
-        break_replacement_from_neighbours([Some(water), None, None, None, None], air, water),
-        water
-    );
-    assert_eq!(
-        break_replacement_from_neighbours([Some(stone), None, None, None, None], air, water),
-        air
+        supported_flow_state(&registry, &facts, &mut world, target, facts.fluid(2).unwrap()),
+        Some(mc_world::BlockStateId(3))
     );
 }
 

@@ -195,17 +195,20 @@ impl Client {
     /// Walk Configuration: echo `ClientboundKnownPacks` back, drain
     /// `RegistryData` until `FinishConfiguration`, then send the ack.
     pub async fn drive_configuration(&mut self) -> Result<()> {
-        let known = self.read_typed::<ClientboundKnownPacks>().await?;
+        let known = loop {
+            let frame = self.read_frame().await?;
+            if frame.id == ClientboundKnownPacks::ID {
+                break ClientboundKnownPacks::decode(&mut frame.body.clone())?;
+            }
+        };
         self.write_packet(&ServerboundKnownPacks { packs: known.packs })
             .await?;
         loop {
             let frame = self.read_frame().await?;
             if frame.id == RegistryData::ID {
-                let _ = RegistryData::decode(&mut frame.body.clone())?;
                 continue;
             }
             if frame.id == UpdateTags::ID {
-                let _ = UpdateTags::decode(&mut frame.body.clone())?;
                 continue;
             }
             if frame.id == FinishConfiguration::ID {

@@ -561,6 +561,60 @@ mod tests {
     }
 
     #[test]
+    fn falling_block_intent_distinguishes_support_from_replaceable_targets() {
+        let source = GridPos::new(0, 10, 0);
+        let mut supported = LocalBlocks {
+            solids: vec![source, source.below()],
+            fluids: Vec::new(),
+        };
+        assert_eq!(falling_block_intent(source, &mut supported), None);
+
+        let mut through_water = LocalBlocks {
+            solids: vec![source],
+            fluids: vec![source.below()],
+        };
+        assert_eq!(
+            falling_block_intent(source, &mut through_water),
+            Some(BlockUpdateIntent::Move {
+                from: source,
+                to: source.below()
+            })
+        );
+    }
+
+    #[test]
+    fn long_fall_clamps_velocity_before_ground_impact() {
+        let mut world = LocalBlocks {
+            solids: Vec::new(),
+            fluids: Vec::new(),
+        };
+        let mut body = EntityBody {
+            position: Vec3::new(0.5, 120.0, 0.5),
+            velocity: Vec3::ZERO,
+            aabb: Aabb::COW,
+            on_ground: false,
+        };
+
+        for _ in 0..200 {
+            body = step_entity(body, &mut world, PhysicsConfig::default()).body;
+        }
+
+        assert!(body.velocity.y >= TERMINAL_VELOCITY_BLOCKS_PER_SECOND);
+        assert!(body.velocity.y < -10.0);
+        assert!(!body.on_ground);
+    }
+
+    #[test]
+    fn non_fluid_blocks_do_not_emit_spread_intents() {
+        let mut world = LocalBlocks {
+            solids: vec![GridPos::new(0, 10, 0)],
+            fluids: Vec::new(),
+        };
+
+        assert!(fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 4).is_empty());
+    }
+
+    #[test]
     fn fluid_prefers_downward_spread_before_horizontal() {
         let mut world = LocalBlocks {
             solids: Vec::new(),

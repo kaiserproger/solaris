@@ -5134,9 +5134,7 @@ async fn break_replacement_state(
     z: i32,
     air: mc_world::BlockStateId,
 ) -> mc_world::BlockStateId {
-    let Some(water) = state.water else {
-        return air;
-    };
+    let pos = mc_world::BlockPos { x, y, z };
     let mut storage = state.world.lock().await;
     let neighbours = [
         (x, y + 1, z),
@@ -5151,19 +5149,27 @@ async fn break_replacement_state(
             .ok()
             .flatten()
     });
-    break_replacement_from_neighbours(neighbour_states, air, water)
-}
-
-fn break_replacement_from_neighbours(
-    neighbours: [Option<mc_world::BlockStateId>; 5],
-    air: mc_world::BlockStateId,
-    water: mc_world::BlockStateId,
-) -> mc_world::BlockStateId {
-    if neighbours.into_iter().any(|state| state == Some(water)) {
-        water
-    } else {
-        air
+    for fluid in neighbour_states
+        .into_iter()
+        .flatten()
+        .filter_map(|state_id| state.block_facts.fluid(state_id.0))
+    {
+        if let Some(flow_state) =
+            supported_flow_state(&state.blocks, &state.block_facts, &mut storage, pos, fluid)
+        {
+            return flow_state;
+        }
     }
+
+    if let Some(water) = state.water
+        && neighbour_states
+            .into_iter()
+            .any(|state| state == Some(water))
+    {
+        return water;
+    }
+
+    air
 }
 
 async fn handle_bucket_use_on<W>(

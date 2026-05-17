@@ -1,0 +1,722 @@
+//! M43 - deterministic physics validation fixtures and oracle scaffolding.
+//!
+//! These tests prepare repo-owned worlds from local vanilla sidecars. They do
+//! not embed Mojang data and skip clearly when the sidecars are absent.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
+
+use mc_protocol::packets::Packet;
+use mc_protocol::packets::play::{
+    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
+    GameMode, LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind,
+    PlayerCommandAction, PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode,
+    ServerboundChatCommand, ServerboundClientTickEnd, ServerboundKeepAlive,
+    ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerCommand,
+    ServerboundPlayerInput, ServerboundPlayerLoaded, SetCenterChunk, SetEntityMotion,
+    SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos, unpack_block_pos,
+};
+use mc_test_harness::client::Client;
+use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
+
+const VIEW_DISTANCE: i32 = 2;
+
+#[test]
+fn deterministic_physics_fixture_materializes_named_shapes() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+
+    let (mut world, states) = physics_fixture_world(Arc::clone(&blocks));
+
+    assert_eq!(
+        world.get_block(BlockPos { x: -4, y: 64, z: 0 }).unwrap(),
+        Some(states.water),
+        "fixture should contain a shallow water pool"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: -2, y: 66, z: 4 }).unwrap(),
+        Some(states.water),
+        "fixture should contain a deep swimming column"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 8, y: 63, z: 0 }).unwrap(),
+        Some(states.dirt),
+        "sugar cane support dirt should be stable and named"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 8, y: 65, z: 0 }).unwrap(),
+        Some(states.sugar_cane),
+        "sugar cane column should be present for support-break captures"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 10, y: 66, z: 0 }).unwrap(),
+        Some(states.air),
+        "falling-block target should leave air below the sand"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 10, y: 67, z: 0 }).unwrap(),
+        Some(states.sand),
+        "sand fall-start oracle should use a named vanilla sand state"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 11, y: 67, z: 0 }).unwrap(),
+        Some(states.gravel),
+        "gravel fall-start oracle should use a named vanilla gravel state"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 12, y: 67, z: 0 }).unwrap(),
+        Some(states.anvil),
+        "anvil fall-start oracle should use a named vanilla anvil state"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 6, y: 63, z: 4 }).unwrap(),
+        Some(states.farmland),
+        "farmland trampling scenario should have a target block"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 4, y: 64, z: 10 }).unwrap(),
+        Some(states.water),
+        "fluid spread oracle should include a water source"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 5, y: 64, z: 10 }).unwrap(),
+        Some(states.lava),
+        "fluid interaction oracle should include an adjacent lava source"
+    );
+}
+
+#[tokio::test]
+async fn physics_fixture_server_reaches_play_and_streams_spawn_chunk() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, sync) = connect_to_play(addr, "M43Fixture").await;
+    assert!(
+        sync.y.is_finite(),
+        "spawn y should be a finite server value"
+    );
+    drain_until_chunk(&mut client, (0, 0)).await;
+}
+
+#[tokio::test]
+async fn shallow_water_entry_emits_player_motion_observation() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M43Water").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: -4.8,
+            y: 64.0,
+            z: 0.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move into shallow water");
+    client
+        .write_packet(&ServerboundPlayerCommand {
+            entity_id: 0,
+            action: PlayerCommandAction::StartSprinting,
+            data: 0,
+        })
+        .await
+        .expect("start sprinting");
+    client
+        .write_packet(&ServerboundPlayerInput {
+            input: PlayerInput {
+                forward: true,
+                jump: true,
+                sprint: true,
+                ..PlayerInput::default()
+            },
+        })
+        .await
+        .expect("send swim input");
+
+    let motion = wait_for_player_motion(&mut client).await;
+    assert!(
+        motion.movement.z.abs() > 0.0 || motion.movement.y.abs() > 0.0,
+        "water input should produce a visible motion packet"
+    );
+}
+
+#[tokio::test]
+async fn sugar_cane_support_break_emits_real_block_edit_observation() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M43Cane").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 8.5,
+            y: 64.0,
+            z: 2.5,
+            yaw: 180.0,
+            pitch: 20.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within support break reach");
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(8, 63, 0),
+            direction: Direction::Up,
+            sequence: 43,
+        })
+        .await
+        .expect("break sugar cane support");
+
+    let observation = wait_for_block_action_observation(&mut client, 43, (8, 63, 0)).await;
+    assert_eq!(
+        observation.last_target_state(),
+        Some(states.flowing_water.0 as i32),
+        "support block next to water should match vanilla flowing-water replacement"
+    );
+    assert!(
+        observation.saw_ack,
+        "block edit should acknowledge sequence"
+    );
+}
+
+#[tokio::test]
+async fn external_vanilla_sugar_cane_support_break_oracle() {
+    let Ok(addr) = std::env::var("M43_VANILLA_ADDR") else {
+        eprintln!("skipping: M43_VANILLA_ADDR not set");
+        return;
+    };
+    let addr = addr.parse().expect("M43_VANILLA_ADDR parses");
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+
+    let (mut client, _) = connect_external_to_play(addr, "M43Oracle").await;
+    setup_vanilla_sugar_cane_fixture(&mut client).await;
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 8.5,
+            y: 64.0,
+            z: 2.5,
+            yaw: 180.0,
+            pitch: 20.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within vanilla support break reach");
+    client
+        .write_packet(&ServerboundClientTickEnd)
+        .await
+        .expect("send pre-break client tick end");
+    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(8, 63, 0),
+            direction: Direction::Up,
+            sequence: 43,
+        })
+        .await
+        .expect("break vanilla sugar cane support");
+    client
+        .write_packet(&ServerboundClientTickEnd)
+        .await
+        .expect("send break client tick end");
+
+    let observation = wait_for_block_action_observation(&mut client, 43, (8, 63, 0)).await;
+    assert_eq!(
+        observation.last_target_state(),
+        Some(states.flowing_water.0 as i32),
+        "vanilla oracle: support cell is water-replaced after break"
+    );
+    assert!(
+        observation.saw_ack,
+        "vanilla oracle: block edit should acknowledge sequence"
+    );
+}
+
+async fn start_physics_server() -> Option<std::net::SocketAddr> {
+    let vanilla_dir = vanilla_data_dir();
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
+        return None;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &report,
+    ));
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("registry builds"));
+    let (storage, _) = physics_fixture_world(Arc::clone(&blocks));
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let block_light_path = vanilla_dir.join("reports/block_light.json");
+    let block_light = mc_data::block_light::load(&block_light_path)
+        .ok()
+        .map(Arc::new);
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M43 physics validation".into(),
+        max_players: 4,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts,
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    Some(addr)
+}
+
+fn load_block_registry() -> Option<Arc<BlockRegistry>> {
+    let blocks_json = vanilla_data_dir().join("reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
+        return None;
+    }
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    Some(Arc::new(
+        mc_world::BlockRegistry::from_report(&report).expect("block registry builds"),
+    ))
+}
+
+fn vanilla_data_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla")
+}
+
+fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureStates) {
+    let states = FixtureStates::resolve(&blocks);
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(43, Arc::clone(&blocks)));
+    let mut world = WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+
+    for x in -8..=12 {
+        for z in -4..=12 {
+            set(&mut world, x, 63, z, states.stone);
+            for y in 64..=70 {
+                set(&mut world, x, y, z, states.air);
+            }
+        }
+    }
+
+    for x in -5..=-1 {
+        for z in -2..=1 {
+            set(&mut world, x, 64, z, states.water);
+        }
+    }
+    for x in -5..=-1 {
+        for z in 3..=6 {
+            for y in 64..=66 {
+                set(&mut world, x, y, z, states.water);
+            }
+        }
+    }
+
+    for x in 1..=4 {
+        for z in -2..=2 {
+            set(&mut world, x, 67, z, states.stone);
+        }
+    }
+
+    set(&mut world, 8, 63, 0, states.dirt);
+    set(&mut world, 7, 63, 0, states.water);
+    for y in 64..=66 {
+        set(&mut world, 8, y, 0, states.sugar_cane);
+    }
+
+    set(&mut world, 10, 66, 0, states.air);
+    set(&mut world, 10, 67, 0, states.sand);
+    set(&mut world, 11, 66, 0, states.air);
+    set(&mut world, 11, 67, 0, states.gravel);
+    set(&mut world, 12, 66, 0, states.air);
+    set(&mut world, 12, 67, 0, states.anvil);
+    set(&mut world, 6, 63, 4, states.farmland);
+
+    set(&mut world, 4, 63, 10, states.stone);
+    set(&mut world, 4, 64, 10, states.water);
+    set(&mut world, 5, 63, 10, states.stone);
+    set(&mut world, 5, 64, 10, states.lava);
+
+    for x in -2..=2 {
+        for z in 8..=12 {
+            set(&mut world, x, 63, z, states.stone);
+            if x == -2 || x == 2 || z == 8 || z == 12 {
+                set(&mut world, x, 64, z, states.stone);
+                set(&mut world, x, 65, z, states.stone);
+            }
+        }
+    }
+
+    (world, states)
+}
+
+fn set(world: &mut WorldStorage, x: i32, y: i32, z: i32, state: BlockStateId) {
+    world
+        .set_block_at(BlockPos { x, y, z }, state)
+        .expect("fixture block edit succeeds");
+}
+
+#[derive(Clone, Copy)]
+struct FixtureStates {
+    air: BlockStateId,
+    stone: BlockStateId,
+    dirt: BlockStateId,
+    water: BlockStateId,
+    flowing_water: BlockStateId,
+    sugar_cane: BlockStateId,
+    sand: BlockStateId,
+    gravel: BlockStateId,
+    anvil: BlockStateId,
+    farmland: BlockStateId,
+    lava: BlockStateId,
+}
+
+impl FixtureStates {
+    fn resolve(blocks: &BlockRegistry) -> Self {
+        Self {
+            air: default_state(blocks, "minecraft:air"),
+            stone: default_state(blocks, "minecraft:stone"),
+            dirt: default_state(blocks, "minecraft:dirt"),
+            water: default_state(blocks, "minecraft:water"),
+            flowing_water: state_with_props(blocks, "minecraft:water", &[("level", "1")]),
+            sugar_cane: default_state(blocks, "minecraft:sugar_cane"),
+            sand: default_state(blocks, "minecraft:sand"),
+            gravel: default_state(blocks, "minecraft:gravel"),
+            anvil: default_state(blocks, "minecraft:anvil"),
+            farmland: default_state(blocks, "minecraft:farmland"),
+            lava: default_state(blocks, "minecraft:lava"),
+        }
+    }
+}
+
+fn default_state(blocks: &BlockRegistry, name: &str) -> BlockStateId {
+    blocks
+        .block(&mc_data::Identifier::parse(name).expect("static identifier"))
+        .unwrap_or_else(|| panic!("missing block {name}"))
+        .default
+}
+
+fn state_with_props(blocks: &BlockRegistry, name: &str, props: &[(&str, &str)]) -> BlockStateId {
+    let props = props
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    blocks
+        .by_name_and_props(
+            &mc_data::Identifier::parse(name).expect("static identifier"),
+            &props,
+        )
+        .unwrap_or_else(|| panic!("missing block state {name} {props:?}"))
+}
+
+async fn connect_to_play(
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition) {
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, name).await.expect("drive login");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
+    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: GameEvent = client.read_typed().await.expect("GameEvent");
+    let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    (client, sync)
+}
+
+async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("drain chunks");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let pkt = LevelChunkWithLight::decode(&mut body).expect("decode chunk");
+            if (pkt.chunk_x, pkt.chunk_z) == target {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_player_motion(client: &mut Client) -> SetEntityMotion {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("wait for player water motion");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SetEntityMotion::ID {
+            let mut body = frame.body;
+            return SetEntityMotion::decode(&mut body).expect("decode SetEntityMotion");
+        }
+    }
+}
+
+struct BlockActionObservation {
+    target_states: Vec<i32>,
+    saw_ack: bool,
+}
+
+impl BlockActionObservation {
+    fn last_target_state(&self) -> Option<i32> {
+        self.target_states.last().copied()
+    }
+}
+
+async fn wait_for_block_action_observation(
+    client: &mut Client,
+    sequence: i32,
+    target: (i32, i32, i32),
+) -> BlockActionObservation {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut target_states = Vec::new();
+    let mut saw_ack = false;
+    let mut post_ack_deadline = None;
+    loop {
+        let now = tokio::time::Instant::now();
+        let read_deadline = if saw_ack && !target_states.is_empty() {
+            post_ack_deadline.unwrap_or(deadline)
+        } else {
+            deadline
+        };
+        if now >= read_deadline {
+            if saw_ack && !target_states.is_empty() {
+                break;
+            }
+            panic!("timed out waiting for block action observation");
+        }
+        let frame = match client
+            .read_frame_with_timeout(read_deadline.saturating_duration_since(now))
+            .await
+        {
+            Ok(frame) => frame,
+            Err(err) if saw_ack && !target_states.is_empty() => {
+                let _ = err;
+                break;
+            }
+            Err(err) => panic!("wait for block action observation: {err}"),
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
+            if unpack_block_pos(pkt.position) == target {
+                target_states.push(pkt.state_id);
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let pkt = SectionBlocksUpdate::decode(&mut body).expect("decode SectionBlocksUpdate");
+            if section_pos_matches(pkt.section_pos, target) {
+                let relative = pack_section_relative_pos(target.0, target.1, target.2);
+                for change in pkt.changes {
+                    if change.relative_pos == relative {
+                        target_states.push(change.state_id);
+                    }
+                }
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if pkt.sequence == sequence {
+                saw_ack = true;
+                post_ack_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(400));
+            }
+        }
+    }
+    BlockActionObservation {
+        target_states,
+        saw_ack,
+    }
+}
+
+fn section_pos_matches(section_pos: i64, target: (i32, i32, i32)) -> bool {
+    let sx = unpack_signed_section_coord(section_pos >> 42, 22);
+    let sy = unpack_signed_section_coord(section_pos, 20);
+    let sz = unpack_signed_section_coord(section_pos >> 20, 22);
+    sx == target.0.div_euclid(16) && sy == target.1.div_euclid(16) && sz == target.2.div_euclid(16)
+}
+
+fn unpack_signed_section_coord(value: i64, bits: u8) -> i32 {
+    let mask = (1_i64 << bits) - 1;
+    let sign = 1_i64 << (bits - 1);
+    let value = value & mask;
+    let signed = if value & sign == 0 {
+        value
+    } else {
+        value - (1_i64 << bits)
+    };
+    signed as i32
+}
+
+async fn connect_external_to_play(
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, SynchronizePlayerPosition) {
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, name).await.expect("drive login");
+    client
+        .drive_configuration()
+        .await
+        .expect("drive configuration");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut sync = None;
+    while sync.is_none() {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("wait for external Play start");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body).expect("decode SyncPlayerPos");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: pkt.teleport_id,
+                })
+                .await
+                .expect("ack teleport");
+            client
+                .write_packet(&ServerboundPlayerLoaded)
+                .await
+                .expect("send player loaded");
+            sync = Some(pkt);
+        }
+    }
+    (client, sync.expect("sync observed"))
+}
+
+async fn setup_vanilla_sugar_cane_fixture(client: &mut Client) {
+    let commands = [
+        "gamerule doDaylightCycle false",
+        "gamerule randomTickSpeed 0",
+        "tp M43Oracle 8.5 64 2.5 180 20",
+        "fill -8 63 -4 12 70 12 air",
+        "fill -8 63 -4 12 63 12 stone",
+        "setblock 8 63 0 dirt",
+        "setblock 7 63 0 water",
+        "setblock 8 64 0 sugar_cane",
+    ];
+    for command in commands {
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: command.into(),
+            })
+            .await
+            .expect("send vanilla setup command");
+        client
+            .write_packet(&ServerboundClientTickEnd)
+            .await
+            .expect("send setup client tick end");
+        drain_external_setup_frames(client, Duration::from_millis(150)).await;
+    }
+}
+
+async fn drain_external_setup_frames(client: &mut Client, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body).expect("decode setup sync");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: pkt.teleport_id,
+                })
+                .await
+                .expect("ack setup teleport");
+        }
+    }
+}
+
+async fn handle_keepalive(client: &mut Client, id: i32, body: &bytes::Bytes) -> bool {
+    if id != ClientboundKeepAlive::ID {
+        return false;
+    }
+    let mut body = body.clone();
+    let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+    client
+        .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+        .await
+        .expect("echo KeepAlive");
+    true
+}
