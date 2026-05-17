@@ -1223,9 +1223,10 @@ async fn load_chunk_neighbourhood(
         std::array::from_fn(|_| std::array::from_fn(|_| None));
     let mut centre = None;
     let mut staged = Vec::new();
+    let mut disk_plan = None;
 
     let generator = {
-        let mut storage = crate::lock_metrics::timed_guard(
+        let storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::ChunkPrepare,
             "chunk prepare snapshot",
             Instant::now(),
@@ -1239,15 +1240,14 @@ async fn load_chunk_neighbourhood(
                 fetch_started.elapsed().as_millis() as u64,
             ));
         }
-        match storage.get_chunk_without_generation(ChunkPos { x: cx, z: cz }) {
-            Ok(Some(chunk)) => {
-                let chunk = Arc::new(chunk);
+        match storage.plan_chunk_snapshot_without_generation(ChunkPos { x: cx, z: cz }) {
+            mc_world::ChunkSnapshotPlan::Cached(chunk) => {
+                let chunk = Arc::new(*chunk);
                 centre = Some(Arc::clone(&chunk));
                 neighbourhood[1][1] = Some(chunk);
                 staged.push((cx, cz));
             }
-            Ok(None) => {}
-            Err(err) => warn!(cx, cz, error = %err, "chunk read failed; skipping"),
+            mc_world::ChunkSnapshotPlan::Load(plan) => disk_plan = Some(plan),
         }
         for (dz, row) in neighbourhood.iter_mut().enumerate() {
             for (dx, slot) in row.iter_mut().enumerate() {
@@ -1264,6 +1264,43 @@ async fn load_chunk_neighbourhood(
         }
         storage.generator()
     };
+
+    if centre.is_none()
+        && let Some(plan) = disk_plan
+    {
+        match plan.load() {
+            Ok(Some(chunk)) => {
+                let chunk = {
+                    let mut storage = crate::lock_metrics::timed_guard(
+                        crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                        "chunk prepare disk commit",
+                        Instant::now(),
+                        world.lock().await,
+                    );
+                    if !is_active_request(request, &active_generation) {
+                        return Ok((
+                            None,
+                            neighbourhood,
+                            staged,
+                            fetch_started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                    storage.commit_chunk_snapshot(ChunkPos { x: cx, z: cz }, chunk)
+                };
+                match chunk {
+                    Ok(chunk) => {
+                        let chunk = Arc::new(chunk);
+                        centre = Some(Arc::clone(&chunk));
+                        neighbourhood[1][1] = Some(chunk);
+                        staged.push((cx, cz));
+                    }
+                    Err(err) => warn!(cx, cz, error = %err, "chunk commit failed; skipping"),
+                }
+            }
+            Ok(None) => {}
+            Err(err) => warn!(cx, cz, error = %err, "chunk read failed; skipping"),
+        }
+    }
 
     if centre.is_none()
         && let Some(generator) = generator

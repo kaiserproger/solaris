@@ -95,6 +95,150 @@ pub struct WorldStorageStats {
     pub dirty_chunks: usize,
 }
 
+#[derive(Debug, Clone)]
+pub struct DirtyFlushPlan {
+    regions: Vec<DirtyFlushRegionPlan>,
+    chunks: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyFlushRegionPlan {
+    region: (i32, i32),
+    region_path: PathBuf,
+    cached_payloads: Option<Vec<ChunkPayload>>,
+    dirty_payloads: Vec<PlannedChunkPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedChunkPayload {
+    pos: ChunkPos,
+    payload: ChunkPayload,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirtyFlushCommit {
+    regions: Vec<DirtyFlushRegionCommit>,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyFlushRegionCommit {
+    region: (i32, i32),
+    chunks: Vec<CommittedChunkPayload>,
+}
+
+#[derive(Debug, Clone)]
+struct CommittedChunkPayload {
+    pos: ChunkPos,
+    uncompressed_nbt: Vec<u8>,
+}
+
+pub enum ChunkSnapshotPlan {
+    Cached(Box<Chunk>),
+    Load(ChunkDiskLoadPlan),
+}
+
+pub struct ChunkDiskLoadPlan {
+    pos: ChunkPos,
+    local: (u8, u8),
+    region_path: PathBuf,
+    cached_region: Option<Arc<DecodedRegion>>,
+    registry: Arc<BlockRegistry>,
+    item_registry: Option<Arc<ItemRegistry>>,
+}
+
+impl ChunkDiskLoadPlan {
+    #[must_use]
+    pub fn pos(&self) -> ChunkPos {
+        self.pos
+    }
+
+    pub fn load(self) -> Result<Option<Chunk>, WorldError> {
+        let payload = if let Some(region) = self.cached_region {
+            region.get(&self.local).cloned()
+        } else if self.region_path.is_file() {
+            read_region(&self.region_path)?
+                .into_iter()
+                .find(|payload| (payload.local_x, payload.local_z) == self.local)
+        } else {
+            None
+        };
+
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
+        let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
+        let (_, root) = mc_nbt::read_named(&mut cursor)?;
+        chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())
+            .map(Some)
+            .map_err(WorldError::from)
+    }
+}
+
+impl DirtyFlushPlan {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.chunks == 0
+    }
+
+    #[must_use]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks
+    }
+
+    pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
+        let mut commits = Vec::with_capacity(self.regions.len());
+        for region in self.regions {
+            let mut by_slot: HashMap<(u8, u8), ChunkPayload> =
+                if let Some(payloads) = region.cached_payloads {
+                    payloads
+                        .into_iter()
+                        .map(|p| ((p.local_x, p.local_z), p))
+                        .collect()
+                } else if region.region_path.is_file() {
+                    read_region(&region.region_path)?
+                        .into_iter()
+                        .map(|p| ((p.local_x, p.local_z), p))
+                        .collect()
+                } else {
+                    HashMap::new()
+                };
+
+            for planned in &region.dirty_payloads {
+                by_slot.insert(
+                    (planned.payload.local_x, planned.payload.local_z),
+                    planned.payload.clone(),
+                );
+            }
+
+            let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
+            payloads.sort_by_key(|p| (p.local_z, p.local_x));
+
+            let tmp_path = region.region_path.with_extension("mca.tmp");
+            write_region(&tmp_path, &payloads)?;
+            std::fs::rename(&tmp_path, &region.region_path).map_err(|e| {
+                WorldError::Region(RegionError::Io {
+                    path: region.region_path.clone(),
+                    source: e,
+                })
+            })?;
+
+            commits.push(DirtyFlushRegionCommit {
+                region: region.region,
+                chunks: region
+                    .dirty_payloads
+                    .into_iter()
+                    .map(|planned| CommittedChunkPayload {
+                        pos: planned.pos,
+                        uncompressed_nbt: planned.payload.uncompressed_nbt,
+                    })
+                    .collect(),
+            });
+        }
+
+        Ok(DirtyFlushCommit { regions: commits })
+    }
+}
+
 impl WorldStorage {
     /// Open a world directory. Tries the 1.20+ layout
     /// (`dimensions/minecraft/overworld/region/`) first, falls back
@@ -272,6 +416,40 @@ impl WorldStorage {
     ) -> Result<Option<Chunk>, WorldError> {
         self.ensure_chunk_loaded(cpos, false)?;
         Ok(self.cache.get(&cpos).cloned())
+    }
+
+    pub fn plan_chunk_snapshot_without_generation(&self, cpos: ChunkPos) -> ChunkSnapshotPlan {
+        if let Some(chunk) = self.cache.get(&cpos) {
+            return ChunkSnapshotPlan::Cached(Box::new(chunk.clone()));
+        }
+        let (rx, rz) = region_of(cpos);
+        let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+        let local_z = cpos.z.rem_euclid(REGION_AXIS_CHUNKS) as u8;
+        ChunkSnapshotPlan::Load(ChunkDiskLoadPlan {
+            pos: cpos,
+            local: (local_x, local_z),
+            region_path: self.region_root.join(format!("r.{rx}.{rz}.mca")),
+            cached_region: self.regions.get(&(rx, rz)).cloned(),
+            registry: Arc::clone(&self.registry),
+            item_registry: self.item_registry.clone(),
+        })
+    }
+
+    pub fn commit_chunk_snapshot(
+        &mut self,
+        cpos: ChunkPos,
+        chunk: Chunk,
+    ) -> Result<Chunk, WorldError> {
+        if !self.cache.contains_key(&cpos) {
+            self.insert_chunk(cpos, chunk)?;
+        } else {
+            self.touch(cpos);
+        }
+        Ok(self
+            .cache
+            .get(&cpos)
+            .expect("chunk snapshot commit leaves chunk cached")
+            .clone())
     }
 
     /// Clone a resident chunk without disk IO or generation.
@@ -526,6 +704,18 @@ impl WorldStorage {
         Ok(chunk.drain_due_fluid_ticks(world_tick, max_ticks))
     }
 
+    pub fn drain_due_cached_fluid_ticks(
+        &mut self,
+        cpos: ChunkPos,
+        world_tick: u64,
+        max_ticks: usize,
+    ) -> Vec<ScheduledFluidTick> {
+        let Some(chunk) = self.cache.get_mut(&cpos) else {
+            return Vec::new();
+        };
+        chunk.drain_due_fluid_ticks(world_tick, max_ticks)
+    }
+
     /// Insert a freshly generated chunk through the same cache/LRU path
     /// as the lazy generator fallback. Existing cached chunks win.
     pub fn insert_generated_chunk(
@@ -628,25 +818,30 @@ impl WorldStorage {
             self.touch(cpos);
             return Ok(());
         }
-        // M6.b: if eviction would drop a dirty chunk, flush every
-        // dirty chunk to disk first. Spawn-burst loads aren't dirty,
-        // so this only fires after player edits.
-        if self.cache.len() >= self.capacity
-            && let Some(front) = self.lru.front()
-            && self.cache.get(front).is_some_and(|c| c.dirty)
-        {
-            self.flush_dirty()?;
-        }
-        while self.cache.len() >= self.capacity {
-            if let Some(evict) = self.lru.pop_front() {
-                self.cache.remove(&evict);
-            } else {
-                break;
-            }
-        }
+        // Dirty chunks are never evicted here: flushing them can rewrite
+        // region files while callers hold the shared world mutex. If every
+        // resident chunk is dirty, the cache grows until the save pipeline
+        // commits them clean.
+        while self.cache.len() >= self.capacity && self.evict_clean_chunk() {}
         self.cache.insert(cpos, chunk);
         self.lru.push_back(cpos);
         Ok(())
+    }
+
+    fn evict_clean_chunk(&mut self) -> bool {
+        let scan_len = self.lru.len();
+        for _ in 0..scan_len {
+            let Some(evict) = self.lru.pop_front() else {
+                return false;
+            };
+            if self.cache.get(&evict).is_some_and(|chunk| chunk.dirty) {
+                self.lru.push_back(evict);
+                continue;
+            }
+            self.cache.remove(&evict);
+            return true;
+        }
+        false
     }
 
     fn touch(&mut self, cpos: ChunkPos) {
@@ -686,102 +881,114 @@ impl WorldStorage {
         }
     }
 
-    /// M6.b: write every dirty chunk in the cache back to its
-    /// `.mca` region file. Returns the number of chunks flushed.
-    /// Groups dirty chunks by region so each `r.X.Z.mca` is rewritten
-    /// at most once per call.
-    pub fn flush_dirty(&mut self) -> Result<usize, WorldError> {
+    /// Build a dirty chunk flush plan without touching disk. The plan
+    /// owns the encoded chunk payloads so callers can write the region
+    /// files after releasing any outer world mutex.
+    pub fn plan_dirty_flush(&self) -> Result<DirtyFlushPlan, WorldError> {
         let dirty_positions: Vec<ChunkPos> = self
             .cache
             .iter()
             .filter_map(|(pos, chunk)| chunk.dirty.then_some(*pos))
             .collect();
         if dirty_positions.is_empty() {
-            return Ok(0);
+            return Ok(DirtyFlushPlan {
+                regions: Vec::new(),
+                chunks: 0,
+            });
         }
         let mut by_region: HashMap<(i32, i32), Vec<ChunkPos>> = HashMap::new();
         for pos in dirty_positions {
             by_region.entry(region_of(pos)).or_default().push(pos);
         }
-        let mut flushed = 0usize;
-        for ((rx, rz), positions) in by_region {
-            flushed += self.flush_region(rx, rz, &positions)?;
-        }
-        Ok(flushed)
-    }
-
-    /// Flush one region: merge the listed dirty chunks (which must
-    /// all live in `(rx, rz)`) with whatever already sits on disk,
-    /// then rewrite the region file atomically via a sibling temp +
-    /// rename. The region cache for this region is dropped on
-    /// success so the next read picks up the fresh bytes.
-    fn flush_region(
-        &mut self,
-        rx: i32,
-        rz: i32,
-        positions: &[ChunkPos],
-    ) -> Result<usize, WorldError> {
-        let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
-        // Load existing payloads (if any) so unmodified slots survive.
-        let mut by_slot: HashMap<(u8, u8), ChunkPayload> =
-            if let Some(region) = self.regions.get(&(rx, rz)) {
-                region
-                    .values()
-                    .cloned()
-                    .map(|p| ((p.local_x, p.local_z), p))
-                    .collect()
-            } else if region_path.is_file() {
-                read_region(&region_path)?
-                    .into_iter()
-                    .map(|p| ((p.local_x, p.local_z), p))
-                    .collect()
-            } else {
-                HashMap::new()
-            };
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as u32)
             .unwrap_or(0);
-
-        for &cpos in positions {
-            let chunk = self
-                .cache
-                .get(&cpos)
-                .expect("dirty position must still be in cache");
-            let payload = chunk_to_payload_with_items(
-                chunk,
-                &self.registry,
-                self.item_registry.as_deref(),
-                now,
-            )?;
-            by_slot.insert((payload.local_x, payload.local_z), payload);
+        let mut regions = Vec::with_capacity(by_region.len());
+        let mut chunks = 0usize;
+        for ((rx, rz), mut positions) in by_region {
+            positions.sort_by_key(|pos| (pos.z, pos.x));
+            let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
+            let cached_payloads = self
+                .regions
+                .get(&(rx, rz))
+                .map(|region| region.values().cloned().collect());
+            let mut dirty_payloads = Vec::with_capacity(positions.len());
+            for cpos in positions {
+                let chunk = self
+                    .cache
+                    .get(&cpos)
+                    .expect("dirty position must still be in cache");
+                let payload = chunk_to_payload_with_items(
+                    chunk,
+                    &self.registry,
+                    self.item_registry.as_deref(),
+                    now,
+                )?;
+                dirty_payloads.push(PlannedChunkPayload { pos: cpos, payload });
+                chunks += 1;
+            }
+            regions.push(DirtyFlushRegionPlan {
+                region: (rx, rz),
+                region_path,
+                cached_payloads,
+                dirty_payloads,
+            });
         }
 
-        let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
-        payloads.sort_by_key(|p| (p.local_z, p.local_x));
+        Ok(DirtyFlushPlan { regions, chunks })
+    }
 
-        let tmp_path = region_path.with_extension("mca.tmp");
-        write_region(&tmp_path, &payloads)?;
-        std::fs::rename(&tmp_path, &region_path).map_err(|e| {
-            WorldError::Region(RegionError::Io {
-                path: region_path.clone(),
-                source: e,
-            })
-        })?;
+    /// Commit a written flush plan. Chunks are marked clean only if
+    /// their current encoded payload still matches the payload that
+    /// was written; chunks changed after planning remain dirty.
+    pub fn commit_dirty_flush(&mut self, commit: DirtyFlushCommit) -> Result<usize, WorldError> {
+        let mut clean = Vec::new();
+        for region in &commit.regions {
+            for planned in &region.chunks {
+                let Some(chunk) = self.cache.get(&planned.pos) else {
+                    continue;
+                };
+                if !chunk.dirty {
+                    continue;
+                }
+                let current = chunk_to_payload_with_items(
+                    chunk,
+                    &self.registry,
+                    self.item_registry.as_deref(),
+                    0,
+                )?;
+                if current.uncompressed_nbt == planned.uncompressed_nbt {
+                    clean.push(planned.pos);
+                }
+            }
+        }
 
-        // Mark flushed chunks clean.
-        for &cpos in positions {
-            if let Some(chunk) = self.cache.get_mut(&cpos) {
+        for cpos in &clean {
+            if let Some(chunk) = self.cache.get_mut(cpos) {
                 chunk.dirty = false;
             }
         }
-        // Drop the region cache for this region so a subsequent read
-        // sees the freshly-written bytes.
-        self.regions.remove(&(rx, rz));
-        self.region_lru.retain(|&k| k != (rx, rz));
+        for region in commit.regions {
+            self.regions.remove(&region.region);
+            self.region_lru.retain(|&k| k != region.region);
+        }
 
-        Ok(positions.len())
+        Ok(clean.len())
+    }
+
+    /// M6.b: write every dirty chunk in the cache back to its
+    /// `.mca` region file. Returns the number of chunks flushed.
+    /// Groups dirty chunks by region so each `r.X.Z.mca` is rewritten
+    /// at most once per call.
+    pub fn flush_dirty(&mut self) -> Result<usize, WorldError> {
+        let plan = self.plan_dirty_flush()?;
+        if plan.is_empty() {
+            return Ok(0);
+        }
+        let commit = plan.write()?;
+        self.commit_dirty_flush(commit)
     }
 
     /// Number of dirty chunks currently in the cache. Used by tests
@@ -1370,6 +1577,155 @@ mod tests {
             WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
         let after = world2.get_block(edit_pos).unwrap().unwrap();
         assert_eq!(after, new_state);
+    }
+
+    #[test]
+    fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
+        use crate::chunk::ChunkGenerator;
+        use mc_data::Identifier;
+
+        struct StubGen {
+            stone: BlockStateId,
+        }
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let air = BlockStateId(0);
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, air, biome);
+                chunk.set_block(3, 0, 5, self.stone);
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let report = vec![
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:dirt").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 2,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+        ];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen {
+                    stone: BlockStateId(1),
+                }));
+
+        let edit_pos = BlockPos { x: 3, y: 0, z: 5 };
+        world.get_block(edit_pos).unwrap().unwrap();
+        world
+            .set_block_at(edit_pos, BlockStateId(2))
+            .unwrap()
+            .unwrap();
+        let plan = world.plan_dirty_flush().unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+
+        world
+            .set_block_at(edit_pos, BlockStateId(1))
+            .unwrap()
+            .unwrap();
+        let commit = plan.write().unwrap();
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+        assert_eq!(world.dirty_count(), 1);
+
+        let mut fresh =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
+        assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(2)));
+
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+        assert_eq!(world.dirty_count(), 0);
+        let mut fresh = WorldStorage::open_with_capacity(tmp_world.path(), registry, 16).unwrap();
+        assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(1)));
+    }
+
+    #[test]
+    fn dirty_lru_eviction_does_not_flush_under_insert() {
+        use crate::chunk::ChunkGenerator;
+        use mc_data::Identifier;
+
+        struct StubGen;
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let air = BlockStateId(0);
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, air, biome);
+                chunk.set_block(0, 0, 0, BlockStateId(1));
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let report = vec![
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+        ];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(tmp_world.path(), registry, 1)
+            .unwrap()
+            .with_generator(Arc::new(StubGen));
+
+        assert_eq!(
+            world.get_block(BlockPos { x: 0, y: 0, z: 0 }).unwrap(),
+            Some(BlockStateId(1))
+        );
+        assert_eq!(world.dirty_count(), 1);
+
+        assert_eq!(
+            world.get_block(BlockPos { x: 16, y: 0, z: 0 }).unwrap(),
+            Some(BlockStateId(1))
+        );
+
+        assert_eq!(world.cache_len(), 2);
+        assert_eq!(world.dirty_count(), 2);
+        assert!(!tmp_world.path().join("region/r.0.0.mca").exists());
     }
 
     #[test]

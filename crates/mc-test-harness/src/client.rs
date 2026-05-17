@@ -9,6 +9,7 @@
 //! print-and-go style: every step is a fallible async fn and the
 //! caller decides what to assert.
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::time::Duration;
 
@@ -34,6 +35,7 @@ use uuid::Uuid;
 pub struct Client {
     stream: TcpStream,
     rbuf: BytesMut,
+    pending: VecDeque<RawFrame>,
     compression: Compression,
 }
 
@@ -46,6 +48,7 @@ impl Client {
         Ok(Self {
             stream,
             rbuf: BytesMut::with_capacity(8192),
+            pending: VecDeque::new(),
             compression: Compression::Disabled,
         })
     }
@@ -64,6 +67,13 @@ impl Client {
 
     /// Read until exactly one frame can be parsed off the buffer.
     pub async fn read_frame(&mut self) -> Result<RawFrame> {
+        if let Some(frame) = self.pending.pop_front() {
+            return Ok(frame);
+        }
+        self.read_network_frame().await
+    }
+
+    async fn read_network_frame(&mut self) -> Result<RawFrame> {
         loop {
             if let Some(frame) = try_decode_frame(&mut self.rbuf, self.compression)? {
                 return Ok(frame);
@@ -79,6 +89,48 @@ impl Client {
         match tokio::time::timeout(dur, self.read_frame()).await {
             Ok(r) => r,
             Err(_) => bail!("timed out after {:?} waiting for a frame", dur),
+        }
+    }
+
+    pub async fn wait_for_frame_id_with_timeout(
+        &mut self,
+        packet_id: i32,
+        dur: Duration,
+    ) -> Result<RawFrame> {
+        if let Some(index) = self.pending.iter().position(|frame| frame.id == packet_id) {
+            return Ok(self
+                .pending
+                .remove(index)
+                .expect("position came from pending frame buffer"));
+        }
+
+        let started = tokio::time::Instant::now();
+        loop {
+            let Some(remaining) = dur.checked_sub(started.elapsed()) else {
+                bail!(
+                    "timed out after {:?} waiting for packet id 0x{packet_id:02X}",
+                    dur
+                );
+            };
+            if remaining.is_zero() {
+                bail!(
+                    "timed out after {:?} waiting for packet id 0x{packet_id:02X}",
+                    dur
+                );
+            }
+            let frame = match tokio::time::timeout(remaining, self.read_network_frame()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    bail!(
+                        "timed out after {:?} waiting for packet id 0x{packet_id:02X}",
+                        dur
+                    )
+                }
+            };
+            if frame.id == packet_id {
+                return Ok(frame);
+            }
+            self.pending.push_back(frame);
         }
     }
 

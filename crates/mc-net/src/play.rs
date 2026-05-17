@@ -3626,7 +3626,7 @@ pub(crate) async fn run_random_ticks(
     {
         let mut storage = world.lock().await;
         for sample in &samples {
-            let Ok(Some(state)) = storage.get_block(sample.pos) else {
+            let Some(state) = storage.get_cached_block(sample.pos) else {
                 continue;
             };
             sampled += 1;
@@ -3707,16 +3707,10 @@ pub(crate) async fn run_scheduled_fluid_ticks(
             }
             let cpos = ChunkPos { x: cx, z: cz };
             let remaining = policy.fluid_tick_budget - drained;
-            let due = match storage.drain_due_fluid_ticks(cpos, world_tick, remaining) {
-                Ok(due) => due,
-                Err(err) => {
-                    warn!(error = %err, cx, cz, "scheduled fluid tick drain failed");
-                    continue;
-                }
-            };
+            let due = storage.drain_due_cached_fluid_ticks(cpos, world_tick, remaining);
             drained += due.len();
             for tick in due {
-                let Ok(Some(state)) = storage.get_block(tick.pos) else {
+                let Some(state) = storage.get_cached_block(tick.pos) else {
                     continue;
                 };
                 let Some(fluid) = config.block_facts.fluid(state.0) else {

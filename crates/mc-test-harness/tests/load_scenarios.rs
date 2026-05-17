@@ -129,6 +129,31 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
         spawns,
         started.elapsed().as_millis()
     );
+
+    let pressure = mc_net::lock_pressure_snapshot();
+    eprintln!(
+        "M42 lock_pressure world(wait={}us max_wait={}us hold={}us max_hold={}us) session(wait={}us max_wait={}us hold={}us max_hold={}us) save(wait={}us max_wait={}us hold={}us max_hold={}us) chunk_prepare(wait={}us max_wait={}us hold={}us max_hold={}us) player_persistence(wait={}us max_wait={}us hold={}us max_hold={}us)",
+        pressure.world_storage.wait_us,
+        pressure.world_storage.max_wait_us,
+        pressure.world_storage.hold_us,
+        pressure.world_storage.max_hold_us,
+        pressure.session_registry.wait_us,
+        pressure.session_registry.max_wait_us,
+        pressure.session_registry.hold_us,
+        pressure.session_registry.max_hold_us,
+        pressure.save_all_flush.wait_us,
+        pressure.save_all_flush.max_wait_us,
+        pressure.save_all_flush.hold_us,
+        pressure.save_all_flush.max_hold_us,
+        pressure.chunk_prepare.wait_us,
+        pressure.chunk_prepare.max_wait_us,
+        pressure.chunk_prepare.hold_us,
+        pressure.chunk_prepare.max_hold_us,
+        pressure.player_persistence.wait_us,
+        pressure.player_persistence.max_wait_us,
+        pressure.player_persistence.hold_us,
+        pressure.player_persistence.max_hold_us,
+    );
 }
 
 struct LoadServer {

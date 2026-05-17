@@ -17,22 +17,22 @@ pub(crate) enum LockMetricKind {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct LockMetricSnapshot {
-    pub(crate) wait_count: u64,
-    pub(crate) wait_us: u64,
-    pub(crate) max_wait_us: u64,
-    pub(crate) hold_count: u64,
-    pub(crate) hold_us: u64,
-    pub(crate) max_hold_us: u64,
+pub struct LockMetricSnapshot {
+    pub wait_count: u64,
+    pub wait_us: u64,
+    pub max_wait_us: u64,
+    pub hold_count: u64,
+    pub hold_us: u64,
+    pub max_hold_us: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct LockMetricsSnapshot {
-    pub(crate) world_storage: LockMetricSnapshot,
-    pub(crate) session_registry: LockMetricSnapshot,
-    pub(crate) save_all_flush: LockMetricSnapshot,
-    pub(crate) chunk_prepare: LockMetricSnapshot,
-    pub(crate) player_persistence: LockMetricSnapshot,
+pub struct LockMetricsSnapshot {
+    pub world_storage: LockMetricSnapshot,
+    pub session_registry: LockMetricSnapshot,
+    pub save_all_flush: LockMetricSnapshot,
+    pub chunk_prepare: LockMetricSnapshot,
+    pub player_persistence: LockMetricSnapshot,
 }
 
 struct LockMetric {
@@ -111,6 +111,10 @@ pub(crate) fn snapshot() -> LockMetricsSnapshot {
         chunk_prepare: CHUNK_PREPARE.snapshot(),
         player_persistence: PLAYER_PERSISTENCE.snapshot(),
     }
+}
+
+pub fn lock_pressure_snapshot() -> LockMetricsSnapshot {
+    snapshot()
 }
 
 impl<G: Deref> Deref for TimedGuard<G> {

@@ -4,8 +4,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
 use bytes::BytesMut;
@@ -34,6 +34,8 @@ use crate::ChunkPipelinePolicy;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
+
+static SAVE_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -213,7 +215,20 @@ pub struct SaveAllReport {
     pub entities_saved: usize,
     pub chunks_flushed: usize,
     pub world_metadata_saved: bool,
+    pub timings: SaveAllTimings,
     pub errors: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SaveAllTimings {
+    pub queued_us: u64,
+    pub players_us: u64,
+    pub entities_us: u64,
+    pub metadata_us: u64,
+    pub flush_plan_us: u64,
+    pub flush_write_us: u64,
+    pub flush_commit_us: u64,
+    pub total_us: u64,
 }
 
 impl SaveAllReport {
@@ -851,14 +866,22 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
 }
 
 pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -> SaveAllReport {
+    let total_started = Instant::now();
+    let queue_started = Instant::now();
+    let _save_guard = SAVE_COORDINATOR.get_or_init(|| Mutex::new(())).lock().await;
     let mut report = SaveAllReport {
         players_saved: 0,
         entities_saved: 0,
         chunks_flushed: 0,
         world_metadata_saved: false,
+        timings: SaveAllTimings {
+            queued_us: elapsed_us(queue_started),
+            ..SaveAllTimings::default()
+        },
         errors: Vec::new(),
     };
     let Some(world) = config.world.as_ref() else {
+        report.timings.total_us = elapsed_us(total_started);
         return report;
     };
     let root = {
@@ -871,9 +894,11 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
         storage.world_root().map(std::path::Path::to_path_buf)
     };
     let Some(root) = root else {
+        report.timings.total_us = elapsed_us(total_started);
         return report;
     };
 
+    let started = Instant::now();
     for (uuid, player) in sessions.persisted_player_states() {
         match play::persistence::save_player_state(&root, uuid, &config.items, &player) {
             Ok(()) => report.players_saved += 1,
@@ -882,13 +907,17 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
                 .push(format!("player {uuid}: save failed: {err}")),
         }
     }
+    report.timings.players_us = elapsed_us(started);
 
+    let started = Instant::now();
     let entities = sessions.persisted_entity_snapshots();
     report.entities_saved = entities.len();
     if let Err(err) = play::persistence::save_persisted_entities(&root, &config.items, &entities) {
         report.errors.push(format!("entities: save failed: {err}"));
     }
+    report.timings.entities_us = elapsed_us(started);
 
+    let started = Instant::now();
     let metadata = play::persistence::WorldPersistedMetadata {
         world_time: sessions.world_time(),
         world_identity: play::persistence::world_identity(&root),
@@ -899,21 +928,77 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
             .errors
             .push(format!("world metadata: save failed: {err}")),
     }
+    report.timings.metadata_us = elapsed_us(started);
 
-    let mut storage = crate::lock_metrics::timed_guard(
+    let started = Instant::now();
+    let storage = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::SaveAllFlush,
-        "save-all dirty flush",
+        "save-all dirty flush plan",
         Instant::now(),
         world.lock().await,
     );
     let storage_before = storage.stats();
+    let flush_plan = match storage.plan_dirty_flush() {
+        Ok(plan) => plan,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("dirty chunks: flush plan failed: {err}"));
+            report.timings.flush_plan_us = elapsed_us(started);
+            report.timings.total_us = elapsed_us(total_started);
+            return report;
+        }
+    };
+    drop(storage);
+    report.timings.flush_plan_us = elapsed_us(started);
+
+    let planned_chunks = flush_plan.chunk_count();
     let flush_started = Instant::now();
-    match storage.flush_dirty() {
+    if flush_plan.is_empty() {
+        info!(
+            flushed = 0usize,
+            planned = 0usize,
+            flush_us = elapsed_us(flush_started),
+            chunk_cache_len = storage_before.chunk_cache_len,
+            chunk_cache_capacity = storage_before.chunk_cache_capacity,
+            region_cache_len = storage_before.region_cache_len,
+            region_cache_capacity = storage_before.region_cache_capacity,
+            dirty_before = storage_before.dirty_chunks,
+            dirty_after = storage_before.dirty_chunks,
+            "world storage save pressure"
+        );
+        report.timings.total_us = elapsed_us(total_started);
+        return report;
+    }
+
+    let started = Instant::now();
+    let commit = match flush_plan.write() {
+        Ok(commit) => commit,
+        Err(err) => {
+            report
+                .errors
+                .push(format!("dirty chunks: flush write failed: {err}"));
+            report.timings.flush_write_us = elapsed_us(started);
+            report.timings.total_us = elapsed_us(total_started);
+            return report;
+        }
+    };
+    report.timings.flush_write_us = elapsed_us(started);
+
+    let started = Instant::now();
+    let mut storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::SaveAllFlush,
+        "save-all dirty flush commit",
+        Instant::now(),
+        world.lock().await,
+    );
+    match storage.commit_dirty_flush(commit) {
         Ok(flushed) => {
             report.chunks_flushed = flushed;
             let storage_after = storage.stats();
             info!(
                 flushed,
+                planned = planned_chunks,
                 flush_us = elapsed_us(flush_started),
                 chunk_cache_len = storage_after.chunk_cache_len,
                 chunk_cache_capacity = storage_after.chunk_cache_capacity,
@@ -926,8 +1011,10 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
         }
         Err(err) => report
             .errors
-            .push(format!("dirty chunks: flush failed: {err}")),
+            .push(format!("dirty chunks: flush commit failed: {err}")),
     }
+    report.timings.flush_commit_us = elapsed_us(started);
+    report.timings.total_us = elapsed_us(total_started);
 
     report
 }

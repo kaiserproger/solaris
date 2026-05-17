@@ -63,30 +63,25 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
         .await
         .expect("send gamemode command");
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut saw_gamemode = false;
-    let mut saw_feedback = false;
-    while !(saw_gamemode && saw_feedback) {
+    loop {
         let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
+            .wait_for_frame_id_with_timeout(GameEvent::ID, Duration::from_secs(5))
             .await
-            .expect("command response frame");
-        if frame.id == GameEvent::ID {
-            let event = GameEvent::decode(&mut frame.body.clone()).expect("decode GameEvent");
-            if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
-                && event.value == GameMode::Creative.id() as f32
-            {
-                saw_gamemode = true;
-            }
-        } else if frame.id == ClientboundSystemChat::ID {
-            let feedback =
-                ClientboundSystemChat::decode(&mut frame.body.clone()).expect("decode SystemChat");
-            assert!(!feedback.content_nbt.is_empty());
-            saw_feedback = true;
+            .expect("gamemode event frame");
+        let event = GameEvent::decode(&mut frame.body.clone()).expect("decode GameEvent");
+        if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
+            && event.value == GameMode::Creative.id() as f32
+        {
+            break;
         }
     }
+    let frame = client
+        .wait_for_frame_id_with_timeout(ClientboundSystemChat::ID, Duration::from_secs(5))
+        .await
+        .expect("command feedback frame");
+    let feedback =
+        ClientboundSystemChat::decode(&mut frame.body.clone()).expect("decode SystemChat");
+    assert!(!feedback.content_nbt.is_empty());
 }
 
 #[tokio::test]
@@ -118,16 +113,9 @@ async fn client_receives_continuing_world_time_updates() {
 }
 
 async fn next_time_update(client: &mut Client) -> ClientboundSetTime {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("world time frame");
-        if frame.id == ClientboundSetTime::ID {
-            return ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime");
-        }
-    }
+    let frame = client
+        .wait_for_frame_id_with_timeout(ClientboundSetTime::ID, Duration::from_secs(5))
+        .await
+        .expect("world time frame");
+    ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime")
 }
