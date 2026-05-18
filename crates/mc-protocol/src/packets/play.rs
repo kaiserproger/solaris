@@ -1132,6 +1132,49 @@ impl Packet for EntityEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoveEntityPos {
+    pub entity_id: i32,
+    pub delta_x: i16,
+    pub delta_y: i16,
+    pub delta_z: i16,
+    pub on_ground: bool,
+}
+
+impl MoveEntityPos {
+    #[must_use]
+    pub fn delta_to_short(delta: f64) -> i16 {
+        move_entity_delta_to_short(delta)
+    }
+}
+
+impl Packet for MoveEntityPos {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_MOVE_ENTITY_POS
+    // immediately precedes CLIENTBOUND_MOVE_ENTITY_POS_ROT, so its game-CB
+    // index is 53 = wire id 0x35. `ClientboundMoveEntityPacket$Pos` carries
+    // VarInt id, three i16 relative deltas, then onGround bool.
+    const ID: i32 = 0x35;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_i16(self.delta_x);
+        buf.write_i16(self.delta_y);
+        buf.write_i16(self.delta_z);
+        buf.write_bool(self.on_ground);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            delta_x: buf.read_i16()?,
+            delta_y: buf.read_i16()?,
+            delta_z: buf.read_i16()?,
+            on_ground: buf.read_bool()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoveEntityPosRot {
     pub entity_id: i32,
     pub delta_x: i16,
@@ -1145,15 +1188,19 @@ pub struct MoveEntityPosRot {
 impl MoveEntityPosRot {
     #[must_use]
     pub fn delta_to_short(delta: f64) -> i16 {
-        (delta * 4096.0)
-            .round()
-            .clamp(i16::MIN as f64, i16::MAX as f64) as i16
+        move_entity_delta_to_short(delta)
     }
 
     #[must_use]
     pub fn pack_degrees(degrees: f32) -> u8 {
         pack_degrees(degrees)
     }
+}
+
+fn move_entity_delta_to_short(delta: f64) -> i16 {
+    (delta * 4096.0)
+        .round()
+        .clamp(i16::MIN as f64, i16::MAX as f64) as i16
 }
 
 impl Packet for MoveEntityPosRot {
@@ -3125,6 +3172,29 @@ impl InteractionHand {
                     max: 1,
                 });
             }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundSwing {
+    pub hand: InteractionHand,
+}
+
+impl Packet for ServerboundSwing {
+    // `.analysis/protocol-dump.txt`: SERVERBOUND_SWING follows
+    // SERVERBOUND_SPECTATE_ENTITY at game-SB index 63, wire id 0x3F.
+    // `javap -p` shows a single InteractionHand field.
+    const ID: i32 = 0x3F;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.hand as i32);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            hand: InteractionHand::from_wire(buf.read_varint()?)?,
         })
     }
 }

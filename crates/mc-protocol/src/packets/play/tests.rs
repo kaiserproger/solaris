@@ -394,6 +394,21 @@ fn take_item_entity_layout_matches_javap() {
 }
 
 #[test]
+fn serverbound_swing_layout_matches_javap() {
+    assert_eq!(ServerboundSwing::ID, 0x3F);
+    let packet = ServerboundSwing {
+        hand: InteractionHand::MainHand,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundSwing::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn entity_animation_id_and_wire_layout_match_server_javap() {
     assert_eq!(EntityAnimation::ID, 0x02);
     let packet = EntityAnimation {
@@ -422,6 +437,28 @@ fn entity_event_id_and_wire_layout_match_server_javap() {
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(EntityEvent::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn move_entity_pos_id_and_wire_layout_match_server_javap() {
+    assert_eq!(MoveEntityPos::ID, 0x35);
+    let packet = MoveEntityPos {
+        entity_id: 300,
+        delta_x: 4,
+        delta_y: -8,
+        delta_z: 12,
+        on_ground: true,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![0xAC, 0x02, 0x00, 0x04, 0xFF, 0xF8, 0x00, 0x0C, 0x01]
+    );
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(MoveEntityPos::decode(&mut cursor).unwrap(), packet);
     assert!(cursor.is_empty());
 }
 

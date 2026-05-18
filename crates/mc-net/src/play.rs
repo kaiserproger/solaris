@@ -3442,25 +3442,52 @@ fn plan_break_block_edits(
     let Some(state) = blocks.by_id(state_id) else {
         return edits;
     };
-    if !state.block.id.path().ends_with("_door") {
-        return edits;
+    if state.block.id.path().ends_with("_door") {
+        let other_y = match block_state_property(state, "half") {
+            Some("lower") => pos.y + 1,
+            Some("upper") => pos.y - 1,
+            _ => return edits,
+        };
+        let other_pos = mc_world::BlockPos { y: other_y, ..pos };
+        if let Ok(Some(other_state_id)) = storage.get_block(other_pos)
+            && let Some(other_state) = blocks.by_id(other_state_id)
+            && other_state.block.id == state.block.id
+        {
+            edits.push(BlockEdit {
+                pos: other_pos,
+                new_state: air,
+            });
+        }
     }
-    let other_y = match block_state_property(state, "half") {
-        Some("lower") => pos.y + 1,
-        Some("upper") => pos.y - 1,
-        _ => return edits,
-    };
-    let other_pos = mc_world::BlockPos { y: other_y, ..pos };
-    if let Ok(Some(other_state_id)) = storage.get_block(other_pos)
-        && let Some(other_state) = blocks.by_id(other_state_id)
-        && other_state.block.id == state.block.id
-    {
+    append_sugar_cane_cascade(blocks, storage, &mut edits, pos, air);
+    edits
+}
+
+fn append_sugar_cane_cascade(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    edits: &mut Vec<BlockEdit>,
+    base: mc_world::BlockPos,
+    air: mc_world::BlockStateId,
+) {
+    let mut y = base.y + 1;
+    loop {
+        let pos = mc_world::BlockPos { y, ..base };
+        let Ok(Some(state_id)) = storage.get_block(pos) else {
+            break;
+        };
+        let Some(state) = blocks.by_id(state_id) else {
+            break;
+        };
+        if state.block.id.path() != "sugar_cane" {
+            break;
+        }
         edits.push(BlockEdit {
-            pos: other_pos,
+            pos,
             new_state: air,
         });
+        y += 1;
     }
-    edits
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the

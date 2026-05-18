@@ -22,6 +22,10 @@ printf 'eula=true\n' > .analysis/vanilla-physics-server/eula.txt
   java -Xms1G -Xmx1G -jar ../server.jar --nogui --world physics-world)
 ```
 
+Minecraft 26.1.2 is built for Java classfile 69. If the default `java` is older
+than 25, use a local Java 25 runtime explicitly, for example
+`~/.sdkman/candidates/java/25.0.3-graal/bin/java`.
+
 Solaris comparison server, from a second shell:
 
 ```sh
@@ -53,6 +57,15 @@ Frame lines keep the existing raw probe shape:
 [PLAY] id=0xNN body_len=<bytes> body=<short hex prefix>
 [PLAY->SERVER:<packet name>] id=0xNN body_len=<bytes> body=<short hex prefix>
 ```
+
+For selected Play packets, `wire-probe` also writes typed annotation lines under
+the raw frame. M44 player-water captures currently annotate
+`SetEntityMotion`, `SetEntityData`, and `SynchronizePlayerPosition` so movement,
+pose/flags metadata, and server correction packets can be compared without
+guessing from hex. The M44 drop-window work also annotates `AddEntity`,
+`BlockUpdate`, `BlockChangedAck`, `ClientboundContainerSetSlot`,
+`ClientboundTakeItemEntity`, and `RemoveEntities` for item visibility and pickup
+ordering.
 
 Committed tests should cite either this local capture path or the `javap` class / dump
 section that established the packet ID and field layout. The capture file itself is
@@ -97,16 +110,59 @@ Named M43 scenarios use the same command shape with these stable names:
 - `water-lava-replacement`
 - `collision-wall-step-fall`
 
-`player-shallow-water-entry` is scripted by `wire-probe`: after Play start it
-confirms the spawn teleport, sends movement into the fixture pool, starts
-sprinting, sends forward+jump+sprint input, then records post-input Play frames.
-The serverbound lines in the capture are part of the oracle and should be cited
-with the corresponding clientbound metadata, motion, or correction frames.
+`player-shallow-water-entry`, `player-deep-water-swim`, and
+`player-water-surface-exit` are scripted by `wire-probe`: after Play start they
+confirm the spawn teleport, optionally prepare the vanilla fixture when
+`--server-kind vanilla` is used, send movement into the named fixture water
+cells, start sprinting, send forward+jump+sprint input, then record post-input
+Play frames. The serverbound setup and movement lines in the capture are part of
+the oracle and should be cited with the corresponding clientbound metadata,
+motion, or correction frames.
 
-`sugar-cane-support-break` currently has a Solaris harness observation on the
-M43 deterministic fixture: creative break of support dirt at `(8, 63, 0)` must
-emit a target flowing-water replacement (`minecraft:water[level=1]`) and matching
-`BlockChangedAck`. This is backed by the external vanilla harness gate:
+For player water movement, the current script is a wire-level correction probe,
+not a full visual swimming oracle. A matching vanilla/Solaris absence of
+post-input player `SetEntityMotion` or extra `SynchronizePlayerPosition` means
+the server accepted the scripted movement window; it does not prove that a real
+client renders the same swimming pose or feel. Use a manual PrismLauncher gate or
+a runtime-side player-state assertion before changing gameplay code from these
+captures alone.
+
+The entity-water scenarios are scripted for vanilla by building a small water
+pool, disabling random ticks and natural spawning, clearing non-player entities,
+and summoning one target entity. Valid target windows are identified by the
+post-`summon` `AddEntity` and then its `SetEntityMotion`, `MoveEntityPos`, and
+`MoveEntityPosRot` frames. The local vanilla world can still surface background
+persisted entities before or after the target summon, so do not treat unrelated
+entity ids in these captures as oracle signals. Current M44 captures use cow,
+zombie, and cod target windows and prove that vanilla emits velocity packets for
+the moving water entities, not only relative position updates.
+
+The automatic vanilla setup uses ordinary Play-state commands, so the probe
+profile must be opped on the local oracle server. The setup creates the same
+shallow and deep water cells used by the Solaris deterministic fixture:
+
+```text
+fill -8 63 -4 12 70 12 air
+fill -8 63 -4 12 63 12 stone
+fill -5 64 -2 -1 64 1 water
+fill -5 64 3 -1 66 6 water
+```
+
+`item-water-drop-window` is scripted for vanilla survival mining. The probe sends
+`PlayerLoaded`, prepares a stable dirt target at `(0, 64, 1)`, selects hotbar slot
+0, sends start/stop destroy with normal swing/client-tick cadence, records the
+visible item window, then moves into pickup range. A valid trace contains the
+target `BlockUpdate` to air, item `AddEntity`, item-stack metadata, delayed
+`TakeItemEntity`, inventory slot update, and `RemoveEntities`. The Solaris live
+server comparison is not deterministic against default terrain; use
+`survival_break_drops_item_entity_and_picks_it_up` for the Solaris regression
+until a matching fixture setup exists for `--server-kind solaris`.
+
+`sugar-cane-support-break` has a Solaris harness observation on the M43
+deterministic fixture: creative break of support dirt at `(8, 63, 0)` must emit a
+target flowing-water replacement (`minecraft:water[level=1]`), cascade the cane
+column at `(8, 64..=66, 0)` to air, and send the matching `BlockChangedAck`. This
+is backed by the external vanilla harness gate:
 
 ```sh
 M43_VANILLA_ADDR=127.0.0.1:25566 \
@@ -114,8 +170,16 @@ M43_VANILLA_ADDR=127.0.0.1:25566 \
   external_vanilla_sugar_cane_support_break_oracle -- --nocapture
 ```
 
-Sugar cane cascade timing and drops still need vanilla capture before they become
+Survival sugar-cane drops still need vanilla capture before they become
 assertions.
+
+`collision-wall-step-fall`, `water-lava-replacement`, and
+`sand-gravel-fall-start` remain oracle names, not completed captures. The M43
+fixture contains representative geometry and block states, and Solaris has unit
+coverage for current collision/fluid/falling-block primitives, but M44 did not
+produce vanilla packet/damage captures for these cases. Do not use the existing
+unit tests as parity evidence for gameplay changes; capture vanilla first, then
+add the corresponding Solaris comparison or regression.
 
 ## Comparison Rule
 

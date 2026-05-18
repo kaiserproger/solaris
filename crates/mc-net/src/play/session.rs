@@ -1178,7 +1178,7 @@ impl SessionRegistry {
                             velocity: snapshot.velocity,
                             rotation: snapshot.rotation,
                             on_ground: snapshot.on_ground,
-                            send_velocity: entity_type_is_aquatic(&snapshot.type_name),
+                            send_velocity: entity_should_send_velocity(&snapshot),
                         }),
                     });
                 }
@@ -1354,6 +1354,16 @@ fn entity_type_is_aquatic(type_name: &str) -> bool {
             | "minecraft:dolphin"
             | "minecraft:axolotl"
             | "minecraft:turtle"
+    )
+}
+
+fn entity_should_send_velocity(snapshot: &ServerEntitySnapshot) -> bool {
+    if snapshot.velocity == Vec3::ZERO {
+        return false;
+    }
+    !matches!(
+        snapshot.type_name.as_str(),
+        "minecraft:item" | "minecraft:experience_orb"
     )
 }
 
@@ -1919,6 +1929,90 @@ mod tests {
 
         assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn moving_mobs_send_velocity_with_relative_move() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (alice, _) = registry.register(
+            &profile("VelocityAlice"),
+            (0, 0),
+            2,
+            HashSet::from([(0, 0)]),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+        let spawn_dispatches = registry.spawn_command_entity(
+            1,
+            "minecraft:zombie".to_string(),
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        dispatch_visibility_commands(spawn_dispatches);
+        let entity_id = {
+            let inner = registry.inner.lock().expect("session registry poisoned");
+            inner
+                .entities
+                .snapshots()
+                .next()
+                .expect("spawned entity")
+                .id
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.5, 64.1, 0.5),
+                velocity: Vec3::new(0.0, 0.05, 0.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+        let Ok(OutboundCommand::MoveEntityRelative(movement)) = rx.try_recv() else {
+            panic!("expected relative mob movement");
+        };
+        assert!(movement.send_velocity);
+    }
+
+    #[test]
+    fn item_drop_relative_move_does_not_emit_extra_velocity_packet() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let (alice, _) = registry.register(
+            &profile("ItemVelocityAlice"),
+            (0, 0),
+            2,
+            HashSet::from([(0, 0)]),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+        let spawn_dispatches =
+            registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 1));
+        dispatch_visibility_commands(spawn_dispatches);
+        let entity_id = {
+            let inner = registry.inner.lock().expect("session registry poisoned");
+            inner.entities.snapshots().next().expect("spawned item").id
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            ENTITY_MOVE_SEND_INTERVAL_TICKS,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.5, 64.1, 0.5),
+                velocity: Vec3::new(0.0, 0.05, 0.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+        let Ok(OutboundCommand::MoveEntityRelative(movement)) = rx.try_recv() else {
+            panic!("expected relative item movement");
+        };
+        assert!(!movement.send_velocity);
     }
 
     #[test]

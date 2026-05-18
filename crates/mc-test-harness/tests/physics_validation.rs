@@ -187,12 +187,24 @@ async fn sugar_cane_support_break_emits_real_block_edit_observation() {
         .await
         .expect("break sugar cane support");
 
-    let observation = wait_for_block_action_observation(&mut client, 43, (8, 63, 0)).await;
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        43,
+        &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+    )
+    .await;
     assert_eq!(
         observation.last_target_state(),
         Some(states.flowing_water.0 as i32),
         "support block next to water should match vanilla flowing-water replacement"
     );
+    for y in 64..=66 {
+        assert_eq!(
+            observation.last_state_at((8, y, 0)),
+            Some(states.air.0 as i32),
+            "sugar cane at y={y} should cascade to air when support breaks"
+        );
+    }
     assert!(
         observation.saw_ack,
         "block edit should acknowledge sequence"
@@ -243,12 +255,24 @@ async fn external_vanilla_sugar_cane_support_break_oracle() {
         .await
         .expect("send break client tick end");
 
-    let observation = wait_for_block_action_observation(&mut client, 43, (8, 63, 0)).await;
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        43,
+        &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+    )
+    .await;
     assert_eq!(
         observation.last_target_state(),
         Some(states.flowing_water.0 as i32),
         "vanilla oracle: support cell is water-replaced after break"
     );
+    for y in 64..=66 {
+        assert_eq!(
+            observation.last_state_at((8, y, 0)),
+            Some(states.air.0 as i32),
+            "vanilla oracle: sugar cane at y={y} should cascade to air"
+        );
+    }
     assert!(
         observation.saw_ack,
         "vanilla oracle: block edit should acknowledge sequence"
@@ -518,34 +542,43 @@ async fn wait_for_player_motion(client: &mut Client) -> SetEntityMotion {
 }
 
 struct BlockActionObservation {
-    target_states: Vec<i32>,
+    updates: Vec<((i32, i32, i32), i32)>,
+    primary_target: (i32, i32, i32),
     saw_ack: bool,
 }
 
 impl BlockActionObservation {
     fn last_target_state(&self) -> Option<i32> {
-        self.target_states.last().copied()
+        self.last_state_at(self.primary_target)
+    }
+
+    fn last_state_at(&self, target: (i32, i32, i32)) -> Option<i32> {
+        self.updates
+            .iter()
+            .rev()
+            .find_map(|(pos, state)| (*pos == target).then_some(*state))
     }
 }
 
 async fn wait_for_block_action_observation(
     client: &mut Client,
     sequence: i32,
-    target: (i32, i32, i32),
+    targets: &[(i32, i32, i32)],
 ) -> BlockActionObservation {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    let mut target_states = Vec::new();
+    let primary_target = targets[0];
+    let mut updates = Vec::new();
     let mut saw_ack = false;
     let mut post_ack_deadline = None;
     loop {
         let now = tokio::time::Instant::now();
-        let read_deadline = if saw_ack && !target_states.is_empty() {
+        let read_deadline = if saw_ack && !updates.is_empty() {
             post_ack_deadline.unwrap_or(deadline)
         } else {
             deadline
         };
         if now >= read_deadline {
-            if saw_ack && !target_states.is_empty() {
+            if saw_ack && !updates.is_empty() {
                 break;
             }
             panic!("timed out waiting for block action observation");
@@ -555,7 +588,7 @@ async fn wait_for_block_action_observation(
             .await
         {
             Ok(frame) => frame,
-            Err(err) if saw_ack && !target_states.is_empty() => {
+            Err(err) if saw_ack && !updates.is_empty() => {
                 let _ = err;
                 break;
             }
@@ -567,17 +600,20 @@ async fn wait_for_block_action_observation(
         if frame.id == BlockUpdate::ID {
             let mut body = frame.body;
             let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
-            if unpack_block_pos(pkt.position) == target {
-                target_states.push(pkt.state_id);
+            let pos = unpack_block_pos(pkt.position);
+            if targets.contains(&pos) {
+                updates.push((pos, pkt.state_id));
             }
         } else if frame.id == SectionBlocksUpdate::ID {
             let mut body = frame.body;
             let pkt = SectionBlocksUpdate::decode(&mut body).expect("decode SectionBlocksUpdate");
-            if section_pos_matches(pkt.section_pos, target) {
-                let relative = pack_section_relative_pos(target.0, target.1, target.2);
-                for change in pkt.changes {
-                    if change.relative_pos == relative {
-                        target_states.push(change.state_id);
+            for target in targets {
+                if section_pos_matches(pkt.section_pos, *target) {
+                    let relative = pack_section_relative_pos(target.0, target.1, target.2);
+                    for change in &pkt.changes {
+                        if change.relative_pos == relative {
+                            updates.push((*target, change.state_id));
+                        }
                     }
                 }
             }
@@ -591,7 +627,8 @@ async fn wait_for_block_action_observation(
         }
     }
     BlockActionObservation {
-        target_states,
+        updates,
+        primary_target,
         saw_ack,
     }
 }
@@ -660,12 +697,15 @@ async fn setup_vanilla_sugar_cane_fixture(client: &mut Client) {
     let commands = [
         "gamerule doDaylightCycle false",
         "gamerule randomTickSpeed 0",
+        "gamemode creative M43Oracle",
         "tp M43Oracle 8.5 64 2.5 180 20",
         "fill -8 63 -4 12 70 12 air",
         "fill -8 63 -4 12 63 12 stone",
         "setblock 8 63 0 dirt",
         "setblock 7 63 0 water",
         "setblock 8 64 0 sugar_cane",
+        "setblock 8 65 0 sugar_cane",
+        "setblock 8 66 0 sugar_cane",
     ];
     for command in commands {
         client

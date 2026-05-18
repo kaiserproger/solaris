@@ -28,9 +28,14 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
-    ClientboundKeepAlive, ConfirmTeleportation, LoginPlay, MovePlayerFlags, PlayerCommandAction,
-    PlayerInput, ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerCommand,
-    ServerboundPlayerInput, SynchronizePlayerPosition,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
+    ClientboundSetEntityData, ClientboundTakeItemEntity, ConfirmTeleportation, Direction,
+    InteractionHand, LoginPlay, MoveEntityPos, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind,
+    PlayerCommandAction, PlayerInput, RemoveEntities, ServerboundChatCommand,
+    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
+    ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSwing, SetEntityMotion,
+    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -73,12 +78,24 @@ struct CaptureWriter {
 enum ProbeScenario {
     Passive,
     PlayerShallowWaterEntry,
+    PlayerDeepWaterSwim,
+    PlayerWaterSurfaceExit,
+    ItemWaterDropWindow,
+    EntityLandPassiveMotion,
+    EntityHostileMotion,
+    EntityAquaticMotion,
 }
 
 impl ProbeScenario {
     fn from_name(name: &str) -> Self {
         match name {
             "player-shallow-water-entry" => Self::PlayerShallowWaterEntry,
+            "player-deep-water-swim" => Self::PlayerDeepWaterSwim,
+            "player-water-surface-exit" => Self::PlayerWaterSurfaceExit,
+            "item-water-drop-window" => Self::ItemWaterDropWindow,
+            "entity-land-passive-motion" => Self::EntityLandPassiveMotion,
+            "entity-hostile-motion" => Self::EntityHostileMotion,
+            "entity-aquatic-motion" => Self::EntityAquaticMotion,
             _ => Self::Passive,
         }
     }
@@ -101,6 +118,124 @@ fn log_frame(
         frame.body.len(),
         hexdump_short(&frame.body, 48)
     ))?;
+    if frame.id == AddEntity::ID {
+        match AddEntity::decode(&mut frame.body.clone()) {
+            Ok(add) => capture.line(format!(
+                "    ↳ AddEntity: entity_id={} type_id={} pos=({:.6}, {:.6}, {:.6}) movement=({:.6}, {:.6}, {:.6}) data={}",
+                add.entity_id,
+                add.entity_type_id,
+                add.x,
+                add.y,
+                add.z,
+                add.movement.x,
+                add.movement.y,
+                add.movement.z,
+                add.data
+            ))?,
+            Err(err) => capture.line(format!("    ↳ AddEntity decode_error={err}"))?,
+        }
+    } else if frame.id == BlockUpdate::ID {
+        match BlockUpdate::decode(&mut frame.body.clone()) {
+            Ok(update) => {
+                let (x, y, z) = unpack_block_pos(update.position);
+                capture.line(format!(
+                    "    ↳ BlockUpdate: pos=({x}, {y}, {z}) state_id={}",
+                    update.state_id
+                ))?
+            }
+            Err(err) => capture.line(format!("    ↳ BlockUpdate decode_error={err}"))?,
+        }
+    } else if frame.id == BlockChangedAck::ID {
+        match BlockChangedAck::decode(&mut frame.body.clone()) {
+            Ok(ack) => capture.line(format!("    ↳ BlockChangedAck: sequence={}", ack.sequence))?,
+            Err(err) => capture.line(format!("    ↳ BlockChangedAck decode_error={err}"))?,
+        }
+    } else if frame.id == SetEntityMotion::ID {
+        match SetEntityMotion::decode(&mut frame.body.clone()) {
+            Ok(motion) => capture.line(format!(
+                "    ↳ SetEntityMotion: entity_id={} movement=({:.6}, {:.6}, {:.6})",
+                motion.entity_id, motion.movement.x, motion.movement.y, motion.movement.z
+            ))?,
+            Err(err) => capture.line(format!("    ↳ SetEntityMotion decode_error={err}"))?,
+        }
+    } else if frame.id == MoveEntityPos::ID {
+        match MoveEntityPos::decode(&mut frame.body.clone()) {
+            Ok(movement) => capture.line(format!(
+                "    ↳ MoveEntityPos: entity_id={} delta=({:.6}, {:.6}, {:.6}) on_ground={}",
+                movement.entity_id,
+                f64::from(movement.delta_x) / 4096.0,
+                f64::from(movement.delta_y) / 4096.0,
+                f64::from(movement.delta_z) / 4096.0,
+                movement.on_ground
+            ))?,
+            Err(err) => capture.line(format!("    ↳ MoveEntityPos decode_error={err}"))?,
+        }
+    } else if frame.id == MoveEntityPosRot::ID {
+        match MoveEntityPosRot::decode(&mut frame.body.clone()) {
+            Ok(movement) => capture.line(format!(
+                "    ↳ MoveEntityPosRot: entity_id={} delta=({:.6}, {:.6}, {:.6}) yaw={} pitch={} on_ground={}",
+                movement.entity_id,
+                f64::from(movement.delta_x) / 4096.0,
+                f64::from(movement.delta_y) / 4096.0,
+                f64::from(movement.delta_z) / 4096.0,
+                movement.yaw,
+                movement.pitch,
+                movement.on_ground
+            ))?,
+            Err(err) => capture.line(format!("    ↳ MoveEntityPosRot decode_error={err}"))?,
+        }
+    } else if frame.id == ClientboundSetEntityData::ID {
+        match ClientboundSetEntityData::decode(&mut frame.body.clone()) {
+            Ok(data) => capture.line(format!(
+                "    ↳ SetEntityData: entity_id={} values={:?}",
+                data.entity_id, data.values
+            ))?,
+            Err(err) => capture.line(format!("    ↳ SetEntityData decode_error={err}"))?,
+        }
+    } else if frame.id == ClientboundContainerSetSlot::ID {
+        match ClientboundContainerSetSlot::decode(&mut frame.body.clone()) {
+            Ok(slot) => capture.line(format!(
+                "    ↳ ContainerSetSlot: container_id={} state_id={} slot={} stack={:?}",
+                slot.container_id, slot.state_id, slot.slot, slot.item_stack
+            ))?,
+            Err(err) => capture.line(format!("    ↳ ContainerSetSlot decode_error={err}"))?,
+        }
+    } else if frame.id == ClientboundTakeItemEntity::ID {
+        match ClientboundTakeItemEntity::decode(&mut frame.body.clone()) {
+            Ok(take) => capture.line(format!(
+                "    ↳ TakeItemEntity: item_entity_id={} player_entity_id={} amount={}",
+                take.item_entity_id, take.player_entity_id, take.amount
+            ))?,
+            Err(err) => capture.line(format!("    ↳ TakeItemEntity decode_error={err}"))?,
+        }
+    } else if frame.id == RemoveEntities::ID {
+        match RemoveEntities::decode(&mut frame.body.clone()) {
+            Ok(remove) => capture.line(format!(
+                "    ↳ RemoveEntities: entity_ids={:?}",
+                remove.entity_ids
+            ))?,
+            Err(err) => capture.line(format!("    ↳ RemoveEntities decode_error={err}"))?,
+        }
+    } else if frame.id == SynchronizePlayerPosition::ID {
+        match SynchronizePlayerPosition::decode(&mut frame.body.clone()) {
+            Ok(sync) => capture.line(format!(
+                "    ↳ SynchronizePlayerPosition: teleport_id={} pos=({:.6}, {:.6}, {:.6}) delta=({:.6}, {:.6}, {:.6}) yaw={:.3} pitch={:.3} flags={}",
+                sync.teleport_id,
+                sync.x,
+                sync.y,
+                sync.z,
+                sync.dx,
+                sync.dy,
+                sync.dz,
+                sync.yaw,
+                sync.pitch,
+                sync.relative_flags
+            ))?,
+            Err(err) => capture.line(format!(
+                "    ↳ SynchronizePlayerPosition decode_error={err}"
+            ))?,
+        }
+    }
     Ok(())
 }
 
@@ -289,12 +424,14 @@ impl Probe {
         }
     }
 
-    async fn run_player_shallow_water_entry(
+    async fn start_scripted_play(
         &mut self,
+        script_name: &str,
         play_seconds: u64,
         capture: &mut CaptureWriter,
-    ) -> Result<()> {
-        capture.line("=== SCRIPT player-shallow-water-entry ===")?;
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<PlayStart> {
+        capture.line(format!("=== SCRIPT {script_name} ==="))?;
         let start = self
             .dump_until_play_start(Duration::from_secs(play_seconds.max(5)), capture)
             .await?;
@@ -307,6 +444,194 @@ impl Probe {
             capture,
         )
         .await?;
+        self.write_packet_logged(&ServerboundPlayerLoaded, "PLAY", "PlayerLoaded", capture)
+            .await?;
+        if let Some(player_name) = vanilla_setup_player {
+            self.setup_player_water_fixture(player_name, capture)
+                .await?;
+        }
+        Ok(start)
+    }
+
+    async fn setup_player_water_fixture(
+        &mut self,
+        player_name: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line("=== VANILLA SETUP player-water fixture ===")?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "fill -8 63 -4 12 70 12 air".to_string(),
+            "fill -8 63 -4 12 63 12 stone".to_string(),
+            "fill -5 64 -2 -1 64 1 water".to_string(),
+            "fill -5 64 3 -1 66 6 water".to_string(),
+            format!("tp {player_name} -4.8 64 0.5 90 0"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn setup_item_drop_fixture(
+        &mut self,
+        player_name: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line("=== VANILLA SETUP item-water-drop-window fixture ===")?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "kill @e[type=!player]".to_string(),
+            format!("clear {player_name}"),
+            format!("give {player_name} minecraft:wooden_shovel"),
+            "fill -2 63 -4 2 67 4 air".to_string(),
+            "fill -2 63 -4 2 63 4 stone".to_string(),
+            "setblock 0 64 1 dirt".to_string(),
+            format!("tp {player_name} 0.5 64.0 3.5 180 37"),
+            format!("gamemode survival {player_name}"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn setup_entity_water_fixture(
+        &mut self,
+        player_name: &str,
+        entity: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line(format!(
+            "=== VANILLA SETUP entity-water fixture entity={entity} ==="
+        ))?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "difficulty normal".to_string(),
+            "kill @e[type=!player]".to_string(),
+            "fill -4 63 -4 4 70 4 air".to_string(),
+            "fill -4 63 -4 4 63 4 stone".to_string(),
+            "fill -2 64 -2 2 66 2 water".to_string(),
+            format!("tp {player_name} 0.5 68.0 5.5 180 35"),
+            "kill @e[type=!player]".to_string(),
+            format!("summon {entity} 0.5 65.0 0.5"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_chat_command_and_drain(
+        &mut self,
+        command: String,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        self.write_packet_logged(
+            &ServerboundChatCommand { command },
+            "PLAY",
+            "ChatCommand",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
+        self.drain_setup_frames(Duration::from_millis(150), capture)
+            .await?;
+        Ok(())
+    }
+
+    async fn send_client_ticks_for(
+        &mut self,
+        duration: Duration,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + duration;
+        let mut ticks = 0;
+        while tokio::time::Instant::now() < deadline {
+            if ticks % 4 == 0 {
+                self.write_packet_logged(
+                    &ServerboundSwing {
+                        hand: InteractionHand::MainHand,
+                    },
+                    "PLAY",
+                    "Swing(MainHand)",
+                    capture,
+                )
+                .await?;
+            }
+            self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            ticks += 1;
+        }
+        Ok(())
+    }
+
+    async fn drain_setup_frames(
+        &mut self,
+        duration: Duration,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            let timeout = tokio::time::timeout(remaining, self.read_frame()).await;
+            let frame = match timeout {
+                Ok(Ok(frame)) => frame,
+                Ok(Err(err)) => {
+                    capture.line(format!("[PLAY] setup read ended: {err}"))?;
+                    return Ok(());
+                }
+                Err(_) => return Ok(()),
+            };
+            log_frame(capture, "PLAY", &frame)?;
+            if frame.id == ClientboundKeepAlive::ID {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                self.write_packet_logged(
+                    &ServerboundKeepAlive { id: keepalive.id },
+                    "PLAY",
+                    "KeepAlive",
+                    capture,
+                )
+                .await?;
+            } else if frame.id == SynchronizePlayerPosition::ID {
+                let mut body = frame.body.clone();
+                let sync = SynchronizePlayerPosition::decode(&mut body)?;
+                self.write_packet_logged(
+                    &ConfirmTeleportation {
+                        teleport_id: sync.teleport_id,
+                    },
+                    "PLAY",
+                    "ConfirmTeleportation(setup)",
+                    capture,
+                )
+                .await?;
+            }
+        }
+    }
+
+    async fn run_player_shallow_water_entry(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play(
+                "player-shallow-water-entry",
+                play_seconds,
+                capture,
+                vanilla_setup_player,
+            )
+            .await?;
 
         let movement_flags = MovePlayerFlags::new(true, false);
         let water_steps = [
@@ -376,6 +701,308 @@ impl Probe {
             .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!("script captured {n} post-input Play-state frames"))?;
+        Ok(())
+    }
+
+    async fn run_player_deep_water_swim(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play(
+                "player-deep-water-swim",
+                play_seconds,
+                capture,
+                vanilla_setup_player,
+            )
+            .await?;
+
+        let movement_flags = MovePlayerFlags::new(false, false);
+        let water_steps = [
+            ServerboundMovePlayerPosRot {
+                x: -3.5,
+                y: 64.2,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: -30.0,
+                flags: movement_flags,
+            },
+            ServerboundMovePlayerPosRot {
+                x: -3.0,
+                y: 65.0,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: -30.0,
+                flags: movement_flags,
+            },
+        ];
+        for step in water_steps {
+            self.write_packet_logged(&step, "PLAY", "MovePlayerPosRot", capture)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.write_packet_logged(
+            &ServerboundPlayerCommand {
+                entity_id: start.entity_id,
+                action: PlayerCommandAction::StartSprinting,
+                data: 0,
+            },
+            "PLAY",
+            "PlayerCommand(StartSprinting)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(
+            &ServerboundPlayerInput {
+                input: PlayerInput {
+                    forward: true,
+                    jump: true,
+                    sprint: true,
+                    ..PlayerInput::default()
+                },
+            },
+            "PLAY",
+            "PlayerInput(forward+jump+sprint)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(
+            &ServerboundMovePlayerPosRot {
+                x: -2.5,
+                y: 65.6,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: -30.0,
+                flags: movement_flags,
+            },
+            "PLAY",
+            "MovePlayerPosRot(swim-up)",
+            capture,
+        )
+        .await?;
+
+        let n = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .await?;
+        capture.line(format!("script captured {n} post-input Play-state frames"))?;
+        Ok(())
+    }
+
+    async fn run_player_water_surface_exit(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play(
+                "player-water-surface-exit",
+                play_seconds,
+                capture,
+                vanilla_setup_player,
+            )
+            .await?;
+
+        let movement_flags = MovePlayerFlags::new(false, false);
+        let water_steps = [
+            ServerboundMovePlayerPosRot {
+                x: -2.5,
+                y: 65.4,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: -20.0,
+                flags: movement_flags,
+            },
+            ServerboundMovePlayerPosRot {
+                x: -1.5,
+                y: 66.2,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: -20.0,
+                flags: movement_flags,
+            },
+        ];
+        for step in water_steps {
+            self.write_packet_logged(&step, "PLAY", "MovePlayerPosRot", capture)
+                .await?;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        self.write_packet_logged(
+            &ServerboundPlayerCommand {
+                entity_id: start.entity_id,
+                action: PlayerCommandAction::StartSprinting,
+                data: 0,
+            },
+            "PLAY",
+            "PlayerCommand(StartSprinting)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(
+            &ServerboundPlayerInput {
+                input: PlayerInput {
+                    forward: true,
+                    jump: true,
+                    sprint: true,
+                    ..PlayerInput::default()
+                },
+            },
+            "PLAY",
+            "PlayerInput(forward+jump+sprint)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(
+            &ServerboundMovePlayerPosRot {
+                x: 0.5,
+                y: 64.0,
+                z: 4.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            "PLAY",
+            "MovePlayerPosRot(exit-to-land)",
+            capture,
+        )
+        .await?;
+
+        let n = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .await?;
+        capture.line(format!("script captured {n} post-input Play-state frames"))?;
+        Ok(())
+    }
+
+    async fn run_item_water_drop_window(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play("item-water-drop-window", play_seconds, capture, None)
+            .await?;
+        let target = if let Some(player_name) = vanilla_setup_player {
+            self.setup_item_drop_fixture(player_name, capture).await?;
+            (0, 64, 1)
+        } else {
+            (0, start.sync.y.floor() as i32 - 2, 0)
+        };
+        let (target_x, target_y, target_z) = target;
+
+        self.write_packet_logged(
+            &ServerboundSetCarriedItem { slot: 0 },
+            "PLAY",
+            "SetCarriedItem(slot=0)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(
+            &ServerboundMovePlayerPosRot {
+                x: f64::from(target_x) + 0.5,
+                y: f64::from(target_y),
+                z: f64::from(target_z) + 2.5,
+                yaw: 180.0,
+                pitch: 37.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            "PLAY",
+            "MovePlayerPosRot(drop-target)",
+            capture,
+        )
+        .await?;
+        let target_pos = pack_block_pos(target_x, target_y, target_z);
+        self.write_packet_logged(
+            &ServerboundPlayerAction {
+                action: PlayerActionKind::StartDestroyBlock,
+                position: target_pos,
+                direction: Direction::South,
+                sequence: 201,
+            },
+            "PLAY",
+            "PlayerAction(StartDestroyBlock)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
+        self.write_packet_logged(
+            &ServerboundSwing {
+                hand: InteractionHand::MainHand,
+            },
+            "PLAY",
+            "Swing(MainHand)",
+            capture,
+        )
+        .await?;
+        self.drain_setup_frames(Duration::from_millis(150), capture)
+            .await?;
+        self.send_client_ticks_for(Duration::from_millis(1500), capture)
+            .await?;
+        self.write_packet_logged(
+            &ServerboundPlayerAction {
+                action: PlayerActionKind::StopDestroyBlock,
+                position: target_pos,
+                direction: Direction::South,
+                sequence: 202,
+            },
+            "PLAY",
+            "PlayerAction(StopDestroyBlock)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
+
+        let visible_frames = self
+            .dump_for("PLAY", Duration::from_millis(400), capture)
+            .await?;
+        self.write_packet_logged(
+            &ServerboundMovePlayerPosRot {
+                x: f64::from(target_x) + 0.5,
+                y: f64::from(target_y),
+                z: f64::from(target_z) + 0.5,
+                yaw: 180.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            "PLAY",
+            "MovePlayerPosRot(pickup-window)",
+            capture,
+        )
+        .await?;
+        let pickup_frames = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(5)), capture)
+            .await?;
+        capture.line(format!(
+            "script captured {visible_frames} visible-window frames and {pickup_frames} pickup-window frames"
+        ))?;
+        Ok(())
+    }
+
+    async fn run_entity_water_motion(
+        &mut self,
+        script_name: &str,
+        entity: &str,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        self.start_scripted_play(script_name, play_seconds, capture, None)
+            .await?;
+        if let Some(player_name) = vanilla_setup_player {
+            self.setup_entity_water_fixture(player_name, entity, capture)
+                .await?;
+        }
+        let frames = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(8)), capture)
+            .await?;
+        capture.line(format!(
+            "script captured {frames} entity-water Play-state frames"
+        ))?;
         Ok(())
     }
 }
@@ -582,6 +1209,7 @@ async fn main() -> Result<()> {
         "=== PLAY STATE (reading for {}s) ===",
         cli.play_seconds
     ))?;
+    let vanilla_setup_player = (cli.server_kind == "vanilla").then_some(cli.name.as_str());
     match ProbeScenario::from_name(&cli.scenario) {
         ProbeScenario::Passive => {
             let n = probe
@@ -591,7 +1219,59 @@ async fn main() -> Result<()> {
         }
         ProbeScenario::PlayerShallowWaterEntry => {
             probe
-                .run_player_shallow_water_entry(cli.play_seconds, &mut capture)
+                .run_player_shallow_water_entry(
+                    cli.play_seconds,
+                    &mut capture,
+                    vanilla_setup_player,
+                )
+                .await?;
+        }
+        ProbeScenario::PlayerDeepWaterSwim => {
+            probe
+                .run_player_deep_water_swim(cli.play_seconds, &mut capture, vanilla_setup_player)
+                .await?;
+        }
+        ProbeScenario::PlayerWaterSurfaceExit => {
+            probe
+                .run_player_water_surface_exit(cli.play_seconds, &mut capture, vanilla_setup_player)
+                .await?;
+        }
+        ProbeScenario::ItemWaterDropWindow => {
+            probe
+                .run_item_water_drop_window(cli.play_seconds, &mut capture, vanilla_setup_player)
+                .await?;
+        }
+        ProbeScenario::EntityLandPassiveMotion => {
+            probe
+                .run_entity_water_motion(
+                    "entity-land-passive-motion",
+                    "minecraft:cow",
+                    cli.play_seconds,
+                    &mut capture,
+                    vanilla_setup_player,
+                )
+                .await?;
+        }
+        ProbeScenario::EntityHostileMotion => {
+            probe
+                .run_entity_water_motion(
+                    "entity-hostile-motion",
+                    "minecraft:zombie",
+                    cli.play_seconds,
+                    &mut capture,
+                    vanilla_setup_player,
+                )
+                .await?;
+        }
+        ProbeScenario::EntityAquaticMotion => {
+            probe
+                .run_entity_water_motion(
+                    "entity-aquatic-motion",
+                    "minecraft:cod",
+                    cli.play_seconds,
+                    &mut capture,
+                    vanilla_setup_player,
+                )
                 .await?;
         }
     }
