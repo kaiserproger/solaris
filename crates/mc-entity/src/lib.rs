@@ -152,6 +152,25 @@ pub struct EntitySnapshot {
     pub goal: GoalState,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct EntityView<'a> {
+    pub id: EntityId,
+    pub uuid: Uuid,
+    pub type_id: i32,
+    pub type_name: &'a str,
+    pub position: Vec3,
+    pub rotation: Rotation,
+    pub velocity: Vec3,
+    pub on_ground: bool,
+    pub item_stack: Option<EntityItemStack>,
+    pub experience_value: Option<i32>,
+    pub block_state: Option<u32>,
+    pub lifecycle: EntityLifecycle,
+    pub health: f32,
+    pub attributes: &'a AttributeSet,
+    pub goal: &'a GoalState,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityDamage {
     pub snapshot: EntitySnapshot,
@@ -370,8 +389,17 @@ impl EntityStore {
             .map(|&slot| self.snapshot_slot(slot))
     }
 
+    #[must_use]
+    pub fn view(&self, id: EntityId) -> Option<EntityView<'_>> {
+        self.slots_by_id.get(&id).map(|&slot| self.view_slot(slot))
+    }
+
     pub fn snapshots(&self) -> impl Iterator<Item = EntitySnapshot> + '_ {
         (0..self.len()).map(|slot| self.snapshot_slot(slot))
+    }
+
+    pub fn views(&self) -> impl Iterator<Item = EntityView<'_>> + '_ {
+        (0..self.len()).map(|slot| self.view_slot(slot))
     }
 
     pub fn mark_despawning(&mut self, id: EntityId) -> bool {
@@ -556,6 +584,26 @@ impl EntityStore {
             health: self.healths[slot],
             attributes: self.attributes[slot].clone(),
             goal: self.goals[slot].clone(),
+        }
+    }
+
+    fn view_slot(&self, slot: usize) -> EntityView<'_> {
+        EntityView {
+            id: self.ids[slot],
+            uuid: self.uuids[slot],
+            type_id: self.type_ids[slot],
+            type_name: &self.type_names[slot],
+            position: self.positions[slot],
+            rotation: self.rotations[slot],
+            velocity: self.velocities[slot],
+            on_ground: self.on_ground[slot],
+            item_stack: self.item_stacks[slot],
+            experience_value: self.experience_values[slot],
+            block_state: self.block_states[slot],
+            lifecycle: self.lifecycles[slot],
+            health: self.healths[slot],
+            attributes: &self.attributes[slot],
+            goal: &self.goals[slot],
         }
     }
 

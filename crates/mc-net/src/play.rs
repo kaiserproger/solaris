@@ -31,7 +31,7 @@ use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
     AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, EntityStore,
-    GoalState, SpawnEntity, Vec3,
+    EntityView, GoalState, SpawnEntity, Vec3,
 };
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
@@ -6329,7 +6329,6 @@ where
         }
 
         tokio::select! {
-            biased;
             command = recv_outbound_command(&mut outbound_rx, &mut pending_outbound) => {
                 match command {
                     Some(OutboundCommand::BlockDeltas(deltas)) => {

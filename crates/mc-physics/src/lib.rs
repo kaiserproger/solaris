@@ -170,7 +170,7 @@ pub struct StepResult {
 }
 
 pub trait BlockSampler {
-    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial;
+    fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -210,7 +210,7 @@ pub enum BlockUpdateIntent {
 
 pub fn falling_block_intent<S: BlockSampler>(
     pos: GridPos,
-    sampler: &mut S,
+    sampler: &S,
 ) -> Option<BlockUpdateIntent> {
     let below = pos.below();
     matches!(
@@ -225,7 +225,7 @@ pub fn falling_block_intent<S: BlockSampler>(
 
 pub fn fluid_spread_intents<S: BlockSampler>(
     pos: GridPos,
-    sampler: &mut S,
+    sampler: &S,
     max_outputs: usize,
 ) -> Vec<BlockUpdateIntent> {
     if !sampler.material_at(pos.x, pos.y, pos.z).is_fluid() {
@@ -256,7 +256,7 @@ pub fn fluid_spread_intents<S: BlockSampler>(
 
 pub fn step_entity<S: BlockSampler>(
     mut body: EntityBody,
-    sampler: &mut S,
+    sampler: &S,
     config: PhysicsConfig,
 ) -> StepResult {
     let in_fluid = body_overlaps_fluid(body, sampler);
@@ -312,7 +312,7 @@ pub fn step_entity<S: BlockSampler>(
     StepResult { body, in_fluid }
 }
 
-pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> Option<f64> {
+pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &S) -> Option<f64> {
     let feet_y = body.position.y.floor() as i32;
     bbox_columns(body)
         .into_iter()
@@ -322,7 +322,7 @@ pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> 
         .max_by(f64::total_cmp)
 }
 
-fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bool {
+fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
     let min_y = body.position.y.floor() as i32;
     let max_y = (body.position.y + body.aabb.height).floor() as i32;
     bbox_columns(body)
@@ -330,7 +330,7 @@ fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bo
         .any(|(x, z)| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
 }
 
-fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &mut S) -> bool {
+fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
     let x = body.position.x;
     let z = body.position.z;
     let half = body.aabb.half_width;
@@ -353,11 +353,7 @@ fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &mut S) 
     false
 }
 
-fn try_step_up<S: BlockSampler>(
-    body: &mut EntityBody,
-    sampler: &mut S,
-    stepped_up: &mut bool,
-) -> bool {
+fn try_step_up<S: BlockSampler>(body: &mut EntityBody, sampler: &S, stepped_up: &mut bool) -> bool {
     if !body.on_ground || *stepped_up {
         return false;
     }
@@ -393,7 +389,7 @@ mod tests {
     }
 
     impl BlockSampler for FlatWorld {
-        fn material_at(&mut self, _x: i32, y: i32, _z: i32) -> BlockMaterial {
+        fn material_at(&self, _x: i32, y: i32, _z: i32) -> BlockMaterial {
             if self.water_y == Some(y) {
                 BlockMaterial::Water
             } else if y <= self.ground_y {
@@ -406,7 +402,7 @@ mod tests {
 
     #[test]
     fn gravity_lands_body_on_solid_ground() {
-        let mut world = FlatWorld {
+        let world = FlatWorld {
             ground_y: 63,
             water_y: None,
         };
@@ -418,7 +414,7 @@ mod tests {
         };
 
         for _ in 0..40 {
-            body = step_entity(body, &mut world, PhysicsConfig::default()).body;
+            body = step_entity(body, &world, PhysicsConfig::default()).body;
         }
 
         assert_eq!(body.position.y, 64.0);
@@ -428,7 +424,7 @@ mod tests {
 
     #[test]
     fn air_drag_damps_horizontal_motion() {
-        let mut world = FlatWorld {
+        let world = FlatWorld {
             ground_y: -64,
             water_y: None,
         };
@@ -439,7 +435,7 @@ mod tests {
             on_ground: false,
         };
 
-        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
+        let stepped = step_entity(body, &world, PhysicsConfig::default()).body;
 
         assert!(stepped.velocity.x < body.velocity.x);
         assert!(stepped.velocity.y < 0.0);
@@ -447,7 +443,7 @@ mod tests {
 
     #[test]
     fn horizontal_collision_stops_body_at_wall() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: vec![GridPos::new(1, 64, 0), GridPos::new(1, 65, 0)],
             fluids: Vec::new(),
         };
@@ -458,7 +454,7 @@ mod tests {
             on_ground: true,
         };
 
-        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
+        let stepped = step_entity(body, &world, PhysicsConfig::default()).body;
 
         assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
         assert_eq!(stepped.velocity.x, 0.0);
@@ -466,7 +462,7 @@ mod tests {
 
     #[test]
     fn grounded_body_does_not_step_up_full_block_obstacle() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: vec![GridPos::new(1, 64, 0)],
             fluids: Vec::new(),
         };
@@ -477,7 +473,7 @@ mod tests {
             on_ground: true,
         };
 
-        let stepped = step_entity(body, &mut world, PhysicsConfig::default()).body;
+        let stepped = step_entity(body, &world, PhysicsConfig::default()).body;
 
         assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
         assert!(stepped.position.y < body.position.y + STEP_HEIGHT);
@@ -486,7 +482,7 @@ mod tests {
 
     #[test]
     fn water_applies_buoyancy_and_stronger_drag() {
-        let mut world = FlatWorld {
+        let world = FlatWorld {
             ground_y: 60,
             water_y: Some(64),
         };
@@ -497,7 +493,7 @@ mod tests {
             on_ground: false,
         };
 
-        let result = step_entity(body, &mut world, PhysicsConfig::default());
+        let result = step_entity(body, &world, PhysicsConfig::default());
 
         assert!(result.in_fluid);
         assert!(result.body.velocity.x < 1.0);
@@ -530,7 +526,7 @@ mod tests {
     }
 
     impl BlockSampler for LocalBlocks {
-        fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
+        fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial {
             let pos = GridPos::new(x, y, z);
             if self.fluids.contains(&pos) {
                 BlockMaterial::Water
@@ -544,12 +540,12 @@ mod tests {
 
     #[test]
     fn falling_block_intent_moves_into_replaceable_cell() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: vec![GridPos::new(0, 10, 0)],
             fluids: Vec::new(),
         };
 
-        let intent = falling_block_intent(GridPos::new(0, 10, 0), &mut world);
+        let intent = falling_block_intent(GridPos::new(0, 10, 0), &world);
 
         assert_eq!(
             intent,
@@ -563,18 +559,18 @@ mod tests {
     #[test]
     fn falling_block_intent_distinguishes_support_from_replaceable_targets() {
         let source = GridPos::new(0, 10, 0);
-        let mut supported = LocalBlocks {
+        let supported = LocalBlocks {
             solids: vec![source, source.below()],
             fluids: Vec::new(),
         };
-        assert_eq!(falling_block_intent(source, &mut supported), None);
+        assert_eq!(falling_block_intent(source, &supported), None);
 
-        let mut through_water = LocalBlocks {
+        let through_water = LocalBlocks {
             solids: vec![source],
             fluids: vec![source.below()],
         };
         assert_eq!(
-            falling_block_intent(source, &mut through_water),
+            falling_block_intent(source, &through_water),
             Some(BlockUpdateIntent::Move {
                 from: source,
                 to: source.below()
@@ -584,7 +580,7 @@ mod tests {
 
     #[test]
     fn long_fall_clamps_velocity_before_ground_impact() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: Vec::new(),
             fluids: Vec::new(),
         };
@@ -596,7 +592,7 @@ mod tests {
         };
 
         for _ in 0..200 {
-            body = step_entity(body, &mut world, PhysicsConfig::default()).body;
+            body = step_entity(body, &world, PhysicsConfig::default()).body;
         }
 
         assert!(body.velocity.y >= TERMINAL_VELOCITY_BLOCKS_PER_SECOND);
@@ -606,22 +602,22 @@ mod tests {
 
     #[test]
     fn non_fluid_blocks_do_not_emit_spread_intents() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: vec![GridPos::new(0, 10, 0)],
             fluids: Vec::new(),
         };
 
-        assert!(fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 4).is_empty());
+        assert!(fluid_spread_intents(GridPos::new(0, 10, 0), &world, 4).is_empty());
     }
 
     #[test]
     fn fluid_prefers_downward_spread_before_horizontal() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: Vec::new(),
             fluids: vec![GridPos::new(0, 10, 0)],
         };
 
-        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 4);
+        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &world, 4);
 
         assert_eq!(
             intents,
@@ -634,12 +630,12 @@ mod tests {
 
     #[test]
     fn fluid_horizontal_spread_is_bounded_and_deterministic() {
-        let mut world = LocalBlocks {
+        let world = LocalBlocks {
             solids: vec![GridPos::new(0, 9, 0)],
             fluids: vec![GridPos::new(0, 10, 0)],
         };
 
-        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &mut world, 2);
+        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &world, 2);
 
         assert_eq!(intents.len(), 2);
         assert_eq!(

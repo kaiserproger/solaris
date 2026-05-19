@@ -37,6 +37,16 @@ use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
 
 static SAVE_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
+type PhysicsMaterialCache = HashMap<
+    (usize, usize),
+    (
+        std::sync::Weak<BlockRegistry>,
+        std::sync::Weak<BlockFactsTable>,
+        Arc<BlockMaterialIds>,
+    ),
+>;
+
+static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
@@ -664,7 +674,7 @@ async fn entity_physics_steps(
     if queries.is_empty() {
         return Vec::new();
     }
-    let materials = material_ids(&config.blocks, &config.block_facts);
+    let materials = cached_material_ids(config);
     let inputs = {
         let mut storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::WorldStorage,
@@ -685,8 +695,12 @@ async fn entity_physics_steps(
         .min(inputs.len());
     let batch_size = inputs.len().div_ceil(workers);
     let mut handles = Vec::with_capacity(workers);
-    for batch in inputs.chunks(batch_size) {
-        let batch = batch.to_vec();
+    let mut inputs = inputs.into_iter();
+    for _ in 0..workers {
+        let batch = inputs.by_ref().take(batch_size).collect::<Vec<_>>();
+        if batch.is_empty() {
+            break;
+        }
         let permit = match Arc::clone(&cpu_permits).acquire_owned().await {
             Ok(permit) => permit,
             Err(_) => return Vec::new(),
@@ -711,7 +725,6 @@ async fn entity_physics_steps(
     steps
 }
 
-#[derive(Clone)]
 struct EntityPhysicsInput {
     query: play::EntityPhysicsQuery,
     samples: HashMap<BlockPos, BlockMaterial>,
@@ -723,7 +736,7 @@ struct SampledPhysicsWorld {
 }
 
 impl BlockSampler for SampledPhysicsWorld {
-    fn material_at(&mut self, x: i32, y: i32, z: i32) -> BlockMaterial {
+    fn material_at(&self, x: i32, y: i32, z: i32) -> BlockMaterial {
         self.samples
             .get(&BlockPos { x, y, z })
             .copied()
@@ -736,9 +749,10 @@ fn sample_entity_physics_input(
     storage: &mut WorldStorage,
     materials: &BlockMaterialIds,
 ) -> EntityPhysicsInput {
-    let mut samples = HashMap::new();
+    let positions = entity_physics_sample_positions(query);
+    let mut samples = HashMap::with_capacity(positions.len());
     let mut complete_samples = true;
-    for pos in entity_physics_sample_positions(query) {
+    for pos in positions {
         let material = match storage.get_cached_block(pos) {
             Some(state) => materials.classify(state.0),
             None if (MIN_Y..MAX_Y).contains(&pos.y) => {
@@ -775,7 +789,10 @@ fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<Block
     let min_y = (body.position.y.min(next_y) - 2.0).floor() as i32;
     let max_y = (body.position.y.max(next_y) + body.aabb.height + 2.0).floor() as i32;
 
-    let mut positions = Vec::new();
+    let capacity = (max_x - min_x + 1).max(0) as usize
+        * (max_y - min_y + 1).max(0) as usize
+        * (max_z - min_z + 1).max(0) as usize;
+    let mut positions = Vec::with_capacity(capacity);
     for x in min_x..=max_x {
         for y in min_y..=max_y {
             for z in min_z..=max_z {
@@ -795,7 +812,7 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
             on_ground: input.query.on_ground,
         };
     }
-    let mut sampler = SampledPhysicsWorld {
+    let sampler = SampledPhysicsWorld {
         samples: input.samples,
     };
     let result = mc_physics::step_entity(
@@ -805,7 +822,7 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
             aabb: input.query.aabb,
             on_ground: input.query.on_ground,
         },
-        &mut sampler,
+        &sampler,
         PhysicsConfig::default(),
     );
     play::EntityPhysicsStep {
@@ -822,6 +839,36 @@ fn physics_vec(vec: mc_entity::Vec3) -> mc_physics::Vec3 {
 
 fn entity_vec(vec: mc_physics::Vec3) -> mc_entity::Vec3 {
     mc_entity::Vec3::new(vec.x, vec.y, vec.z)
+}
+
+fn cached_material_ids(config: &ServerConfig) -> Arc<BlockMaterialIds> {
+    let key = (
+        Arc::as_ptr(&config.blocks) as usize,
+        Arc::as_ptr(&config.block_facts) as usize,
+    );
+    let cache = PHYSICS_MATERIAL_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("physics material cache poisoned");
+    if let Some((blocks, facts, materials)) = cache.get(&key)
+        && blocks
+            .upgrade()
+            .is_some_and(|blocks| Arc::ptr_eq(&blocks, &config.blocks))
+        && facts
+            .upgrade()
+            .is_some_and(|facts| Arc::ptr_eq(&facts, &config.block_facts))
+    {
+        return Arc::clone(materials);
+    }
+
+    let materials = Arc::new(material_ids(&config.blocks, &config.block_facts));
+    cache.insert(
+        key,
+        (
+            Arc::downgrade(&config.blocks),
+            Arc::downgrade(&config.block_facts),
+            Arc::clone(&materials),
+        ),
+    );
+    materials
 }
 
 fn material_ids(blocks: &BlockRegistry, facts: &BlockFactsTable) -> BlockMaterialIds {

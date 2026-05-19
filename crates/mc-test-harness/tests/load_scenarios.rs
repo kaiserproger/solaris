@@ -59,6 +59,52 @@ async fn multicore_chunk_load_respects_global_pipeline_budgets() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn paused_reader_does_not_stall_active_entity_broadcasts() {
+    let Some(server) = start_load_server().await else {
+        return;
+    };
+    let addr = server.addr;
+
+    let (mut paused_client, paused_sync) = connect_to_play(addr, "M50PausedReader").await;
+    drain_until_chunk(&mut paused_client, (0, 0)).await;
+
+    let (mut active_client, active_sync) = connect_to_play(addr, "M50ActiveReader").await;
+    drain_until_chunk(&mut active_client, (0, 0)).await;
+
+    let spawn_y = active_sync.y.floor() as i32;
+    for idx in 0..32 {
+        active_client
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    idx % 4,
+                    spawn_y,
+                    2 + idx / 4
+                ),
+            })
+            .await
+            .expect("summon zombie while peer reader is paused");
+    }
+
+    let spawns = drain_counting(&mut active_client, Duration::from_secs(5), AddEntity::ID).await;
+    assert!(
+        spawns > 0,
+        "active client should keep receiving entity broadcasts while another reader is paused"
+    );
+
+    let pressure = mc_net::lock_pressure_snapshot();
+    eprintln!(
+        "M50 slow_reader active_spawns={} paused_start=({:.1},{:.1},{:.1}) session_lock_max_hold_us={} session_lock_wait_us={}",
+        spawns,
+        paused_sync.x,
+        paused_sync.y,
+        paused_sync.z,
+        pressure.session_registry.max_hold_us,
+        pressure.session_registry.wait_us,
+    );
+}
+
 #[tokio::test]
 #[ignore = "M37 load report; run explicitly with --ignored --nocapture"]
 async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
