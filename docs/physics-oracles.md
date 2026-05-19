@@ -173,13 +173,23 @@ M43_VANILLA_ADDR=127.0.0.1:25566 \
 Survival sugar-cane drops still need vanilla capture before they become
 assertions.
 
-`collision-wall-step-fall`, `water-lava-replacement`, and
-`sand-gravel-fall-start` remain oracle names, not completed captures. The M43
-fixture contains representative geometry and block states, and Solaris has unit
-coverage for current collision/fluid/falling-block primitives, but M44 did not
-produce vanilla packet/damage captures for these cases. Do not use the existing
-unit tests as parity evidence for gameplay changes; capture vanilla first, then
-add the corresponding Solaris comparison or regression.
+`collision-wall-step-fall` is scripted by `wire-probe` for M46. The vanilla setup
+builds the flat floor, shallow water pool, wall, and selected full-block
+non-step target, then teleports the probe player to each sub-window before
+sending the movement packet(s). The selected oracle signals are no correction on
+flat ground, correction back to the pre-collision pose for wall/full-block
+overlap, `SetHealth` to `18.000` for the `y=69..64` landing window, and no
+additional fall-damage health drop for the matching water-entry window. The
+local capture path is
+`.analysis/physics-oracles/collision-wall-step-fall.vanilla.capture`.
+
+`water-lava-replacement` and `sand-gravel-fall-start` remain oracle names, not
+completed captures. The M43 fixture contains representative geometry and block
+states, and Solaris has unit coverage for current collision/fluid/falling-block
+primitives, but M44 did not produce vanilla packet/damage captures for these
+cases. Do not use the existing unit tests as parity evidence for gameplay
+changes; capture vanilla first, then add the corresponding Solaris comparison or
+regression.
 
 ## Comparison Rule
 

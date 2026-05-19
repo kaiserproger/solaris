@@ -439,6 +439,20 @@ fn fall_damage_starts_after_three_blocks_on_landing() {
 }
 
 #[test]
+fn fall_damage_uses_accumulated_airborne_height() {
+    let mut takeoff = PlayerPose::new(0.0, 70.0, 0.0);
+    takeoff.flags = MovePlayerFlags::new(true, false);
+    let mut mid_fall = PlayerPose::new(0.0, 66.0, 0.0);
+    mid_fall.flags = MovePlayerFlags::new(false, false);
+    refresh_player_fall_state(takeoff, &mut mid_fall);
+
+    let mut landing = PlayerPose::new(0.0, 64.0, 0.0);
+    landing.flags = MovePlayerFlags::new(true, false);
+
+    assert_eq!(fall_damage_amount(mid_fall, landing), 3.0);
+}
+
+#[test]
 fn survival_damage_heal_and_death_are_clamped() {
     let mut state = SurvivalState::FULL;
 

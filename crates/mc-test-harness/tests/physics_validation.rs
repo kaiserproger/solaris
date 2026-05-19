@@ -10,13 +10,13 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ClientboundSetEntityData,
-    ConfirmTeleportation, Direction, GameEvent, GameMode, LevelChunkWithLight, LoginPlay,
-    MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput, SectionBlocksUpdate,
-    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
-    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent, GameMode,
+    LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind, PlayerCommandAction,
+    PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand,
+    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
+    ServerboundPlayerLoaded, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    pack_block_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -80,6 +80,11 @@ fn deterministic_physics_fixture_materializes_named_shapes() {
         world.get_block(BlockPos { x: 4, y: 64, z: 10 }).unwrap(),
         Some(states.water),
         "fluid spread oracle should include a water source"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 4, y: 64, z: -3 }).unwrap(),
+        Some(states.stone),
+        "full-block non-step collision target should be present"
     );
     assert_eq!(
         world.get_block(BlockPos { x: 5, y: 64, z: 10 }).unwrap(),
@@ -227,6 +232,176 @@ async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
         Duration::from_millis(750),
     )
     .await;
+}
+
+#[tokio::test]
+async fn flat_ground_move_does_not_emit_position_correction() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M46FlatGround").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 0.5,
+            y: 64.0,
+            z: 0.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move across flat ground");
+
+    assert_no_position_correction(&mut client, Duration::from_millis(500)).await;
+}
+
+#[tokio::test]
+async fn wall_collision_corrects_player_to_last_accepted_position() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M46WallCollision").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 1.5,
+            y: 64.0,
+            z: 10.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move near wall");
+    assert_no_position_correction(&mut client, Duration::from_millis(250)).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 2.5,
+            y: 64.0,
+            z: 10.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move into wall");
+
+    let correction = wait_for_position_correction(&mut client, Duration::from_secs(2)).await;
+    assert_position_near(&correction, 1.5, 64.0, 10.5, 1.0e-6);
+}
+
+#[tokio::test]
+async fn full_block_non_step_attempt_corrects_player() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M46NonStep").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 3.5,
+            y: 64.0,
+            z: -2.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move beside full block");
+    assert_no_position_correction(&mut client, Duration::from_millis(250)).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 4.5,
+            y: 64.0,
+            z: -2.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("attempt full-block step");
+
+    let correction = wait_for_position_correction(&mut client, Duration::from_secs(2)).await;
+    assert_position_near(&correction, 3.5, 64.0, -2.5, 1.0e-6);
+}
+
+#[tokio::test]
+async fn landing_fall_damage_uses_accumulated_descent() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M46FallDamage").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Survival,
+        })
+        .await
+        .expect("switch to survival");
+    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+
+    for (y, on_ground) in [
+        (69.0, false),
+        (68.0, false),
+        (67.0, false),
+        (66.0, false),
+        (65.0, false),
+        (64.0, true),
+    ] {
+        client
+            .write_packet(&ServerboundMovePlayerPosRot {
+                x: 6.5,
+                y,
+                z: 0.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(on_ground, false),
+            })
+            .await
+            .expect("send fall movement");
+    }
+
+    wait_for_health_near(&mut client, 18.0, 0.01).await;
+}
+
+#[tokio::test]
+async fn water_entry_suppresses_fall_damage() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M46WaterFall").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Survival,
+        })
+        .await
+        .expect("switch to survival");
+    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+
+    for y in [69.0, 68.0, 67.0, 66.0, 65.0, 64.0] {
+        client
+            .write_packet(&ServerboundMovePlayerPosRot {
+                x: -4.5,
+                y,
+                z: 0.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(false, false),
+            })
+            .await
+            .expect("send water-entry movement");
+    }
+
+    assert_no_health_below(&mut client, 20.0, Duration::from_millis(750)).await;
 }
 
 #[tokio::test]
@@ -483,6 +658,7 @@ fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureSt
     set(&mut world, 4, 64, 10, states.water);
     set(&mut world, 5, 63, 10, states.stone);
     set(&mut world, 5, 64, 10, states.lava);
+    set(&mut world, 4, 64, -3, states.stone);
 
     for x in -2..=2 {
         for z in 8..=12 {
@@ -644,6 +820,126 @@ async fn assert_no_self_authoritative_water_frames(
             );
         } else if frame.id == SynchronizePlayerPosition::ID {
             panic!("water movement window should not require a player correction");
+        }
+    }
+}
+
+async fn assert_no_position_correction(client: &mut Client, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body).expect("decode SyncPlayerPos");
+            panic!("movement window should not require correction: {pkt:?}");
+        }
+    }
+}
+
+async fn wait_for_position_correction(
+    client: &mut Client,
+    duration: Duration,
+) -> SynchronizePlayerPosition {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for position correction"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("wait for position correction");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            return SynchronizePlayerPosition::decode(&mut body).expect("decode SyncPlayerPos");
+        }
+    }
+}
+
+fn assert_position_near(
+    correction: &SynchronizePlayerPosition,
+    x: f64,
+    y: f64,
+    z: f64,
+    tolerance: f64,
+) {
+    assert!(
+        (correction.x - x).abs() <= tolerance,
+        "correction x: expected {x}, got {}",
+        correction.x
+    );
+    assert!(
+        (correction.y - y).abs() <= tolerance,
+        "correction y: expected {y}, got {}",
+        correction.y
+    );
+    assert!(
+        (correction.z - z).abs() <= tolerance,
+        "correction z: expected {z}, got {}",
+        correction.z
+    );
+}
+
+async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for health {health}"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("health update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetHealth::decode(&mut body).expect("decode set health");
+            if (pkt.health - health).abs() <= tolerance {
+                return;
+            }
+        }
+    }
+}
+
+async fn assert_no_health_below(client: &mut Client, health: f32, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundSetHealth::decode(&mut body).expect("decode set health");
+            assert!(
+                pkt.health >= health,
+                "water entry should suppress fall damage; got health {}",
+                pkt.health
+            );
         }
     }
 }

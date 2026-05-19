@@ -372,6 +372,7 @@ struct PlayerPose {
     in_water: bool,
     eye_in_water: bool,
     swimming: bool,
+    fall_start_y: f64,
 }
 
 impl PlayerPose {
@@ -389,6 +390,7 @@ impl PlayerPose {
             in_water: false,
             eye_in_water: false,
             swimming: false,
+            fall_start_y: y,
         }
     }
 
@@ -4480,6 +4482,106 @@ async fn player_water_overlap(state: &InteractionState, pose: PlayerPose) -> (bo
     (in_water, eye_in_water)
 }
 
+fn refresh_player_fall_state(old_pose: PlayerPose, new_pose: &mut PlayerPose) {
+    if new_pose.in_water || new_pose.flags.on_ground {
+        new_pose.fall_start_y = new_pose.y;
+    } else if old_pose.flags.on_ground || old_pose.in_water {
+        new_pose.fall_start_y = old_pose.y.max(new_pose.y);
+    } else {
+        new_pose.fall_start_y = old_pose.fall_start_y.max(new_pose.y);
+    }
+}
+
+async fn player_pose_collides_with_solid(
+    state: Option<&InteractionState>,
+    pose: PlayerPose,
+) -> bool {
+    let Some(state) = state else {
+        return false;
+    };
+    let half_width = 0.3;
+    let min_x = (pose.x - half_width).floor() as i32;
+    let max_x = (pose.x + half_width).floor() as i32;
+    let min_y = pose.y.floor() as i32;
+    let max_y = (pose.y + 1.8 - 1.0e-6).floor() as i32;
+    let min_z = (pose.z - half_width).floor() as i32;
+    let max_z = (pose.z + half_width).floor() as i32;
+    let mut storage = state.world.lock().await;
+    for x in min_x..=max_x {
+        for y in min_y..=max_y {
+            for z in min_z..=max_z {
+                let solid = storage
+                    .get_block(mc_world::BlockPos { x, y, z })
+                    .ok()
+                    .flatten()
+                    .is_some_and(|state_id| player_collision_state_is_solid(state, state_id));
+                if solid {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn player_collision_state_is_solid(
+    state: &InteractionState,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    if state.block_facts.fluid(state_id.0).is_some() {
+        return false;
+    }
+    state.blocks.by_id(state_id).is_some_and(|block_state| {
+        !matches!(
+            block_state.block.id.as_str(),
+            "minecraft:air"
+                | "minecraft:short_grass"
+                | "minecraft:tall_grass"
+                | "minecraft:fern"
+                | "minecraft:large_fern"
+                | "minecraft:dandelion"
+                | "minecraft:poppy"
+                | "minecraft:sugar_cane"
+        )
+    })
+}
+
+async fn correct_player_collision<W>(
+    state: Option<&InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    old_pose: PlayerPose,
+    new_pose: PlayerPose,
+    next_teleport_id: &mut i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if !player_pose_collides_with_solid(state, new_pose).await {
+        return Ok(false);
+    }
+    let teleport_id = *next_teleport_id;
+    *next_teleport_id = (*next_teleport_id).saturating_add(1);
+    write_packet(
+        writer,
+        &SynchronizePlayerPosition {
+            teleport_id,
+            x: old_pose.x,
+            y: old_pose.y,
+            z: old_pose.z,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+            yaw: old_pose.yaw,
+            pitch: old_pose.pitch,
+            relative_flags: 0,
+        },
+        compression,
+    )
+    .await?;
+    Ok(true)
+}
+
 fn state_is_water(
     facts: &mc_data::block_facts::BlockFactsTable,
     state_id: mc_world::BlockStateId,
@@ -4584,7 +4686,9 @@ fn fall_damage_amount(old_pose: PlayerPose, new_pose: PlayerPose) -> f32 {
     if old_pose.flags.on_ground || !new_pose.flags.on_ground {
         return 0.0;
     }
-    ((old_pose.y - new_pose.y).max(0.0) - 3.0).floor().max(0.0) as f32
+    ((old_pose.fall_start_y - new_pose.y).max(0.0) - 3.0)
+        .floor()
+        .max(0.0) as f32
 }
 
 async fn interact_with_bed<W>(
@@ -5965,6 +6069,7 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut survival_tick: u32 = 0;
+    let mut next_teleport_id: i32 = 4;
     let mut client_brand: Option<String> = None;
     let mut client_preferences: Option<ClientPreferences> = None;
     let mut pending_outbound = VecDeque::new();
@@ -6201,79 +6306,111 @@ where
                     let movement = ServerboundMovePlayerPos::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
                     let old_pose = player_pose;
-                    player_pose.x = movement.x;
-                    player_pose.y = movement.y;
-                    player_pose.z = movement.z;
-                    player_pose.flags = movement.flags;
-                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
-                    if game_mode == GameMode::Survival
-                        && let Some(state) = interaction.as_deref_mut()
+                    let mut new_pose = player_pose;
+                    new_pose.x = movement.x;
+                    new_pose.y = movement.y;
+                    new_pose.z = movement.z;
+                    new_pose.flags = movement.flags;
+                    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
+                    refresh_player_fall_state(old_pose, &mut new_pose);
+                    if correct_player_collision(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        old_pose,
+                        new_pose,
+                        &mut next_teleport_id,
+                    )
+                    .await?
                     {
-                        maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
-                    }
-                    if game_mode == GameMode::Survival {
-                        apply_fall_damage(
-                            interaction.as_deref_mut(),
+                        player_pose = old_pose;
+                    } else {
+                        player_pose = new_pose;
+                        if game_mode == GameMode::Survival
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
+                        }
+                        if game_mode == GameMode::Survival {
+                            apply_fall_damage(
+                                interaction.as_deref_mut(),
+                                writer,
+                                compression,
+                                &mut survival_state,
+                                old_pose,
+                                player_pose,
+                            )
+                            .await?;
+                        }
+                        let new_center = player_pose.chunk_pos();
+                        dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
+                        replan_after_movement(
                             writer,
                             compression,
-                            &mut survival_state,
-                            old_pose,
-                            player_pose,
+                            &mut chunk_stream,
+                            interaction.as_deref_mut(),
+                            old_center,
+                            new_center,
+                            player_pose.yaw,
                         )
                         .await?;
                     }
-                    let new_center = player_pose.chunk_pos();
-                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                    replan_after_movement(
-                        writer,
-                        compression,
-                        &mut chunk_stream,
-                        interaction.as_deref_mut(),
-                        old_center,
-                        new_center,
-                        player_pose.yaw,
-                    )
-                    .await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
                     let old_pose = player_pose;
-                    player_pose.x = movement.x;
-                    player_pose.y = movement.y;
-                    player_pose.z = movement.z;
-                    player_pose.yaw = movement.yaw;
-                    player_pose.pitch = movement.pitch;
-                    player_pose.flags = movement.flags;
-                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
-                    if game_mode == GameMode::Survival
-                        && let Some(state) = interaction.as_deref_mut()
+                    let mut new_pose = player_pose;
+                    new_pose.x = movement.x;
+                    new_pose.y = movement.y;
+                    new_pose.z = movement.z;
+                    new_pose.yaw = movement.yaw;
+                    new_pose.pitch = movement.pitch;
+                    new_pose.flags = movement.flags;
+                    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
+                    refresh_player_fall_state(old_pose, &mut new_pose);
+                    if correct_player_collision(
+                        interaction.as_deref(),
+                        writer,
+                        compression,
+                        old_pose,
+                        new_pose,
+                        &mut next_teleport_id,
+                    )
+                    .await?
                     {
-                        maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
-                    }
-                    if game_mode == GameMode::Survival {
-                        apply_fall_damage(
-                            interaction.as_deref_mut(),
+                        player_pose = old_pose;
+                    } else {
+                        player_pose = new_pose;
+                        if game_mode == GameMode::Survival
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
+                        }
+                        if game_mode == GameMode::Survival {
+                            apply_fall_damage(
+                                interaction.as_deref_mut(),
+                                writer,
+                                compression,
+                                &mut survival_state,
+                                old_pose,
+                                player_pose,
+                            )
+                            .await?;
+                        }
+                        let new_center = player_pose.chunk_pos();
+                        dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
+                        replan_after_movement(
                             writer,
                             compression,
-                            &mut survival_state,
-                            old_pose,
-                            player_pose,
+                            &mut chunk_stream,
+                            interaction.as_deref_mut(),
+                            old_center,
+                            new_center,
+                            player_pose.yaw,
                         )
                         .await?;
                     }
-                    let new_center = player_pose.chunk_pos();
-                    dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                    replan_after_movement(
-                        writer,
-                        compression,
-                        &mut chunk_stream,
-                        interaction.as_deref_mut(),
-                        old_center,
-                        new_center,
-                        player_pose.yaw,
-                    )
-                    .await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerRot::decode(&mut body)?;

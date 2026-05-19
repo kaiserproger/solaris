@@ -29,13 +29,14 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundSetEntityData, ClientboundTakeItemEntity, ConfirmTeleportation, Direction,
-    InteractionHand, LoginPlay, MoveEntityPos, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind,
-    PlayerCommandAction, PlayerInput, RemoveEntities, ServerboundChatCommand,
-    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
-    ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSwing, SetEntityMotion,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    ClientboundSetEntityData, ClientboundSetHealth, ClientboundTakeItemEntity,
+    ConfirmTeleportation, Direction, GameMode, InteractionHand, LoginPlay, MoveEntityPos,
+    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput,
+    RemoveEntities, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
+    ServerboundSetCarriedItem, ServerboundSwing, SetEntityMotion, SynchronizePlayerPosition,
+    pack_block_pos, unpack_block_pos,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -84,6 +85,7 @@ enum ProbeScenario {
     EntityLandPassiveMotion,
     EntityHostileMotion,
     EntityAquaticMotion,
+    CollisionWallStepFall,
 }
 
 impl ProbeScenario {
@@ -96,6 +98,7 @@ impl ProbeScenario {
             "entity-land-passive-motion" => Self::EntityLandPassiveMotion,
             "entity-hostile-motion" => Self::EntityHostileMotion,
             "entity-aquatic-motion" => Self::EntityAquaticMotion,
+            "collision-wall-step-fall" => Self::CollisionWallStepFall,
             _ => Self::Passive,
         }
     }
@@ -200,6 +203,14 @@ fn log_frame(
             ))?,
             Err(err) => capture.line(format!("    ↳ ContainerSetSlot decode_error={err}"))?,
         }
+    } else if frame.id == ClientboundSetHealth::ID {
+        match ClientboundSetHealth::decode(&mut frame.body.clone()) {
+            Ok(health) => capture.line(format!(
+                "    ↳ SetHealth: health={:.3} food={} saturation={:.3}",
+                health.health, health.food, health.saturation
+            ))?,
+            Err(err) => capture.line(format!("    ↳ SetHealth decode_error={err}"))?,
+        }
     } else if frame.id == ClientboundTakeItemEntity::ID {
         match ClientboundTakeItemEntity::decode(&mut frame.body.clone()) {
             Ok(take) => capture.line(format!(
@@ -278,6 +289,17 @@ fn hexdump_short(bytes: &[u8], max: usize) -> String {
         s.push('…');
     }
     s.trim_end().to_string()
+}
+
+fn fall_step(x: f64, y: f64, z: f64, on_ground: bool) -> ServerboundMovePlayerPosRot {
+    ServerboundMovePlayerPosRot {
+        x,
+        y,
+        z,
+        yaw: 90.0,
+        pitch: 0.0,
+        flags: MovePlayerFlags::new(on_ground, false),
+    }
 }
 
 /// State for tracking the connection.
@@ -518,6 +540,31 @@ impl Probe {
             format!("tp {player_name} 0.5 68.0 5.5 180 35"),
             "kill @e[type=!player]".to_string(),
             format!("summon {entity} 0.5 65.0 0.5"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn setup_collision_wall_step_fall_fixture(
+        &mut self,
+        player_name: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line("=== VANILLA SETUP collision-wall-step-fall fixture ===")?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "difficulty peaceful".to_string(),
+            "fill -8 63 -4 12 75 12 air".to_string(),
+            "fill -8 63 -4 12 63 12 stone".to_string(),
+            "fill -5 64 -2 -1 64 1 water".to_string(),
+            "setblock 2 64 10 stone".to_string(),
+            "setblock 2 65 10 stone".to_string(),
+            "setblock 4 64 -3 stone".to_string(),
+            format!("gamemode survival {player_name}"),
+            format!("tp {player_name} 0.5 64.0 0.5 90 0"),
         ];
         for command in commands {
             self.send_chat_command_and_drain(command, capture).await?;
@@ -1005,6 +1052,165 @@ impl Probe {
         ))?;
         Ok(())
     }
+
+    async fn run_collision_wall_step_fall(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play("collision-wall-step-fall", play_seconds, capture, None)
+            .await?;
+        if let Some(player_name) = vanilla_setup_player {
+            self.setup_collision_wall_step_fall_fixture(player_name, capture)
+                .await?;
+        }
+        self.write_packet_logged(
+            &ServerboundChangeGameMode {
+                mode: GameMode::Survival,
+            },
+            "PLAY",
+            "ChangeGameMode(Survival)",
+            capture,
+        )
+        .await?;
+
+        let teleport = |name: Option<&str>, x: f64, y: f64, z: f64| {
+            name.map(|name| format!("tp {name} {x} {y} {z} 90 0"))
+        };
+        if let Some(command) = teleport(vanilla_setup_player, 0.5, 64.0, 0.5) {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        self.write_move_and_drain(
+            "flat-ground",
+            ServerboundMovePlayerPosRot {
+                x: 0.6,
+                y: 64.0,
+                z: 0.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            capture,
+        )
+        .await?;
+        if let Some(command) = teleport(vanilla_setup_player, 1.5, 64.0, 10.5) {
+            self.send_chat_command_and_drain(command, capture).await?;
+        } else {
+            self.write_move_and_drain(
+                "wall-start",
+                ServerboundMovePlayerPosRot {
+                    x: 1.5,
+                    y: 64.0,
+                    z: 10.5,
+                    yaw: 90.0,
+                    pitch: 0.0,
+                    flags: MovePlayerFlags::new(true, false),
+                },
+                capture,
+            )
+            .await?;
+        }
+        self.write_move_and_drain(
+            "wall-collision",
+            ServerboundMovePlayerPosRot {
+                x: 2.5,
+                y: 64.0,
+                z: 10.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            capture,
+        )
+        .await?;
+        if let Some(command) = teleport(vanilla_setup_player, 3.5, 64.0, -2.5) {
+            self.send_chat_command_and_drain(command, capture).await?;
+        } else {
+            self.write_move_and_drain(
+                "non-step-start",
+                ServerboundMovePlayerPosRot {
+                    x: 3.5,
+                    y: 64.0,
+                    z: -2.5,
+                    yaw: 90.0,
+                    pitch: 0.0,
+                    flags: MovePlayerFlags::new(true, false),
+                },
+                capture,
+            )
+            .await?;
+        }
+        self.write_move_and_drain(
+            "full-block-non-step",
+            ServerboundMovePlayerPosRot {
+                x: 4.5,
+                y: 64.0,
+                z: -2.5,
+                yaw: 90.0,
+                pitch: 0.0,
+                flags: MovePlayerFlags::new(true, false),
+            },
+            capture,
+        )
+        .await?;
+        if let Some(command) = teleport(vanilla_setup_player, 6.5, 70.0, 0.5) {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        for (label, step) in [
+            ("fall-y69", fall_step(6.5, 69.0, 0.5, false)),
+            ("fall-y68", fall_step(6.5, 68.0, 0.5, false)),
+            ("fall-y67", fall_step(6.5, 67.0, 0.5, false)),
+            ("fall-y66", fall_step(6.5, 66.0, 0.5, false)),
+            ("fall-y65", fall_step(6.5, 65.0, 0.5, false)),
+            ("fall-landing", fall_step(6.5, 64.0, 0.5, true)),
+        ] {
+            self.write_move_and_drain(label, step, capture).await?;
+        }
+        if let Some(command) = teleport(vanilla_setup_player, -4.5, 70.0, 0.5) {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        for (label, step) in [
+            ("water-fall-y69", fall_step(-4.5, 69.0, 0.5, false)),
+            ("water-fall-y68", fall_step(-4.5, 68.0, 0.5, false)),
+            ("water-fall-y67", fall_step(-4.5, 67.0, 0.5, false)),
+            ("water-fall-y66", fall_step(-4.5, 66.0, 0.5, false)),
+            ("water-fall-y65", fall_step(-4.5, 65.0, 0.5, false)),
+            ("water-entry", fall_step(-4.5, 64.0, 0.5, false)),
+        ] {
+            self.write_move_and_drain(label, step, capture).await?;
+        }
+
+        let n = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .await?;
+        capture.line(format!(
+            "script captured {n} final collision-wall-step-fall frames for entity_id={}",
+            start.entity_id
+        ))?;
+        Ok(())
+    }
+
+    async fn write_move_and_drain(
+        &mut self,
+        label: &str,
+        step: ServerboundMovePlayerPosRot,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        self.write_packet_logged(
+            &step,
+            "PLAY",
+            &format!("MovePlayerPosRot({label})"),
+            capture,
+        )
+        .await?;
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        let _ = self
+            .dump_for("PLAY", Duration::from_millis(125), capture)
+            .await?;
+        Ok(())
+    }
 }
 
 #[tokio::main]
@@ -1272,6 +1478,11 @@ async fn main() -> Result<()> {
                     &mut capture,
                     vanilla_setup_player,
                 )
+                .await?;
+        }
+        ProbeScenario::CollisionWallStepFall => {
+            probe
+                .run_collision_wall_step_fall(cli.play_seconds, &mut capture, vanilla_setup_player)
                 .await?;
         }
     }
