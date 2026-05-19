@@ -71,10 +71,11 @@ use mc_world::{
     FurnaceSlot, ScheduledFluidTick,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
+use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
@@ -440,6 +441,7 @@ impl PlayerPose {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -448,6 +450,7 @@ pub(crate) async fn handle<R, W>(
     profile: &LoggedInProfile,
     config: &ServerConfig,
     sessions: Arc<SessionRegistry>,
+    chunk_pipeline_resources: ChunkPipelineResources,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -683,6 +686,7 @@ where
             spawn_cz,
             initial_pose.yaw,
             config.view_distance,
+            chunk_pipeline_resources.clone(),
             config.chunk_pipeline,
         ))
     });
@@ -6392,6 +6396,10 @@ where
             }
             _ = world_time_ticker.tick() => {
                 send_world_time(writer, compression, &sessions).await?;
+            }
+            () = config.shutdown.notified() => {
+                info!("shutdown requested; closing play session");
+                return Ok(());
             }
             result = read_frame(reader, buf, compression) => {
                 let frame = result?;

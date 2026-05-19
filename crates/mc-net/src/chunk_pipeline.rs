@@ -6,6 +6,10 @@
 //! bounded chunk workers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPipelinePolicy {
@@ -38,6 +42,97 @@ impl Default for ChunkPipelinePolicy {
             region_cache_size: 4,
             compression_threshold: crate::login::LOGIN_COMPRESSION_THRESHOLD,
             compression_level: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ChunkPipelineResources {
+    io_permits: Arc<Semaphore>,
+    cpu_permits: Arc<Semaphore>,
+    metrics: ChunkPipelineResourceMetrics,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ChunkPipelineResourceMetrics {
+    active_io: Arc<AtomicUsize>,
+    max_io_active: Arc<AtomicUsize>,
+    active_cpu: Arc<AtomicUsize>,
+    max_cpu_active: Arc<AtomicUsize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChunkPipelineResourceSnapshot {
+    pub active_io: usize,
+    pub max_io_active: usize,
+    pub active_cpu: usize,
+    pub max_cpu_active: usize,
+}
+
+pub(crate) struct ChunkPipelinePermit {
+    _permit: OwnedSemaphorePermit,
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ChunkPipelinePermit {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl ChunkPipelineResourceMetrics {
+    #[must_use]
+    pub fn snapshot(&self) -> ChunkPipelineResourceSnapshot {
+        ChunkPipelineResourceSnapshot {
+            active_io: self.active_io.load(Ordering::Acquire),
+            max_io_active: self.max_io_active.load(Ordering::Acquire),
+            active_cpu: self.active_cpu.load(Ordering::Acquire),
+            max_cpu_active: self.max_cpu_active.load(Ordering::Acquire),
+        }
+    }
+}
+
+impl ChunkPipelineResources {
+    #[must_use]
+    pub(crate) fn new(policy: ChunkPipelinePolicy) -> Self {
+        Self::with_limits(policy.chunk_io_threads, policy.chunk_worker_threads)
+    }
+
+    #[must_use]
+    pub(crate) fn with_limits(chunk_io_threads: usize, chunk_worker_threads: usize) -> Self {
+        Self {
+            io_permits: Arc::new(Semaphore::new(chunk_io_threads.max(1))),
+            cpu_permits: Arc::new(Semaphore::new(chunk_worker_threads.max(1))),
+            metrics: ChunkPipelineResourceMetrics::default(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn metrics(&self) -> ChunkPipelineResourceMetrics {
+        self.metrics.clone()
+    }
+
+    pub(crate) async fn acquire_io(&self) -> Result<ChunkPipelinePermit, AcquireError> {
+        let permit = Arc::clone(&self.io_permits).acquire_owned().await?;
+        Ok(self.track_permit(permit, true))
+    }
+
+    pub(crate) async fn acquire_cpu(&self) -> Result<ChunkPipelinePermit, AcquireError> {
+        let permit = Arc::clone(&self.cpu_permits).acquire_owned().await?;
+        Ok(self.track_permit(permit, false))
+    }
+
+    fn track_permit(&self, permit: OwnedSemaphorePermit, io: bool) -> ChunkPipelinePermit {
+        let (active, max_active) = if io {
+            (&self.metrics.active_io, &self.metrics.max_io_active)
+        } else {
+            (&self.metrics.active_cpu, &self.metrics.max_cpu_active)
+        };
+        let now = active.fetch_add(1, Ordering::AcqRel) + 1;
+        max_active.fetch_max(now, Ordering::AcqRel);
+        ChunkPipelinePermit {
+            _permit: permit,
+            active: Arc::clone(active),
         }
     }
 }
@@ -270,5 +365,41 @@ mod tests {
         assert_eq!((current.chunk_x, current.chunk_z), (0, 0));
         assert!(scheduler.mark_finished(current));
         assert!(scheduler.is_complete());
+    }
+
+    #[test]
+    fn resources_share_global_permit_budget_across_clones() {
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let other_stream_resources = resources.clone();
+
+        let io_permit = Arc::clone(&resources.io_permits)
+            .try_acquire_owned()
+            .expect("first IO permit");
+        assert!(
+            Arc::clone(&other_stream_resources.io_permits)
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(io_permit);
+        assert!(
+            Arc::clone(&other_stream_resources.io_permits)
+                .try_acquire_owned()
+                .is_ok()
+        );
+
+        let cpu_permit = Arc::clone(&resources.cpu_permits)
+            .try_acquire_owned()
+            .expect("first CPU permit");
+        assert!(
+            Arc::clone(&other_stream_resources.cpu_permits)
+                .try_acquire_owned()
+                .is_err()
+        );
+        drop(cpu_permit);
+        assert!(
+            Arc::clone(&other_stream_resources.cpu_permits)
+                .try_acquire_owned()
+                .is_ok()
+        );
     }
 }

@@ -6,7 +6,7 @@ use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use mc_data::Identifier;
@@ -31,11 +31,13 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
 use crate::ChunkPipelinePolicy;
+use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection::read_packet;
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
 
 static SAVE_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -126,7 +128,12 @@ impl ShutdownHandle {
         self.notify.notify_waiters();
     }
 
-    async fn notified(&self) {
+    #[must_use]
+    pub fn is_requested(&self) -> bool {
+        self.requested.load(Ordering::SeqCst)
+    }
+
+    pub(crate) async fn notified(&self) {
         if self.requested.load(Ordering::SeqCst) {
             return;
         }
@@ -206,6 +213,7 @@ pub struct ServerConfig {
 pub struct BoundServer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
+    chunk_pipeline_resources: ChunkPipelineResources,
     sessions: Arc<play::SessionRegistry>,
 }
 
@@ -264,6 +272,11 @@ impl BoundServer {
         }
     }
 
+    #[must_use]
+    pub fn chunk_pipeline_metrics(&self) -> crate::ChunkPipelineResourceMetrics {
+        self.chunk_pipeline_resources.metrics()
+    }
+
     /// Accept connections forever, spawning a per-connection task each
     /// time. An error inside a connection task is logged but does not
     /// stop the listener.
@@ -275,8 +288,10 @@ impl BoundServer {
             "Solaris is listening"
         );
         let config = self.config;
+        let chunk_pipeline_resources = self.chunk_pipeline_resources;
         let sessions = self.sessions;
         let shutdown = config.shutdown.clone();
+        let mut connections = tokio::task::JoinSet::new();
         let entity_world_root = if let Some(world) = config.world.as_ref() {
             let storage = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::WorldStorage,
@@ -299,7 +314,13 @@ impl BoundServer {
             let simulation_policy = entity_config.random_tick.normalized();
             let mut tick = 0_u64;
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = ticker.tick() => {}
+                    () = entity_config.shutdown.notified() => {
+                        info!("shutdown requested; entity ticker stopping");
+                        break;
+                    }
+                }
                 let tick_started = Instant::now();
                 tick = tick.wrapping_add(1);
 
@@ -328,18 +349,22 @@ impl BoundServer {
                     && let Some(root) = entity_world_root.as_deref()
                 {
                     let snapshots = entity_sessions.persisted_entity_snapshots();
-                    if let Err(err) = play::persistence::save_persisted_entities(
-                        root,
-                        &entity_config.items,
-                        &snapshots,
-                    ) {
+                    if let Err(err) = save_entities_blocking(
+                        root.to_path_buf(),
+                        Arc::clone(&entity_config.items),
+                        snapshots,
+                    )
+                    .await
+                    {
                         warn!(error = %err, "persisted entity save failed");
                     }
                     let metadata = play::persistence::WorldPersistedMetadata {
                         world_time,
                         world_identity: play::persistence::world_identity(root),
                     };
-                    if let Err(err) = play::persistence::save_world_metadata(root, &metadata) {
+                    if let Err(err) =
+                        save_world_metadata_blocking(root.to_path_buf(), metadata).await
+                    {
                         warn!(error = %err, "world metadata save failed");
                     }
                     entity_save_us = elapsed_us(started);
@@ -474,30 +499,61 @@ impl BoundServer {
             Arc::clone(&sessions),
         ));
         loop {
-            let (socket, peer) = tokio::select! {
-                result = self.listener.accept() => result?,
+            tokio::select! {
+                result = self.listener.accept() => {
+                    let (socket, peer) = result?;
+                    debug!(%peer, "accepted connection");
+                    let config = config.clone();
+                    let chunk_pipeline_resources = chunk_pipeline_resources.clone();
+                    let sessions = Arc::clone(&sessions);
+                    connections.spawn(async move {
+                        if let Err(err) =
+                            handle_connection(socket, &config, sessions, chunk_pipeline_resources).await
+                        {
+                            match err {
+                                err if is_client_disconnect(&err) => {
+                                    debug!(%peer, "client disconnected");
+                                }
+                                other => {
+                                    warn!(%peer, error = %other, "connection terminated");
+                                }
+                            }
+                        } else {
+                            debug!(%peer, "connection finished");
+                        }
+                    });
+                }
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(err)) = result {
+                        warn!(error = %err, "connection task join failed");
+                    }
+                }
                 () = shutdown.notified() => {
                     info!("shutdown requested; listener stopping");
-                    return Ok(());
+                    break;
                 }
             };
-            debug!(%peer, "accepted connection");
-            let config = config.clone();
-            let sessions = Arc::clone(&sessions);
-            tokio::spawn(async move {
-                if let Err(err) = handle_connection(socket, &config, sessions).await {
-                    match err {
-                        err if is_client_disconnect(&err) => {
-                            debug!(%peer, "client disconnected");
-                        }
-                        other => {
-                            warn!(%peer, error = %other, "connection terminated");
-                        }
-                    }
-                } else {
-                    debug!(%peer, "connection finished");
-                }
-            });
+        }
+        drain_connections(&mut connections).await;
+        Ok(())
+    }
+}
+
+async fn drain_connections(connections: &mut tokio::task::JoinSet<()>) {
+    let started = Instant::now();
+    while !connections.is_empty() {
+        let Some(remaining) = CONNECTION_DRAIN_TIMEOUT.checked_sub(started.elapsed()) else {
+            warn!(remaining = connections.len(), "connection drain timed out");
+            return;
+        };
+        match tokio::time::timeout(remaining, connections.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(err))) => warn!(error = %err, "connection task join failed"),
+            Ok(None) => return,
+            Err(_) => {
+                warn!(remaining = connections.len(), "connection drain timed out");
+                return;
+            }
         }
     }
 }
@@ -518,11 +574,19 @@ async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::Ses
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     loop {
-        let line = match lines.next_line().await {
-            Ok(Some(line)) => line,
-            Ok(None) => return,
-            Err(err) => {
-                warn!(error = %err, "console command input failed");
+        let line = tokio::select! {
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => line,
+                    Ok(None) => return,
+                    Err(err) => {
+                        warn!(error = %err, "console command input failed");
+                        return;
+                    }
+                }
+            }
+            () = config.shutdown.notified() => {
+                info!("shutdown requested; console task stopping");
                 return;
             }
         };
@@ -815,6 +879,7 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     let listener = TcpListener::bind(config.bind_address).await?;
+    let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
     let sessions = Arc::new(play::SessionRegistry::new());
     if let Some(world) = config.world.as_ref() {
         let world_root = {
@@ -861,6 +926,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     Ok(BoundServer {
         listener,
         config: Arc::new(config),
+        chunk_pipeline_resources,
         sessions,
     })
 }
@@ -899,20 +965,19 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     };
 
     let started = Instant::now();
-    for (uuid, player) in sessions.persisted_player_states() {
-        match play::persistence::save_player_state(&root, uuid, &config.items, &player) {
-            Ok(()) => report.players_saved += 1,
-            Err(err) => report
-                .errors
-                .push(format!("player {uuid}: save failed: {err}")),
-        }
-    }
+    let players = sessions.persisted_player_states();
+    let (players_saved, player_errors) =
+        save_player_states_blocking(root.clone(), Arc::clone(&config.items), players).await;
+    report.players_saved = players_saved;
+    report.errors.extend(player_errors);
     report.timings.players_us = elapsed_us(started);
 
     let started = Instant::now();
     let entities = sessions.persisted_entity_snapshots();
     report.entities_saved = entities.len();
-    if let Err(err) = play::persistence::save_persisted_entities(&root, &config.items, &entities) {
+    if let Err(err) =
+        save_entities_blocking(root.clone(), Arc::clone(&config.items), entities).await
+    {
         report.errors.push(format!("entities: save failed: {err}"));
     }
     report.timings.entities_us = elapsed_us(started);
@@ -922,7 +987,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
         world_time: sessions.world_time(),
         world_identity: play::persistence::world_identity(&root),
     };
-    match play::persistence::save_world_metadata(&root, &metadata) {
+    match save_world_metadata_blocking(root.clone(), metadata).await {
         Ok(()) => report.world_metadata_saved = true,
         Err(err) => report
             .errors
@@ -972,7 +1037,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     }
 
     let started = Instant::now();
-    let commit = match flush_plan.write() {
+    let commit = match write_dirty_flush_blocking(flush_plan).await {
         Ok(commit) => commit,
         Err(err) => {
             report
@@ -1019,6 +1084,70 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     report
 }
 
+async fn save_player_states_blocking(
+    root: std::path::PathBuf,
+    items: Arc<ItemRegistry>,
+    players: Vec<(uuid::Uuid, play::persistence::PlayerPersistedState)>,
+) -> (usize, Vec<String>) {
+    match tokio::task::spawn_blocking(move || {
+        let mut saved = 0usize;
+        let mut errors = Vec::new();
+        for (uuid, player) in players {
+            match play::persistence::save_player_state(&root, uuid, &items, &player) {
+                Ok(()) => saved += 1,
+                Err(err) => errors.push(format!("player {uuid}: save failed: {err}")),
+            }
+        }
+        (saved, errors)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(err) => (0, vec![format!("players: save worker failed: {err}")]),
+    }
+}
+
+async fn save_entities_blocking(
+    root: std::path::PathBuf,
+    items: Arc<ItemRegistry>,
+    entities: Vec<mc_entity::EntitySnapshot>,
+) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || {
+        play::persistence::save_persisted_entities(&root, &items, &entities)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn save_world_metadata_blocking(
+    root: std::path::PathBuf,
+    metadata: play::persistence::WorldPersistedMetadata,
+) -> Result<(), String> {
+    match tokio::task::spawn_blocking(move || {
+        play::persistence::save_world_metadata(&root, &metadata)
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn write_dirty_flush_blocking(
+    flush_plan: mc_world::storage::DirtyFlushPlan,
+) -> Result<mc_world::storage::DirtyFlushCommit, String> {
+    match tokio::task::spawn_blocking(move || flush_plan.write()).await {
+        Ok(Ok(commit)) => Ok(commit),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 /// Convenience for the binary: `bind` followed by `serve`.
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
     bind(config).await?.serve().await
@@ -1028,6 +1157,7 @@ async fn handle_connection(
     socket: tokio::net::TcpStream,
     config: &ServerConfig,
     sessions: Arc<play::SessionRegistry>,
+    chunk_pipeline_resources: ChunkPipelineResources,
 ) -> Result<(), ConnectionError> {
     // Disable Nagle for low-latency interactive packets — same setting
     // vanilla uses.
@@ -1082,6 +1212,7 @@ async fn handle_connection(
                 &profile,
                 config,
                 sessions,
+                chunk_pipeline_resources,
             )
             .await
         }

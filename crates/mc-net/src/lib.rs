@@ -20,8 +20,9 @@ mod server;
 mod status;
 
 pub use chunk_pipeline::{
-    ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineStopReason,
-    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk,
+    ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
+    ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPriority, ChunkRequest,
+    ChunkScheduler, PreparedChunk,
 };
 pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};

@@ -5,10 +5,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use std::{future::Future, pin::Pin};
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use mc_server::ServerConfig;
+
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Debug, Parser)]
 #[command(
@@ -374,10 +377,12 @@ async fn serve(path: &Path) -> Result<()> {
     );
 
     // M29.f: race the network listener against a Ctrl-C signal. On
-    // signal, run the shared save-all path before returning.
+    // signal, request shutdown before the final save so gameplay tasks
+    // stop mutating state first.
+    let shutdown_handle = net.shutdown.clone();
     let bound = mc_net::bind(net).await.context("network bind")?;
     let save_handle = bound.save_handle();
-    let run_fut = bound.serve();
+    let mut run_fut = std::pin::pin!(bound.serve());
     let shutdown = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
@@ -386,12 +391,21 @@ async fn serve(path: &Path) -> Result<()> {
         }
     };
     tokio::select! {
-        result = run_fut => {
+        result = &mut run_fut => {
             result.context("network listener")
         }
         () = shutdown => {
             tracing::info!("shutdown signal received");
-            let report = save_handle.save_all().await;
+            let (drain_result, report) = request_shutdown_drain_then_save(
+                &shutdown_handle,
+                run_fut.as_mut(),
+                save_handle.save_all(),
+            ).await;
+            match drain_result {
+                Ok(Ok(())) => tracing::info!("shutdown: runtime tasks drained"),
+                Ok(Err(err)) => return Err(err).context("network listener"),
+                Err(_) => tracing::warn!("shutdown: drain timeout elapsed before final save"),
+            }
             if report.is_ok() {
                 tracing::info!(
                     players = report.players_saved,
@@ -409,6 +423,21 @@ async fn serve(path: &Path) -> Result<()> {
             Ok(())
         }
     }
+}
+
+async fn request_shutdown_drain_then_save<D, S, SR>(
+    shutdown: &mc_net::ShutdownHandle,
+    drain: Pin<&mut D>,
+    save: S,
+) -> (Result<D::Output, tokio::time::error::Elapsed>, SR)
+where
+    D: Future,
+    S: Future<Output = SR>,
+{
+    shutdown.request();
+    let drain_result = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await;
+    let save_result = save.await;
+    (drain_result, save_result)
 }
 
 fn load_structure_rules(
@@ -801,6 +830,34 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
         assert_eq!(chunk_cache_size_for_view_distance(10), 529);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[tokio::test]
+    async fn shutdown_sequence_requests_and_drains_before_save() {
+        let shutdown = mc_net::ShutdownHandle::default();
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drain_shutdown = shutdown.clone();
+        let drain_events = Arc::clone(&events);
+        let mut drain = std::pin::pin!(async move {
+            assert!(drain_shutdown.is_requested());
+            drain_events.lock().unwrap().push("drain");
+            Ok::<(), std::io::Error>(())
+        });
+        let save_shutdown = shutdown.clone();
+        let save_events = Arc::clone(&events);
+        let save = async move {
+            assert!(save_shutdown.is_requested());
+            assert_eq!(save_events.lock().unwrap().as_slice(), ["drain"]);
+            save_events.lock().unwrap().push("save");
+            42
+        };
+
+        let (drain_result, save_result) =
+            request_shutdown_drain_then_save(&shutdown, drain.as_mut(), save).await;
+
+        assert!(drain_result.unwrap().is_ok());
+        assert_eq!(save_result, 42);
+        assert_eq!(events.lock().unwrap().as_slice(), ["drain", "save"]);
     }
 
     #[test]

@@ -21,6 +21,43 @@ use mc_protocol::packets::play::{
 use mc_test_harness::client::Client;
 
 const VIEW_DISTANCE: i32 = 1;
+const LOAD_CHUNK_IO_THREADS: usize = 1;
+const LOAD_CHUNK_WORKER_THREADS: usize = 2;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn multicore_chunk_load_respects_global_pipeline_budgets() {
+    let Some(server) = start_load_server().await else {
+        return;
+    };
+    let addr = server.addr;
+
+    let mut clients = Vec::new();
+    for idx in 0..4 {
+        clients.push(tokio::spawn(async move {
+            let (mut client, _) = connect_to_play(addr, &format!("M48Load{idx}")).await;
+            drain_until_chunk(&mut client, (0, 0)).await;
+        }));
+    }
+    for client in clients {
+        client.await.expect("client task joins");
+    }
+
+    let snapshot = server.chunk_pipeline_metrics.snapshot();
+    assert!(
+        snapshot.max_cpu_active > 0,
+        "chunk load test should force CPU chunk preparation"
+    );
+    assert!(
+        snapshot.max_io_active <= server.chunk_io_threads,
+        "global IO permits exceeded: {:?}",
+        snapshot
+    );
+    assert!(
+        snapshot.max_cpu_active <= server.chunk_worker_threads,
+        "global CPU permits exceeded: {:?}",
+        snapshot
+    );
+}
 
 #[tokio::test]
 #[ignore = "M37 load report; run explicitly with --ignored --nocapture"]
@@ -158,6 +195,9 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
 
 struct LoadServer {
     addr: std::net::SocketAddr,
+    chunk_pipeline_metrics: mc_net::ChunkPipelineResourceMetrics,
+    chunk_io_threads: usize,
+    chunk_worker_threads: usize,
 }
 
 async fn start_load_server() -> Option<LoadServer> {
@@ -219,6 +259,8 @@ async fn start_load_server() -> Option<LoadServer> {
         biome_spawns,
         chunk_pipeline: mc_net::ChunkPipelinePolicy {
             chunk_prepare_batch_size: 2,
+            chunk_io_threads: LOAD_CHUNK_IO_THREADS,
+            chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
             chunk_result_queue_size: 8,
             ..mc_net::ChunkPipelinePolicy::default()
         },
@@ -234,10 +276,16 @@ async fn start_load_server() -> Option<LoadServer> {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local addr");
+    let chunk_pipeline_metrics = bound.chunk_pipeline_metrics();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
-    Some(LoadServer { addr })
+    Some(LoadServer {
+        addr,
+        chunk_pipeline_metrics,
+        chunk_io_threads: LOAD_CHUNK_IO_THREADS,
+        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
+    })
 }
 
 async fn connect_to_play(

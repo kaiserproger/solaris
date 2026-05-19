@@ -46,8 +46,7 @@ pub(super) struct ChunkStreamState {
     compression: Compression,
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
-    io_permits: Arc<Semaphore>,
-    cpu_permits: Arc<Semaphore>,
+    resources: ChunkPipelineResources,
     active_generation: Arc<AtomicU64>,
     result_tx: mpsc::Sender<ChunkPrepareResult>,
     result_rx: mpsc::Receiver<ChunkPrepareResult>,
@@ -544,6 +543,7 @@ impl ChunkStreamState {
         center_cz: i32,
         direction_yaw: f32,
         view_distance: i32,
+        resources: ChunkPipelineResources,
         policy: ChunkPipelinePolicy,
     ) -> Self {
         let vd = view_distance.max(0);
@@ -568,8 +568,7 @@ impl ChunkStreamState {
             compression,
             sessions,
             session_id,
-            io_permits: Arc::new(Semaphore::new(policy.chunk_io_threads)),
-            cpu_permits: Arc::new(Semaphore::new(policy.chunk_worker_threads)),
+            resources,
             active_generation,
             result_tx,
             result_rx,
@@ -781,8 +780,7 @@ impl ChunkStreamState {
             let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
             let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
             let entity_types = Arc::clone(&self.entity_types);
-            let io_permits = Arc::clone(&self.io_permits);
-            let cpu_permits = Arc::clone(&self.cpu_permits);
+            let resources = self.resources.clone();
             let active_generation = Arc::clone(&self.active_generation);
             let compression = self.compression;
             let tx = self.result_tx.clone();
@@ -798,8 +796,7 @@ impl ChunkStreamState {
                     passive_spawn_rules,
                     entity_types,
                     compression,
-                    io_permits,
-                    cpu_permits,
+                    resources,
                     active_generation,
                 )
                 .await;
@@ -1060,8 +1057,7 @@ async fn prepare_chunk_request(
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
     compression: Compression,
-    io_permits: Arc<Semaphore>,
-    cpu_permits: Arc<Semaphore>,
+    resources: ChunkPipelineResources,
     active_generation: Arc<AtomicU64>,
 ) -> ChunkPrepareResult {
     if !is_active_request(request, &active_generation) {
@@ -1071,7 +1067,7 @@ async fn prepare_chunk_request(
         Arc::clone(&world),
         request.chunk_x,
         request.chunk_z,
-        io_permits,
+        resources.clone(),
         request,
         Arc::clone(&active_generation),
     )
@@ -1101,7 +1097,7 @@ async fn prepare_chunk_request(
         return stale_chunk_result(request);
     }
 
-    let cpu_permit = match cpu_permits.acquire_owned().await {
+    let cpu_permit = match resources.acquire_cpu().await {
         Ok(permit) => permit,
         Err(_) => {
             return ChunkPrepareResult {
@@ -1194,22 +1190,10 @@ async fn load_chunk_neighbourhood(
     world: WorldHandle,
     cx: i32,
     cz: i32,
-    io_permits: Arc<Semaphore>,
+    resources: ChunkPipelineResources,
     request: ChunkRequest,
     active_generation: Arc<AtomicU64>,
 ) -> Result<LoadedNeighbourhood, String> {
-    if !is_active_request(request, &active_generation) {
-        return Ok((
-            None,
-            std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            Vec::new(),
-            0,
-        ));
-    }
-    let _permit = io_permits
-        .acquire_owned()
-        .await
-        .map_err(|_| "IO worker pool closed".to_string())?;
     if !is_active_request(request, &active_generation) {
         return Ok((
             None,
@@ -1268,7 +1252,14 @@ async fn load_chunk_neighbourhood(
     if centre.is_none()
         && let Some(plan) = disk_plan
     {
-        match plan.load() {
+        match load_chunk_from_disk(
+            plan,
+            resources.clone(),
+            request,
+            Arc::clone(&active_generation),
+        )
+        .await
+        {
             Ok(Some(chunk)) => {
                 let chunk = {
                     let mut storage = crate::lock_metrics::timed_guard(
@@ -1305,8 +1296,34 @@ async fn load_chunk_neighbourhood(
     if centre.is_none()
         && let Some(generator) = generator
     {
-        let mut chunk = generator.generate(ChunkPos { x: cx, z: cz });
-        chunk.dirty = true;
+        let chunk = match generate_fresh_chunk(
+            generator,
+            ChunkPos { x: cx, z: cz },
+            resources,
+            request,
+            Arc::clone(&active_generation),
+        )
+        .await
+        {
+            Ok(Some(chunk)) => chunk,
+            Ok(None) => {
+                return Ok((
+                    None,
+                    neighbourhood,
+                    staged,
+                    fetch_started.elapsed().as_millis() as u64,
+                ));
+            }
+            Err(err) => {
+                warn!(cx, cz, error = %err, "chunk generation failed; skipping");
+                return Ok((
+                    None,
+                    neighbourhood,
+                    staged,
+                    fetch_started.elapsed().as_millis() as u64,
+                ));
+            }
+        };
         let chunk = {
             let mut storage = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::ChunkPrepare,
@@ -1341,6 +1358,64 @@ async fn load_chunk_neighbourhood(
         staged,
         fetch_started.elapsed().as_millis() as u64,
     ))
+}
+
+async fn load_chunk_from_disk(
+    plan: mc_world::ChunkDiskLoadPlan,
+    resources: ChunkPipelineResources,
+    request: ChunkRequest,
+    active_generation: Arc<AtomicU64>,
+) -> Result<Option<Chunk>, String> {
+    if !is_active_request(request, &active_generation) {
+        return Ok(None);
+    }
+    let permit = resources
+        .acquire_io()
+        .await
+        .map_err(|_| "IO worker pool closed".to_string())?;
+    if !is_active_request(request, &active_generation) {
+        return Ok(None);
+    }
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        plan.load()
+    })
+    .await
+    {
+        Ok(Ok(chunk)) => Ok(chunk),
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+async fn generate_fresh_chunk(
+    generator: Arc<dyn mc_world::ChunkGenerator>,
+    pos: ChunkPos,
+    resources: ChunkPipelineResources,
+    request: ChunkRequest,
+    active_generation: Arc<AtomicU64>,
+) -> Result<Option<Chunk>, String> {
+    if !is_active_request(request, &active_generation) {
+        return Ok(None);
+    }
+    let permit = resources
+        .acquire_cpu()
+        .await
+        .map_err(|_| "CPU worker pool closed".to_string())?;
+    if !is_active_request(request, &active_generation) {
+        return Ok(None);
+    }
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let mut chunk = generator.generate(pos);
+        chunk.dirty = true;
+        chunk
+    })
+    .await
+    {
+        Ok(chunk) => Ok(Some(chunk)),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 struct BuiltChunkPacket {
