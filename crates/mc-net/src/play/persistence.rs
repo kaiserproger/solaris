@@ -353,6 +353,8 @@ pub(crate) fn load_persisted_entities(
             None
         };
         let experience_value = int_field(fields, "Value").filter(|value| *value > 0);
+        let block_state =
+            int_field(fields, "BlockState").and_then(|value| u32::try_from(value).ok());
         let mut attributes = attributes_from_entity_facts(&parsed, type_id as u32);
         let health = float_field(fields, "Health").unwrap_or(20.0).max(0.0);
         attributes.set_base(AttributeKind::MaxHealth, health.max(1.0) as f64);
@@ -377,10 +379,14 @@ pub(crate) fn load_persisted_entities(
             on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0 && !aquatic,
             item_stack,
             experience_value,
+            block_state,
             lifecycle: EntityLifecycle::Alive,
             health,
             attributes,
-            goal: if type_name == "minecraft:item" || experience_value.is_some() {
+            goal: if type_name == "minecraft:item"
+                || type_name == "minecraft:falling_block"
+                || experience_value.is_some()
+            {
                 GoalState::Idle
             } else if aquatic {
                 GoalState::AquaticWander {
@@ -542,6 +548,9 @@ fn entity_tag(
     }
     if let Some(value) = entity.experience_value {
         fields.push(("Value".into(), Tag::Int(value.max(0))));
+    }
+    if let Some(block_state) = entity.block_state {
+        fields.push(("BlockState".into(), Tag::Int(block_state as i32)));
     }
     Ok(Tag::Compound(fields))
 }
@@ -938,6 +947,10 @@ mod tests {
                 id: mc_data::Identifier::parse("minecraft:cod").unwrap(),
                 protocol_id: 3,
             },
+            mc_data::entity_types::EntityTypeReport {
+                id: mc_data::Identifier::parse("minecraft:falling_block").unwrap(),
+                protocol_id: 4,
+            },
         ];
         EntityTypeRegistry::from_report(&reports)
     }
@@ -1048,6 +1061,7 @@ mod tests {
             on_ground: false,
             item_stack: Some(EntityItemStack::new(1, 3)),
             experience_value: None,
+            block_state: None,
             lifecycle: EntityLifecycle::Alive,
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
@@ -1068,6 +1082,7 @@ mod tests {
             on_ground: true,
             item_stack: None,
             experience_value: None,
+            block_state: None,
             lifecycle: EntityLifecycle::Alive,
             health: 13.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
@@ -1076,11 +1091,33 @@ mod tests {
                 period_ticks: 80,
             },
         };
+        let falling_block = EntitySnapshot {
+            id: EntityId(102),
+            uuid: uuid::Uuid::from_u128(102),
+            type_id: 4,
+            type_name: "minecraft:falling_block".into(),
+            position: Vec3::new(3.5, 70.0, 4.5),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: false,
+            item_stack: None,
+            experience_value: None,
+            block_state: Some(1234),
+            lifecycle: EntityLifecycle::Alive,
+            health: 20.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: GoalState::Idle,
+        };
 
-        save_persisted_entities(tmp.path(), &items, &[item.clone(), cow.clone()]).unwrap();
+        save_persisted_entities(
+            tmp.path(),
+            &items,
+            &[item.clone(), cow.clone(), falling_block.clone()],
+        )
+        .unwrap();
         let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
 
-        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded.len(), 3);
         assert_eq!(loaded[0].id, item.id);
         assert_eq!(loaded[0].uuid, item.uuid);
         assert_eq!(loaded[0].position, item.position);
@@ -1094,6 +1131,9 @@ mod tests {
             loaded[1].attributes.base(&AttributeKind::MovementSpeed),
             Some(0.2)
         );
+        assert_eq!(loaded[2].type_name, falling_block.type_name);
+        assert_eq!(loaded[2].block_state, falling_block.block_state);
+        assert!(matches!(loaded[2].goal, GoalState::Idle));
     }
 
     #[test]
@@ -1112,6 +1152,7 @@ mod tests {
             on_ground: true,
             item_stack: None,
             experience_value: None,
+            block_state: None,
             lifecycle: EntityLifecycle::Alive,
             health: 3.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
@@ -1142,6 +1183,7 @@ mod tests {
             on_ground: false,
             item_stack: Some(EntityItemStack::new(1, 3)),
             experience_value: None,
+            block_state: None,
             lifecycle: EntityLifecycle::Alive,
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),

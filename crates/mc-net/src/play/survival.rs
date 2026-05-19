@@ -249,6 +249,14 @@ pub(super) fn xp_orb_entity_type_id(entity_types: &EntityTypeRegistry) -> Option
         })
 }
 
+pub(super) fn falling_block_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let falling_block =
+        mc_data::Identifier::parse("minecraft:falling_block").expect("static identifier");
+    entity_types
+        .id_of(&falling_block)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
     mc_data::Identifier::parse(entity_type.to_string())
         .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))

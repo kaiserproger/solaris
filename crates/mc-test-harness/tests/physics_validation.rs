@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ClientboundSetEntityData,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ClientboundSetEntityData,
     ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent, GameMode,
     LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind, PlayerCommandAction,
     PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand,
@@ -70,6 +70,16 @@ fn deterministic_physics_fixture_materializes_named_shapes() {
         world.get_block(BlockPos { x: 12, y: 67, z: 0 }).unwrap(),
         Some(states.anvil),
         "anvil fall-start oracle should use a named vanilla anvil state"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 10, y: 66, z: 2 }).unwrap(),
+        Some(states.stone),
+        "sand support-break fixture should keep support until the test breaks it"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 12, y: 67, z: 2 }).unwrap(),
+        Some(states.anvil),
+        "anvil support-break fixture should use the real anvil state"
     );
     assert_eq!(
         world.get_block(BlockPos { x: 6, y: 63, z: 4 }).unwrap(),
@@ -468,6 +478,79 @@ async fn sugar_cane_support_break_emits_real_block_edit_observation() {
 }
 
 #[tokio::test]
+async fn falling_blocks_start_when_support_breaks() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M47Fall").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 11.5,
+            y: 67.0,
+            z: 4.5,
+            yaw: 180.0,
+            pitch: 35.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within falling-block support break reach");
+
+    for (idx, (x, falling_state)) in [(10, states.sand), (11, states.gravel), (12, states.anvil)]
+        .into_iter()
+        .enumerate()
+    {
+        let sequence = 147 + idx as i32;
+        client
+            .write_packet(&ServerboundPlayerAction {
+                action: PlayerActionKind::StartDestroyBlock,
+                position: pack_block_pos(x, 66, 2),
+                direction: Direction::Up,
+                sequence,
+            })
+            .await
+            .expect("break falling-block support");
+        let observation =
+            wait_for_block_action_observation(&mut client, sequence, &[(x, 66, 2), (x, 67, 2)])
+                .await;
+        assert_eq!(
+            observation.last_state_at((x, 66, 2)),
+            Some(states.air.0 as i32),
+            "support cell should be removed before falling starts"
+        );
+        assert_eq!(
+            observation.last_state_at((x, 67, 2)),
+            Some(states.air.0 as i32),
+            "falling block source should be cleared"
+        );
+        assert!(
+            observation.add_entities.iter().any(|entity| {
+                entity.data == falling_state.0 as i32
+                    && (entity.x - (f64::from(x) + 0.5)).abs() < 0.01
+                    && (entity.y - 67.0).abs() < 0.01
+                    && (entity.z - 2.5).abs() < 0.01
+            }),
+            "falling block should spawn as AddEntity with block-state data"
+        );
+        assert!(
+            observation.saw_ack,
+            "falling-block support edit should acknowledge sequence"
+        );
+    }
+}
+
+#[tokio::test]
 async fn external_vanilla_sugar_cane_support_break_oracle() {
     let Ok(addr) = std::env::var("M43_VANILLA_ADDR") else {
         eprintln!("skipping: M43_VANILLA_ADDR not set");
@@ -556,6 +639,10 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
     let block_light = mc_data::block_light::load(&block_light_path)
         .ok()
         .map(Arc::new);
+    let registries_path = vanilla_dir.join("reports/registries.json");
+    let entity_types = mc_data::entity_types::load_entity_types_report(&registries_path)
+        .map(|report| mc_data::entity_types::EntityTypeRegistry::from_report(&report))
+        .unwrap_or_default();
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -572,7 +659,7 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts,
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(entity_types),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -652,6 +739,12 @@ fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureSt
     set(&mut world, 11, 67, 0, states.gravel);
     set(&mut world, 12, 66, 0, states.air);
     set(&mut world, 12, 67, 0, states.anvil);
+    set(&mut world, 10, 66, 2, states.stone);
+    set(&mut world, 10, 67, 2, states.sand);
+    set(&mut world, 11, 66, 2, states.stone);
+    set(&mut world, 11, 67, 2, states.gravel);
+    set(&mut world, 12, 66, 2, states.stone);
+    set(&mut world, 12, 67, 2, states.anvil);
     set(&mut world, 6, 63, 4, states.farmland);
 
     set(&mut world, 4, 63, 10, states.stone);
@@ -946,6 +1039,7 @@ async fn assert_no_health_below(client: &mut Client, health: f32, duration: Dura
 
 struct BlockActionObservation {
     updates: Vec<((i32, i32, i32), i32)>,
+    add_entities: Vec<AddEntity>,
     primary_target: (i32, i32, i32),
     saw_ack: bool,
 }
@@ -971,6 +1065,7 @@ async fn wait_for_block_action_observation(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let primary_target = targets[0];
     let mut updates = Vec::new();
+    let mut add_entities = Vec::new();
     let mut saw_ack = false;
     let mut post_ack_deadline = None;
     loop {
@@ -1027,10 +1122,14 @@ async fn wait_for_block_action_observation(
                 saw_ack = true;
                 post_ack_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(400));
             }
+        } else if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            add_entities.push(AddEntity::decode(&mut body).expect("decode AddEntity"));
         }
     }
     BlockActionObservation {
         updates,
+        add_entities,
         primary_target,
         saw_ack,
     }

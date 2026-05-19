@@ -125,6 +125,9 @@ fn fluid_test_reports() -> Vec<BlockReport> {
         fluid_block(10, "minecraft:lava", 3),
         simple_block(14, "minecraft:obsidian"),
         simple_block(15, "minecraft:cobblestone"),
+        simple_block(16, "minecraft:sand"),
+        simple_block(17, "minecraft:gravel"),
+        simple_block(18, "minecraft:anvil"),
     ]
 }
 
@@ -681,6 +684,49 @@ fn water_lava_interactions_make_solid_blocks() {
 }
 
 #[test]
+fn falling_block_starts_when_support_edit_becomes_replaceable() {
+    let facts = fluid_test_facts();
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let sand = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(sand, BlockStateId(16)).unwrap();
+
+    let starts = collect_falling_block_starts(
+        blocks,
+        &facts,
+        &mut world,
+        &[AppliedBlockEdit {
+            pos: support,
+            previous: BlockStateId(1),
+            new_state: BlockStateId(0),
+        }],
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        starts,
+        vec![FallingBlockStart {
+            pos: sand,
+            state: BlockStateId(16),
+        }]
+    );
+}
+
+#[test]
 fn wheat_random_tick_advances_age_until_mature() {
     let blocks = crop_test_registry();
 
@@ -998,6 +1044,7 @@ fn hostile_melee_requires_moving_toward_player() {
         on_ground: true,
         item_stack: None,
         experience_value: None,
+        block_state: None,
     };
     let player = Vec3::new(1.0, 0.0, 0.0);
 
@@ -1025,6 +1072,7 @@ fn hostile_melee_reaches_player_one_block_above() {
         on_ground: true,
         item_stack: None,
         experience_value: None,
+        block_state: None,
     };
 
     assert!(hostile_can_melee_player(

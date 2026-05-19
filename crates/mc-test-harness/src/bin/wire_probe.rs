@@ -86,6 +86,8 @@ enum ProbeScenario {
     EntityHostileMotion,
     EntityAquaticMotion,
     CollisionWallStepFall,
+    WaterLavaReplacement,
+    SandGravelFallStart,
 }
 
 impl ProbeScenario {
@@ -99,6 +101,8 @@ impl ProbeScenario {
             "entity-hostile-motion" => Self::EntityHostileMotion,
             "entity-aquatic-motion" => Self::EntityAquaticMotion,
             "collision-wall-step-fall" => Self::CollisionWallStepFall,
+            "water-lava-replacement" => Self::WaterLavaReplacement,
+            "sand-gravel-fall-start" => Self::SandGravelFallStart,
             _ => Self::Passive,
         }
     }
@@ -565,6 +569,61 @@ impl Probe {
             "setblock 4 64 -3 stone".to_string(),
             format!("gamemode survival {player_name}"),
             format!("tp {player_name} 0.5 64.0 0.5 90 0"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn setup_water_lava_replacement_fixture(
+        &mut self,
+        player_name: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line("=== VANILLA SETUP water-lava-replacement fixture ===")?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "fill 0 63 8 8 68 14 air".to_string(),
+            "fill 0 63 8 8 63 14 stone".to_string(),
+            "setblock 4 64 10 water".to_string(),
+            "setblock 5 64 10 lava".to_string(),
+            "setblock 1 64 10 water".to_string(),
+            "setblock 1 63 10 stone".to_string(),
+            "setblock 2 63 10 stone".to_string(),
+            "setblock 2 64 10 dirt".to_string(),
+            "setblock 6 64 10 water".to_string(),
+            "setblock 6 63 10 stone".to_string(),
+            format!("gamemode creative {player_name}"),
+            format!("tp {player_name} 2.5 64.0 12.5 180 35"),
+        ];
+        for command in commands {
+            self.send_chat_command_and_drain(command, capture).await?;
+        }
+        Ok(())
+    }
+
+    async fn setup_sand_gravel_fall_start_fixture(
+        &mut self,
+        player_name: &str,
+        capture: &mut CaptureWriter,
+    ) -> Result<()> {
+        capture.line("=== VANILLA SETUP sand-gravel-fall-start fixture ===")?;
+        let commands = [
+            "gamerule doDaylightCycle false".to_string(),
+            "gamerule randomTickSpeed 0".to_string(),
+            "kill @e[type=!player]".to_string(),
+            "fill 8 63 0 14 70 4 air".to_string(),
+            "fill 8 63 0 14 63 4 stone".to_string(),
+            "setblock 10 66 2 stone".to_string(),
+            "setblock 10 67 2 sand".to_string(),
+            "setblock 11 66 2 stone".to_string(),
+            "setblock 11 67 2 gravel".to_string(),
+            "setblock 12 66 2 stone".to_string(),
+            "setblock 12 67 2 anvil".to_string(),
+            format!("gamemode creative {player_name}"),
+            format!("tp {player_name} 11.5 67.0 4.5 180 35"),
         ];
         for command in commands {
             self.send_chat_command_and_drain(command, capture).await?;
@@ -1192,6 +1251,89 @@ impl Probe {
         Ok(())
     }
 
+    async fn run_water_lava_replacement(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play("water-lava-replacement", play_seconds, capture, None)
+            .await?;
+        if let Some(player_name) = vanilla_setup_player {
+            self.setup_water_lava_replacement_fixture(player_name, capture)
+                .await?;
+        }
+        self.write_packet_logged(
+            &ServerboundPlayerAction {
+                action: PlayerActionKind::StartDestroyBlock,
+                position: pack_block_pos(2, 64, 10),
+                direction: Direction::Up,
+                sequence: 4701,
+            },
+            "PLAY",
+            "StartDestroyBlock(underwater-dirt)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
+        let frames = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .await?;
+        capture.line(format!(
+            "script captured {frames} water-lava-replacement Play-state frames for entity_id={}",
+            start.entity_id
+        ))?;
+        Ok(())
+    }
+
+    async fn run_sand_gravel_fall_start(
+        &mut self,
+        play_seconds: u64,
+        capture: &mut CaptureWriter,
+        vanilla_setup_player: Option<&str>,
+    ) -> Result<()> {
+        let start = self
+            .start_scripted_play("sand-gravel-fall-start", play_seconds, capture, None)
+            .await?;
+        if let Some(player_name) = vanilla_setup_player {
+            self.setup_sand_gravel_fall_start_fixture(player_name, capture)
+                .await?;
+        }
+        for (label, x, sequence) in [
+            ("sand-support", 10, 4710),
+            ("gravel-support", 11, 4711),
+            ("anvil-support", 12, 4712),
+        ] {
+            self.write_packet_logged(
+                &ServerboundPlayerAction {
+                    action: PlayerActionKind::StartDestroyBlock,
+                    position: pack_block_pos(x, 66, 2),
+                    direction: Direction::Up,
+                    sequence,
+                },
+                "PLAY",
+                &format!("StartDestroyBlock({label})"),
+                capture,
+            )
+            .await?;
+            self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+                .await?;
+            let _ = self
+                .dump_for("PLAY", Duration::from_millis(400), capture)
+                .await?;
+        }
+        let frames = self
+            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .await?;
+        capture.line(format!(
+            "script captured {frames} final sand-gravel-fall-start frames for entity_id={}",
+            start.entity_id
+        ))?;
+        Ok(())
+    }
+
     async fn write_move_and_drain(
         &mut self,
         label: &str,
@@ -1483,6 +1625,16 @@ async fn main() -> Result<()> {
         ProbeScenario::CollisionWallStepFall => {
             probe
                 .run_collision_wall_step_fall(cli.play_seconds, &mut capture, vanilla_setup_player)
+                .await?;
+        }
+        ProbeScenario::WaterLavaReplacement => {
+            probe
+                .run_water_lava_replacement(cli.play_seconds, &mut capture, vanilla_setup_player)
+                .await?;
+        }
+        ProbeScenario::SandGravelFallStart => {
+            probe
+                .run_sand_gravel_fall_start(cli.play_seconds, &mut capture, vanilla_setup_player)
                 .await?;
         }
     }

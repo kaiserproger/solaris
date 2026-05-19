@@ -108,6 +108,7 @@ pub struct SpawnEntity {
     pub on_ground: bool,
     pub item_stack: Option<EntityItemStack>,
     pub experience_value: Option<i32>,
+    pub block_state: Option<u32>,
     pub attributes: AttributeSet,
     pub goal: GoalState,
 }
@@ -125,6 +126,7 @@ impl SpawnEntity {
             on_ground: true,
             item_stack: None,
             experience_value: None,
+            block_state: None,
             attributes: AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
         }
@@ -143,6 +145,7 @@ pub struct EntitySnapshot {
     pub on_ground: bool,
     pub item_stack: Option<EntityItemStack>,
     pub experience_value: Option<i32>,
+    pub block_state: Option<u32>,
     pub lifecycle: EntityLifecycle,
     pub health: f32,
     pub attributes: AttributeSet,
@@ -257,6 +260,7 @@ pub struct EntityStore {
     on_ground: Vec<bool>,
     item_stacks: Vec<Option<EntityItemStack>>,
     experience_values: Vec<Option<i32>>,
+    block_states: Vec<Option<u32>>,
     lifecycles: Vec<EntityLifecycle>,
     healths: Vec<f32>,
     attributes: Vec<AttributeSet>,
@@ -311,6 +315,7 @@ impl EntityStore {
         self.on_ground.push(entity.on_ground);
         self.item_stacks.push(entity.item_stack);
         self.experience_values.push(entity.experience_value);
+        self.block_states.push(entity.block_state);
         self.lifecycles.push(EntityLifecycle::Alive);
         let health = entity
             .attributes
@@ -345,6 +350,7 @@ impl EntityStore {
         self.on_ground.push(snapshot.on_ground);
         self.item_stacks.push(snapshot.item_stack);
         self.experience_values.push(snapshot.experience_value);
+        self.block_states.push(snapshot.block_state);
         self.lifecycles.push(snapshot.lifecycle);
         self.healths.push(snapshot.health);
         self.attributes.push(snapshot.attributes);
@@ -545,6 +551,7 @@ impl EntityStore {
             on_ground: self.on_ground[slot],
             item_stack: self.item_stacks[slot],
             experience_value: self.experience_values[slot],
+            block_state: self.block_states[slot],
             lifecycle: self.lifecycles[slot],
             health: self.healths[slot],
             attributes: self.attributes[slot].clone(),
@@ -563,6 +570,7 @@ impl EntityStore {
         self.on_ground.swap_remove(slot);
         self.item_stacks.swap_remove(slot);
         self.experience_values.swap_remove(slot);
+        self.block_states.swap_remove(slot);
         self.lifecycles.swap_remove(slot);
         self.healths.swap_remove(slot);
         self.attributes.swap_remove(slot);

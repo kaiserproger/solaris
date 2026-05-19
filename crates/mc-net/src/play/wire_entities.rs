@@ -201,7 +201,11 @@ where
             pitch: entity.rotation.pitch,
             yaw: entity.rotation.yaw,
             head_yaw: entity.rotation.head_yaw,
-            data: entity.experience_value.unwrap_or(0),
+            data: entity
+                .block_state
+                .and_then(|state| i32::try_from(state).ok())
+                .or(entity.experience_value)
+                .unwrap_or(0),
         },
         compression,
     )

@@ -122,6 +122,7 @@ pub(super) struct ServerEntitySnapshot {
     pub(super) on_ground: bool,
     pub(super) item_stack: Option<EntityItemStack>,
     pub(super) experience_value: Option<i32>,
+    pub(super) block_state: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -780,6 +781,21 @@ impl SessionRegistry {
         refresh_visibility_locked(&mut inner)
     }
 
+    pub(super) fn spawn_falling_block(
+        &self,
+        entity_type_id: i32,
+        position: Vec3,
+        block_state: mc_world::BlockStateId,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.inner.lock().expect("session registry poisoned");
+        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:falling_block", position);
+        entity.block_state = Some(block_state.0);
+        entity.on_ground = false;
+        let id = inner.entities.spawn(entity);
+        inner.last_sent_entity_positions.insert(id, position);
+        refresh_visibility_locked(&mut inner)
+    }
+
     pub(super) fn spawn_command_entity(
         &self,
         entity_type_id: i32,
@@ -1276,6 +1292,7 @@ pub(super) fn server_entity_snapshot_from(
         on_ground: entity.on_ground,
         item_stack: entity.item_stack,
         experience_value: entity.experience_value,
+        block_state: entity.block_state,
     }
 }
 

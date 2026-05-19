@@ -183,13 +183,21 @@ additional fall-damage health drop for the matching water-entry window. The
 local capture path is
 `.analysis/physics-oracles/collision-wall-step-fall.vanilla.capture`.
 
-`water-lava-replacement` and `sand-gravel-fall-start` remain oracle names, not
-completed captures. The M43 fixture contains representative geometry and block
-states, and Solaris has unit coverage for current collision/fluid/falling-block
-primitives, but M44 did not produce vanilla packet/damage captures for these
-cases. Do not use the existing unit tests as parity evidence for gameplay
-changes; capture vanilla first, then add the corresponding Solaris comparison or
-regression.
+`sand-gravel-fall-start` is scripted by `wire-probe` for M47. The vanilla setup
+builds sand, gravel, and anvil above stone supports at `(10..=12, 66, 2)`, then
+breaks those supports in creative mode. The local capture path is
+`.analysis/physics-oracles/sand-gravel-fall-start.vanilla.capture`. The selected
+oracle signals are support `BlockUpdate` to air, `BlockChangedAck`,
+`AddEntity(type_id=51, data=<block state>)` at the source block center, source
+`BlockUpdate` to air, and later landing `BlockUpdate`/`RemoveEntities` frames.
+
+`water-lava-replacement` is scripted by `wire-probe` for M47. The vanilla setup
+builds adjacent water/lava sources, a bounded water-spread lane, and an ordinary
+dirt target next to water, then breaks the dirt target. The local capture path is
+`.analysis/physics-oracles/water-lava-replacement.vanilla.capture`. The selected
+oracle signals currently include the scripted setup `BlockUpdate` windows and
+the ordinary adjacent-dirt break `BlockUpdate` to air plus `BlockChangedAck`; use
+that as a narrow observation, not proof of full fluid simulation parity.
 
 ## Comparison Rule
 

@@ -1314,6 +1314,7 @@ mod tests {
             on_ground: true,
             item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
             experience_value: None,
+            block_state: None,
             lifecycle: mc_entity::EntityLifecycle::Alive,
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),

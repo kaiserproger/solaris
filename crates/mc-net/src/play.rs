@@ -147,10 +147,11 @@ use spawn::{chunk_pos_from_coords, spawn_dimension, spawn_position};
 use spawn::{pack_block_pos, spawn_y_from_chunk};
 use survival::{
     PendingBreak, PendingUse, SurvivalState, block_drop_stack, damage_held_tool_after_mining,
-    damage_held_weapon_after_attack, entity_item_stack, held_attack_damage, held_food_use,
-    held_item_id, is_hostile_entity, item_entity_type_id, max_tool_damage_for_path,
-    mining_time_for_target, mob_drop_stack, mob_xp_value, pending_break_is_complete,
-    pending_break_matches, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
+    damage_held_weapon_after_attack, entity_item_stack, falling_block_entity_type_id,
+    held_attack_damage, held_food_use, held_item_id, is_hostile_entity, item_entity_type_id,
+    max_tool_damage_for_path, mining_time_for_target, mob_drop_stack, mob_xp_value,
+    pending_break_is_complete, pending_break_matches, pending_use_is_complete, pending_use_matches,
+    xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{
@@ -336,6 +337,12 @@ pub(crate) struct EntityPhysicsStep {
 struct BlockEdit {
     pos: mc_world::BlockPos,
     new_state: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FallingBlockStart {
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3414,6 +3421,7 @@ where
     let changed = !outcome.applied.is_empty();
     if changed {
         schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
+        start_falling_blocks_after_edits(state, writer, &outcome.applied).await?;
     }
     if drop_items
         && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
@@ -3463,6 +3471,109 @@ fn plan_break_block_edits(
     }
     append_sugar_cane_cascade(blocks, storage, &mut edits, pos, air);
     edits
+}
+
+async fn start_falling_blocks_after_edits<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    applied: &[AppliedBlockEdit],
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(entity_type_id) = falling_block_entity_type_id(&state.entity_types) else {
+        return Ok(());
+    };
+    let air = air_state_id(&state.blocks);
+    let starts = {
+        let mut storage = state.world.lock().await;
+        collect_falling_block_starts(
+            &state.blocks,
+            &state.block_facts,
+            &mut storage,
+            applied,
+            air,
+        )
+    };
+    if starts.is_empty() {
+        return Ok(());
+    }
+
+    let removal_edits = starts
+        .iter()
+        .map(|start| BlockEdit {
+            pos: start.pos,
+            new_state: air,
+        })
+        .collect::<Vec<_>>();
+    let outcome = apply_visible_block_edit_batch(state, writer, &removal_edits).await?;
+    if outcome.applied.is_empty() {
+        return Ok(());
+    }
+    schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
+
+    for edit in &outcome.applied {
+        if !is_falling_block_state(&state.blocks, edit.previous) {
+            continue;
+        }
+        dispatch_visibility_commands(state.sessions.spawn_falling_block(
+            entity_type_id,
+            Vec3::new(
+                f64::from(edit.pos.x) + 0.5,
+                f64::from(edit.pos.y),
+                f64::from(edit.pos.z) + 0.5,
+            ),
+            edit.previous,
+        ));
+    }
+    Ok(())
+}
+
+fn collect_falling_block_starts(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    applied: &[AppliedBlockEdit],
+    air: mc_world::BlockStateId,
+) -> Vec<FallingBlockStart> {
+    let mut seen = HashSet::new();
+    let mut starts = Vec::new();
+    for edit in applied {
+        let pos = mc_world::BlockPos {
+            y: edit.pos.y + 1,
+            ..edit.pos
+        };
+        if !seen.insert(pos) || !falling_block_can_enter(facts, edit.new_state, air) {
+            continue;
+        }
+        let Ok(Some(state)) = storage.get_block(pos) else {
+            continue;
+        };
+        if is_falling_block_state(blocks, state) {
+            starts.push(FallingBlockStart { pos, state });
+        }
+    }
+    starts
+}
+
+fn is_falling_block_state(
+    blocks: &mc_world::BlockRegistry,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    blocks.by_id(state_id).is_some_and(|state| {
+        matches!(
+            state.block.id.path(),
+            "sand" | "red_sand" | "gravel" | "anvil" | "chipped_anvil" | "damaged_anvil"
+        )
+    })
+}
+
+fn falling_block_can_enter(
+    facts: &mc_data::block_facts::BlockFactsTable,
+    state: mc_world::BlockStateId,
+    air: mc_world::BlockStateId,
+) -> bool {
+    state == air || facts.fluid(state.0).is_some()
 }
 
 fn append_sugar_cane_cascade(

@@ -273,6 +273,13 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             EntityAttributeFacts::default(),
             None,
         ),
+        "minecraft:falling_block" => (
+            EntityCategory::Other,
+            EntityDimensions::new(0.98, 0.98, None),
+            Some(10),
+            EntityAttributeFacts::default(),
+            None,
+        ),
         _ => (
             EntityCategory::Other,
             EntityDimensions::new(0.9, 1.4, Some(1.3)),
