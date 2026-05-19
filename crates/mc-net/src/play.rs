@@ -4435,18 +4435,7 @@ fn farmland_has_nearby_water(
     false
 }
 
-async fn refresh_player_water_state<W>(
-    state: Option<&InteractionState>,
-    writer: &mut W,
-    compression: Compression,
-    entity_id: i32,
-    pose: &mut PlayerPose,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let old_pose = pose.entity_pose();
-    let old_flags = pose.shared_flags();
+async fn refresh_player_water_state(state: Option<&InteractionState>, pose: &mut PlayerPose) {
     if let Some(state) = state {
         let (in_water, eye_in_water) = player_water_overlap(state, *pose).await;
         pose.in_water = in_water;
@@ -4456,86 +4445,6 @@ where
         pose.eye_in_water = false;
     }
     pose.swimming = pose.in_water && pose.sprinting && (pose.input.forward || pose.eye_in_water);
-    if old_pose != pose.entity_pose() || old_flags != pose.shared_flags() {
-        write_packet(
-            writer,
-            &ClientboundSetEntityData {
-                entity_id,
-                values: pose.entity_data_values(),
-            },
-            compression,
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-fn player_water_motion(pose: PlayerPose) -> Option<EntityVec3> {
-    if !pose.in_water {
-        return None;
-    }
-
-    let forward = i32::from(pose.input.forward) - i32::from(pose.input.backward);
-    let strafe = i32::from(pose.input.right) - i32::from(pose.input.left);
-    let mut vertical = 0.0;
-    if pose.input.jump {
-        vertical += 1.0;
-    }
-    if pose.input.shift {
-        vertical -= 1.0;
-    }
-    if forward == 0 && strafe == 0 && vertical == 0.0 {
-        return None;
-    }
-
-    let yaw = f64::from(pose.yaw).to_radians();
-    let pitch = f64::from(pose.pitch).to_radians();
-    let forward_x = -yaw.sin();
-    let forward_z = yaw.cos();
-    let right_x = forward_z;
-    let right_z = -forward_x;
-    let mut x = forward_x * f64::from(forward) + right_x * f64::from(strafe);
-    let mut z = forward_z * f64::from(forward) + right_z * f64::from(strafe);
-    let horizontal = x.hypot(z);
-    if horizontal > f64::EPSILON {
-        x /= horizontal;
-        z /= horizontal;
-    }
-
-    let speed = if pose.sprinting { 0.12 } else { 0.06 };
-    let pitch_lift = if forward > 0 && pose.swimming {
-        -pitch.sin() * speed
-    } else {
-        0.0
-    };
-    Some(EntityVec3 {
-        x: x * speed,
-        y: vertical * 0.08 + pitch_lift,
-        z: z * speed,
-    })
-}
-
-async fn send_player_water_motion<W>(
-    writer: &mut W,
-    compression: Compression,
-    entity_id: i32,
-    pose: PlayerPose,
-) -> Result<(), ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    if let Some(movement) = player_water_motion(pose) {
-        write_packet(
-            writer,
-            &SetEntityMotion {
-                entity_id,
-                movement,
-            },
-            compression,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 async fn player_water_overlap(state: &InteractionState, pose: PlayerPose) -> (bool, bool) {
@@ -6296,14 +6205,7 @@ where
                     player_pose.y = movement.y;
                     player_pose.z = movement.z;
                     player_pose.flags = movement.flags;
-                    refresh_player_water_state(
-                        interaction.as_deref(),
-                        writer,
-                        compression,
-                        session_id as i32,
-                        &mut player_pose,
-                    )
-                    .await?;
+                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
                     if game_mode == GameMode::Survival
                         && let Some(state) = interaction.as_deref_mut()
                     {
@@ -6343,14 +6245,7 @@ where
                     player_pose.yaw = movement.yaw;
                     player_pose.pitch = movement.pitch;
                     player_pose.flags = movement.flags;
-                    refresh_player_water_state(
-                        interaction.as_deref(),
-                        writer,
-                        compression,
-                        session_id as i32,
-                        &mut player_pose,
-                    )
-                    .await?;
+                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
                     if game_mode == GameMode::Survival
                         && let Some(state) = interaction.as_deref_mut()
                     {
@@ -6432,16 +6327,7 @@ where
                         PlayerCommandAction::ReleaseShiftKey => player_pose.shifting = false,
                         _ => {}
                     }
-                    refresh_player_water_state(
-                        interaction.as_deref(),
-                        writer,
-                        compression,
-                        session_id as i32,
-                        &mut player_pose,
-                    )
-                    .await?;
-                    send_player_water_motion(writer, compression, session_id as i32, player_pose)
-                        .await?;
+                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundPlayerInput::ID {
                     let mut body = frame.body;
@@ -6449,16 +6335,7 @@ where
                     player_pose.input = input;
                     player_pose.sprinting = input.sprint;
                     player_pose.shifting = input.shift;
-                    refresh_player_water_state(
-                        interaction.as_deref(),
-                        writer,
-                        compression,
-                        session_id as i32,
-                        &mut player_pose,
-                    )
-                    .await?;
-                    send_player_water_motion(writer, compression, session_id as i32, player_pose)
-                        .await?;
+                    refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
                     dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
                 } else if frame.id == ServerboundUseItemOn::ID {
                     let mut body = frame.body;

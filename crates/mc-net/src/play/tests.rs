@@ -23,37 +23,6 @@ fn player_pose_metadata_reports_swimming_and_shared_flags() {
     assert_eq!(pose.shared_flags() & 0x08, 0x08);
 }
 
-#[test]
-fn player_water_motion_uses_input_and_pitch() {
-    let mut pose = PlayerPose::new(0.5, 62.0, 0.5);
-    pose.in_water = true;
-    pose.eye_in_water = true;
-    pose.swimming = true;
-    pose.sprinting = true;
-    pose.pitch = -30.0;
-    pose.input = PlayerInput {
-        forward: true,
-        sprint: true,
-        ..PlayerInput::default()
-    };
-
-    let motion = player_water_motion(pose).expect("water input emits motion");
-
-    assert!(motion.z > 0.0);
-    assert!(motion.y > 0.0);
-}
-
-#[test]
-fn player_water_motion_ignores_dry_input() {
-    let mut pose = PlayerPose::new(0.5, 62.0, 0.5);
-    pose.input = PlayerInput {
-        forward: true,
-        ..PlayerInput::default()
-    };
-
-    assert!(player_water_motion(pose).is_none());
-}
-
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
     BlockStateReport {
         id,

@@ -9,13 +9,14 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
-    GameMode, LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind,
-    PlayerCommandAction, PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode,
-    ServerboundChatCommand, ServerboundClientTickEnd, ServerboundKeepAlive,
-    ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerCommand,
-    ServerboundPlayerInput, ServerboundPlayerLoaded, SetCenterChunk, SetEntityMotion,
-    SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos, unpack_block_pos,
+    BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ClientboundSetEntityData,
+    ConfirmTeleportation, Direction, GameEvent, GameMode, LevelChunkWithLight, LoginPlay,
+    MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput, SectionBlocksUpdate,
+    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -102,12 +103,12 @@ async fn physics_fixture_server_reaches_play_and_streams_spawn_chunk() {
 }
 
 #[tokio::test]
-async fn shallow_water_entry_emits_player_motion_observation() {
+async fn shallow_water_entry_keeps_self_motion_client_predicted() {
     let Some(addr) = start_physics_server().await else {
         return;
     };
 
-    let (mut client, _) = connect_to_play(addr, "M43Water").await;
+    let (mut client, login, _) = connect_to_play_with_login(addr, "M45ShallowWater").await;
     drain_until_chunk(&mut client, (0, 0)).await;
 
     client
@@ -141,11 +142,91 @@ async fn shallow_water_entry_emits_player_motion_observation() {
         .await
         .expect("send swim input");
 
-    let motion = wait_for_player_motion(&mut client).await;
-    assert!(
-        motion.movement.z.abs() > 0.0 || motion.movement.y.abs() > 0.0,
-        "water input should produce a visible motion packet"
-    );
+    assert_no_self_authoritative_water_frames(
+        &mut client,
+        login.entity_id,
+        Duration::from_millis(750),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, login, _) = connect_to_play_with_login(addr, "M45WaterSelfWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: -3.0,
+            y: 65.0,
+            z: 4.5,
+            yaw: 90.0,
+            pitch: -30.0,
+            flags: MovePlayerFlags::new(false, false),
+        })
+        .await
+        .expect("move into deep water");
+    client
+        .write_packet(&ServerboundPlayerCommand {
+            entity_id: 0,
+            action: PlayerCommandAction::StartSprinting,
+            data: 0,
+        })
+        .await
+        .expect("start sprinting in deep water");
+    client
+        .write_packet(&ServerboundPlayerInput {
+            input: PlayerInput {
+                forward: true,
+                jump: true,
+                sprint: true,
+                ..PlayerInput::default()
+            },
+        })
+        .await
+        .expect("send swim input");
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: -2.5,
+            y: 65.6,
+            z: 4.5,
+            yaw: 90.0,
+            pitch: -30.0,
+            flags: MovePlayerFlags::new(false, false),
+        })
+        .await
+        .expect("swim upward in deep water");
+
+    assert_no_self_authoritative_water_frames(
+        &mut client,
+        login.entity_id,
+        Duration::from_millis(750),
+    )
+    .await;
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 0.5,
+            y: 64.0,
+            z: 4.5,
+            yaw: 90.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("leave water onto land");
+
+    assert_no_self_authoritative_water_frames(
+        &mut client,
+        login.entity_id,
+        Duration::from_millis(750),
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -479,13 +560,21 @@ async fn connect_to_play(
     addr: std::net::SocketAddr,
     name: &str,
 ) -> (Client, SynchronizePlayerPosition) {
+    let (client, _, sync) = connect_to_play_with_login(addr, name).await;
+    (client, sync)
+}
+
+async fn connect_to_play_with_login(
+    addr: std::net::SocketAddr,
+    name: &str,
+) -> (Client, LoginPlay, SynchronizePlayerPosition) {
     let mut client = Client::connect(addr).await.expect("client connect");
     let _ = client.drive_login(addr, name).await.expect("drive login");
     client
         .drive_configuration()
         .await
         .expect("drive configuration");
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let login: LoginPlay = client.read_typed().await.expect("LoginPlay");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
@@ -497,7 +586,7 @@ async fn connect_to_play(
         })
         .await
         .expect("ack teleport");
-    (client, sync)
+    (client, login, sync)
 }
 
 async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
@@ -522,21 +611,39 @@ async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
     }
 }
 
-async fn wait_for_player_motion(client: &mut Client) -> SetEntityMotion {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+async fn assert_no_self_authoritative_water_frames(
+    client: &mut Client,
+    player_entity_id: i32,
+    duration: Duration,
+) {
+    let deadline = tokio::time::Instant::now() + duration;
     loop {
-        let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("wait for player water motion");
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return;
+        };
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
         if frame.id == SetEntityMotion::ID {
             let mut body = frame.body;
-            return SetEntityMotion::decode(&mut body).expect("decode SetEntityMotion");
+            let motion = SetEntityMotion::decode(&mut body).expect("decode SetEntityMotion");
+            assert_ne!(
+                motion.entity_id, player_entity_id,
+                "vanilla keeps local water movement client-predicted; server must not send self motion"
+            );
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let data = ClientboundSetEntityData::decode(&mut body).expect("decode entity data");
+            assert_ne!(
+                data.entity_id, player_entity_id,
+                "vanilla does not send self pose metadata during local water movement"
+            );
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            panic!("water movement window should not require a player correction");
         }
     }
 }
