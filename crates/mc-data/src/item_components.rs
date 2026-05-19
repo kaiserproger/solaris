@@ -7,6 +7,7 @@ use thiserror::Error;
 use crate::Identifier;
 use crate::food::FoodEntry;
 
+const REQUIRED_ITEM_COMPONENTS: &str = include_str!("../data/required_item_components.json");
 const DEFAULT_CONSUME_SECONDS: f32 = 1.6;
 
 #[derive(Debug, Error)]
@@ -113,6 +114,19 @@ pub fn load_item_facts(
         items.insert(id, facts);
     }
     Ok(ItemFactsTable { items })
+}
+
+#[must_use]
+pub fn solaris_required_item_facts() -> ItemFactsTable {
+    let raw: BTreeMap<String, RawEmbeddedItemFacts> =
+        serde_json::from_str(REQUIRED_ITEM_COMPONENTS)
+            .expect("embedded required item component JSON is valid");
+    ItemFactsTable::from_entries(raw.into_iter().map(|(id, facts)| {
+        (
+            Identifier::parse(id).expect("embedded required item component id is valid"),
+            facts.into_facts(),
+        )
+    }))
 }
 
 fn collect_json_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), ItemComponentsError> {
@@ -266,6 +280,56 @@ impl RawItemComponents {
 struct RawFood {
     nutrition: i32,
     saturation: f32,
+}
+
+#[derive(Default, Deserialize)]
+struct RawEmbeddedItemFacts {
+    max_stack_size: Option<u32>,
+    max_damage: Option<u32>,
+    food: Option<FoodEntry>,
+    use_duration_ticks: Option<u32>,
+    use_action: Option<RawEmbeddedUseAction>,
+    weapon: Option<bool>,
+    weapon_damage_per_attack: Option<u32>,
+    attack_damage_modifier: Option<f32>,
+    attack_speed_modifier: Option<f32>,
+}
+
+impl RawEmbeddedItemFacts {
+    fn into_facts(self) -> ItemFacts {
+        ItemFacts {
+            max_stack_size: self.max_stack_size,
+            max_damage: self.max_damage,
+            food: self.food,
+            use_duration_ticks: self.use_duration_ticks,
+            use_action: self.use_action.map(RawEmbeddedUseAction::into_use_action),
+            tool: None,
+            equippable_slot: None,
+            weapon: self.weapon.unwrap_or(false),
+            weapon_damage_per_attack: self.weapon_damage_per_attack,
+            attack_damage_modifier: self.attack_damage_modifier,
+            attack_speed_modifier: self.attack_speed_modifier,
+            armor: None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum RawEmbeddedUseAction {
+    Eat,
+    Drink,
+    Other,
+}
+
+impl RawEmbeddedUseAction {
+    const fn into_use_action(self) -> UseAction {
+        match self {
+            Self::Eat => UseAction::Eat,
+            Self::Drink => UseAction::Drink,
+            Self::Other => UseAction::Other,
+        }
+    }
 }
 
 #[derive(Default, Deserialize)]

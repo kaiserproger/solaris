@@ -12,6 +12,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_RECIPES: &str = include_str!("../data/required_recipes.json");
+
 #[derive(Debug, Error)]
 pub enum RecipeDataError {
     #[error("recipe data io error at {path}: {source}")]
@@ -111,6 +113,22 @@ pub fn load_recipes(recipe_dir: impl AsRef<Path>) -> Result<Vec<Recipe>, RecipeD
     Ok(recipes)
 }
 
+/// Repo-owned crafting baseline for running Solaris without a local recipe sidecar.
+#[must_use]
+pub fn solaris_required_recipes() -> Vec<Recipe> {
+    let path = Path::new("crates/mc-data/data/required_recipes.json");
+    let raw: BTreeMap<String, serde_json::Value> =
+        serde_json::from_str(REQUIRED_RECIPES).expect("embedded required recipe JSON is valid");
+    raw.into_iter()
+        .map(|(id, value)| {
+            let id = Identifier::parse(id).expect("embedded required recipe id is valid");
+            parse_recipe_value(path, id, value)
+                .expect("embedded required recipe JSON uses supported recipe shapes")
+                .expect("embedded required recipe JSON contains supported recipe types")
+        })
+        .collect()
+}
+
 fn collect_recipe_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), RecipeDataError> {
     let entries = std::fs::read_dir(dir).map_err(|source| RecipeDataError::Io {
         path: dir.to_path_buf(),
@@ -138,6 +156,14 @@ fn collect_recipe_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), Reci
 fn load_one_recipe(root: &Path, path: &Path) -> Result<Option<Recipe>, RecipeDataError> {
     let id = id_from_file(root, path)?;
     let value: serde_json::Value = read_json(path)?;
+    parse_recipe_value(path, id, value)
+}
+
+fn parse_recipe_value(
+    path: &Path,
+    id: Identifier,
+    value: serde_json::Value,
+) -> Result<Option<Recipe>, RecipeDataError> {
     let header: RawRecipeHeader = from_value(path, value.clone())?;
     match header.kind.as_str() {
         "minecraft:crafting_shaped" => {

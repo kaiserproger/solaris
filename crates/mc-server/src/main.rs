@@ -82,89 +82,35 @@ impl From<mc_net::ChunkPipelinePolicy> for EffectiveChunkPipeline {
 async fn serve(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
 
-    let data = mc_data::load(&cfg.data.vanilla_dir).with_context(|| {
-        format!(
-            "loading vanilla data sidecar from {}",
-            cfg.data.vanilla_dir.display()
-        )
-    })?;
+    let data = mc_data::solaris_required_data();
     tracing::info!(
         registries = data.registry_count(),
         entries = data.entry_count(),
-        path = %cfg.data.vanilla_dir.display(),
-        "vanilla data loaded",
+        "embedded registry index loaded",
     );
 
-    let blocks_path = cfg.data.vanilla_dir.join("reports").join("blocks.json");
-    let blocks_report = mc_data::blocks::load_blocks_report(&blocks_path).with_context(|| {
-        format!(
-            "loading blocks report from {}; run tools/extract-vanilla-data.sh \
-             to regenerate the sidecar",
-            blocks_path.display(),
-        )
-    })?;
+    let blocks_report = mc_data::blocks::solaris_required_blocks_report();
     let block_states: usize = blocks_report.iter().map(|b| b.states.len()).sum();
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&blocks_report)
-            .context("building block-state registry from blocks.json")?,
+            .context("building block-state registry from embedded JSON")?,
     );
     tracing::info!(
         blocks = blocks_report.len(),
         states = block_states,
-        path = %blocks_path.display(),
-        "block registry source loaded",
+        "embedded block registry loaded",
     );
-    let structure_rules = load_structure_rules(&cfg.data.vanilla_dir, blocks.as_ref())?;
+    let structure_rules = mc_worldgen::StructureRules::none();
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
-    let terrain_generator = build_terrain_generator(
-        cfg.data.seed,
-        &cfg.data.vanilla_dir,
-        Arc::clone(&blocks),
-        structure_rules,
+    let terrain_generator =
+        build_terrain_generator(cfg.data.seed, Arc::clone(&blocks), structure_rules);
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    tracing::info!(entries = items.len(), "embedded item registry loaded");
+    let item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
+    tracing::info!(
+        entries = item_facts.len(),
+        "embedded item component facts loaded"
     );
-    let items_path = cfg.data.vanilla_dir.join("reports").join("registries.json");
-    let items = match mc_data::items::load_items_report(&items_path) {
-        Ok(report) => {
-            let reg = mc_data::items::ItemRegistry::from_report(&report);
-            tracing::info!(
-                entries = reg.len(),
-                path = %items_path.display(),
-                "item registry loaded",
-            );
-            Arc::new(reg)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %items_path.display(),
-                error = %err,
-                "item registry load failed; M6 place will fall back to stone",
-            );
-            Arc::new(mc_data::items::ItemRegistry::default())
-        }
-    };
-
-    let item_facts_path = cfg
-        .data
-        .vanilla_dir
-        .join("reports/minecraft/components/item");
-    let item_facts = match mc_data::item_components::load_item_facts(&item_facts_path) {
-        Ok(facts) => {
-            tracing::info!(
-                entries = facts.len(),
-                path = %item_facts_path.display(),
-                "item component facts loaded",
-            );
-            Arc::new(facts)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %item_facts_path.display(),
-                error = %err,
-                "item component facts load failed; survival item data will use explicit fallbacks",
-            );
-            Arc::new(mc_data::item_components::ItemFactsTable::default())
-        }
-    };
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
         let open_result = (|| -> Result<mc_world::WorldStorage> {
@@ -233,67 +179,16 @@ async fn serve(path: &Path) -> Result<()> {
     };
 
     let data = Arc::new(data);
-    let tags = match mc_data::tags::load(&cfg.data.vanilla_dir, &data) {
-        Ok(t) => {
-            tracing::info!(
-                registries = t.registries.len(),
-                tags = t.total_tags(),
-                entries = t.total_entries(),
-                path = %cfg.data.vanilla_dir.display(),
-                "tag set loaded",
-            );
-            Arc::new(t)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %cfg.data.vanilla_dir.display(),
-                error = %err,
-                "tag set load failed; the configuration handler will ship an empty Update Tags \
-                 packet and the vanilla client will reject login at registry freeze",
-            );
-            Arc::new(mc_data::tags::TagsData::default())
-        }
-    };
-
-    let recipes_path = cfg.data.vanilla_dir.join("data/minecraft/recipe");
-    let recipes = match mc_data::recipes::load_recipes(&recipes_path) {
-        Ok(recipes) => {
-            tracing::info!(
-                entries = recipes.len(),
-                path = %recipes_path.display(),
-                "recipe data loaded",
-            );
-            Arc::new(recipes)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %recipes_path.display(),
-                error = %err,
-                "recipe data load failed; crafting will use explicit fallbacks",
-            );
-            Arc::new(Vec::new())
-        }
-    };
-
-    let loot_path = cfg.data.vanilla_dir.join("data/minecraft/loot_table");
-    let loot = match mc_data::loot::load_vanilla_subset(&loot_path) {
-        Ok(loot) => {
-            tracing::info!(
-                drops = loot.total_drops(),
-                path = %loot_path.display(),
-                "loot table subset loaded",
-            );
-            Arc::new(loot)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %loot_path.display(),
-                error = %err,
-                "loot table subset load failed; drops will use explicit fallbacks",
-            );
-            Arc::new(mc_data::loot::LootTables::default())
-        }
-    };
+    let tags = Arc::new(mc_data::tags::solaris_required_item_tags(&items));
+    tracing::info!(
+        tags = tags.total_tags(),
+        entries = tags.total_entries(),
+        "embedded tags loaded"
+    );
+    let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
+    tracing::info!(entries = recipes.len(), "embedded recipe registry loaded");
+    let loot = Arc::new(mc_data::loot::builtin().clone());
+    tracing::info!(drops = loot.total_drops(), "embedded loot tables loaded");
 
     let block_light = Arc::new(
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&blocks_report),
@@ -313,45 +208,16 @@ async fn serve(path: &Path) -> Result<()> {
         "block simulation facts built from blocks report",
     );
 
-    let entity_types = match mc_data::entity_types::load_entity_types_report(&items_path) {
-        Ok(report) => {
-            let reg = mc_data::entity_types::EntityTypeRegistry::from_report(&report);
-            tracing::info!(
-                entries = reg.len(),
-                path = %items_path.display(),
-                "entity type registry loaded",
-            );
-            Arc::new(reg)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %items_path.display(),
-                error = %err,
-                "entity type registry load failed; passive mob spawning disabled",
-            );
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default())
-        }
-    };
-
-    let biome_spawns_path = cfg.data.vanilla_dir.join("data/minecraft/worldgen/biome");
-    let biome_spawns = match mc_data::biomes::load_biome_spawn_rules(&biome_spawns_path) {
-        Ok(rules) => {
-            tracing::info!(
-                biomes = rules.len(),
-                path = %biome_spawns_path.display(),
-                "biome spawn rules loaded",
-            );
-            Arc::new(rules)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %biome_spawns_path.display(),
-                error = %err,
-                "biome spawn rules load failed; passive mob spawning disabled",
-            );
-            Arc::new(mc_data::biomes::BiomeSpawnRules::default())
-        }
-    };
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
+    tracing::info!(
+        entries = entity_types.len(),
+        "embedded entity type registry loaded"
+    );
+    let biome_spawns = Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules());
+    tracing::info!(
+        biomes = biome_spawns.len(),
+        "embedded biome spawn rules loaded"
+    );
 
     let net = cfg
         .to_network(
@@ -440,191 +306,23 @@ where
     (drain_result, save_result)
 }
 
-fn load_structure_rules(
-    vanilla_dir: &Path,
-    blocks: &mc_world::BlockRegistry,
-) -> Result<mc_worldgen::StructureRules> {
-    let root = vanilla_dir.join("data/minecraft/structure/village/plains");
-    let mut template_paths = Vec::new();
-    collect_nbt_templates(&root, &mut template_paths)?;
-    template_paths.sort();
-    if template_paths.is_empty() {
-        tracing::warn!(
-            path = %root.display(),
-            "plains village templates missing; generated structures disabled",
-        );
-        return Ok(mc_worldgen::StructureRules::none());
-    }
-
-    let mut templates = Vec::new();
-    for path in template_paths.into_iter().take(8) {
-        match mc_worldgen::StructureTemplate::from_nbt_file(&path, blocks) {
-            Ok(template) if !template.blocks().is_empty() => templates.push(template),
-            Ok(_) => tracing::warn!(path = %path.display(), "empty structure template skipped"),
-            Err(err) => tracing::warn!(
-                path = %path.display(),
-                error = %err,
-                "structure template skipped",
-            ),
-        }
-    }
-    if templates.is_empty() {
-        tracing::warn!(path = %root.display(), "no usable plains village templates loaded");
-        return Ok(mc_worldgen::StructureRules::none());
-    }
-    let structure_sets = match mc_data::worldgen_structures::load_structure_set_facts(
-        vanilla_dir.join("data/minecraft/worldgen"),
-    ) {
-        Ok(facts) => {
-            tracing::info!(
-                sets = facts.len(),
-                "worldgen structure-set facts loaded for Solaris structure policy",
-            );
-            Some(facts)
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "structure-set facts unavailable; using fallback structure spacing",
-            );
-            None
-        }
-    };
-    let template_count = templates.len();
-    let block_count: usize = templates
-        .iter()
-        .map(|template| template.blocks().len())
-        .sum();
-    tracing::info!(
-        path = %root.display(),
-        templates = template_count,
-        blocks = block_count,
-        "plains village templates loaded",
-    );
-    let mut rules = mc_worldgen::StructureRules::plains_village_markers(templates);
-    if let Some(structure_sets) = structure_sets.as_ref() {
-        rules = rules.with_structure_set_facts(structure_sets);
-    }
-    Ok(rules)
-}
-
-fn collect_nbt_templates(root: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for entry in std::fs::read_dir(root)
-        .with_context(|| format!("reading structure template directory {}", root.display()))?
-    {
-        let entry = entry.with_context(|| format!("reading entry under {}", root.display()))?;
-        let path = entry.path();
-        let ty = entry
-            .file_type()
-            .with_context(|| format!("reading file type for {}", path.display()))?;
-        if ty.is_dir() {
-            collect_nbt_templates(&path, out)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "nbt") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn build_terrain_generator(
     seed: i64,
-    vanilla_dir: &Path,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
 ) -> Arc<mc_worldgen::TerrainGenerator> {
-    let biome_dir = vanilla_dir.join("data/minecraft/worldgen/biome");
-    let biome_tags_dir = vanilla_dir.join("data/minecraft/tags/worldgen/biome");
-    let biome_data = match mc_data::biomes::load_biome_worldgen_data(&biome_dir, &biome_tags_dir) {
-        Ok(data) => {
-            tracing::info!(
-                biomes = data.biomes().count(),
-                tags = data.tags_len(),
-                path = %biome_dir.display(),
-                "biome worldgen data loaded",
-            );
-            Some(data)
-        }
-        Err(err) => {
-            tracing::warn!(
-                path = %biome_dir.display(),
-                error = %err,
-                "biome worldgen data load failed; using Solaris fallback biome rules",
-            );
-            None
-        }
-    };
-    let biomes = biome_data
-        .as_ref()
-        .and_then(mc_worldgen::BiomeRules::from_worldgen_data)
-        .unwrap_or_else(mc_worldgen::BiomeRules::vanilla_overworld);
+    let biomes = mc_worldgen::BiomeRules::vanilla_overworld();
 
     let stone = blocks
         .block(&mc_data::Identifier::parse("minecraft:stone").expect("static identifier"))
         .map(|block| block.default)
         .expect("block registry contains stone");
-    let ore_features =
-        mc_data::worldgen_ores::load_ore_features(vanilla_dir.join("data/minecraft/worldgen"));
-    let ores = match ore_features {
-        Ok(features) => {
-            match mc_worldgen::OreRules::from_features(
-                blocks.as_ref(),
-                &biomes,
-                &features,
-                biome_data.as_ref(),
-            ) {
-                Some(rules) => {
-                    tracing::info!(
-                        features = features.len(),
-                        rules = rules.rules().len(),
-                        "ore sidecar data fed into terrain generator",
-                    );
-                    rules
-                }
-                None => {
-                    tracing::warn!(
-                        features = features.len(),
-                        "ore sidecar data produced no Solaris ore rules; using fallback",
-                    );
-                    mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone)
-                }
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "ore sidecar data load failed; using Solaris fallback ore rules",
-            );
-            mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone)
-        }
-    };
+    let ores = mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone);
 
-    let feature_facts = match mc_data::worldgen_features::load_feature_facts(
-        vanilla_dir.join("data/minecraft/worldgen"),
-    ) {
-        Ok(features) => {
-            tracing::info!(
-                features = features.len(),
-                "worldgen feature facts loaded for Solaris decoration policy",
-            );
-            Some(features)
-        }
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "worldgen feature fact load failed; using Solaris fallback decorations",
-            );
-            None
-        }
-    };
-
-    let mut generator = mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores);
-    if let Some(feature_facts) = feature_facts.as_ref() {
-        generator = generator.with_feature_facts(feature_facts);
-    }
-    Arc::new(generator.with_structures(structure_rules))
+    Arc::new(
+        mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores)
+            .with_structures(structure_rules),
+    )
 }
 
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {

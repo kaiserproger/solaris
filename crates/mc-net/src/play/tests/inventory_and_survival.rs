@@ -333,13 +333,24 @@ fn recipe_ingredient_matching_resolves_item_tags() {
 }
 
 #[test]
-fn fallback_recipes_include_tag_driven_survival_basics() {
-    let recipes = fallback_crafting_recipes();
+fn solaris_required_recipes_include_tag_driven_survival_basics() {
+    let recipes = mc_data::recipes::solaris_required_recipes();
 
-    assert_eq!(recipes[0].id.as_str(), "minecraft:torch");
-    assert_eq!(recipes[1].id.as_str(), "minecraft:oak_planks");
-    assert_eq!(recipes[2].id.as_str(), "minecraft:stick");
-    assert_eq!(recipes[3].id.as_str(), "minecraft:crafting_table");
+    assert!(recipes
+        .iter()
+        .any(|recipe| recipe.id.as_str() == "minecraft:torch"));
+    assert!(recipes
+        .iter()
+        .any(|recipe| recipe.id.as_str() == "minecraft:oak_planks"));
+    assert!(recipes
+        .iter()
+        .any(|recipe| recipe.id.as_str() == "minecraft:birch_planks"));
+    assert!(recipes
+        .iter()
+        .any(|recipe| recipe.id.as_str() == "minecraft:stick"));
+    assert!(recipes
+        .iter()
+        .any(|recipe| recipe.id.as_str() == "minecraft:crafting_table"));
     assert!(
         recipes
             .iter()
@@ -363,7 +374,11 @@ fn fallback_recipes_include_tag_driven_survival_basics() {
         )
     )));
 
-    let mc_data::recipes::RecipeKind::Shapeless(oak_planks) = &recipes[1].kind else {
+    let oak_recipe = recipes
+        .iter()
+        .find(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
+        .expect("oak planks recipe present");
+    let mc_data::recipes::RecipeKind::Shapeless(oak_planks) = &oak_recipe.kind else {
         panic!("expected shapeless oak planks recipe");
     };
     assert_eq!(
@@ -372,6 +387,44 @@ fn fallback_recipes_include_tag_driven_survival_basics() {
             mc_data::Identifier::parse("minecraft:oak_logs").unwrap()
         )
     );
+}
+
+#[test]
+fn inventory_crafting_grid_crafts_birch_logs_to_planks() {
+    use mc_data::items::ItemReport;
+
+    let birch_log = mc_data::Identifier::parse("minecraft:birch_log").unwrap();
+    let birch_planks = mc_data::Identifier::parse("minecraft:birch_planks").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: birch_log,
+            protocol_id: 11,
+        },
+        ItemReport {
+            id: birch_planks,
+            protocol_id: 12,
+        },
+    ]);
+    let tags = TagsData {
+        registries: BTreeMap::from([(
+            mc_data::Identifier::parse("minecraft:item").unwrap(),
+            BTreeMap::from([(
+                mc_data::Identifier::parse("minecraft:birch_logs").unwrap(),
+                vec![11],
+            )]),
+        )]),
+    };
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[1] = ItemStack::new(11, 1);
+
+    let result = crafting_result_from_input(
+        &items,
+        &tags,
+        &mc_data::recipes::solaris_required_recipes(),
+        &inventory_crafting_input(&inventory),
+    );
+
+    assert_eq!(result, ItemStack::new(12, 4));
 }
 
 #[test]

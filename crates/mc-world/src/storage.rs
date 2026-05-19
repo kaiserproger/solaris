@@ -64,7 +64,7 @@ pub struct WorldStorage {
     region_root: PathBuf,
     registry: Arc<BlockRegistry>,
     /// LRU of fully decoded chunks, keyed by chunk position.
-    cache: HashMap<ChunkPos, Chunk>,
+    cache: HashMap<ChunkPos, ChunkSnapshot>,
     /// MRU at the back, LRU at the front. On `get_chunk` we move
     /// the accessed key to the back.
     lru: VecDeque<ChunkPos>,
@@ -132,8 +132,10 @@ struct CommittedChunkPayload {
     uncompressed_nbt: Vec<u8>,
 }
 
+pub type ChunkSnapshot = Arc<Chunk>;
+
 pub enum ChunkSnapshotPlan {
-    Cached(Box<Chunk>),
+    Cached(ChunkSnapshot),
     Load(ChunkDiskLoadPlan),
 }
 
@@ -404,7 +406,7 @@ impl WorldStorage {
     /// Borrow a cached chunk; loads its region on demand.
     pub fn get_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
         self.ensure_chunk(cpos)?;
-        Ok(self.cache.get(&cpos))
+        Ok(self.cache.get(&cpos).map(Arc::as_ref))
     }
 
     /// Clone a chunk if it is already resident or present on disk, but do not
@@ -413,14 +415,14 @@ impl WorldStorage {
     pub fn get_chunk_without_generation(
         &mut self,
         cpos: ChunkPos,
-    ) -> Result<Option<Chunk>, WorldError> {
+    ) -> Result<Option<ChunkSnapshot>, WorldError> {
         self.ensure_chunk_loaded(cpos, false)?;
         Ok(self.cache.get(&cpos).cloned())
     }
 
     pub fn plan_chunk_snapshot_without_generation(&self, cpos: ChunkPos) -> ChunkSnapshotPlan {
         if let Some(chunk) = self.cache.get(&cpos) {
-            return ChunkSnapshotPlan::Cached(Box::new(chunk.clone()));
+            return ChunkSnapshotPlan::Cached(Arc::clone(chunk));
         }
         let (rx, rz) = region_of(cpos);
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -439,7 +441,7 @@ impl WorldStorage {
         &mut self,
         cpos: ChunkPos,
         chunk: Chunk,
-    ) -> Result<Chunk, WorldError> {
+    ) -> Result<ChunkSnapshot, WorldError> {
         if !self.cache.contains_key(&cpos) {
             self.insert_chunk(cpos, chunk)?;
         } else {
@@ -455,6 +457,12 @@ impl WorldStorage {
     /// Clone a resident chunk without disk IO or generation.
     #[must_use]
     pub fn cached_chunk(&self, cpos: ChunkPos) -> Option<Chunk> {
+        self.cache.get(&cpos).map(|chunk| chunk.as_ref().clone())
+    }
+
+    /// Return a resident chunk snapshot without disk IO, generation, or full chunk cloning.
+    #[must_use]
+    pub fn cached_chunk_snapshot(&self, cpos: ChunkPos) -> Option<ChunkSnapshot> {
         self.cache.get(&cpos).cloned()
     }
 
@@ -488,6 +496,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.set_block_and_update(local_x, pos.y, local_z, state, air))
     }
 
@@ -506,6 +515,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         chunk.update_highest_opaque_column(local_x, local_z, table);
         Ok(())
     }
@@ -515,7 +525,7 @@ impl WorldStorage {
             return Ok(None);
         }
         self.touch(cpos);
-        Ok(self.cache.get_mut(&cpos))
+        Ok(self.cache.get_mut(&cpos).map(Arc::make_mut))
     }
 
     pub fn furnace_block_entity(
@@ -546,6 +556,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         if chunk.furnaces.get(&pos) == Some(&furnace) {
             return Ok(true);
         }
@@ -582,6 +593,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         if chunk.chests.get(&pos) == Some(&chest) {
             return Ok(true);
         }
@@ -613,6 +625,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.schedule_block_tick(tick))
     }
 
@@ -628,6 +641,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.remove_scheduled_block_ticks_at(pos))
     }
 
@@ -644,6 +658,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.drain_due_block_ticks(world_tick, max_ticks))
     }
 
@@ -670,6 +685,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.schedule_fluid_tick(tick))
     }
 
@@ -685,6 +701,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.remove_scheduled_fluid_ticks_at(pos))
     }
 
@@ -701,6 +718,7 @@ impl WorldStorage {
             .cache
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
         Ok(chunk.drain_due_fluid_ticks(world_tick, max_ticks))
     }
 
@@ -713,6 +731,7 @@ impl WorldStorage {
         let Some(chunk) = self.cache.get_mut(&cpos) else {
             return Vec::new();
         };
+        let chunk = Arc::make_mut(chunk);
         chunk.drain_due_fluid_ticks(world_tick, max_ticks)
     }
 
@@ -738,7 +757,7 @@ impl WorldStorage {
     ) -> Result<Option<&Chunk>, WorldError> {
         if self.cache.contains_key(&cpos) {
             self.touch(cpos);
-            return Ok(self.cache.get(&cpos));
+            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
         }
         let (rx, rz) = region_of(cpos);
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -753,7 +772,7 @@ impl WorldStorage {
             let chunk =
                 chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())?;
             self.insert_chunk(cpos, chunk)?;
-            return Ok(self.cache.get(&cpos));
+            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
         }
 
         // M7: no on-disk chunk → ask the generator (if any).
@@ -761,7 +780,7 @@ impl WorldStorage {
             let mut chunk = generator.generate(cpos);
             chunk.dirty = true; // belt-and-braces; generator already sets this
             self.insert_chunk(cpos, chunk)?;
-            return Ok(self.cache.get(&cpos));
+            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
         }
         Ok(None)
     }
@@ -823,7 +842,7 @@ impl WorldStorage {
         // resident chunk is dirty, the cache grows until the save pipeline
         // commits them clean.
         while self.cache.len() >= self.capacity && self.evict_clean_chunk() {}
-        self.cache.insert(cpos, chunk);
+        self.cache.insert(cpos, Arc::new(chunk));
         self.lru.push_back(cpos);
         Ok(())
     }
@@ -967,6 +986,7 @@ impl WorldStorage {
 
         for cpos in &clean {
             if let Some(chunk) = self.cache.get_mut(cpos) {
+                let chunk = Arc::make_mut(chunk);
                 chunk.dirty = false;
             }
         }
@@ -1104,6 +1124,50 @@ mod tests {
         assert_eq!(stats.region_cache_len, 0);
         assert_eq!(stats.region_cache_capacity, 4);
         assert_eq!(stats.dirty_chunks, 1);
+    }
+
+    #[test]
+    fn cached_chunk_snapshots_are_shared_and_copy_on_write() {
+        let air = mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        };
+        let stone = mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:stone").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 1,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        };
+        let registry = Arc::new(BlockRegistry::from_report(&[air, stone]).unwrap());
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+
+        let before = world.cached_chunk_snapshot(cpos).unwrap();
+        assert_eq!(before.get_block(1, 0, 1), Some(BlockStateId(0)));
+
+        assert_eq!(
+            world
+                .set_block_at(BlockPos { x: 1, y: 0, z: 1 }, BlockStateId(1))
+                .unwrap(),
+            Some(BlockStateId(0))
+        );
+        let after = world.cached_chunk_snapshot(cpos).unwrap();
+
+        assert_eq!(before.get_block(1, 0, 1), Some(BlockStateId(0)));
+        assert_eq!(after.get_block(1, 0, 1), Some(BlockStateId(1)));
+        assert!(!Arc::ptr_eq(&before, &after));
     }
 
     #[test]

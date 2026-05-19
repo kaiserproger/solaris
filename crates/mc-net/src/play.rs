@@ -111,6 +111,7 @@ use block_wire::{BlockDeltaPacket, plan_block_delta_packets};
 use chunk_stream::{ChunkBuildTiming, ChunkWriteTiming, plan_passive_herd, spiral_chunks};
 use chunk_stream::{
     ChunkStreamState, ChunkStreamStep, PreparedChunkFrame, desired_chunk_set, herd_uuid,
+    passable_block_name,
 };
 use commands::{
     AdminCommand, CommandError, CommandPermissions, DebugCommand, SurvivalCommand,
@@ -131,7 +132,7 @@ use inventory::{
     PlayerInventory, armor_entry_for_item, armor_slot_for_kind, can_stack, damage_equipped_armor,
     item_max_stack, survival_damage_after_armor,
 };
-use item_blocks::{ItemToBlockTable, fallback_crafting_recipes};
+use item_blocks::ItemToBlockTable;
 use persistence::{
     PlayerPersistedState, SpawnState, XpState, load_player_state, save_player_state,
 };
@@ -728,7 +729,7 @@ where
 
         let mut recipes = (*config.recipes).clone();
         if recipes.is_empty() {
-            recipes = fallback_crafting_recipes();
+            recipes = mc_data::recipes::solaris_required_recipes();
         }
 
         // 7. Play loop. Runs until the connection drops or the client
@@ -924,7 +925,8 @@ fn crafting_player_slot(menu_slot: usize) -> Option<usize> {
 }
 
 fn shaped_recipe_matches(
-    state: &InteractionState,
+    items: &ItemRegistry,
+    tags: &TagsData,
     input: &[ItemStack; 9],
     shaped: &mc_data::recipes::ShapedRecipe,
 ) -> bool {
@@ -959,8 +961,8 @@ fn shaped_recipe_matches(
                         Some(ingredient)
                             if !stack.is_empty()
                                 && ingredient_accepts_item(
-                                    &state.items,
-                                    &state.tags,
+                                    items,
+                                    tags,
                                     stack.item_id,
                                     ingredient,
                                 ) => {}
@@ -976,7 +978,8 @@ fn shaped_recipe_matches(
 }
 
 fn shapeless_recipe_matches(
-    state: &InteractionState,
+    items: &ItemRegistry,
+    tags: &TagsData,
     input: &[ItemStack; 9],
     shapeless: &mc_data::recipes::ShapelessRecipe,
 ) -> bool {
@@ -991,8 +994,7 @@ fn shapeless_recipe_matches(
             .iter()
             .enumerate()
             .find(|(idx, ingredient)| {
-                !used[*idx]
-                    && ingredient_accepts_item(&state.items, &state.tags, stack.item_id, ingredient)
+                !used[*idx] && ingredient_accepts_item(items, tags, stack.item_id, ingredient)
             })
         else {
             return false;
@@ -1003,26 +1005,33 @@ fn shapeless_recipe_matches(
 }
 
 fn crafting_recipe_matches(
-    state: &InteractionState,
+    items: &ItemRegistry,
+    tags: &TagsData,
     input: &[ItemStack; 9],
     recipe: &mc_data::recipes::Recipe,
 ) -> bool {
     match &recipe.kind {
-        mc_data::recipes::RecipeKind::Shaped(shaped) => shaped_recipe_matches(state, input, shaped),
+        mc_data::recipes::RecipeKind::Shaped(shaped) => {
+            shaped_recipe_matches(items, tags, input, shaped)
+        }
         mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
-            shapeless_recipe_matches(state, input, shapeless)
+            shapeless_recipe_matches(items, tags, input, shapeless)
         }
         mc_data::recipes::RecipeKind::Smelting(_) => false,
     }
 }
 
-fn crafting_result_from_input(state: &InteractionState, input: &[ItemStack; 9]) -> ItemStack {
-    state
-        .recipes
+fn crafting_result_from_input(
+    items: &ItemRegistry,
+    tags: &TagsData,
+    recipes: &[mc_data::recipes::Recipe],
+    input: &[ItemStack; 9],
+) -> ItemStack {
+    recipes
         .iter()
-        .find(|recipe| crafting_recipe_matches(state, input, recipe))
+        .find(|recipe| crafting_recipe_matches(items, tags, input, recipe))
         .and_then(|recipe| {
-            let item_id = state.items.id_of(&recipe.result.item)?;
+            let item_id = items.id_of(&recipe.result.item)?;
             let count = i32::try_from(recipe.result.count).ok()?;
             (count > 0).then(|| ItemStack::new(item_id, count))
         })
@@ -1030,7 +1039,23 @@ fn crafting_result_from_input(state: &InteractionState, input: &[ItemStack; 9]) 
 }
 
 fn refresh_crafting_result(state: &InteractionState, window: &mut CraftingTableWindow) {
-    window.result = crafting_result_from_input(state, &window.input);
+    window.result =
+        crafting_result_from_input(&state.items, &state.tags, &state.recipes, &window.input);
+}
+
+fn inventory_crafting_input(inventory: &PlayerInventory) -> [ItemStack; 9] {
+    let mut input = std::array::from_fn(|_| ItemStack::EMPTY);
+    input[0] = inventory.slots[1].clone();
+    input[1] = inventory.slots[2].clone();
+    input[3] = inventory.slots[3].clone();
+    input[4] = inventory.slots[4].clone();
+    input
+}
+
+fn refresh_inventory_crafting_result(state: &mut InteractionState) {
+    let input = inventory_crafting_input(&state.inventory);
+    state.inventory.slots[0] =
+        crafting_result_from_input(&state.items, &state.tags, &state.recipes, &input);
 }
 
 fn crafting_wire_items(
@@ -1205,6 +1230,54 @@ fn consume_crafting_ingredients(state: &mut InteractionState, window: &mut Craft
         }
     }
     refresh_crafting_result(state, window);
+}
+
+fn consume_inventory_crafting_ingredients(state: &mut InteractionState) {
+    for slot in 1..=4 {
+        let item_id = (!state.inventory.slots[slot].is_empty())
+            .then_some(state.inventory.slots[slot].item_id);
+        let Some(item_id) = item_id else {
+            continue;
+        };
+        state.inventory.slots[slot].count -= 1;
+        if state.inventory.slots[slot].count <= 0 {
+            state.inventory.slots[slot] =
+                crafting_remainder_for_item(state, item_id).unwrap_or(ItemStack::EMPTY);
+        } else if let Some(remainder) = crafting_remainder_for_item(state, item_id) {
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &remainder);
+            let (remaining, _) = state.inventory.merge_stack(remainder, max_stack);
+            if !remaining.is_empty() {
+                debug!(
+                    item_id = remaining.item_id,
+                    count = remaining.count,
+                    "dropping inventory crafting remainder because inventory is full"
+                );
+            }
+        }
+    }
+    refresh_inventory_crafting_result(state);
+}
+
+fn take_inventory_crafting_result(state: &mut InteractionState) -> bool {
+    refresh_inventory_crafting_result(state);
+    let result = state.inventory.slots[0].clone();
+    if result.is_empty() {
+        return false;
+    }
+    let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
+    if state.carried_item.is_empty() {
+        state.carried_item = result;
+        consume_inventory_crafting_ingredients(state);
+        return true;
+    }
+    if can_stack(&state.carried_item, &result)
+        && state.carried_item.count + result.count <= max_stack
+    {
+        state.carried_item.count += result.count;
+        consume_inventory_crafting_ingredients(state);
+        return true;
+    }
+    false
 }
 
 fn take_crafting_result(state: &mut InteractionState, window: &mut CraftingTableWindow) -> bool {
@@ -2040,6 +2113,9 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
     if slot >= state.inventory.slots.len() || !(button == 0 || button == 1) {
         return false;
     }
+    if slot == 0 {
+        return take_inventory_crafting_result(state);
+    }
 
     let slot_stack = state.inventory.slots[slot].clone();
     let cursor = state.carried_item.clone();
@@ -2076,6 +2152,9 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
             state.inventory.slots[slot] = cursor;
             state.carried_item = slot_stack;
         }
+        if (1..=4).contains(&slot) {
+            refresh_inventory_crafting_result(state);
+        }
         return true;
     }
 
@@ -2102,11 +2181,14 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
     } else {
         return false;
     }
+    if (1..=4).contains(&slot) {
+        refresh_inventory_crafting_result(state);
+    }
     true
 }
 
 fn apply_swap_click(state: &mut InteractionState, slot: usize, button: i8) -> bool {
-    if slot >= state.inventory.slots.len() {
+    if slot == 0 || slot >= state.inventory.slots.len() {
         return false;
     }
     let Some(swap_slot) = player_swap_slot(button) else {
@@ -2124,14 +2206,21 @@ fn apply_swap_click(state: &mut InteractionState, slot: usize, button: i8) -> bo
     }
     state.inventory.slots[slot] = swap;
     state.inventory.slots[swap_slot] = clicked;
+    if (1..=4).contains(&slot) || (1..=4).contains(&swap_slot) {
+        refresh_inventory_crafting_result(state);
+    }
     true
 }
 
 fn apply_throw_click(state: &mut InteractionState, slot: usize, button: i8) -> Option<ItemStack> {
-    if slot >= state.inventory.slots.len() {
+    if slot == 0 || slot >= state.inventory.slots.len() {
         return None;
     }
-    take_throw_stack(&mut state.inventory.slots[slot], button)
+    let dropped = take_throw_stack(&mut state.inventory.slots[slot], button);
+    if dropped.is_some() && (1..=4).contains(&slot) {
+        refresh_inventory_crafting_result(state);
+    }
+    dropped
 }
 
 fn can_place_in_player_slot(state: &InteractionState, slot: usize, stack: &ItemStack) -> bool {
@@ -2149,6 +2238,16 @@ fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
     if slot >= state.inventory.slots.len() || state.inventory.slots[slot].is_empty() {
         return false;
     }
+    if slot == 0 {
+        let result = state.inventory.slots[0].clone();
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
+        let (remaining, _) = state.inventory.merge_stack(result, max_stack);
+        if !remaining.is_empty() {
+            return false;
+        }
+        consume_inventory_crafting_ingredients(state);
+        return true;
+    }
 
     let original = state.inventory.slots[slot].clone();
     let max_stack = item_max_stack(&state.item_facts, &state.items, &original);
@@ -2165,6 +2264,9 @@ fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
             } else {
                 state.inventory.slots[slot].count -= 1;
             }
+            if (1..=4).contains(&slot) {
+                refresh_inventory_crafting_result(state);
+            }
             return true;
         }
     }
@@ -2180,6 +2282,9 @@ fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
             .merge_stack_into_ranges(original.clone(), &[36..=44, 9..=35], max_stack)
     };
     state.inventory.slots[slot] = remaining;
+    if (1..=4).contains(&slot) {
+        refresh_inventory_crafting_result(state);
+    }
     state.inventory.slots[slot] != original
 }
 
@@ -4646,19 +4751,10 @@ fn player_collision_state_is_solid(
     if state.block_facts.fluid(state_id.0).is_some() {
         return false;
     }
-    state.blocks.by_id(state_id).is_some_and(|block_state| {
-        !matches!(
-            block_state.block.id.as_str(),
-            "minecraft:air"
-                | "minecraft:short_grass"
-                | "minecraft:tall_grass"
-                | "minecraft:fern"
-                | "minecraft:large_fern"
-                | "minecraft:dandelion"
-                | "minecraft:poppy"
-                | "minecraft:sugar_cane"
-        )
-    })
+    state
+        .blocks
+        .by_id(state_id)
+        .is_some_and(|block_state| !passable_block_name(block_state.block.id.as_str()))
 }
 
 async fn correct_player_collision<W>(
@@ -5161,21 +5257,15 @@ async fn collect_incremental_relight(
     //    edit has already been applied, so these are post-edit.
     let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
     {
-        let mut storage = state.world.lock().await;
+        let storage = state.world.lock().await;
         for dcz in -1i32..=1 {
             for dcx in -1i32..=1 {
                 let pos = ChunkPos {
                     x: cx + dcx,
                     z: cz + dcz,
                 };
-                match storage.get_chunk(pos) {
-                    Ok(Some(c)) => {
-                        chunks.insert((cx + dcx, cz + dcz), Arc::new(c.clone()));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, cx = pos.x, cz = pos.z, "relight neighbour read failed");
-                    }
+                if let Some(chunk) = storage.cached_chunk_snapshot(pos) {
+                    chunks.insert((cx + dcx, cz + dcz), chunk);
                 }
             }
         }

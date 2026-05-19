@@ -497,24 +497,51 @@ fn herd_spawn_clearance(
 }
 
 pub(crate) fn passive_entity_passable_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {
-    const PASSABLE_BLOCKS: &[&str] = &[
-        "minecraft:air",
-        "minecraft:short_grass",
-        "minecraft:tall_grass",
-        "minecraft:fern",
-        "minecraft:large_fern",
-        "minecraft:dandelion",
-        "minecraft:poppy",
-        "minecraft:sugar_cane",
-    ];
-
-    PASSABLE_BLOCKS
-        .iter()
-        .filter_map(|name| {
-            blocks.block(&mc_data::Identifier::parse(*name).expect("static identifier"))
-        })
-        .flat_map(|block| block.states.iter().copied())
+    blocks
+        .states()
+        .filter(|state| passable_block_name(state.block.id.as_str()))
+        .map(|state| state.id)
         .collect()
+}
+
+pub(crate) fn passable_block_name(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:air"
+            | "minecraft:short_grass"
+            | "minecraft:tall_grass"
+            | "minecraft:short_dry_grass"
+            | "minecraft:tall_dry_grass"
+            | "minecraft:fern"
+            | "minecraft:large_fern"
+            | "minecraft:dead_bush"
+            | "minecraft:bush"
+            | "minecraft:firefly_bush"
+            | "minecraft:dandelion"
+            | "minecraft:poppy"
+            | "minecraft:blue_orchid"
+            | "minecraft:allium"
+            | "minecraft:azure_bluet"
+            | "minecraft:red_tulip"
+            | "minecraft:orange_tulip"
+            | "minecraft:white_tulip"
+            | "minecraft:pink_tulip"
+            | "minecraft:oxeye_daisy"
+            | "minecraft:cornflower"
+            | "minecraft:lily_of_the_valley"
+            | "minecraft:wither_rose"
+            | "minecraft:torchflower"
+            | "minecraft:open_eyeblossom"
+            | "minecraft:closed_eyeblossom"
+            | "minecraft:sunflower"
+            | "minecraft:lilac"
+            | "minecraft:rose_bush"
+            | "minecraft:peony"
+            | "minecraft:pitcher_plant"
+            | "minecraft:pink_petals"
+            | "minecraft:wildflowers"
+            | "minecraft:sugar_cane"
+    )
 }
 
 pub(super) fn desired_chunk_set(
@@ -862,7 +889,7 @@ impl ChunkStreamState {
             }
             ChunkPrepareOutcome::Absent => {
                 self.absent += 1;
-                debug!(cx, cz, "no chunk in storage");
+                info!(cx, cz, "no chunk in storage");
             }
             ChunkPrepareOutcome::Failed(err) => {
                 warn!(cx, cz, error = %err, "chunk encode failed; skipping");
@@ -1226,7 +1253,6 @@ async fn load_chunk_neighbourhood(
         }
         match storage.plan_chunk_snapshot_without_generation(ChunkPos { x: cx, z: cz }) {
             mc_world::ChunkSnapshotPlan::Cached(chunk) => {
-                let chunk = Arc::new(*chunk);
                 centre = Some(Arc::clone(&chunk));
                 neighbourhood[1][1] = Some(chunk);
                 staged.push((cx, cz));
@@ -1240,8 +1266,8 @@ async fn load_chunk_neighbourhood(
                 }
                 let ncx = cx + (dx as i32 - 1);
                 let ncz = cz + (dz as i32 - 1);
-                if let Some(chunk) = storage.cached_chunk(ChunkPos { x: ncx, z: ncz }) {
-                    *slot = Some(Arc::new(chunk));
+                if let Some(chunk) = storage.cached_chunk_snapshot(ChunkPos { x: ncx, z: ncz }) {
+                    *slot = Some(chunk);
                     staged.push((ncx, ncz));
                 }
             }
@@ -1280,7 +1306,6 @@ async fn load_chunk_neighbourhood(
                 };
                 match chunk {
                     Ok(chunk) => {
-                        let chunk = Arc::new(chunk);
                         centre = Some(Arc::clone(&chunk));
                         neighbourhood[1][1] = Some(chunk);
                         staged.push((cx, cz));
@@ -1342,10 +1367,9 @@ async fn load_chunk_neighbourhood(
             if let Err(err) = storage.insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
                 warn!(cx, cz, error = %err, "generated chunk insert failed; skipping");
             }
-            storage.cached_chunk(ChunkPos { x: cx, z: cz })
+            storage.cached_chunk_snapshot(ChunkPos { x: cx, z: cz })
         };
         if let Some(chunk) = chunk {
-            let chunk = Arc::new(chunk);
             centre = Some(Arc::clone(&chunk));
             neighbourhood[1][1] = Some(chunk);
             staged.push((cx, cz));

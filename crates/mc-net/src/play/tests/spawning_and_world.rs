@@ -564,6 +564,15 @@ fn chunk_pos_from_coords_uses_floor_division() {
 }
 
 #[test]
+fn passable_block_names_cover_common_flowers() {
+    assert!(passable_block_name("minecraft:blue_orchid"));
+    assert!(passable_block_name("minecraft:lily_of_the_valley"));
+    assert!(passable_block_name("minecraft:rose_bush"));
+    assert!(!passable_block_name("minecraft:flower_pot"));
+    assert!(!passable_block_name("minecraft:stone"));
+}
+
+#[test]
 fn session_registry_drops_prepared_cache_with_last_ticket() {
     let registry = SessionRegistry::new();
     let (tx, _rx) = mpsc::channel(1);

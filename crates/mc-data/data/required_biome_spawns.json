@@ -1,0 +1,21 @@
+{
+  "minecraft:plains": {
+    "creature": [
+      { "type": "minecraft:sheep", "minCount": 2, "maxCount": 4, "weight": 12 },
+      { "type": "minecraft:pig", "minCount": 1, "maxCount": 3, "weight": 10 },
+      { "type": "minecraft:chicken", "minCount": 2, "maxCount": 4, "weight": 10 },
+      { "type": "minecraft:cow", "minCount": 2, "maxCount": 4, "weight": 8 }
+    ],
+    "monster": [
+      { "type": "minecraft:zombie", "minCount": 1, "maxCount": 4, "weight": 95 },
+      { "type": "minecraft:skeleton", "minCount": 1, "maxCount": 4, "weight": 100 },
+      { "type": "minecraft:spider", "minCount": 1, "maxCount": 4, "weight": 100 }
+    ]
+  },
+  "minecraft:ocean": {
+    "water_ambient": [
+      { "type": "minecraft:cod", "minCount": 3, "maxCount": 6, "weight": 10 },
+      { "type": "minecraft:salmon", "minCount": 1, "maxCount": 5, "weight": 5 }
+    ]
+  }
+}

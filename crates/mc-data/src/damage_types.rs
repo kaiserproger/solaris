@@ -6,6 +6,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_DAMAGE_TYPES: &str = include_str!("../data/required_damage_types.json");
+
 #[derive(Debug, Error)]
 pub enum DamageTypesError {
     #[error("damage type directory not found at {0}")]
@@ -70,17 +72,12 @@ impl DamageTypeTable {
 
     #[must_use]
     pub fn with_solaris_fallbacks() -> Self {
-        Self::from_entries(FALLBACK_DAMAGE_TYPES.iter().map(|fallback| {
-            DamageTypeFacts {
-                id: Identifier::parse(format!("minecraft:{}", fallback.path))
-                    .expect("fallback damage type ids are valid"),
-                category: fallback.category,
-                message_id: fallback.message_id.to_string(),
-                scaling: "when_caused_by_living_non_player".to_string(),
-                exhaustion: fallback.exhaustion,
-                effects: fallback.effects.map(str::to_string),
-                death_message_type: fallback.death_message_type.map(str::to_string),
-            }
+        let raw: BTreeMap<String, RawDamageType> = serde_json::from_str(REQUIRED_DAMAGE_TYPES)
+            .expect("embedded required damage type JSON is valid");
+        Self::from_entries(raw.into_iter().map(|(id, raw)| {
+            raw.into_facts(
+                Identifier::parse(id).expect("embedded required damage type id is valid"),
+            )
         }))
     }
 
@@ -219,98 +216,6 @@ fn category_for_id(path: &str) -> DamageCategory {
         _ => DamageCategory::Other,
     }
 }
-
-struct FallbackDamageType {
-    path: &'static str,
-    category: DamageCategory,
-    message_id: &'static str,
-    exhaustion: f32,
-    effects: Option<&'static str>,
-    death_message_type: Option<&'static str>,
-}
-
-const FALLBACK_DAMAGE_TYPES: &[FallbackDamageType] = &[
-    FallbackDamageType {
-        path: "generic",
-        category: DamageCategory::Generic,
-        message_id: "generic",
-        exhaustion: 0.0,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "player_attack",
-        category: DamageCategory::PlayerAttack,
-        message_id: "player",
-        exhaustion: 0.1,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "mob_attack",
-        category: DamageCategory::MobAttack,
-        message_id: "mob",
-        exhaustion: 0.1,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "arrow",
-        category: DamageCategory::Projectile,
-        message_id: "arrow",
-        exhaustion: 0.1,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "fall",
-        category: DamageCategory::Fall,
-        message_id: "fall",
-        exhaustion: 0.0,
-        effects: None,
-        death_message_type: Some("fall_variants"),
-    },
-    FallbackDamageType {
-        path: "lava",
-        category: DamageCategory::Fire,
-        message_id: "lava",
-        exhaustion: 0.1,
-        effects: Some("burning"),
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "drown",
-        category: DamageCategory::Drowning,
-        message_id: "drown",
-        exhaustion: 0.0,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "in_wall",
-        category: DamageCategory::Suffocation,
-        message_id: "inWall",
-        exhaustion: 0.0,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "starve",
-        category: DamageCategory::Starvation,
-        message_id: "starve",
-        exhaustion: 0.0,
-        effects: None,
-        death_message_type: None,
-    },
-    FallbackDamageType {
-        path: "explosion",
-        category: DamageCategory::Explosion,
-        message_id: "explosion",
-        exhaustion: 0.1,
-        effects: None,
-        death_message_type: None,
-    },
-];
 
 #[cfg(test)]
 mod tests {

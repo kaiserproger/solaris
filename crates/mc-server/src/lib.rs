@@ -60,20 +60,14 @@ pub struct NetworkSection {
     pub port: u16,
 }
 
-/// Where the vanilla data sidecar lives on disk. Defaults to
-/// `./data/vanilla` relative to the working directory the server is
-/// launched from, which matches the layout `tools/extract-vanilla-data.sh`
-/// produces.
-///
 /// `world_dir` is the on-disk world save the server reads chunks from
 /// at runtime. `None` (or the default) means "no world wired up yet";
 /// the server will start and log a warning, and chunk queries will
 /// resolve to `None` everywhere. Plumbing the world into the network
 /// layer happens in M3.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataSection {
-    #[serde(default = "default_vanilla_dir")]
-    pub vanilla_dir: PathBuf,
     #[serde(default)]
     pub world_dir: Option<PathBuf>,
     /// World seed for the M7 terrain generator. Defaults to `0` —
@@ -223,26 +217,12 @@ fn threads_from_percent(cores: usize, percent: u32) -> usize {
     scaled.max(1)
 }
 
-impl Default for DataSection {
-    fn default() -> Self {
-        Self {
-            vanilla_dir: default_vanilla_dir(),
-            world_dir: None,
-            seed: 0,
-        }
-    }
-}
-
 fn default_max_players() -> u32 {
     20
 }
 
 fn default_view_distance() -> i32 {
     mc_net::DEFAULT_VIEW_DISTANCE
-}
-
-fn default_vanilla_dir() -> PathBuf {
-    PathBuf::from("data/vanilla")
 }
 
 fn default_chunk_send_rate() -> u32 {
@@ -375,7 +355,6 @@ mod tests {
         assert_eq!(cfg.server.view_distance, 10);
         assert_eq!(cfg.server.simulation_distance, 10);
         assert_eq!(cfg.network.port, 25565);
-        assert_eq!(cfg.data.vanilla_dir, PathBuf::from("data/vanilla"));
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 8);
         assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
         assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
@@ -384,6 +363,25 @@ mod tests {
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
         assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 256);
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
+    }
+
+    #[test]
+    fn data_section_rejects_removed_vanilla_dir() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [data]
+            vanilla_dir = "data/vanilla"
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `vanilla_dir`"));
     }
 
     #[test]
@@ -530,7 +528,7 @@ mod tests {
             port = 25000
 
             [data]
-            vanilla_dir = "/tmp/vanilla"
+            world_dir = "/tmp/world"
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).unwrap();
         let data = Arc::new(mc_data::testing::stub());
@@ -557,7 +555,7 @@ mod tests {
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
         assert_eq!(net.chunk_pipeline.region_cache_size, 4);
-        assert_eq!(cfg.data.vanilla_dir, PathBuf::from("/tmp/vanilla"));
+        assert_eq!(cfg.data.world_dir, Some(PathBuf::from("/tmp/world")));
     }
 
     #[test]

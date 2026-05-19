@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, trace};
 
+const REQUIRED_REGISTRY_INDEX: &str = include_str!("../data/required_registry_index.json");
+
 pub mod armor;
 pub mod biomes;
 pub mod block_facts;
@@ -210,6 +212,36 @@ pub mod testing {
     }
 }
 
+/// Repo-owned registry index used when the local vanilla sidecar is absent.
+/// Entries are the minimal identifiers Solaris needs to complete the
+/// Configuration state and keep worldgen/survival baselines running.
+#[must_use]
+pub fn solaris_required_data() -> VanillaData {
+    let index: BTreeMap<String, Vec<String>> = serde_json::from_str(REQUIRED_REGISTRY_INDEX)
+        .expect("embedded required registry index JSON is valid");
+
+    let registries = KNOWN_REGISTRIES
+        .iter()
+        .map(|(path, _)| {
+            let entries = index
+                .get(*path)
+                .unwrap_or_else(|| panic!("embedded required registry index missing {path}"))
+                .iter()
+                .map(|entry| {
+                    Identifier::parse(entry.clone())
+                        .expect("embedded required registry entry id is valid")
+                })
+                .collect();
+            Registry {
+                id: Identifier::parse(format!("minecraft:{path}"))
+                    .expect("KNOWN_REGISTRIES paths are valid identifiers"),
+                entries,
+            }
+        })
+        .collect();
+    VanillaData::from_registries("<solaris-built-in>", registries)
+}
+
 /// Load the vanilla data sidecar rooted at `path` (typically
 /// `data/vanilla/`).
 ///
@@ -360,6 +392,28 @@ mod tests {
         assert!(data.registry("minecraft:dimension_type").is_some());
         assert!(data.registry("dimension_type").is_some());
         assert!(data.registry("nonexistent").is_none());
+    }
+
+    #[test]
+    fn embedded_required_registry_index_covers_known_registries() {
+        let data = solaris_required_data();
+
+        assert_eq!(data.registry_count(), KNOWN_REGISTRIES.len());
+        assert!(data.entry_count() > 800);
+        assert!(
+            data.registry("minecraft:worldgen/biome")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.as_str() == "minecraft:plains")
+        );
+        assert!(
+            data.registry("minecraft:dimension_type")
+                .unwrap()
+                .entries
+                .iter()
+                .any(|entry| entry.as_str() == "minecraft:overworld")
+        );
     }
 
     #[test]

@@ -1,0 +1,174 @@
+{
+  "minecraft:torch": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X", "#"],
+    "key": {
+      "X": [{ "item": "minecraft:coal" }, { "item": "minecraft:charcoal" }],
+      "#": "minecraft:stick"
+    },
+    "result": { "id": "minecraft:torch", "count": 4 }
+  },
+  "minecraft:oak_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:oak_logs" }],
+    "result": { "id": "minecraft:oak_planks", "count": 4 }
+  },
+  "minecraft:spruce_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:spruce_logs" }],
+    "result": { "id": "minecraft:spruce_planks", "count": 4 }
+  },
+  "minecraft:birch_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:birch_logs" }],
+    "result": { "id": "minecraft:birch_planks", "count": 4 }
+  },
+  "minecraft:jungle_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:jungle_logs" }],
+    "result": { "id": "minecraft:jungle_planks", "count": 4 }
+  },
+  "minecraft:acacia_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:acacia_logs" }],
+    "result": { "id": "minecraft:acacia_planks", "count": 4 }
+  },
+  "minecraft:dark_oak_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:dark_oak_logs" }],
+    "result": { "id": "minecraft:dark_oak_planks", "count": 4 }
+  },
+  "minecraft:mangrove_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:mangrove_logs" }],
+    "result": { "id": "minecraft:mangrove_planks", "count": 4 }
+  },
+  "minecraft:cherry_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:cherry_logs" }],
+    "result": { "id": "minecraft:cherry_planks", "count": 4 }
+  },
+  "minecraft:pale_oak_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:pale_oak_logs" }],
+    "result": { "id": "minecraft:pale_oak_planks", "count": 4 }
+  },
+  "minecraft:crimson_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:crimson_stems" }],
+    "result": { "id": "minecraft:crimson_planks", "count": 4 }
+  },
+  "minecraft:warped_planks": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": [{ "tag": "minecraft:warped_stems" }],
+    "result": { "id": "minecraft:warped_planks", "count": 4 }
+  },
+  "minecraft:stick": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "#"],
+    "key": { "#": { "tag": "minecraft:planks" } },
+    "result": { "id": "minecraft:stick", "count": 4 }
+  },
+  "minecraft:crafting_table": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##"],
+    "key": { "#": { "tag": "minecraft:planks" } },
+    "result": { "id": "minecraft:crafting_table", "count": 1 }
+  },
+  "minecraft:wooden_pickaxe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", " X ", " X "],
+    "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
+    "result": { "id": "minecraft:wooden_pickaxe", "count": 1 }
+  },
+  "minecraft:wooden_axe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "#X", " X"],
+    "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
+    "result": { "id": "minecraft:wooden_axe", "count": 1 }
+  },
+  "minecraft:wooden_shovel": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "X", "X"],
+    "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
+    "result": { "id": "minecraft:wooden_shovel", "count": 1 }
+  },
+  "minecraft:wooden_sword": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "#", "X"],
+    "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
+    "result": { "id": "minecraft:wooden_sword", "count": 1 }
+  },
+  "minecraft:stone_pickaxe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", " X ", " X "],
+    "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:stone_pickaxe", "count": 1 }
+  },
+  "minecraft:stone_axe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "#X", " X"],
+    "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:stone_axe", "count": 1 }
+  },
+  "minecraft:stone_shovel": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "X", "X"],
+    "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:stone_shovel", "count": 1 }
+  },
+  "minecraft:stone_sword": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "#", "X"],
+    "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:stone_sword", "count": 1 }
+  },
+  "minecraft:furnace": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "# #", "###"],
+    "key": { "#": "minecraft:cobblestone" },
+    "result": { "id": "minecraft:furnace", "count": 1 }
+  },
+  "minecraft:iron_ingot_from_smelting_raw_iron": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:raw_iron",
+    "result": { "id": "minecraft:iron_ingot", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:gold_ingot_from_smelting_raw_gold": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:raw_gold",
+    "result": { "id": "minecraft:gold_ingot", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:copper_ingot_from_smelting_raw_copper": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:raw_copper",
+    "result": { "id": "minecraft:copper_ingot", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:cooked_beef": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:beef",
+    "result": { "id": "minecraft:cooked_beef", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:cooked_porkchop": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:porkchop",
+    "result": { "id": "minecraft:cooked_porkchop", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:cooked_chicken": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:chicken",
+    "result": { "id": "minecraft:cooked_chicken", "count": 1 },
+    "cooking_time": 200
+  },
+  "minecraft:baked_potato": {
+    "type": "minecraft:smelting",
+    "ingredient": "minecraft:potato",
+    "result": { "id": "minecraft:baked_potato", "count": 1 },
+    "cooking_time": 200
+  }
+}

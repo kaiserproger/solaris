@@ -18,6 +18,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_REGISTRIES: &str = include_str!("../data/required_registries.json");
+
 #[derive(Debug, Error)]
 pub enum ItemsReportError {
     #[error("registries.json not found at {0}")]
@@ -110,6 +112,27 @@ impl ItemRegistry {
     }
 }
 
+/// Repo-owned item registry slice required by the embedded Solaris survival
+/// data. Protocol ids are loaded from JSON pinned to the supported protocol.
+#[must_use]
+pub fn solaris_required_items() -> ItemRegistry {
+    let raw: RawRegistries = serde_json::from_str(REQUIRED_REGISTRIES)
+        .expect("embedded required registries JSON is valid");
+    let items = raw
+        .registries
+        .get("minecraft:item")
+        .expect("embedded required registries JSON contains minecraft:item");
+    let report: Vec<_> = items
+        .entries
+        .iter()
+        .map(|(name, body)| ItemReport {
+            id: Identifier::parse(name.clone()).expect("embedded required item id is valid"),
+            protocol_id: body.protocol_id,
+        })
+        .collect();
+    ItemRegistry::from_report(&report)
+}
+
 // Raw deserialisation shape — keep separate so the public ItemReport
 // stays plain and serde-free for downstream consumers.
 
@@ -194,6 +217,28 @@ mod tests {
                 ("minecraft:air".to_string(), 0),
                 ("minecraft:stone".to_string(), 1),
             ]
+        );
+    }
+
+    #[test]
+    fn solaris_required_items_cover_recipe_baseline() {
+        let reg = solaris_required_items();
+
+        assert_eq!(
+            reg.id_of(&Identifier::parse("minecraft:air").unwrap()),
+            Some(0)
+        );
+        assert_eq!(
+            reg.id_of(&Identifier::parse("minecraft:birch_log").unwrap()),
+            Some(136)
+        );
+        assert_eq!(
+            reg.id_of(&Identifier::parse("minecraft:birch_planks").unwrap()),
+            Some(38)
+        );
+        assert_eq!(
+            reg.name_of(947).map(Identifier::as_str),
+            Some("minecraft:stick")
         );
     }
 }

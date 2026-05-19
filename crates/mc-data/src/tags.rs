@@ -23,7 +23,9 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::{Identifier, VanillaData};
+use crate::{Identifier, VanillaData, items::ItemRegistry};
+
+const REQUIRED_ITEM_TAGS: &str = include_str!("../data/required_item_tags.json");
 
 /// `(tags/<fs subpath>, "minecraft:<registry id>")` pairs the loader
 /// knows about. We deliberately limit the set to registries the
@@ -107,6 +109,36 @@ impl TagsData {
             .flat_map(|m| m.values())
             .map(Vec::len)
             .sum()
+    }
+}
+
+/// Repo-owned item tags required by [`crate::recipes::solaris_required_recipes`].
+#[must_use]
+pub fn solaris_required_item_tags(items: &ItemRegistry) -> TagsData {
+    let tags: BTreeMap<String, Vec<String>> = serde_json::from_str(REQUIRED_ITEM_TAGS)
+        .expect("embedded required item tags JSON is valid");
+    let item_registry = Identifier::parse("minecraft:item").expect("static registry id");
+    let mut item_tags = BTreeMap::new();
+    for (tag, entries) in tags {
+        let ids: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| {
+                items
+                    .id_of(
+                        &Identifier::parse(entry.clone())
+                            .expect("embedded required item id is valid"),
+                    )
+                    .and_then(|id| i32::try_from(id).ok())
+            })
+            .collect();
+        item_tags.insert(
+            Identifier::parse(tag).expect("embedded required item tag id is valid"),
+            ids,
+        );
+    }
+
+    TagsData {
+        registries: BTreeMap::from([(item_registry, item_tags)]),
     }
 }
 
@@ -468,5 +500,28 @@ mod tests {
         let ours = empty_vanilla_data();
         let err = load(dir.path(), &ours).unwrap_err();
         assert!(matches!(err, TagError::RegistriesMissing(_)));
+    }
+
+    #[test]
+    fn solaris_required_item_tags_cover_recipe_baseline() {
+        let items = crate::items::solaris_required_items();
+        let tags = solaris_required_item_tags(&items);
+        let item_tags = tags
+            .registries
+            .get(&Identifier::parse("minecraft:item").unwrap())
+            .expect("item tag registry present");
+
+        assert_eq!(
+            item_tags
+                .get(&Identifier::parse("minecraft:birch_logs").unwrap())
+                .unwrap(),
+            &[136, 173, 150, 161]
+        );
+        assert!(
+            item_tags
+                .get(&Identifier::parse("minecraft:planks").unwrap())
+                .unwrap()
+                .contains(&38)
+        );
     }
 }

@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_BIOME_SPAWNS: &str = include_str!("../data/required_biome_spawns.json");
+
 #[derive(Debug, Error)]
 pub enum BiomeDataError {
     #[error("biome directory not found at {0}")]
@@ -115,6 +117,38 @@ impl BiomeSpawnRules {
     pub fn is_empty(&self) -> bool {
         self.by_biome.is_empty()
     }
+}
+
+/// Repo-owned spawn baseline used when biome JSON is absent.
+#[must_use]
+pub fn solaris_required_biome_spawn_rules() -> BiomeSpawnRules {
+    let raw: BTreeMap<String, BTreeMap<String, Vec<RawSpawnEntry>>> =
+        serde_json::from_str(REQUIRED_BIOME_SPAWNS)
+            .expect("embedded required biome spawn JSON is valid");
+    let mut by_biome = BTreeMap::new();
+    for (biome, groups) in raw {
+        let mut parsed_groups = BTreeMap::new();
+        for (group, entries) in groups {
+            parsed_groups.insert(
+                group,
+                entries
+                    .into_iter()
+                    .map(|entry| BiomeSpawnEntry {
+                        entity_type: Identifier::parse(entry.entity_type)
+                            .expect("embedded required biome spawn entity id is valid"),
+                        min_count: entry.min_count,
+                        max_count: entry.max_count,
+                        weight: entry.weight,
+                    })
+                    .collect(),
+            );
+        }
+        by_biome.insert(
+            Identifier::parse(biome).expect("embedded required biome id is valid"),
+            parsed_groups,
+        );
+    }
+    BiomeSpawnRules::from_entries(by_biome)
 }
 
 pub fn load_biome_spawn_rules(path: impl AsRef<Path>) -> Result<BiomeSpawnRules, BiomeDataError> {

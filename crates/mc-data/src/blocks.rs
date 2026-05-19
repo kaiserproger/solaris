@@ -13,6 +13,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_BLOCKS: &str = include_str!("../data/required_blocks.json");
+
 /// One block entry from `blocks.json`.
 ///
 /// Property schema (`properties`) lists each property's allowed values
@@ -56,6 +58,20 @@ pub fn load_blocks_report(path: impl AsRef<Path>) -> Result<Vec<BlockReport>, Bl
     }
     let bytes = std::fs::read(path)?;
     let raw: BTreeMap<String, RawBlock> = serde_json::from_slice(&bytes)?;
+    raw_blocks_to_report(raw)
+}
+
+/// Embedded derived block-state registry used when the local sidecar is absent.
+#[must_use]
+pub fn solaris_required_blocks_report() -> Vec<BlockReport> {
+    let raw: BTreeMap<String, RawBlock> = serde_json::from_str(REQUIRED_BLOCKS)
+        .expect("embedded required block registry JSON is valid");
+    raw_blocks_to_report(raw).expect("embedded required block ids are valid")
+}
+
+fn raw_blocks_to_report(
+    raw: BTreeMap<String, RawBlock>,
+) -> Result<Vec<BlockReport>, BlocksReportError> {
     raw.into_iter()
         .map(|(name, body)| {
             let id = Identifier::parse(name.clone())
@@ -144,6 +160,30 @@ mod tests {
     fn missing_file_errors() {
         let err = load_blocks_report("/nonexistent/blocks.json").unwrap_err();
         assert!(matches!(err, BlocksReportError::Missing(_)));
+    }
+
+    #[test]
+    fn embedded_required_blocks_cover_dense_26_1_state_registry() {
+        let report = solaris_required_blocks_report();
+
+        assert_eq!(report.len(), 1168, "block count for 26.1.2");
+        let total_states: usize = report.iter().map(|b| b.states.len()).sum();
+        assert_eq!(total_states, 29873, "total block states for 26.1.2");
+        let air = report
+            .iter()
+            .find(|b| b.id.as_str() == "minecraft:air")
+            .unwrap();
+        assert_eq!(air.states[0].id, 0);
+        let birch = report
+            .iter()
+            .find(|b| b.id.as_str() == "minecraft:birch_log")
+            .unwrap();
+        assert!(
+            birch
+                .states
+                .iter()
+                .any(|state| state.default && state.id == 143)
+        );
     }
 
     /// Smoke test against the real vanilla report when one is present.

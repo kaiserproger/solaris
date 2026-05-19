@@ -23,22 +23,11 @@ cargo build
 Use debug builds for development; release builds are reserved for CI/owner-run
 checks.
 
-## Prerequisite: vanilla data sidecar
+## Runtime Data
 
-Solaris reads its registry data from a local sidecar populated from the
-official Mojang server jar. Drop a `server.jar` (any 26.1.x release)
-into `.analysis/` and run:
-
-```sh
-tools/extract-vanilla-data.sh
-```
-
-This populates `data/vanilla/` (gitignored — Mojang bytes never enter
-this repo). See [ADR 0001](docs/decisions/0001-vanilla-data-as-runtime-input.md)
-and [`data/vanilla/README.md`](data/vanilla/README.md) for the why.
-
-The server fails fast with a clear error pointing at this script if
-the sidecar is missing.
+Solaris ships its required registry/data baseline as repo-owned JSON assets
+embedded into the server binary. No external vanilla data sidecar is required
+to start the server.
 
 ## Run
 

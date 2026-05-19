@@ -20,7 +20,7 @@ pub use chunk::{
     ScheduledFluidTick, SectionLight,
 };
 pub use section::{ChunkSection, PackedBitArray, SECTION_DIM, SECTION_VOLUME};
-pub use storage::{ChunkDiskLoadPlan, ChunkSnapshotPlan, WorldError, WorldStorage};
+pub use storage::{ChunkDiskLoadPlan, ChunkSnapshot, ChunkSnapshotPlan, WorldError, WorldStorage};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

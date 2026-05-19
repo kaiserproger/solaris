@@ -1,0 +1,78 @@
+{
+  "minecraft:wooden_sword": {
+    "max_damage": 59,
+    "weapon": true,
+    "weapon_damage_per_attack": 1,
+    "attack_damage_modifier": 3.0
+  },
+  "minecraft:wooden_shovel": {
+    "max_damage": 59,
+    "attack_damage_modifier": 1.5
+  },
+  "minecraft:wooden_pickaxe": {
+    "max_damage": 59,
+    "attack_damage_modifier": 1.0
+  },
+  "minecraft:wooden_axe": {
+    "max_damage": 59,
+    "attack_damage_modifier": 6.0
+  },
+  "minecraft:stone_sword": {
+    "max_damage": 131,
+    "weapon": true,
+    "weapon_damage_per_attack": 1,
+    "attack_damage_modifier": 4.0
+  },
+  "minecraft:stone_shovel": {
+    "max_damage": 131,
+    "attack_damage_modifier": 2.5
+  },
+  "minecraft:stone_pickaxe": {
+    "max_damage": 131,
+    "attack_damage_modifier": 2.0
+  },
+  "minecraft:stone_axe": {
+    "max_damage": 131,
+    "attack_damage_modifier": 8.0
+  },
+  "minecraft:beef": {
+    "food": { "food": 3, "saturation": 1.8 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:cooked_beef": {
+    "food": { "food": 8, "saturation": 12.8 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:porkchop": {
+    "food": { "food": 3, "saturation": 1.8 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:cooked_porkchop": {
+    "food": { "food": 8, "saturation": 12.8 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:chicken": {
+    "food": { "food": 2, "saturation": 1.2 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:cooked_chicken": {
+    "food": { "food": 6, "saturation": 7.2 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:potato": {
+    "food": { "food": 1, "saturation": 0.6 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  },
+  "minecraft:baked_potato": {
+    "food": { "food": 5, "saturation": 6.0 },
+    "use_duration_ticks": 32,
+    "use_action": "eat"
+  }
+}

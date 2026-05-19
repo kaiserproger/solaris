@@ -8,7 +8,6 @@ bind_address = "0.0.0.0"
 port = 25565
 
 [data]
-vanilla_dir = "data/vanilla"
 world_dir = ".analysis/test-world"
 # World seed for deterministic Solaris generation. Chunks already on
 # disk in `world_dir` win over fallback generation, so changing this

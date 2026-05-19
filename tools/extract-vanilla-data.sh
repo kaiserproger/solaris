@@ -26,20 +26,28 @@
 # Re-runnable; safe to delete data/vanilla/ first if you want a clean slate.
 #
 # Requires Java matching the server's java_version (25 for 26.1.x). Override
-# with `JAVA=...`; defaults to the sdkman 25.0.2-graalce install used by
-# dump-vanilla-protocol.sh.
+# with `JAVA=...`; defaults to a local SDKMAN Java 25 when present.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BUNDLE_JAR="${1:-$REPO_ROOT/.analysis/server.jar}"
 OUT_DIR="$REPO_ROOT/data/vanilla"
-JAVA="${JAVA:-/home/user/.sdkman/candidates/java/25.0.2-graalce/bin/java}"
+if [[ -z "${JAVA:-}" ]]; then
+  if [[ -x "$HOME/.sdkman/candidates/java/25.0.3-graal/bin/java" ]]; then
+    JAVA="$HOME/.sdkman/candidates/java/25.0.3-graal/bin/java"
+  elif [[ -x "$HOME/.sdkman/candidates/java/25.0.2-graalce/bin/java" ]]; then
+    JAVA="$HOME/.sdkman/candidates/java/25.0.2-graalce/bin/java"
+  else
+    JAVA="$(command -v java || true)"
+  fi
+fi
 
 if [[ ! -f "$BUNDLE_JAR" ]]; then
   echo "error: bundle jar not found at $BUNDLE_JAR" >&2
   exit 1
 fi
+BUNDLE_JAR="$(realpath "$BUNDLE_JAR")"
 if [[ ! -x "$JAVA" ]]; then
   echo "error: java not found at $JAVA (override with JAVA=…)" >&2
   exit 1
@@ -158,13 +166,18 @@ done
 
 echo "[4/5] Generating data reports via server's own data generator …"
 mkdir -p "$TMP/datagen"
-(
+if ! (
   cd "$TMP/datagen"
   "$JAVA" -DbundlerMainClass=net.minecraft.data.Main \
-    -jar "$BUNDLE_JAR" --server --reports >/dev/null 2>&1
-)
+    -jar "$BUNDLE_JAR" --server --reports >"$TMP/datagen.log" 2>&1
+); then
+  echo "error: --reports failed; datagen output:" >&2
+  cat "$TMP/datagen.log" >&2
+  exit 1
+fi
 if [[ ! -f "$TMP/datagen/generated/reports/blocks.json" ]]; then
-  echo "error: --reports did not produce blocks.json; rerun with stderr visible to debug" >&2
+  echo "error: --reports did not produce blocks.json; datagen output:" >&2
+  cat "$TMP/datagen.log" >&2
   exit 1
 fi
 mkdir -p "$OUT_DIR/reports"

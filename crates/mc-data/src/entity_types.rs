@@ -8,6 +8,8 @@ use thiserror::Error;
 
 use crate::Identifier;
 
+const REQUIRED_REGISTRIES: &str = include_str!("../data/required_registries.json");
+
 #[derive(Debug, Error)]
 pub enum EntityTypesReportError {
     #[error("registries.json not found at {0}")]
@@ -158,6 +160,26 @@ impl EntityTypeRegistry {
     pub fn is_empty(&self) -> bool {
         self.by_name.is_empty()
     }
+}
+
+/// Repo-owned entity type slice used when `registries.json` is absent.
+#[must_use]
+pub fn solaris_required_entity_types() -> EntityTypeRegistry {
+    let raw: RawRegistries = serde_json::from_str(REQUIRED_REGISTRIES)
+        .expect("embedded required registries JSON is valid");
+    let entity_types = raw
+        .registries
+        .get("minecraft:entity_type")
+        .expect("embedded required registries JSON contains minecraft:entity_type");
+    let report: Vec<_> = entity_types
+        .entries
+        .iter()
+        .map(|(name, body)| EntityTypeReport {
+            id: Identifier::parse(name.clone()).expect("embedded required entity type id is valid"),
+            protocol_id: body.protocol_id,
+        })
+        .collect();
+    EntityTypeRegistry::from_report(&report)
 }
 
 #[must_use]
