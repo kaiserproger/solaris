@@ -33,6 +33,7 @@ use mc_entity::{
     AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, EntityStore,
     EntityView, GoalState, SpawnEntity, Vec3,
 };
+use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
@@ -6851,6 +6852,14 @@ where
                     );
                     client_preferences = Some(preferences);
                 } else if frame.id == ServerboundCustomPayload::ID {
+                    if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+                        warn!(
+                            len = frame.body.len(),
+                            max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+                            "oversized custom payload rejected before decode"
+                        );
+                        continue;
+                    }
                     let mut body = frame.body;
                     match ServerboundCustomPayload::decode(&mut body)?.payload {
                         CustomPayload::Brand(brand) => {
@@ -6861,6 +6870,9 @@ where
                             client_brand = Some(brand);
                         }
                         CustomPayload::Unknown { channel, payload } => {
+                            // Future extension forwarding should pass this borrowed
+                            // channel/body through `mc_extension::CustomPayloadPolicy`
+                            // before enqueueing an `InboundEvent::CustomPayload`.
                             debug!(channel = %channel.as_str(), len = payload.len(), "custom payload ignored");
                         }
                     }

@@ -21,6 +21,7 @@
 use bytes::BytesMut;
 use mc_data::VanillaData;
 use mc_data::tags::TagsData;
+use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::CustomPayload;
@@ -101,12 +102,23 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
+            if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+                warn!(
+                    len = frame.body.len(),
+                    max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+                    "oversized Configuration custom payload rejected before decode"
+                );
+                continue;
+            }
             let mut body = frame.body;
             match ServerboundCustomPayload::decode(&mut body)?.payload {
                 CustomPayload::Brand(brand) => {
                     debug!(brand = %brand, "client brand noted during Configuration")
                 }
                 CustomPayload::Unknown { channel, payload } => {
+                    // Future extension forwarding should pass this borrowed
+                    // channel/body through `mc_extension::CustomPayloadPolicy`
+                    // before enqueueing an `InboundEvent::CustomPayload`.
                     debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored");
                 }
             }
@@ -228,12 +240,23 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
+            if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+                warn!(
+                    len = frame.body.len(),
+                    max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+                    "oversized Configuration custom payload rejected before decode while waiting for ack"
+                );
+                continue;
+            }
             let mut body = frame.body;
             match ServerboundCustomPayload::decode(&mut body)?.payload {
                 CustomPayload::Brand(brand) => {
                     debug!(brand = %brand, "client brand noted while waiting for Configuration ack")
                 }
                 CustomPayload::Unknown { channel, payload } => {
+                    // Future extension forwarding should pass this borrowed
+                    // channel/body through `mc_extension::CustomPayloadPolicy`
+                    // before enqueueing an `InboundEvent::CustomPayload`.
                     debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored while waiting for ack");
                 }
             }
