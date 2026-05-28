@@ -5,6 +5,7 @@
 //! Part of the Solaris engine.
 
 pub mod client;
+pub mod parity;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
