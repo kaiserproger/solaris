@@ -262,6 +262,20 @@ pub enum GoalState {
     },
 }
 
+/// Observable counters from an AI goal tick.
+///
+/// These counters intentionally describe the read-only decision/application
+/// boundary: every alive entity with a goal produces one applied decision, while
+/// despawning entities are skipped and missing follow targets are reported
+/// without mutating unrelated entities.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct GoalTickStats {
+    pub alive_entities: usize,
+    pub decisions_applied: usize,
+    pub skipped_non_alive: usize,
+    pub missing_follow_targets: usize,
+}
+
 /// Dense entity storage. Hot state is kept in parallel vectors so later
 /// milestones can split ticks into independent batches without redesigning
 /// the runtime around per-entity locks.
@@ -479,10 +493,17 @@ impl EntityStore {
     }
 
     pub fn tick_goals(&mut self, tick: u64) {
+        let _ = self.tick_goals_with_stats(tick);
+    }
+
+    pub fn tick_goals_with_stats(&mut self, tick: u64) -> GoalTickStats {
+        let mut stats = GoalTickStats::default();
         for slot in 0..self.len() {
             if self.lifecycles[slot] != EntityLifecycle::Alive {
+                stats.skipped_non_alive += 1;
                 continue;
             }
+            stats.alive_entities += 1;
             match self.goals[slot].clone() {
                 GoalState::Idle => {
                     self.velocities[slot].x = 0.0;
@@ -515,16 +536,17 @@ impl EntityStore {
                     self.rotations[slot] = aquatic_rotation_from_velocity(self.velocities[slot]);
                 }
                 GoalState::FollowTarget { target, speed } => {
-                    let velocity = self
-                        .slots_by_id
-                        .get(&target)
-                        .map(|&target_slot| Vec3 {
+                    let velocity = if let Some(&target_slot) = self.slots_by_id.get(&target) {
+                        Vec3 {
                             x: self.positions[target_slot].x - self.positions[slot].x,
                             y: 0.0,
                             z: self.positions[target_slot].z - self.positions[slot].z,
-                        })
-                        .unwrap_or(Vec3::ZERO)
-                        .horizontal_normalized();
+                        }
+                        .horizontal_normalized()
+                    } else {
+                        stats.missing_follow_targets += 1;
+                        Vec3::ZERO
+                    };
                     self.velocities[slot].x = velocity.x * speed;
                     self.velocities[slot].z = velocity.z * speed;
                     self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
@@ -543,7 +565,9 @@ impl EntityStore {
                     self.rotations[slot].head_yaw = self.rotations[slot].yaw;
                 }
             }
+            stats.decisions_applied += 1;
         }
+        stats
     }
 
     pub fn tick_positions(&mut self, delta_seconds: f64) {
@@ -851,6 +875,44 @@ mod tests {
         let velocity = store.snapshot(follower).unwrap().velocity;
         assert!((velocity.x - 0.3).abs() < 0.000_001);
         assert!((velocity.z - 0.4).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn goal_tick_stats_report_applied_and_skipped_ai_decisions() {
+        let mut store = EntityStore::new();
+        let idle = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let follower = store.spawn(cow(Vec3::new(2.0, 64.0, 0.0)));
+        let despawning = store.spawn(cow(Vec3::new(4.0, 64.0, 0.0)));
+        store.set_velocity(idle, Vec3::new(1.0, 2.0, 3.0));
+        store.set_goal(
+            follower,
+            GoalState::FollowTarget {
+                target: EntityId(99_999),
+                speed: 0.5,
+            },
+        );
+        store.mark_despawning(despawning);
+
+        let stats = store.tick_goals_with_stats(1);
+
+        assert_eq!(
+            stats,
+            GoalTickStats {
+                alive_entities: 2,
+                decisions_applied: 2,
+                skipped_non_alive: 1,
+                missing_follow_targets: 1,
+            }
+        );
+        assert_eq!(
+            store.snapshot(idle).unwrap().velocity,
+            Vec3::new(0.0, 2.0, 0.0)
+        );
+        assert_eq!(store.snapshot(follower).unwrap().velocity, Vec3::ZERO);
+        assert_eq!(
+            store.snapshot(despawning).unwrap().lifecycle,
+            EntityLifecycle::Despawning
+        );
     }
 
     #[test]
