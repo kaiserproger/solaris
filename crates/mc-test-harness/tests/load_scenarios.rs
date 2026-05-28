@@ -1,7 +1,7 @@
-//! M37 load-oriented scenarios.
+//! Load-oriented scenarios.
 //!
-//! These tests are ignored by default because they are timing/report harnesses,
-//! not deterministic correctness gates. Run with:
+//! Non-ignored tests are coarse debug-build regression gates. The ignored M37
+//! report remains diagnostic-only and can be run explicitly with:
 //!
 //! ```text
 //! cargo test -p mc-test-harness --test load_scenarios -- --ignored --nocapture
@@ -23,24 +23,61 @@ use mc_test_harness::client::Client;
 const VIEW_DISTANCE: i32 = 1;
 const LOAD_CHUNK_IO_THREADS: usize = 1;
 const LOAD_CHUNK_WORKER_THREADS: usize = 2;
+const M52_BASELINE_CLIENTS: usize = 4;
+const M52_BASELINE_SUMMONS: usize = 8;
+const M52_BASELINE_ELAPSED_BUDGET: Duration = Duration::from_secs(30);
+const M52_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multicore_chunk_load_respects_global_pipeline_budgets() {
+async fn multicore_login_chunk_stream_and_broadcast_stays_within_budgets() {
     let Some(server) = start_load_server().await else {
         return;
     };
     let addr = server.addr;
+    let started = Instant::now();
 
-    let mut clients = Vec::new();
-    for idx in 0..4 {
-        clients.push(tokio::spawn(async move {
-            let (mut client, _) = connect_to_play(addr, &format!("M48Load{idx}")).await;
+    let mut client_tasks = Vec::new();
+    for idx in 0..M52_BASELINE_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let (mut client, sync) = connect_to_play(addr, &format!("M52Load{idx}")).await;
             drain_until_chunk(&mut client, (0, 0)).await;
+            (client, sync)
         }));
     }
-    for client in clients {
-        client.await.expect("client task joins");
+
+    let mut clients = Vec::new();
+    for task in client_tasks {
+        clients.push(task.await.expect("client task joins"));
     }
+
+    let (mut actor, actor_sync) = clients.remove(0);
+    let (mut observer, _) = clients.remove(0);
+    let spawn_y = actor_sync.y.floor() as i32;
+    for idx in 0..M52_BASELINE_SUMMONS {
+        actor
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    idx % 4,
+                    spawn_y,
+                    2 + idx / 4
+                ),
+            })
+            .await
+            .expect("summon zombie for broadcast baseline");
+    }
+
+    let spawns = drain_counting(&mut observer, Duration::from_secs(5), AddEntity::ID).await;
+    assert!(
+        spawns > 0,
+        "observer should receive gameplay entity broadcasts from command path"
+    );
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= M52_BASELINE_ELAPSED_BUDGET,
+        "M52 multicore baseline exceeded debug elapsed budget: elapsed={elapsed:?} budget={M52_BASELINE_ELAPSED_BUDGET:?}"
+    );
 
     let snapshot = server.chunk_pipeline_metrics.snapshot();
     assert!(
@@ -56,6 +93,28 @@ async fn multicore_chunk_load_respects_global_pipeline_budgets() {
         snapshot.max_cpu_active <= server.chunk_worker_threads,
         "global CPU permits exceeded: {:?}",
         snapshot
+    );
+
+    let pressure = mc_net::lock_pressure_snapshot();
+    assert!(
+        pressure.session_registry.max_hold_us <= M52_LOCK_MAX_HOLD_BUDGET_US,
+        "session registry lock hold exceeded coarse M52 budget: {:?}",
+        pressure.session_registry
+    );
+    assert!(
+        pressure.world_storage.max_hold_us <= M52_LOCK_MAX_HOLD_BUDGET_US,
+        "world storage lock hold exceeded coarse M52 budget: {:?}",
+        pressure.world_storage
+    );
+    eprintln!(
+        "M52 multicore clients={} summons={} observer_spawns={} elapsed_ms={} chunk_pipeline={:?} session_lock={:?} world_lock={:?}",
+        M52_BASELINE_CLIENTS,
+        M52_BASELINE_SUMMONS,
+        spawns,
+        elapsed.as_millis(),
+        snapshot,
+        pressure.session_registry,
+        pressure.world_storage,
     );
 }
 
