@@ -227,6 +227,30 @@ pub struct BoundServer {
     sessions: Arc<play::SessionRegistry>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OutboundPressureSnapshot {
+    pub visibility_command_drops: u64,
+    pub reliable_command_retries: u64,
+    pub reliable_command_retries_in_flight: u64,
+}
+
+#[derive(Clone)]
+pub struct OutboundPressureHandle {
+    sessions: Arc<play::SessionRegistry>,
+}
+
+impl OutboundPressureHandle {
+    #[must_use]
+    pub fn snapshot(&self) -> OutboundPressureSnapshot {
+        let pressure = self.sessions.pressure_snapshot();
+        OutboundPressureSnapshot {
+            visibility_command_drops: pressure.visibility_command_drops,
+            reliable_command_retries: pressure.reliable_command_retries,
+            reliable_command_retries_in_flight: pressure.reliable_command_retries_in_flight,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SaveAllReport {
     pub players_saved: usize,
@@ -285,6 +309,13 @@ impl BoundServer {
     #[must_use]
     pub fn chunk_pipeline_metrics(&self) -> crate::ChunkPipelineResourceMetrics {
         self.chunk_pipeline_resources.metrics()
+    }
+
+    #[must_use]
+    pub fn outbound_pressure_handle(&self) -> OutboundPressureHandle {
+        OutboundPressureHandle {
+            sessions: Arc::clone(&self.sessions),
+        }
     }
 
     /// Accept connections forever, spawning a per-connection task each
