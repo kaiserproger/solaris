@@ -17,6 +17,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use mc_protocol::packets::Packet;
+use mc_protocol::packets::play::{
+    ClientboundCommands, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay,
+    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, SetCenterChunk,
+    SynchronizePlayerPosition,
+};
+
+use crate::client::Client;
 
 /// Default local path for the vanilla oracle jar. The jar itself is never
 /// tracked by git.
@@ -303,6 +312,180 @@ pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<ObservationSet>
 pub trait ParityScenario: Send + Sync {
     fn name(&self) -> &'static str;
     fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a>;
+}
+
+/// Deterministic core-action scenario shared by Solaris-only smoke tests and
+/// vanilla-backed parity diffs. It drives the login/play prelude, then executes
+/// a small movement/look/wait sequence while recording normalized observations.
+#[derive(Debug, Clone)]
+pub struct CoreActionSequenceScenario {
+    name: &'static str,
+    actions: Vec<CoreAction>,
+}
+
+impl CoreActionSequenceScenario {
+    #[must_use]
+    pub fn new(name: &'static str, actions: Vec<CoreAction>) -> Self {
+        Self { name, actions }
+    }
+
+    #[must_use]
+    pub fn actions(&self) -> &[CoreAction] {
+        &self.actions
+    }
+}
+
+impl ParityScenario for CoreActionSequenceScenario {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+
+    fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
+        Box::pin(async move { observe_core_action_sequence(ctx, self.name, &self.actions).await })
+    }
+}
+
+async fn observe_core_action_sequence(
+    ctx: ScenarioContext,
+    phase: &'static str,
+    actions: &[CoreAction],
+) -> Result<ObservationSet> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    };
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, subject).await?;
+    client.drive_configuration().await?;
+
+    let mut observations = ObservationSet::new(subject, phase);
+    let _: LoginPlay = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundCommands = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundCommands::ID,
+    });
+    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    });
+    observations.push(ObservationFact::SpawnPosition {
+        x: sync.x.floor() as i64,
+        y: sync.y.floor() as i64,
+        z: sync.z.floor() as i64,
+    });
+    let _: GameEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
+    let _: SetCenterChunk = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetCenterChunk::ID,
+    });
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await?;
+    client.write_packet(&ServerboundPlayerLoaded).await?;
+
+    execute_core_actions(
+        &mut client,
+        &mut observations,
+        actions,
+        sync.x,
+        sync.y,
+        sync.z,
+    )
+    .await?;
+    observe_post_action_liveness(&mut client, &mut observations).await?;
+    Ok(observations.normalized())
+}
+
+async fn observe_post_action_liveness(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+) -> Result<()> {
+    let frame = client
+        .read_frame_with_timeout(Duration::from_secs(5))
+        .await
+        .context("wait for post-action server liveness frame")?;
+    if frame.id == ClientboundKeepAlive::ID {
+        let mut body = frame.body.clone();
+        let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+        client
+            .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+            .await?;
+    }
+    observations.push(ObservationFact::Note {
+        key: "post_action_liveness".into(),
+        value: "clientbound_frame".into(),
+    });
+    Ok(())
+}
+
+async fn execute_core_actions(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+    actions: &[CoreAction],
+    mut x: f64,
+    y: f64,
+    mut z: f64,
+) -> Result<()> {
+    let mut yaw = 0.0_f32;
+    let mut pitch = 0.0_f32;
+    let flags = MovePlayerFlags::new(false, false);
+
+    for (index, action) in actions.iter().enumerate() {
+        observations.push(ObservationFact::Note {
+            key: format!("action.{index}"),
+            value: action.summary(),
+        });
+        match *action {
+            CoreAction::WaitTicks { ticks } => {
+                client
+                    .write_packet(&ServerboundMovePlayerStatusOnly { flags })
+                    .await?;
+                observations.push(ObservationFact::PacketSeen {
+                    id: ServerboundMovePlayerStatusOnly::ID,
+                });
+                tokio::time::sleep(Duration::from_millis(u64::from(ticks) * 50)).await;
+            }
+            CoreAction::MoveBy { dx_cm, dz_cm } => {
+                x += f64::from(dx_cm) / 100.0;
+                z += f64::from(dz_cm) / 100.0;
+                client
+                    .write_packet(&ServerboundMovePlayerPos { x, y, z, flags })
+                    .await?;
+                observations.push(ObservationFact::PacketSeen {
+                    id: ServerboundMovePlayerPos::ID,
+                });
+            }
+            CoreAction::Look { yaw_deg, pitch_deg } => {
+                yaw = f32::from(yaw_deg);
+                pitch = f32::from(pitch_deg);
+                client
+                    .write_packet(&ServerboundMovePlayerRot { yaw, pitch, flags })
+                    .await?;
+                observations.push(ObservationFact::PacketSeen {
+                    id: ServerboundMovePlayerRot::ID,
+                });
+            }
+            CoreAction::Reconnect => {
+                observations.push(ObservationFact::Note {
+                    key: format!("action.{index}.skipped"),
+                    value: "reconnect".into(),
+                });
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundMovePlayerRot { yaw, pitch, flags })
+        .await?;
+    observations.push(ObservationFact::Note {
+        key: "actions_executed".into(),
+        value: actions.len().to_string(),
+    });
+    Ok(())
 }
 
 /// Pick a currently-free localhost port for a child server process.

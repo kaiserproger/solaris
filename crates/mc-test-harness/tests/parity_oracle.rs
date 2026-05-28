@@ -10,9 +10,9 @@ use mc_protocol::packets::play::{
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
-    ObservationFact, ObservationSet, OracleAvailability, ParityScenario, ScenarioContext,
-    ScenarioFuture, ServerKind, VanillaServerProcess, diff_observations,
-    vanilla_oracle_availability,
+    CoreActionGenerator, CoreActionSequenceScenario, ObservationFact, ObservationSet,
+    OracleAvailability, ParityScenario, ScenarioContext, ScenarioFuture, ServerKind,
+    VanillaServerProcess, diff_observations, vanilla_oracle_availability,
 };
 
 struct SpawnSmokeScenario;
@@ -166,6 +166,61 @@ async fn solaris_spawn_smoke_scenario_produces_normalized_observations() {
         fact,
         ObservationFact::Note { key, value }
             if key == "start_waiting_for_chunks" && value == "true"
+    )));
+
+    task.abort();
+}
+
+#[tokio::test]
+async fn solaris_core_action_sequence_produces_liveness_observations() {
+    let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
+    let task = tokio::spawn(async move { bound.serve().await });
+
+    let actions = CoreActionGenerator::generate(0x54, 3);
+    assert_eq!(
+        actions
+            .iter()
+            .map(|action| action.summary())
+            .collect::<Vec<_>>(),
+        vec!["move:167,76", "look:-62,-89", "wait:4"]
+    );
+    let scenario = CoreActionSequenceScenario::new("seeded-core-actions", actions);
+    let observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr,
+        })
+        .await
+        .expect("core action scenario runs");
+
+    assert_eq!(scenario.name(), "seeded-core-actions");
+    assert!(observations.facts().contains(&ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    }));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "actions_executed" && value == "3"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "post_action_liveness" && value == "clientbound_frame"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "action.0" && value == "move:167,76"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "action.1" && value == "look:-62,-89"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "action.2" && value == "wait:4"
     )));
 
     task.abort();
