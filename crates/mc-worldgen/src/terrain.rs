@@ -46,6 +46,8 @@ const NOISE_FREQUENCY: f64 = 1.0 / 24.0;
 const NOISE_OCTAVES: u32 = 3;
 const NOISE_PERSISTENCE: f64 = 0.5;
 pub const SEA_LEVEL: i32 = 63;
+pub const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
+pub const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
 const CONTINENT_FREQUENCY: f64 = 1.0 / 420.0;
 const COAST_DETAIL_FREQUENCY: f64 = 1.0 / 96.0;
 const FOREST_FREQUENCY: f64 = 1.0 / 160.0;
@@ -135,6 +137,86 @@ const OVERWORLD_BIOME_IDS: &[&str] = &[
     "minecraft:deep_dark",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TellusWorldgenSettings {
+    pub world_scale_meters_per_block: f64,
+    pub terrestrial_height_scale: f64,
+    pub oceanic_height_scale: f64,
+    pub sea_level: i32,
+    pub climate_strength: f64,
+    pub water_enabled: bool,
+}
+
+impl Default for TellusWorldgenSettings {
+    fn default() -> Self {
+        Self {
+            world_scale_meters_per_block: 30.0,
+            terrestrial_height_scale: 1.0,
+            oceanic_height_scale: 1.0,
+            sea_level: SEA_LEVEL,
+            climate_strength: 1.0,
+            water_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum WorldgenMode {
+    #[default]
+    VanillaLike,
+    TellusLike(TellusWorldgenSettings),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MercatorProjection {
+    world_scale_meters_per_block: f64,
+}
+
+impl MercatorProjection {
+    #[must_use]
+    pub fn new(world_scale_meters_per_block: f64) -> Self {
+        Self {
+            world_scale_meters_per_block: world_scale_meters_per_block.max(0.001),
+        }
+    }
+
+    #[must_use]
+    pub fn from_settings(settings: TellusWorldgenSettings) -> Self {
+        Self::new(settings.world_scale_meters_per_block)
+    }
+
+    #[must_use]
+    pub fn blocks_per_degree(&self) -> f64 {
+        METERS_PER_DEGREE / self.world_scale_meters_per_block
+    }
+
+    #[must_use]
+    pub fn lat_lon_to_block(&self, latitude_degrees: f64, longitude_degrees: f64) -> (f64, f64) {
+        let lat = latitude_degrees.clamp(-MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE);
+        let lon = longitude_degrees.clamp(-180.0, 180.0);
+        let x = lon * self.blocks_per_degree();
+        let lat_rad = lat.to_radians();
+        let mercator_degrees = (lat_rad.tan() + lat_rad.cos().recip()).ln().to_degrees();
+        let z = -mercator_degrees * self.blocks_per_degree();
+        (x, z)
+    }
+
+    #[must_use]
+    pub fn block_to_lat_lon(&self, x: f64, z: f64) -> (f64, f64) {
+        let longitude = (x / self.blocks_per_degree()).clamp(-180.0, 180.0);
+        let mercator_radians = (-z / self.blocks_per_degree()).to_radians();
+        let latitude = mercator_radians.sinh().atan().to_degrees();
+        (latitude, longitude)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TellusClimate {
+    pub latitude_degrees: f64,
+    pub temperature: f64,
+    pub moisture: f64,
+}
+
 pub const GENERATION_STAGE_ORDER: &[&str] = &[
     "base_terrain_and_surfaces",
     "caves_and_ores",
@@ -166,6 +248,7 @@ pub struct TerrainGenerator {
     ores: OreRules,
     structures: StructureRules,
     decorations: DecorationBlocks,
+    worldgen_mode: WorldgenMode,
     // Kept so the generator's lifetime is bounded by something
     // sensible if the storage drops the only other reference.
     #[allow(dead_code)]
@@ -865,6 +948,19 @@ impl TerrainGenerator {
     }
 
     #[must_use]
+    pub fn with_worldgen_mode(seed: i64, registry: Arc<BlockRegistry>, mode: WorldgenMode) -> Self {
+        let mut generator = Self::new(seed, registry);
+        generator.worldgen_mode = mode;
+        generator
+    }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: WorldgenMode) -> Self {
+        self.worldgen_mode = mode;
+        self
+    }
+
+    #[must_use]
     pub fn with_rules(
         seed: i64,
         registry: Arc<BlockRegistry>,
@@ -891,6 +987,7 @@ impl TerrainGenerator {
             ores,
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
+            worldgen_mode: WorldgenMode::VanillaLike,
             registry,
         }
     }
@@ -912,6 +1009,15 @@ impl TerrainGenerator {
     /// function the generator does.
     #[must_use]
     pub fn surface_height(&self, world_x: i32, world_z: i32) -> i32 {
+        match self.worldgen_mode {
+            WorldgenMode::VanillaLike => self.vanilla_surface_height(world_x, world_z),
+            WorldgenMode::TellusLike(settings) => {
+                self.tellus_surface_height(world_x, world_z, settings)
+            }
+        }
+    }
+
+    fn vanilla_surface_height(&self, world_x: i32, world_z: i32) -> i32 {
         let hills = fbm_2d(
             world_x as f64 * NOISE_FREQUENCY,
             world_z as f64 * NOISE_FREQUENCY,
@@ -939,6 +1045,84 @@ impl TerrainGenerator {
         let raw = ocean * (1.0 - smooth) + land * smooth;
         // Guard against extreme outputs even though fbm_2d is bounded.
         raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
+    }
+
+    fn tellus_surface_height(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        settings: TellusWorldgenSettings,
+    ) -> i32 {
+        let projection = MercatorProjection::from_settings(settings);
+        let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
+        let continent = fbm_2d(
+            world_x as f64 / 15_000.0,
+            world_z as f64 / 15_000.0,
+            self.seed ^ 0x5445_4C4C_5553,
+            5,
+            0.55,
+        );
+        let coast = fbm_2d(
+            world_x as f64 / 3_000.0,
+            world_z as f64 / 3_000.0,
+            self.seed ^ 0x434F_4153_5453,
+            3,
+            0.5,
+        );
+        let ridges = self.ridges(world_x / 4, world_z / 4);
+        let hills = fbm_2d(
+            world_x as f64 / 900.0,
+            world_z as f64 / 900.0,
+            self.seed ^ 0x454C_4556,
+            4,
+            0.52,
+        );
+        let land_mask = continent + coast * 0.22 + (equator_weight - 0.5) * 0.08;
+        let shore = ((land_mask + 0.10) / 0.30).clamp(0.0, 1.0);
+        let shore = shore * shore * (3.0 - 2.0 * shore);
+        let terrestrial = settings.sea_level as f64
+            + 5.0
+            + (land_mask.max(0.0) * 54.0 + ridges * 42.0 + hills * 18.0)
+                * settings.terrestrial_height_scale.max(0.0);
+        let oceanic = settings.sea_level as f64
+            - 7.0
+            - ((-land_mask).max(0.0) * 44.0 + hills.abs() * 6.0)
+                * settings.oceanic_height_scale.max(0.0);
+        let raw = oceanic * (1.0 - shore) + terrestrial * shore;
+        raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
+    }
+
+    #[must_use]
+    pub fn tellus_climate(&self, world_x: i32, height: i32, world_z: i32) -> TellusClimate {
+        let settings = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => TellusWorldgenSettings::default(),
+            WorldgenMode::TellusLike(settings) => settings,
+        };
+        let projection = MercatorProjection::from_settings(settings);
+        let (latitude_degrees, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let latitude_cooling = latitude_degrees.abs() / MAX_MERCATOR_LATITUDE;
+        let altitude_cooling = ((height - settings.sea_level).max(0) as f64 / 128.0).min(1.0);
+        let weather = fbm_2d(
+            world_x as f64 / 7_500.0,
+            world_z as f64 / 7_500.0,
+            self.seed ^ 0x434C_494D_4154,
+            3,
+            0.55,
+        );
+        TellusClimate {
+            latitude_degrees,
+            temperature: ((1.0 - latitude_cooling * 1.8 - altitude_cooling * 0.85)
+                * settings.climate_strength)
+                + weather * 0.12,
+            moisture: fbm_2d(
+                world_x as f64 / 5_500.0,
+                world_z as f64 / 5_500.0,
+                self.seed ^ 0x4D4F_4953_5455,
+                3,
+                0.55,
+            ),
+        }
     }
 
     fn continentalness(&self, world_x: i32, world_z: i32) -> f64 {
@@ -2166,6 +2350,60 @@ mod tests {
             },
         ];
         Arc::new(BlockRegistry::from_report(&report).unwrap())
+    }
+
+    #[test]
+    fn tellus_mercator_projection_round_trips_and_clamps_latitude() {
+        let projection = MercatorProjection::from_settings(TellusWorldgenSettings::default());
+        assert!((projection.blocks_per_degree() - 3710.649722222222).abs() < 0.0001);
+        let (x, z) = projection.lat_lon_to_block(45.0, -73.5);
+        let (lat, lon) = projection.block_to_lat_lon(x, z);
+        assert!((lat - 45.0).abs() < 0.000_001);
+        assert!((lon + 73.5).abs() < 0.000_001);
+        let north = projection.lat_lon_to_block(120.0, 0.0).1;
+        let max_north = projection.lat_lon_to_block(MAX_MERCATOR_LATITUDE, 0.0).1;
+        assert!((north - max_north).abs() < 0.000_001);
+        assert!(projection.lat_lon_to_block(45.0, 0.0).1 < 0.0);
+    }
+
+    #[test]
+    fn tellus_like_mode_preserves_default_but_changes_explicit_generator() {
+        let registry = tiny_registry();
+        let default = TerrainGenerator::new(1234, Arc::clone(&registry));
+        let explicit_vanilla = TerrainGenerator::with_worldgen_mode(
+            1234,
+            Arc::clone(&registry),
+            WorldgenMode::VanillaLike,
+        );
+        let tellus = TerrainGenerator::with_worldgen_mode(
+            1234,
+            registry,
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        assert_eq!(
+            default.surface_height(512, -256),
+            explicit_vanilla.surface_height(512, -256)
+        );
+        assert_ne!(
+            default.surface_height(512, -256),
+            tellus.surface_height(512, -256)
+        );
+        assert!((MIN_Y + 2..=250).contains(&tellus.surface_height(1_000_000, -1_000_000)));
+    }
+
+    #[test]
+    fn tellus_like_latitude_and_altitude_drive_climate() {
+        let g = TerrainGenerator::with_worldgen_mode(
+            77,
+            tiny_registry(),
+            WorldgenMode::TellusLike(TellusWorldgenSettings::default()),
+        );
+        let equator = g.tellus_climate(0, 72, 0);
+        let arctic = g.tellus_climate(0, 72, -10_000_000);
+        let summit = g.tellus_climate(0, 180, 0);
+        assert!(equator.temperature > arctic.temperature);
+        assert!(equator.temperature > summit.temperature);
+        assert!(equator.latitude_degrees.abs() < arctic.latitude_degrees.abs());
     }
 
     #[test]
