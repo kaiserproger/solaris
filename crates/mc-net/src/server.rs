@@ -425,6 +425,9 @@ impl BoundServer {
                             entity_take_dispatches = pressure.entity_dispatches.take,
                             entity_remove_dispatches = pressure.entity_dispatches.remove,
                             visibility_command_drops = pressure.visibility_command_drops,
+                            reliable_command_retries = pressure.reliable_command_retries,
+                            reliable_command_retries_in_flight =
+                                pressure.reliable_command_retries_in_flight,
                             furnace_viewer_sets = pressure.furnace_viewer_sets,
                             chest_viewer_sets = pressure.chest_viewer_sets,
                             world_lock_waits = lock_pressure.world_storage.wait_count,
@@ -478,6 +481,9 @@ impl BoundServer {
                             entity_take_dispatches = pressure.entity_dispatches.take,
                             entity_remove_dispatches = pressure.entity_dispatches.remove,
                             visibility_command_drops = pressure.visibility_command_drops,
+                            reliable_command_retries = pressure.reliable_command_retries,
+                            reliable_command_retries_in_flight =
+                                pressure.reliable_command_retries_in_flight,
                             furnace_viewer_sets = pressure.furnace_viewer_sets,
                             chest_viewer_sets = pressure.chest_viewer_sets,
                             world_lock_waits = lock_pressure.world_storage.wait_count,

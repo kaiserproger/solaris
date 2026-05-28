@@ -14,6 +14,8 @@ world_dir = ".analysis/test-world"
 # affects only missing chunks unless the world is regenerated. Defaults
 # to 0 when omitted.
 seed = 0
+# Optional M51 terrain study mode. Defaults to "vanilla_like" when omitted.
+# worldgen_mode = "tellus_like"
 
 [simulation]
 # Random block ticks per active chunk per game tick. Set to 0 to disable

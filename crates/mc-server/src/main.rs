@@ -102,8 +102,12 @@ async fn serve(path: &Path) -> Result<()> {
     );
     let structure_rules = mc_worldgen::StructureRules::none();
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
-    let terrain_generator =
-        build_terrain_generator(cfg.data.seed, Arc::clone(&blocks), structure_rules);
+    let terrain_generator = build_terrain_generator(
+        cfg.data.seed,
+        cfg.data.worldgen_mode.to_worldgen(),
+        Arc::clone(&blocks),
+        structure_rules,
+    );
     let items = Arc::new(mc_data::items::solaris_required_items());
     tracing::info!(entries = items.len(), "embedded item registry loaded");
     let item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
@@ -308,6 +312,7 @@ where
 
 fn build_terrain_generator(
     seed: i64,
+    worldgen_mode: mc_worldgen::WorldgenMode,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
 ) -> Arc<mc_worldgen::TerrainGenerator> {
@@ -321,6 +326,7 @@ fn build_terrain_generator(
 
     Arc::new(
         mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores)
+            .with_mode(worldgen_mode)
             .with_structures(structure_rules),
     )
 }

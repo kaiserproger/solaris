@@ -77,6 +77,28 @@ pub struct DataSection {
     /// keep their old contents (the on-disk slot wins).
     #[serde(default)]
     pub seed: i64,
+    #[serde(default)]
+    pub worldgen_mode: WorldgenMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorldgenMode {
+    #[default]
+    VanillaLike,
+    TellusLike,
+}
+
+impl WorldgenMode {
+    #[must_use]
+    pub fn to_worldgen(self) -> mc_worldgen::WorldgenMode {
+        match self {
+            Self::VanillaLike => mc_worldgen::WorldgenMode::VanillaLike,
+            Self::TellusLike => {
+                mc_worldgen::WorldgenMode::TellusLike(mc_worldgen::TellusWorldgenSettings::default())
+            }
+        }
+    }
 }
 
 /// Chunk preparation, worker, and cache policy. M13 moves chunk work out
@@ -363,6 +385,25 @@ mod tests {
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
         assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 256);
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
+        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+    }
+
+    #[test]
+    fn parses_tellus_like_worldgen_config_without_changing_defaults() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [data]
+            worldgen_mode = "tellus_like"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::TellusLike);
     }
 
     #[test]

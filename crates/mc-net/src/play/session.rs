@@ -103,10 +103,12 @@ pub(crate) struct SessionPressureSnapshot {
     pub(crate) entity_dispatches: EntityDispatchCounters,
     pub(crate) visibility_command_drops: u64,
     pub(crate) reliable_command_retries: u64,
+    pub(crate) reliable_command_retries_in_flight: u64,
 }
 
 static VISIBILITY_COMMAND_DROPS: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES: AtomicU64 = AtomicU64::new(0);
+static RELIABLE_COMMAND_RETRIES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub(super) struct ClaimedPickup {
@@ -400,6 +402,8 @@ impl SessionRegistry {
             entity_dispatches: inner.entity_dispatches,
             visibility_command_drops: VISIBILITY_COMMAND_DROPS.load(Ordering::Relaxed),
             reliable_command_retries: RELIABLE_COMMAND_RETRIES.load(Ordering::Relaxed),
+            reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_IN_FLIGHT
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -2145,6 +2149,7 @@ fn retry_reliable_command(
     command: OutboundCommand,
 ) {
     RELIABLE_COMMAND_RETRIES.fetch_add(1, Ordering::Relaxed);
+    RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         if tx.send(command).await.is_err() {
             VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -2153,6 +2158,7 @@ fn retry_reliable_command(
                 "reliable outbound retry target closed"
             );
         }
+        RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
     });
 }
 
@@ -2652,10 +2658,9 @@ mod tests {
             }),
         }]);
 
-        assert_eq!(
-            registry.pressure_snapshot().reliable_command_retries,
-            start + 1
-        );
+        let pressure = registry.pressure_snapshot();
+        assert_eq!(pressure.reliable_command_retries, start + 1);
+        assert!(pressure.reliable_command_retries_in_flight > 0);
         assert!(matches!(
             rx.recv().await,
             Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
@@ -2667,6 +2672,22 @@ mod tests {
                 ..
             }))
         ));
+        for _ in 0..8 {
+            if registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight
+                == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight,
+            0
+        );
     }
 
     #[test]
