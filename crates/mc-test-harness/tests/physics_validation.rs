@@ -886,14 +886,22 @@ async fn assert_no_self_authoritative_water_frames(
     duration: Duration,
 ) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if !saw_liveness {
+                prove_clientbound_liveness(client, "negative water-movement assertion").await;
+            }
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            if !saw_liveness {
+                prove_clientbound_liveness(client, "negative water-movement assertion").await;
+            }
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -919,14 +927,32 @@ async fn assert_no_self_authoritative_water_frames(
 
 async fn assert_no_position_correction(client: &mut Client, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if !saw_liveness {
+                let id = prove_clientbound_liveness(client, "negative correction assertion").await;
+                assert_ne!(
+                    id,
+                    SynchronizePlayerPosition::ID,
+                    "movement window should not require correction after liveness probe"
+                );
+            }
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            if !saw_liveness {
+                let id = prove_clientbound_liveness(client, "negative correction assertion").await;
+                assert_ne!(
+                    id,
+                    SynchronizePlayerPosition::ID,
+                    "movement window should not require correction after liveness probe"
+                );
+            }
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -1014,14 +1040,22 @@ async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) 
 
 async fn assert_no_health_below(client: &mut Client, health: f32, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            if !saw_liveness {
+                prove_clientbound_liveness(client, "negative health assertion").await;
+            }
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            if !saw_liveness {
+                prove_clientbound_liveness(client, "negative health assertion").await;
+            }
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -1034,6 +1068,32 @@ async fn assert_no_health_below(client: &mut Client, health: f32, duration: Dura
                 pkt.health
             );
         }
+    }
+}
+
+async fn prove_clientbound_liveness(client: &mut Client, reason: &str) -> i32 {
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "list".into(),
+        })
+        .await
+        .expect("send liveness probe command");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "{reason} timed out before liveness probe response"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("wait for liveness probe response");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        return frame.id;
     }
 }
 

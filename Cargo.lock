@@ -636,6 +636,9 @@ dependencies = [
 [[package]]
 name = "mc-extension"
 version = "0.0.1"
+dependencies = [
+ "bytes",
+]
 
 [[package]]
 name = "mc-nbt"
@@ -654,6 +657,7 @@ dependencies = [
  "flate2",
  "mc-data",
  "mc-entity",
+ "mc-extension",
  "mc-nbt",
  "mc-physics",
  "mc-protocol",

@@ -29,7 +29,8 @@ pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_sn
 pub use login::offline_uuid;
 pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
 pub use server::{
-    BoundServer, CommandPermissionConfig, ServerConfig, ShutdownHandle, WorldHandle, bind, run,
+    BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,
+    ServerConfig, ShutdownHandle, WorldHandle, bind, run,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

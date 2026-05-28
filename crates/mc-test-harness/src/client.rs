@@ -39,6 +39,48 @@ pub struct Client {
     compression: Compression,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FrameWaitLimits {
+    pub max_skipped_frames: Option<usize>,
+    pub max_skipped_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SkippedFrameStats {
+    pub frames: usize,
+    pub bytes: usize,
+}
+
+impl SkippedFrameStats {
+    fn record(&mut self, frame: &RawFrame, limits: FrameWaitLimits) -> Result<()> {
+        self.frames += 1;
+        self.bytes += frame.body.len();
+        if let Some(max) = limits.max_skipped_frames
+            && self.frames > max
+        {
+            bail!(
+                "skipped {} frames while waiting for target packet; cap is {max}",
+                self.frames
+            );
+        }
+        if let Some(max) = limits.max_skipped_bytes
+            && self.bytes > max
+        {
+            bail!(
+                "skipped {} bytes while waiting for target packet; cap is {max}",
+                self.bytes
+            );
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameWaitOutcome {
+    pub frame: RawFrame,
+    pub skipped: SkippedFrameStats,
+}
+
 impl Client {
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr)
@@ -97,14 +139,30 @@ impl Client {
         packet_id: i32,
         dur: Duration,
     ) -> Result<RawFrame> {
+        Ok(self
+            .wait_for_frame_id_with_timeout_and_limits(packet_id, dur, FrameWaitLimits::default())
+            .await?
+            .frame)
+    }
+
+    pub async fn wait_for_frame_id_with_timeout_and_limits(
+        &mut self,
+        packet_id: i32,
+        dur: Duration,
+        limits: FrameWaitLimits,
+    ) -> Result<FrameWaitOutcome> {
         if let Some(index) = self.pending.iter().position(|frame| frame.id == packet_id) {
-            return Ok(self
-                .pending
-                .remove(index)
-                .expect("position came from pending frame buffer"));
+            return Ok(FrameWaitOutcome {
+                frame: self
+                    .pending
+                    .remove(index)
+                    .expect("position came from pending frame buffer"),
+                skipped: SkippedFrameStats::default(),
+            });
         }
 
         let started = tokio::time::Instant::now();
+        let mut skipped = SkippedFrameStats::default();
         loop {
             let Some(remaining) = dur.checked_sub(started.elapsed()) else {
                 bail!(
@@ -128,8 +186,9 @@ impl Client {
                 }
             };
             if frame.id == packet_id {
-                return Ok(frame);
+                return Ok(FrameWaitOutcome { frame, skipped });
             }
+            skipped.record(&frame, limits)?;
             self.pending.push_back(frame);
         }
     }
@@ -221,5 +280,62 @@ impl Client {
                 frame.body.len()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::Bytes;
+
+    use super::*;
+
+    #[test]
+    fn skipped_frame_stats_count_frames_and_bytes() {
+        let mut stats = SkippedFrameStats::default();
+        stats
+            .record(
+                &RawFrame {
+                    id: 0x01,
+                    body: Bytes::from_static(b"abc"),
+                },
+                FrameWaitLimits::default(),
+            )
+            .expect("record skip");
+        stats
+            .record(
+                &RawFrame {
+                    id: 0x02,
+                    body: Bytes::from_static(b"de"),
+                },
+                FrameWaitLimits::default(),
+            )
+            .expect("record skip");
+
+        assert_eq!(
+            stats,
+            SkippedFrameStats {
+                frames: 2,
+                bytes: 5
+            }
+        );
+    }
+
+    #[test]
+    fn skipped_frame_stats_enforce_caps() {
+        let mut stats = SkippedFrameStats::default();
+        let err = stats
+            .record(
+                &RawFrame {
+                    id: 0x01,
+                    body: Bytes::from_static(b"abc"),
+                },
+                FrameWaitLimits {
+                    max_skipped_frames: Some(0),
+                    max_skipped_bytes: Some(2),
+                },
+            )
+            .expect_err("frame cap should reject first skip");
+
+        assert!(err.to_string().contains("skipped 1 frames"));
     }
 }

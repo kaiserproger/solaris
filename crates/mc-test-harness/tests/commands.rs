@@ -8,7 +8,12 @@ use mc_protocol::packets::play::{
     GameEvent, GameMode, LoginPlay, ServerboundChatCommand, SetCenterChunk,
     SynchronizePlayerPosition,
 };
-use mc_test_harness::client::Client;
+use mc_test_harness::client::{Client, FrameWaitLimits};
+
+const LATENCY_SENSITIVE_FRAME_WAIT_LIMITS: FrameWaitLimits = FrameWaitLimits {
+    max_skipped_frames: Some(128),
+    max_skipped_bytes: Some(128 * 1024),
+};
 
 async fn start_server() -> SocketAddr {
     let cfg = mc_net::ServerConfig {
@@ -64,10 +69,15 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
         .expect("send gamemode command");
 
     loop {
-        let frame = client
-            .wait_for_frame_id_with_timeout(GameEvent::ID, Duration::from_secs(5))
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                GameEvent::ID,
+                Duration::from_secs(5),
+                LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+            )
             .await
             .expect("gamemode event frame");
+        let frame = outcome.frame;
         let event = GameEvent::decode(&mut frame.body.clone()).expect("decode GameEvent");
         if event.event == GameEvent::EVENT_CHANGE_GAME_MODE
             && event.value == GameMode::Creative.id() as f32
@@ -75,10 +85,20 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
             break;
         }
     }
-    let frame = client
-        .wait_for_frame_id_with_timeout(ClientboundSystemChat::ID, Duration::from_secs(5))
+    let outcome = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundSystemChat::ID,
+            Duration::from_secs(5),
+            LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+        )
         .await
         .expect("command feedback frame");
+    assert!(
+        outcome.skipped.frames <= 16,
+        "command feedback skipped too many frames: {:?}",
+        outcome.skipped
+    );
+    let frame = outcome.frame;
     let feedback =
         ClientboundSystemChat::decode(&mut frame.body.clone()).expect("decode SystemChat");
     assert!(!feedback.content_nbt.is_empty());
@@ -113,9 +133,19 @@ async fn client_receives_continuing_world_time_updates() {
 }
 
 async fn next_time_update(client: &mut Client) -> ClientboundSetTime {
-    let frame = client
-        .wait_for_frame_id_with_timeout(ClientboundSetTime::ID, Duration::from_secs(5))
+    let outcome = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundSetTime::ID,
+            Duration::from_secs(5),
+            LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+        )
         .await
         .expect("world time frame");
+    assert!(
+        outcome.skipped.bytes <= 32 * 1024,
+        "time update skipped too many bytes: {:?}",
+        outcome.skipped
+    );
+    let frame = outcome.frame;
     ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime")
 }

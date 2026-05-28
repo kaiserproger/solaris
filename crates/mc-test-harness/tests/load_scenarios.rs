@@ -1,7 +1,7 @@
-//! M37 load-oriented scenarios.
+//! Load-oriented scenarios.
 //!
-//! These tests are ignored by default because they are timing/report harnesses,
-//! not deterministic correctness gates. Run with:
+//! Non-ignored tests are coarse debug-build regression gates. The ignored M37
+//! report remains diagnostic-only and can be run explicitly with:
 //!
 //! ```text
 //! cargo test -p mc-test-harness --test load_scenarios -- --ignored --nocapture
@@ -23,24 +23,62 @@ use mc_test_harness::client::Client;
 const VIEW_DISTANCE: i32 = 1;
 const LOAD_CHUNK_IO_THREADS: usize = 1;
 const LOAD_CHUNK_WORKER_THREADS: usize = 2;
+const M52_BASELINE_CLIENTS: usize = 4;
+const M52_BASELINE_SUMMONS: usize = 8;
+const M52_SLOW_READER_SUMMONS: usize = 256;
+const M52_BASELINE_ELAPSED_BUDGET: Duration = Duration::from_secs(30);
+const M52_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn multicore_chunk_load_respects_global_pipeline_budgets() {
+async fn multicore_login_chunk_stream_and_broadcast_stays_within_budgets() {
     let Some(server) = start_load_server().await else {
         return;
     };
     let addr = server.addr;
+    let started = Instant::now();
 
-    let mut clients = Vec::new();
-    for idx in 0..4 {
-        clients.push(tokio::spawn(async move {
-            let (mut client, _) = connect_to_play(addr, &format!("M48Load{idx}")).await;
+    let mut client_tasks = Vec::new();
+    for idx in 0..M52_BASELINE_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let (mut client, sync) = connect_to_play(addr, &format!("M52Load{idx}")).await;
             drain_until_chunk(&mut client, (0, 0)).await;
+            (client, sync)
         }));
     }
-    for client in clients {
-        client.await.expect("client task joins");
+
+    let mut clients = Vec::new();
+    for task in client_tasks {
+        clients.push(task.await.expect("client task joins"));
     }
+
+    let (mut actor, actor_sync) = clients.remove(0);
+    let (mut observer, _) = clients.remove(0);
+    let spawn_y = actor_sync.y.floor() as i32;
+    for idx in 0..M52_BASELINE_SUMMONS {
+        actor
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    idx % 4,
+                    spawn_y,
+                    2 + idx / 4
+                ),
+            })
+            .await
+            .expect("summon zombie for broadcast baseline");
+    }
+
+    let spawns = drain_counting(&mut observer, Duration::from_secs(5), AddEntity::ID).await;
+    assert!(
+        spawns > 0,
+        "observer should receive gameplay entity broadcasts from command path"
+    );
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= M52_BASELINE_ELAPSED_BUDGET,
+        "M52 multicore baseline exceeded debug elapsed budget: elapsed={elapsed:?} budget={M52_BASELINE_ELAPSED_BUDGET:?}"
+    );
 
     let snapshot = server.chunk_pipeline_metrics.snapshot();
     assert!(
@@ -57,6 +95,28 @@ async fn multicore_chunk_load_respects_global_pipeline_budgets() {
         "global CPU permits exceeded: {:?}",
         snapshot
     );
+
+    let pressure = mc_net::lock_pressure_snapshot();
+    assert!(
+        pressure.session_registry.max_hold_us <= M52_LOCK_MAX_HOLD_BUDGET_US,
+        "session registry lock hold exceeded coarse M52 budget: {:?}",
+        pressure.session_registry
+    );
+    assert!(
+        pressure.world_storage.max_hold_us <= M52_LOCK_MAX_HOLD_BUDGET_US,
+        "world storage lock hold exceeded coarse M52 budget: {:?}",
+        pressure.world_storage
+    );
+    eprintln!(
+        "M52 multicore clients={} summons={} observer_spawns={} elapsed_ms={} chunk_pipeline={:?} session_lock={:?} world_lock={:?}",
+        M52_BASELINE_CLIENTS,
+        M52_BASELINE_SUMMONS,
+        spawns,
+        elapsed.as_millis(),
+        snapshot,
+        pressure.session_registry,
+        pressure.world_storage,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -66,14 +126,14 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
     };
     let addr = server.addr;
 
-    let (mut paused_client, paused_sync) = connect_to_play(addr, "M50PausedReader").await;
-    drain_until_chunk(&mut paused_client, (0, 0)).await;
+    let paused_reader = PausedReaderClient::connect(addr, "M52PausedReader").await;
 
-    let (mut active_client, active_sync) = connect_to_play(addr, "M50ActiveReader").await;
+    let (mut active_client, active_sync) = connect_to_play(addr, "M52ActiveReader").await;
     drain_until_chunk(&mut active_client, (0, 0)).await;
 
+    let pressure_before = server.outbound_pressure_snapshot();
     let spawn_y = active_sync.y.floor() as i32;
-    for idx in 0..32 {
+    for idx in 0..M52_SLOW_READER_SUMMONS {
         active_client
             .write_packet(&ServerboundChatCommand {
                 command: format!(
@@ -93,16 +153,23 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
         "active client should keep receiving entity broadcasts while another reader is paused"
     );
 
+    let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
+
     let pressure = mc_net::lock_pressure_snapshot();
     eprintln!(
-        "M50 slow_reader active_spawns={} paused_start=({:.1},{:.1},{:.1}) session_lock_max_hold_us={} session_lock_wait_us={}",
+        "M52 slow_reader active_spawns={} summons={} paused_start=({:.1},{:.1},{:.1}) outbound_before={:?} outbound_after={:?} session_lock_max_hold_us={} session_lock_wait_us={}",
         spawns,
-        paused_sync.x,
-        paused_sync.y,
-        paused_sync.z,
+        M52_SLOW_READER_SUMMONS,
+        paused_reader.sync.x,
+        paused_reader.sync.y,
+        paused_reader.sync.z,
+        pressure_before,
+        pressure_after,
         pressure.session_registry.max_hold_us,
         pressure.session_registry.wait_us,
     );
+
+    paused_reader.close();
 }
 
 #[tokio::test]
@@ -242,8 +309,15 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
 struct LoadServer {
     addr: std::net::SocketAddr,
     chunk_pipeline_metrics: mc_net::ChunkPipelineResourceMetrics,
+    outbound_pressure: mc_net::OutboundPressureHandle,
     chunk_io_threads: usize,
     chunk_worker_threads: usize,
+}
+
+impl LoadServer {
+    fn outbound_pressure_snapshot(&self) -> mc_net::OutboundPressureSnapshot {
+        self.outbound_pressure.snapshot()
+    }
 }
 
 async fn start_load_server() -> Option<LoadServer> {
@@ -323,15 +397,53 @@ async fn start_load_server() -> Option<LoadServer> {
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local addr");
     let chunk_pipeline_metrics = bound.chunk_pipeline_metrics();
+    let outbound_pressure = bound.outbound_pressure_handle();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
     Some(LoadServer {
         addr,
         chunk_pipeline_metrics,
+        outbound_pressure,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
     })
+}
+
+struct PausedReaderClient {
+    client: Client,
+    sync: SynchronizePlayerPosition,
+}
+
+impl PausedReaderClient {
+    async fn connect(addr: std::net::SocketAddr, name: &str) -> Self {
+        let (client, sync) = connect_to_play(addr, name).await;
+        Self { client, sync }
+    }
+
+    fn close(self) {
+        drop(self.client);
+    }
+}
+
+async fn wait_for_outbound_pressure_increase(
+    server: &LoadServer,
+    before: mc_net::OutboundPressureSnapshot,
+) -> mc_net::OutboundPressureSnapshot {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let after = server.outbound_pressure_snapshot();
+        if after.reliable_command_retries > before.reliable_command_retries
+            || after.visibility_command_drops > before.visibility_command_drops
+        {
+            return after;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "paused reader should make outbound queue pressure observable: before={before:?} after={after:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 async fn connect_to_play(
