@@ -222,6 +222,74 @@ pub enum ServerKind {
     Vanilla,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoreAction {
+    WaitTicks { ticks: u8 },
+    MoveBy { dx_cm: i16, dz_cm: i16 },
+    Look { yaw_deg: i16, pitch_deg: i16 },
+    Reconnect,
+}
+
+impl CoreAction {
+    #[must_use]
+    pub fn summary(&self) -> String {
+        match self {
+            Self::WaitTicks { ticks } => format!("wait:{ticks}"),
+            Self::MoveBy { dx_cm, dz_cm } => format!("move:{dx_cm},{dz_cm}"),
+            Self::Look { yaw_deg, pitch_deg } => format!("look:{yaw_deg},{pitch_deg}"),
+            Self::Reconnect => "reconnect".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CoreActionGenerator {
+    state: u64,
+}
+
+impl CoreActionGenerator {
+    #[must_use]
+    pub fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+
+    #[must_use]
+    pub fn generate(seed: u64, count: usize) -> Vec<CoreAction> {
+        let mut generator = Self::new(seed);
+        (0..count).map(|_| generator.next_action()).collect()
+    }
+
+    pub fn next_action(&mut self) -> CoreAction {
+        match self.next_u32() % 4 {
+            0 => CoreAction::WaitTicks {
+                ticks: 1 + (self.next_u32() % 20) as u8,
+            },
+            1 => CoreAction::MoveBy {
+                dx_cm: (self.next_u32() % 401) as i16 - 200,
+                dz_cm: (self.next_u32() % 401) as i16 - 200,
+            },
+            2 => CoreAction::Look {
+                yaw_deg: (self.next_u32() % 360) as i16 - 180,
+                pitch_deg: (self.next_u32() % 181) as i16 - 90,
+            },
+            _ => CoreAction::Reconnect,
+        }
+    }
+
+    fn next_u32(&mut self) -> u32 {
+        self.state = self
+            .state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        (self.state >> 32) as u32
+    }
+}
+
+#[must_use]
+pub fn shrink_action_prefix(actions: &[CoreAction], failing_len: usize) -> &[CoreAction] {
+    &actions[..actions.len().min(failing_len)]
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ScenarioContext {
     pub kind: ServerKind,
@@ -397,6 +465,19 @@ mod tests {
         let message = availability.skip_message().expect("skip message");
         assert!(message.contains(".analysis/server.jar"));
         assert!(message.contains("skipping vanilla-backed parity test"));
+    }
+
+    #[test]
+    fn core_action_generator_is_seeded_and_shrinkable() {
+        let first = CoreActionGenerator::generate(0x51, 8);
+        let second = CoreActionGenerator::generate(0x51, 8);
+        let different = CoreActionGenerator::generate(0x52, 8);
+
+        assert_eq!(first, second);
+        assert_ne!(first, different);
+        assert_eq!(shrink_action_prefix(&first, 3), &first[..3]);
+        assert_eq!(shrink_action_prefix(&first, 99), &first[..]);
+        assert!(first.iter().all(|action| !action.summary().is_empty()));
     }
 
     #[test]
