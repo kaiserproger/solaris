@@ -886,14 +886,24 @@ async fn assert_no_self_authoritative_water_frames(
     duration: Duration,
 ) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            assert!(
+                saw_liveness,
+                "negative water-movement assertion saw no clientbound liveness frame"
+            );
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            assert!(
+                saw_liveness,
+                "negative water-movement assertion timed out before clientbound liveness"
+            );
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -919,14 +929,24 @@ async fn assert_no_self_authoritative_water_frames(
 
 async fn assert_no_position_correction(client: &mut Client, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            assert!(
+                saw_liveness,
+                "negative correction assertion saw no clientbound liveness frame"
+            );
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            assert!(
+                saw_liveness,
+                "negative correction assertion timed out before clientbound liveness"
+            );
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -1014,14 +1034,24 @@ async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) 
 
 async fn assert_no_health_below(client: &mut Client, health: f32, duration: Duration) {
     let deadline = tokio::time::Instant::now() + duration;
+    let mut saw_liveness = false;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
+            assert!(
+                saw_liveness,
+                "negative health assertion saw no clientbound liveness frame"
+            );
             return;
         }
         let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            assert!(
+                saw_liveness,
+                "negative health assertion timed out before clientbound liveness"
+            );
             return;
         };
+        saw_liveness = true;
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
