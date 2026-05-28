@@ -172,7 +172,7 @@ async fn solaris_spawn_smoke_scenario_produces_normalized_observations() {
 }
 
 #[tokio::test]
-async fn solaris_core_action_sequence_produces_liveness_observations() {
+async fn solaris_core_action_sequence_samples_inventory_after_actions() {
     let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
     let task = tokio::spawn(async move { bound.serve().await });
 
@@ -206,6 +206,14 @@ async fn solaris_core_action_sequence_produces_liveness_observations() {
         fact,
         ObservationFact::Note { key, value }
             if key == "post_action_liveness" && value == "clientbound_frame"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::InventoryContent {
+            container_id: 0,
+            slots: 46,
+            ..
+        }
     )));
     assert!(observations.facts().iter().any(|fact| matches!(
         fact,
@@ -256,6 +264,64 @@ async fn vanilla_and_solaris_spawn_smoke_can_be_diffed() {
         })
         .await
         .expect("Solaris scenario runs");
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_seeded_core_actions_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let scenario = CoreActionSequenceScenario::new(
+        "seeded-core-actions",
+        CoreActionGenerator::generate(0x54, 3),
+    );
+    let vanilla_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        })
+        .await
+        .expect("vanilla core action scenario runs");
+    let solaris_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        })
+        .await
+        .expect("Solaris core action scenario runs");
+
+    assert!(vanilla_observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::InventoryContent {
+            container_id: 0,
+            slots: 46,
+            ..
+        }
+    )));
+    assert!(solaris_observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::InventoryContent {
+            container_id: 0,
+            slots: 46,
+            ..
+        }
+    )));
 
     let diff = diff_observations(&vanilla_observations, &solaris_observations);
     assert!(diff.is_empty(), "{diff}");

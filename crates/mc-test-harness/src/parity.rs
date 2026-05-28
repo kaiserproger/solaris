@@ -19,7 +19,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundKeepAlive, ConfirmTeleportation, GameEvent, LoginPlay,
+    ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
+    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay,
     MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerRot,
     ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, SetCenterChunk,
     SynchronizePlayerPosition,
@@ -124,6 +125,13 @@ pub enum ObservationFact {
         y: i32,
         z: i32,
         state_id: u32,
+    },
+    InventoryContent {
+        container_id: i32,
+        state_id: i32,
+        slots: u16,
+        non_empty_slots: u16,
+        carried_count: i32,
     },
     Health {
         half_hearts_milli: i32,
@@ -404,16 +412,79 @@ async fn observe_post_action_liveness(
     client: &mut Client,
     observations: &mut ObservationSet,
 ) -> Result<()> {
-    let frame = client
-        .read_frame_with_timeout(Duration::from_secs(5))
-        .await
-        .context("wait for post-action server liveness frame")?;
-    if frame.id == ClientboundKeepAlive::ID {
-        let mut body = frame.body.clone();
-        let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-        client
-            .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-            .await?;
+    let mut saw_frame = false;
+    let mut saw_inventory = false;
+    for index in 0..64 {
+        let timeout = if index == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(250)
+        };
+        let frame = match client.read_frame_with_timeout(timeout).await {
+            Ok(frame) => frame,
+            Err(_err) if saw_inventory => break,
+            Err(err) if saw_frame => {
+                return Err(err).context("post-action frame drain ended before inventory snapshot");
+            }
+            Err(err) => return Err(err).context("wait for post-action server liveness frame"),
+        };
+        saw_frame = true;
+
+        match frame.id {
+            id if id == ClientboundKeepAlive::ID => {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                client
+                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                    .await?;
+            }
+            id if id == ClientboundSetHeldSlot::ID => {
+                let mut body = frame.body.clone();
+                let held = ClientboundSetHeldSlot::decode(&mut body)?;
+                observations.push(ObservationFact::Note {
+                    key: "post_action_held_slot".into(),
+                    value: held.slot.to_string(),
+                });
+            }
+            id if id == ClientboundContainerSetContent::ID => {
+                let mut body = frame.body.clone();
+                let inventory = ClientboundContainerSetContent::decode(&mut body)?;
+                let slots = u16::try_from(inventory.items.len())
+                    .context("inventory slot count exceeds observation range")?;
+                let non_empty_slots = u16::try_from(
+                    inventory
+                        .items
+                        .iter()
+                        .filter(|item| !item.is_empty())
+                        .count(),
+                )
+                .context("non-empty inventory slot count exceeds observation range")?;
+                observations.push(ObservationFact::InventoryContent {
+                    container_id: inventory.container_id,
+                    state_id: inventory.state_id,
+                    slots,
+                    non_empty_slots,
+                    carried_count: inventory.carried_item.count,
+                });
+                saw_inventory = true;
+            }
+            id if id == ClientboundSetHealth::ID => {
+                let mut body = frame.body.clone();
+                let health = ClientboundSetHealth::decode(&mut body)?;
+                observations.push(ObservationFact::Health {
+                    half_hearts_milli: (health.health * 1000.0).round() as i32,
+                    food: health.food,
+                });
+            }
+            _ => {}
+        }
+
+        if saw_inventory {
+            break;
+        }
+    }
+    if !saw_inventory {
+        bail!("post-action inventory snapshot was not observed");
     }
     observations.push(ObservationFact::Note {
         key: "post_action_liveness".into(),
