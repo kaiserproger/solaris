@@ -1093,6 +1093,32 @@ impl TerrainGenerator {
         raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
     }
 
+    fn tellus_land_mask(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        settings: TellusWorldgenSettings,
+    ) -> f64 {
+        let projection = MercatorProjection::from_settings(settings);
+        let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
+        let continent = fbm_2d(
+            world_x as f64 / 15_000.0,
+            world_z as f64 / 15_000.0,
+            self.seed ^ 0x5445_4C4C_5553,
+            5,
+            0.55,
+        );
+        let coast = fbm_2d(
+            world_x as f64 / 3_000.0,
+            world_z as f64 / 3_000.0,
+            self.seed ^ 0x434F_4153_5453,
+            3,
+            0.5,
+        );
+        continent + coast * 0.22 + (equator_weight - 0.5) * 0.08
+    }
+
     #[must_use]
     pub fn tellus_climate(&self, world_x: i32, height: i32, world_z: i32) -> TellusClimate {
         let settings = match self.worldgen_mode {
@@ -1144,6 +1170,15 @@ impl TerrainGenerator {
     }
 
     fn biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
+        match self.worldgen_mode {
+            WorldgenMode::VanillaLike => self.vanilla_biome_for(world_x, world_z, height),
+            WorldgenMode::TellusLike(settings) => {
+                self.tellus_biome_for(world_x, world_z, height, settings)
+            }
+        }
+    }
+
+    fn vanilla_biome_for(&self, world_x: i32, world_z: i32, height: i32) -> Identifier {
         let continental = self.continentalness(world_x, world_z);
         let temperature = self.temperature(world_x, world_z);
         let moisture = self.moisture(world_x, world_z);
@@ -1209,6 +1244,80 @@ impl TerrainGenerator {
         }
     }
 
+    fn tellus_biome_for(
+        &self,
+        world_x: i32,
+        world_z: i32,
+        height: i32,
+        settings: TellusWorldgenSettings,
+    ) -> Identifier {
+        let sea_level = settings.sea_level;
+        let land_mask = self.tellus_land_mask(world_x, world_z, settings);
+        let climate = self.tellus_climate(world_x, height, world_z);
+        let ridges = self.ridges(world_x / 4, world_z / 4);
+        let river = self.river_signal(world_x / 2, world_z / 2);
+
+        if settings.water_enabled {
+            if height < sea_level - 18 {
+                return self
+                    .biomes
+                    .pick(&self.biomes.deep_ocean, world_x, world_z, 0x5444_4545);
+            }
+            if height < sea_level - 1 {
+                return self
+                    .biomes
+                    .pick(&self.biomes.ocean, world_x, world_z, 0x544F_434E);
+            }
+        }
+        if land_mask.abs() < 0.08 || height <= sea_level + BEACH_HEIGHT_ABOVE_SEA {
+            return self
+                .biomes
+                .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
+        }
+        if settings.water_enabled && river.abs() < 0.035 && land_mask > -0.02 {
+            return self
+                .biomes
+                .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
+        }
+        if height > sea_level + 58 || ridges > 0.58 {
+            return self
+                .biomes
+                .pick(&self.biomes.mountain, world_x, world_z, 0x544D_4F55);
+        }
+        if height < 18 {
+            return self
+                .biomes
+                .pick(&self.biomes.cave, world_x, world_z, 0x5443_4156);
+        }
+        if climate.moisture > 0.62 && height <= sea_level + 8 {
+            return self
+                .biomes
+                .pick(&self.biomes.swamp, world_x, world_z, 0x5453_5741);
+        }
+        if climate.temperature < -0.25 {
+            return self
+                .biomes
+                .pick(&self.biomes.cold, world_x, world_z, 0x5443_4F4C);
+        }
+        if climate.temperature > 0.38 && climate.moisture < -0.08 {
+            return self
+                .biomes
+                .pick(&self.biomes.hot_dry, world_x, world_z, 0x5448_4F54);
+        }
+        if climate.temperature > 0.22 && climate.moisture > 0.2 {
+            return self
+                .biomes
+                .pick(&self.biomes.jungle, world_x, world_z, 0x544A_554E);
+        }
+        if climate.moisture > 0.04 {
+            self.biomes
+                .pick(&self.biomes.temperate_forest, world_x, world_z, 0x5446_4F52)
+        } else {
+            self.biomes
+                .pick(&self.biomes.grassland, world_x, world_z, 0x5447_5241)
+        }
+    }
+
     fn biome_for_cell(
         &self,
         world_x: i32,
@@ -1271,8 +1380,12 @@ impl TerrainGenerator {
         let height = self.surface_height(wx, wz);
         let biome = self.biome_for(wx, wz, height);
         let (surface, fill) = self.surface_materials(&biome);
-        let top_non_air = if height < SEA_LEVEL || self.biomes.is_river(&biome) {
-            SEA_LEVEL
+        let (sea_level, water_enabled) = match self.worldgen_mode {
+            WorldgenMode::VanillaLike => (SEA_LEVEL, true),
+            WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
+        };
+        let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
+            sea_level
         } else {
             height
         };
@@ -2404,6 +2517,104 @@ mod tests {
         assert!(equator.temperature > arctic.temperature);
         assert!(equator.temperature > summit.temperature);
         assert!(equator.latitude_degrees.abs() < arctic.latitude_degrees.abs());
+    }
+
+    #[test]
+    fn tellus_like_biomes_use_projected_climate_bands() {
+        let settings = TellusWorldgenSettings::default();
+        let projection = MercatorProjection::from_settings(settings);
+        let g = TerrainGenerator::with_worldgen_mode(
+            77,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        );
+        let sea = settings.sea_level;
+        let equator_biome = g.biome_for(0, 0, sea + 24);
+        let (_, arctic_z) = projection.lat_lon_to_block(78.0, 0.0);
+        let arctic_z = arctic_z.round() as i32;
+        let arctic_biome = (-4096..=4096)
+            .step_by(256)
+            .map(|x| g.biome_for(x, arctic_z, sea + 24))
+            .find(|biome| g.biomes.cold.contains(biome))
+            .expect("high-latitude Tellus sample should include a cold climate biome");
+
+        assert!(
+            !g.biomes.cold.contains(&equator_biome),
+            "equatorial Tellus biome should not be cold: {equator_biome}"
+        );
+        assert!(
+            g.biomes.cold.contains(&arctic_biome),
+            "high-latitude Tellus biome should use cold climate band: {arctic_biome}"
+        );
+    }
+
+    #[test]
+    fn tellus_like_water_uses_configured_sea_level() {
+        let settings = TellusWorldgenSettings {
+            sea_level: 120,
+            ..TellusWorldgenSettings::default()
+        };
+        let g = TerrainGenerator::with_worldgen_mode(
+            91,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        );
+        let (wx, wz, height) = (-60_000..=60_000)
+            .step_by(2_000)
+            .flat_map(|x| (-60_000..=60_000).step_by(2_000).map(move |z| (x, z)))
+            .map(|(x, z)| (x, z, g.surface_height(x, z)))
+            .find(|(_, _, height)| *height < settings.sea_level)
+            .expect("Tellus sample should include below-sea terrain");
+        let chunk = g.generate(ChunkPos {
+            x: wx.div_euclid(16),
+            z: wz.div_euclid(16),
+        });
+        let lx = wx.rem_euclid(16) as u8;
+        let lz = wz.rem_euclid(16) as u8;
+
+        assert!(height < settings.sea_level);
+        assert_eq!(
+            chunk.get_block(lx, settings.sea_level, lz),
+            Some(BlockStateId(5))
+        );
+        assert_eq!(
+            chunk.get_block(lx, settings.sea_level + 1, lz),
+            Some(BlockStateId(0))
+        );
+    }
+
+    #[test]
+    fn tellus_like_can_disable_water_fill_without_changing_vanilla_default() {
+        let settings = TellusWorldgenSettings {
+            water_enabled: false,
+            sea_level: 120,
+            ..TellusWorldgenSettings::default()
+        };
+        let g = TerrainGenerator::with_worldgen_mode(
+            91,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        );
+        let (wx, wz, height) = (-60_000..=60_000)
+            .step_by(2_000)
+            .flat_map(|x| (-60_000..=60_000).step_by(2_000).map(move |z| (x, z)))
+            .map(|(x, z)| (x, z, g.surface_height(x, z)))
+            .find(|(_, _, height)| *height < settings.sea_level)
+            .expect("Tellus sample should include below-sea terrain");
+        let chunk = g.generate(ChunkPos {
+            x: wx.div_euclid(16),
+            z: wz.div_euclid(16),
+        });
+        let lx = wx.rem_euclid(16) as u8;
+        let lz = wz.rem_euclid(16) as u8;
+        let biome = g.biome_for(wx, wz, height);
+
+        assert!(!g.biomes.is_surface_water(&biome));
+        assert_eq!(chunk.get_block(lx, height + 1, lz), Some(BlockStateId(0)));
+        assert_eq!(
+            chunk.get_block(lx, settings.sea_level, lz),
+            Some(BlockStateId(0))
+        );
     }
 
     #[test]
