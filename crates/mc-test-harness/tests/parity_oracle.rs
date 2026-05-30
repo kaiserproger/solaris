@@ -2,11 +2,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ConfirmTeleportation, GameEvent, LoginPlay, SetCenterChunk,
-    SynchronizePlayerPosition,
+    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
+    ClientboundKeepAlive, ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation,
+    EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
+    ServerboundSetCarriedItem, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
@@ -322,6 +325,710 @@ async fn vanilla_and_solaris_seeded_core_actions_can_be_diffed() {
             ..
         }
     )));
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// M53.b scenario 1: container held-slot lifecycle
+// ---------------------------------------------------------------------------
+
+struct ContainerHeldSlotScenario;
+
+impl ParityScenario for ContainerHeldSlotScenario {
+    fn name(&self) -> &'static str {
+        "container-held-slot"
+    }
+
+    fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
+        Box::pin(async move { observe_container_held_slot(ctx).await })
+    }
+}
+
+async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<ObservationSet> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    };
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, subject).await?;
+    client.drive_configuration().await?;
+
+    let mut observations = ObservationSet::new(subject, "container-held-slot");
+    let _: LoginPlay = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundCommands = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundCommands::ID,
+    });
+    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    });
+    observations.push(ObservationFact::SpawnPosition {
+        x: sync.x.floor() as i64,
+        y: sync.y.floor() as i64,
+        z: sync.z.floor() as i64,
+    });
+    let _: GameEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
+    let _: SetCenterChunk = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetCenterChunk::ID,
+    });
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await?;
+    client.write_packet(&ServerboundPlayerLoaded).await?;
+
+    // Drain initial frames to capture held slot and inventory snapshot.
+    let mut saw_held_slot = false;
+    let mut saw_inventory = false;
+    for index in 0..64 {
+        let timeout = if index == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(250)
+        };
+        let frame = match client.read_frame_with_timeout(timeout).await {
+            Ok(frame) => frame,
+            Err(_err) if saw_inventory => break,
+            Err(_err) if saw_held_slot => {
+                continue;
+            }
+            Err(err) => return Err(err).context("wait for post-login frames"),
+        };
+
+        match frame.id {
+            id if id == ClientboundSetHeldSlot::ID => {
+                let mut body = frame.body.clone();
+                let held = ClientboundSetHeldSlot::decode(&mut body)?;
+                observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+                saw_held_slot = true;
+            }
+            id if id == ClientboundContainerSetContent::ID => {
+                let mut body = frame.body.clone();
+                let inventory = ClientboundContainerSetContent::decode(&mut body)?;
+                let slots = u16::try_from(inventory.items.len())
+                    .context("inventory slot count exceeds observation range")?;
+                let non_empty_slots = u16::try_from(
+                    inventory
+                        .items
+                        .iter()
+                        .filter(|item| !item.is_empty())
+                        .count(),
+                )
+                .context("non-empty inventory slot count exceeds observation range")?;
+                observations.push(ObservationFact::InventoryContent {
+                    container_id: inventory.container_id,
+                    state_id: inventory.state_id,
+                    slots,
+                    non_empty_slots,
+                    carried_count: inventory.carried_item.count,
+                });
+                saw_inventory = true;
+            }
+            id if id == ClientboundSetHealth::ID => {
+                let mut body = frame.body.clone();
+                let health = ClientboundSetHealth::decode(&mut body)?;
+                observations.push(ObservationFact::Health {
+                    half_hearts_milli: (health.health * 1000.0).round() as i32,
+                    food: health.food,
+                });
+            }
+            id if id == ClientboundKeepAlive::ID => {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                client
+                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                    .await?;
+            }
+            _ => {}
+        }
+        if saw_inventory {
+            break;
+        }
+    }
+
+    observations.push(ObservationFact::Note {
+        key: "initial_held_slot_observed".into(),
+        value: saw_held_slot.to_string(),
+    });
+    observations.push(ObservationFact::Note {
+        key: "initial_inventory_observed".into(),
+        value: saw_inventory.to_string(),
+    });
+
+    // Send a held-slot change to slot 1.
+    client
+        .write_packet(&ServerboundSetCarriedItem { slot: 1 })
+        .await?;
+    observations.push(ObservationFact::Note {
+        key: "set_carried_item.1".into(),
+        value: "sent".into(),
+    });
+
+    // Observe the server's echoed held-slot change.
+    let mut saw_echo = false;
+    for _ in 0..32 {
+        let frame = match client
+            .read_frame_with_timeout(Duration::from_millis(250))
+            .await
+        {
+            Ok(frame) => frame,
+            Err(_) => break,
+        };
+        if frame.id == ClientboundSetHeldSlot::ID {
+            let mut body = frame.body.clone();
+            let held = ClientboundSetHeldSlot::decode(&mut body)?;
+            observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+            saw_echo = true;
+            break;
+        }
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body.clone();
+            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        }
+    }
+
+    observations.push(ObservationFact::Note {
+        key: "held_slot_echo_observed".into(),
+        value: saw_echo.to_string(),
+    });
+
+    // Send one more held-slot change back to slot 0.
+    client
+        .write_packet(&ServerboundSetCarriedItem { slot: 0 })
+        .await?;
+    observations.push(ObservationFact::Note {
+        key: "set_carried_item.0".into(),
+        value: "sent".into(),
+    });
+
+    // Observe the second echo.
+    let mut saw_second_echo = false;
+    for _ in 0..32 {
+        let frame = match client
+            .read_frame_with_timeout(Duration::from_millis(250))
+            .await
+        {
+            Ok(frame) => frame,
+            Err(_) => break,
+        };
+        if frame.id == ClientboundSetHeldSlot::ID {
+            let mut body = frame.body.clone();
+            let held = ClientboundSetHeldSlot::decode(&mut body)?;
+            observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+            saw_second_echo = true;
+            break;
+        }
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body.clone();
+            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        }
+    }
+
+    observations.push(ObservationFact::Note {
+        key: "second_held_slot_echo_observed".into(),
+        value: saw_second_echo.to_string(),
+    });
+
+    Ok(observations.normalized())
+}
+
+#[tokio::test]
+async fn solaris_container_held_slot_produces_observations() {
+    let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
+    let task = tokio::spawn(async move { bound.serve().await });
+
+    let scenario = ContainerHeldSlotScenario;
+    let observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr,
+        })
+        .await
+        .expect("scenario runs");
+
+    assert_eq!(scenario.name(), "container-held-slot");
+    assert!(observations.facts().contains(&ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    }));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "initial_held_slot_observed"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "initial_inventory_observed"
+    )));
+    assert!(
+        observations
+            .facts()
+            .iter()
+            .any(|fact| matches!(fact, ObservationFact::HeldSlotChanged { .. }))
+    );
+
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_container_held_slot_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let scenario = ContainerHeldSlotScenario;
+    let vanilla_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        })
+        .await
+        .expect("vanilla scenario runs");
+    let solaris_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        })
+        .await
+        .expect("Solaris scenario runs");
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// M53.b scenario 2: entity lifecycle (spawn observation)
+// ---------------------------------------------------------------------------
+
+struct EntityLifecycleScenario;
+
+impl ParityScenario for EntityLifecycleScenario {
+    fn name(&self) -> &'static str {
+        "entity-lifecycle"
+    }
+
+    fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
+        Box::pin(async move { observe_entity_lifecycle(ctx).await })
+    }
+}
+
+async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    };
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, subject).await?;
+    client.drive_configuration().await?;
+
+    let mut observations = ObservationSet::new(subject, "entity-lifecycle");
+    let _: LoginPlay = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundCommands = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundCommands::ID,
+    });
+    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    });
+    observations.push(ObservationFact::SpawnPosition {
+        x: sync.x.floor() as i64,
+        y: sync.y.floor() as i64,
+        z: sync.z.floor() as i64,
+    });
+    let _: GameEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
+    let _: SetCenterChunk = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetCenterChunk::ID,
+    });
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await?;
+    client.write_packet(&ServerboundPlayerLoaded).await?;
+
+    // Drain frames for ~2.4 seconds collecting entity spawn/removal/event facts.
+    let flags = MovePlayerFlags::new(false, false);
+    let mut entity_count = 0u32;
+    for _cycle in 0..8 {
+        client
+            .write_packet(&ServerboundMovePlayerStatusOnly { flags })
+            .await?;
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline - tokio::time::Instant::now();
+            let frame = match client.read_frame_with_timeout(remaining).await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            match frame.id {
+                id if id == ClientboundKeepAlive::ID => {
+                    let mut body = frame.body.clone();
+                    let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                    client
+                        .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                        .await?;
+                }
+                id if id == AddEntity::ID => {
+                    let mut body = frame.body.clone();
+                    let add = AddEntity::decode(&mut body)?;
+                    observations.push(ObservationFact::EntitySpawned {
+                        entity_id: add.entity_id,
+                        entity_type_id: add.entity_type_id,
+                        x: add.x.floor() as i64,
+                        y: add.y.floor() as i64,
+                        z: add.z.floor() as i64,
+                    });
+                    entity_count += 1;
+                }
+                id if id == RemoveEntities::ID => {
+                    let mut body = frame.body.clone();
+                    let removed = RemoveEntities::decode(&mut body)?;
+                    for eid in removed.entity_ids {
+                        observations.push(ObservationFact::EntityRemoved { entity_id: eid });
+                    }
+                }
+                id if id == EntityEvent::ID => {
+                    let mut body = frame.body.clone();
+                    let event = EntityEvent::decode(&mut body)?;
+                    observations.push(ObservationFact::ProjectileEvent {
+                        entity_id: event.entity_id,
+                        event_id: event.event_id,
+                    });
+                }
+                id if id == ClientboundSetHealth::ID => {
+                    let mut body = frame.body.clone();
+                    let health = ClientboundSetHealth::decode(&mut body)?;
+                    observations.push(ObservationFact::Health {
+                        half_hearts_milli: (health.health * 1000.0).round() as i32,
+                        food: health.food,
+                    });
+                }
+                id if id == ClientboundContainerSetContent::ID => {
+                    let mut body = frame.body.clone();
+                    let inventory = ClientboundContainerSetContent::decode(&mut body)?;
+                    let slots = u16::try_from(inventory.items.len())
+                        .context("inventory slot count exceeds observation range")?;
+                    let non_empty_slots = u16::try_from(
+                        inventory
+                            .items
+                            .iter()
+                            .filter(|item| !item.is_empty())
+                            .count(),
+                    )
+                    .context("non-empty inventory slot count exceeds observation range")?;
+                    observations.push(ObservationFact::InventoryContent {
+                        container_id: inventory.container_id,
+                        state_id: inventory.state_id,
+                        slots,
+                        non_empty_slots,
+                        carried_count: inventory.carried_item.count,
+                    });
+                }
+                id if id == ClientboundContainerSetSlot::ID => {
+                    let mut body = frame.body.clone();
+                    let slot = ClientboundContainerSetSlot::decode(&mut body)?;
+                    observations.push(ObservationFact::ContainerSlotContent {
+                        container_id: slot.container_id,
+                        state_id: slot.state_id,
+                        slot: slot.slot,
+                        item_id: slot.item_stack.item_id,
+                        count: slot.item_stack.count,
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: sync.x,
+                y: sync.y,
+                z: sync.z,
+                flags,
+            })
+            .await?;
+    }
+
+    observations.push(ObservationFact::Note {
+        key: "entities_observed".into(),
+        value: entity_count.to_string(),
+    });
+    observations.push(ObservationFact::Note {
+        key: "post_action_liveness".into(),
+        value: "clientbound_frame".into(),
+    });
+
+    Ok(observations.normalized())
+}
+
+#[tokio::test]
+async fn solaris_entity_lifecycle_produces_observations() {
+    let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
+    let task = tokio::spawn(async move { bound.serve().await });
+
+    let scenario = EntityLifecycleScenario;
+    let observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr,
+        })
+        .await
+        .expect("scenario runs");
+
+    assert_eq!(scenario.name(), "entity-lifecycle");
+    assert!(observations.facts().contains(&ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    }));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "entities_observed"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "post_action_liveness" && value == "clientbound_frame"
+    )));
+
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_entity_lifecycle_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let scenario = EntityLifecycleScenario;
+    let vanilla_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        })
+        .await
+        .expect("vanilla scenario runs");
+    let solaris_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        })
+        .await
+        .expect("Solaris scenario runs");
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+// ---------------------------------------------------------------------------
+// M53.b scenario 3: timed action liveness
+// ---------------------------------------------------------------------------
+
+struct TimedActionScenario;
+
+impl ParityScenario for TimedActionScenario {
+    fn name(&self) -> &'static str {
+        "timed-action"
+    }
+
+    fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
+        Box::pin(async move { observe_timed_action(ctx).await })
+    }
+}
+
+async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    };
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, subject).await?;
+    client.drive_configuration().await?;
+
+    let mut observations = ObservationSet::new(subject, "timed-action");
+    let _: LoginPlay = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundCommands = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundCommands::ID,
+    });
+    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    });
+    observations.push(ObservationFact::SpawnPosition {
+        x: sync.x.floor() as i64,
+        y: sync.y.floor() as i64,
+        z: sync.z.floor() as i64,
+    });
+    let _: GameEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
+    let _: SetCenterChunk = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetCenterChunk::ID,
+    });
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await?;
+    client.write_packet(&ServerboundPlayerLoaded).await?;
+
+    let flags = MovePlayerFlags::new(false, false);
+    let mut keepalive_count = 0u32;
+    let cycles = 6u32;
+
+    for _ in 0..cycles {
+        client
+            .write_packet(&ServerboundMovePlayerStatusOnly { flags })
+            .await?;
+
+        let end = tokio::time::Instant::now() + Duration::from_millis(500);
+        while tokio::time::Instant::now() < end {
+            let remaining = end - tokio::time::Instant::now();
+            if remaining.is_zero() {
+                break;
+            }
+            let frame = match client.read_frame_with_timeout(remaining).await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            };
+            if frame.id == ClientboundKeepAlive::ID {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                client
+                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                    .await?;
+                keepalive_count += 1;
+            }
+        }
+
+        client
+            .write_packet(&ServerboundMovePlayerPos {
+                x: sync.x,
+                y: sync.y,
+                z: sync.z,
+                flags,
+            })
+            .await?;
+    }
+
+    observations.push(ObservationFact::Note {
+        key: "keepalive_round_trips".into(),
+        value: keepalive_count.to_string(),
+    });
+    observations.push(ObservationFact::Note {
+        key: "cycles_executed".into(),
+        value: cycles.to_string(),
+    });
+    observations.push(ObservationFact::Note {
+        key: "post_action_liveness".into(),
+        value: "clientbound_frame".into(),
+    });
+
+    Ok(observations.normalized())
+}
+
+#[tokio::test]
+async fn solaris_timed_action_produces_liveness_observations() {
+    let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
+    let task = tokio::spawn(async move { bound.serve().await });
+
+    let scenario = TimedActionScenario;
+    let observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr,
+        })
+        .await
+        .expect("scenario runs");
+
+    assert_eq!(scenario.name(), "timed-action");
+    assert!(observations.facts().contains(&ObservationFact::PacketSeen {
+        id: SynchronizePlayerPosition::ID,
+    }));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "keepalive_round_trips"
+    )));
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value } if key == "cycles_executed"
+    )));
+
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_timed_action_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let scenario = TimedActionScenario;
+    let vanilla_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        })
+        .await
+        .expect("vanilla scenario runs");
+    let solaris_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        })
+        .await
+        .expect("Solaris scenario runs");
 
     let diff = diff_observations(&vanilla_observations, &solaris_observations);
     assert!(diff.is_empty(), "{diff}");
