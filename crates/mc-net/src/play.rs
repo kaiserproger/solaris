@@ -149,12 +149,12 @@ use spawn::{chunk_pos_from_coords, spawn_dimension, spawn_position};
 #[cfg(test)]
 use spawn::{pack_block_pos, spawn_y_from_chunk};
 use survival::{
-    PendingBreak, PendingUse, SurvivalState, block_drop_stack, damage_held_tool_after_mining,
-    damage_held_weapon_after_attack, entity_item_stack, falling_block_entity_type_id,
-    held_attack_damage, held_food_use, held_item_id, is_hostile_entity, item_entity_type_id,
-    max_tool_damage_for_path, mining_time_for_target, mob_drop_stack, mob_xp_value,
-    pending_break_is_complete, pending_break_matches, pending_use_is_complete, pending_use_matches,
-    xp_orb_entity_type_id,
+    PendingBreak, PendingUse, SurvivalState, UseKind, block_drop_stack,
+    damage_held_tool_after_mining, damage_held_weapon_after_attack, entity_item_stack,
+    falling_block_entity_type_id, held_attack_damage, held_food_use, held_item_id,
+    is_hostile_entity, item_entity_type_id, max_tool_damage_for_path, mining_time_for_target,
+    mob_drop_stack, mob_xp_value, pending_break_is_complete, pending_break_matches,
+    pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{
@@ -247,6 +247,8 @@ const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
+#[allow(dead_code)]
+const ARROW_PICKUP_DELAY_TICKS: u64 = 4;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
 const DEFAULT_FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
@@ -5961,7 +5963,7 @@ where
         required_time,
         held_hotbar_slot: state.selected_hotbar_slot,
         held_item_id,
-        rule,
+        kind: UseKind::Food(rule),
     });
     write_block_ack(writer, state.compression, action.sequence).await
 }
@@ -5982,7 +5984,10 @@ where
         return Ok(());
     }
 
-    survival_state.add_food(pending.rule.food, pending.rule.saturation);
+    let UseKind::Food(food_rule) = &pending.kind else {
+        return Ok(());
+    };
+    survival_state.add_food(food_rule.food, food_rule.saturation);
     let held_slot = state.selected_hotbar_slot;
     {
         let held = state.inventory.held_mut(held_slot);

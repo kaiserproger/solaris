@@ -302,6 +302,13 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             EntityAttributeFacts::default(),
             None,
         ),
+        "minecraft:arrow" | "minecraft:spectral_arrow" | "minecraft:tipped_arrow" => (
+            EntityCategory::Other,
+            EntityDimensions::new(0.5, 0.5, None),
+            Some(4),
+            EntityAttributeFacts::default(),
+            None,
+        ),
         _ => (
             EntityCategory::Other,
             EntityDimensions::new(0.9, 1.4, Some(1.3)),
