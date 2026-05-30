@@ -19,9 +19,10 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay,
-    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerRot,
+    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
+    ClientboundKeepAlive, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundTakeItemEntity,
+    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerRot,
     ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, SetCenterChunk,
     SynchronizePlayerPosition,
 };
@@ -136,6 +137,41 @@ pub enum ObservationFact {
     Health {
         half_hearts_milli: i32,
         food: i32,
+    },
+    /// A single container slot's observed content (from ClientboundContainerSetSlot).
+    ContainerSlotContent {
+        container_id: i32,
+        state_id: i32,
+        slot: i16,
+        item_id: u32,
+        count: i32,
+    },
+    /// An entity was added to the world (AddEntity).
+    EntitySpawned {
+        entity_id: i32,
+        entity_type_id: i32,
+        x: i64,
+        y: i64,
+        z: i64,
+    },
+    /// An entity was removed from the world (RemoveEntities); one fact per removed entity.
+    EntityRemoved {
+        entity_id: i32,
+    },
+    /// A projectile lifecycle event (EntityEvent), e.g. arrow critical hit, snowball land.
+    ProjectileEvent {
+        entity_id: i32,
+        event_id: i8,
+    },
+    /// An item-entity drop or pickup (ClientboundTakeItemEntity).
+    DropEvent {
+        item_entity_id: i32,
+        player_entity_id: Option<i32>,
+        amount: i32,
+    },
+    /// Server instructed the client to select a hotbar slot (ClientboundSetHeldSlot).
+    HeldSlotChanged {
+        slot: i32,
     },
     Note {
         key: String,
@@ -441,10 +477,7 @@ async fn observe_post_action_liveness(
             id if id == ClientboundSetHeldSlot::ID => {
                 let mut body = frame.body.clone();
                 let held = ClientboundSetHeldSlot::decode(&mut body)?;
-                observations.push(ObservationFact::Note {
-                    key: "post_action_held_slot".into(),
-                    value: held.slot.to_string(),
-                });
+                observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
             }
             id if id == ClientboundContainerSetContent::ID => {
                 let mut body = frame.body.clone();
@@ -474,6 +507,52 @@ async fn observe_post_action_liveness(
                 observations.push(ObservationFact::Health {
                     half_hearts_milli: (health.health * 1000.0).round() as i32,
                     food: health.food,
+                });
+            }
+            id if id == AddEntity::ID => {
+                let mut body = frame.body.clone();
+                let add = AddEntity::decode(&mut body)?;
+                observations.push(ObservationFact::EntitySpawned {
+                    entity_id: add.entity_id,
+                    entity_type_id: add.entity_type_id,
+                    x: add.x.floor() as i64,
+                    y: add.y.floor() as i64,
+                    z: add.z.floor() as i64,
+                });
+            }
+            id if id == RemoveEntities::ID => {
+                let mut body = frame.body.clone();
+                let removed = RemoveEntities::decode(&mut body)?;
+                for eid in removed.entity_ids {
+                    observations.push(ObservationFact::EntityRemoved { entity_id: eid });
+                }
+            }
+            id if id == EntityEvent::ID => {
+                let mut body = frame.body.clone();
+                let event = EntityEvent::decode(&mut body)?;
+                observations.push(ObservationFact::ProjectileEvent {
+                    entity_id: event.entity_id,
+                    event_id: event.event_id,
+                });
+            }
+            id if id == ClientboundContainerSetSlot::ID => {
+                let mut body = frame.body.clone();
+                let slot = ClientboundContainerSetSlot::decode(&mut body)?;
+                observations.push(ObservationFact::ContainerSlotContent {
+                    container_id: slot.container_id,
+                    state_id: slot.state_id,
+                    slot: slot.slot,
+                    item_id: slot.item_stack.item_id,
+                    count: slot.item_stack.count,
+                });
+            }
+            id if id == ClientboundTakeItemEntity::ID => {
+                let mut body = frame.body.clone();
+                let take = ClientboundTakeItemEntity::decode(&mut body)?;
+                observations.push(ObservationFact::DropEvent {
+                    item_entity_id: take.item_entity_id,
+                    player_entity_id: Some(take.player_entity_id),
+                    amount: take.amount,
                 });
             }
             _ => {}
