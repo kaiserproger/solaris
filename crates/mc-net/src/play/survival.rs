@@ -84,12 +84,19 @@ pub(super) struct PendingBreak {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(super) enum UseKind {
+    Food(mc_data::food::FoodEntry),
+    #[allow(dead_code)]
+    Bow,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub(super) struct PendingUse {
     pub(super) started_at: Instant,
     pub(super) required_time: Duration,
     pub(super) held_hotbar_slot: u8,
     pub(super) held_item_id: u32,
-    pub(super) rule: mc_data::food::FoodEntry,
+    pub(super) kind: UseKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,6 +264,14 @@ pub(super) fn falling_block_entity_type_id(entity_types: &EntityTypeRegistry) ->
         .and_then(|id| i32::try_from(id).ok())
 }
 
+#[allow(dead_code)]
+pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
+    let arrow = mc_data::Identifier::parse("minecraft:arrow").expect("static identifier");
+    entity_types
+        .id_of(&arrow)
+        .and_then(|id| i32::try_from(id).ok())
+}
+
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
     mc_data::Identifier::parse(entity_type.to_string())
         .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))
@@ -327,6 +342,66 @@ pub(super) fn held_food_use(
         .name_of(held.item_id)
         .and_then(|item| food_rule_for_item(&state.item_facts, item))?;
     Some((held.item_id, rule, duration))
+}
+
+#[allow(dead_code)]
+pub(super) fn is_bow_item(state: &InteractionState) -> bool {
+    let held = state.inventory.held(state.selected_hotbar_slot);
+    if held.is_empty() {
+        return false;
+    }
+    state
+        .items
+        .name_of(held.item_id)
+        .is_some_and(|item| item.as_str() == "minecraft:bow")
+}
+
+#[allow(dead_code)]
+pub(super) fn consume_arrow(state: &mut InteractionState) -> Option<usize> {
+    // Offhand first (slot 45)
+    if !state.inventory.slots[45].is_empty()
+        && state
+            .items
+            .name_of(state.inventory.slots[45].item_id)
+            .is_some_and(|item| item.as_str() == "minecraft:arrow")
+    {
+        let slot = &mut state.inventory.slots[45];
+        slot.count = slot.count.saturating_sub(1);
+        if slot.count <= 0 {
+            *slot = ItemStack::EMPTY;
+        }
+        return Some(45);
+    }
+    // Hotbar slots 0-8 (inventory slots 36-44)
+    for hotbar_slot in 0..9u8 {
+        let inv_slot = PlayerInventory::HOTBAR_BASE + hotbar_slot as usize;
+        if !state.inventory.slots[inv_slot].is_empty()
+            && state
+                .items
+                .name_of(state.inventory.slots[inv_slot].item_id)
+                .is_some_and(|item| item.as_str() == "minecraft:arrow")
+        {
+            let slot = &mut state.inventory.slots[inv_slot];
+            slot.count = slot.count.saturating_sub(1);
+            if slot.count <= 0 {
+                *slot = ItemStack::EMPTY;
+            }
+            return Some(inv_slot);
+        }
+    }
+    None
+}
+
+#[allow(dead_code)]
+pub(super) fn bow_draw_power(started_at: Instant) -> f64 {
+    let elapsed = Instant::now().duration_since(started_at);
+    let ticks = (elapsed.as_millis() as f64 / 50.0).min(20.0);
+    let power = ticks / 20.0;
+    if power < 0.15 {
+        0.0
+    } else {
+        power.clamp(0.0, 1.0)
+    }
 }
 
 pub(super) fn pending_use_matches(state: &InteractionState, pending: &PendingUse) -> bool {
