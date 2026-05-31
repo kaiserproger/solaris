@@ -647,6 +647,7 @@ fn fluid_test_reports() -> Vec<BlockReport> {
         simple_block(18, "minecraft:anvil"),
         simple_block(19, "minecraft:cactus"),
         simple_block(20, "minecraft:bamboo"),
+        simple_block(21, "minecraft:sugar_cane"),
     ]
 }
 
@@ -1365,6 +1366,123 @@ fn cactus_column_cascades_when_support_breaks() {
                 new_state: BlockStateId(0),
             },
         ]
+    );
+}
+
+#[test]
+fn sugar_cane_random_tick_grows_supported_column_to_height_three() {
+    let registry = Arc::new(fluid_test_registry());
+    let facts = fluid_test_facts();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let cane_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cane_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    let cane_3 = mc_world::BlockPos { x: 4, y: 67, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(cane_1, BlockStateId(21)).unwrap();
+
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane_1,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        Some(vec![BlockEdit {
+            pos: cane_2,
+            new_state: BlockStateId(21),
+        }])
+    );
+    world.set_block_at(cane_2, BlockStateId(21)).unwrap();
+
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane_1,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        Some(vec![BlockEdit {
+            pos: cane_3,
+            new_state: BlockStateId(21),
+        }])
+    );
+    world.set_block_at(cane_3, BlockStateId(21)).unwrap();
+
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane_2,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        None
+    );
+}
+
+#[test]
+fn sugar_cane_random_tick_unsupported_or_obstructed_columns_are_noop() {
+    let registry = Arc::new(fluid_test_registry());
+    let facts = fluid_test_facts();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let cane = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let above = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(cane, BlockStateId(21)).unwrap();
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        None
+    );
+
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(above, BlockStateId(1)).unwrap();
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        None
     );
 }
 

@@ -4850,7 +4850,10 @@ fn random_tick_edit(
 ) -> Option<Vec<BlockEdit>> {
     match family {
         mc_data::block_facts::RandomTickFamily::Crop => next_crop_growth_state(blocks, state)
-            .map(|new_state| vec![BlockEdit { pos, new_state }]),
+            .map(|new_state| vec![BlockEdit { pos, new_state }])
+            .or_else(|| {
+                vertical_plant_growth_edit(blocks, storage, pos, state).map(|edit| vec![edit])
+            }),
         mc_data::block_facts::RandomTickFamily::Farmland => {
             next_farmland_state(blocks, facts, storage, pos, state)
                 .map(|new_state| vec![BlockEdit { pos, new_state }])
@@ -4868,6 +4871,91 @@ fn random_tick_edit(
             sapling_tree_edits(blocks, storage, pos, state)
         }
     }
+}
+
+fn vertical_plant_growth_edit(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<BlockEdit> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.path() != "sugar_cane" {
+        return None;
+    }
+    let plant_state = blocks.block(&current.block.id).map(|block| block.default)?;
+    let air = named_block_default(blocks, "minecraft:air")?;
+
+    let mut bottom_y = pos.y;
+    while same_block_at(
+        blocks,
+        storage,
+        current.block.id.path(),
+        mc_world::BlockPos {
+            y: bottom_y - 1,
+            ..pos
+        },
+    )? {
+        bottom_y -= 1;
+    }
+    let support = mc_world::BlockPos {
+        y: bottom_y - 1,
+        ..pos
+    };
+    if storage
+        .get_block(support)
+        .ok()
+        .flatten()
+        .is_none_or(|found| found == air)
+    {
+        return None;
+    }
+
+    let mut top_y = pos.y;
+    while same_block_at(
+        blocks,
+        storage,
+        current.block.id.path(),
+        mc_world::BlockPos {
+            y: top_y + 1,
+            ..pos
+        },
+    )? {
+        top_y += 1;
+    }
+    if top_y - bottom_y + 1 >= 3 {
+        return None;
+    }
+
+    let above = mc_world::BlockPos {
+        y: top_y + 1,
+        ..pos
+    };
+    match storage.get_block(above) {
+        Ok(Some(found)) if found == air => Some(BlockEdit {
+            pos: above,
+            new_state: plant_state,
+        }),
+        Ok(Some(_)) | Ok(None) => None,
+        Err(err) => {
+            warn!(error = %err, x = above.x, y = above.y, z = above.z, "vertical plant growth target read failed");
+            None
+        }
+    }
+}
+
+fn same_block_at(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    path: &str,
+    pos: mc_world::BlockPos,
+) -> Option<bool> {
+    let state = storage.get_block(pos).ok().flatten()?;
+    Some(
+        blocks
+            .by_id(state)
+            .is_some_and(|found| found.block.id.path() == path),
+    )
 }
 
 fn collect_full_light_updates_for_chunks(
