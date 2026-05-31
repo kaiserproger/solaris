@@ -46,14 +46,17 @@ client files.
   item-on-campfire metadata, in-flight persistence across restart, smoke/sound
   particles, exact ejection vector parity, and hopper/comparator automation are
   not claimed.
-- Farming has partial crop growth and bonemeal support: wheat, carrots,
-  potatoes, beetroots, and nether wart can advance one age at a time through
-  random ticks or successful bonemeal use; bonemeal consumes exactly one item
-  only after growth, with Solaris harness coverage for young wheat growth and
-  mature wheat no-consume behavior. Particles/sounds/level events, vanilla
-  RNG/growth-rate parity, exact soil/moisture/light growth rules beyond the
-  existing random-tick sampling, and all-crop harness coverage are not claimed
-  yet.
+- Farming has partial crop growth, bonemeal, and wheat harvest drop support:
+  wheat, carrots, potatoes, beetroots, and nether wart can advance one age at a
+  time through random ticks or successful bonemeal use; bonemeal consumes
+  exactly one item only after growth; breaking wheat drops deterministic local
+  yields, with mature `age=7` wheat dropping wheat plus seeds and immature
+  `age=0` through `age=6` wheat dropping seeds only. Solaris harness coverage
+  exists for young wheat growth and mature wheat no-consume behavior, but not
+  harvest drops yet. Particles/sounds/level events, vanilla RNG/growth-rate or
+  loot-table parity, exact soil/moisture/light growth rules beyond the existing
+  random-tick sampling, other crop harvest drops, and all-crop harness coverage
+  are not claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;

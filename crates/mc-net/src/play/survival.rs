@@ -316,18 +316,64 @@ pub(super) fn mob_xp_value(entity_type: &str) -> i32 {
     }
 }
 
-pub(super) fn block_drop_stack(
-    state: &InteractionState,
+pub(super) fn block_drop_stacks_from(
+    loot: &mc_data::loot::LootTables,
+    items: &ItemRegistry,
+    blocks: &mc_world::BlockRegistry,
     block_state: BlockStateId,
-) -> Option<ItemStack> {
-    let block = state.blocks.by_id(block_state)?;
-    let item = state
-        .loot
+) -> Vec<ItemStack> {
+    let Some(block) = blocks.by_id(block_state) else {
+        return Vec::new();
+    };
+    if let Some(crop_drops) = crop_drop_stacks(items, block) {
+        return crop_drops;
+    }
+
+    let item = loot
         .block_drop(&block.block.id)
         .or_else(|| mc_data::loot::builtin().block_drop(&block.block.id))
         .unwrap_or(&block.block.id);
-    let item_id = state.items.id_of(item)?;
-    Some(ItemStack::new(item_id, 1))
+    items
+        .id_of(item)
+        .map(|item_id| vec![ItemStack::new(item_id, 1)])
+        .unwrap_or_default()
+}
+
+pub(super) fn block_drop_stacks(
+    state: &InteractionState,
+    block_state: BlockStateId,
+) -> Vec<ItemStack> {
+    block_drop_stacks_from(&state.loot, &state.items, &state.blocks, block_state)
+}
+
+fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Option<Vec<ItemStack>> {
+    if block.block.id.as_str() != "minecraft:wheat" {
+        return None;
+    }
+
+    let age = block_state_property(block, "age")?.parse::<u8>().ok()?;
+    let mut drops = Vec::new();
+    if age >= 7
+        && let Some(wheat_id) = item_id(items, "minecraft:wheat")
+    {
+        drops.push(ItemStack::new(wheat_id, 1));
+    }
+    if let Some(seeds_id) = item_id(items, "minecraft:wheat_seeds") {
+        drops.push(ItemStack::new(seeds_id, 1));
+    }
+    Some(drops)
+}
+
+fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
+    let id = Identifier::parse(name).expect("static identifier");
+    items.id_of(&id)
+}
+
+fn block_state_property<'a>(state: &'a mc_world::BlockState, name: &str) -> Option<&'a str> {
+    state
+        .properties
+        .iter()
+        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
 }
 
 pub(super) fn food_rule_for_item(

@@ -132,6 +132,108 @@ fn crop_test_registry() -> mc_world::BlockRegistry {
     mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
 }
 
+fn wheat_drop_items() -> ItemRegistry {
+    ItemRegistry::from_report(&[
+        ItemReport {
+            id: Identifier::parse("minecraft:wheat").unwrap(),
+            protocol_id: 50,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
+            protocol_id: 51,
+        },
+    ])
+}
+
+fn test_crop_state_with_age(blocks: &mc_world::BlockRegistry, crop: &str, age: u8) -> BlockStateId {
+    blocks
+        .by_name_and_props(
+            &Identifier::parse(crop).unwrap(),
+            &[("age".to_string(), age.to_string())],
+        )
+        .unwrap()
+}
+
+#[test]
+fn wheat_crop_drop_mature_returns_wheat_and_seeds() {
+    let blocks = crop_test_registry();
+    let items = wheat_drop_items();
+    let wheat = test_crop_state_with_age(&blocks, "minecraft:wheat", 7);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        wheat,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(50, 1), ItemStack::new(51, 1)]);
+}
+
+#[test]
+fn wheat_crop_drop_young_returns_seeds_only() {
+    let blocks = crop_test_registry();
+    let items = wheat_drop_items();
+    let wheat = test_crop_state_with_age(&blocks, "minecraft:wheat", 3);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        wheat,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(51, 1)]);
+}
+
+#[test]
+fn block_drop_generic_non_crop_fallback_still_returns_block_item() {
+    let blocks = crop_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:dirt").unwrap(),
+        protocol_id: 52,
+    }]);
+    let dirt = blocks
+        .block(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap()
+        .default;
+
+    let drops =
+        block_drop_stacks_from(&mc_data::loot::LootTables::default(), &items, &blocks, dirt);
+
+    assert_eq!(drops, vec![ItemStack::new(52, 1)]);
+}
+
+#[test]
+fn wheat_crop_drop_missing_item_ids_omit_unavailable_stacks() {
+    let blocks = crop_test_registry();
+    let wheat = test_crop_state_with_age(&blocks, "minecraft:wheat", 7);
+    let seeds_only = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
+        protocol_id: 51,
+    }]);
+    let missing_all = ItemRegistry::default();
+
+    assert_eq!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &seeds_only,
+            &blocks,
+            wheat,
+        ),
+        vec![ItemStack::new(51, 1)]
+    );
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_all,
+            &blocks,
+            wheat,
+        )
+        .is_empty()
+    );
+}
+
 fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
     let mut properties = BTreeMap::new();
     properties.insert(

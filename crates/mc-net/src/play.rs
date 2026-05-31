@@ -151,7 +151,7 @@ use spawn::spawn_y_from_chunk;
 use spawn::{chunk_pos_from_coords, pack_block_pos, spawn_dimension, spawn_position};
 use survival::{
     PendingBreak, PendingUse, SurvivalState, UseKind, arrow_entity_type_id, block_break_is_denied,
-    block_drop_stack, bow_draw_power, consume_arrow, damage_held_tool_after_mining,
+    block_drop_stacks, bow_draw_power, consume_arrow, damage_held_tool_after_mining,
     damage_held_weapon_after_attack, entity_item_stack, falling_block_entity_type_id,
     held_attack_damage, held_food_use, held_item_id, is_bow_item, is_hostile_entity,
     item_entity_type_id, max_tool_damage_for_path, mining_time_for_target, mob_drop_stack,
@@ -160,7 +160,8 @@ use survival::{
 };
 #[cfg(test)]
 use survival::{
-    attack_damage_for_item, fallback_mining_time, food_rule_for_item, is_durability_tool_path,
+    attack_damage_for_item, block_drop_stacks_from, fallback_mining_time, food_rule_for_item,
+    is_durability_tool_path,
 };
 use wire_entities::{
     send_entity_data, send_entity_despawn, send_entity_relative_move, send_entity_spawn,
@@ -3883,14 +3884,18 @@ where
     }
     if drop_items
         && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
-        && let Some(drop) = block_drop_stack(state, prev)
     {
-        dispatch_visibility_commands(state.sessions.spawn_item_drop(
-            entity_type_id,
-            Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
-            entity_item_stack(drop),
-        ));
-        pickup_nearby_items(state, writer, player_pose).await?;
+        let drops = block_drop_stacks(state, prev);
+        if !drops.is_empty() {
+            for drop in drops {
+                dispatch_visibility_commands(state.sessions.spawn_item_drop(
+                    entity_type_id,
+                    Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                    entity_item_stack(drop),
+                ));
+            }
+            pickup_nearby_items(state, writer, player_pose).await?;
+        }
     }
     Ok(changed)
 }
