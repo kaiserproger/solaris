@@ -50,10 +50,10 @@ client files.
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
   full vanilla combat parity is not claimed.
-- Shields have partial runtime support: using a main-hand or offhand shield can
-  block frontal mob melee and arrow player damage after a short activation delay;
-  durability, disable behavior, sounds, particles, visual metadata, and full
-  vanilla parity are not claimed.
+- Shields have partial runtime support with Solaris harness coverage: using a
+  main-hand or offhand shield can block frontal mob melee and arrow player damage
+  after a short activation delay; durability, disable behavior, sounds,
+  particles, visual metadata, and full vanilla parity are not claimed.
 
 ## Not Claimed
 
