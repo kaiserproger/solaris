@@ -1503,5 +1503,133 @@ fn hostile_melee_reaches_player_one_block_above() {
     ));
 }
 
+#[test]
+fn shield_use_starts_blocking_state_for_shield_stack() {
+    let stack = ItemStack::new(77, 1);
+
+    let shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::MainHand,
+        PlayerInventory::HOTBAR_BASE,
+        stack.clone(),
+        12,
+        true,
+    )
+    .expect("shield stack should start shield use");
+
+    assert_eq!(shield_use.started_tick, 12);
+    assert_eq!(shield_use.slot, PlayerInventory::HOTBAR_BASE);
+    assert_eq!(shield_use.stack, stack);
+}
+
+#[test]
+fn shield_non_shield_use_does_not_block() {
+    let shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::MainHand,
+        PlayerInventory::HOTBAR_BASE,
+        ItemStack::new(77, 1),
+        12,
+        false,
+    );
+
+    assert!(shield_use.is_none());
+    assert!(!shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(0.0, 0.0, 1.0)),
+        20,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        shield_use.as_ref(),
+    ));
+}
+
+#[test]
+fn shield_activation_delay_gates_damage() {
+    let shield_use = ShieldUseState {
+        hand: mc_protocol::packets::play::InteractionHand::MainHand,
+        started_tick: 10,
+        slot: PlayerInventory::HOTBAR_BASE,
+        stack: ItemStack::new(77, 1),
+    };
+
+    assert!(!shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(0.0, 0.0, 1.0)),
+        14,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+    assert!(shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(0.0, 0.0, 1.0)),
+        15,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+}
+
+#[test]
+fn shield_blocks_frontal_mob_and_arrow_sources() {
+    let shield_use = ShieldUseState {
+        hand: mc_protocol::packets::play::InteractionHand::OffHand,
+        started_tick: 1,
+        slot: 45,
+        stack: ItemStack::new(77, 1),
+    };
+
+    assert!(shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(0.0, 0.0, 2.0)),
+        10,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+    assert!(shield_blocks_damage(
+        Vec3::ZERO,
+        90.0,
+        Some(Vec3::new(-2.0, 0.0, 0.0)),
+        10,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+}
+
+#[test]
+fn shield_side_back_and_unknown_sources_are_not_blocked() {
+    let shield_use = ShieldUseState {
+        hand: mc_protocol::packets::play::InteractionHand::MainHand,
+        started_tick: 1,
+        slot: PlayerInventory::HOTBAR_BASE,
+        stack: ItemStack::new(77, 1),
+    };
+
+    assert!(!shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(2.0, 0.0, 0.0)),
+        10,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+    assert!(!shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        Some(Vec3::new(0.0, 0.0, -2.0)),
+        10,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+    assert!(!shield_blocks_damage(
+        Vec3::ZERO,
+        0.0,
+        None,
+        10,
+        SHIELD_ACTIVATION_DELAY_TICKS,
+        Some(&shield_use),
+    ));
+}
+
 include!("tests/inventory_and_survival.rs");
 include!("tests/spawning_and_world.rs");

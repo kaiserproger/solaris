@@ -20,6 +20,7 @@ pub(super) enum OutboundCommand {
     },
     DamagePlayer {
         amount: f32,
+        source_origin: Option<Vec3>,
     },
     TakeItemEntity {
         item_entity_id: i32,
@@ -2307,6 +2308,7 @@ fn resolve_arrow_entity_hits_locked(
                         },
                         command: OutboundCommand::DamagePlayer {
                             amount: ARROW_ENTITY_HIT_DAMAGE,
+                            source_origin: Some(start),
                         },
                     });
                 }
@@ -3277,7 +3279,7 @@ mod tests {
         while let Ok(command) = target_rx.try_recv() {
             target_damaged |= matches!(
                 command,
-                OutboundCommand::DamagePlayer { amount }
+                OutboundCommand::DamagePlayer { amount, .. }
                     if (amount - ARROW_ENTITY_HIT_DAMAGE).abs() < f32::EPSILON
             );
         }

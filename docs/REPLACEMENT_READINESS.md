@@ -50,12 +50,17 @@ client files.
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
   full vanilla combat parity is not claimed.
+- Shields have partial runtime support: using a main-hand or offhand shield can
+  block frontal mob melee and arrow player damage after a short activation delay;
+  durability, disable behavior, sounds, particles, visual metadata, and full
+  vanilla parity are not claimed.
 
 ## Not Claimed
 
 - Other dimensions, portals, structures, full biome parity, villages/trading,
-  redstone parity, full bow/arrow combat parity, shields, boats, minecarts, full
-  recipe-book parity, weather parity, or M39 lock-free ownership hardening.
+  redstone parity, full bow/arrow combat parity, full shield parity, boats,
+  minecarts, full recipe-book parity, weather parity, or M39 lock-free ownership
+  hardening.
 
 ## Manual Gate
 
