@@ -153,6 +153,13 @@ fn crop_test_reports() -> Vec<BlockReport> {
                 .map(|age| state(54 + age, age == 0, &[("age", &age.to_string())]))
                 .collect(),
         },
+        BlockReport {
+            id: Identifier::parse("minecraft:sweet_berry_bush").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1", "2", "3"])]),
+            states: (0..=3)
+                .map(|age| state(56 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
@@ -1725,6 +1732,32 @@ fn stem_crop_growth_advances_melon_and_pumpkin_stems_once() {
             "{stem} bonemeal should advance by one age"
         );
     }
+}
+
+#[test]
+fn sweet_berry_bush_growth_advances_until_mature() {
+    let blocks = crop_test_registry();
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(56)),
+        Some(mc_world::BlockStateId(57))
+    );
+    assert_eq!(
+        bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(57)),
+        Some(BlockEdit {
+            pos,
+            new_state: mc_world::BlockStateId(58),
+        })
+    );
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(58)),
+        Some(mc_world::BlockStateId(59))
+    );
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(59)),
+        None
+    );
 }
 
 #[test]
