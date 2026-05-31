@@ -46,23 +46,25 @@ client files.
   item-on-campfire metadata, in-flight persistence across restart, smoke/sound
   particles, exact ejection vector parity, and hopper/comparator automation are
   not claimed.
-- Farming has partial crop growth, bonemeal, wheat harvest drop support, and
-  carrot harvest drop support:
+- Farming has partial crop growth, bonemeal, wheat harvest drop support, carrot
+  harvest drop support, and potato harvest drop support:
   wheat, carrots, potatoes, beetroots, and nether wart can advance one age at a
   time through random ticks or successful bonemeal use; bonemeal consumes
   exactly one item only after growth; breaking wheat drops deterministic local
   yields, with mature `age=7` wheat dropping wheat plus seeds and immature
   `age=0` through `age=6` wheat dropping seeds only; breaking carrots drops
   deterministic local yields, with mature `age=7` carrots dropping carrot x2
-  and immature `age=0` through `age=6` carrots dropping carrot x1. Solaris
-  harness coverage exists for young wheat growth, mature wheat no-consume
-  behavior, and mature wheat harvest drops; young wheat and carrot harvest
-  remain unit-covered only.
+  and immature `age=0` through `age=6` carrots dropping carrot x1; breaking
+  potatoes drops deterministic local yields, with mature `age=7` potatoes
+  dropping potato x2 and immature `age=0` through `age=6` potatoes dropping
+  potato x1. Solaris harness coverage exists for young wheat growth, mature
+  wheat no-consume behavior, and mature wheat harvest drops; young wheat,
+  carrot harvest, and potato harvest remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
-  sampling, potato/beetroot/nether wart harvest drops, and all-crop harness
-  coverage are not claimed yet.
+  sampling, beetroot/nether wart harvest drops, poisonous potato chance, and
+  all-crop harness coverage are not claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;

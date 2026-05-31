@@ -352,10 +352,13 @@ fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Optio
     const WHEAT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:wheat_seeds", 1)];
     const CARROT_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 2)];
     const CARROT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 1)];
+    const POTATO_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:potato", 2)];
+    const POTATO_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:potato", 1)];
 
     let (mature_drops, immature_drops) = match block.block.id.as_str() {
         "minecraft:wheat" => (WHEAT_MATURE_DROPS, WHEAT_IMMATURE_DROPS),
         "minecraft:carrots" => (CARROT_MATURE_DROPS, CARROT_IMMATURE_DROPS),
+        "minecraft:potatoes" => (POTATO_MATURE_DROPS, POTATO_IMMATURE_DROPS),
         _ => return None,
     };
 

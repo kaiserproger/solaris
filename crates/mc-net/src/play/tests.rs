@@ -163,6 +163,10 @@ fn carrot_slice_drop_items() -> ItemRegistry {
             id: Identifier::parse("minecraft:pumpkin_stem").unwrap(),
             protocol_id: 53,
         },
+        ItemReport {
+            id: Identifier::parse("minecraft:potato").unwrap(),
+            protocol_id: 54,
+        },
     ])
 }
 
@@ -348,6 +352,61 @@ fn carrot_crop_drop_missing_item_id_omits_unavailable_stack() {
             &missing_carrot,
             &blocks,
             carrots,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn potato_crop_drop_mature_returns_two_potatoes() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let potatoes = test_crop_state_with_age(&blocks, "minecraft:potatoes", 7);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        potatoes,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(54, 2)]);
+}
+
+#[test]
+fn potato_crop_drop_immature_returns_one_potato() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+
+    for age in 0..=6 {
+        let potatoes = test_crop_state_with_age(&blocks, "minecraft:potatoes", age);
+
+        let drops = block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            potatoes,
+        );
+
+        assert_eq!(drops, vec![ItemStack::new(54, 1)], "age {age}");
+    }
+}
+
+#[test]
+fn potato_crop_drop_missing_item_id_omits_unavailable_stack() {
+    let blocks = crop_test_registry();
+    let potatoes = test_crop_state_with_age(&blocks, "minecraft:potatoes", 7);
+    let missing_potato = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:carrot").unwrap(),
+        protocol_id: 52,
+    }]);
+
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_potato,
+            &blocks,
+            potatoes,
         )
         .is_empty()
     );
