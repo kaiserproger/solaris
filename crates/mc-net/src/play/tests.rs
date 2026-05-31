@@ -132,6 +132,52 @@ fn crop_test_registry() -> mc_world::BlockRegistry {
     mc_world::BlockRegistry::from_report(&crop_test_reports()).unwrap()
 }
 
+fn sapling_tree_test_reports() -> Vec<BlockReport> {
+    vec![
+        simple_block(0, "minecraft:air"),
+        simple_block(1, "minecraft:oak_sapling"),
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_log").unwrap(),
+            properties: prop_schema(&[("axis", &["x", "y"])]),
+            states: vec![
+                state(2, true, &[("axis", "x")]),
+                state(3, false, &[("axis", "y")]),
+            ],
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+            properties: prop_schema(&[("distance", &["1"]), ("persistent", &["false"])]),
+            states: vec![state(
+                4,
+                true,
+                &[("distance", "1"), ("persistent", "false")],
+            )],
+        },
+        simple_block(5, "minecraft:stone"),
+        simple_block(6, "minecraft:birch_sapling"),
+    ]
+}
+
+fn sapling_tree_test_registry() -> Arc<mc_world::BlockRegistry> {
+    Arc::new(mc_world::BlockRegistry::from_report(&sapling_tree_test_reports()).unwrap())
+}
+
+fn in_memory_tree_world(registry: Arc<mc_world::BlockRegistry>) -> mc_world::WorldStorage {
+    let mut world = mc_world::WorldStorage::in_memory(registry);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    world
+}
+
 fn wheat_drop_items() -> ItemRegistry {
     ItemRegistry::from_report(&[
         ItemReport {
@@ -1423,6 +1469,119 @@ fn bonemeal_growth_edit_ignores_mature_and_invalid_targets() {
     );
     assert_eq!(
         bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(1)),
+        None
+    );
+}
+
+#[test]
+fn sapling_bonemeal_grows_small_oak_tree_and_consumes_one_item() {
+    let registry = sapling_tree_test_registry();
+    let mut world = in_memory_tree_world(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+    let edits = bonemeal_growth_edits(registry.as_ref(), &mut world, pos, BlockStateId(1)).unwrap();
+    assert_eq!(edits.len(), 17);
+    assert_eq!(
+        edits[0],
+        BlockEdit {
+            pos,
+            new_state: BlockStateId(3)
+        }
+    );
+    assert!(edits.iter().any(|edit| {
+        edit.pos == mc_world::BlockPos { x: 4, y: 68, z: 4 } && edit.new_state == BlockStateId(4)
+    }));
+
+    let mut outcome = BlockEditBatchOutcome::default();
+    for edit in &edits {
+        apply_block_edit_to_storage(&mut world, None, edit, &mut outcome);
+    }
+    assert!(!outcome.applied.is_empty());
+    for dy in 0..=3 {
+        assert_eq!(
+            world
+                .get_block(mc_world::BlockPos {
+                    y: pos.y + dy,
+                    ..pos
+                })
+                .unwrap(),
+            Some(BlockStateId(3))
+        );
+    }
+    assert_eq!(
+        world
+            .get_block(mc_world::BlockPos { x: 4, y: 68, z: 4 })
+            .unwrap(),
+        Some(BlockStateId(4))
+    );
+
+    let mut inventory = PlayerInventory::empty();
+    inventory.set_hotbar(
+        0,
+        ItemStack {
+            item_id: 99,
+            count: 2,
+            damage: None,
+        },
+    );
+    let synced =
+        consume_bonemeal_after_growth(&mut inventory, 0, !outcome.applied.is_empty()).unwrap();
+    assert_eq!(synced.count, 1);
+    assert_eq!(inventory.held(0).count, 1);
+}
+
+#[test]
+fn sapling_bonemeal_blocked_space_does_not_edit_or_consume() {
+    let registry = sapling_tree_test_registry();
+    let mut world = in_memory_tree_world(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(pos, BlockStateId(1)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { x: 4, y: 68, z: 4 }, BlockStateId(5))
+        .unwrap();
+
+    assert_eq!(
+        bonemeal_growth_edits(registry.as_ref(), &mut world, pos, BlockStateId(1)),
+        None
+    );
+    assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(1)));
+
+    let mut inventory = PlayerInventory::empty();
+    inventory.set_hotbar(
+        0,
+        ItemStack {
+            item_id: 99,
+            count: 2,
+            damage: None,
+        },
+    );
+    assert_eq!(
+        consume_bonemeal_after_growth(&mut inventory, 0, false),
+        None
+    );
+    assert_eq!(inventory.held(0).count, 2);
+}
+
+#[test]
+fn sapling_bonemeal_unsupported_and_missing_tree_states_are_noop() {
+    let registry = sapling_tree_test_registry();
+    let mut world = in_memory_tree_world(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    assert_eq!(
+        bonemeal_growth_edits(registry.as_ref(), &mut world, pos, BlockStateId(6)),
+        None
+    );
+
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        simple_block(1, "minecraft:oak_sapling"),
+        simple_block(2, "minecraft:oak_leaves"),
+    ];
+    let missing_registry = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let mut world = in_memory_tree_world(Arc::clone(&missing_registry));
+    assert_eq!(
+        bonemeal_growth_edits(missing_registry.as_ref(), &mut world, pos, BlockStateId(1)),
         None
     );
 }

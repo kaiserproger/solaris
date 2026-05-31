@@ -4953,6 +4953,118 @@ fn bonemeal_growth_edit(
     next_crop_growth_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
 }
 
+fn bonemeal_growth_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<Vec<BlockEdit>> {
+    if let Some(edit) = bonemeal_growth_edit(blocks, pos, state) {
+        return Some(vec![edit]);
+    }
+    oak_sapling_tree_edits(blocks, storage, pos, state)
+}
+
+fn oak_sapling_tree_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<Vec<BlockEdit>> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:oak_sapling" {
+        return None;
+    }
+
+    let log = tree_state_with_props(blocks, "minecraft:oak_log", &[("axis", "y")])?;
+    let leaves = oak_leaves_tree_state(blocks)?;
+    let air = named_block_default(blocks, "minecraft:air")?;
+
+    let mut edits = Vec::new();
+    for dy in 0..=3 {
+        edits.push(BlockEdit {
+            pos: mc_world::BlockPos {
+                y: pos.y + dy,
+                ..pos
+            },
+            new_state: log,
+        });
+    }
+
+    for dx in -1..=1 {
+        for dz in -1..=1 {
+            if dx == 0 && dz == 0 {
+                continue;
+            }
+            edits.push(BlockEdit {
+                pos: mc_world::BlockPos {
+                    x: pos.x + dx,
+                    y: pos.y + 3,
+                    z: pos.z + dz,
+                },
+                new_state: leaves,
+            });
+        }
+    }
+    for (dx, dz) in [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)] {
+        edits.push(BlockEdit {
+            pos: mc_world::BlockPos {
+                x: pos.x + dx,
+                y: pos.y + 4,
+                z: pos.z + dz,
+            },
+            new_state: leaves,
+        });
+    }
+
+    for edit in &edits {
+        if edit.pos == pos {
+            continue;
+        }
+        match storage.get_block(edit.pos) {
+            Ok(Some(found)) if found == air => {}
+            Ok(Some(_)) | Ok(None) => return None,
+            Err(err) => {
+                warn!(error = %err, x = edit.pos.x, y = edit.pos.y, z = edit.pos.z, "sapling tree volume read failed");
+                return None;
+            }
+        }
+    }
+
+    Some(edits)
+}
+
+fn tree_state_with_props(
+    blocks: &mc_world::BlockRegistry,
+    name: &str,
+    props: &[(&str, &str)],
+) -> Option<mc_world::BlockStateId> {
+    let id = Identifier::parse(name).expect("static identifier");
+    let props = props
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    blocks
+        .by_name_and_props(&id, &props)
+        .or_else(|| blocks.block(&id).map(|block| block.default))
+}
+
+fn oak_leaves_tree_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::BlockStateId> {
+    tree_state_with_props(
+        blocks,
+        "minecraft:oak_leaves",
+        &[("distance", "1"), ("persistent", "false")],
+    )
+    .or_else(|| {
+        tree_state_with_props(
+            blocks,
+            "minecraft:oak_leaves",
+            &[("distance", "1"), ("persistent", "true")],
+        )
+    })
+    .or_else(|| tree_state_with_props(blocks, "minecraft:oak_leaves", &[("persistent", "true")]))
+}
+
 fn next_leaf_decay_state(
     blocks: &mc_world::BlockRegistry,
     state: mc_world::BlockStateId,
@@ -6464,10 +6576,12 @@ where
         return Ok(false);
     }
 
-    let edit = {
+    let edits = {
         let mut storage = state.world.lock().await;
         match storage.get_block(clicked_pos) {
-            Ok(Some(current)) => bonemeal_growth_edit(&state.blocks, clicked_pos, current),
+            Ok(Some(current)) => {
+                bonemeal_growth_edits(&state.blocks, &mut storage, clicked_pos, current)
+            }
             Ok(None) => None,
             Err(err) => {
                 warn!(error = %err, x = clicked_pos.x, y = clicked_pos.y, z = clicked_pos.z, "bonemeal target read failed");
@@ -6476,12 +6590,12 @@ where
         }
     };
 
-    let Some(edit) = edit else {
+    let Some(edits) = edits else {
         write_block_ack(writer, state.compression, sequence).await?;
         return Ok(true);
     };
 
-    let outcome = apply_player_block_edit_batch(state, writer, sequence, &[edit]).await?;
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
     if outcome.applied.is_empty() {
         return Ok(true);
     }
