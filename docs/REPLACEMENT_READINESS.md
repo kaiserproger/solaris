@@ -63,10 +63,11 @@ client files.
   `age=0` through `age=2` beetroots dropping beetroot seeds x1; breaking
   nether wart drops deterministic local yields, with mature `age=3` nether
   wart dropping nether wart x2 and immature `age=0` through `age=2` nether
-  wart dropping nether wart x1. Solaris harness coverage exists for young wheat
-  growth, mature wheat no-consume behavior, and mature wheat harvest drops;
-  young wheat, carrot harvest, potato harvest, beetroot harvest, and nether
-  wart harvest remain unit-covered only.
+  wart dropping nether wart x1. Crop harvest item ids are resolved through the
+  loaded item registry and missing ids are omitted safely. Solaris harness
+  coverage exists for young wheat growth, mature wheat no-consume behavior, and
+  mature wheat harvest drops; young wheat, carrot harvest, potato harvest,
+  beetroot harvest, and nether wart harvest remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
