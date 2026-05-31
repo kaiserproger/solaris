@@ -50,8 +50,10 @@ client files.
   potatoes, beetroots, and nether wart can advance one age at a time through
   random ticks or successful bonemeal use; bonemeal consumes exactly one item
   only after growth, with Solaris harness coverage for young wheat growth and
-  mature wheat no-consume behavior. Particles/sounds/level events and vanilla
-  RNG/growth-rate parity are not claimed yet.
+  mature wheat no-consume behavior. Particles/sounds/level events, vanilla
+  RNG/growth-rate parity, exact soil/moisture/light growth rules beyond the
+  existing random-tick sampling, and all-crop harness coverage are not claimed
+  yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
