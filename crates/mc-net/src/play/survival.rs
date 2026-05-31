@@ -359,6 +359,8 @@ fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Optio
     const BEETROOT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:beetroot_seeds", 1)];
     const NETHER_WART_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:nether_wart", 2)];
     const NETHER_WART_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:nether_wart", 1)];
+    const COCOA_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:cocoa_beans", 3)];
+    const COCOA_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:cocoa_beans", 1)];
 
     let (mature_age, mature_drops, immature_drops) = match block.block.id.as_str() {
         "minecraft:wheat" => (7, WHEAT_MATURE_DROPS, WHEAT_IMMATURE_DROPS),
@@ -366,6 +368,7 @@ fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Optio
         "minecraft:potatoes" => (7, POTATO_MATURE_DROPS, POTATO_IMMATURE_DROPS),
         "minecraft:beetroots" => (3, BEETROOT_MATURE_DROPS, BEETROOT_IMMATURE_DROPS),
         "minecraft:nether_wart" => (3, NETHER_WART_MATURE_DROPS, NETHER_WART_IMMATURE_DROPS),
+        "minecraft:cocoa" => (2, COCOA_MATURE_DROPS, COCOA_IMMATURE_DROPS),
         _ => return None,
     };
 

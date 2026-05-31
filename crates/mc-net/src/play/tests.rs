@@ -658,6 +658,63 @@ fn nether_wart_crop_drop_missing_item_id_omits_unavailable_stack() {
     );
 }
 
+#[test]
+fn cocoa_crop_drop_mature_returns_three_beans() {
+    let blocks = crop_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:cocoa_beans").unwrap(),
+        protocol_id: 58,
+    }]);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        mc_world::BlockStateId(62),
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(58, 3)]);
+}
+
+#[test]
+fn cocoa_crop_drop_immature_returns_one_bean() {
+    let blocks = crop_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:cocoa_beans").unwrap(),
+        protocol_id: 58,
+    }]);
+
+    for state in [mc_world::BlockStateId(60), mc_world::BlockStateId(61)] {
+        let drops = block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            state,
+        );
+
+        assert_eq!(drops, vec![ItemStack::new(58, 1)], "state {state:?}");
+    }
+}
+
+#[test]
+fn cocoa_crop_drop_missing_item_id_omits_unavailable_stack() {
+    let blocks = crop_test_registry();
+    let missing_beans = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:beetroot").unwrap(),
+        protocol_id: 55,
+    }]);
+
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_beans,
+            &blocks,
+            mc_world::BlockStateId(62),
+        )
+        .is_empty()
+    );
+}
+
 fn fluid_block(first_id: u32, name: &str, max_level: u8) -> BlockReport {
     let mut properties = BTreeMap::new();
     properties.insert(
