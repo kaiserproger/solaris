@@ -160,6 +160,19 @@ fn crop_test_reports() -> Vec<BlockReport> {
                 .map(|age| state(56 + age, age == 0, &[("age", &age.to_string())]))
                 .collect(),
         },
+        BlockReport {
+            id: Identifier::parse("minecraft:cocoa").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1", "2"]), ("facing", &["north"])]),
+            states: (0..=2)
+                .map(|age| {
+                    state(
+                        60 + age,
+                        age == 0,
+                        &[("age", &age.to_string()), ("facing", "north")],
+                    )
+                })
+                .collect(),
+        },
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
@@ -1756,6 +1769,34 @@ fn sweet_berry_bush_growth_advances_until_mature() {
     );
     assert_eq!(
         next_crop_growth_state(&blocks, mc_world::BlockStateId(59)),
+        None
+    );
+}
+
+#[test]
+fn cocoa_growth_advances_age_without_losing_facing() {
+    let blocks = crop_test_registry();
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(60)),
+        Some(mc_world::BlockStateId(61))
+    );
+    assert_eq!(
+        bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(61)),
+        Some(BlockEdit {
+            pos,
+            new_state: mc_world::BlockStateId(62),
+        })
+    );
+    assert_eq!(
+        blocks
+            .by_id(mc_world::BlockStateId(62))
+            .and_then(|state| block_state_property(state, "facing")),
+        Some("north")
+    );
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(62)),
         None
     );
 }

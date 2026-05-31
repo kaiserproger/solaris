@@ -5022,7 +5022,7 @@ fn next_crop_growth_state(
         return None;
     }
     let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
-    crop_state_with_age(blocks, &current.block.id, age.checked_add(1)?)
+    sibling_state_with_property(blocks, current, "age", &age.checked_add(1)?.to_string())
 }
 
 fn is_supported_age_crop(block: &Identifier) -> bool {
@@ -5036,6 +5036,7 @@ fn is_supported_age_crop(block: &Identifier) -> bool {
             | "minecraft:melon_stem"
             | "minecraft:pumpkin_stem"
             | "minecraft:sweet_berry_bush"
+            | "minecraft:cocoa"
     )
 }
 

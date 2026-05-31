@@ -50,7 +50,7 @@ client files.
   harvest drop support, potato harvest drop support, beetroot harvest drop
   support, and nether wart harvest drop support:
   wheat, carrots, potatoes, beetroots, nether wart, melon stems, pumpkin stems,
-  and sweet berry bushes can advance one age at a time through random ticks or
+  sweet berry bushes, and cocoa can advance one age at a time through random ticks or
   successful bonemeal use; bonemeal consumes exactly one item only after growth; breaking
   wheat drops deterministic local
   yields, with mature `age=7` wheat dropping wheat plus seeds and immature
@@ -74,7 +74,8 @@ client files.
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, and
   stem fruit placement/conversion, sweet berry harvesting/collision behavior,
-  all-crop harness coverage are not claimed yet.
+  cocoa placement/harvest/support parity, all-crop harness coverage are not
+  claimed yet.
 - Sugar cane and cactus have partial vertical-plant growth support: random ticks
   can grow supported clear columns by one block up to height three, and samples
   from any block in the column grow only above the contiguous top. Existing
