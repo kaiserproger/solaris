@@ -52,8 +52,9 @@ client files.
   full vanilla combat parity is not claimed.
 - Shields have partial runtime support with Solaris harness coverage: using a
   main-hand or offhand shield can block frontal mob melee and arrow player damage
-  after a short activation delay; durability, disable behavior, sounds,
-  particles, visual metadata, and full vanilla parity are not claimed.
+  after a short activation delay; durability damage, axe disable behavior,
+  sounds/particles, shield pose metadata, exact vanilla angle/timing, broader
+  projectile/damage-source parity, and full vanilla parity are not claimed.
 
 ## Not Claimed
 
