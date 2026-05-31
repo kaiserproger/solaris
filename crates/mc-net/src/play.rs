@@ -5056,16 +5056,30 @@ fn oak_leaves_tree_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::B
     tree_state_with_props(
         blocks,
         "minecraft:oak_leaves",
-        &[("distance", "1"), ("persistent", "false")],
+        &[
+            ("distance", "1"),
+            ("persistent", "false"),
+            ("waterlogged", "false"),
+        ],
     )
     .or_else(|| {
         tree_state_with_props(
             blocks,
             "minecraft:oak_leaves",
-            &[("distance", "1"), ("persistent", "true")],
+            &[
+                ("distance", "1"),
+                ("persistent", "true"),
+                ("waterlogged", "false"),
+            ],
         )
     })
-    .or_else(|| tree_state_with_props(blocks, "minecraft:oak_leaves", &[("persistent", "true")]))
+    .or_else(|| {
+        tree_state_with_props(
+            blocks,
+            "minecraft:oak_leaves",
+            &[("persistent", "true"), ("waterlogged", "false")],
+        )
+    })
 }
 
 fn next_leaf_decay_state(

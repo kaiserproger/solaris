@@ -27,11 +27,12 @@ use mc_protocol::packets::play::{
     ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
     EntityAnimationAction, EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
     ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, RemoveEntities, ServerboundChatCommand,
-    ServerboundClientCommand, ServerboundContainerClick, ServerboundContainerClose,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlaceRecipe,
-    ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, RemoveEntities, SectionBlocksUpdate,
+    ServerboundChatCommand, ServerboundClientCommand, ServerboundContainerClick,
+    ServerboundContainerClose, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_block_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -45,5 +46,6 @@ include!("block_edit/breaks_and_crafting.rs");
 include!("block_edit/campfire.rs");
 include!("block_edit/crop_bonemeal.rs");
 include!("block_edit/furnace_and_chests.rs");
+include!("block_edit/sapling_growth.rs");
 include!("block_edit/survival_lifecycle.rs");
 include!("block_edit/wheat_harvest.rs");

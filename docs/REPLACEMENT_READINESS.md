@@ -78,9 +78,9 @@ client files.
   tree through existing block-edit paths, and oak sapling random ticks can grow
   the same tree without item consumption. Oak log/leaves/air states are resolved
   from the loaded block registry, and bonemeal is consumed only after successful
-  edits. Harness coverage, non-oak saplings, vanilla tree-feature parity,
-  particles/sounds/statistics/game events, and vanilla random shape variation are
-  not claimed yet.
+  edits; a Solaris harness covers the bonemeal survival path. Non-oak saplings,
+  vanilla tree-feature parity, particles/sounds/statistics/game events, and
+  vanilla random shape variation are not claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
