@@ -73,14 +73,15 @@ client files.
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, and
   all-crop harness coverage are not claimed yet.
-- Oak saplings have partial bonemeal tree-growth support: using bonemeal on a
-  clear `minecraft:oak_sapling` creates a deterministic Solaris-owned small oak
-  tree through existing block-edit paths, and oak sapling random ticks can grow
-  the same tree without item consumption. Oak log/leaves/air states are resolved
-  from the loaded block registry, and bonemeal is consumed only after successful
-  edits; a Solaris harness covers the bonemeal survival path. Non-oak saplings,
-  vanilla tree-feature parity, particles/sounds/statistics/game events, and
-  vanilla random shape variation are not claimed yet.
+- Common one-by-one saplings have partial tree-growth support: using bonemeal on
+  a clear oak, birch, spruce, jungle, acacia, or dark oak sapling creates a
+  deterministic Solaris-owned small tree through existing block-edit paths, and
+  random ticks can grow the same tree without item consumption. Matching
+  log/leaves/air states are resolved from the loaded block registry, and bonemeal
+  is consumed only after successful edits; a Solaris harness covers the oak
+  bonemeal survival path. Vanilla tree-feature parity, special/two-by-two trees,
+  particles/sounds/statistics/game events, and vanilla random shape variation are
+  not claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;

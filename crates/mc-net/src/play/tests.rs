@@ -39,6 +39,29 @@ fn simple_block(id: u32, name: &str) -> BlockReport {
     }
 }
 
+fn axis_log_block(id_base: u32, name: &str) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: prop_schema(&[("axis", &["x", "y"])]),
+        states: vec![
+            state(id_base, true, &[("axis", "x")]),
+            state(id_base + 1, false, &[("axis", "y")]),
+        ],
+    }
+}
+
+fn tree_leaves_block(id: u32, name: &str) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: prop_schema(&[("distance", &["1"]), ("persistent", &["false"])]),
+        states: vec![state(
+            id,
+            true,
+            &[("distance", "1"), ("persistent", "false")],
+        )],
+    }
+}
+
 fn prop_schema(entries: &[(&str, &[&str])]) -> BTreeMap<String, Vec<String>> {
     entries
         .iter()
@@ -136,25 +159,25 @@ fn sapling_tree_test_reports() -> Vec<BlockReport> {
     vec![
         simple_block(0, "minecraft:air"),
         simple_block(1, "minecraft:oak_sapling"),
-        BlockReport {
-            id: Identifier::parse("minecraft:oak_log").unwrap(),
-            properties: prop_schema(&[("axis", &["x", "y"])]),
-            states: vec![
-                state(2, true, &[("axis", "x")]),
-                state(3, false, &[("axis", "y")]),
-            ],
-        },
-        BlockReport {
-            id: Identifier::parse("minecraft:oak_leaves").unwrap(),
-            properties: prop_schema(&[("distance", &["1"]), ("persistent", &["false"])]),
-            states: vec![state(
-                4,
-                true,
-                &[("distance", "1"), ("persistent", "false")],
-            )],
-        },
+        axis_log_block(2, "minecraft:oak_log"),
+        tree_leaves_block(4, "minecraft:oak_leaves"),
         simple_block(5, "minecraft:stone"),
-        simple_block(6, "minecraft:birch_sapling"),
+        simple_block(6, "minecraft:cherry_sapling"),
+        simple_block(7, "minecraft:birch_sapling"),
+        axis_log_block(8, "minecraft:birch_log"),
+        tree_leaves_block(10, "minecraft:birch_leaves"),
+        simple_block(11, "minecraft:spruce_sapling"),
+        axis_log_block(12, "minecraft:spruce_log"),
+        tree_leaves_block(14, "minecraft:spruce_leaves"),
+        simple_block(15, "minecraft:jungle_sapling"),
+        axis_log_block(16, "minecraft:jungle_log"),
+        tree_leaves_block(18, "minecraft:jungle_leaves"),
+        simple_block(19, "minecraft:acacia_sapling"),
+        axis_log_block(20, "minecraft:acacia_log"),
+        tree_leaves_block(22, "minecraft:acacia_leaves"),
+        simple_block(23, "minecraft:dark_oak_sapling"),
+        axis_log_block(24, "minecraft:dark_oak_log"),
+        tree_leaves_block(26, "minecraft:dark_oak_leaves"),
     ]
 }
 
@@ -1529,6 +1552,49 @@ fn sapling_bonemeal_grows_small_oak_tree_and_consumes_one_item() {
         consume_bonemeal_after_growth(&mut inventory, 0, !outcome.applied.is_empty()).unwrap();
     assert_eq!(synced.count, 1);
     assert_eq!(inventory.held(0).count, 1);
+}
+
+#[test]
+fn common_sapling_bonemeal_uses_matching_log_and_leaves() {
+    let registry = sapling_tree_test_registry();
+
+    for (sapling_state, log_state, leaves_state) in [
+        (7, 9, 10),
+        (11, 13, 14),
+        (15, 17, 18),
+        (19, 21, 22),
+        (23, 25, 26),
+    ] {
+        let mut world = in_memory_tree_world(Arc::clone(&registry));
+        let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        world
+            .set_block_at(pos, BlockStateId(sapling_state))
+            .unwrap();
+
+        let edits = bonemeal_growth_edits(
+            registry.as_ref(),
+            &mut world,
+            pos,
+            BlockStateId(sapling_state),
+        )
+        .unwrap();
+
+        assert_eq!(
+            edits[0],
+            BlockEdit {
+                pos,
+                new_state: BlockStateId(log_state)
+            },
+            "sapling state {sapling_state} should use its matching log"
+        );
+        assert!(
+            edits.iter().any(|edit| {
+                edit.pos == mc_world::BlockPos { x: 4, y: 68, z: 4 }
+                    && edit.new_state == BlockStateId(leaves_state)
+            }),
+            "sapling state {sapling_state} should use its matching leaves"
+        );
+    }
 }
 
 #[test]

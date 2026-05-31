@@ -4865,7 +4865,7 @@ fn random_tick_edit(
             next_leaf_decay_state(blocks, state).map(|new_state| vec![BlockEdit { pos, new_state }])
         }
         mc_data::block_facts::RandomTickFamily::Sapling => {
-            oak_sapling_tree_edits(blocks, storage, pos, state)
+            sapling_tree_edits(blocks, storage, pos, state)
         }
     }
 }
@@ -4965,22 +4965,20 @@ fn bonemeal_growth_edits(
     if let Some(edit) = bonemeal_growth_edit(blocks, pos, state) {
         return Some(vec![edit]);
     }
-    oak_sapling_tree_edits(blocks, storage, pos, state)
+    sapling_tree_edits(blocks, storage, pos, state)
 }
 
-fn oak_sapling_tree_edits(
+fn sapling_tree_edits(
     blocks: &mc_world::BlockRegistry,
     storage: &mut mc_world::WorldStorage,
     pos: mc_world::BlockPos,
     state: mc_world::BlockStateId,
 ) -> Option<Vec<BlockEdit>> {
     let current = blocks.by_id(state)?;
-    if current.block.id.as_str() != "minecraft:oak_sapling" {
-        return None;
-    }
+    let (log_name, leaves_name) = sapling_tree_blocks(current.block.id.as_str())?;
 
-    let log = tree_state_with_props(blocks, "minecraft:oak_log", &[("axis", "y")])?;
-    let leaves = oak_leaves_tree_state(blocks)?;
+    let log = tree_state_with_props(blocks, log_name, &[("axis", "y")])?;
+    let leaves = tree_leaves_state(blocks, leaves_name)?;
     let air = named_block_default(blocks, "minecraft:air")?;
 
     let mut edits = Vec::new();
@@ -5037,6 +5035,20 @@ fn oak_sapling_tree_edits(
     Some(edits)
 }
 
+fn sapling_tree_blocks(sapling: &str) -> Option<(&'static str, &'static str)> {
+    match sapling {
+        "minecraft:oak_sapling" => Some(("minecraft:oak_log", "minecraft:oak_leaves")),
+        "minecraft:birch_sapling" => Some(("minecraft:birch_log", "minecraft:birch_leaves")),
+        "minecraft:spruce_sapling" => Some(("minecraft:spruce_log", "minecraft:spruce_leaves")),
+        "minecraft:jungle_sapling" => Some(("minecraft:jungle_log", "minecraft:jungle_leaves")),
+        "minecraft:acacia_sapling" => Some(("minecraft:acacia_log", "minecraft:acacia_leaves")),
+        "minecraft:dark_oak_sapling" => {
+            Some(("minecraft:dark_oak_log", "minecraft:dark_oak_leaves"))
+        }
+        _ => None,
+    }
+}
+
 fn tree_state_with_props(
     blocks: &mc_world::BlockRegistry,
     name: &str,
@@ -5052,10 +5064,13 @@ fn tree_state_with_props(
         .or_else(|| blocks.block(&id).map(|block| block.default))
 }
 
-fn oak_leaves_tree_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::BlockStateId> {
+fn tree_leaves_state(
+    blocks: &mc_world::BlockRegistry,
+    name: &str,
+) -> Option<mc_world::BlockStateId> {
     tree_state_with_props(
         blocks,
-        "minecraft:oak_leaves",
+        name,
         &[
             ("distance", "1"),
             ("persistent", "false"),
@@ -5065,7 +5080,7 @@ fn oak_leaves_tree_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::B
     .or_else(|| {
         tree_state_with_props(
             blocks,
-            "minecraft:oak_leaves",
+            name,
             &[
                 ("distance", "1"),
                 ("persistent", "true"),
@@ -5076,7 +5091,7 @@ fn oak_leaves_tree_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::B
     .or_else(|| {
         tree_state_with_props(
             blocks,
-            "minecraft:oak_leaves",
+            name,
             &[("persistent", "true"), ("waterlogged", "false")],
         )
     })
