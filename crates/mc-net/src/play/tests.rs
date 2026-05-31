@@ -145,6 +145,27 @@ fn wheat_drop_items() -> ItemRegistry {
     ])
 }
 
+fn carrot_slice_drop_items() -> ItemRegistry {
+    ItemRegistry::from_report(&[
+        ItemReport {
+            id: Identifier::parse("minecraft:wheat").unwrap(),
+            protocol_id: 50,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:wheat_seeds").unwrap(),
+            protocol_id: 51,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:carrot").unwrap(),
+            protocol_id: 52,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:pumpkin_stem").unwrap(),
+            protocol_id: 53,
+        },
+    ])
+}
+
 fn test_crop_state_with_age(blocks: &mc_world::BlockRegistry, crop: &str, age: u8) -> BlockStateId {
     blocks
         .by_name_and_props(
@@ -229,6 +250,104 @@ fn wheat_crop_drop_missing_item_ids_omit_unavailable_stacks() {
             &missing_all,
             &blocks,
             wheat,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn carrot_crop_drop_mature_returns_two_carrots() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let carrots = test_crop_state_with_age(&blocks, "minecraft:carrots", 7);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        carrots,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(52, 2)]);
+}
+
+#[test]
+fn carrot_crop_drop_immature_returns_one_carrot() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+
+    for age in 0..=6 {
+        let carrots = test_crop_state_with_age(&blocks, "minecraft:carrots", age);
+
+        let drops = block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            carrots,
+        );
+
+        assert_eq!(drops, vec![ItemStack::new(52, 1)], "age {age}");
+    }
+}
+
+#[test]
+fn carrot_slice_preserves_wheat_crop_drop_behavior() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let mature_wheat = test_crop_state_with_age(&blocks, "minecraft:wheat", 7);
+    let young_wheat = test_crop_state_with_age(&blocks, "minecraft:wheat", 3);
+
+    assert_eq!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            mature_wheat,
+        ),
+        vec![ItemStack::new(50, 1), ItemStack::new(51, 1)]
+    );
+    assert_eq!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            young_wheat,
+        ),
+        vec![ItemStack::new(51, 1)]
+    );
+}
+
+#[test]
+fn carrot_slice_unsupported_crop_state_uses_generic_fallback() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let pumpkin_stem = test_crop_state_with_age(&blocks, "minecraft:pumpkin_stem", 1);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        pumpkin_stem,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(53, 1)]);
+}
+
+#[test]
+fn carrot_crop_drop_missing_item_id_omits_unavailable_stack() {
+    let blocks = crop_test_registry();
+    let carrots = test_crop_state_with_age(&blocks, "minecraft:carrots", 7);
+    let missing_carrot = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:wheat").unwrap(),
+        protocol_id: 50,
+    }]);
+
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_carrot,
+            &blocks,
+            carrots,
         )
         .is_empty()
     );

@@ -347,21 +347,30 @@ pub(super) fn block_drop_stacks(
 }
 
 fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Option<Vec<ItemStack>> {
-    if block.block.id.as_str() != "minecraft:wheat" {
-        return None;
-    }
+    const WHEAT_MATURE_DROPS: &[(&str, i32)] =
+        &[("minecraft:wheat", 1), ("minecraft:wheat_seeds", 1)];
+    const WHEAT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:wheat_seeds", 1)];
+    const CARROT_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 2)];
+    const CARROT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 1)];
+
+    let (mature_drops, immature_drops) = match block.block.id.as_str() {
+        "minecraft:wheat" => (WHEAT_MATURE_DROPS, WHEAT_IMMATURE_DROPS),
+        "minecraft:carrots" => (CARROT_MATURE_DROPS, CARROT_IMMATURE_DROPS),
+        _ => return None,
+    };
 
     let age = block_state_property(block, "age")?.parse::<u8>().ok()?;
-    let mut drops = Vec::new();
-    if age >= 7
-        && let Some(wheat_id) = item_id(items, "minecraft:wheat")
-    {
-        drops.push(ItemStack::new(wheat_id, 1));
-    }
-    if let Some(seeds_id) = item_id(items, "minecraft:wheat_seeds") {
-        drops.push(ItemStack::new(seeds_id, 1));
-    }
-    Some(drops)
+    let drops = if age >= 7 {
+        mature_drops
+    } else {
+        immature_drops
+    };
+    Some(
+        drops
+            .iter()
+            .filter_map(|(item, count)| item_id(items, item).map(|id| ItemStack::new(id, *count)))
+            .collect(),
+    )
 }
 
 fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
