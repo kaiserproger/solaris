@@ -42,5 +42,6 @@ use support::*;
 const VIEW_DISTANCE: i32 = 2;
 
 include!("block_edit/breaks_and_crafting.rs");
+include!("block_edit/campfire.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/survival_lifecycle.rs");

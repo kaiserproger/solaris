@@ -42,9 +42,9 @@ client files.
 - Smokers/blast furnaces use furnace behavior; faster/specialized cooking is not
   claimed.
 - Barrels use chest storage; barrel animation parity is not claimed.
-- Campfire cooking consumes matching held inputs and drops cooked results, but
-  visual item metadata, in-flight persistence, exact timing parity, smoke, and
-  sound parity are not claimed.
+- Campfire cooking has Solaris harness coverage for consuming matching held
+  inputs and dropping cooked results, but visual item metadata, in-flight
+  persistence, exact timing parity, smoke, and sound parity are not claimed.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
