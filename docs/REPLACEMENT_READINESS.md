@@ -54,7 +54,8 @@ client files.
   `age=0` through `age=6` wheat dropping seeds only. Solaris harness coverage
   exists for young wheat growth, mature wheat no-consume behavior, and mature
   wheat harvest drops; young wheat harvest remains unit-covered only.
-  Particles/sounds/level events, vanilla RNG/growth-rate or loot-table parity,
+  Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
+  parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, other crop harvest drops, and all-crop harness coverage are not
   claimed yet.
