@@ -46,3 +46,4 @@ include!("block_edit/campfire.rs");
 include!("block_edit/crop_bonemeal.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/survival_lifecycle.rs");
+include!("block_edit/wheat_harvest.rs");

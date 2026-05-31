@@ -52,11 +52,12 @@ client files.
   exactly one item only after growth; breaking wheat drops deterministic local
   yields, with mature `age=7` wheat dropping wheat plus seeds and immature
   `age=0` through `age=6` wheat dropping seeds only. Solaris harness coverage
-  exists for young wheat growth and mature wheat no-consume behavior, but not
-  harvest drops yet. Particles/sounds/level events, vanilla RNG/growth-rate or
-  loot-table parity, exact soil/moisture/light growth rules beyond the existing
-  random-tick sampling, other crop harvest drops, and all-crop harness coverage
-  are not claimed yet.
+  exists for young wheat growth, mature wheat no-consume behavior, and mature
+  wheat harvest drops; young wheat harvest remains unit-covered only.
+  Particles/sounds/level events, vanilla RNG/growth-rate or loot-table parity,
+  exact soil/moisture/light growth rules beyond the existing random-tick
+  sampling, other crop harvest drops, and all-crop harness coverage are not
+  claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
