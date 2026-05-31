@@ -73,6 +73,13 @@ client files.
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, and
   all-crop harness coverage are not claimed yet.
+- Sugar cane and cactus have partial vertical-plant growth support: random ticks
+  can grow supported clear columns by one block up to height three, and samples
+  from any block in the column grow only above the contiguous top. Existing
+  support-break cascade behavior is preserved. Vanilla age-counter/RNG/timing
+  parity, exact sugar cane water adjacency or cactus neighbor survivability,
+  bonemeal, particles/sounds/statistics/game events, and harness coverage for
+  random-tick growth are not claimed yet.
 - Common one-by-one saplings have partial tree-growth support: using bonemeal on
   a clear oak, birch, spruce, jungle, acacia, or dark oak sapling creates a
   deterministic Solaris-owned small tree through existing block-edit paths, and
