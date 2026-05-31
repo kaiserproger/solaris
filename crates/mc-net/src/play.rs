@@ -5033,6 +5033,8 @@ fn is_supported_age_crop(block: &Identifier) -> bool {
             | "minecraft:potatoes"
             | "minecraft:beetroots"
             | "minecraft:nether_wart"
+            | "minecraft:melon_stem"
+            | "minecraft:pumpkin_stem"
     )
 }
 

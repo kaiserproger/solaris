@@ -146,6 +146,13 @@ fn crop_test_reports() -> Vec<BlockReport> {
                 .map(|age| state(52 + age, age == 0, &[("age", &age.to_string())]))
                 .collect(),
         },
+        BlockReport {
+            id: Identifier::parse("minecraft:melon_stem").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1"])]),
+            states: (0..=1)
+                .map(|age| state(54 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
@@ -1688,9 +1695,36 @@ fn crop_random_tick_advances_supported_age_crops_until_mature() {
         None
     );
     assert_eq!(
-        next_crop_growth_state(&blocks, mc_world::BlockStateId(52)),
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(0)),
         None
     );
+}
+
+#[test]
+fn stem_crop_growth_advances_melon_and_pumpkin_stems_once() {
+    let blocks = crop_test_registry();
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    for (stem, first_state) in [("minecraft:pumpkin_stem", 52), ("minecraft:melon_stem", 54)] {
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(first_state)),
+            Some(mc_world::BlockStateId(first_state + 1)),
+            "{stem} age 0 should advance"
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(first_state + 1)),
+            None,
+            "{stem} max fixture age should not advance"
+        );
+        assert_eq!(
+            bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(first_state)),
+            Some(BlockEdit {
+                pos,
+                new_state: mc_world::BlockStateId(first_state + 1),
+            }),
+            "{stem} bonemeal should advance by one age"
+        );
+    }
 }
 
 #[test]
