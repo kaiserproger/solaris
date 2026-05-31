@@ -4414,7 +4414,7 @@ pub(crate) async fn run_random_ticks(
                 continue;
             };
             eligible += 1;
-            if let Some(edit) = random_tick_edit(
+            if let Some(edits) = random_tick_edit(
                 &config.blocks,
                 &config.block_facts,
                 &mut storage,
@@ -4422,7 +4422,9 @@ pub(crate) async fn run_random_ticks(
                 state,
                 family,
             ) {
-                apply_block_edit_to_storage(&mut storage, table, &edit, &mut outcome);
+                for edit in &edits {
+                    apply_block_edit_to_storage(&mut storage, table, edit, &mut outcome);
+                }
             }
         }
     }
@@ -4845,25 +4847,26 @@ fn random_tick_edit(
     pos: mc_world::BlockPos,
     state: mc_world::BlockStateId,
     family: mc_data::block_facts::RandomTickFamily,
-) -> Option<BlockEdit> {
+) -> Option<Vec<BlockEdit>> {
     match family {
-        mc_data::block_facts::RandomTickFamily::Crop => {
-            next_crop_growth_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
-        }
+        mc_data::block_facts::RandomTickFamily::Crop => next_crop_growth_state(blocks, state)
+            .map(|new_state| vec![BlockEdit { pos, new_state }]),
         mc_data::block_facts::RandomTickFamily::Farmland => {
             next_farmland_state(blocks, facts, storage, pos, state)
-                .map(|new_state| BlockEdit { pos, new_state })
+                .map(|new_state| vec![BlockEdit { pos, new_state }])
         }
         mc_data::block_facts::RandomTickFamily::Fire => {
-            next_fire_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+            next_fire_state(blocks, state).map(|new_state| vec![BlockEdit { pos, new_state }])
         }
         mc_data::block_facts::RandomTickFamily::Grass => {
-            next_grass_edit(blocks, storage, pos, state)
+            next_grass_edit(blocks, storage, pos, state).map(|edit| vec![edit])
         }
         mc_data::block_facts::RandomTickFamily::Leaves => {
-            next_leaf_decay_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
+            next_leaf_decay_state(blocks, state).map(|new_state| vec![BlockEdit { pos, new_state }])
         }
-        mc_data::block_facts::RandomTickFamily::Sapling => None,
+        mc_data::block_facts::RandomTickFamily::Sapling => {
+            oak_sapling_tree_edits(blocks, storage, pos, state)
+        }
     }
 }
 

@@ -1622,20 +1622,62 @@ fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
 }
 
 #[test]
-fn sapling_random_tick_is_noop_until_tree_growth_exists() {
-    let reports = vec![
-        simple_block(0, "minecraft:air"),
-        simple_block(1, "minecraft:oak_sapling"),
-    ];
+fn sapling_random_tick_grows_clear_oak_tree_without_item_consumption() {
+    let reports = sapling_tree_test_reports();
     let registry = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
     let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
-    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
-    let pos = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+    let mut world = in_memory_tree_world(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(pos, BlockStateId(1)).unwrap();
 
     assert_eq!(
         facts.random_tick_family(1),
         Some(mc_data::block_facts::RandomTickFamily::Sapling)
     );
+    let edits = random_tick_edit(
+        registry.as_ref(),
+        &facts,
+        &mut world,
+        pos,
+        BlockStateId(1),
+        mc_data::block_facts::RandomTickFamily::Sapling,
+    )
+    .unwrap();
+    assert_eq!(edits.len(), 17);
+    assert_eq!(
+        edits[0],
+        BlockEdit {
+            pos,
+            new_state: BlockStateId(3)
+        }
+    );
+
+    let mut outcome = BlockEditBatchOutcome::default();
+    for edit in &edits {
+        apply_block_edit_to_storage(&mut world, None, edit, &mut outcome);
+    }
+    assert!(!outcome.applied.is_empty());
+    assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(3)));
+    assert_eq!(
+        world
+            .get_block(mc_world::BlockPos { x: 4, y: 68, z: 4 })
+            .unwrap(),
+        Some(BlockStateId(4))
+    );
+}
+
+#[test]
+fn sapling_random_tick_obstructed_or_unsupported_targets_are_noop() {
+    let reports = sapling_tree_test_reports();
+    let registry = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
+    let mut world = in_memory_tree_world(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    world.set_block_at(pos, BlockStateId(1)).unwrap();
+    world
+        .set_block_at(mc_world::BlockPos { x: 4, y: 68, z: 4 }, BlockStateId(5))
+        .unwrap();
+
     assert_eq!(
         random_tick_edit(
             registry.as_ref(),
@@ -1643,6 +1685,18 @@ fn sapling_random_tick_is_noop_until_tree_growth_exists() {
             &mut world,
             pos,
             BlockStateId(1),
+            mc_data::block_facts::RandomTickFamily::Sapling,
+        ),
+        None
+    );
+    assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(1)));
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            pos,
+            BlockStateId(6),
             mc_data::block_facts::RandomTickFamily::Sapling,
         ),
         None
