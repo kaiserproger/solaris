@@ -77,6 +77,9 @@ impl ItemToBlockTable {
         {
             return None;
         }
+        if is_cocoa_beans_item(items, item_id) {
+            return cocoa_state_for_use_on(clicked_state, direction, blocks);
+        }
         if is_sign_item(items, item_id) {
             return sign_state_for_use_on(items, item_id, direction, blocks);
         }
@@ -117,6 +120,32 @@ fn is_sign_item(items: &ItemRegistry, item_id: u32) -> bool {
         let path = item.path();
         path.ends_with("_sign") && !path.ends_with("_hanging_sign")
     })
+}
+
+fn is_cocoa_beans_item(items: &ItemRegistry, item_id: u32) -> bool {
+    items
+        .name_of(item_id)
+        .is_some_and(|item| item.as_str() == "minecraft:cocoa_beans")
+}
+
+fn cocoa_state_for_use_on(
+    clicked_state: mc_world::BlockStateId,
+    direction: Direction,
+    blocks: &mc_world::BlockRegistry,
+) -> Option<mc_world::BlockStateId> {
+    let facing = direction_to_horizontal_facing(direction)?;
+    let clicked = blocks.by_id(clicked_state)?;
+    if !matches!(clicked.block.id.as_str(), "minecraft:jungle_log") {
+        return None;
+    }
+    let cocoa = Identifier::parse("minecraft:cocoa").expect("static identifier");
+    blocks.by_name_and_props(
+        &cocoa,
+        &[
+            ("age".to_string(), "0".to_string()),
+            ("facing".to_string(), facing.to_string()),
+        ],
+    )
 }
 
 fn sign_state_for_use_on(

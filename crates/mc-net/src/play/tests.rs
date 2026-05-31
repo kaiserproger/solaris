@@ -177,6 +177,7 @@ fn crop_test_reports() -> Vec<BlockReport> {
         simple_block(64, "minecraft:pumpkin"),
         attached_stem_block(65, "minecraft:attached_melon_stem"),
         attached_stem_block(69, "minecraft:attached_pumpkin_stem"),
+        simple_block(73, "minecraft:jungle_log"),
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
@@ -1081,6 +1082,37 @@ fn common_crop_items_place_on_their_required_soil_only() {
     );
     assert_eq!(
         table.resolve_for_use_on(&items, 54, farmland_state, Direction::Up, &blocks),
+        None
+    );
+}
+
+#[test]
+fn cocoa_beans_place_cocoa_on_jungle_log_sides() {
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:cocoa_beans").unwrap(),
+        protocol_id: 58,
+    }]);
+    let blocks = crop_test_registry();
+    let table = ItemToBlockTable::build(&items, &blocks);
+    let jungle_log = blocks
+        .block(&Identifier::parse("minecraft:jungle_log").unwrap())
+        .unwrap()
+        .default;
+    let dirt = blocks
+        .block(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap()
+        .default;
+
+    assert_eq!(
+        table.resolve_for_use_on(&items, 58, jungle_log, Direction::North, &blocks),
+        Some(mc_world::BlockStateId(60))
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 58, jungle_log, Direction::Up, &blocks),
+        None
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 58, dirt, Direction::North, &blocks),
         None
     );
 }

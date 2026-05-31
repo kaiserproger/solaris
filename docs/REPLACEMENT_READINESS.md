@@ -70,19 +70,20 @@ client files.
   berry bushes can be harvested with use-on, reset to `age=1`, and drop
   deterministic local sweet berry yields. Breaking cocoa drops deterministic
   local cocoa bean yields, with mature `age=2` cocoa dropping cocoa beans x3
-  and immature `age=0` through `age=1` cocoa dropping cocoa beans x1. Crop
-  harvest item ids are resolved through the loaded item registry and missing ids
-  are omitted safely. Solaris harness coverage exists for young wheat growth,
-  mature wheat no-consume behavior, and mature wheat harvest drops; young wheat,
-  carrot harvest, potato harvest, beetroot harvest, nether wart harvest, stem
-  fruit lifecycle, sweet berry harvest, and cocoa harvest remain unit-covered
-  only.
+  and immature `age=0` through `age=1` cocoa dropping cocoa beans x1. Cocoa
+  beans can place age-0 cocoa on horizontal jungle-log faces when the target
+  cell is clear. Crop harvest item ids are resolved through the loaded item
+  registry and missing ids are omitted safely. Solaris harness coverage exists
+  for young wheat growth, mature wheat no-consume behavior, and mature wheat
+  harvest drops; young wheat, carrot harvest, potato harvest, beetroot harvest,
+  nether wart harvest, stem fruit lifecycle, sweet berry harvest, cocoa harvest,
+  and cocoa placement remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, exact
   vanilla stem fruit placement/support/RNG parity, exact sweet berry drop RNG or
-  collision behavior, cocoa placement/support parity, exact cocoa loot/RNG
+  collision behavior, exact cocoa placement/support parity, exact cocoa loot/RNG
   parity, all-crop harness coverage are not claimed yet.
 - Sugar cane, cactus, and bamboo have partial vertical-plant growth support:
   random ticks can grow supported clear columns by one block up to the local
