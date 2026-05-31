@@ -4880,7 +4880,7 @@ fn vertical_plant_growth_edit(
     state: mc_world::BlockStateId,
 ) -> Option<BlockEdit> {
     let current = blocks.by_id(state)?;
-    if !matches!(current.block.id.path(), "sugar_cane" | "cactus") {
+    if !matches!(current.block.id.path(), "sugar_cane" | "cactus" | "bamboo") {
         return None;
     }
     let plant_state = blocks.block(&current.block.id).map(|block| block.default)?;
