@@ -167,6 +167,18 @@ fn carrot_slice_drop_items() -> ItemRegistry {
             id: Identifier::parse("minecraft:potato").unwrap(),
             protocol_id: 54,
         },
+        ItemReport {
+            id: Identifier::parse("minecraft:beetroot").unwrap(),
+            protocol_id: 55,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:beetroot_seeds").unwrap(),
+            protocol_id: 56,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:nether_wart").unwrap(),
+            protocol_id: 57,
+        },
     ])
 }
 
@@ -407,6 +419,126 @@ fn potato_crop_drop_missing_item_id_omits_unavailable_stack() {
             &missing_potato,
             &blocks,
             potatoes,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn beetroot_crop_drop_mature_returns_beetroot_and_seeds() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let beetroots = test_crop_state_with_age(&blocks, "minecraft:beetroots", 3);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        beetroots,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(55, 1), ItemStack::new(56, 1)]);
+}
+
+#[test]
+fn beetroot_crop_drop_immature_returns_seeds_only() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+
+    for age in 0..=2 {
+        let beetroots = test_crop_state_with_age(&blocks, "minecraft:beetroots", age);
+
+        let drops = block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            beetroots,
+        );
+
+        assert_eq!(drops, vec![ItemStack::new(56, 1)], "age {age}");
+    }
+}
+
+#[test]
+fn beetroot_crop_drop_missing_item_ids_omit_unavailable_stacks() {
+    let blocks = crop_test_registry();
+    let beetroots = test_crop_state_with_age(&blocks, "minecraft:beetroots", 3);
+    let seeds_only = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:beetroot_seeds").unwrap(),
+        protocol_id: 56,
+    }]);
+    let missing_all = ItemRegistry::default();
+
+    assert_eq!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &seeds_only,
+            &blocks,
+            beetroots,
+        ),
+        vec![ItemStack::new(56, 1)]
+    );
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_all,
+            &blocks,
+            beetroots,
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn nether_wart_crop_drop_mature_returns_two_warts() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+    let nether_wart = test_crop_state_with_age(&blocks, "minecraft:nether_wart", 3);
+
+    let drops = block_drop_stacks_from(
+        &mc_data::loot::LootTables::default(),
+        &items,
+        &blocks,
+        nether_wart,
+    );
+
+    assert_eq!(drops, vec![ItemStack::new(57, 2)]);
+}
+
+#[test]
+fn nether_wart_crop_drop_immature_returns_one_wart() {
+    let blocks = crop_test_registry();
+    let items = carrot_slice_drop_items();
+
+    for age in 0..=2 {
+        let nether_wart = test_crop_state_with_age(&blocks, "minecraft:nether_wart", age);
+
+        let drops = block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &items,
+            &blocks,
+            nether_wart,
+        );
+
+        assert_eq!(drops, vec![ItemStack::new(57, 1)], "age {age}");
+    }
+}
+
+#[test]
+fn nether_wart_crop_drop_missing_item_id_omits_unavailable_stack() {
+    let blocks = crop_test_registry();
+    let nether_wart = test_crop_state_with_age(&blocks, "minecraft:nether_wart", 3);
+    let missing_wart = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:beetroot").unwrap(),
+        protocol_id: 55,
+    }]);
+
+    assert!(
+        block_drop_stacks_from(
+            &mc_data::loot::LootTables::default(),
+            &missing_wart,
+            &blocks,
+            nether_wart,
         )
         .is_empty()
     );

@@ -47,7 +47,8 @@ client files.
   particles, exact ejection vector parity, and hopper/comparator automation are
   not claimed.
 - Farming has partial crop growth, bonemeal, wheat harvest drop support, carrot
-  harvest drop support, and potato harvest drop support:
+  harvest drop support, potato harvest drop support, beetroot harvest drop
+  support, and nether wart harvest drop support:
   wheat, carrots, potatoes, beetroots, and nether wart can advance one age at a
   time through random ticks or successful bonemeal use; bonemeal consumes
   exactly one item only after growth; breaking wheat drops deterministic local
@@ -57,13 +58,19 @@ client files.
   and immature `age=0` through `age=6` carrots dropping carrot x1; breaking
   potatoes drops deterministic local yields, with mature `age=7` potatoes
   dropping potato x2 and immature `age=0` through `age=6` potatoes dropping
-  potato x1. Solaris harness coverage exists for young wheat growth, mature
-  wheat no-consume behavior, and mature wheat harvest drops; young wheat,
-  carrot harvest, and potato harvest remain unit-covered only.
+  potato x1; breaking beetroots drops deterministic local yields, with mature
+  `age=3` beetroots dropping beetroot x1 plus beetroot seeds x1 and immature
+  `age=0` through `age=2` beetroots dropping beetroot seeds x1; breaking
+  nether wart drops deterministic local yields, with mature `age=3` nether
+  wart dropping nether wart x2 and immature `age=0` through `age=2` nether
+  wart dropping nether wart x1. Solaris harness coverage exists for young wheat
+  growth, mature wheat no-consume behavior, and mature wheat harvest drops;
+  young wheat, carrot harvest, potato harvest, beetroot harvest, and nether
+  wart harvest remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
-  sampling, beetroot/nether wart harvest drops, poisonous potato chance, and
+  sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, and
   all-crop harness coverage are not claimed yet.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
