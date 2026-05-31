@@ -28,8 +28,7 @@ client files.
 - Crafting table, chest, barrel-style storage, furnace, smoker, and blast furnace
   using the current furnace storage/cooking model.
 - Recipe loading accepts furnace, blasting, smoking, and campfire variants;
-  furnace runtime routes furnace, blast furnace, and smoker categories, and
-  campfires support volatile no-GUI cooking item drops.
+  furnace runtime routes furnace, blast furnace, and smoker categories.
 - Basic farming, fluids, mobs/combat, death/respawn, XP, drops, inventory, and
   multiplayer visibility/pickups.
 - Runtime metrics and budgets from M37 for debug-load visibility.
@@ -42,9 +41,11 @@ client files.
 - Smokers/blast furnaces use furnace behavior; faster/specialized cooking is not
   claimed.
 - Barrels use chest storage; barrel animation parity is not claimed.
-- Campfire cooking has Solaris harness coverage for consuming matching held
-  inputs and dropping cooked results, but visual item metadata, in-flight
-  persistence, exact timing parity, smoke, and sound parity are not claimed.
+- Campfire cooking has usable partial support with Solaris harness coverage for
+  consuming matching held inputs and dropping cooked results, but visual
+  item-on-campfire metadata, in-flight persistence across restart, smoke/sound
+  particles, exact ejection vector parity, and hopper/comparator automation are
+  not claimed.
 - Bows can launch basic arrow projectile entities with local physics, block stop,
   lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
   self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
