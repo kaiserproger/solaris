@@ -116,6 +116,13 @@ fn crop_test_reports() -> Vec<BlockReport> {
                 .map(|age| state(44 + age, age == 0, &[("age", &age.to_string())]))
                 .collect(),
         },
+        BlockReport {
+            id: Identifier::parse("minecraft:pumpkin_stem").unwrap(),
+            properties: prop_schema(&[("age", &["0", "1"])]),
+            states: (0..=1)
+                .map(|age| state(52 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
@@ -932,25 +939,115 @@ fn bamboo_column_cascades_when_support_breaks() {
 }
 
 #[test]
-fn wheat_random_tick_advances_age_until_mature() {
+fn crop_random_tick_advances_supported_age_crops_until_mature() {
     let blocks = crop_test_registry();
 
-    assert_eq!(
-        next_crop_growth_state(&blocks, mc_world::BlockStateId(11)),
-        Some(mc_world::BlockStateId(12))
-    );
-    assert_eq!(
-        next_crop_growth_state(&blocks, mc_world::BlockStateId(17)),
-        Some(mc_world::BlockStateId(18))
-    );
-    assert_eq!(
-        next_crop_growth_state(&blocks, mc_world::BlockStateId(18)),
-        None
-    );
+    for (crop, first_state) in [
+        ("minecraft:wheat", 11),
+        ("minecraft:carrots", 20),
+        ("minecraft:potatoes", 28),
+        ("minecraft:beetroots", 36),
+        ("minecraft:nether_wart", 44),
+    ] {
+        let crop = Identifier::parse(crop).unwrap();
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(first_state)),
+            Some(mc_world::BlockStateId(first_state + 1)),
+            "{crop} age 0 should advance"
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(first_state + 6)),
+            Some(mc_world::BlockStateId(first_state + 7)),
+            "{crop} age 6 should advance"
+        );
+        assert_eq!(
+            next_crop_growth_state(&blocks, mc_world::BlockStateId(first_state + 7)),
+            None,
+            "{crop} max age should not advance"
+        );
+    }
+
     assert_eq!(
         next_crop_growth_state(&blocks, mc_world::BlockStateId(1)),
         None
     );
+    assert_eq!(
+        next_crop_growth_state(&blocks, mc_world::BlockStateId(52)),
+        None
+    );
+}
+
+#[test]
+fn bonemeal_growth_edit_advances_supported_crop_one_age() {
+    let blocks = crop_test_registry();
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    for (crop, first_state) in [
+        ("minecraft:wheat", 11),
+        ("minecraft:carrots", 20),
+        ("minecraft:potatoes", 28),
+        ("minecraft:beetroots", 36),
+        ("minecraft:nether_wart", 44),
+    ] {
+        assert_eq!(
+            bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(first_state)),
+            Some(BlockEdit {
+                pos,
+                new_state: mc_world::BlockStateId(first_state + 1),
+            }),
+            "{crop} should advance by one registered age state"
+        );
+    }
+}
+
+#[test]
+fn bonemeal_growth_edit_ignores_mature_and_invalid_targets() {
+    let blocks = crop_test_registry();
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    assert_eq!(
+        bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(18)),
+        None
+    );
+    assert_eq!(
+        bonemeal_growth_edit(&blocks, pos, mc_world::BlockStateId(1)),
+        None
+    );
+}
+
+#[test]
+fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.set_hotbar(
+        0,
+        ItemStack {
+            item_id: 99,
+            count: 3,
+            damage: None,
+        },
+    );
+
+    assert_eq!(
+        consume_bonemeal_after_growth(&mut inventory, 0, false),
+        None
+    );
+    assert_eq!(inventory.held(0).count, 3);
+
+    let synced = consume_bonemeal_after_growth(&mut inventory, 0, true).unwrap();
+    assert_eq!(synced.count, 2);
+    assert_eq!(inventory.held(0).count, 2);
+
+    inventory.set_hotbar(
+        0,
+        ItemStack {
+            item_id: 99,
+            count: 1,
+            damage: None,
+        },
+    );
+    let synced = consume_bonemeal_after_growth(&mut inventory, 0, true).unwrap();
+    assert!(synced.is_empty());
+    assert!(inventory.held(0).is_empty());
 }
 
 #[test]

@@ -4922,14 +4922,30 @@ fn next_crop_growth_state(
     state: mc_world::BlockStateId,
 ) -> Option<mc_world::BlockStateId> {
     let current = blocks.by_id(state)?;
-    if current.block.id.as_str() != "minecraft:wheat" {
+    if !is_supported_age_crop(&current.block.id) {
         return None;
     }
     let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
-    if age >= 7 {
-        return None;
-    }
-    crop_state_with_age(blocks, &current.block.id, age + 1)
+    crop_state_with_age(blocks, &current.block.id, age.checked_add(1)?)
+}
+
+fn is_supported_age_crop(block: &Identifier) -> bool {
+    matches!(
+        block.as_str(),
+        "minecraft:wheat"
+            | "minecraft:carrots"
+            | "minecraft:potatoes"
+            | "minecraft:beetroots"
+            | "minecraft:nether_wart"
+    )
+}
+
+fn bonemeal_growth_edit(
+    blocks: &mc_world::BlockRegistry,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<BlockEdit> {
+    next_crop_growth_state(blocks, state).map(|new_state| BlockEdit { pos, new_state })
 }
 
 fn next_leaf_decay_state(
@@ -6300,6 +6316,19 @@ where
         return Ok(());
     };
 
+    if handle_bonemeal_use_on(
+        state,
+        writer,
+        action.sequence,
+        clicked_pos,
+        held_slot,
+        held.item_id,
+    )
+    .await?
+    {
+        return Ok(());
+    }
+
     // Validate: target cell must currently be air. Crop items also
     // inspect the clicked block because seeds place the crop above
     // their supporting soil instead of mapping item name to block name.
@@ -6412,6 +6441,67 @@ where
     )
     .await?;
     Ok(())
+}
+
+async fn handle_bonemeal_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    held_slot: u8,
+    held_item_id: u32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let bone_meal = Identifier::parse("minecraft:bone_meal").expect("static identifier");
+    if state.items.id_of(&bone_meal) != Some(held_item_id) {
+        return Ok(false);
+    }
+
+    let edit = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(clicked_pos) {
+            Ok(Some(current)) => bonemeal_growth_edit(&state.blocks, clicked_pos, current),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = %err, x = clicked_pos.x, y = clicked_pos.y, z = clicked_pos.z, "bonemeal target read failed");
+                None
+            }
+        }
+    };
+
+    let Some(edit) = edit else {
+        write_block_ack(writer, state.compression, sequence).await?;
+        return Ok(true);
+    };
+
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &[edit]).await?;
+    if outcome.applied.is_empty() {
+        return Ok(true);
+    }
+
+    let slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
+    let slot_value = consume_bonemeal_after_growth(&mut state.inventory, held_slot, true)
+        .expect("growth succeeded");
+    write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
+    Ok(true)
+}
+
+fn consume_bonemeal_after_growth(
+    inventory: &mut PlayerInventory,
+    held_slot: u8,
+    grew: bool,
+) -> Option<ItemStack> {
+    if !grew {
+        return None;
+    }
+    let held = inventory.held_mut(held_slot);
+    held.count = held.count.saturating_sub(1);
+    if held.count <= 0 {
+        *held = ItemStack::EMPTY;
+    }
+    Some(inventory.held(held_slot).clone())
 }
 
 async fn plan_place_block_edits(
