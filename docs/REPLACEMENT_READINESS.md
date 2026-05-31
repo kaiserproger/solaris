@@ -64,18 +64,21 @@ client files.
   `age=0` through `age=2` beetroots dropping beetroot seeds x1; breaking
   nether wart drops deterministic local yields, with mature `age=3` nether
   wart dropping nether wart x2 and immature `age=0` through `age=2` nether
-  wart dropping nether wart x1. Crop harvest item ids are resolved through the
-  loaded item registry and missing ids are omitted safely. Solaris harness
-  coverage exists for young wheat growth, mature wheat no-consume behavior, and
-  mature wheat harvest drops; young wheat, carrot harvest, potato harvest,
-  beetroot harvest, and nether wart harvest remain unit-covered only.
+  wart dropping nether wart x1. Mature melon and pumpkin stems can place one
+  adjacent fruit block through random ticks or successful bonemeal use and
+  convert the stem to the matching attached-stem state. Crop harvest item ids
+  are resolved through the loaded item registry and missing ids are omitted
+  safely. Solaris harness coverage exists for young wheat growth, mature wheat
+  no-consume behavior, and mature wheat harvest drops; young wheat, carrot
+  harvest, potato harvest, beetroot harvest, and nether wart harvest remain
+  unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
-  sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, and
-  stem fruit placement/conversion, sweet berry harvesting/collision behavior,
-  cocoa placement/harvest/support parity, all-crop harness coverage are not
-  claimed yet.
+  sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, exact
+  vanilla stem fruit placement/support/RNG parity, sweet berry
+  harvesting/collision behavior, cocoa placement/harvest/support parity,
+  all-crop harness coverage are not claimed yet.
 - Sugar cane, cactus, and bamboo have partial vertical-plant growth support:
   random ticks can grow supported clear columns by one block up to the local
   height-three cap, and samples from any block in the column grow only above the

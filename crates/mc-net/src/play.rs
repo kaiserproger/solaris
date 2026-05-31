@@ -4851,6 +4851,7 @@ fn random_tick_edit(
     match family {
         mc_data::block_facts::RandomTickFamily::Crop => next_crop_growth_state(blocks, state)
             .map(|new_state| vec![BlockEdit { pos, new_state }])
+            .or_else(|| stem_fruit_edits(blocks, storage, pos, state))
             .or_else(|| {
                 vertical_plant_growth_edit(blocks, storage, pos, state).map(|edit| vec![edit])
             }),
@@ -5057,7 +5058,71 @@ fn bonemeal_growth_edits(
     if let Some(edit) = bonemeal_growth_edit(blocks, pos, state) {
         return Some(vec![edit]);
     }
+    if let Some(edits) = stem_fruit_edits(blocks, storage, pos, state) {
+        return Some(edits);
+    }
     sapling_tree_edits(blocks, storage, pos, state)
+}
+
+fn stem_fruit_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<Vec<BlockEdit>> {
+    let current = blocks.by_id(state)?;
+    let (fruit_name, attached_name) = stem_lifecycle_blocks(current.block.id.as_str())?;
+    let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
+    if sibling_state_with_property(blocks, current, "age", &age.checked_add(1)?.to_string())
+        .is_some()
+    {
+        return None;
+    }
+
+    let fruit_state = named_block_default(blocks, fruit_name)?;
+    let attached = Identifier::parse(attached_name).expect("static identifier");
+    let attached_default = blocks
+        .block(&attached)
+        .and_then(|block| blocks.by_id(block.default))?;
+    let air = named_block_default(blocks, "minecraft:air")?;
+
+    for (facing, dx, dz) in [
+        ("north", 0, -1),
+        ("south", 0, 1),
+        ("west", -1, 0),
+        ("east", 1, 0),
+    ] {
+        let fruit_pos = mc_world::BlockPos {
+            x: pos.x + dx,
+            z: pos.z + dz,
+            ..pos
+        };
+        if !matches!(storage.get_block(fruit_pos), Ok(Some(found)) if found == air) {
+            continue;
+        }
+        let attached_state =
+            sibling_state_with_property(blocks, attached_default, "facing", facing)?;
+        return Some(vec![
+            BlockEdit {
+                pos,
+                new_state: attached_state,
+            },
+            BlockEdit {
+                pos: fruit_pos,
+                new_state: fruit_state,
+            },
+        ]);
+    }
+
+    None
+}
+
+fn stem_lifecycle_blocks(stem: &str) -> Option<(&'static str, &'static str)> {
+    match stem {
+        "minecraft:melon_stem" => Some(("minecraft:melon", "minecraft:attached_melon_stem")),
+        "minecraft:pumpkin_stem" => Some(("minecraft:pumpkin", "minecraft:attached_pumpkin_stem")),
+        _ => None,
+    }
 }
 
 fn sapling_tree_edits(

@@ -173,9 +173,27 @@ fn crop_test_reports() -> Vec<BlockReport> {
                 })
                 .collect(),
         },
+        simple_block(63, "minecraft:melon"),
+        simple_block(64, "minecraft:pumpkin"),
+        attached_stem_block(65, "minecraft:attached_melon_stem"),
+        attached_stem_block(69, "minecraft:attached_pumpkin_stem"),
     ];
     reports.sort_by_key(|block| block.states.first().map(|state| state.id).unwrap_or(0));
     reports
+}
+
+fn attached_stem_block(first_id: u32, name: &str) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: prop_schema(&[("facing", &["north", "south", "west", "east"])]),
+        states: ["north", "south", "west", "east"]
+            .into_iter()
+            .enumerate()
+            .map(|(offset, facing)| {
+                state(first_id + offset as u32, offset == 0, &[("facing", facing)])
+            })
+            .collect(),
+    }
 }
 
 fn crop_test_registry() -> mc_world::BlockRegistry {
@@ -1814,6 +1832,67 @@ fn stem_crop_growth_advances_melon_and_pumpkin_stems_once() {
             "{stem} bonemeal should advance by one age"
         );
     }
+}
+
+#[test]
+fn mature_stem_growth_places_fruit_and_attaches_stem() {
+    let registry = Arc::new(crop_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+
+    let melon_stem = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let melon_fruit = mc_world::BlockPos { x: 4, y: 64, z: 3 };
+    world.set_block_at(melon_stem, BlockStateId(55)).unwrap();
+    assert_eq!(
+        random_tick_edit(
+            blocks,
+            &mc_data::block_facts::BlockFactsTable::default(),
+            &mut world,
+            melon_stem,
+            BlockStateId(55),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        Some(vec![
+            BlockEdit {
+                pos: melon_stem,
+                new_state: BlockStateId(65),
+            },
+            BlockEdit {
+                pos: melon_fruit,
+                new_state: BlockStateId(63),
+            },
+        ])
+    );
+
+    let pumpkin_stem = mc_world::BlockPos { x: 8, y: 64, z: 8 };
+    let blocked_north = mc_world::BlockPos { x: 8, y: 64, z: 7 };
+    let pumpkin_fruit = mc_world::BlockPos { x: 8, y: 64, z: 9 };
+    world.set_block_at(pumpkin_stem, BlockStateId(53)).unwrap();
+    world.set_block_at(blocked_north, BlockStateId(1)).unwrap();
+    assert_eq!(
+        bonemeal_growth_edits(blocks, &mut world, pumpkin_stem, BlockStateId(53)),
+        Some(vec![
+            BlockEdit {
+                pos: pumpkin_stem,
+                new_state: BlockStateId(70),
+            },
+            BlockEdit {
+                pos: pumpkin_fruit,
+                new_state: BlockStateId(64),
+            },
+        ])
+    );
 }
 
 #[test]
