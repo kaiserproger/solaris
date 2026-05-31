@@ -30,9 +30,7 @@ impl ItemToBlockTable {
                     .map(|block| (item_pid, block.default))
             })
             .collect();
-        let crop_entries = wheat_crop_placement_entry(items, blocks)
-            .into_iter()
-            .collect();
+        let crop_entries = crop_placement_entries(items, blocks);
         let empty_bucket_item = item_id(items, "minecraft:bucket");
         let water_bucket_item = item_id(items, "minecraft:water_bucket");
         let lava_bucket_item = item_id(items, "minecraft:lava_bucket");
@@ -71,6 +69,13 @@ impl ItemToBlockTable {
                 .find(|entry| entry.item_id == item_id && clicked.block.id == entry.soil_block)
         {
             return Some(entry.crop_state);
+        }
+        if self
+            .crop_entries
+            .iter()
+            .any(|entry| entry.item_id == item_id)
+        {
+            return None;
         }
         if is_sign_item(items, item_id) {
             return sign_state_for_use_on(items, item_id, direction, blocks);
@@ -140,19 +145,58 @@ fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
     items.id_of(&Identifier::parse(name).expect("static identifier"))
 }
 
-fn wheat_crop_placement_entry(
+fn crop_placement_entries(
     items: &ItemRegistry,
     blocks: &mc_world::BlockRegistry,
+) -> Vec<CropPlacementEntry> {
+    [
+        (
+            "minecraft:wheat_seeds",
+            "minecraft:farmland",
+            "minecraft:wheat",
+        ),
+        (
+            "minecraft:carrot",
+            "minecraft:farmland",
+            "minecraft:carrots",
+        ),
+        (
+            "minecraft:potato",
+            "minecraft:farmland",
+            "minecraft:potatoes",
+        ),
+        (
+            "minecraft:beetroot_seeds",
+            "minecraft:farmland",
+            "minecraft:beetroots",
+        ),
+        (
+            "minecraft:nether_wart",
+            "minecraft:soul_sand",
+            "minecraft:nether_wart",
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(item, soil, crop)| crop_placement_entry(items, blocks, item, soil, crop))
+    .collect()
+}
+
+fn crop_placement_entry(
+    items: &ItemRegistry,
+    blocks: &mc_world::BlockRegistry,
+    item: &str,
+    soil: &str,
+    crop: &str,
 ) -> Option<CropPlacementEntry> {
-    let wheat_seeds = Identifier::parse("minecraft:wheat_seeds").expect("static identifier");
-    let farmland = Identifier::parse("minecraft:farmland").expect("static identifier");
-    let wheat = Identifier::parse("minecraft:wheat").expect("static identifier");
-    let item_id = items.id_of(&wheat_seeds)?;
-    blocks.block(&farmland)?;
-    let crop_state = crop_state_with_age(blocks, &wheat, 0)?;
+    let item = Identifier::parse(item).expect("static identifier");
+    let soil = Identifier::parse(soil).expect("static identifier");
+    let crop = Identifier::parse(crop).expect("static identifier");
+    let item_id = items.id_of(&item)?;
+    blocks.block(&soil)?;
+    let crop_state = crop_state_with_age(blocks, &crop, 0)?;
     Some(CropPlacementEntry {
         item_id,
-        soil_block: farmland,
+        soil_block: soil,
         crop_state,
     })
 }

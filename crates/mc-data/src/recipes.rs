@@ -52,6 +52,9 @@ pub enum RecipeKind {
     Shaped(ShapedRecipe),
     Shapeless(ShapelessRecipe),
     Smelting(SmeltingRecipe),
+    Blasting(SmeltingRecipe),
+    Smoking(SmeltingRecipe),
+    CampfireCooking(SmeltingRecipe),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -88,11 +91,10 @@ pub struct RecipeResult {
     pub count: u32,
 }
 
-/// Load shaped and shapeless recipes from `<data>/minecraft/recipe`.
+/// Load shaped, shapeless, and cooking recipes from `<data>/minecraft/recipe`.
 ///
-/// Unsupported recipe types are skipped because this foundation slice only
-/// prepares normal crafting data. A missing directory is not an error: the
-/// default sidecar extraction excludes recipe JSON, and startup should keep
+/// Unsupported recipe types are skipped. A missing directory is not an error:
+/// the default sidecar extraction excludes recipe JSON, and startup should keep
 /// working without crafting data.
 pub fn load_recipes(recipe_dir: impl AsRef<Path>) -> Result<Vec<Recipe>, RecipeDataError> {
     let recipe_dir = recipe_dir.as_ref();
@@ -174,9 +176,12 @@ fn parse_recipe_value(
             let raw: RawShapelessRecipe = from_value(path, value)?;
             Ok(Some(parse_shapeless_recipe(path, id, raw)?))
         }
-        "minecraft:smelting" => {
+        "minecraft:smelting"
+        | "minecraft:blasting"
+        | "minecraft:smoking"
+        | "minecraft:campfire_cooking" => {
             let raw: RawSmeltingRecipe = from_value(path, value)?;
-            Ok(Some(parse_smelting_recipe(path, id, raw)?))
+            Ok(Some(parse_smelting_recipe(path, id, raw, header.kind)?))
         }
         _ => Ok(None),
     }
@@ -250,13 +255,22 @@ fn parse_smelting_recipe(
     path: &Path,
     id: Identifier,
     raw: RawSmeltingRecipe,
+    raw_kind: String,
 ) -> Result<Recipe, RecipeDataError> {
+    let smelting = SmeltingRecipe {
+        ingredient: parse_ingredient(path, raw.ingredient)?,
+        cooking_time: raw.cooking_time,
+    };
+    let kind = match raw_kind.as_str() {
+        "minecraft:smelting" => RecipeKind::Smelting(smelting),
+        "minecraft:blasting" => RecipeKind::Blasting(smelting),
+        "minecraft:smoking" => RecipeKind::Smoking(smelting),
+        "minecraft:campfire_cooking" => RecipeKind::CampfireCooking(smelting),
+        _ => unreachable!("caller filters supported cooking recipe types"),
+    };
     Ok(Recipe {
         id,
-        kind: RecipeKind::Smelting(SmeltingRecipe {
-            ingredient: parse_ingredient(path, raw.ingredient)?,
-            cooking_time: raw.cooking_time,
-        }),
+        kind,
         result: parse_result(path, raw.result)?,
     })
 }
@@ -481,10 +495,37 @@ mod tests {
               "result": { "id": "minecraft:iron_ingot" }
             }"#,
         );
+        write(
+            &root.join("ignored/test_blasting.json"),
+            r#"{
+              "type": "minecraft:blasting",
+              "ingredient": "minecraft:raw_iron",
+              "result": { "id": "minecraft:iron_ingot" },
+              "cooking_time": 100
+            }"#,
+        );
+        write(
+            &root.join("ignored/test_smoking.json"),
+            r#"{
+              "type": "minecraft:smoking",
+              "ingredient": "minecraft:beef",
+              "result": { "id": "minecraft:cooked_beef" },
+              "cooking_time": 100
+            }"#,
+        );
+        write(
+            &root.join("ignored/test_campfire.json"),
+            r#"{
+              "type": "minecraft:campfire_cooking",
+              "ingredient": "minecraft:porkchop",
+              "result": { "id": "minecraft:cooked_porkchop" },
+              "cooking_time": 600
+            }"#,
+        );
 
         let recipes = load_recipes(root).unwrap();
 
-        assert_eq!(recipes.len(), 3);
+        assert_eq!(recipes.len(), 6);
         assert_eq!(
             recipes[0].id.as_str(),
             "minecraft:building_blocks/test_planks"
@@ -538,6 +579,22 @@ mod tests {
             IngredientAlternative::Item(Identifier::parse("minecraft:iron_ore").unwrap())
         );
         assert_eq!(smelting_recipe.result.item.as_str(), "minecraft:iron_ingot");
+
+        assert!(recipes.iter().any(|recipe| matches!(
+            (&recipe.kind, recipe.id.as_str()),
+            (RecipeKind::Blasting(smelting), "minecraft:ignored/test_blasting")
+                if smelting.cooking_time == 100
+        )));
+        assert!(recipes.iter().any(|recipe| matches!(
+            (&recipe.kind, recipe.id.as_str()),
+            (RecipeKind::Smoking(smelting), "minecraft:ignored/test_smoking")
+                if smelting.cooking_time == 100
+        )));
+        assert!(recipes.iter().any(|recipe| matches!(
+            (&recipe.kind, recipe.id.as_str()),
+            (RecipeKind::CampfireCooking(smelting), "minecraft:ignored/test_campfire")
+                if smelting.cooking_time == 600
+        )));
     }
 
     #[test]

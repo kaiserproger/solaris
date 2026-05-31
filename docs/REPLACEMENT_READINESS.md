@@ -27,6 +27,9 @@ client files.
   beds as respawn anchors, and save/restart persistence.
 - Crafting table, chest, barrel-style storage, furnace, smoker, and blast furnace
   using the current furnace storage/cooking model.
+- Recipe loading accepts furnace, blasting, smoking, and campfire variants;
+  furnace runtime routes furnace, blast furnace, and smoker categories, and
+  campfires support volatile no-GUI cooking item drops.
 - Basic farming, fluids, mobs/combat, death/respawn, XP, drops, inventory, and
   multiplayer visibility/pickups.
 - Runtime metrics and budgets from M37 for debug-load visibility.
@@ -39,12 +42,19 @@ client files.
 - Smokers/blast furnaces use furnace behavior; faster/specialized cooking is not
   claimed.
 - Barrels use chest storage; barrel animation parity is not claimed.
+- Campfire cooking consumes matching held inputs and drops cooked results, but
+  visual item metadata, in-flight persistence, exact timing parity, smoke, and
+  sound parity are not claimed.
+- Bows can launch basic arrow projectile entities with local physics, block stop,
+  lifetime despawn, grounded pickup, simple entity/player-hit damage, owner
+  self-hit safety, entity knockback, and configured mob drops/XP on lethal hits;
+  full vanilla combat parity is not claimed.
 
 ## Not Claimed
 
 - Other dimensions, portals, structures, full biome parity, villages/trading,
-  redstone parity, bows/arrows, shields, boats, minecarts, full recipe-book parity,
-  weather parity, or M39 lock-free ownership hardening.
+  redstone parity, full bow/arrow combat parity, shields, boats, minecarts, full
+  recipe-book parity, weather parity, or M39 lock-free ownership hardening.
 
 ## Manual Gate
 

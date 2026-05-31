@@ -26,7 +26,7 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundKeepAlive, ConfirmTeleportation, ForgetLevelChunk, GameEvent, LevelChunkWithLight,
-    LoginPlay, MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
+    MovePlayerFlags, ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk,
     SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
@@ -118,10 +118,16 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         .expect("drive configuration");
 
     // Spawn burst, in the order `mc_net::play::handle` emits it.
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
     let center: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
@@ -328,10 +334,16 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
         .await
         .expect("drive configuration");
 
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let center: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
     assert_eq!((center.chunk_x, center.chunk_z), (0, 0));

@@ -24,6 +24,10 @@ use mc_protocol::packets::configuration::{
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
+use mc_protocol::packets::play::{
+    ClientboundChangeDifficulty, ClientboundPlayerAbilities, ClientboundSetHeldSlot, EntityEvent,
+    LoginPlay,
+};
 use mc_protocol::{PROTOCOL_VERSION, RawFrame};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -280,6 +284,16 @@ impl Client {
                 frame.body.len()
             );
         }
+    }
+
+    /// Read the fixed Play-entry prelude Solaris emits before the command tree.
+    pub async fn read_play_login(&mut self) -> Result<LoginPlay> {
+        let login = self.read_typed::<LoginPlay>().await?;
+        let _: ClientboundChangeDifficulty = self.read_typed().await?;
+        let _: ClientboundPlayerAbilities = self.read_typed().await?;
+        let _: ClientboundSetHeldSlot = self.read_typed().await?;
+        let _: EntityEvent = self.read_typed().await?;
+        Ok(login)
     }
 }
 

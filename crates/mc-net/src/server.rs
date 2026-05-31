@@ -808,7 +808,7 @@ fn sample_entity_physics_input(
 }
 
 fn entity_physics_sample_positions(query: play::EntityPhysicsQuery) -> Vec<BlockPos> {
-    let config = PhysicsConfig::default();
+    let config = physics_config_for_query(query);
     let body = EntityBody {
         position: physics_vec(query.position),
         velocity: physics_vec(query.velocity),
@@ -860,13 +860,20 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
             on_ground: input.query.on_ground,
         },
         &sampler,
-        PhysicsConfig::default(),
+        physics_config_for_query(input.query),
     );
     play::EntityPhysicsStep {
         id: input.query.id,
         position: entity_vec(result.body.position),
         velocity: entity_vec(result.body.velocity),
         on_ground: result.body.on_ground,
+    }
+}
+
+fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
+    match query.kind {
+        play::EntityPhysicsKind::Default => PhysicsConfig::default(),
+        play::EntityPhysicsKind::ArrowProjectile => PhysicsConfig::arrow_projectile(),
     }
 }
 
@@ -965,6 +972,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     let listener = TcpListener::bind(config.bind_address).await?;
     let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
     let sessions = Arc::new(play::SessionRegistry::new());
+    play::configure_session_arrow_kill_rewards(&sessions, &config);
     if let Some(world) = config.world.as_ref() {
         let world_root = {
             let storage = crate::lock_metrics::timed_guard(
@@ -1423,6 +1431,7 @@ mod tests {
             velocity: mc_entity::Vec3::new(1.0, 0.0, 0.0),
             aabb: mc_physics::Aabb::COW,
             on_ground: true,
+            kind: play::EntityPhysicsKind::Default,
         };
         let step = step_sampled_entity(EntityPhysicsInput {
             query,
@@ -1477,6 +1486,7 @@ mod tests {
             velocity: mc_entity::Vec3::ZERO,
             aabb: mc_physics::Aabb::COW,
             on_ground: false,
+            kind: play::EntityPhysicsKind::Default,
         };
 
         let input = sample_entity_physics_input(query, &mut storage, &materials);

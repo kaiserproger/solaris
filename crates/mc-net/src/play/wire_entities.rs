@@ -231,7 +231,11 @@ where
             entity_id: entity.id.0,
             values: vec![EntityDataValue::ItemStack {
                 index: ITEM_ENTITY_DATA_ITEM_INDEX,
-                stack: ItemStack::new(stack.item_id, stack.count),
+                stack: ItemStack {
+                    item_id: stack.item_id,
+                    count: stack.count,
+                    damage: stack.damage,
+                },
             }],
         },
         compression,

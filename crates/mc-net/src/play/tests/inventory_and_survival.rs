@@ -92,6 +92,45 @@ fn death_drops_inventory_and_carried_item() {
 }
 
 #[test]
+fn dropped_item_entity_stack_preserves_damage_component() {
+    let stack = entity_item_stack(ItemStack::new(42, 1).with_damage(19));
+
+    assert_eq!(stack, EntityItemStack::new(42, 1).with_damage(19));
+}
+
+#[test]
+fn block_break_denylist_blocks_unbreakable_vanilla_blocks() {
+    let blocks = BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        simple_block(1, "minecraft:stone"),
+        simple_block(2, "minecraft:bedrock"),
+        simple_block(3, "minecraft:barrier"),
+        simple_block(4, "minecraft:end_portal_frame"),
+    ])
+    .unwrap();
+
+    assert!(!block_break_is_denied(&blocks, BlockStateId(0)));
+    assert!(!block_break_is_denied(&blocks, BlockStateId(1)));
+    assert!(block_break_is_denied(&blocks, BlockStateId(2)));
+    assert!(block_break_is_denied(&blocks, BlockStateId(3)));
+    assert!(block_break_is_denied(&blocks, BlockStateId(4)));
+    assert!(!block_break_is_denied(&blocks, BlockStateId(99)));
+}
+
+#[test]
+fn pickup_merge_keeps_damaged_items_separate() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[36] = ItemStack::new(42, 1).with_damage(1);
+
+    let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 1).with_damage(2), 1);
+
+    assert!(remaining.is_empty());
+    assert_eq!(inventory.slots[36], ItemStack::new(42, 1).with_damage(1));
+    assert_eq!(inventory.slots[37], ItemStack::new(42, 1).with_damage(2));
+    assert_eq!(changed, vec![(37, ItemStack::new(42, 1).with_damage(2))]);
+}
+
+#[test]
 fn double_chest_view_uses_verified_nine_by_six_menu_and_split_storage() {
     let left = mc_world::BlockPos { x: 0, y: 64, z: 0 };
     let right = mc_world::BlockPos { x: 1, y: 64, z: 0 };

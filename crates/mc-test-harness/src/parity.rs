@@ -19,12 +19,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundKeepAlive, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundTakeItemEntity,
-    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerRot,
-    ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, SetCenterChunk,
-    SynchronizePlayerPosition,
+    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
+    ClientboundTakeItemEntity, ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay,
+    MovePlayerFlags, RemoveEntities, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
+    SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
 };
 
 use crate::client::Client;
@@ -405,6 +406,22 @@ async fn observe_core_action_sequence(
     let mut observations = ObservationSet::new(subject, phase);
     let _: LoginPlay = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundChangeDifficulty::ID,
+    });
+    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundPlayerAbilities::ID,
+    });
+    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetHeldSlot::ID,
+    });
+    let _: EntityEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: EntityEvent::ID,
+    });
     let _: ClientboundCommands = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
@@ -417,6 +434,18 @@ async fn observe_core_action_sequence(
         x: sync.x.floor() as i64,
         y: sync.y.floor() as i64,
         z: sync.z.floor() as i64,
+    });
+    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundInitializeBorder::ID,
+    });
+    let _: ClientboundSetTime = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetTime::ID,
+    });
+    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetDefaultSpawnPosition::ID,
     });
     let _: GameEvent = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });

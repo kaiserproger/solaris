@@ -10,10 +10,16 @@ pub(super) async fn connect_to_play(
         .drive_configuration()
         .await
         .expect("drive configuration");
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
     client
@@ -85,6 +91,28 @@ pub(super) async fn read_ack_without_target_update(
                 "survival break mutated before timed completion"
             );
         } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if pkt.sequence == sequence {
+                return;
+            }
+        }
+    }
+}
+
+pub(super) async fn wait_for_block_ack(client: &mut Client, sequence: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("block ack");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
             let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
             if pkt.sequence == sequence {

@@ -83,12 +83,23 @@ pub enum EntityLifecycle {
 pub struct EntityItemStack {
     pub item_id: u32,
     pub count: i32,
+    pub damage: Option<i32>,
 }
 
 impl EntityItemStack {
     #[must_use]
     pub const fn new(item_id: u32, count: i32) -> Self {
-        Self { item_id, count }
+        Self {
+            item_id,
+            count,
+            damage: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_damage(mut self, damage: i32) -> Self {
+        self.damage = Some(damage);
+        self
     }
 
     #[must_use]

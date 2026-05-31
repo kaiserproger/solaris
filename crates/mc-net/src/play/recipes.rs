@@ -16,7 +16,10 @@ fn recipe_ingredients(
             }
             Some(ingredients)
         }
-        mc_data::recipes::RecipeKind::Smelting(_) => None,
+        mc_data::recipes::RecipeKind::Smelting(_)
+        | mc_data::recipes::RecipeKind::Blasting(_)
+        | mc_data::recipes::RecipeKind::Smoking(_)
+        | mc_data::recipes::RecipeKind::CampfireCooking(_) => None,
     }
 }
 

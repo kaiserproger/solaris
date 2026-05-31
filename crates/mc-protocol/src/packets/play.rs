@@ -635,6 +635,88 @@ impl Packet for GameEvent {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClientboundInitializeBorder {
+    pub center_x: f64,
+    pub center_z: f64,
+    pub old_size: f64,
+    pub new_size: f64,
+    pub lerp_time: i64,
+    pub absolute_max_size: i32,
+    pub warning_blocks: i32,
+    pub warning_time: i32,
+}
+
+impl Packet for ClientboundInitializeBorder {
+    // `.analysis/protocol-dump.txt` / GameProtocols: game-CB index 43,
+    // wire id 0x2B. `ClientboundInitializeBorderPacket` writes doubles for
+    // center/size, then VarLong lerp time and three VarInts.
+    const ID: i32 = 0x2B;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_f64(self.center_x);
+        buf.write_f64(self.center_z);
+        buf.write_f64(self.old_size);
+        buf.write_f64(self.new_size);
+        buf.write_varlong(self.lerp_time);
+        buf.write_varint(self.absolute_max_size);
+        buf.write_varint(self.warning_blocks);
+        buf.write_varint(self.warning_time);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            center_x: buf.read_f64()?,
+            center_z: buf.read_f64()?,
+            old_size: buf.read_f64()?,
+            new_size: buf.read_f64()?,
+            lerp_time: buf.read_varlong()?,
+            absolute_max_size: buf.read_varint()?,
+            warning_blocks: buf.read_varint()?,
+            warning_time: buf.read_varint()?,
+        })
+    }
+}
+
+/// Clientbound `ChangeDifficulty`. Vanilla sends this during Play entry
+/// right after `LoginPlay` to inform the client of the current difficulty
+/// setting and whether it is locked.
+///
+/// Wire format: VarInt ordinal (0=PEACEFUL, 1=EASY, 2=NORMAL, 3=HARD),
+/// followed by a bool (`locked`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundChangeDifficulty {
+    /// Difficulty ordinal. 0 = PEACEFUL, 1 = EASY, 2 = NORMAL, 3 = HARD.
+    pub difficulty: u8,
+    /// Whether the difficulty is locked (cannot be changed in-game).
+    pub locked: bool,
+}
+
+impl Packet for ClientboundChangeDifficulty {
+    // `.analysis/protocol-dump.txt` / `GameProtocols`:
+    // CLIENTBOUND_CHANGE_DIFFICULTY is clientbound registration index 10,
+    // wire id 0x0A.
+    const ID: i32 = 0x0A;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(i32::from(self.difficulty));
+        buf.write_bool(self.locked);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let difficulty = buf.read_varint()?;
+        if !(0..=3).contains(&difficulty) {
+            return Err(CodecError::NotSupported("difficulty ordinal out of range"));
+        }
+        Ok(Self {
+            difficulty: difficulty as u8,
+            locked: buf.read_bool()?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientboundSetTime {
     pub game_time: i64,

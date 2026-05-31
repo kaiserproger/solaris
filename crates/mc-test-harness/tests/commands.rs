@@ -5,8 +5,7 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, ConfirmTeleportation,
-    GameEvent, GameMode, LoginPlay, ServerboundChatCommand, SetCenterChunk,
-    SynchronizePlayerPosition,
+    GameEvent, GameMode, ServerboundChatCommand, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -53,7 +52,7 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
     let _ = client.drive_login(addr, "M35Command").await.expect("login");
     client.drive_configuration().await.expect("configuration");
 
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let commands: ClientboundCommands = client.read_typed().await.expect("Commands");
     let root = &commands.nodes[commands.root_index as usize];
     assert!(
@@ -111,9 +110,14 @@ async fn client_receives_continuing_world_time_updates() {
     let _ = client.drive_login(addr, "M38Time").await.expect("login");
     client.drive_configuration().await.expect("configuration");
 
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: ClientboundCommands = client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: ClientboundSetTime = client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
     client

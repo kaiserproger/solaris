@@ -31,7 +31,7 @@ use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
     AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, EntityStore,
-    EntityView, GoalState, SpawnEntity, Vec3,
+    EntityView, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_nbt::Tag;
@@ -39,14 +39,15 @@ use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
-    ClientboundCommandSuggestions, ClientboundContainerSetContent, ClientboundContainerSetData,
-    ClientboundContainerSetSlot, ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn,
-    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTakeItemEntity,
-    ConfirmTeleportation, ContainerInput, Direction, ENTITY_DATA_POSE_INDEX,
-    ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction, EntityDataValue,
-    EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
-    ITEM_ENTITY_DATA_ITEM_INDEX, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    ClientboundChangeDifficulty, ClientboundCommandSuggestions, ClientboundContainerSetContent,
+    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundInitializeBorder,
+    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
+    ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
+    Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
+    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
+    EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX,
+    InteractionHand, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
     MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
     PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput,
     PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
@@ -58,9 +59,9 @@ use mc_protocol::packets::play::{
     ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
     ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
     ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
-    ServerboundSetCarriedItem, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    ServerboundSetCarriedItem, ServerboundSwing, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion, SynchronizePlayerPosition,
+    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_world::light::{
@@ -121,11 +122,11 @@ use commands::{
 #[cfg(test)]
 use commands::{parse_debug_command, parse_gamemode_command};
 use containers::{
-    ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceWindow,
-    chest_menu_title_nbt, crafting_menu_title_nbt, find_smelting_recipe_for_item,
-    furnace_menu_title_for_state, furnace_menu_title_nbt, is_barrel_state, is_chest_state,
-    is_crafting_table_state, is_fuel_item, is_furnace_state, next_container_id,
-    store_active_container,
+    ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceKind, FurnaceWindow,
+    chest_menu_title_nbt, crafting_menu_title_nbt, find_campfire_recipe_for_item,
+    find_smelting_recipe_for_item, furnace_kind_for_state, furnace_menu_title_for_state,
+    furnace_menu_title_nbt, is_barrel_state, is_chest_state, is_crafting_table_state, is_fuel_item,
+    is_furnace_state, next_container_id, store_active_container,
 };
 #[cfg(test)]
 use inventory::{ArmorStats, armor_reduced_damage};
@@ -145,15 +146,16 @@ use session::{
 };
 #[cfg(test)]
 use spawn::spawn_chunk_pos;
-use spawn::{chunk_pos_from_coords, spawn_dimension, spawn_position};
 #[cfg(test)]
-use spawn::{pack_block_pos, spawn_y_from_chunk};
+use spawn::spawn_y_from_chunk;
+use spawn::{chunk_pos_from_coords, pack_block_pos, spawn_dimension, spawn_position};
 use survival::{
-    PendingBreak, PendingUse, SurvivalState, UseKind, block_drop_stack,
-    damage_held_tool_after_mining, damage_held_weapon_after_attack, entity_item_stack,
-    falling_block_entity_type_id, held_attack_damage, held_food_use, held_item_id,
-    is_hostile_entity, item_entity_type_id, max_tool_damage_for_path, mining_time_for_target,
-    mob_drop_stack, mob_xp_value, pending_break_is_complete, pending_break_matches,
+    PendingBreak, PendingUse, SurvivalState, UseKind, arrow_entity_type_id, block_break_is_denied,
+    block_drop_stack, bow_draw_power, consume_arrow, damage_held_tool_after_mining,
+    damage_held_weapon_after_attack, entity_item_stack, falling_block_entity_type_id,
+    held_attack_damage, held_food_use, held_item_id, is_bow_item, is_hostile_entity,
+    item_entity_type_id, max_tool_damage_for_path, mining_time_for_target, mob_drop_stack,
+    mob_drop_stack_from, mob_xp_value, pending_break_is_complete, pending_break_matches,
     pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
 };
 #[cfg(test)]
@@ -188,6 +190,19 @@ const DEFAULT_SEA_LEVEL: i32 = 63;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
+const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
+
+pub(crate) fn configure_session_arrow_kill_rewards(
+    sessions: &SessionRegistry,
+    config: &ServerConfig,
+) {
+    sessions.configure_arrow_kill_rewards(
+        item_entity_type_id(&config.entity_types),
+        xp_orb_entity_type_id(&config.entity_types),
+        Arc::clone(&config.items),
+        Arc::clone(&config.loot),
+    );
+}
 const ENTITY_MOVE_SEND_INTERVAL_TICKS: u64 = 1;
 const WORLD_TIME_SYNC_PERIOD: Duration = Duration::from_secs(1);
 const ENTITY_SIMULATION_DISTANCE_CHUNKS: i32 = 8;
@@ -199,6 +214,48 @@ const CHEST_MENU_TYPE_ID: i32 = 2;
 const DOUBLE_CHEST_MENU_TYPE_ID: i32 = 5;
 const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;
 const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CampfireCookingEntry {
+    result: ItemStack,
+    ticks_remaining: u32,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct CampfireCookingState {
+    slots: [Option<CampfireCookingEntry>; CAMPFIRE_COOKING_SLOT_COUNT],
+}
+
+impl CampfireCookingState {
+    fn insert(&mut self, result: ItemStack, cooking_time: u32) -> bool {
+        let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
+            return false;
+        };
+        *slot = Some(CampfireCookingEntry {
+            result,
+            ticks_remaining: cooking_time.max(1),
+        });
+        true
+    }
+
+    fn tick(&mut self) -> Vec<ItemStack> {
+        let mut completed = Vec::new();
+        for slot in &mut self.slots {
+            let Some(entry) = slot.as_mut() else {
+                continue;
+            };
+            entry.ticks_remaining = entry.ticks_remaining.saturating_sub(1);
+            if entry.ticks_remaining == 0 {
+                let entry = slot.take().expect("entry existed before completion");
+                completed.push(entry.result);
+            }
+        }
+        completed
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.iter().all(Option::is_none)
+    }
+}
 
 struct RegisteredSessionCleanup {
     sessions: Arc<SessionRegistry>,
@@ -247,8 +304,9 @@ const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
-#[allow(dead_code)]
-const ARROW_PICKUP_DELAY_TICKS: u64 = 4;
+const ARROW_DESPAWN_AGE_TICKS: u64 = 1_200;
+const ARROW_ENTITY_HIT_DAMAGE: f32 = 4.0;
+const ARROW_ENTITY_HIT_KNOCKBACK: f64 = 0.6;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
 const DEFAULT_FLUID_TICK_BUDGET: usize = 256;
 const WATER_FLOW_DELAY_TICKS: u64 = 5;
@@ -328,6 +386,13 @@ pub(crate) struct EntityPhysicsQuery {
     pub velocity: Vec3,
     pub aabb: mc_physics::Aabb,
     pub on_ground: bool,
+    pub kind: EntityPhysicsKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntityPhysicsKind {
+    Default,
+    ArrowProjectile,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -600,6 +665,41 @@ where
         data_to_keep: 0,
     };
     write_packet(writer, &login, compression).await?;
+    // Vanilla 26.1.x sends ChangeDifficulty right after LoginPlay.
+    // The ordinal 1 = EASY (Minecraft default for new worlds).
+    write_packet(
+        writer,
+        &ClientboundChangeDifficulty {
+            difficulty: 1,
+            locked: false,
+        },
+        compression,
+    )
+    .await?;
+    // Vanilla 26.1.x also sends PlayerAbilities after ChangeDifficulty.
+    write_packet(
+        writer,
+        &player_abilities_for_mode(player_state.game_mode),
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &ClientboundSetHeldSlot {
+            slot: i32::from(player_state.selected_hotbar_slot),
+        },
+        compression,
+    )
+    .await?;
+    write_packet(
+        writer,
+        &EntityEvent {
+            entity_id: login.entity_id,
+            event_id: if permissions.op { 28 } else { 24 },
+        },
+        compression,
+    )
+    .await?;
     write_packet(writer, &command_tree_packet(permissions), compression).await?;
     dispatch_visibility_commands(visibility);
 
@@ -625,13 +725,40 @@ where
     )
     .await?;
 
-    // 3. Set Default Spawn Position — was historically sent here to set
-    //    the compass anchor. Skipped in M1.g: in the 26.1.2 wire capture
-    //    the matching 8-byte clientbound packet looks like its layout
-    //    changed (no `angle` field), and its ID is uncertain. The
-    //    client renders without a configured compass target — minor
-    //    cosmetic regression, not a protocol error. Re-introduce once
-    //    the new shape is verified.
+    // 3. Level info. Vanilla sends border, full clock sync, default spawn,
+    //    optional weather, then LEVEL_CHUNKS_LOAD_START. Solaris uses a static
+    //    vanilla-default border until world border state exists.
+    write_packet(
+        writer,
+        &ClientboundInitializeBorder {
+            center_x: 0.0,
+            center_z: 0.0,
+            old_size: 59_999_968.0,
+            new_size: 59_999_968.0,
+            lerp_time: 0,
+            absolute_max_size: 29_999_984,
+            warning_blocks: 5,
+            warning_time: 15,
+        },
+        compression,
+    )
+    .await?;
+    write_packet(writer, &ClientboundSetTime { game_time: 0 }, compression).await?;
+    write_packet(
+        writer,
+        &SetDefaultSpawnPosition {
+            dimension: dim_name.clone(),
+            position: pack_block_pos(
+                spawn_x.floor() as i32,
+                spawn_y.floor() as i32,
+                spawn_z.floor() as i32,
+            ),
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+        compression,
+    )
+    .await?;
 
     // 4. Game Event: start waiting for chunks. Tells the client to
     //    drop the loading screen even though no chunks are coming.
@@ -710,14 +837,6 @@ where
         //    and dev-only inventory mutation goes through explicit
         //    debug commands; normal survival no longer gets a starter kit.
         let initial_inventory = player_state.inventory.clone();
-        write_packet(
-            writer,
-            &ClientboundSetHeldSlot {
-                slot: i32::from(player_state.selected_hotbar_slot),
-            },
-            compression,
-        )
-        .await?;
         write_packet(
             writer,
             &ClientboundContainerSetContent {
@@ -1020,7 +1139,10 @@ fn crafting_recipe_matches(
         mc_data::recipes::RecipeKind::Shapeless(shapeless) => {
             shapeless_recipe_matches(items, tags, input, shapeless)
         }
-        mc_data::recipes::RecipeKind::Smelting(_) => false,
+        mc_data::recipes::RecipeKind::Smelting(_)
+        | mc_data::recipes::RecipeKind::Blasting(_)
+        | mc_data::recipes::RecipeKind::Smoking(_)
+        | mc_data::recipes::RecipeKind::CampfireCooking(_) => false,
     }
 }
 
@@ -1851,7 +1973,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     let position = mc_world::BlockPos { x, y, z };
-    let title = {
+    let (title, kind) = {
         let mut storage = state.world.lock().await;
         let clicked = storage
             .get_block(position)
@@ -1870,12 +1992,15 @@ where
         let Some(title) = furnace_menu_title_for_state(state, clicked) else {
             return Ok(false);
         };
-        title
+        let Some(kind) = furnace_kind_for_state(state, clicked) else {
+            return Ok(false);
+        };
+        (title, kind)
     };
 
     store_active_container(state);
     let container_id = next_container_id(state);
-    let window = FurnaceWindow::new(position, container_id);
+    let window = FurnaceWindow::new(position, container_id, kind);
     let furnace = {
         let mut storage = state.world.lock().await;
         storage.furnace_block_entity(position).map_err(|err| {
@@ -2074,6 +2199,137 @@ fn dispatch_inventory_drop(state: &InteractionState, player_pose: PlayerPose, st
         Vec3::new(player_pose.x, player_pose.y + 1.0, player_pose.z),
         entity_item_stack(stack),
     ));
+}
+
+fn is_campfire_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
+    state.blocks.by_id(block_state).is_some_and(|block_state| {
+        matches!(
+            block_state.block.id.as_str(),
+            "minecraft:campfire" | "minecraft:soul_campfire"
+        )
+    })
+}
+
+fn hand_inventory_slot(state: &InteractionState, hand: InteractionHand) -> usize {
+    match hand {
+        InteractionHand::MainHand => {
+            PlayerInventory::HOTBAR_BASE + state.selected_hotbar_slot as usize
+        }
+        InteractionHand::OffHand => 45,
+    }
+}
+
+fn campfire_result_stack(
+    state: &InteractionState,
+    recipe: &mc_data::recipes::Recipe,
+) -> Option<ItemStack> {
+    let item_id = state.items.id_of(&recipe.result.item)?;
+    let count = i32::try_from(recipe.result.count).ok()?;
+    (count > 0).then(|| ItemStack::new(item_id, count))
+}
+
+async fn handle_campfire_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    _game_mode: GameMode,
+    sequence: i32,
+    position: mc_world::BlockPos,
+    hand: InteractionHand,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let clicked = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(position) {
+            Ok(Some(current)) => current,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(error = %err, x = position.x, y = position.y, z = position.z, "campfire clicked read failed");
+                return Ok(false);
+            }
+        }
+    };
+    if !is_campfire_state(state, clicked) {
+        return Ok(false);
+    }
+
+    let slot = hand_inventory_slot(state, hand);
+    let held = state.inventory.slots[slot].clone();
+    if held.is_empty() {
+        return Ok(false);
+    }
+    let Some(recipe) = find_campfire_recipe_for_item(state, held.item_id) else {
+        return Ok(false);
+    };
+    let Some(result) = campfire_result_stack(state, &recipe) else {
+        return Ok(false);
+    };
+    let cooking_time = match &recipe.kind {
+        mc_data::recipes::RecipeKind::CampfireCooking(smelting) => smelting.cooking_time,
+        _ => return Ok(false),
+    };
+    if !state
+        .sessions
+        .insert_campfire_cooking(position, result, cooking_time)
+    {
+        return Ok(false);
+    }
+
+    let held = &mut state.inventory.slots[slot];
+    held.count = held.count.saturating_sub(1);
+    if held.count <= 0 {
+        *held = ItemStack::EMPTY;
+    }
+    state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+    write_packet(
+        writer,
+        &ClientboundContainerSetSlot {
+            container_id: 0,
+            state_id: state.inventory_state_id,
+            slot: slot as i16,
+            item_stack: state.inventory.slots[slot].clone(),
+        },
+        state.compression,
+    )
+    .await?;
+    write_block_ack(writer, state.compression, sequence).await?;
+    Ok(true)
+}
+
+async fn tick_campfire_cooking(state: &mut InteractionState) {
+    let completed = state.sessions.tick_campfire_cooking();
+    let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
+        if !completed.is_empty() {
+            debug!(
+                count = completed.len(),
+                "campfire drops ignored: item entity type unavailable"
+            );
+        }
+        return;
+    };
+    for (position, stack) in completed {
+        let still_campfire = {
+            let mut storage = state.world.lock().await;
+            storage
+                .get_block(position)
+                .ok()
+                .flatten()
+                .is_some_and(|block_state| is_campfire_state(state, block_state))
+        };
+        if !still_campfire {
+            continue;
+        }
+        dispatch_visibility_commands(state.sessions.spawn_item_drop(
+            entity_type_id,
+            Vec3::new(
+                position.x as f64 + 0.5,
+                position.y as f64 + 1.0,
+                position.z as f64 + 0.5,
+            ),
+            entity_item_stack(stack),
+        ));
+    }
 }
 
 fn take_death_inventory_drops(
@@ -2333,6 +2589,7 @@ fn set_furnace_menu_stack(
 
 fn can_place_in_furnace_menu_slot(
     state: &InteractionState,
+    kind: FurnaceKind,
     menu_slot: usize,
     stack: &ItemStack,
 ) -> bool {
@@ -2340,7 +2597,7 @@ fn can_place_in_furnace_menu_slot(
         return true;
     }
     match menu_slot {
-        0 => find_smelting_recipe_for_item(state, stack.item_id).is_some(),
+        0 => find_smelting_recipe_for_item(state, kind, stack.item_id).is_some(),
         1 => is_fuel_item(state, stack.item_id),
         2 => false,
         3..=38 => true,
@@ -2351,6 +2608,7 @@ fn can_place_in_furnace_menu_slot(
 fn apply_furnace_swap_click(
     state: &mut InteractionState,
     furnace: &mut FurnaceBlockEntity,
+    kind: FurnaceKind,
     menu_slot: usize,
     button: i8,
 ) -> bool {
@@ -2367,7 +2625,7 @@ fn apply_furnace_swap_click(
         return false;
     };
     let swap = state.inventory.slots[player_slot].clone();
-    if !can_place_in_furnace_menu_slot(state, menu_slot, &swap)
+    if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &swap)
         || !can_place_in_player_slot(state, player_slot, &clicked)
     {
         return false;
@@ -2399,6 +2657,7 @@ fn apply_furnace_throw_click(
 fn apply_furnace_pickup_click(
     state: &mut InteractionState,
     furnace: &mut FurnaceBlockEntity,
+    kind: FurnaceKind,
     menu_slot: usize,
     button: i8,
 ) -> bool {
@@ -2446,13 +2705,13 @@ fn apply_furnace_pickup_click(
             state.carried_item = slot_stack;
             set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, ItemStack::EMPTY)
         } else if slot_stack.is_empty() {
-            if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+            if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
                 return false;
             }
             state.carried_item = ItemStack::EMPTY;
             set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, cursor)
         } else if can_stack(&slot_stack, &cursor)
-            && can_place_in_furnace_menu_slot(state, menu_slot, &cursor)
+            && can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor)
             && slot_stack.count < max_stack
         {
             let moved = (max_stack - slot_stack.count).min(cursor.count);
@@ -2464,7 +2723,7 @@ fn apply_furnace_pickup_click(
             }
             set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
         } else {
-            if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+            if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
                 return false;
             }
             state.carried_item = slot_stack;
@@ -2485,7 +2744,7 @@ fn apply_furnace_pickup_click(
         state.carried_item = new_cursor;
         set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, remaining)
     } else if slot_stack.is_empty() {
-        if !can_place_in_furnace_menu_slot(state, menu_slot, &cursor) {
+        if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
             return false;
         }
         let mut one = cursor;
@@ -2493,7 +2752,7 @@ fn apply_furnace_pickup_click(
         decrement_cursor(&mut state.carried_item);
         set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, one)
     } else if can_stack(&slot_stack, &cursor)
-        && can_place_in_furnace_menu_slot(state, menu_slot, &cursor)
+        && can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor)
         && slot_stack.count < max_stack
     {
         let mut new_slot = slot_stack;
@@ -2508,10 +2767,11 @@ fn apply_furnace_pickup_click(
 fn merge_stack_into_furnace_slot(
     state: &InteractionState,
     furnace: &mut FurnaceBlockEntity,
+    kind: FurnaceKind,
     menu_slot: usize,
     stack: ItemStack,
 ) -> ItemStack {
-    if stack.is_empty() || !can_place_in_furnace_menu_slot(state, menu_slot, &stack) {
+    if stack.is_empty() || !can_place_in_furnace_menu_slot(state, kind, menu_slot, &stack) {
         return stack;
     }
     let target = &mut furnace.slots[menu_slot];
@@ -2546,6 +2806,7 @@ fn merge_stack_into_furnace_slot(
 fn apply_furnace_quick_move_click(
     state: &mut InteractionState,
     furnace: &mut FurnaceBlockEntity,
+    kind: FurnaceKind,
     menu_slot: usize,
 ) -> bool {
     if menu_slot >= FURNACE_MENU_SLOT_COUNT {
@@ -2570,7 +2831,7 @@ fn apply_furnace_quick_move_click(
             if original.is_empty() {
                 return false;
             }
-            let target = if find_smelting_recipe_for_item(state, original.item_id).is_some() {
+            let target = if find_smelting_recipe_for_item(state, kind, original.item_id).is_some() {
                 Some(0)
             } else if is_fuel_item(state, original.item_id) {
                 Some(1)
@@ -2581,7 +2842,8 @@ fn apply_furnace_quick_move_click(
                 return false;
             };
             state.inventory.slots[player_slot] = ItemStack::EMPTY;
-            let remaining = merge_stack_into_furnace_slot(state, furnace, target, original.clone());
+            let remaining =
+                merge_stack_into_furnace_slot(state, furnace, kind, target, original.clone());
             state.inventory.slots[player_slot] = remaining;
             state.inventory.slots[player_slot] != original
         }
@@ -2934,15 +3196,22 @@ where
             ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
                 state,
                 &mut furnace,
+                window.kind,
                 packet.slot_num as usize,
                 packet.button_num,
             ),
             ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-                apply_furnace_quick_move_click(state, &mut furnace, packet.slot_num as usize)
+                apply_furnace_quick_move_click(
+                    state,
+                    &mut furnace,
+                    window.kind,
+                    packet.slot_num as usize,
+                )
             }
             ContainerInput::Swap if packet.slot_num >= 0 => apply_furnace_swap_click(
                 state,
                 &mut furnace,
+                window.kind,
                 packet.slot_num as usize,
                 packet.button_num,
             ),
@@ -3009,6 +3278,7 @@ fn decrement_furnace_slot(stack: &mut FurnaceSlot) {
 fn tick_furnace(
     state: &InteractionState,
     furnace: &mut FurnaceBlockEntity,
+    kind: FurnaceKind,
 ) -> (bool, Vec<(i16, i16)>) {
     let before_slots = furnace.slots.clone();
     let before_data = furnace_data_values(furnace);
@@ -3019,7 +3289,7 @@ fn tick_furnace(
 
     let input = furnace_slot_to_stack(&furnace.slots[0]);
     let recipe = (!input.is_empty())
-        .then(|| find_smelting_recipe_for_item(state, input.item_id))
+        .then(|| find_smelting_recipe_for_item(state, kind, input.item_id))
         .flatten();
     let Some(recipe) = recipe else {
         furnace.cook_progress = 0;
@@ -3033,7 +3303,10 @@ fn tick_furnace(
     };
     let output_count = i32::try_from(recipe.result.count).unwrap_or(0);
     let cooking_time = match &recipe.kind {
-        mc_data::recipes::RecipeKind::Smelting(smelting) => smelting.cooking_time,
+        mc_data::recipes::RecipeKind::Smelting(smelting)
+        | mc_data::recipes::RecipeKind::Blasting(smelting)
+        | mc_data::recipes::RecipeKind::Smoking(smelting)
+        | mc_data::recipes::RecipeKind::CampfireCooking(smelting) => smelting.cooking_time,
         _ => DEFAULT_FURNACE_COOK_TICKS as u32,
     };
     furnace.cook_total = i16::try_from(cooking_time)
@@ -3107,7 +3380,7 @@ where
                     })?
             }
             .unwrap_or_default();
-            let (slots_changed, data_changed) = tick_furnace(state, &mut furnace);
+            let (slots_changed, data_changed) = tick_furnace(state, &mut furnace, window.kind);
             if slots_changed {
                 window.state_id = window.state_id.wrapping_add(1);
                 write_furnace_content(state, writer, &window, &furnace).await?;
@@ -3296,7 +3569,11 @@ where
         let Some(stack) = entity.item_stack else {
             continue;
         };
-        let probe = ItemStack::new(stack.item_id, stack.count);
+        let probe = ItemStack {
+            item_id: stack.item_id,
+            count: stack.count,
+            damage: stack.damage,
+        };
         let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
         let (remaining, changed) = state.inventory.clone().merge_pickup_stack(probe, max_stack);
         let requested = stack.count - remaining.count;
@@ -3310,7 +3587,11 @@ where
         else {
             continue;
         };
-        let picked = ItemStack::new(claimed.stack.item_id, claimed.stack.count);
+        let picked = ItemStack {
+            item_id: claimed.stack.item_id,
+            count: claimed.stack.count,
+            damage: claimed.stack.damage,
+        };
         let max_stack = item_max_stack(&state.item_facts, &state.items, &picked);
         let (remaining, changed) = state.inventory.merge_pickup_stack(picked, max_stack);
         debug_assert!(
@@ -3322,6 +3603,49 @@ where
         }
         write_inventory_slot_updates(state, writer, changed).await?;
         dispatch_visibility_commands(claimed.dispatches);
+    }
+    Ok(())
+}
+
+async fn pickup_nearby_arrows<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    player_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let arrow = Identifier::parse("minecraft:arrow").expect("static identifier");
+    let Some(item_id) = state.items.id_of(&arrow) else {
+        return Ok(());
+    };
+    let player_position = Vec3::new(player_pose.x, player_pose.y, player_pose.z);
+    let candidates = state.sessions.nearby_grounded_arrows(player_position, 2.25);
+    for entity in candidates {
+        let probe = ItemStack::new(item_id, 1);
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
+        let (remaining, changed) = state.inventory.clone().merge_pickup_stack(probe, max_stack);
+        if !remaining.is_empty() || changed.is_empty() {
+            continue;
+        }
+        let Some(dispatches) = state
+            .sessions
+            .claim_arrow_pickup(entity.id, state.session_id)
+        else {
+            continue;
+        };
+        let picked = ItemStack::new(item_id, 1);
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &picked);
+        let (remaining, changed) = state.inventory.merge_pickup_stack(picked, max_stack);
+        debug_assert!(
+            remaining.is_empty(),
+            "claimed arrow should fit probed inventory space"
+        );
+        if changed.is_empty() {
+            continue;
+        }
+        write_inventory_slot_updates(state, writer, changed).await?;
+        dispatch_visibility_commands(dispatches);
     }
     Ok(())
 }
@@ -3373,7 +3697,7 @@ async fn handle_attack<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
-    survival_state: SurvivalState,
+    survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
     player_pose: PlayerPose,
     packet: ServerboundAttack,
@@ -3448,6 +3772,11 @@ where
         return Ok(());
     };
     damage_held_weapon_after_attack(state, writer).await?;
+    if game_mode == GameMode::Survival
+        && survival_state.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION)
+    {
+        write_packet(writer, &survival_state.as_packet(), state.compression).await?;
+    }
     if !damage.killed {
         write_packet(
             writer,
@@ -3515,8 +3844,10 @@ where
     let (prev, edits) = {
         let mut storage = state.world.lock().await;
         let prev = storage.get_block(pos).ok().flatten();
-        let edits = prev
-            .map(|state_id| {
+        let edits = if prev.is_some_and(|state_id| block_break_is_denied(&state.blocks, state_id)) {
+            Vec::new()
+        } else {
+            prev.map(|state_id| {
                 plan_break_block_edits(&state.blocks, &mut storage, pos, state_id, replacement, air)
             })
             .unwrap_or_else(|| {
@@ -3524,7 +3855,8 @@ where
                     pos,
                     new_state: replacement,
                 }]
-            });
+            })
+        };
         (prev, edits)
     };
 
@@ -3581,7 +3913,7 @@ fn plan_break_block_edits(
             });
         }
     }
-    append_sugar_cane_cascade(blocks, storage, &mut edits, pos, air);
+    append_vertical_support_cascade(blocks, storage, &mut edits, pos, air);
     edits
 }
 
@@ -3688,7 +4020,7 @@ fn falling_block_can_enter(
     state == air || facts.fluid(state.0).is_some()
 }
 
-fn append_sugar_cane_cascade(
+fn append_vertical_support_cascade(
     blocks: &mc_world::BlockRegistry,
     storage: &mut mc_world::WorldStorage,
     edits: &mut Vec<BlockEdit>,
@@ -3704,7 +4036,7 @@ fn append_sugar_cane_cascade(
         let Some(state) = blocks.by_id(state_id) else {
             break;
         };
-        if state.block.id.path() != "sugar_cane" {
+        if !is_vertical_support_cascade_block(state.block.id.path()) {
             break;
         }
         edits.push(BlockEdit {
@@ -3715,6 +4047,10 @@ fn append_sugar_cane_cascade(
     }
 }
 
+fn is_vertical_support_cascade_block(path: &str) -> bool {
+    matches!(path, "sugar_cane" | "cactus" | "bamboo")
+}
+
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
 /// historical instant edit path; survival now requires a server-timed start/stop
 /// pair before the shared mutation back-half can run.
@@ -3722,7 +4058,7 @@ async fn handle_player_action<W>(
     state: &mut InteractionState,
     writer: &mut W,
     game_mode: GameMode,
-    survival_state: SurvivalState,
+    survival_state: &mut SurvivalState,
     player_pose: PlayerPose,
     action: ServerboundPlayerAction,
 ) -> Result<(), ConnectionError>
@@ -3736,7 +4072,34 @@ where
             | PlayerActionKind::StopDestroyBlock
     );
     if matches!(action.action, PlayerActionKind::ReleaseUseItem) {
-        state.pending_use = None;
+        if game_mode == GameMode::Survival
+            && let Some(pending) = state.pending_use.take()
+            && matches!(pending.kind, UseKind::Bow)
+            && pending_use_matches(state, &pending)
+            && bow_draw_power(pending.started_at) > 0.0
+            && let Some(entity_type_id) = arrow_entity_type_id(&state.entity_types)
+            && let Some(slot) = consume_arrow(state)
+        {
+            let power = bow_draw_power(pending.started_at);
+            let position = arrow_spawn_position(player_pose);
+            let velocity = arrow_velocity(player_pose, power);
+            let rotation = Rotation {
+                yaw: player_pose.yaw,
+                pitch: player_pose.pitch,
+                head_yaw: player_pose.yaw,
+            };
+            dispatch_visibility_commands(state.sessions.spawn_arrow(
+                Some(state.session_id),
+                entity_type_id,
+                position,
+                velocity,
+                rotation,
+            ));
+            let slot_value = state.inventory.slots[slot].clone();
+            write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
+        } else {
+            state.pending_use = None;
+        }
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
     if !is_destroy {
@@ -3826,6 +4189,10 @@ where
                     )
                     .await?;
                     if changed {
+                        if survival_state.add_exhaustion(SurvivalState::BLOCK_BREAK_EXHAUSTION) {
+                            write_packet(writer, &survival_state.as_packet(), state.compression)
+                                .await?;
+                        }
                         damage_held_tool_after_mining(state, writer).await
                     } else {
                         Ok(())
@@ -3851,6 +4218,27 @@ where
             write_block_ack(writer, state.compression, action.sequence).await
         }
     }
+}
+
+fn arrow_spawn_position(pose: PlayerPose) -> Vec3 {
+    Vec3::new(pose.x, pose.y + 1.62, pose.z)
+}
+
+fn player_look_direction(pose: PlayerPose) -> Vec3 {
+    let yaw = f64::from(pose.yaw).to_radians();
+    let pitch = f64::from(pose.pitch).to_radians();
+    let pitch_cos = pitch.cos();
+    Vec3::new(-yaw.sin() * pitch_cos, -pitch.sin(), yaw.cos() * pitch_cos)
+}
+
+fn arrow_velocity(pose: PlayerPose, power: f64) -> Vec3 {
+    let direction = player_look_direction(pose);
+    let speed = 3.0 * power.clamp(0.0, 1.0);
+    Vec3::new(
+        direction.x * speed,
+        direction.y * speed,
+        direction.z * speed,
+    )
 }
 
 pub(crate) async fn run_random_ticks(
@@ -4893,6 +5281,35 @@ where
     Ok(())
 }
 
+async fn apply_projectile_player_damage<W>(
+    state: Option<&mut InteractionState>,
+    writer: &mut W,
+    compression: Compression,
+    survival_state: &mut SurvivalState,
+    game_mode: GameMode,
+    player_pose: PlayerPose,
+    amount: f32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if game_mode != GameMode::Survival || amount <= 0.0 || survival_state.is_dead() {
+        return Ok(());
+    }
+    let was_dead = survival_state.is_dead();
+    survival_state.apply_damage(amount);
+    write_packet(writer, &survival_state.as_packet(), compression).await?;
+    if !was_dead
+        && survival_state.is_dead()
+        && let Some(state) = state
+    {
+        state.pending_break = None;
+        state.pending_use = None;
+        drop_inventory_on_death(state, writer, player_pose).await?;
+    }
+    Ok(())
+}
+
 fn fall_damage_amount(old_pose: PlayerPose, new_pose: PlayerPose) -> f32 {
     if old_pose.in_water || new_pose.in_water {
         return 0.0;
@@ -5118,6 +5535,15 @@ async fn apply_block_edit_batch_to_world(
     let mut storage = state.world.lock().await;
     for edit in edits {
         apply_block_edit_to_storage(&mut storage, table.as_deref(), edit, &mut outcome);
+    }
+    drop(storage);
+
+    for applied in &outcome.applied {
+        if is_campfire_state(state, applied.previous)
+            && !is_campfire_state(state, applied.new_state)
+        {
+            state.sessions.clear_campfire_cooking(applied.pos);
+        }
     }
 
     outcome
@@ -5639,32 +6065,34 @@ where
     }
 
     let (cx, cy, cz) = unpack_block_pos(action.position);
-    if open_crafting_table_container(state, writer, action.sequence, cx, cy, cz).await? {
-        return Ok(());
-    }
-    if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
-        return Ok(());
-    }
-    if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
-        return Ok(());
-    }
-    if interact_with_bed(
-        state,
-        writer,
-        action.sequence,
-        mc_world::BlockPos {
-            x: cx,
-            y: cy,
-            z: cz,
-        },
-        respawn_pose,
-    )
-    .await?
-    {
-        return Ok(());
-    }
-    if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
-        return Ok(());
+    if !player_pose.shifting {
+        if open_crafting_table_container(state, writer, action.sequence, cx, cy, cz).await? {
+            return Ok(());
+        }
+        if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
+            return Ok(());
+        }
+        if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
+            return Ok(());
+        }
+        if interact_with_bed(
+            state,
+            writer,
+            action.sequence,
+            mc_world::BlockPos {
+                x: cx,
+                y: cy,
+                z: cz,
+            },
+            respawn_pose,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
+            return Ok(());
+        }
     }
 
     let clicked_pos = mc_world::BlockPos {
@@ -5672,6 +6100,18 @@ where
         y: cy,
         z: cz,
     };
+    if handle_campfire_use_on(
+        state,
+        writer,
+        game_mode,
+        action.sequence,
+        clicked_pos,
+        action.hand,
+    )
+    .await?
+    {
+        return Ok(());
+    }
     if handle_bucket_use_on(
         state,
         writer,
@@ -5949,7 +6389,26 @@ where
     {
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
-    if survival_state.is_dead() || survival_state.food >= SurvivalState::MAX_FOOD {
+    if survival_state.is_dead() {
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+
+    if is_bow_item(state) {
+        let Some(held_item_id) = held_item_id(state) else {
+            return write_block_ack(writer, state.compression, action.sequence).await;
+        };
+        state.pending_break = None;
+        state.pending_use = Some(PendingUse {
+            started_at: Instant::now(),
+            required_time: Duration::from_secs(60),
+            held_hotbar_slot: state.selected_hotbar_slot,
+            held_item_id,
+            kind: UseKind::Bow,
+        });
+        return write_block_ack(writer, state.compression, action.sequence).await;
+    }
+
+    if survival_state.food >= SurvivalState::MAX_FOOD {
         return write_block_ack(writer, state.compression, action.sequence).await;
     }
 
@@ -6070,7 +6529,8 @@ where
         state.compression,
     )
     .await?;
-    let damage = survival_damage_after_armor(Some(state), 3.0);
+    let damage =
+        survival_damage_after_armor(Some(state), hostile.attack_damage.unwrap_or(3.0) as f32);
     let was_dead = survival_state.is_dead();
     survival_state.apply_damage(damage);
     state.last_hostile_damage_at = Some(now);
@@ -6365,6 +6825,22 @@ where
                     Some(OutboundCommand::MoveEntityRelative(movement)) => {
                         send_entity_relative_move(writer, compression, &movement).await?;
                     }
+                    Some(OutboundCommand::EntityEvent { entity_id, event_id }) => {
+                        write_packet(writer, &EntityEvent { entity_id, event_id }, compression)
+                            .await?;
+                    }
+                    Some(OutboundCommand::DamagePlayer { amount }) => {
+                        apply_projectile_player_damage(
+                            interaction.as_deref_mut(),
+                            writer,
+                            compression,
+                            &mut survival_state,
+                            game_mode,
+                            player_pose,
+                            amount,
+                        )
+                        .await?;
+                    }
                     Some(OutboundCommand::TakeItemEntity {
                         item_entity_id,
                         player_entity_id,
@@ -6483,9 +6959,11 @@ where
                 if let Some(state) = interaction.as_deref_mut() {
                     state.fluid_schedule_tick = state.fluid_schedule_tick.wrapping_add(1);
                     tick_active_container(state, writer).await?;
+                    tick_campfire_cooking(state).await;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                     tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
                     pickup_nearby_items(state, writer, player_pose).await?;
+                    pickup_nearby_arrows(state, writer, player_pose).await?;
                     pickup_nearby_xp(state, writer, &mut xp_state, player_pose).await?;
                 }
             }
@@ -6656,7 +7134,7 @@ where
                             state,
                             writer,
                             game_mode,
-                            survival_state,
+                            &mut survival_state,
                             player_pose,
                             action,
                         )
@@ -6728,7 +7206,7 @@ where
                             state,
                             writer,
                             game_mode,
-                            survival_state,
+                            &mut survival_state,
                             &mut xp_state,
                             player_pose,
                             attack,
@@ -6751,6 +7229,9 @@ where
                             "Interact ignored — no world configured"
                         );
                     }
+                } else if frame.id == ServerboundSwing::ID {
+                    let mut body = frame.body;
+                    let _ = ServerboundSwing::decode(&mut body)?;
                 } else if frame.id == ServerboundPlaceRecipe::ID {
                     let mut body = frame.body;
                     let recipe = ServerboundPlaceRecipe::decode(&mut body)?;
@@ -7333,7 +7814,9 @@ where
         }
         SurvivalCommand::Heal(amount) => state.heal(amount),
         SurvivalCommand::Feed { food, saturation } => state.add_food(food, saturation),
-        SurvivalCommand::Exhaust(amount) => state.add_exhaustion(amount),
+        SurvivalCommand::Exhaust(amount) => {
+            state.add_exhaustion(amount);
+        }
     }
     if state.is_dead() {
         debug!("player survival state reached death threshold");

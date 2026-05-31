@@ -11,6 +11,8 @@ pub(super) struct SurvivalState {
 impl SurvivalState {
     pub(super) const MAX_HEALTH: f32 = 20.0;
     pub(super) const MAX_FOOD: i32 = 20;
+    pub(super) const BLOCK_BREAK_EXHAUSTION: f32 = 0.005;
+    pub(super) const ENTITY_ATTACK_EXHAUSTION: f32 = 0.1;
     const EXHAUSTION_STEP: f32 = 4.0;
     const HEALTH_TICK_PERIOD: u32 = 4;
 
@@ -46,7 +48,9 @@ impl SurvivalState {
         self.health <= 0.0
     }
 
-    pub(super) fn add_exhaustion(&mut self, amount: f32) {
+    pub(super) fn add_exhaustion(&mut self, amount: f32) -> bool {
+        let before_food = self.food;
+        let before_saturation = self.saturation;
         self.exhaustion = (self.exhaustion + amount.max(0.0)).max(0.0);
         while self.exhaustion >= Self::EXHAUSTION_STEP {
             self.exhaustion -= Self::EXHAUSTION_STEP;
@@ -56,6 +60,7 @@ impl SurvivalState {
                 self.food -= 1;
             }
         }
+        self.food != before_food || self.saturation != before_saturation
     }
 
     pub(super) fn tick_health(&mut self, tick: u32) -> bool {
@@ -213,6 +218,15 @@ fn mining_time_for_block(
     fallback_mining_time(block_state.block.id.path(), tool_path)
 }
 
+pub(super) fn block_break_is_denied(blocks: &BlockRegistry, block_state: BlockStateId) -> bool {
+    blocks.by_id(block_state).is_some_and(|state| {
+        matches!(
+            state.block.id.path(),
+            "bedrock" | "barrier" | "end_portal_frame"
+        )
+    })
+}
+
 pub(super) async fn mining_time_for_target(state: &InteractionState, position: i64) -> Duration {
     let (x, y, z) = unpack_block_pos(position);
     let block_state = {
@@ -264,7 +278,6 @@ pub(super) fn falling_block_entity_type_id(entity_types: &EntityTypeRegistry) ->
         .and_then(|id| i32::try_from(id).ok())
 }
 
-#[allow(dead_code)]
 pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<i32> {
     let arrow = mc_data::Identifier::parse("minecraft:arrow").expect("static identifier");
     entity_types
@@ -278,14 +291,21 @@ pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
         .is_ok_and(|facts| facts.category.is_hostile())
 }
 
-pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
+pub(super) fn mob_drop_stack_from(
+    loot: &mc_data::loot::LootTables,
+    items: &ItemRegistry,
+    entity_type: &str,
+) -> Option<ItemStack> {
     let entity = Identifier::parse(entity_type.to_string()).ok()?;
-    let item = state
-        .loot
+    let item = loot
         .entity_drop(&entity)
         .or_else(|| mc_data::loot::builtin().entity_drop(&entity))?;
-    let item_id = state.items.id_of(item)?;
+    let item_id = items.id_of(item)?;
     Some(ItemStack::new(item_id, 1))
+}
+
+pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
+    mob_drop_stack_from(&state.loot, &state.items, entity_type)
 }
 
 pub(super) fn mob_xp_value(entity_type: &str) -> i32 {
@@ -414,7 +434,11 @@ pub(super) fn pending_use_is_complete(pending: &PendingUse, now: Instant) -> boo
 }
 
 pub(super) fn entity_item_stack(stack: ItemStack) -> EntityItemStack {
-    EntityItemStack::new(stack.item_id, stack.count)
+    EntityItemStack {
+        item_id: stack.item_id,
+        count: stack.count,
+        damage: stack.damage,
+    }
 }
 
 pub(super) fn held_attack_damage(state: &InteractionState) -> f32 {

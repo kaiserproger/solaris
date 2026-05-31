@@ -477,12 +477,17 @@ fn survival_exhaustion_drains_saturation_before_food() {
         exhaustion: 0.0,
     };
 
-    state.add_exhaustion(4.0);
+    assert!(!state.add_exhaustion(3.0));
+    assert_eq!(state.saturation, 1.0);
+    assert_eq!(state.food, 20);
+    assert_eq!(state.exhaustion, 3.0);
+
+    assert!(state.add_exhaustion(1.0));
     assert_eq!(state.saturation, 0.0);
     assert_eq!(state.food, 20);
     assert_eq!(state.exhaustion, 0.0);
 
-    state.add_exhaustion(8.0);
+    assert!(state.add_exhaustion(8.0));
     assert_eq!(state.food, 18);
     assert_eq!(state.saturation, 0.0);
 }

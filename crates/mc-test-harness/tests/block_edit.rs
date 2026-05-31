@@ -26,11 +26,12 @@ use mc_protocol::packets::play::{
     ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData, ClientboundSetHealth,
     ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
     EntityAnimationAction, EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
-    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate, LoginPlay,
-    PlayerActionKind, RemoveEntities, ServerboundChatCommand, ServerboundClientCommand,
-    ServerboundContainerClick, ServerboundContainerClose, ServerboundKeepAlive,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate,
+    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, RemoveEntities, ServerboundChatCommand,
+    ServerboundClientCommand, ServerboundContainerClick, ServerboundContainerClose,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlaceRecipe,
+    ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 

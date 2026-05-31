@@ -3,8 +3,8 @@
 //!
 //! Two scenarios in one test:
 //!
-//! 1. After login the server emits `ClientboundSetHeldSlot` and a
-//!    `ClientboundContainerSetContent` packet with the M6 starter kit.
+//! 1. After login the server emits `ClientboundContainerSetContent`
+//!    with the authoritative player inventory.
 //!    The hotbar slots 36..=39 must contain stone, dirt, oak planks,
 //!    torch.
 //! 2. Send `ServerboundSetCarriedItem{slot=1}` to select dirt, then
@@ -28,9 +28,9 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundContainerSetContent, ClientboundContainerSetSlot,
     ClientboundKeepAlive, ClientboundSetHeldSlot, ConfirmTeleportation, Direction, GameEvent,
-    LevelChunkWithLight, LoginPlay, ServerboundChatCommand, ServerboundKeepAlive,
-    ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
-    pack_block_pos, unpack_block_pos,
+    LevelChunkWithLight, ServerboundChatCommand, ServerboundKeepAlive, ServerboundSetCarriedItem,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use std::collections::HashSet;
@@ -137,10 +137,16 @@ async fn place_dirt_persists_through_flush_to_disk() {
         .await
         .expect("drive configuration");
 
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
@@ -154,10 +160,9 @@ async fn place_dirt_persists_through_flush_to_disk() {
     // Drain the spawn burst + collect the empty inventory seed.
     let expected_chunks = (2 * VIEW_DISTANCE + 1).pow(2) as usize;
     let mut chunks_seen: HashSet<(i32, i32)> = HashSet::new();
-    let mut saw_set_held_slot = false;
     let mut saw_set_content = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
-    while chunks_seen.len() < expected_chunks || !saw_set_held_slot || !saw_set_content {
+    while chunks_seen.len() < expected_chunks || !saw_set_content {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         let frame = client
             .read_frame_with_timeout(remaining)
@@ -178,7 +183,6 @@ async fn place_dirt_persists_through_flush_to_disk() {
             let mut body = frame.body;
             let pkt = ClientboundSetHeldSlot::decode(&mut body).expect("decode SetHeldSlot");
             assert_eq!(pkt.slot, 0, "login selects slot 0");
-            saw_set_held_slot = true;
         } else if frame.id == ClientboundContainerSetContent::ID {
             let mut body = frame.body;
             let pkt = ClientboundContainerSetContent::decode(&mut body)

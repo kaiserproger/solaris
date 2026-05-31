@@ -238,6 +238,34 @@ fn game_event_round_trip() {
 }
 
 #[test]
+fn initialize_border_id_and_layout_match_javap() {
+    assert_eq!(ClientboundInitializeBorder::ID, 0x2B);
+    let packet = ClientboundInitializeBorder {
+        center_x: 0.0,
+        center_z: 0.0,
+        old_size: 59_999_968.0,
+        new_size: 59_999_968.0,
+        lerp_time: 0,
+        absolute_max_size: 29_999_984,
+        warning_blocks: 5,
+        warning_time: 15,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(&buf[0..8], &0.0_f64.to_be_bytes());
+    assert_eq!(&buf[8..16], &0.0_f64.to_be_bytes());
+    assert_eq!(&buf[16..24], &59_999_968.0_f64.to_be_bytes());
+    assert_eq!(&buf[24..32], &59_999_968.0_f64.to_be_bytes());
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundInitializeBorder::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn player_visible_packet_ids_match_javap() {
     assert_eq!(AddEntity::ID, 0x01);
     assert_eq!(EntityPositionSync::ID, 0x23);
@@ -810,6 +838,25 @@ fn player_abilities_id_and_wire_layout_match_javap() {
     let mut cursor: &[u8] = &buf;
     assert_eq!(
         ClientboundPlayerAbilities::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn change_difficulty_id_and_wire_layout_match_javap() {
+    assert_eq!(ClientboundChangeDifficulty::ID, 0x0A);
+    let packet = ClientboundChangeDifficulty {
+        difficulty: 1,
+        locked: false,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0x01, 0x00]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundChangeDifficulty::decode(&mut cursor).unwrap(),
         packet
     );
     assert!(cursor.is_empty());

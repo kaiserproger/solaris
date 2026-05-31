@@ -40,17 +40,26 @@ impl CraftingTableWindow {
 pub(super) struct FurnaceWindow {
     pub(super) container_id: i32,
     pub(super) position: mc_world::BlockPos,
+    pub(super) kind: FurnaceKind,
     pub(super) state_id: i32,
 }
 
 impl FurnaceWindow {
-    pub(super) fn new(position: mc_world::BlockPos, container_id: i32) -> Self {
+    pub(super) fn new(position: mc_world::BlockPos, container_id: i32, kind: FurnaceKind) -> Self {
         Self {
             container_id,
             position,
+            kind,
             state_id: 1,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum FurnaceKind {
+    Furnace,
+    Smoker,
+    BlastFurnace,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +123,25 @@ pub(super) fn furnace_menu_title_for_state(
         .and_then(|block_state| furnace_menu_title_for_block_id(block_state.block.id.as_str()))
 }
 
+pub(super) fn furnace_kind_for_state(
+    state: &InteractionState,
+    block_state: mc_world::BlockStateId,
+) -> Option<FurnaceKind> {
+    state
+        .blocks
+        .by_id(block_state)
+        .and_then(|block_state| furnace_kind_for_block_id(block_state.block.id.as_str()))
+}
+
+pub(super) fn furnace_kind_for_block_id(id: &str) -> Option<FurnaceKind> {
+    match id {
+        "minecraft:furnace" => Some(FurnaceKind::Furnace),
+        "minecraft:smoker" => Some(FurnaceKind::Smoker),
+        "minecraft:blast_furnace" => Some(FurnaceKind::BlastFurnace),
+        _ => None,
+    }
+}
+
 pub(super) fn furnace_menu_title_for_block_id(id: &str) -> Option<&'static str> {
     match id {
         "minecraft:furnace" => Some("Furnace"),
@@ -155,14 +183,50 @@ pub(super) fn is_crafting_table_state(
 
 pub(super) fn find_smelting_recipe_for_item(
     state: &InteractionState,
+    kind: FurnaceKind,
     item_id: u32,
 ) -> Option<mc_data::recipes::Recipe> {
-    state.recipes.iter().find_map(|recipe| {
-        let mc_data::recipes::RecipeKind::Smelting(smelting) = &recipe.kind else {
+    find_cooking_recipe_for_item(&state.recipes, &state.items, &state.tags, kind, item_id)
+}
+
+pub(super) fn find_campfire_recipe_for_item(
+    state: &InteractionState,
+    item_id: u32,
+) -> Option<mc_data::recipes::Recipe> {
+    find_campfire_recipe_in(&state.recipes, &state.items, &state.tags, item_id)
+}
+
+pub(super) fn find_campfire_recipe_in(
+    recipes: &[mc_data::recipes::Recipe],
+    items: &ItemRegistry,
+    tags: &TagsData,
+    item_id: u32,
+) -> Option<mc_data::recipes::Recipe> {
+    recipes.iter().find_map(|recipe| {
+        let mc_data::recipes::RecipeKind::CampfireCooking(smelting) = &recipe.kind else {
             return None;
         };
-        ingredient_accepts_item(&state.items, &state.tags, item_id, &smelting.ingredient)
-            .then(|| recipe.clone())
+        ingredient_accepts_item(items, tags, item_id, &smelting.ingredient).then(|| recipe.clone())
+    })
+}
+
+pub(super) fn find_cooking_recipe_for_item(
+    recipes: &[mc_data::recipes::Recipe],
+    items: &ItemRegistry,
+    tags: &TagsData,
+    kind: FurnaceKind,
+    item_id: u32,
+) -> Option<mc_data::recipes::Recipe> {
+    recipes.iter().find_map(|recipe| {
+        let smelting = match (&recipe.kind, kind) {
+            (mc_data::recipes::RecipeKind::Smelting(smelting), FurnaceKind::Furnace) => smelting,
+            (mc_data::recipes::RecipeKind::Smoking(smelting), FurnaceKind::Smoker) => smelting,
+            (mc_data::recipes::RecipeKind::Blasting(smelting), FurnaceKind::BlastFurnace) => {
+                smelting
+            }
+            _ => return None,
+        };
+        ingredient_accepts_item(items, tags, item_id, &smelting.ingredient).then(|| recipe.clone())
     })
 }
 

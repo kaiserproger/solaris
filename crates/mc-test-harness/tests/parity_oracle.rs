@@ -5,11 +5,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundKeepAlive, ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation,
-    EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
-    ServerboundSetCarriedItem, SetCenterChunk, SynchronizePlayerPosition,
+    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
+    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly,
+    ServerboundPlayerLoaded, ServerboundSetCarriedItem, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
@@ -42,6 +44,23 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
     let mut observations = ObservationSet::new(subject, "spawn-smoke");
     let _: LoginPlay = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundChangeDifficulty::ID,
+    });
+    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundPlayerAbilities::ID,
+    });
+    let held: ClientboundSetHeldSlot = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetHeldSlot::ID,
+    });
+    observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+    let _: EntityEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: EntityEvent::ID,
+    });
     let _: ClientboundCommands = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
@@ -54,6 +73,18 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
         x: sync.x.floor() as i64,
         y: sync.y.floor() as i64,
         z: sync.z.floor() as i64,
+    });
+    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundInitializeBorder::ID,
+    });
+    let _: ClientboundSetTime = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetTime::ID,
+    });
+    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetDefaultSpawnPosition::ID,
     });
     let event: GameEvent = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
@@ -361,6 +392,23 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
     let mut observations = ObservationSet::new(subject, "container-held-slot");
     let _: LoginPlay = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundChangeDifficulty::ID,
+    });
+    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundPlayerAbilities::ID,
+    });
+    let held: ClientboundSetHeldSlot = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetHeldSlot::ID,
+    });
+    observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+    let _: EntityEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: EntityEvent::ID,
+    });
     let _: ClientboundCommands = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
@@ -373,6 +421,18 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
         x: sync.x.floor() as i64,
         y: sync.y.floor() as i64,
         z: sync.z.floor() as i64,
+    });
+    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundInitializeBorder::ID,
+    });
+    let _: ClientboundSetTime = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetTime::ID,
+    });
+    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetDefaultSpawnPosition::ID,
     });
     let _: GameEvent = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
@@ -388,7 +448,7 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
     client.write_packet(&ServerboundPlayerLoaded).await?;
 
     // Drain initial frames to capture held slot and inventory snapshot.
-    let mut saw_held_slot = false;
+    let mut saw_held_slot = true;
     let mut saw_inventory = false;
     for index in 0..64 {
         let timeout = if index == 0 {
@@ -650,6 +710,22 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
     let mut observations = ObservationSet::new(subject, "entity-lifecycle");
     let _: LoginPlay = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundChangeDifficulty::ID,
+    });
+    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundPlayerAbilities::ID,
+    });
+    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetHeldSlot::ID,
+    });
+    let _: EntityEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: EntityEvent::ID,
+    });
     let _: ClientboundCommands = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
@@ -662,6 +738,18 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         x: sync.x.floor() as i64,
         y: sync.y.floor() as i64,
         z: sync.z.floor() as i64,
+    });
+    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundInitializeBorder::ID,
+    });
+    let _: ClientboundSetTime = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetTime::ID,
+    });
+    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetDefaultSpawnPosition::ID,
     });
     let _: GameEvent = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
@@ -888,6 +976,22 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
     let mut observations = ObservationSet::new(subject, "timed-action");
     let _: LoginPlay = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
+    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundChangeDifficulty::ID,
+    });
+    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundPlayerAbilities::ID,
+    });
+    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetHeldSlot::ID,
+    });
+    let _: EntityEvent = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: EntityEvent::ID,
+    });
     let _: ClientboundCommands = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
@@ -900,6 +1004,18 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
         x: sync.x.floor() as i64,
         y: sync.y.floor() as i64,
         z: sync.z.floor() as i64,
+    });
+    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundInitializeBorder::ID,
+    });
+    let _: ClientboundSetTime = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundSetTime::ID,
+    });
+    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    observations.push(ObservationFact::PacketSeen {
+        id: SetDefaultSpawnPosition::ID,
     });
     let _: GameEvent = client.read_typed().await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });

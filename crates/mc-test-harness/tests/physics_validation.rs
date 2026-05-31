@@ -843,10 +843,16 @@ async fn connect_to_play_with_login(
         .drive_configuration()
         .await
         .expect("drive configuration");
-    let login: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let login = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands =
         client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let _: GameEvent = client.read_typed().await.expect("GameEvent");
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
     client

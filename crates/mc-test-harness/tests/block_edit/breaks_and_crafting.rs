@@ -78,9 +78,17 @@ async fn break_block_round_trips_update_ack_relight() {
         .expect("drive configuration");
 
     // Spawn burst.
-    let _: LoginPlay = client.read_typed().await.expect("LoginPlay");
+    let _ = client.read_play_login().await.expect("play entry");
     let _: mc_protocol::packets::play::ClientboundCommands = client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    let _: mc_protocol::packets::play::ClientboundInitializeBorder =
+        client.read_typed().await.expect("InitializeBorder");
+    let _: mc_protocol::packets::play::ClientboundSetTime =
+        client.read_typed().await.expect("SetTime");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition = client
+        .read_typed()
+        .await
+        .expect("SetDefaultSpawnPosition");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");

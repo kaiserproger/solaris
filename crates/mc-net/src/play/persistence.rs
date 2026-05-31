@@ -562,10 +562,14 @@ fn entity_item_stack_tag(
     let name = items
         .name_of(stack.item_id)
         .ok_or_else(|| PlayerPersistenceError::UnknownItem(stack.item_id.to_string()))?;
-    Ok(Tag::Compound(vec![
+    let mut fields = vec![
         ("id".into(), Tag::String(name.as_str().to_string())),
         ("count".into(), Tag::Int(stack.count)),
-    ]))
+    ];
+    if let Some(damage) = stack.damage {
+        set_damage_component(&mut fields, damage);
+    }
+    Ok(Tag::Compound(fields))
 }
 
 fn read_entity_item_stack(
@@ -581,7 +585,11 @@ fn read_entity_item_stack(
         return Err(PlayerPersistenceError::UnknownItem(item_name.to_string()));
     };
     let count = int_field(fields, "count").unwrap_or(1).max(0);
-    Ok((count > 0).then_some(EntityItemStack::new(item_id, count)))
+    Ok((count > 0).then_some(EntityItemStack {
+        item_id,
+        count,
+        damage: damage_component(fields),
+    }))
 }
 
 fn vec3_double_list(vec: Vec3) -> Tag {
@@ -1134,6 +1142,24 @@ mod tests {
         assert_eq!(loaded[2].type_name, falling_block.type_name);
         assert_eq!(loaded[2].block_state, falling_block.block_state);
         assert!(matches!(loaded[2].goal, GoalState::Idle));
+    }
+
+    #[test]
+    fn entity_item_stack_persistence_preserves_damage_component() {
+        let items = items();
+        let stack = EntityItemStack::new(2, 1).with_damage(17);
+
+        let tag = entity_item_stack_tag(&items, stack).unwrap();
+        let Tag::Compound(fields) = tag else {
+            panic!("item stack compound");
+        };
+        let Some(Tag::Compound(components)) = field(&fields, "components") else {
+            panic!("components compound");
+        };
+        assert_eq!(int_field(components, DAMAGE_COMPONENT), Some(17));
+
+        let loaded = read_entity_item_stack(&fields, &items).unwrap().unwrap();
+        assert_eq!(loaded, stack);
     }
 
     #[test]

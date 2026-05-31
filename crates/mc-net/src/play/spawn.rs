@@ -1,10 +1,6 @@
 use super::*;
 
 /// Pack `(x, y, z)` into vanilla's `BlockPos` `i64` representation.
-/// Currently used only by tests but kept here for the eventual
-/// re-introduction of `SetDefaultSpawnPosition` and other block-pos
-/// carrying clientbound packets.
-#[allow(dead_code)]
 pub(super) fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
     (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
 }

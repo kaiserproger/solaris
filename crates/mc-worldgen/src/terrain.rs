@@ -54,6 +54,13 @@ const FOREST_FREQUENCY: f64 = 1.0 / 160.0;
 const OCEAN_THRESHOLD: f64 = -0.16;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
 const COAST_BLEND_WIDTH: f64 = 0.28;
+const TELLUS_CONTINENT_SCALE: f64 = 22_000.0;
+const TELLUS_COAST_SCALE: f64 = 6_500.0;
+const TELLUS_HILL_SCALE: f64 = 2_400.0;
+const TELLUS_CLIMATE_SCALE: f64 = 18_000.0;
+const TELLUS_MOISTURE_SCALE: f64 = 16_000.0;
+const TELLUS_MOUNTAIN_MASK_SCALE: f64 = 24_000.0;
+const TELLUS_MOUNTAIN_DETAIL_SCALE: f64 = 3_200.0;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
 const CAVE_MIN_Y: i32 = MIN_Y + 8;
@@ -1056,38 +1063,30 @@ impl TerrainGenerator {
         let projection = MercatorProjection::from_settings(settings);
         let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
         let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
-        let continent = fbm_2d(
-            world_x as f64 / 15_000.0,
-            world_z as f64 / 15_000.0,
-            self.seed ^ 0x5445_4C4C_5553,
-            5,
-            0.55,
-        );
-        let coast = fbm_2d(
-            world_x as f64 / 3_000.0,
-            world_z as f64 / 3_000.0,
-            self.seed ^ 0x434F_4153_5453,
-            3,
-            0.5,
-        );
-        let ridges = self.ridges(world_x / 4, world_z / 4);
+        let land_mask = self.tellus_land_mask(world_x, world_z, settings);
+        let ridges = self.ridges(world_x / 8, world_z / 8);
         let hills = fbm_2d(
-            world_x as f64 / 900.0,
-            world_z as f64 / 900.0,
+            world_x as f64 / TELLUS_HILL_SCALE,
+            world_z as f64 / TELLUS_HILL_SCALE,
             self.seed ^ 0x454C_4556,
             4,
             0.52,
         );
-        let land_mask = continent + coast * 0.22 + (equator_weight - 0.5) * 0.08;
-        let shore = ((land_mask + 0.10) / 0.30).clamp(0.0, 1.0);
+        let mountain = self.tellus_mountain_factor(world_x, world_z);
+        let shore = ((land_mask + 0.14) / 0.42).clamp(0.0, 1.0);
         let shore = shore * shore * (3.0 - 2.0 * shore);
+        let equatorial_uplift = (equator_weight - 0.5).max(0.0) * 4.0;
         let terrestrial = settings.sea_level as f64
             + 5.0
-            + (land_mask.max(0.0) * 54.0 + ridges * 42.0 + hills * 18.0)
+            + equatorial_uplift
+            + (land_mask.max(0.0) * 38.0
+                + ridges * 14.0
+                + hills * 8.0
+                + mountain * (270.0 + ridges * 180.0))
                 * settings.terrestrial_height_scale.max(0.0);
         let oceanic = settings.sea_level as f64
             - 7.0
-            - ((-land_mask).max(0.0) * 44.0 + hills.abs() * 6.0)
+            - ((-land_mask).max(0.0) * 42.0 + hills.abs() * 4.0)
                 * settings.oceanic_height_scale.max(0.0);
         let raw = oceanic * (1.0 - shore) + terrestrial * shore;
         raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
@@ -1103,15 +1102,15 @@ impl TerrainGenerator {
         let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
         let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
         let continent = fbm_2d(
-            world_x as f64 / 15_000.0,
-            world_z as f64 / 15_000.0,
+            world_x as f64 / TELLUS_CONTINENT_SCALE,
+            world_z as f64 / TELLUS_CONTINENT_SCALE,
             self.seed ^ 0x5445_4C4C_5553,
             5,
             0.55,
         );
         let coast = fbm_2d(
-            world_x as f64 / 3_000.0,
-            world_z as f64 / 3_000.0,
+            world_x as f64 / TELLUS_COAST_SCALE,
+            world_z as f64 / TELLUS_COAST_SCALE,
             self.seed ^ 0x434F_4153_5453,
             3,
             0.5,
@@ -1130,8 +1129,8 @@ impl TerrainGenerator {
         let latitude_cooling = latitude_degrees.abs() / MAX_MERCATOR_LATITUDE;
         let altitude_cooling = ((height - settings.sea_level).max(0) as f64 / 128.0).min(1.0);
         let weather = fbm_2d(
-            world_x as f64 / 7_500.0,
-            world_z as f64 / 7_500.0,
+            world_x as f64 / TELLUS_CLIMATE_SCALE,
+            world_z as f64 / TELLUS_CLIMATE_SCALE,
             self.seed ^ 0x434C_494D_4154,
             3,
             0.55,
@@ -1142,8 +1141,8 @@ impl TerrainGenerator {
                 * settings.climate_strength)
                 + weather * 0.12,
             moisture: fbm_2d(
-                world_x as f64 / 5_500.0,
-                world_z as f64 / 5_500.0,
+                world_x as f64 / TELLUS_MOISTURE_SCALE,
+                world_z as f64 / TELLUS_MOISTURE_SCALE,
                 self.seed ^ 0x4D4F_4953_5455,
                 3,
                 0.55,
@@ -1254,7 +1253,7 @@ impl TerrainGenerator {
         let sea_level = settings.sea_level;
         let land_mask = self.tellus_land_mask(world_x, world_z, settings);
         let climate = self.tellus_climate(world_x, height, world_z);
-        let ridges = self.ridges(world_x / 4, world_z / 4);
+        let mountain = self.tellus_mountain_factor(world_x, world_z);
         let river = self.river_signal(world_x / 2, world_z / 2);
 
         if settings.water_enabled {
@@ -1279,7 +1278,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
         }
-        if height > sea_level + 58 || ridges > 0.58 {
+        if height > sea_level + 86 || mountain > 0.22 {
             return self
                 .biomes
                 .pick(&self.biomes.mountain, world_x, world_z, 0x544D_4F55);
@@ -1362,6 +1361,28 @@ impl TerrainGenerator {
             0.5,
         )
         .abs()
+    }
+
+    fn tellus_mountain_factor(&self, world_x: i32, world_z: i32) -> f64 {
+        let mask = fbm_2d(
+            world_x as f64 / TELLUS_MOUNTAIN_MASK_SCALE,
+            world_z as f64 / TELLUS_MOUNTAIN_MASK_SCALE,
+            self.seed ^ 0x544D_4F55_4E54,
+            4,
+            0.56,
+        );
+        let mask = ((mask - 0.32) / 0.30).clamp(0.0, 1.0);
+        let mask = mask * mask * (3.0 - 2.0 * mask);
+        let ridge = self.ridges(world_x / 10, world_z / 10).powf(1.35);
+        let detail = fbm_2d(
+            world_x as f64 / TELLUS_MOUNTAIN_DETAIL_SCALE,
+            world_z as f64 / TELLUS_MOUNTAIN_DETAIL_SCALE,
+            self.seed ^ 0x544D_4153_5349,
+            3,
+            0.5,
+        )
+        .max(0.0);
+        (mask * (ridge * 0.78 + detail * 0.22)).clamp(0.0, 1.0)
     }
 
     fn river_signal(&self, world_x: i32, world_z: i32) -> f64 {
@@ -2614,6 +2635,78 @@ mod tests {
         assert_eq!(
             chunk.get_block(lx, settings.sea_level, lz),
             Some(BlockStateId(0))
+        );
+    }
+
+    #[test]
+    fn tellus_like_keeps_local_terrain_smooth() {
+        let settings = TellusWorldgenSettings::default();
+        let g = TerrainGenerator::with_worldgen_mode(
+            91,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        );
+        let mut total_step = 0i64;
+        let mut samples = 0i64;
+        let mut max_step = 0;
+
+        for wx in (-256..=256).step_by(8) {
+            for wz in (-256..=256).step_by(8) {
+                if g.tellus_mountain_factor(wx, wz) > 0.05 {
+                    continue;
+                }
+                let h = g.surface_height(wx, wz);
+                let hx = g.surface_height(wx + 1, wz);
+                let hz = g.surface_height(wx, wz + 1);
+                let step = (h - hx).abs().max((h - hz).abs());
+                total_step += i64::from((h - hx).abs() + (h - hz).abs());
+                samples += 2;
+                max_step = max_step.max(step);
+            }
+        }
+
+        let average_step = total_step as f64 / samples as f64;
+        assert!(
+            average_step <= 1.35,
+            "Tellus average local step {average_step}"
+        );
+        assert!(max_step <= 5, "Tellus local non-mountain step {max_step}");
+    }
+
+    #[test]
+    fn tellus_like_mountains_are_rare_but_giant() {
+        let settings = TellusWorldgenSettings::default();
+        let g = TerrainGenerator::with_worldgen_mode(
+            91,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        );
+        let mut samples = 0usize;
+        let mut mountain_samples = 0usize;
+        let mut max_height = i32::MIN;
+
+        for wx in (-160_000..=160_000).step_by(4_096) {
+            for wz in (-160_000..=160_000).step_by(4_096) {
+                samples += 1;
+                let height = g.surface_height(wx, wz);
+                max_height = max_height.max(height);
+                if g.tellus_mountain_factor(wx, wz) > 0.22 {
+                    mountain_samples += 1;
+                }
+            }
+        }
+
+        assert!(
+            max_height >= settings.sea_level + 118,
+            "Tellus sample should contain giant mountains; max height {max_height}"
+        );
+        assert!(
+            mountain_samples > 0,
+            "Tellus mountain mask should be reachable"
+        );
+        assert!(
+            mountain_samples * 8 < samples,
+            "Tellus mountains should stay rare: {mountain_samples}/{samples}"
         );
     }
 

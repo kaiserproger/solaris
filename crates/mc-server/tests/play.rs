@@ -29,10 +29,11 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundContainerSetContent, ClientboundKeepAlive,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ConfirmTeleportation, GameEvent, LoginPlay,
-    PlayDisconnect, ServerboundChatCommand, ServerboundKeepAlive, SetCenterChunk,
-    SynchronizePlayerPosition,
+    ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundPlayerAbilities,
+    ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime, ConfirmTeleportation,
+    EntityEvent, GameEvent, LoginPlay, PlayDisconnect, ServerboundChatCommand,
+    ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -193,6 +194,40 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
+        ClientboundChangeDifficulty::ID,
+        "expected ChangeDifficulty after Login"
+    );
+    let change_difficulty = ClientboundChangeDifficulty::decode(&mut frame.body).unwrap();
+    assert!(
+        change_difficulty.difficulty < 4,
+        "difficulty ordinal in range"
+    );
+
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundPlayerAbilities::ID,
+        "expected PlayerAbilities after ChangeDifficulty"
+    );
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundSetHeldSlot::ID,
+        "expected SetHeldSlot after PlayerAbilities"
+    );
+    let held = ClientboundSetHeldSlot::decode(&mut frame.body).unwrap();
+    assert_eq!(held.slot, 0);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, EntityEvent::ID, "expected permission EntityEvent");
+    let permission_event = EntityEvent::decode(&mut frame.body).unwrap();
+    assert_eq!(permission_event.entity_id, login.entity_id);
+    assert_eq!(permission_event.event_id, 28);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
         ClientboundCommands::ID,
         "expected Commands after Login"
     );
@@ -221,6 +256,33 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     );
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundInitializeBorder::ID,
+        "expected Initialize Border"
+    );
+    let border = ClientboundInitializeBorder::decode(&mut frame.body).unwrap();
+    assert_eq!(border.absolute_max_size, 29_999_984);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundSetTime::ID,
+        "expected initial Set Time"
+    );
+    let time = ClientboundSetTime::decode(&mut frame.body).unwrap();
+    assert_eq!(time.game_time, 0);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        SetDefaultSpawnPosition::ID,
+        "expected Set Default Spawn Position"
+    );
+    let default_spawn = SetDefaultSpawnPosition::decode(&mut frame.body).unwrap();
+    assert_eq!(default_spawn.dimension, login.dimension_name);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, GameEvent::ID, "expected Game Event");
     let event = GameEvent::decode(&mut frame.body).unwrap();
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
@@ -232,15 +294,6 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!((center.chunk_x, center.chunk_z), (0, 0));
     // With world = None in this test the chunk packet is intentionally
     // not emitted; M3.e's view-distance test exercises the chunk path.
-
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(
-        frame.id,
-        ClientboundSetHeldSlot::ID,
-        "expected Set Held Slot"
-    );
-    let held = ClientboundSetHeldSlot::decode(&mut frame.body).unwrap();
-    assert_eq!(held.slot, 0);
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
@@ -345,8 +398,11 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
     // Drain Play entry burst. With world = None the chunk packet itself
-    // is intentionally not emitted.
-    for _ in 0..9 {
+    // is intentionally not emitted (LoginPlay, ChangeDifficulty,
+    // PlayerAbilities, SetHeldSlot, permission EntityEvent, Commands,
+    // SyncPos, InitializeBorder, SetTime, SetDefaultSpawn, GameEvent,
+    // SetCenterChunk, 3 visibility/dispatch bursts = 15 frames).
+    for _ in 0..15 {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 
@@ -380,7 +436,7 @@ async fn play_state_survival_damage_command_updates_health() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "DamageCmd").await;
 
-    for _ in 0..9 {
+    for _ in 0..15 {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 

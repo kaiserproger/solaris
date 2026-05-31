@@ -57,8 +57,8 @@ fn crop_test_reports() -> Vec<BlockReport> {
         "moisture".to_string(),
         (0..=7).map(|value| value.to_string()).collect(),
     );
-    let mut wheat_properties = BTreeMap::new();
-    wheat_properties.insert(
+    let mut crop_properties = BTreeMap::new();
+    crop_properties.insert(
         "age".to_string(),
         (0..=7).map(|value| value.to_string()).collect(),
     );
@@ -67,6 +67,7 @@ fn crop_test_reports() -> Vec<BlockReport> {
         simple_block(0, "minecraft:air"),
         simple_block(1, "minecraft:dirt"),
         simple_block(2, "minecraft:water"),
+        simple_block(19, "minecraft:soul_sand"),
         BlockReport {
             id: Identifier::parse("minecraft:farmland").unwrap(),
             properties: farmland_properties,
@@ -82,9 +83,37 @@ fn crop_test_reports() -> Vec<BlockReport> {
         },
         BlockReport {
             id: Identifier::parse("minecraft:wheat").unwrap(),
-            properties: wheat_properties,
+            properties: crop_properties.clone(),
             states: (0..=7)
                 .map(|age| state(11 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:carrots").unwrap(),
+            properties: crop_properties.clone(),
+            states: (0..=7)
+                .map(|age| state(20 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:potatoes").unwrap(),
+            properties: crop_properties.clone(),
+            states: (0..=7)
+                .map(|age| state(28 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:beetroots").unwrap(),
+            properties: crop_properties.clone(),
+            states: (0..=7)
+                .map(|age| state(36 + age, age == 0, &[("age", &age.to_string())]))
+                .collect(),
+        },
+        BlockReport {
+            id: Identifier::parse("minecraft:nether_wart").unwrap(),
+            properties: crop_properties,
+            states: (0..=7)
+                .map(|age| state(44 + age, age == 0, &[("age", &age.to_string())]))
                 .collect(),
         },
     ];
@@ -128,6 +157,8 @@ fn fluid_test_reports() -> Vec<BlockReport> {
         simple_block(16, "minecraft:sand"),
         simple_block(17, "minecraft:gravel"),
         simple_block(18, "minecraft:anvil"),
+        simple_block(19, "minecraft:cactus"),
+        simple_block(20, "minecraft:bamboo"),
     ]
 }
 
@@ -144,6 +175,25 @@ fn entity_tick_cadence_matches_vanilla_cow_tracking() {
     assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
     assert_eq!(mc_physics::TICK_SECONDS, 0.05);
     assert_eq!(ENTITY_MOVE_SEND_INTERVAL_TICKS, 1);
+}
+
+#[test]
+fn arrow_launch_uses_player_look_direction_and_draw_power() {
+    let pose = PlayerPose {
+        yaw: 90.0,
+        pitch: -30.0,
+        ..PlayerPose::new(1.0, 64.0, 2.0)
+    };
+
+    let spawn = arrow_spawn_position(pose);
+    let velocity = arrow_velocity(pose, 0.5);
+
+    assert!((spawn.x - 1.0).abs() < 0.000_001);
+    assert!((spawn.y - 65.62).abs() < 0.000_001);
+    assert!((spawn.z - 2.0).abs() < 0.000_001);
+    assert!((velocity.x + 1.299_038_105_676_658).abs() < 0.000_001);
+    assert!((velocity.y - 0.75).abs() < 0.000_001);
+    assert!(velocity.z.abs() < 0.000_001);
 }
 
 #[test]
@@ -387,6 +437,59 @@ fn wheat_seeds_place_wheat_on_farmland_only() {
     );
     assert_eq!(
         table.resolve_for_use_on(&items, 50, dirt_state, Direction::Up, &blocks),
+        None
+    );
+}
+
+#[test]
+fn common_crop_items_place_on_their_required_soil_only() {
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: Identifier::parse("minecraft:carrot").unwrap(),
+            protocol_id: 51,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:potato").unwrap(),
+            protocol_id: 52,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:beetroot_seeds").unwrap(),
+            protocol_id: 53,
+        },
+        ItemReport {
+            id: Identifier::parse("minecraft:nether_wart").unwrap(),
+            protocol_id: 54,
+        },
+    ]);
+    let blocks = crop_test_registry();
+    let table = ItemToBlockTable::build(&items, &blocks);
+    let farmland = Identifier::parse("minecraft:farmland").unwrap();
+    let farmland_state = blocks
+        .by_name_and_props(&farmland, &[("moisture".to_string(), "0".to_string())])
+        .unwrap();
+    let soul_sand = blocks
+        .block(&Identifier::parse("minecraft:soul_sand").unwrap())
+        .unwrap()
+        .default;
+
+    assert_eq!(
+        table.resolve_for_use_on(&items, 51, farmland_state, Direction::Up, &blocks),
+        Some(mc_world::BlockStateId(20))
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 52, farmland_state, Direction::Up, &blocks),
+        Some(mc_world::BlockStateId(28))
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 53, farmland_state, Direction::Up, &blocks),
+        Some(mc_world::BlockStateId(36))
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 54, soul_sand, Direction::Up, &blocks),
+        Some(mc_world::BlockStateId(44))
+    );
+    assert_eq!(
+        table.resolve_for_use_on(&items, 54, farmland_state, Direction::Up, &blocks),
         None
     );
 }
@@ -727,6 +830,108 @@ fn falling_block_starts_when_support_edit_becomes_replaceable() {
 }
 
 #[test]
+fn cactus_column_cascades_when_support_breaks() {
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let cactus_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cactus_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(cactus_1, BlockStateId(19)).unwrap();
+    world.set_block_at(cactus_2, BlockStateId(19)).unwrap();
+
+    let edits = plan_break_block_edits(
+        blocks,
+        &mut world,
+        support,
+        BlockStateId(1),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: support,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: cactus_1,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: cactus_2,
+                new_state: BlockStateId(0),
+            },
+        ]
+    );
+}
+
+#[test]
+fn bamboo_column_cascades_when_support_breaks() {
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let bamboo_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let bamboo_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(bamboo_1, BlockStateId(20)).unwrap();
+    world.set_block_at(bamboo_2, BlockStateId(20)).unwrap();
+
+    let edits = plan_break_block_edits(
+        blocks,
+        &mut world,
+        support,
+        BlockStateId(1),
+        BlockStateId(0),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: support,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: bamboo_1,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: bamboo_2,
+                new_state: BlockStateId(0),
+            },
+        ]
+    );
+}
+
+#[test]
 fn wheat_random_tick_advances_age_until_mature() {
     let blocks = crop_test_registry();
 
@@ -744,6 +949,34 @@ fn wheat_random_tick_advances_age_until_mature() {
     );
     assert_eq!(
         next_crop_growth_state(&blocks, mc_world::BlockStateId(1)),
+        None
+    );
+}
+
+#[test]
+fn sapling_random_tick_is_noop_until_tree_growth_exists() {
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        simple_block(1, "minecraft:oak_sapling"),
+    ];
+    let registry = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let pos = mc_world::BlockPos { x: 0, y: 64, z: 0 };
+
+    assert_eq!(
+        facts.random_tick_family(1),
+        Some(mc_data::block_facts::RandomTickFamily::Sapling)
+    );
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            pos,
+            BlockStateId(1),
+            mc_data::block_facts::RandomTickFamily::Sapling,
+        ),
         None
     );
 }
@@ -1032,6 +1265,189 @@ fn common_container_paper_cuts_resolve_to_existing_menus() {
 }
 
 #[test]
+fn furnace_like_recipe_lookup_uses_matching_cooking_category() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, SmeltingRecipe,
+    };
+
+    let iron_ore = Identifier::parse("minecraft:iron_ore").unwrap();
+    let raw_iron = Identifier::parse("minecraft:raw_iron").unwrap();
+    let beef = Identifier::parse("minecraft:beef").unwrap();
+    let porkchop = Identifier::parse("minecraft:porkchop").unwrap();
+    let iron_ingot = Identifier::parse("minecraft:iron_ingot").unwrap();
+    let cooked_beef = Identifier::parse("minecraft:cooked_beef").unwrap();
+    let cooked_porkchop = Identifier::parse("minecraft:cooked_porkchop").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: iron_ore.clone(),
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: raw_iron.clone(),
+            protocol_id: 11,
+        },
+        ItemReport {
+            id: beef.clone(),
+            protocol_id: 12,
+        },
+        ItemReport {
+            id: porkchop.clone(),
+            protocol_id: 13,
+        },
+        ItemReport {
+            id: iron_ingot.clone(),
+            protocol_id: 20,
+        },
+        ItemReport {
+            id: cooked_beef.clone(),
+            protocol_id: 21,
+        },
+        ItemReport {
+            id: cooked_porkchop.clone(),
+            protocol_id: 22,
+        },
+    ]);
+    let ingredient = |item: Identifier| Ingredient {
+        alternatives: vec![IngredientAlternative::Item(item)],
+    };
+    let cooking = |item: Identifier, cooking_time| SmeltingRecipe {
+        ingredient: ingredient(item),
+        cooking_time,
+    };
+    let result = |item: Identifier| RecipeResult { item, count: 1 };
+    let recipes = vec![
+        Recipe {
+            id: Identifier::parse("minecraft:test_smelting").unwrap(),
+            kind: RecipeKind::Smelting(cooking(iron_ore, 200)),
+            result: result(iron_ingot.clone()),
+        },
+        Recipe {
+            id: Identifier::parse("minecraft:test_blasting").unwrap(),
+            kind: RecipeKind::Blasting(cooking(raw_iron.clone(), 100)),
+            result: result(iron_ingot),
+        },
+        Recipe {
+            id: Identifier::parse("minecraft:test_smoking").unwrap(),
+            kind: RecipeKind::Smoking(cooking(beef.clone(), 100)),
+            result: result(cooked_beef),
+        },
+        Recipe {
+            id: Identifier::parse("minecraft:test_campfire").unwrap(),
+            kind: RecipeKind::CampfireCooking(cooking(porkchop.clone(), 600)),
+            result: result(cooked_porkchop),
+        },
+    ];
+    let tags = TagsData::default();
+
+    assert_eq!(
+        containers::find_cooking_recipe_for_item(&recipes, &items, &tags, FurnaceKind::Furnace, 10)
+            .map(|recipe| recipe.id),
+        Some(Identifier::parse("minecraft:test_smelting").unwrap())
+    );
+    assert!(
+        containers::find_cooking_recipe_for_item(&recipes, &items, &tags, FurnaceKind::Furnace, 11)
+            .is_none()
+    );
+    assert_eq!(
+        containers::find_cooking_recipe_for_item(
+            &recipes,
+            &items,
+            &tags,
+            FurnaceKind::BlastFurnace,
+            11
+        )
+        .map(|recipe| recipe.id),
+        Some(Identifier::parse("minecraft:test_blasting").unwrap())
+    );
+    assert_eq!(
+        containers::find_cooking_recipe_for_item(&recipes, &items, &tags, FurnaceKind::Smoker, 12)
+            .map(|recipe| recipe.id),
+        Some(Identifier::parse("minecraft:test_smoking").unwrap())
+    );
+    assert!(
+        containers::find_cooking_recipe_for_item(&recipes, &items, &tags, FurnaceKind::Furnace, 13)
+            .is_none()
+    );
+}
+
+#[test]
+fn campfire_recipe_lookup_uses_campfire_category() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, SmeltingRecipe,
+    };
+
+    let porkchop = Identifier::parse("minecraft:porkchop").unwrap();
+    let beef = Identifier::parse("minecraft:beef").unwrap();
+    let cooked_porkchop = Identifier::parse("minecraft:cooked_porkchop").unwrap();
+    let cooked_beef = Identifier::parse("minecraft:cooked_beef").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: porkchop.clone(),
+            protocol_id: 13,
+        },
+        ItemReport {
+            id: beef.clone(),
+            protocol_id: 14,
+        },
+        ItemReport {
+            id: cooked_porkchop.clone(),
+            protocol_id: 22,
+        },
+        ItemReport {
+            id: cooked_beef.clone(),
+            protocol_id: 23,
+        },
+    ]);
+    let ingredient = |item: Identifier| Ingredient {
+        alternatives: vec![IngredientAlternative::Item(item)],
+    };
+    let cooking = |item: Identifier, cooking_time| SmeltingRecipe {
+        ingredient: ingredient(item),
+        cooking_time,
+    };
+    let result = |item: Identifier| RecipeResult { item, count: 1 };
+    let recipes = vec![
+        Recipe {
+            id: Identifier::parse("minecraft:test_smoking").unwrap(),
+            kind: RecipeKind::Smoking(cooking(beef.clone(), 100)),
+            result: result(cooked_beef),
+        },
+        Recipe {
+            id: Identifier::parse("minecraft:test_campfire").unwrap(),
+            kind: RecipeKind::CampfireCooking(cooking(porkchop, 600)),
+            result: result(cooked_porkchop),
+        },
+    ];
+    let tags = TagsData::default();
+
+    assert_eq!(
+        containers::find_campfire_recipe_in(&recipes, &items, &tags, 13).map(|recipe| recipe.id),
+        Some(Identifier::parse("minecraft:test_campfire").unwrap())
+    );
+    assert!(containers::find_campfire_recipe_in(&recipes, &items, &tags, 14).is_none());
+}
+
+#[test]
+fn campfire_cooking_rejects_invalid_when_full() {
+    let mut cooking = CampfireCookingState::default();
+
+    for item_id in 1..=CAMPFIRE_COOKING_SLOT_COUNT as u32 {
+        assert!(cooking.insert(ItemStack::new(item_id, 1), 5));
+    }
+    assert!(!cooking.insert(ItemStack::new(99, 1), 5));
+}
+
+#[test]
+fn campfire_cooking_outputs_after_cooking_time() {
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(42, 1), 2));
+
+    assert!(cooking.tick().is_empty());
+    assert_eq!(cooking.tick(), vec![ItemStack::new(42, 1)]);
+    assert!(cooking.is_empty());
+}
+
+#[test]
 fn hostile_melee_requires_moving_toward_player() {
     let hostile = |velocity: Vec3| ServerEntitySnapshot {
         id: mc_entity::EntityId(7),
@@ -1045,6 +1461,7 @@ fn hostile_melee_requires_moving_toward_player() {
         item_stack: None,
         experience_value: None,
         block_state: None,
+        attack_damage: Some(3.0),
     };
     let player = Vec3::new(1.0, 0.0, 0.0);
 
@@ -1073,6 +1490,7 @@ fn hostile_melee_reaches_player_one_block_above() {
         item_stack: None,
         experience_value: None,
         block_state: None,
+        attack_damage: Some(3.0),
     };
 
     assert!(hostile_can_melee_player(

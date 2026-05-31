@@ -15,6 +15,9 @@ pub const AIR_DRAG: f64 = 0.98;
 pub const WATER_DRAG: f64 = 0.8;
 pub const WATER_BUOYANCY_BLOCKS_PER_SECOND_SQUARED: f64 = 7.0;
 pub const STEP_HEIGHT: f64 = 0.6;
+pub const ARROW_GRAVITY_BLOCKS_PER_SECOND_SQUARED: f64 = 9.8;
+pub const ARROW_DRAG: f64 = 0.99;
+pub const ARROW_WATER_DRAG: f64 = 0.6;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Vec3 {
@@ -145,8 +148,11 @@ pub struct PhysicsConfig {
     pub terminal_velocity: f64,
     pub ground_friction: f64,
     pub air_drag: f64,
+    pub vertical_air_drag: f64,
     pub water_drag: f64,
     pub water_buoyancy: f64,
+    pub step_height: f64,
+    pub stop_on_solid: bool,
 }
 
 impl Default for PhysicsConfig {
@@ -157,8 +163,27 @@ impl Default for PhysicsConfig {
             terminal_velocity: TERMINAL_VELOCITY_BLOCKS_PER_SECOND,
             ground_friction: GROUND_FRICTION,
             air_drag: AIR_DRAG,
+            vertical_air_drag: 1.0,
             water_drag: WATER_DRAG,
             water_buoyancy: WATER_BUOYANCY_BLOCKS_PER_SECOND_SQUARED,
+            step_height: STEP_HEIGHT,
+            stop_on_solid: false,
+        }
+    }
+}
+
+impl PhysicsConfig {
+    #[must_use]
+    pub fn arrow_projectile() -> Self {
+        Self {
+            gravity: ARROW_GRAVITY_BLOCKS_PER_SECOND_SQUARED,
+            air_drag: ARROW_DRAG,
+            vertical_air_drag: ARROW_DRAG,
+            water_drag: ARROW_WATER_DRAG,
+            water_buoyancy: 0.0,
+            step_height: 0.0,
+            stop_on_solid: true,
+            ..Self::default()
         }
     }
 }
@@ -260,6 +285,9 @@ pub fn step_entity<S: BlockSampler>(
     config: PhysicsConfig,
 ) -> StepResult {
     let in_fluid = body_overlaps_fluid(body, sampler);
+    if config.stop_on_solid && body.on_ground && body.velocity == Vec3::ZERO {
+        return StepResult { body, in_fluid };
+    }
     if in_fluid {
         body.velocity.y += config.water_buoyancy * config.tick_seconds;
         body.velocity.x *= config.water_drag;
@@ -268,6 +296,7 @@ pub fn step_entity<S: BlockSampler>(
     } else {
         body.velocity.y -= config.gravity * config.tick_seconds;
         body.velocity.x *= config.air_drag;
+        body.velocity.y *= config.vertical_air_drag;
         body.velocity.z *= config.air_drag;
     }
     body.velocity.y = body.velocity.y.max(config.terminal_velocity);
@@ -277,20 +306,32 @@ pub fn step_entity<S: BlockSampler>(
     body.position.x += dx;
     if dx != 0.0
         && body_collides_with_solid(body, sampler)
-        && !try_step_up(&mut body, sampler, &mut stepped_up)
+        && !try_step_up(&mut body, sampler, &mut stepped_up, config.step_height)
     {
         body.position.x -= dx;
-        body.velocity.x = 0.0;
+        if config.stop_on_solid {
+            body.velocity = Vec3::ZERO;
+            body.on_ground = true;
+            return StepResult { body, in_fluid };
+        } else {
+            body.velocity.x = 0.0;
+        }
     }
 
     let dz = body.velocity.z * config.tick_seconds;
     body.position.z += dz;
     if dz != 0.0
         && body_collides_with_solid(body, sampler)
-        && !try_step_up(&mut body, sampler, &mut stepped_up)
+        && !try_step_up(&mut body, sampler, &mut stepped_up, config.step_height)
     {
         body.position.z -= dz;
-        body.velocity.z = 0.0;
+        if config.stop_on_solid {
+            body.velocity = Vec3::ZERO;
+            body.on_ground = true;
+            return StepResult { body, in_fluid };
+        } else {
+            body.velocity.z = 0.0;
+        }
     }
 
     body.position.y += body.velocity.y * config.tick_seconds;
@@ -303,9 +344,13 @@ pub fn step_entity<S: BlockSampler>(
         && body.velocity.y <= 0.0
     {
         body.position.y = ground_y;
-        body.velocity.y = 0.0;
-        body.velocity.x *= config.ground_friction;
-        body.velocity.z *= config.ground_friction;
+        if config.stop_on_solid {
+            body.velocity = Vec3::ZERO;
+        } else {
+            body.velocity.y = 0.0;
+            body.velocity.x *= config.ground_friction;
+            body.velocity.z *= config.ground_friction;
+        }
         body.on_ground = true;
     }
 
@@ -353,13 +398,18 @@ fn body_collides_with_solid<S: BlockSampler>(body: EntityBody, sampler: &S) -> b
     false
 }
 
-fn try_step_up<S: BlockSampler>(body: &mut EntityBody, sampler: &S, stepped_up: &mut bool) -> bool {
-    if !body.on_ground || *stepped_up {
+fn try_step_up<S: BlockSampler>(
+    body: &mut EntityBody,
+    sampler: &S,
+    stepped_up: &mut bool,
+    step_height: f64,
+) -> bool {
+    if !body.on_ground || *stepped_up || step_height <= 0.0 {
         return false;
     }
-    body.position.y += STEP_HEIGHT;
+    body.position.y += step_height;
     if body_collides_with_solid(*body, sampler) {
-        body.position.y -= STEP_HEIGHT;
+        body.position.y -= step_height;
         false
     } else {
         *stepped_up = true;
@@ -458,6 +508,74 @@ mod tests {
 
         assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
         assert_eq!(stepped.velocity.x, 0.0);
+    }
+
+    #[test]
+    fn arrow_projectile_applies_gravity_and_vertical_drag() {
+        let world = FlatWorld {
+            ground_y: -64,
+            water_y: None,
+        };
+        let body = EntityBody {
+            position: Vec3::new(0.5, 70.0, 0.5),
+            velocity: Vec3::new(0.0, 1.0, 0.0),
+            aabb: Aabb {
+                half_width: 0.25,
+                height: 0.25,
+            },
+            on_ground: false,
+        };
+
+        let stepped = step_entity(body, &world, PhysicsConfig::arrow_projectile()).body;
+
+        assert!(stepped.velocity.y < body.velocity.y);
+        assert!(stepped.position.y > body.position.y);
+    }
+
+    #[test]
+    fn arrow_projectile_stops_on_solid_without_step_up() {
+        let world = LocalBlocks {
+            solids: vec![GridPos::new(1, 64, 0)],
+            fluids: Vec::new(),
+        };
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::new(20.0, 0.0, 0.0),
+            aabb: Aabb {
+                half_width: 0.25,
+                height: 0.25,
+            },
+            on_ground: true,
+        };
+
+        let stepped = step_entity(body, &world, PhysicsConfig::arrow_projectile()).body;
+
+        assert!((stepped.position.x - body.position.x).abs() < 1.0e-9);
+        assert!((stepped.position.y - body.position.y).abs() < 1.0e-9);
+        assert!((stepped.position.z - body.position.z).abs() < 1.0e-9);
+        assert_eq!(stepped.velocity, Vec3::ZERO);
+        assert!(stepped.on_ground);
+    }
+
+    #[test]
+    fn stopped_arrow_projectile_remains_stopped() {
+        let world = FlatWorld {
+            ground_y: 63,
+            water_y: None,
+        };
+        let body = EntityBody {
+            position: Vec3::new(0.5, 64.0, 0.5),
+            velocity: Vec3::ZERO,
+            aabb: Aabb {
+                half_width: 0.25,
+                height: 0.25,
+            },
+            on_ground: true,
+        };
+
+        let stepped = step_entity(body, &world, PhysicsConfig::arrow_projectile()).body;
+
+        assert_eq!(stepped, body);
     }
 
     #[test]

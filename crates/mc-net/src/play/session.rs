@@ -14,6 +14,13 @@ pub(super) enum OutboundCommand {
     SpawnEntity(ServerEntitySnapshot),
     UpdateEntityData(ServerEntitySnapshot),
     MoveEntityRelative(ServerEntityMove),
+    EntityEvent {
+        entity_id: i32,
+        event_id: i8,
+    },
+    DamagePlayer {
+        amount: f32,
+    },
     TakeItemEntity {
         item_entity_id: i32,
         player_entity_id: i32,
@@ -55,6 +62,8 @@ impl OutboundCommand {
             | Self::DespawnPlayer(_)
             | Self::SpawnEntity(_)
             | Self::UpdateEntityData(_)
+            | Self::EntityEvent { .. }
+            | Self::DamagePlayer { .. }
             | Self::TakeItemEntity { .. }
             | Self::DespawnEntity(_)
             | Self::FurnaceSlots { .. }
@@ -154,6 +163,7 @@ pub(super) struct ServerEntitySnapshot {
     pub(super) item_stack: Option<EntityItemStack>,
     pub(super) experience_value: Option<i32>,
     pub(super) block_state: Option<u32>,
+    pub(super) attack_damage: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -199,12 +209,24 @@ struct SessionRegistryInner {
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
     last_entity_damage_ticks: HashMap<EntityId, u64>,
     item_pickup_ready_ticks: HashMap<EntityId, u64>,
+    arrow_spawn_ticks: HashMap<EntityId, u64>,
+    arrow_owner_sessions: HashMap<EntityId, SessionId>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
     chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
+    campfire_cooking: HashMap<mc_world::BlockPos, CampfireCookingState>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     entity_dispatches: EntityDispatchCounters,
     world_time: u64,
+    arrow_kill_rewards: ArrowKillRewards,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ArrowKillRewards {
+    item_entity_type_id: Option<i32>,
+    xp_orb_entity_type_id: Option<i32>,
+    items: Option<Arc<ItemRegistry>>,
+    loot: Option<Arc<mc_data::loot::LootTables>>,
 }
 
 impl Default for SessionRegistryInner {
@@ -221,12 +243,16 @@ impl Default for SessionRegistryInner {
             last_sent_entity_positions: HashMap::new(),
             last_entity_damage_ticks: HashMap::new(),
             item_pickup_ready_ticks: HashMap::new(),
+            arrow_spawn_ticks: HashMap::new(),
+            arrow_owner_sessions: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
             chest_viewers: HashMap::new(),
+            campfire_cooking: HashMap::new(),
             player_persistence: HashMap::new(),
             entity_dispatches: EntityDispatchCounters::default(),
             world_time: 0,
+            arrow_kill_rewards: ArrowKillRewards::default(),
         }
     }
 }
@@ -240,6 +266,35 @@ impl SessionRegistry {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(super) fn insert_campfire_cooking(
+        &self,
+        position: mc_world::BlockPos,
+        result: ItemStack,
+        cooking_time: u32,
+    ) -> bool {
+        let mut inner = self.lock_inner("insert campfire cooking");
+        inner
+            .campfire_cooking
+            .entry(position)
+            .or_default()
+            .insert(result, cooking_time)
+    }
+
+    pub(super) fn tick_campfire_cooking(&self) -> Vec<(mc_world::BlockPos, ItemStack)> {
+        let mut inner = self.lock_inner("tick campfire cooking");
+        let mut completed = Vec::new();
+        inner.campfire_cooking.retain(|position, cooking| {
+            completed.extend(cooking.tick().into_iter().map(|stack| (*position, stack)));
+            !cooking.is_empty()
+        });
+        completed
+    }
+
+    pub(super) fn clear_campfire_cooking(&self, position: mc_world::BlockPos) {
+        let mut inner = self.lock_inner("clear campfire cooking");
+        inner.campfire_cooking.remove(&position);
     }
 
     fn lock_inner(
@@ -829,23 +884,8 @@ impl SessionRegistry {
         position: Vec3,
         stack: EntityItemStack,
     ) -> Vec<VisibilityDispatch> {
-        if stack.is_empty() {
-            return Vec::new();
-        }
         let mut inner = self.lock_inner("spawn item drop");
-        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
-        entity.item_stack = Some(stack);
-        entity.velocity = Vec3::new(0.0, 0.1, 0.0);
-        let id = inner.entities.spawn(entity);
-        inner
-            .entity_type_aabbs
-            .entry(entity_type_id)
-            .or_insert_with(|| entity_aabb("minecraft:item"));
-        track_entity_chunk_locked(&mut inner, id, position);
-        inner.last_sent_entity_positions.insert(id, position);
-        let ready_tick = inner.world_time.saturating_add(ITEM_PICKUP_DELAY_TICKS);
-        inner.item_pickup_ready_ticks.insert(id, ready_tick);
-        spawn_entity_visibility_locked(&mut inner, id)
+        spawn_item_drop_locked(&mut inner, entity_type_id, position, stack)
     }
 
     pub(super) fn spawn_xp_orb(
@@ -854,21 +894,24 @@ impl SessionRegistry {
         position: Vec3,
         value: i32,
     ) -> Vec<VisibilityDispatch> {
-        if value <= 0 {
-            return Vec::new();
-        }
         let mut inner = self.lock_inner("spawn xp orb");
-        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:experience_orb", position);
-        entity.experience_value = Some(value);
-        entity.velocity = Vec3::new(0.0, 0.08, 0.0);
-        let id = inner.entities.spawn(entity);
-        inner
-            .entity_type_aabbs
-            .entry(entity_type_id)
-            .or_insert_with(|| entity_aabb("minecraft:experience_orb"));
-        track_entity_chunk_locked(&mut inner, id, position);
-        inner.last_sent_entity_positions.insert(id, position);
-        spawn_entity_visibility_locked(&mut inner, id)
+        spawn_xp_orb_locked(&mut inner, entity_type_id, position, value)
+    }
+
+    pub(crate) fn configure_arrow_kill_rewards(
+        &self,
+        item_entity_type_id: Option<i32>,
+        xp_orb_entity_type_id: Option<i32>,
+        items: Arc<ItemRegistry>,
+        loot: Arc<mc_data::loot::LootTables>,
+    ) {
+        let mut inner = self.lock_inner("configure arrow kill rewards");
+        inner.arrow_kill_rewards = ArrowKillRewards {
+            item_entity_type_id,
+            xp_orb_entity_type_id,
+            items: Some(items),
+            loot: Some(loot),
+        };
     }
 
     pub(super) fn spawn_falling_block(
@@ -886,6 +929,36 @@ impl SessionRegistry {
             .entity_type_aabbs
             .entry(entity_type_id)
             .or_insert_with(|| entity_aabb("minecraft:falling_block"));
+        track_entity_chunk_locked(&mut inner, id, position);
+        inner.last_sent_entity_positions.insert(id, position);
+        spawn_entity_visibility_locked(&mut inner, id)
+    }
+
+    pub(super) fn spawn_arrow(
+        &self,
+        owner_session: Option<SessionId>,
+        entity_type_id: i32,
+        position: Vec3,
+        velocity: Vec3,
+        rotation: Rotation,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_inner("spawn arrow");
+        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:arrow", position);
+        entity.velocity = velocity;
+        entity.rotation = rotation;
+        entity.on_ground = false;
+        apply_entity_facts(&mut entity);
+        let aabb = entity_aabb(&entity.type_name);
+        let id = inner.entities.spawn(entity);
+        let world_time = inner.world_time;
+        inner.arrow_spawn_ticks.insert(id, world_time);
+        if let Some(owner_session) = owner_session {
+            inner.arrow_owner_sessions.insert(id, owner_session);
+        }
+        inner
+            .entity_type_aabbs
+            .entry(entity_type_id)
+            .or_insert(aabb);
         track_entity_chunk_locked(&mut inner, id, position);
         inner.last_sent_entity_positions.insert(id, position);
         spawn_entity_visibility_locked(&mut inner, id)
@@ -924,6 +997,24 @@ impl SessionRegistry {
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .filter(|entity| entity.item_stack.is_some())
             .filter(|entity| item_pickup_ready_locked(&inner, entity.id))
+            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+            .map(server_entity_snapshot_from_view)
+            .collect()
+    }
+
+    pub(super) fn nearby_grounded_arrows(
+        &self,
+        position: Vec3,
+        radius: f64,
+    ) -> Vec<ServerEntitySnapshot> {
+        let radius_sq = radius * radius;
+        let inner = self.lock_inner("nearby grounded arrows");
+        inner
+            .entities
+            .views()
+            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .filter(|entity| entity.type_name == "minecraft:arrow")
+            .filter(|entity| entity.on_ground && entity.velocity == Vec3::ZERO)
             .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
             .map(server_entity_snapshot_from_view)
             .collect()
@@ -981,17 +1072,7 @@ impl SessionRegistry {
         amount: f32,
     ) -> Option<mc_entity::EntityDamage> {
         let mut inner = self.lock_inner("damage server entity");
-        let world_time = inner.world_time;
-        if inner
-            .last_entity_damage_ticks
-            .get(&entity_id)
-            .is_some_and(|last| world_time.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
-        {
-            return None;
-        }
-        let damage = inner.entities.damage(entity_id, amount)?;
-        inner.last_entity_damage_ticks.insert(entity_id, world_time);
-        Some(damage)
+        damage_server_entity_locked(&mut inner, entity_id, amount)
     }
 
     pub(super) fn claim_item_pickup(
@@ -1016,7 +1097,11 @@ impl SessionRegistry {
             return None;
         }
         let picked_count = stack.count.min(max_count);
-        let picked = EntityItemStack::new(stack.item_id, picked_count);
+        let picked = EntityItemStack {
+            item_id: stack.item_id,
+            count: picked_count,
+            damage: stack.damage,
+        };
         stack.count -= picked_count;
 
         if stack.count <= 0 {
@@ -1027,6 +1112,8 @@ impl SessionRegistry {
             inner.last_sent_entity_positions.remove(&entity_id);
             inner.last_entity_damage_ticks.remove(&entity_id);
             inner.item_pickup_ready_ticks.remove(&entity_id);
+            inner.arrow_spawn_ticks.remove(&entity_id);
+            inner.arrow_owner_sessions.remove(&entity_id);
             untrack_entity_chunk_locked(&mut inner, entity_id);
             let dispatches = picked_entity_dispatches_locked(
                 &mut inner,
@@ -1069,11 +1156,20 @@ impl SessionRegistry {
         }
     }
 
-    pub(super) fn remove_server_entity(
+    pub(super) fn claim_arrow_pickup(
         &self,
         entity_id: EntityId,
-    ) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
-        let mut inner = self.lock_inner("despawn entity");
+        collector_session: SessionId,
+    ) -> Option<Vec<VisibilityDispatch>> {
+        let mut inner = self.lock_inner("claim arrow pickup");
+        let snapshot = inner.entities.snapshot(entity_id)?;
+        if snapshot.lifecycle != EntityLifecycle::Alive
+            || snapshot.type_name != "minecraft:arrow"
+            || !snapshot.on_ground
+            || snapshot.velocity != Vec3::ZERO
+        {
+            return None;
+        }
         let snapshot = inner
             .entities
             .remove(entity_id)
@@ -1081,22 +1177,24 @@ impl SessionRegistry {
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
         inner.item_pickup_ready_ticks.remove(&entity_id);
+        inner.arrow_spawn_ticks.remove(&entity_id);
+        inner.arrow_owner_sessions.remove(&entity_id);
         untrack_entity_chunk_locked(&mut inner, entity_id);
+        Some(picked_entity_dispatches_locked(
+            &mut inner,
+            entity_id,
+            collector_session,
+            1,
+            snapshot,
+        ))
+    }
 
-        let mut dispatches = Vec::new();
-        for (&observer_id, observer) in &mut inner.sessions {
-            if observer.visible_entities.remove(&entity_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
-                });
-            }
-        }
-        record_entity_dispatches_locked(&mut inner, &dispatches);
-        Some((snapshot, dispatches))
+    pub(super) fn remove_server_entity(
+        &self,
+        entity_id: EntityId,
+    ) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
+        let mut inner = self.lock_inner("despawn entity");
+        remove_server_entity_locked(&mut inner, entity_id)
     }
 
     pub(super) fn remove_picked_item(
@@ -1113,6 +1211,8 @@ impl SessionRegistry {
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
         inner.item_pickup_ready_ticks.remove(&entity_id);
+        inner.arrow_spawn_ticks.remove(&entity_id);
+        inner.arrow_owner_sessions.remove(&entity_id);
         untrack_entity_chunk_locked(&mut inner, entity_id);
         Some(picked_entity_dispatches_locked(
             &mut inner,
@@ -1170,6 +1270,11 @@ impl SessionRegistry {
                         velocity: entity.velocity,
                         aabb,
                         on_ground: entity.on_ground,
+                        kind: if entity.type_name == "minecraft:arrow" {
+                            EntityPhysicsKind::ArrowProjectile
+                        } else {
+                            EntityPhysicsKind::Default
+                        },
                     },
                 ))
             })
@@ -1196,9 +1301,14 @@ impl SessionRegistry {
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
+            let is_arrow = entity.type_name == "minecraft:arrow";
             if inner.entities.insert_snapshot(entity) {
                 inner.entity_type_aabbs.entry(type_id).or_insert(aabb);
                 track_entity_chunk_locked(&mut inner, entity_id, position);
+                if is_arrow {
+                    let world_time = inner.world_time;
+                    inner.arrow_spawn_ticks.insert(entity_id, world_time);
+                }
                 inner.spawned_entity_chunks.insert(chunk);
                 restored += 1;
             }
@@ -1220,6 +1330,7 @@ impl SessionRegistry {
         if inner.entities.is_empty() {
             return;
         }
+        let mut dispatches = despawn_expired_arrows_locked(&mut inner);
         let old_chunks: HashMap<_, _> = steps
             .iter()
             .filter_map(|step| {
@@ -1228,6 +1339,15 @@ impl SessionRegistry {
                     .get(&step.id)
                     .copied()
                     .map(|chunk| (step.id, chunk))
+            })
+            .collect();
+        let old_positions: HashMap<_, _> = steps
+            .iter()
+            .filter_map(|step| {
+                inner
+                    .entities
+                    .view(step.id)
+                    .map(|entity| (step.id, entity.position))
             })
             .collect();
         let crossed_visibility_boundary = steps.iter().any(|step| {
@@ -1261,23 +1381,27 @@ impl SessionRegistry {
                 }
             }
         }
-        let mut dispatches = if crossed_visibility_boundary {
-            steps
-                .iter()
-                .filter_map(|step| {
-                    let old_chunk = old_chunks.get(&step.id).copied()?;
-                    let new_chunk = chunk_pos_from_coords(step.position.x, step.position.z);
-                    (old_chunk != new_chunk).then_some((step.id, old_chunk, new_chunk))
-                })
-                .flat_map(|(entity_id, old_chunk, new_chunk)| {
-                    refresh_entity_target_visibility_locked(
-                        &mut inner, entity_id, old_chunk, new_chunk,
-                    )
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        dispatches.extend(resolve_arrow_entity_hits_locked(
+            &mut inner,
+            steps,
+            &old_positions,
+        ));
+        if crossed_visibility_boundary {
+            dispatches.extend(
+                steps
+                    .iter()
+                    .filter_map(|step| {
+                        let old_chunk = old_chunks.get(&step.id).copied()?;
+                        let new_chunk = chunk_pos_from_coords(step.position.x, step.position.z);
+                        (old_chunk != new_chunk).then_some((step.id, old_chunk, new_chunk))
+                    })
+                    .flat_map(|(entity_id, old_chunk, new_chunk)| {
+                        refresh_entity_target_visibility_locked(
+                            &mut inner, entity_id, old_chunk, new_chunk,
+                        )
+                    }),
+            );
+        }
         if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
             drop(inner);
             dispatch_visibility_commands(dispatches);
@@ -1427,6 +1551,7 @@ pub(super) fn server_entity_snapshot_from(
         item_stack: entity.item_stack,
         experience_value: entity.experience_value,
         block_state: entity.block_state,
+        attack_damage: entity.attributes.base(&AttributeKind::AttackDamage),
     }
 }
 
@@ -1443,6 +1568,7 @@ fn server_entity_snapshot_from_view(entity: EntityView<'_>) -> ServerEntitySnaps
         item_stack: entity.item_stack,
         experience_value: entity.experience_value,
         block_state: entity.block_state,
+        attack_damage: entity.attributes.base(&AttributeKind::AttackDamage),
     }
 }
 
@@ -2091,6 +2217,415 @@ fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<Visibility
     dispatches
 }
 
+fn despawn_expired_arrows_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
+    let expired = inner
+        .arrow_spawn_ticks
+        .iter()
+        .filter_map(|(&entity_id, &spawn_tick)| {
+            (inner.world_time.saturating_sub(spawn_tick) >= ARROW_DESPAWN_AGE_TICKS)
+                .then_some(entity_id)
+        })
+        .collect::<Vec<_>>();
+    expired
+        .into_iter()
+        .filter_map(|entity_id| {
+            remove_server_entity_locked(inner, entity_id).map(|(_, dispatches)| dispatches)
+        })
+        .flatten()
+        .collect()
+}
+
+fn resolve_arrow_entity_hits_locked(
+    inner: &mut SessionRegistryInner,
+    steps: &[EntityPhysicsStep],
+    old_positions: &HashMap<EntityId, Vec3>,
+) -> Vec<VisibilityDispatch> {
+    let mut dispatches = Vec::new();
+    for step in steps {
+        let Some(start) = old_positions.get(&step.id).copied() else {
+            continue;
+        };
+        let Some(arrow) = inner.entities.view(step.id) else {
+            continue;
+        };
+        if arrow.lifecycle != EntityLifecycle::Alive || arrow.type_name != "minecraft:arrow" {
+            continue;
+        }
+        let Some(target) = first_arrow_hit_target_locked(inner, step.id, start, step.position)
+        else {
+            continue;
+        };
+        match target {
+            ArrowHitTarget::Entity(target_id) => {
+                let Some(damage) =
+                    damage_server_entity_locked(inner, target_id, ARROW_ENTITY_HIT_DAMAGE)
+                else {
+                    continue;
+                };
+                if damage.killed {
+                    if let Some((target, target_dispatches)) =
+                        remove_server_entity_locked(inner, target_id)
+                    {
+                        dispatches.extend(target_dispatches);
+                        let item_entity_type_id = inner.arrow_kill_rewards.item_entity_type_id;
+                        let xp_orb_entity_type_id = inner.arrow_kill_rewards.xp_orb_entity_type_id;
+                        let drop =
+                            arrow_kill_drop_stack(&inner.arrow_kill_rewards, &target.type_name);
+                        if let (Some(entity_type_id), Some(drop)) = (item_entity_type_id, drop) {
+                            dispatches.extend(spawn_item_drop_locked(
+                                inner,
+                                entity_type_id,
+                                target.position,
+                                entity_item_stack(drop),
+                            ));
+                        }
+                        if let Some(entity_type_id) = xp_orb_entity_type_id {
+                            dispatches.extend(spawn_xp_orb_locked(
+                                inner,
+                                entity_type_id,
+                                target.position,
+                                mob_xp_value(&target.type_name),
+                            ));
+                        }
+                    }
+                } else {
+                    dispatches.extend(apply_arrow_knockback_locked(
+                        inner,
+                        target_id,
+                        start,
+                        step.position,
+                    ));
+                    dispatches.extend(entity_event_dispatches_locked(inner, target_id, 2));
+                }
+            }
+            ArrowHitTarget::Player(session_id) => {
+                if let Some(session) = inner.sessions.get(&session_id) {
+                    dispatches.push(VisibilityDispatch {
+                        recipient: SessionRecipient {
+                            id: session_id,
+                            tx: session.tx.clone(),
+                        },
+                        command: OutboundCommand::DamagePlayer {
+                            amount: ARROW_ENTITY_HIT_DAMAGE,
+                        },
+                    });
+                }
+            }
+        }
+        if let Some((_, arrow_dispatches)) = remove_server_entity_locked(inner, step.id) {
+            dispatches.extend(arrow_dispatches);
+        }
+    }
+    dispatches
+}
+
+fn arrow_kill_drop_stack(config: &ArrowKillRewards, entity_type: &str) -> Option<ItemStack> {
+    mob_drop_stack_from(
+        config.loot.as_deref()?,
+        config.items.as_deref()?,
+        entity_type,
+    )
+}
+
+fn spawn_item_drop_locked(
+    inner: &mut SessionRegistryInner,
+    entity_type_id: i32,
+    position: Vec3,
+    stack: EntityItemStack,
+) -> Vec<VisibilityDispatch> {
+    if stack.is_empty() {
+        return Vec::new();
+    }
+    let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
+    entity.item_stack = Some(stack);
+    entity.velocity = Vec3::new(0.0, 0.1, 0.0);
+    let id = inner.entities.spawn(entity);
+    inner
+        .entity_type_aabbs
+        .entry(entity_type_id)
+        .or_insert_with(|| entity_aabb("minecraft:item"));
+    track_entity_chunk_locked(inner, id, position);
+    inner.last_sent_entity_positions.insert(id, position);
+    let ready_tick = inner.world_time.saturating_add(ITEM_PICKUP_DELAY_TICKS);
+    inner.item_pickup_ready_ticks.insert(id, ready_tick);
+    spawn_entity_visibility_locked(inner, id)
+}
+
+fn spawn_xp_orb_locked(
+    inner: &mut SessionRegistryInner,
+    entity_type_id: i32,
+    position: Vec3,
+    value: i32,
+) -> Vec<VisibilityDispatch> {
+    if value <= 0 {
+        return Vec::new();
+    }
+    let mut entity = SpawnEntity::new(entity_type_id, "minecraft:experience_orb", position);
+    entity.experience_value = Some(value);
+    entity.velocity = Vec3::new(0.0, 0.08, 0.0);
+    let id = inner.entities.spawn(entity);
+    inner
+        .entity_type_aabbs
+        .entry(entity_type_id)
+        .or_insert_with(|| entity_aabb("minecraft:experience_orb"));
+    track_entity_chunk_locked(inner, id, position);
+    inner.last_sent_entity_positions.insert(id, position);
+    spawn_entity_visibility_locked(inner, id)
+}
+
+fn apply_arrow_knockback_locked(
+    inner: &mut SessionRegistryInner,
+    target_id: EntityId,
+    start: Vec3,
+    end: Vec3,
+) -> Vec<VisibilityDispatch> {
+    let Some(knockback) = arrow_knockback(start, end) else {
+        return Vec::new();
+    };
+    let Some(target) = inner.entities.view(target_id) else {
+        return Vec::new();
+    };
+    let velocity = Vec3::new(
+        target.velocity.x + knockback.x,
+        (target.velocity.y + knockback.y).max(knockback.y),
+        target.velocity.z + knockback.z,
+    );
+    if !inner.entities.set_velocity(target_id, velocity) {
+        return Vec::new();
+    }
+    let Some(snapshot) = inner
+        .entities
+        .view(target_id)
+        .map(server_entity_snapshot_from_view)
+    else {
+        return Vec::new();
+    };
+    visible_entity_observers_locked(inner, target_id)
+        .into_iter()
+        .filter_map(|observer_id| {
+            let observer = inner.sessions.get(&observer_id)?;
+            Some(VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id: observer_id,
+                    tx: observer.tx.clone(),
+                },
+                command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
+                    id: target_id,
+                    delta: Vec3::ZERO,
+                    velocity: snapshot.velocity,
+                    rotation: snapshot.rotation,
+                    on_ground: snapshot.on_ground,
+                    send_velocity: true,
+                }),
+            })
+        })
+        .collect()
+}
+
+fn arrow_knockback(start: Vec3, end: Vec3) -> Option<Vec3> {
+    let dx = end.x - start.x;
+    let dz = end.z - start.z;
+    let horizontal = dx.hypot(dz);
+    if horizontal <= f64::EPSILON {
+        return None;
+    }
+    Some(Vec3::new(
+        dx / horizontal * ARROW_ENTITY_HIT_KNOCKBACK,
+        0.1,
+        dz / horizontal * ARROW_ENTITY_HIT_KNOCKBACK,
+    ))
+}
+
+fn damage_server_entity_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+    amount: f32,
+) -> Option<mc_entity::EntityDamage> {
+    let world_time = inner.world_time;
+    if inner
+        .last_entity_damage_ticks
+        .get(&entity_id)
+        .is_some_and(|last| world_time.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
+    {
+        return None;
+    }
+    let damage = inner.entities.damage(entity_id, amount)?;
+    inner.last_entity_damage_ticks.insert(entity_id, world_time);
+    Some(damage)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ArrowHitTarget {
+    Entity(EntityId),
+    Player(SessionId),
+}
+
+fn first_arrow_hit_target_locked(
+    inner: &SessionRegistryInner,
+    arrow_id: EntityId,
+    start: Vec3,
+    end: Vec3,
+) -> Option<ArrowHitTarget> {
+    let owner = inner.arrow_owner_sessions.get(&arrow_id).copied();
+    let entity_hit = inner
+        .entities
+        .views()
+        .filter(|entity| arrow_can_hit_entity(arrow_id, *entity))
+        .filter_map(|entity| {
+            let aabb = inner
+                .entity_type_aabbs
+                .get(&entity.type_id)
+                .copied()
+                .unwrap_or_else(|| entity_aabb(entity.type_name));
+            segment_target_aabb_t(start, end, entity.position, aabb)
+                .map(|t| (t, ArrowHitTarget::Entity(entity.id)))
+        })
+        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t));
+    let player_hit = inner
+        .sessions
+        .iter()
+        .filter(|(session_id, _)| Some(**session_id) != owner)
+        .filter_map(|(session_id, session)| {
+            segment_target_aabb_t(
+                start,
+                end,
+                player_collision_position(session.pose),
+                player_aabb(),
+            )
+            .map(|t| (t, ArrowHitTarget::Player(*session_id)))
+        })
+        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t));
+    entity_hit
+        .into_iter()
+        .chain(player_hit)
+        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t))
+        .map(|(_, target)| target)
+}
+
+fn player_collision_position(pose: PlayerPose) -> Vec3 {
+    Vec3::new(pose.x, pose.y, pose.z)
+}
+
+fn player_aabb() -> mc_physics::Aabb {
+    mc_physics::Aabb {
+        half_width: 0.3,
+        height: 1.8,
+    }
+}
+
+fn arrow_can_hit_entity(arrow_id: EntityId, entity: EntityView<'_>) -> bool {
+    entity.id != arrow_id
+        && entity.lifecycle == EntityLifecycle::Alive
+        && entity.type_name != "minecraft:arrow"
+        && entity.item_stack.is_none()
+        && entity.experience_value.is_none()
+        && entity.block_state.is_none()
+}
+
+fn segment_target_aabb_t(
+    start: Vec3,
+    end: Vec3,
+    target_position: Vec3,
+    target_aabb: mc_physics::Aabb,
+) -> Option<f64> {
+    const ARROW_HIT_EXPANSION: f64 = 0.25;
+    let min = Vec3::new(
+        target_position.x - target_aabb.half_width - ARROW_HIT_EXPANSION,
+        target_position.y - ARROW_HIT_EXPANSION,
+        target_position.z - target_aabb.half_width - ARROW_HIT_EXPANSION,
+    );
+    let max = Vec3::new(
+        target_position.x + target_aabb.half_width + ARROW_HIT_EXPANSION,
+        target_position.y + target_aabb.height + ARROW_HIT_EXPANSION,
+        target_position.z + target_aabb.half_width + ARROW_HIT_EXPANSION,
+    );
+    segment_aabb_intersection_t(start, end, min, max)
+}
+
+fn segment_aabb_intersection_t(start: Vec3, end: Vec3, min: Vec3, max: Vec3) -> Option<f64> {
+    let delta = Vec3::new(end.x - start.x, end.y - start.y, end.z - start.z);
+    let mut t_min: f64 = 0.0;
+    let mut t_max: f64 = 1.0;
+    for (origin, direction, min_axis, max_axis) in [
+        (start.x, delta.x, min.x, max.x),
+        (start.y, delta.y, min.y, max.y),
+        (start.z, delta.z, min.z, max.z),
+    ] {
+        if direction.abs() <= f64::EPSILON {
+            if origin < min_axis || origin > max_axis {
+                return None;
+            }
+            continue;
+        }
+        let inv_direction = 1.0 / direction;
+        let mut near = (min_axis - origin) * inv_direction;
+        let mut far = (max_axis - origin) * inv_direction;
+        if near > far {
+            std::mem::swap(&mut near, &mut far);
+        }
+        t_min = t_min.max(near);
+        t_max = t_max.min(far);
+        if t_min > t_max {
+            return None;
+        }
+    }
+    Some(t_min.clamp(0.0, 1.0))
+}
+
+fn entity_event_dispatches_locked(
+    inner: &SessionRegistryInner,
+    entity_id: EntityId,
+    event_id: i8,
+) -> Vec<VisibilityDispatch> {
+    visible_entity_observers_locked(inner, entity_id)
+        .into_iter()
+        .filter_map(|observer_id| {
+            let observer = inner.sessions.get(&observer_id)?;
+            Some(VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id: observer_id,
+                    tx: observer.tx.clone(),
+                },
+                command: OutboundCommand::EntityEvent {
+                    entity_id: entity_id.0,
+                    event_id,
+                },
+            })
+        })
+        .collect()
+}
+
+fn remove_server_entity_locked(
+    inner: &mut SessionRegistryInner,
+    entity_id: EntityId,
+) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
+    let snapshot = inner
+        .entities
+        .remove(entity_id)
+        .map(server_entity_snapshot_from)?;
+    inner.last_sent_entity_positions.remove(&entity_id);
+    inner.last_entity_damage_ticks.remove(&entity_id);
+    inner.item_pickup_ready_ticks.remove(&entity_id);
+    inner.arrow_spawn_ticks.remove(&entity_id);
+    inner.arrow_owner_sessions.remove(&entity_id);
+    untrack_entity_chunk_locked(inner, entity_id);
+
+    let mut dispatches = Vec::new();
+    for (&observer_id, observer) in &mut inner.sessions {
+        if observer.visible_entities.remove(&entity_id) {
+            dispatches.push(VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id: observer_id,
+                    tx: observer.tx.clone(),
+                },
+                command: OutboundCommand::DespawnEntity(snapshot.clone()),
+            });
+        }
+    }
+    record_entity_dispatches_locked(inner, &dispatches);
+    Some((snapshot, dispatches))
+}
+
 fn record_entity_dispatches_locked(
     inner: &mut SessionRegistryInner,
     dispatches: &[VisibilityDispatch],
@@ -2284,6 +2819,518 @@ mod tests {
         id
     }
 
+    #[test]
+    fn hostile_entity_snapshots_expose_attack_damage_facts() {
+        let mut skeleton = SpawnEntity::new(1, "minecraft:skeleton", Vec3::ZERO);
+        apply_entity_facts(&mut skeleton);
+        let mut store = EntityStore::new();
+        let id = store.spawn(skeleton);
+        let snapshot = server_entity_snapshot_from(store.snapshot(id).unwrap());
+
+        assert_eq!(snapshot.attack_damage, Some(2.0));
+    }
+
+    #[test]
+    fn arrow_despawns_after_lifetime_and_dispatches_remove() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let profile = profile("ArrowAlice");
+        let (session_id, _) = registry.register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+
+        let spawn_dispatches = registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+        assert_eq!(spawn_dispatches.len(), 1);
+        let entity_id = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS);
+        registry.apply_entity_physics_and_dispatch(1, &[]);
+
+        assert!(registry.server_entity_snapshot(entity_id).is_none());
+        match rx.try_recv().expect("arrow despawn dispatch") {
+            OutboundCommand::DespawnEntity(entity) => assert_eq!(entity.id, entity_id),
+            other => panic!("expected arrow despawn dispatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn arrow_before_lifetime_remains_tracked() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let profile = profile("ArrowBob");
+        let (session_id, _) = registry.register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let spawn_dispatches = registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+        let entity_id = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS - 1);
+        registry.apply_entity_physics_and_dispatch(1, &[]);
+
+        assert!(registry.server_entity_snapshot(entity_id).is_some());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn spawned_arrow_uses_projectile_physics_kind() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "ArrowPhysicsAlice");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+
+        let queries = registry.tick_entities_and_collect_physics_queries(1);
+
+        assert_eq!(queries.len(), 1);
+        assert_eq!(queries[0].kind, EntityPhysicsKind::ArrowProjectile);
+    }
+
+    #[test]
+    fn grounded_zero_velocity_arrow_is_pickup_candidate() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "ArrowPickupAlice");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let spawn_dispatches = registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+        let entity_id = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.5, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+            }],
+        );
+
+        let candidates = registry.nearby_grounded_arrows(Vec3::new(0.5, 64.0, 0.5), 2.25);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, entity_id);
+    }
+
+    #[test]
+    fn moving_or_airborne_arrow_is_not_pickup_candidate() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "ArrowPickupBob");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+
+        let candidates = registry.nearby_grounded_arrows(Vec3::new(0.5, 64.0, 0.5), 2.25);
+
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn arrow_pickup_claim_removes_once_and_dispatches_take() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "ArrowPickupCarol");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let spawn_dispatches = registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            Vec3::new(0.0, 0.0, 1.0),
+            Rotation::ZERO,
+        );
+        let entity_id = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: entity_id,
+                position: Vec3::new(0.5, 64.0, 0.5),
+                velocity: Vec3::ZERO,
+                on_ground: true,
+            }],
+        );
+
+        let dispatches = registry.claim_arrow_pickup(entity_id, session_id).unwrap();
+
+        assert!(registry.claim_arrow_pickup(entity_id, session_id).is_none());
+        assert!(registry.server_entity_snapshot(entity_id).is_none());
+        assert!(dispatches.iter().any(|dispatch| matches!(
+            dispatch.command,
+            OutboundCommand::TakeItemEntity { item_entity_id, amount: 1, .. } if item_entity_id == entity_id.0
+        )));
+        assert!(dispatches.iter().any(|dispatch| matches!(
+            &dispatch.command,
+            OutboundCommand::DespawnEntity(entity) if entity.id == entity_id
+        )));
+    }
+
+    #[test]
+    fn moving_arrow_hit_damages_entity_and_despawns_arrow() {
+        let registry = SessionRegistry::new();
+        let (tx, mut rx) = mpsc::channel(8);
+        let profile = profile("ArrowHitAlice");
+        let (session_id, _) = registry.register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let cow_id = match &registry.spawn_command_entity(
+            2,
+            "minecraft:cow".to_string(),
+            Vec3::new(0.5, 64.0, 1.5),
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected cow spawn dispatch, got {other:?}"),
+        };
+        let arrow_id = match &registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+            }],
+        );
+
+        let cow_health = registry
+            .lock_inner("test read cow health")
+            .entities
+            .snapshot(cow_id)
+            .expect("cow remains after non-lethal arrow hit")
+            .health;
+        assert_eq!(cow_health, 6.0);
+        let cow_velocity = registry
+            .lock_inner("test read cow velocity")
+            .entities
+            .snapshot(cow_id)
+            .expect("cow remains after non-lethal arrow hit")
+            .velocity;
+        assert!(cow_velocity.z > 0.5);
+        assert!(cow_velocity.y > 0.0);
+        assert!(registry.server_entity_snapshot(arrow_id).is_none());
+
+        let mut saw_hurt = false;
+        let mut saw_knockback = false;
+        let mut saw_arrow_despawn = false;
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                OutboundCommand::EntityEvent {
+                    entity_id,
+                    event_id,
+                } => {
+                    saw_hurt |= entity_id == cow_id.0 && event_id == 2;
+                }
+                OutboundCommand::MoveEntityRelative(movement) => {
+                    saw_knockback |= movement.id == cow_id
+                        && movement.send_velocity
+                        && movement.velocity.z > 0.5;
+                }
+                OutboundCommand::DespawnEntity(entity) => {
+                    saw_arrow_despawn |= entity.id == arrow_id;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_hurt);
+        assert!(saw_knockback);
+        assert!(saw_arrow_despawn);
+    }
+
+    #[test]
+    fn lethal_arrow_hit_spawns_mob_rewards_and_despawns_targets() {
+        let registry = SessionRegistry::new();
+        let chicken = Identifier::parse("minecraft:chicken".to_string()).unwrap();
+        let feather = Identifier::parse("minecraft:feather".to_string()).unwrap();
+        let items = Arc::new(ItemRegistry::from_report(&[mc_data::items::ItemReport {
+            id: feather.clone(),
+            protocol_id: 42,
+        }]));
+        let loot = Arc::new(mc_data::loot::LootTables::from_maps(
+            BTreeMap::from([(chicken, feather)]),
+            BTreeMap::new(),
+        ));
+        registry.configure_arrow_kill_rewards(Some(98), Some(99), items, loot);
+        let (tx, mut rx) = mpsc::channel(16);
+        let profile = profile("LethalArrowAlice");
+        let (session_id, _) = registry.register(
+            &profile,
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        let chicken_id = match &registry.spawn_command_entity(
+            2,
+            "minecraft:chicken".to_string(),
+            Vec3::new(0.5, 64.0, 1.5),
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected chicken spawn dispatch, got {other:?}"),
+        };
+        let arrow_id = match &registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(registry.server_entity_snapshot(chicken_id).is_none());
+        assert!(registry.server_entity_snapshot(arrow_id).is_none());
+        let mut saw_chicken_despawn = false;
+        let mut saw_arrow_despawn = false;
+        let mut saw_drop = false;
+        let mut saw_xp = false;
+        while let Ok(command) = rx.try_recv() {
+            match command {
+                OutboundCommand::DespawnEntity(entity) if entity.id == chicken_id => {
+                    saw_chicken_despawn = true;
+                }
+                OutboundCommand::DespawnEntity(entity) if entity.id == arrow_id => {
+                    saw_arrow_despawn = true;
+                }
+                OutboundCommand::SpawnEntity(entity) if entity.type_name == "minecraft:item" => {
+                    saw_drop = entity.type_id == 98
+                        && entity.position == Vec3::new(0.5, 64.0, 1.5)
+                        && entity.item_stack == Some(EntityItemStack::new(42, 1));
+                }
+                OutboundCommand::SpawnEntity(entity)
+                    if entity.type_name == "minecraft:experience_orb" =>
+                {
+                    saw_xp = entity.type_id == 99
+                        && entity.position == Vec3::new(0.5, 64.0, 1.5)
+                        && entity.experience_value == Some(1);
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_chicken_despawn);
+        assert!(saw_arrow_despawn);
+        assert!(saw_drop);
+        assert!(saw_xp);
+    }
+
+    #[test]
+    fn moving_arrow_ignores_item_entities() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "ArrowHitBob");
+        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+        registry.spawn_item_drop(2, Vec3::new(0.5, 64.0, 1.5), EntityItemStack::new(42, 1));
+        let arrow_id = match &registry.spawn_arrow(
+            Some(session_id),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(registry.server_entity_snapshot(arrow_id).is_some());
+    }
+
+    #[test]
+    fn moving_arrow_damages_player_target_but_not_owner() {
+        let registry = SessionRegistry::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(8);
+        let (target_tx, mut target_rx) = mpsc::channel(8);
+        let (owner_id, _) = registry.register(
+            &profile("ArrowPlayerOwner"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            owner_tx,
+            PlayerPose::new(0.5, 64.0, 0.0),
+        );
+        let (target_id, _) = registry.register(
+            &profile("ArrowPlayerTarget"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            target_tx,
+            PlayerPose::new(0.5, 64.0, 1.5),
+        );
+        registry.mark_loaded(owner_id, (0, 0));
+        registry.mark_loaded(target_id, (0, 0));
+        let arrow_id = match &registry.spawn_arrow(
+            Some(owner_id),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(registry.server_entity_snapshot(arrow_id).is_none());
+        let mut target_damaged = false;
+        while let Ok(command) = target_rx.try_recv() {
+            target_damaged |= matches!(
+                command,
+                OutboundCommand::DamagePlayer { amount }
+                    if (amount - ARROW_ENTITY_HIT_DAMAGE).abs() < f32::EPSILON
+            );
+        }
+        let mut owner_damaged = false;
+        while let Ok(command) = owner_rx.try_recv() {
+            owner_damaged |= matches!(command, OutboundCommand::DamagePlayer { .. });
+        }
+        assert!(target_damaged);
+        assert!(!owner_damaged);
+    }
+
+    #[test]
+    fn moving_arrow_does_not_hit_owner_without_other_targets() {
+        let registry = SessionRegistry::new();
+        let (owner_tx, mut owner_rx) = mpsc::channel(8);
+        let (owner_id, _) = registry.register(
+            &profile("ArrowOwnerSafe"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            owner_tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        assert!(registry.mark_loaded(owner_id, (0, 0)).is_empty());
+        let arrow_id = match &registry.spawn_arrow(
+            Some(owner_id),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+            }],
+        );
+
+        assert!(registry.server_entity_snapshot(arrow_id).is_some());
+        while let Ok(command) = owner_rx.try_recv() {
+            assert!(!matches!(command, OutboundCommand::DamagePlayer { .. }));
+        }
+    }
+
     fn registration<'a>(
         profile: &'a LoggedInProfile,
         tx: mpsc::Sender<OutboundCommand>,
@@ -2447,6 +3494,27 @@ mod tests {
                 .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn item_pickup_preserves_damage_on_partial_claim() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "DamagePickupAlice");
+        registry.spawn_item_drop(
+            1,
+            Vec3::new(0.5, 64.0, 0.5),
+            EntityItemStack::new(42, 3).with_damage(17),
+        );
+        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
+
+        let claimed = registry.claim_item_pickup(entity_id, alice, 1).unwrap();
+        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0]
+            .item_stack
+            .unwrap();
+
+        assert_eq!(claimed.stack, EntityItemStack::new(42, 1).with_damage(17));
+        assert_eq!(remaining, EntityItemStack::new(42, 2).with_damage(17));
     }
 
     #[test]

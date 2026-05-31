@@ -564,6 +564,229 @@ async fn survival_use_item_release_cancels_food_use() {
 }
 
 #[tokio::test]
+async fn survival_bow_release_spawns_and_moves_arrow() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let bow_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:bow").unwrap())
+        .expect("bow item");
+    let arrow_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:arrow").unwrap())
+        .expect("arrow item");
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+    let arrow_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:arrow").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("arrow entity type");
+    let target_entity_type = entity_types
+        .id_of(&mc_data::Identifier::parse("minecraft:armor_stand").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("armor stand entity type");
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M54 bow arrow lifecycle".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types,
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M54BowArrow").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:bow 1 0".into(),
+        })
+        .await
+        .expect("give bow");
+    wait_for_slot_stack(&mut client, bow_id, 1).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:arrow 3 1".into(),
+        })
+        .await
+        .expect("give arrows");
+    wait_for_slot_stack(&mut client, arrow_id, 3).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: format!(
+                "summon minecraft:armor_stand {} {} {}",
+                sync.x,
+                sync.y,
+                sync.z + 0.8
+            ),
+        })
+        .await
+        .expect("summon projectile target");
+    let _target_entity_id = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let frame = client
+                .read_frame_with_timeout(
+                    deadline.saturating_duration_since(tokio::time::Instant::now()),
+                )
+                .await
+                .expect("cow summon response");
+            if handle_keepalive(&mut client, frame.id, &frame.body).await {
+                continue;
+            }
+            if frame.id == AddEntity::ID {
+                let mut body = frame.body;
+                let pkt = AddEntity::decode(&mut body).expect("decode target AddEntity");
+                if pkt.entity_type_id == target_entity_type {
+                    break pkt.entity_id;
+                }
+            }
+        }
+    };
+
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: sync.x,
+            y: sync.y,
+            z: sync.z,
+            yaw: 0.0,
+            pitch: 0.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("aim bow");
+    client
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::MainHand,
+            sequence: 91,
+            y_rot: 0.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("start drawing bow");
+    wait_for_block_ack(&mut client, 91).await;
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::ReleaseUseItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 92,
+        })
+        .await
+        .expect("release bow");
+
+    let mut arrow_entity_id = None;
+    let mut saw_arrow_decrement = false;
+    let mut saw_release_ack = false;
+    let mut saw_initial_motion = false;
+    let mut saw_relative_move = false;
+    let mut saw_arrow_despawn = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_arrow_decrement
+        && saw_release_ack
+        && saw_initial_motion
+        && saw_relative_move
+        && saw_arrow_despawn)
+    {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "bow arrow lifecycle response: {err}; decrement={saw_arrow_decrement} ack={saw_release_ack} motion={saw_initial_motion} move={saw_relative_move} despawn={saw_arrow_despawn} arrow={arrow_entity_id:?}"
+                )
+            });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let pkt = AddEntity::decode(&mut body).expect("decode arrow AddEntity");
+            if pkt.entity_type_id == arrow_entity_type {
+                saw_initial_motion |= pkt.movement.x != 0.0
+                    || pkt.movement.y != 0.0
+                    || pkt.movement.z != 0.0;
+                arrow_entity_id = Some(pkt.entity_id);
+            }
+        } else if frame.id == SetEntityMotion::ID {
+            let mut body = frame.body;
+            let pkt = SetEntityMotion::decode(&mut body).expect("decode arrow motion");
+            if Some(pkt.entity_id) == arrow_entity_id {
+                saw_initial_motion |= pkt.movement.x != 0.0
+                    || pkt.movement.y != 0.0
+                    || pkt.movement.z != 0.0;
+            }
+        } else if frame.id == MoveEntityPosRot::ID {
+            let mut body = frame.body;
+            let pkt = MoveEntityPosRot::decode(&mut body).expect("decode arrow relative move");
+            if Some(pkt.entity_id) == arrow_entity_id {
+                saw_relative_move |= pkt.delta_x != 0 || pkt.delta_y != 0 || pkt.delta_z != 0;
+            }
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let pkt = RemoveEntities::decode(&mut body).expect("decode arrow despawn");
+            saw_arrow_despawn |= arrow_entity_id.is_some_and(|id| pkt.entity_ids.contains(&id));
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode arrow slot");
+            saw_arrow_decrement |= pkt.item_stack.item_id == arrow_id && pkt.item_stack.count == 2;
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode release ack");
+            saw_release_ack |= pkt.sequence == 92;
+        }
+    }
+}
+
+#[tokio::test]
 async fn dead_survival_player_cannot_mine_or_eat() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
