@@ -6595,6 +6595,9 @@ where
     {
         return Ok(());
     }
+    if handle_plant_use_on(state, writer, action.sequence, clicked_pos, player_pose).await? {
+        return Ok(());
+    }
 
     let (dx, dy, dz) = action.direction.normal();
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
@@ -6794,6 +6797,82 @@ where
         .expect("growth succeeded");
     write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
     Ok(true)
+}
+
+async fn handle_plant_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    position: mc_world::BlockPos,
+    player_pose: PlayerPose,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let plan = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(position) {
+            Ok(Some(current)) => {
+                sweet_berry_harvest(&state.blocks, &state.items, position, current)
+            }
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = %err, x = position.x, y = position.y, z = position.z, "plant use target read failed");
+                None
+            }
+        }
+    };
+    let Some((edit, drop)) = plan else {
+        return Ok(false);
+    };
+
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &[edit]).await?;
+    if outcome.applied.is_empty() {
+        return Ok(true);
+    }
+
+    let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
+        debug!("plant harvest drop ignored: item entity type unavailable");
+        return Ok(true);
+    };
+    dispatch_visibility_commands(state.sessions.spawn_item_drop(
+        entity_type_id,
+        Vec3::new(
+            position.x as f64 + 0.5,
+            position.y as f64 + 0.5,
+            position.z as f64 + 0.5,
+        ),
+        entity_item_stack(drop),
+    ));
+    pickup_nearby_items(state, writer, player_pose).await?;
+    Ok(true)
+}
+
+fn sweet_berry_harvest(
+    blocks: &mc_world::BlockRegistry,
+    items: &ItemRegistry,
+    pos: mc_world::BlockPos,
+    state: mc_world::BlockStateId,
+) -> Option<(BlockEdit, ItemStack)> {
+    let current = blocks.by_id(state)?;
+    if current.block.id.as_str() != "minecraft:sweet_berry_bush" {
+        return None;
+    }
+    let age = block_state_property(current, "age")?.parse::<u8>().ok()?;
+    if age < 2 {
+        return None;
+    }
+
+    let harvested_state = sibling_state_with_property(blocks, current, "age", "1")?;
+    let berries = Identifier::parse("minecraft:sweet_berries").expect("static identifier");
+    let item_id = items.id_of(&berries)?;
+    Some((
+        BlockEdit {
+            pos,
+            new_state: harvested_state,
+        },
+        ItemStack::new(item_id, i32::from(age - 1)),
+    ))
 }
 
 fn consume_bonemeal_after_growth(

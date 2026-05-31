@@ -1922,6 +1922,50 @@ fn sweet_berry_bush_growth_advances_until_mature() {
 }
 
 #[test]
+fn sweet_berry_harvest_resets_mature_bush_and_drops_berries() {
+    let blocks = crop_test_registry();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:sweet_berries").unwrap(),
+        protocol_id: 88,
+    }]);
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
+
+    assert_eq!(
+        sweet_berry_harvest(&blocks, &items, pos, mc_world::BlockStateId(58)),
+        Some((
+            BlockEdit {
+                pos,
+                new_state: mc_world::BlockStateId(57),
+            },
+            ItemStack::new(88, 1),
+        ))
+    );
+    assert_eq!(
+        sweet_berry_harvest(&blocks, &items, pos, mc_world::BlockStateId(59)),
+        Some((
+            BlockEdit {
+                pos,
+                new_state: mc_world::BlockStateId(57),
+            },
+            ItemStack::new(88, 2),
+        ))
+    );
+    assert_eq!(
+        sweet_berry_harvest(&blocks, &items, pos, mc_world::BlockStateId(57)),
+        None
+    );
+
+    let missing_berries = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:wheat").unwrap(),
+        protocol_id: 50,
+    }]);
+    assert_eq!(
+        sweet_berry_harvest(&blocks, &missing_berries, pos, mc_world::BlockStateId(59)),
+        None
+    );
+}
+
+#[test]
 fn cocoa_growth_advances_age_without_losing_facing() {
     let blocks = crop_test_registry();
     let pos = mc_world::BlockPos { x: 1, y: 64, z: 2 };
