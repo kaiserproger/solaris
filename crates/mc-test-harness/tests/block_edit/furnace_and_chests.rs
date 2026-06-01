@@ -328,6 +328,11 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
     let crafting_table_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:crafting_table").unwrap())
         .expect("crafting_table item");
@@ -370,7 +375,7 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types,
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -394,11 +399,11 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     wait_for_slot_stack(&mut client, crafting_table_id, 1).await;
     client
         .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:oak_log 1 1".into(),
+            command: "debug give minecraft:oak_log 2 1".into(),
         })
         .await
         .expect("give oak log");
-    wait_for_slot_stack(&mut client, oak_log_id, 1).await;
+    wait_for_slot_stack(&mut client, oak_log_id, 2).await;
 
     let support_y = sync.y.floor() as i32 - 2;
     let table_y = support_y + 1;
@@ -444,14 +449,14 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
             state_id: content.state_id,
             slot_num: 38,
             button_num: 0,
-            container_input: ContainerInput::Pickup,
+            container_input: ContainerInput::Throw,
             changed_slots: Vec::new(),
             carried_item: HashedStack::empty(),
         })
         .await
-        .expect("pick up oak log");
+        .expect("throw one oak log from crafting window");
     content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
-        pkt.carried_item.item_id == oak_log_id && pkt.carried_item.count == 1
+        pkt.carried_item.is_empty() && pkt.items[38].item_id == oak_log_id && pkt.items[38].count == 1
     })
     .await;
     client
@@ -459,19 +464,18 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
             container_id: opened.container_id,
             state_id: content.state_id,
             slot_num: 1,
-            button_num: 0,
-            container_input: ContainerInput::Pickup,
+            button_num: 1,
+            container_input: ContainerInput::Swap,
             changed_slots: Vec::new(),
-            carried_item: HashedStack::Actual {
-                item_id: oak_log_id,
-                count: 1,
-                components: HashedStackComponentHashes::empty(),
-            },
+            carried_item: HashedStack::empty(),
         })
         .await
-        .expect("place oak log in crafting grid");
+        .expect("swap oak log into crafting grid");
     content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
-        pkt.items[0].item_id == oak_planks_id && pkt.items[0].count == 4
+        pkt.items[0].item_id == oak_planks_id
+            && pkt.items[0].count == 4
+            && pkt.items[1].item_id == oak_log_id
+            && pkt.items[38].is_empty()
     })
     .await;
     client
