@@ -2797,6 +2797,126 @@ fn common_container_paper_cuts_resolve_to_existing_menus() {
     );
 }
 
+fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap());
+    let world = Arc::new(tokio::sync::Mutex::new(mc_world::WorldStorage::in_memory(
+        Arc::clone(&blocks),
+    )));
+    let item_to_block = ItemToBlockTable::build(&items, &blocks);
+    InteractionState {
+        world,
+        blocks,
+        block_light: None,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        water: None,
+        sessions: Arc::new(SessionRegistry::new()),
+        session_id: 1,
+        workspace: LightWorkspace::new(),
+        light_cache: LightCache::new(),
+        compression: Compression::Disabled,
+        selected_hotbar_slot: 0,
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::EMPTY,
+        inventory_state_id: 1,
+        items,
+        item_facts: Arc::new(ItemFactsTable::default()),
+        entity_types: Arc::new(EntityTypeRegistry::default()),
+        item_to_block,
+        tags: Arc::new(TagsData::default()),
+        recipes: Vec::new(),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        next_container_id: FURNACE_CONTAINER_ID_MIN,
+        active_container: None,
+        pending_break: None,
+        pending_use: None,
+        pending_sign_edit: None,
+        shield_use: None,
+        last_hostile_damage_at: None,
+        last_entity_attack_at: None,
+        fluid_schedule_tick: 0,
+    }
+}
+
+#[test]
+fn furnace_window_swap_and_throw_mutate_menu_slots() {
+    let coal = Identifier::parse("minecraft:coal").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: coal,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let coal_id = items
+        .id_of(&Identifier::parse("minecraft:coal").unwrap())
+        .unwrap();
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(coal_id, 4);
+    let mut furnace = FurnaceBlockEntity::default();
+
+    assert!(apply_furnace_swap_click(
+        &mut state,
+        &mut furnace,
+        FurnaceKind::Furnace,
+        1,
+        0,
+    ));
+    assert_eq!(
+        furnace_slot_to_stack(&furnace.slots[1]),
+        ItemStack::new(coal_id, 4)
+    );
+    assert!(state.inventory.slots[PlayerInventory::HOTBAR_BASE].is_empty());
+
+    let dropped = apply_furnace_throw_click(&mut state, &mut furnace, 1, 0).unwrap();
+    assert_eq!(dropped, ItemStack::new(coal_id, 1));
+    assert_eq!(
+        furnace_slot_to_stack(&furnace.slots[1]),
+        ItemStack::new(coal_id, 3)
+    );
+}
+
+#[test]
+fn chest_window_swap_and_throw_mutate_storage_slots() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let stone = Identifier::parse("minecraft:stone").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: dirt,
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: stone,
+            protocol_id: 11,
+        },
+    ]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let stone_id = items
+        .id_of(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap();
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(stone_id, 2);
+    let mut view = ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+    view.chests[0].slots[0] = stack_to_furnace_slot(&ItemStack::new(dirt_id, 5));
+
+    assert!(apply_chest_swap_click(&mut state, &mut view, 0, 0));
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[0]),
+        ItemStack::new(stone_id, 2)
+    );
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::new(dirt_id, 5)
+    );
+
+    let dropped = apply_chest_throw_click(&mut state, &mut view, 0, 0).unwrap();
+    assert_eq!(dropped, ItemStack::new(stone_id, 1));
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[0]),
+        ItemStack::new(stone_id, 1)
+    );
+}
+
 #[test]
 fn furnace_like_recipe_lookup_uses_matching_cooking_category() {
     use mc_data::recipes::{
