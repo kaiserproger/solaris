@@ -1,3 +1,4 @@
+use super::plants::plant_drop_stacks;
 use super::*;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -325,7 +326,7 @@ pub(super) fn block_drop_stacks_from(
     let Some(block) = blocks.by_id(block_state) else {
         return Vec::new();
     };
-    if let Some(crop_drops) = crop_drop_stacks(items, block) {
+    if let Some(crop_drops) = plant_drop_stacks(items, block) {
         return crop_drops;
     }
 
@@ -344,58 +345,6 @@ pub(super) fn block_drop_stacks(
     block_state: BlockStateId,
 ) -> Vec<ItemStack> {
     block_drop_stacks_from(&state.loot, &state.items, &state.blocks, block_state)
-}
-
-fn crop_drop_stacks(items: &ItemRegistry, block: &mc_world::BlockState) -> Option<Vec<ItemStack>> {
-    const WHEAT_MATURE_DROPS: &[(&str, i32)] =
-        &[("minecraft:wheat", 1), ("minecraft:wheat_seeds", 1)];
-    const WHEAT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:wheat_seeds", 1)];
-    const CARROT_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 2)];
-    const CARROT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:carrot", 1)];
-    const POTATO_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:potato", 2)];
-    const POTATO_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:potato", 1)];
-    const BEETROOT_MATURE_DROPS: &[(&str, i32)] =
-        &[("minecraft:beetroot", 1), ("minecraft:beetroot_seeds", 1)];
-    const BEETROOT_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:beetroot_seeds", 1)];
-    const NETHER_WART_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:nether_wart", 2)];
-    const NETHER_WART_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:nether_wart", 1)];
-    const COCOA_MATURE_DROPS: &[(&str, i32)] = &[("minecraft:cocoa_beans", 3)];
-    const COCOA_IMMATURE_DROPS: &[(&str, i32)] = &[("minecraft:cocoa_beans", 1)];
-
-    let (mature_age, mature_drops, immature_drops) = match block.block.id.as_str() {
-        "minecraft:wheat" => (7, WHEAT_MATURE_DROPS, WHEAT_IMMATURE_DROPS),
-        "minecraft:carrots" => (7, CARROT_MATURE_DROPS, CARROT_IMMATURE_DROPS),
-        "minecraft:potatoes" => (7, POTATO_MATURE_DROPS, POTATO_IMMATURE_DROPS),
-        "minecraft:beetroots" => (3, BEETROOT_MATURE_DROPS, BEETROOT_IMMATURE_DROPS),
-        "minecraft:nether_wart" => (3, NETHER_WART_MATURE_DROPS, NETHER_WART_IMMATURE_DROPS),
-        "minecraft:cocoa" => (2, COCOA_MATURE_DROPS, COCOA_IMMATURE_DROPS),
-        _ => return None,
-    };
-
-    let age = block_state_property(block, "age")?.parse::<u8>().ok()?;
-    let drops = if age >= mature_age {
-        mature_drops
-    } else {
-        immature_drops
-    };
-    Some(
-        drops
-            .iter()
-            .filter_map(|(item, count)| item_id(items, item).map(|id| ItemStack::new(id, *count)))
-            .collect(),
-    )
-}
-
-fn item_id(items: &ItemRegistry, name: &str) -> Option<u32> {
-    let id = Identifier::parse(name).expect("static identifier");
-    items.id_of(&id)
-}
-
-fn block_state_property<'a>(state: &'a mc_world::BlockState, name: &str) -> Option<&'a str> {
-    state
-        .properties
-        .iter()
-        .find_map(|(key, value)| (key == name).then_some(value.as_str()))
 }
 
 pub(super) fn food_rule_for_item(
