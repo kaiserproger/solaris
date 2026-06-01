@@ -31,7 +31,7 @@ use mc_protocol::packets::play::{
     ServerboundChatCommand, ServerboundClientCommand, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
     ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_block_pos,
+    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_pos,
     pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
@@ -47,6 +47,7 @@ include!("block_edit/campfire.rs");
 include!("block_edit/crop_bonemeal.rs");
 include!("block_edit/crop_harvest.rs");
 include!("block_edit/plant_harvest.rs");
+include!("block_edit/plant_lifecycle.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/sapling_growth.rs");
 include!("block_edit/survival_lifecycle.rs");
