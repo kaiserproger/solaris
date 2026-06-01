@@ -6146,12 +6146,19 @@ async fn schedule_fluid_ticks_for_interaction(
     );
 }
 
-/// M6.f/M23 follow-up: handle a serverbound `UseItemOn`. Resolves the placed
-/// block via the player's currently-held hotbar slot through the item→block
-/// table. Drops the placement silently (still acking) if the held stack is
-/// empty, if the held item has no block mapping (e.g. food, tool), or if the
-/// target cell is non-air. On a successful placement decrements the held stack's
-/// count and emits `ContainerSetSlot` so the client sees the new count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseItemOnOutcome {
+    Handled,
+    NoOp,
+    PlaceBlock,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UseItemOnTarget {
+    clicked_pos: mc_world::BlockPos,
+    coords: (i32, i32, i32),
+}
+
 async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -6166,20 +6173,65 @@ where
 {
     state.pending_use = None;
     state.shield_use = None;
+
+    if classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action)
+        == UseItemOnOutcome::NoOp
+    {
+        return ack_use_item_on_noop(writer, state.compression, action.sequence).await;
+    }
+
+    let (cx, cy, cz) = unpack_block_pos(action.position);
+    let clicked_pos = mc_world::BlockPos {
+        x: cx,
+        y: cy,
+        z: cz,
+    };
+    let target = UseItemOnTarget {
+        clicked_pos,
+        coords: (cx, cy, cz),
+    };
+
+    match handle_use_item_on_interactions(
+        state,
+        writer,
+        game_mode,
+        player_pose,
+        respawn_pose,
+        &action,
+        target,
+    )
+    .await?
+    {
+        UseItemOnOutcome::Handled => Ok(()),
+        UseItemOnOutcome::NoOp => {
+            ack_use_item_on_noop(writer, state.compression, action.sequence).await
+        }
+        UseItemOnOutcome::PlaceBlock => {
+            handle_block_item_placement(
+                state,
+                writer,
+                player_pose,
+                target.clicked_pos,
+                &action,
+                target.coords,
+            )
+            .await
+        }
+    }
+}
+
+fn classify_use_item_on_preflight(
+    game_mode: GameMode,
+    survival_state: SurvivalState,
+    player_pose: PlayerPose,
+    action: &ServerboundUseItemOn,
+) -> UseItemOnOutcome {
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         debug!(
             sequence = action.sequence,
             "survival block placement ignored for dead player"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+        return UseItemOnOutcome::NoOp;
     }
 
     if !matches!(game_mode, GameMode::Creative | GameMode::Survival) {
@@ -6188,15 +6240,7 @@ where
             sequence = action.sequence,
             "block placement denied outside creative/survival"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+        return UseItemOnOutcome::NoOp;
     }
 
     if game_mode == GameMode::Survival
@@ -6206,27 +6250,34 @@ where
             sequence = action.sequence,
             "survival block placement ignored: target out of reach"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+        return UseItemOnOutcome::NoOp;
     }
 
-    let (cx, cy, cz) = unpack_block_pos(action.position);
+    UseItemOnOutcome::PlaceBlock
+}
+
+async fn handle_use_item_on_interactions<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    player_pose: PlayerPose,
+    respawn_pose: &mut PlayerPose,
+    action: &ServerboundUseItemOn,
+    target: UseItemOnTarget,
+) -> Result<UseItemOnOutcome, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (cx, cy, cz) = target.coords;
     if !player_pose.shifting {
         if open_crafting_table_container(state, writer, action.sequence, cx, cy, cz).await? {
-            return Ok(());
+            return Ok(UseItemOnOutcome::Handled);
         }
         if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
-            return Ok(());
+            return Ok(UseItemOnOutcome::Handled);
         }
         if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
-            return Ok(());
+            return Ok(UseItemOnOutcome::Handled);
         }
         if interact_with_bed(
             state,
@@ -6241,45 +6292,69 @@ where
         )
         .await?
         {
-            return Ok(());
+            return Ok(UseItemOnOutcome::Handled);
         }
         if interact_with_toggle_block(state, writer, action.sequence, cx, cy, cz).await? {
-            return Ok(());
+            return Ok(UseItemOnOutcome::Handled);
         }
     }
 
-    let clicked_pos = mc_world::BlockPos {
-        x: cx,
-        y: cy,
-        z: cz,
-    };
     if handle_campfire_use_on(
         state,
         writer,
         game_mode,
         action.sequence,
-        clicked_pos,
+        target.clicked_pos,
         action.hand,
     )
     .await?
     {
-        return Ok(());
+        return Ok(UseItemOnOutcome::Handled);
     }
     if handle_bucket_use_on(
         state,
         writer,
         game_mode,
         action.sequence,
-        clicked_pos,
+        target.clicked_pos,
         action.direction,
     )
     .await?
     {
-        return Ok(());
+        return Ok(UseItemOnOutcome::Handled);
     }
-    if handle_plant_use_on(state, writer, action.sequence, clicked_pos, player_pose).await? {
-        return Ok(());
+    if handle_plant_use_on(
+        state,
+        writer,
+        action.sequence,
+        target.clicked_pos,
+        player_pose,
+    )
+    .await?
+    {
+        return Ok(UseItemOnOutcome::Handled);
     }
+
+    Ok(UseItemOnOutcome::PlaceBlock)
+}
+
+/// M6.f/M23 follow-up: resolve the placed block via the player's currently-held
+/// hotbar slot through the item→block table. Drops the placement silently (still
+/// acking) if the held stack is empty, if the held item has no block mapping
+/// (e.g. food, tool), or if the target cell is non-air. On success decrements
+/// the held stack and emits `ContainerSetSlot` so the client sees the new count.
+async fn handle_block_item_placement<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    player_pose: PlayerPose,
+    clicked_pos: mc_world::BlockPos,
+    action: &ServerboundUseItemOn,
+    (cx, cy, cz): (i32, i32, i32),
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let sequence = action.sequence;
 
     let (dx, dy, dz) = action.direction.normal();
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
@@ -6296,15 +6371,7 @@ where
             held_count = held.count,
             "UseItemOn: held item is empty or not placeable; skipping"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+        return ack_use_item_on_noop(writer, state.compression, sequence).await;
     };
 
     if handle_bonemeal_use_on(
@@ -6338,11 +6405,11 @@ where
                     z = cz,
                     "UseItemOn clicked cell absent; skipping placement"
                 );
-                return write_block_ack(writer, state.compression, action.sequence).await;
+                return ack_use_item_on_noop(writer, state.compression, sequence).await;
             }
             Err(err) => {
                 warn!(error = %err, x = cx, y = cy, z = cz, "UseItemOn clicked read failed");
-                return write_block_ack(writer, state.compression, action.sequence).await;
+                return ack_use_item_on_noop(writer, state.compression, sequence).await;
             }
         };
         let target_is_air = match storage.get_block(mc_world::BlockPos {
@@ -6377,15 +6444,7 @@ where
             held_item = held.item_id,
             "UseItemOn target invalid or held item not placeable; skipping placement"
         );
-        write_packet(
-            writer,
-            &BlockChangedAck {
-                sequence: action.sequence,
-            },
-            state.compression,
-        )
-        .await?;
-        return Ok(());
+        return ack_use_item_on_noop(writer, state.compression, sequence).await;
     };
 
     let Some(edits) = plan_place_block_edits(
@@ -6401,9 +6460,9 @@ where
     )
     .await
     else {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_on_noop(writer, state.compression, sequence).await;
     };
-    let outcome = apply_player_block_edit_batch(state, writer, action.sequence, &edits).await?;
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
     if outcome.applied.is_empty() {
         return Ok(());
     }
@@ -6432,6 +6491,17 @@ where
     )
     .await?;
     Ok(())
+}
+
+async fn ack_use_item_on_noop<W>(
+    writer: &mut W,
+    compression: Compression,
+    sequence: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_block_ack(writer, compression, sequence).await
 }
 
 async fn handle_bonemeal_use_on<W>(
