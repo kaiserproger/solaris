@@ -51,4 +51,5 @@ include!("block_edit/plant_lifecycle.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/sapling_growth.rs");
 include!("block_edit/survival_lifecycle.rs");
+include!("block_edit/vertical_plant_growth.rs");
 include!("block_edit/wheat_harvest.rs");
