@@ -203,6 +203,7 @@ const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
 const SIGN_BLOCK_ENTITY_TYPE_ID: i32 = 7;
+const CAMPFIRE_BLOCK_ENTITY_TYPE_ID: i32 = 33;
 
 pub(crate) fn configure_session_arrow_kill_rewards(
     sessions: &SessionRegistry,
@@ -228,8 +229,21 @@ const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;
 const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CampfireCookingEntry {
+    input: ItemStack,
     result: ItemStack,
     ticks_remaining: u32,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CampfireCookingTick {
+    completed: Vec<ItemStack>,
+    changed: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CampfireCookingUpdates {
+    completed: Vec<(mc_world::BlockPos, ItemStack)>,
+    changed: Vec<(mc_world::BlockPos, CampfireCookingState)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -238,19 +252,20 @@ struct CampfireCookingState {
 }
 
 impl CampfireCookingState {
-    fn insert(&mut self, result: ItemStack, cooking_time: u32) -> bool {
+    fn insert(&mut self, input: ItemStack, result: ItemStack, cooking_time: u32) -> bool {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
         *slot = Some(CampfireCookingEntry {
+            input,
             result,
             ticks_remaining: cooking_time.max(1),
         });
         true
     }
 
-    fn tick(&mut self) -> Vec<ItemStack> {
-        let mut completed = Vec::new();
+    fn tick(&mut self) -> CampfireCookingTick {
+        let mut tick = CampfireCookingTick::default();
         for slot in &mut self.slots {
             let Some(entry) = slot.as_mut() else {
                 continue;
@@ -258,10 +273,11 @@ impl CampfireCookingState {
             entry.ticks_remaining = entry.ticks_remaining.saturating_sub(1);
             if entry.ticks_remaining == 0 {
                 let entry = slot.take().expect("entry existed before completion");
-                completed.push(entry.result);
+                tick.completed.push(entry.result);
+                tick.changed = true;
             }
         }
-        completed
+        tick
     }
 
     fn is_empty(&self) -> bool {
@@ -439,6 +455,7 @@ struct BlockEditBatchOutcome {
     applied: Vec<AppliedBlockEdit>,
     deltas: Vec<BlockDelta>,
     edit_chunks: HashSet<(i32, i32)>,
+    cleared_campfires: Vec<mc_world::BlockPos>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2329,6 +2346,90 @@ fn campfire_result_stack(
     (count > 0).then(|| ItemStack::new(item_id, count))
 }
 
+fn campfire_block_entity_update_nbt(
+    items: &ItemRegistry,
+    cooking: &CampfireCookingState,
+) -> Option<Tag> {
+    let mut item_tags = Vec::new();
+    for (slot, entry) in cooking.slots.iter().enumerate() {
+        let Some(entry) = entry else {
+            continue;
+        };
+        let name = items.name_of(entry.input.item_id)?;
+        item_tags.push(Tag::Compound(vec![
+            ("Slot".into(), Tag::Int(slot as i32)),
+            ("id".into(), Tag::String(name.as_str().to_string())),
+            ("count".into(), Tag::Int(entry.input.count)),
+        ]));
+    }
+    Some(Tag::Compound(vec![(
+        "Items".into(),
+        Tag::List(ListTag {
+            element_type: if item_tags.is_empty() {
+                mc_nbt::tag_type::END
+            } else {
+                mc_nbt::tag_type::COMPOUND
+            },
+            elements: item_tags,
+        }),
+    )]))
+}
+
+async fn send_campfire_block_entity_update<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    position: mc_world::BlockPos,
+    cooking: &CampfireCookingState,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(nbt) = campfire_block_entity_update_nbt(&state.items, cooking) else {
+        warn!(
+            ?position,
+            "campfire block entity update skipped for unknown item id"
+        );
+        return Ok(());
+    };
+    write_packet(
+        writer,
+        &ClientboundBlockEntityData {
+            position: pack_block_pos(position.x, position.y, position.z),
+            block_entity_type: CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
+            nbt: nbt.clone(),
+        },
+        state.compression,
+    )
+    .await?;
+    dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
+        position,
+        Some(state.session_id),
+        CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
+        nbt,
+    ));
+    Ok(())
+}
+
+fn dispatch_campfire_block_entity_update(
+    state: &InteractionState,
+    position: mc_world::BlockPos,
+    cooking: &CampfireCookingState,
+) {
+    let Some(nbt) = campfire_block_entity_update_nbt(&state.items, cooking) else {
+        warn!(
+            ?position,
+            "campfire block entity update skipped for unknown item id"
+        );
+        return;
+    };
+    dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
+        position,
+        None,
+        CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
+        nbt,
+    ));
+}
+
 async fn handle_campfire_use_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -2370,12 +2471,18 @@ where
         mc_data::recipes::RecipeKind::CampfireCooking(smelting) => smelting.cooking_time,
         _ => return Ok(false),
     };
-    if !state
-        .sessions
-        .insert_campfire_cooking(position, result, cooking_time)
-    {
+    let input = ItemStack {
+        count: 1,
+        item_id: held.item_id,
+        damage: held.damage,
+    };
+    let Some(cooking) =
+        state
+            .sessions
+            .insert_campfire_cooking(position, input, result, cooking_time)
+    else {
         return Ok(false);
-    }
+    };
 
     let held = &mut state.inventory.slots[slot];
     held.count = held.count.saturating_sub(1);
@@ -2394,30 +2501,30 @@ where
         state.compression,
     )
     .await?;
+    send_campfire_block_entity_update(state, writer, position, &cooking).await?;
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
 }
 
 async fn tick_campfire_cooking(state: &mut InteractionState) {
-    let completed = state.sessions.tick_campfire_cooking();
+    let updates = state.sessions.tick_campfire_cooking();
+    for (position, cooking) in updates.changed {
+        let still_campfire = campfire_block_still_present(state, position).await;
+        if still_campfire {
+            dispatch_campfire_block_entity_update(state, position, &cooking);
+        }
+    }
     let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
-        if !completed.is_empty() {
+        if !updates.completed.is_empty() {
             debug!(
-                count = completed.len(),
+                count = updates.completed.len(),
                 "campfire drops ignored: item entity type unavailable"
             );
         }
         return;
     };
-    for (position, stack) in completed {
-        let still_campfire = {
-            let mut storage = state.world.lock().await;
-            storage
-                .get_block(position)
-                .ok()
-                .flatten()
-                .is_some_and(|block_state| is_campfire_state(state, block_state))
-        };
+    for (position, stack) in updates.completed {
+        let still_campfire = campfire_block_still_present(state, position).await;
         if !still_campfire {
             continue;
         }
@@ -2431,6 +2538,18 @@ async fn tick_campfire_cooking(state: &mut InteractionState) {
             entity_item_stack(stack),
         ));
     }
+}
+
+async fn campfire_block_still_present(
+    state: &InteractionState,
+    position: mc_world::BlockPos,
+) -> bool {
+    let mut storage = state.world.lock().await;
+    storage
+        .get_block(position)
+        .ok()
+        .flatten()
+        .is_some_and(|block_state| is_campfire_state(state, block_state))
 }
 
 fn take_death_inventory_drops(
@@ -5592,14 +5711,19 @@ async fn apply_block_edit_batch_to_world(
     drop(storage);
 
     for applied in &outcome.applied {
-        if is_campfire_state(state, applied.previous)
-            && !is_campfire_state(state, applied.new_state)
-        {
-            state.sessions.clear_campfire_cooking(applied.pos);
+        if !replaced_campfire_with_non_campfire(state, applied) {
+            continue;
+        }
+        if state.sessions.clear_campfire_cooking(applied.pos) {
+            outcome.cleared_campfires.push(applied.pos);
         }
     }
 
     outcome
+}
+
+fn replaced_campfire_with_non_campfire(state: &InteractionState, edit: &AppliedBlockEdit) -> bool {
+    is_campfire_state(state, edit.previous) && !is_campfire_state(state, edit.new_state)
 }
 
 fn apply_block_edit_to_storage(
@@ -5663,6 +5787,9 @@ where
         &outcome.deltas,
         Some(state.session_id),
     );
+    for pos in &outcome.cleared_campfires {
+        dispatch_campfire_block_entity_update(state, *pos, &CampfireCookingState::default());
+    }
 
     if let Some(table) = table {
         let mut light_updates = Vec::new();
@@ -6672,7 +6799,7 @@ where
     .await?;
     dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
         pos,
-        state.session_id,
+        Some(state.session_id),
         SIGN_BLOCK_ENTITY_TYPE_ID,
         update_tag,
     ));

@@ -278,30 +278,36 @@ impl SessionRegistry {
     pub(super) fn insert_campfire_cooking(
         &self,
         position: mc_world::BlockPos,
+        input: ItemStack,
         result: ItemStack,
         cooking_time: u32,
-    ) -> bool {
+    ) -> Option<CampfireCookingState> {
         let mut inner = self.lock_inner("insert campfire cooking");
-        inner
-            .campfire_cooking
-            .entry(position)
-            .or_default()
-            .insert(result, cooking_time)
+        let cooking = inner.campfire_cooking.entry(position).or_default();
+        cooking
+            .insert(input, result, cooking_time)
+            .then(|| cooking.clone())
     }
 
-    pub(super) fn tick_campfire_cooking(&self) -> Vec<(mc_world::BlockPos, ItemStack)> {
+    pub(super) fn tick_campfire_cooking(&self) -> CampfireCookingUpdates {
         let mut inner = self.lock_inner("tick campfire cooking");
-        let mut completed = Vec::new();
+        let mut updates = CampfireCookingUpdates::default();
         inner.campfire_cooking.retain(|position, cooking| {
-            completed.extend(cooking.tick().into_iter().map(|stack| (*position, stack)));
+            let tick = cooking.tick();
+            updates
+                .completed
+                .extend(tick.completed.into_iter().map(|stack| (*position, stack)));
+            if tick.changed {
+                updates.changed.push((*position, cooking.clone()));
+            }
             !cooking.is_empty()
         });
-        completed
+        updates
     }
 
-    pub(super) fn clear_campfire_cooking(&self, position: mc_world::BlockPos) {
+    pub(super) fn clear_campfire_cooking(&self, position: mc_world::BlockPos) -> bool {
         let mut inner = self.lock_inner("clear campfire cooking");
-        inner.campfire_cooking.remove(&position);
+        inner.campfire_cooking.remove(&position).is_some()
     }
 
     fn lock_inner(
@@ -590,7 +596,7 @@ impl SessionRegistry {
     pub(super) fn block_entity_data_dispatches(
         &self,
         position: mc_world::BlockPos,
-        except: SessionId,
+        except: Option<SessionId>,
         block_entity_type: i32,
         nbt: Tag,
     ) -> Vec<VisibilityDispatch> {
@@ -599,7 +605,7 @@ impl SessionRegistry {
         inner
             .sessions
             .iter()
-            .filter(|&(&id, session)| id != except && session.loaded.contains(&chunk))
+            .filter(|&(&id, session)| except != Some(id) && session.loaded.contains(&chunk))
             .map(|(&id, session)| VisibilityDispatch {
                 recipient: SessionRecipient {
                     id,

@@ -2712,6 +2712,51 @@ fn sign_update_nbt_matches_vanilla_plain_text_shape() {
 }
 
 #[test]
+fn campfire_update_nbt_contains_visible_cooking_items_only() {
+    let porkchop = Identifier::parse("minecraft:porkchop").unwrap();
+    let cooked_porkchop = Identifier::parse("minecraft:cooked_porkchop").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: porkchop.clone(),
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: cooked_porkchop,
+            protocol_id: 11,
+        },
+    ]);
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(10, 1), ItemStack::new(11, 1), 2));
+
+    assert_eq!(
+        campfire_block_entity_update_nbt(&items, &cooking),
+        Some(Tag::Compound(vec![(
+            "Items".into(),
+            Tag::List(ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements: vec![Tag::Compound(vec![
+                    ("Slot".into(), Tag::Int(0)),
+                    ("id".into(), Tag::String(porkchop.as_str().to_string())),
+                    ("count".into(), Tag::Int(1)),
+                ])],
+            }),
+        )]))
+    );
+
+    assert!(!cooking.tick().changed);
+    let tick = cooking.tick();
+    assert!(tick.changed);
+    assert_eq!(tick.completed, vec![ItemStack::new(11, 1)]);
+    assert_eq!(
+        campfire_block_entity_update_nbt(&items, &cooking),
+        Some(Tag::Compound(vec![(
+            "Items".into(),
+            Tag::List(ListTag::empty()),
+        )]))
+    );
+}
+
+#[test]
 fn bed_respawn_pose_uses_block_above_bed() {
     let blocks = mc_world::BlockRegistry::from_report(&[
         simple_block(0, "minecraft:air"),
@@ -2914,18 +2959,18 @@ fn campfire_cooking_rejects_invalid_when_full() {
     let mut cooking = CampfireCookingState::default();
 
     for item_id in 1..=CAMPFIRE_COOKING_SLOT_COUNT as u32 {
-        assert!(cooking.insert(ItemStack::new(item_id, 1), 5));
+        assert!(cooking.insert(ItemStack::new(item_id, 1), ItemStack::new(item_id, 1), 5));
     }
-    assert!(!cooking.insert(ItemStack::new(99, 1), 5));
+    assert!(!cooking.insert(ItemStack::new(99, 1), ItemStack::new(99, 1), 5));
 }
 
 #[test]
 fn campfire_cooking_outputs_after_cooking_time() {
     let mut cooking = CampfireCookingState::default();
-    assert!(cooking.insert(ItemStack::new(42, 1), 2));
+    assert!(cooking.insert(ItemStack::new(41, 1), ItemStack::new(42, 1), 2));
 
-    assert!(cooking.tick().is_empty());
-    assert_eq!(cooking.tick(), vec![ItemStack::new(42, 1)]);
+    assert!(cooking.tick().completed.is_empty());
+    assert_eq!(cooking.tick().completed, vec![ItemStack::new(42, 1)]);
     assert!(cooking.is_empty());
 }
 
