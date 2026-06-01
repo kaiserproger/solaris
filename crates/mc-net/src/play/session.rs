@@ -31,6 +31,10 @@ pub(super) enum OutboundCommand {
     AnimatePlayer {
         entity_id: i32,
     },
+    PlayerEntityData {
+        entity_id: i32,
+        values: Vec<EntityDataValue>,
+    },
     BlockEntityData {
         position: mc_world::BlockPos,
         block_entity_type: i32,
@@ -72,6 +76,7 @@ impl OutboundCommand {
             | Self::DamagePlayer { .. }
             | Self::TakeItemEntity { .. }
             | Self::DespawnEntity(_)
+            | Self::PlayerEntityData { .. }
             | Self::BlockEntityData { .. }
             | Self::FurnaceSlots { .. }
             | Self::ChestSlots { .. }
@@ -834,6 +839,34 @@ impl SessionRegistry {
                         tx: observer.tx.clone(),
                     },
                     command: OutboundCommand::AnimatePlayer { entity_id },
+                })
+            })
+            .collect()
+    }
+
+    pub(super) fn broadcast_player_entity_data(
+        &self,
+        id: SessionId,
+        values: Vec<EntityDataValue>,
+    ) -> Vec<VisibilityDispatch> {
+        let inner = self.lock_inner("broadcast player entity data");
+        let Some(session) = inner.sessions.get(&id) else {
+            return Vec::new();
+        };
+        let entity_id = session.entity_id;
+        visible_observers_locked(&inner, id)
+            .into_iter()
+            .filter_map(|observer_id| {
+                let observer = inner.sessions.get(&observer_id)?;
+                Some(VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: observer_id,
+                        tx: observer.tx.clone(),
+                    },
+                    command: OutboundCommand::PlayerEntityData {
+                        entity_id,
+                        values: values.clone(),
+                    },
                 })
             })
             .collect()

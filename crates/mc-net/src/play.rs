@@ -48,7 +48,8 @@ use mc_protocol::packets::play::{
     Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
     EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
     EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX,
-    InteractionHand, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    InteractionHand, ItemStack, LIVING_ENTITY_DATA_FLAGS_INDEX, LIVING_ENTITY_FLAG_OFF_HAND,
+    LIVING_ENTITY_FLAG_USING_ITEM, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
     MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
     PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput,
     PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
@@ -2033,7 +2034,7 @@ where
 {
     state.pending_break = None;
     state.pending_use = None;
-    state.shield_use = None;
+    clear_shield_use(state);
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         debug!(
             recipe = packet.recipe_display_id,
@@ -3484,7 +3485,7 @@ where
 {
     state.pending_break = None;
     state.pending_use = None;
-    state.shield_use = None;
+    clear_shield_use(state);
     if game_mode == GameMode::Spectator
         || matches!(game_mode, GameMode::Survival | GameMode::Adventure) && survival_state.is_dead()
     {
@@ -4118,7 +4119,7 @@ where
             | PlayerActionKind::StopDestroyBlock
     );
     if matches!(action.action, PlayerActionKind::ReleaseUseItem) {
-        state.shield_use = None;
+        clear_shield_use(state);
         if game_mode == GameMode::Survival
             && let Some(pending) = state.pending_use.take()
             && matches!(pending.kind, UseKind::Bow)
@@ -4303,10 +4304,44 @@ fn stack_is_shield(state: &InteractionState, stack: &ItemStack) -> bool {
             .is_some_and(|item| item.as_str() == "minecraft:shield")
 }
 
+fn shield_use_flags(shield_use: Option<&ShieldUseState>) -> i8 {
+    let Some(shield_use) = shield_use else {
+        return 0;
+    };
+    let mut flags = LIVING_ENTITY_FLAG_USING_ITEM;
+    if shield_use.hand == InteractionHand::OffHand {
+        flags |= LIVING_ENTITY_FLAG_OFF_HAND;
+    }
+    flags
+}
+
+fn shield_use_entity_data_value(shield_use: Option<&ShieldUseState>) -> EntityDataValue {
+    EntityDataValue::Byte {
+        index: LIVING_ENTITY_DATA_FLAGS_INDEX,
+        value: shield_use_flags(shield_use),
+    }
+}
+
+fn dispatch_shield_use_metadata(state: &InteractionState) {
+    dispatch_visibility_commands(state.sessions.broadcast_player_entity_data(
+        state.session_id,
+        vec![shield_use_entity_data_value(state.shield_use.as_ref())],
+    ));
+}
+
+fn clear_shield_use(state: &mut InteractionState) {
+    if state.shield_use.take().is_some() {
+        dispatch_shield_use_metadata(state);
+    }
+}
+
 fn start_shield_use(
     state: &mut InteractionState,
     hand: mc_protocol::packets::play::InteractionHand,
 ) -> bool {
+    if state.shield_use.is_some() {
+        return true;
+    }
     let slot = shield_hand_slot(state, hand);
     let stack = state.inventory.slots[slot].clone();
     let Some(shield_use) = shield_use_from_stack(
@@ -4321,6 +4356,7 @@ fn start_shield_use(
     state.pending_break = None;
     state.pending_use = None;
     state.shield_use = Some(shield_use);
+    dispatch_shield_use_metadata(state);
     true
 }
 
@@ -4347,7 +4383,7 @@ fn refresh_shield_use_state(state: &mut InteractionState) {
         || state.inventory.slots[shield_use.slot] != shield_use.stack
         || !stack_is_shield(state, &state.inventory.slots[shield_use.slot])
     {
-        state.shield_use = None;
+        clear_shield_use(state);
     }
 }
 
@@ -5435,7 +5471,7 @@ where
     {
         state.pending_break = None;
         state.pending_use = None;
-        state.shield_use = None;
+        clear_shield_use(state);
         drop_inventory_on_death(state, writer, new_pose).await?;
     }
     Ok(())
@@ -5476,7 +5512,7 @@ where
     {
         state.pending_break = None;
         state.pending_use = None;
-        state.shield_use = None;
+        clear_shield_use(state);
         drop_inventory_on_death(state, writer, damage.player_pose).await?;
     }
     Ok(())
@@ -6200,7 +6236,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     state.pending_use = None;
-    state.shield_use = None;
+    clear_shield_use(state);
 
     if classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action)
         == UseItemOnOutcome::NoOp
@@ -7003,7 +7039,7 @@ where
 {
     if game_mode != GameMode::Survival {
         state.pending_use = None;
-        state.shield_use = None;
+        clear_shield_use(state);
         return Ok(());
     }
     refresh_shield_use_state(state);
@@ -7084,7 +7120,7 @@ where
     if !was_dead && survival_state.is_dead() {
         state.pending_break = None;
         state.pending_use = None;
-        state.shield_use = None;
+        clear_shield_use(state);
         drop_inventory_on_death(state, writer, player_pose).await?;
     }
     Ok(())
@@ -7409,6 +7445,14 @@ where
                     Some(OutboundCommand::AnimatePlayer { entity_id }) => {
                         send_player_animation(writer, compression, entity_id).await?;
                     }
+                    Some(OutboundCommand::PlayerEntityData { entity_id, values }) => {
+                        write_packet(
+                            writer,
+                            &ClientboundSetEntityData { entity_id, values },
+                            compression,
+                        )
+                        .await?;
+                    }
                     Some(OutboundCommand::BlockEntityData { position, block_entity_type, nbt }) => {
                         write_packet(
                             writer,
@@ -7505,14 +7549,14 @@ where
                         {
                             state.pending_break = None;
                             state.pending_use = None;
-                            state.shield_use = None;
+                            clear_shield_use(state);
                         }
                         write_packet(writer, &survival_state.as_packet(), compression).await?;
                         if !was_dead
                             && survival_state.is_dead()
                             && let Some(state) = interaction.as_deref_mut()
                         {
-                            state.shield_use = None;
+                            clear_shield_use(state);
                             drop_inventory_on_death(state, writer, player_pose).await?;
                         }
                     }
@@ -7867,7 +7911,7 @@ where
                     if let Some(state) = interaction.as_deref_mut() {
                         state.pending_break = None;
                         state.pending_use = None;
-                        state.shield_use = None;
+                        clear_shield_use(state);
                         state.selected_hotbar_slot = slot;
                         debug!(slot, "hotbar selection updated");
                     }
@@ -8148,7 +8192,7 @@ where
             {
                 state.pending_break = None;
                 state.pending_use = None;
-                state.shield_use = None;
+                clear_shield_use(state);
                 drop_inventory_on_death(state, writer, *player_pose).await?;
             }
             send_command_feedback(writer, compression, "Killed player").await
@@ -8406,7 +8450,7 @@ where
     {
         interaction.pending_break = None;
         interaction.pending_use = None;
-        interaction.shield_use = None;
+        clear_shield_use(interaction);
         drop_inventory_on_death(interaction, writer, player_pose).await?;
     }
     Ok(())

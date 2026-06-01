@@ -3049,6 +3049,39 @@ fn shield_use_starts_blocking_state_for_shield_stack() {
 }
 
 #[test]
+fn shield_use_metadata_uses_vanilla_living_entity_flags() {
+    let main_hand = ShieldUseState {
+        hand: mc_protocol::packets::play::InteractionHand::MainHand,
+        started_tick: 1,
+        slot: PlayerInventory::HOTBAR_BASE,
+        stack: ItemStack::new(77, 1),
+    };
+    let off_hand = ShieldUseState {
+        hand: mc_protocol::packets::play::InteractionHand::OffHand,
+        started_tick: 1,
+        slot: 45,
+        stack: ItemStack::new(77, 1),
+    };
+
+    assert_eq!(shield_use_flags(None), 0);
+    assert_eq!(
+        shield_use_flags(Some(&main_hand)),
+        LIVING_ENTITY_FLAG_USING_ITEM
+    );
+    assert_eq!(
+        shield_use_flags(Some(&off_hand)),
+        LIVING_ENTITY_FLAG_USING_ITEM | LIVING_ENTITY_FLAG_OFF_HAND
+    );
+    assert_eq!(
+        shield_use_entity_data_value(Some(&off_hand)),
+        EntityDataValue::Byte {
+            index: LIVING_ENTITY_DATA_FLAGS_INDEX,
+            value: LIVING_ENTITY_FLAG_USING_ITEM | LIVING_ENTITY_FLAG_OFF_HAND,
+        }
+    );
+}
+
+#[test]
 fn shield_non_shield_use_does_not_block() {
     let shield_use = shield_use_from_stack(
         mc_protocol::packets::play::InteractionHand::MainHand,
