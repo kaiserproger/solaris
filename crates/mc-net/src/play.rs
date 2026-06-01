@@ -1621,36 +1621,25 @@ where
         return Ok(window);
     }
     let mut dropped = None;
-    let changed = match packet.container_input {
-        ContainerInput::Pickup if packet.slot_num >= 0 => apply_crafting_pickup_click(
-            state,
-            &mut window,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-            apply_crafting_quick_move_click(state, &mut window, packet.slot_num as usize)
+    let changed = match classify_container_click(&packet) {
+        ContainerClickAction::Pickup { slot, button } => {
+            apply_crafting_pickup_click(state, &mut window, slot, button)
         }
-        ContainerInput::Swap if packet.slot_num >= 0 => apply_crafting_swap_click(
-            state,
-            &mut window,
-            packet.slot_num as usize,
-            packet.button_num,
-        ),
-        ContainerInput::Throw if packet.slot_num >= 0 => {
+        ContainerClickAction::QuickMove { slot } => {
+            apply_crafting_quick_move_click(state, &mut window, slot)
+        }
+        ContainerClickAction::Swap { slot, button } => {
+            apply_crafting_swap_click(state, &mut window, slot, button)
+        }
+        ContainerClickAction::Throw { slot, button } => {
             if item_entity_type_id(&state.entity_types).is_some() {
-                dropped = apply_crafting_throw_click(
-                    state,
-                    &mut window,
-                    packet.slot_num as usize,
-                    packet.button_num,
-                );
+                dropped = apply_crafting_throw_click(state, &mut window, slot, button);
                 dropped.is_some()
             } else {
                 false
             }
         }
-        _ => false,
+        ContainerClickAction::Unsupported => false,
     };
     if changed {
         window.state_id = window.state_id.wrapping_add(1);
@@ -2204,6 +2193,39 @@ fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
         0 => (!slot.is_empty()).then(|| take_from_slot(slot, 1)),
         1 => (!slot.is_empty()).then(|| std::mem::take(slot)),
         _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerClickAction {
+    Pickup { slot: usize, button: i8 },
+    QuickMove { slot: usize },
+    Swap { slot: usize, button: i8 },
+    Throw { slot: usize, button: i8 },
+    Unsupported,
+}
+
+fn classify_container_click(packet: &ServerboundContainerClick) -> ContainerClickAction {
+    let Ok(slot) = usize::try_from(packet.slot_num) else {
+        return ContainerClickAction::Unsupported;
+    };
+    match packet.container_input {
+        ContainerInput::Pickup => ContainerClickAction::Pickup {
+            slot,
+            button: packet.button_num,
+        },
+        ContainerInput::QuickMove if packet.button_num == 0 => {
+            ContainerClickAction::QuickMove { slot }
+        }
+        ContainerInput::Swap => ContainerClickAction::Swap {
+            slot,
+            button: packet.button_num,
+        },
+        ContainerInput::Throw => ContainerClickAction::Throw {
+            slot,
+            button: packet.button_num,
+        },
+        _ => ContainerClickAction::Unsupported,
     }
 }
 
@@ -3128,36 +3150,25 @@ where
             write_chest_content(state, writer, &window, &view).await?;
             return Ok(window);
         }
-        changed = match packet.container_input {
-            ContainerInput::Pickup if packet.slot_num >= 0 => apply_chest_pickup_click(
-                state,
-                &mut view,
-                packet.slot_num as usize,
-                packet.button_num,
-            ),
-            ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-                apply_chest_quick_move_click(state, &mut view, packet.slot_num as usize)
+        changed = match classify_container_click(&packet) {
+            ContainerClickAction::Pickup { slot, button } => {
+                apply_chest_pickup_click(state, &mut view, slot, button)
             }
-            ContainerInput::Swap if packet.slot_num >= 0 => apply_chest_swap_click(
-                state,
-                &mut view,
-                packet.slot_num as usize,
-                packet.button_num,
-            ),
-            ContainerInput::Throw if packet.slot_num >= 0 => {
+            ContainerClickAction::QuickMove { slot } => {
+                apply_chest_quick_move_click(state, &mut view, slot)
+            }
+            ContainerClickAction::Swap { slot, button } => {
+                apply_chest_swap_click(state, &mut view, slot, button)
+            }
+            ContainerClickAction::Throw { slot, button } => {
                 if item_entity_type_id(&state.entity_types).is_some() {
-                    dropped = apply_chest_throw_click(
-                        state,
-                        &mut view,
-                        packet.slot_num as usize,
-                        packet.button_num,
-                    );
+                    dropped = apply_chest_throw_click(state, &mut view, slot, button);
                     dropped.is_some()
                 } else {
                     false
                 }
             }
-            _ => false,
+            ContainerClickAction::Unsupported => false,
         };
         if changed {
             window.state_id = window.state_id.wrapping_add(1);
@@ -3213,43 +3224,25 @@ where
             write_furnace_content(state, writer, &window, &furnace).await?;
             return Ok(window);
         }
-        changed = match packet.container_input {
-            ContainerInput::Pickup if packet.slot_num >= 0 => apply_furnace_pickup_click(
-                state,
-                &mut furnace,
-                window.kind,
-                packet.slot_num as usize,
-                packet.button_num,
-            ),
-            ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-                apply_furnace_quick_move_click(
-                    state,
-                    &mut furnace,
-                    window.kind,
-                    packet.slot_num as usize,
-                )
+        changed = match classify_container_click(&packet) {
+            ContainerClickAction::Pickup { slot, button } => {
+                apply_furnace_pickup_click(state, &mut furnace, window.kind, slot, button)
             }
-            ContainerInput::Swap if packet.slot_num >= 0 => apply_furnace_swap_click(
-                state,
-                &mut furnace,
-                window.kind,
-                packet.slot_num as usize,
-                packet.button_num,
-            ),
-            ContainerInput::Throw if packet.slot_num >= 0 => {
+            ContainerClickAction::QuickMove { slot } => {
+                apply_furnace_quick_move_click(state, &mut furnace, window.kind, slot)
+            }
+            ContainerClickAction::Swap { slot, button } => {
+                apply_furnace_swap_click(state, &mut furnace, window.kind, slot, button)
+            }
+            ContainerClickAction::Throw { slot, button } => {
                 if item_entity_type_id(&state.entity_types).is_some() {
-                    dropped = apply_furnace_throw_click(
-                        state,
-                        &mut furnace,
-                        packet.slot_num as usize,
-                        packet.button_num,
-                    );
+                    dropped = apply_furnace_throw_click(state, &mut furnace, slot, button);
                     dropped.is_some()
                 } else {
                     false
                 }
             }
-            _ => false,
+            ContainerClickAction::Unsupported => false,
         };
         if changed {
             window.state_id = window.state_id.wrapping_add(1);
@@ -3542,25 +3535,19 @@ where
     }
 
     let mut dropped = None;
-    let changed = match packet.container_input {
-        ContainerInput::Pickup if packet.slot_num >= 0 => {
-            apply_pickup_click(state, packet.slot_num as usize, packet.button_num)
-        }
-        ContainerInput::QuickMove if packet.slot_num >= 0 && packet.button_num == 0 => {
-            apply_quick_move_click(state, packet.slot_num as usize)
-        }
-        ContainerInput::Swap if packet.slot_num >= 0 => {
-            apply_swap_click(state, packet.slot_num as usize, packet.button_num)
-        }
-        ContainerInput::Throw if packet.slot_num >= 0 => {
+    let changed = match classify_container_click(&packet) {
+        ContainerClickAction::Pickup { slot, button } => apply_pickup_click(state, slot, button),
+        ContainerClickAction::QuickMove { slot } => apply_quick_move_click(state, slot),
+        ContainerClickAction::Swap { slot, button } => apply_swap_click(state, slot, button),
+        ContainerClickAction::Throw { slot, button } => {
             if item_entity_type_id(&state.entity_types).is_some() {
-                dropped = apply_throw_click(state, packet.slot_num as usize, packet.button_num);
+                dropped = apply_throw_click(state, slot, button);
                 dropped.is_some()
             } else {
                 false
             }
         }
-        _ => false,
+        ContainerClickAction::Unsupported => false,
     };
 
     if !changed {
