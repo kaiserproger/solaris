@@ -78,17 +78,17 @@ client files.
   beans can place age-0 cocoa on horizontal jungle-log faces when the target
   cell is clear. Crop harvest item ids are resolved through the loaded item
   registry and missing ids are omitted safely. Solaris harness coverage exists
-  for young wheat growth, mature wheat no-consume behavior, and mature wheat
-  harvest drops; young wheat, carrot harvest, potato harvest, beetroot harvest,
-  nether wart harvest, stem fruit lifecycle, sweet berry harvest, cocoa harvest,
-  and cocoa placement remain unit-covered only.
+  for young wheat growth, mature wheat no-consume behavior, mature wheat harvest
+  drops, mature carrot/potato/beetroot/nether wart harvest drops, and sweet
+  berry harvest; immature crop harvest variants, stem fruit lifecycle, cocoa
+  harvest, and cocoa placement remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, exact
   vanilla stem fruit placement/support/RNG parity, exact sweet berry drop RNG or
   collision behavior, exact cocoa placement/support parity, exact cocoa loot/RNG
-  parity, all-crop harness coverage are not claimed yet.
+  parity, and immature crop harvest harness coverage are not claimed yet.
 - Sugar cane, cactus, and bamboo have partial vertical-plant growth support:
   random ticks can grow supported clear columns by one block up to the local
   height-three cap, and samples from any block in the column grow only above the
