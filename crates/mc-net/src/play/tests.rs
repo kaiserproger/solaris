@@ -2654,6 +2654,64 @@ fn sign_placement_sets_wall_facing_and_floor_rotation() {
 }
 
 #[test]
+fn sign_update_nbt_matches_vanilla_plain_text_shape() {
+    let tag = sign_block_entity_update_nbt(
+        &[
+            "Hello".to_string(),
+            "World".to_string(),
+            String::new(),
+            "!".to_string(),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        tag,
+        Tag::Compound(vec![
+            (
+                "front_text".into(),
+                Tag::Compound(vec![
+                    (
+                        "messages".into(),
+                        Tag::List(ListTag {
+                            element_type: mc_nbt::tag_type::STRING,
+                            elements: vec![
+                                Tag::String("Hello".into()),
+                                Tag::String("World".into()),
+                                Tag::String(String::new()),
+                                Tag::String("!".into()),
+                            ],
+                        }),
+                    ),
+                    ("color".into(), Tag::String("black".into())),
+                    ("has_glowing_text".into(), Tag::Byte(0)),
+                ]),
+            ),
+            (
+                "back_text".into(),
+                Tag::Compound(vec![
+                    (
+                        "messages".into(),
+                        Tag::List(ListTag {
+                            element_type: mc_nbt::tag_type::STRING,
+                            elements: vec![
+                                Tag::String(String::new()),
+                                Tag::String(String::new()),
+                                Tag::String(String::new()),
+                                Tag::String(String::new()),
+                            ],
+                        }),
+                    ),
+                    ("color".into(), Tag::String("black".into())),
+                    ("has_glowing_text".into(), Tag::Byte(0)),
+                ]),
+            ),
+            ("is_waxed".into(), Tag::Byte(0)),
+        ])
+    );
+}
+
+#[test]
 fn bed_respawn_pose_uses_block_above_bed() {
     let blocks = mc_world::BlockRegistry::from_report(&[
         simple_block(0, "minecraft:air"),

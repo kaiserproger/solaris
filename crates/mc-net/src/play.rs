@@ -34,35 +34,35 @@ use mc_entity::{
     EntityView, GoalState, Rotation, SpawnEntity, Vec3,
 };
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
-use mc_nbt::Tag;
+use mc_nbt::{ListTag, Tag};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
-    ClientboundChangeDifficulty, ClientboundCommandSuggestions, ClientboundContainerSetContent,
-    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundInitializeBorder,
-    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundOpenSignEditor, ClientboundRespawn,
-    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTakeItemEntity,
-    ConfirmTeleportation, ContainerInput, Direction, ENTITY_DATA_POSE_INDEX,
-    ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction, EntityDataValue,
-    EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
-    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack, LevelChunkWithLight, LightData,
-    LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
-    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
-    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange,
-    SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode, ServerboundChatAck,
-    ServerboundChatCommand, ServerboundChunkBatchReceived, ServerboundClientCommand,
-    ServerboundClientInformation, ServerboundClientTickEnd, ServerboundCommandSuggestion,
-    ServerboundContainerClick, ServerboundContainerClose, ServerboundCustomPayload,
-    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerCommand,
-    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings,
-    ServerboundRecipeBookSeenRecipe, ServerboundResourcePack, ServerboundSetCarriedItem,
-    ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion, SynchronizePlayerPosition,
-    pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ClientboundBlockEntityData, ClientboundChangeDifficulty, ClientboundCommandSuggestions,
+    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
+    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
+    ClientboundOpenSignEditor, ClientboundRespawn, ClientboundSetEntityData,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
+    ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
+    Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
+    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
+    EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX,
+    InteractionHand, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
+    MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
+    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput,
+    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
+    ServerboundAttack, ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
+    ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
+    ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerClick,
+    ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
+    ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
+    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
+    ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem,
+    ServerboundUseItemOn, SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion,
+    SynchronizePlayerPosition, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_world::light::{
@@ -202,6 +202,7 @@ const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
 const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
+const SIGN_BLOCK_ENTITY_TYPE_ID: i32 = 7;
 
 pub(crate) fn configure_session_arrow_kill_rewards(
     sessions: &SessionRegistry,
@@ -6611,7 +6612,14 @@ fn is_editable_sign_state(state: &mc_world::BlockState) -> bool {
     path.ends_with("_sign") && !path.ends_with("_hanging_sign")
 }
 
-async fn handle_sign_update(state: &mut InteractionState, packet: ServerboundSignUpdate) {
+async fn handle_sign_update<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    packet: ServerboundSignUpdate,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let (x, y, z) = unpack_block_pos(packet.position);
     let pos = mc_world::BlockPos { x, y, z };
     if state.pending_sign_edit != Some(pos) {
@@ -6619,7 +6627,7 @@ async fn handle_sign_update(state: &mut InteractionState, packet: ServerboundSig
             ?pos,
             "sign update ignored without matching open editor state"
         );
-        return;
+        return Ok(());
     }
     let is_sign = {
         let mut storage = state.world.lock().await;
@@ -6637,10 +6645,88 @@ async fn handle_sign_update(state: &mut InteractionState, packet: ServerboundSig
     };
     if !is_sign {
         debug!(?pos, "sign update ignored for non-sign block");
-        return;
+        return Ok(());
     }
+
+    let update_tag = sign_block_entity_update_nbt(&packet.lines, packet.is_front_text);
+    let persistent_tag = sign_block_entity_persistent_nbt(pos, &update_tag);
+    let mut persistent_bytes = Vec::new();
+    mc_nbt::write_network(&mut persistent_bytes, &persistent_tag)
+        .map_err(mc_protocol::CodecError::from)?;
+    {
+        let mut storage = state.world.lock().await;
+        if let Err(err) = storage.set_opaque_block_entity(pos, persistent_bytes) {
+            warn!(error = %err, ?pos, "sign block entity save failed");
+        }
+    }
+
+    write_packet(
+        writer,
+        &ClientboundBlockEntityData {
+            position: packet.position,
+            block_entity_type: SIGN_BLOCK_ENTITY_TYPE_ID,
+            nbt: update_tag.clone(),
+        },
+        state.compression,
+    )
+    .await?;
+    dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
+        pos,
+        state.session_id,
+        SIGN_BLOCK_ENTITY_TYPE_ID,
+        update_tag,
+    ));
     state.pending_sign_edit = None;
     debug!(?pos, lines = ?packet.lines, front = packet.is_front_text, "sign update accepted");
+    Ok(())
+}
+
+fn sign_block_entity_update_nbt(lines: &[String], is_front_text: bool) -> Tag {
+    let text = sign_text_nbt(lines);
+    let empty = sign_text_nbt(&[]);
+    Tag::Compound(vec![
+        (
+            "front_text".into(),
+            if is_front_text {
+                text.clone()
+            } else {
+                empty.clone()
+            },
+        ),
+        ("back_text".into(), if is_front_text { empty } else { text }),
+        ("is_waxed".into(), Tag::Byte(0)),
+    ])
+}
+
+fn sign_block_entity_persistent_nbt(pos: mc_world::BlockPos, update_tag: &Tag) -> Tag {
+    let Tag::Compound(fields) = update_tag else {
+        unreachable!("sign update tag is always a compound")
+    };
+    let mut fields = fields.clone();
+    fields.extend([
+        ("x".into(), Tag::Int(pos.x)),
+        ("y".into(), Tag::Int(pos.y)),
+        ("z".into(), Tag::Int(pos.z)),
+        ("id".into(), Tag::String("minecraft:sign".into())),
+    ]);
+    Tag::Compound(fields)
+}
+
+fn sign_text_nbt(lines: &[String]) -> Tag {
+    let messages = (0..4)
+        .map(|idx| Tag::String(lines.get(idx).cloned().unwrap_or_default()))
+        .collect();
+    Tag::Compound(vec![
+        (
+            "messages".into(),
+            Tag::List(ListTag {
+                element_type: mc_nbt::tag_type::STRING,
+                elements: messages,
+            }),
+        ),
+        ("color".into(), Tag::String("black".into())),
+        ("has_glowing_text".into(), Tag::Byte(0)),
+    ])
 }
 
 fn direction_to_horizontal_facing(direction: Direction) -> Option<&'static str> {
@@ -7196,6 +7282,18 @@ where
                     Some(OutboundCommand::AnimatePlayer { entity_id }) => {
                         send_player_animation(writer, compression, entity_id).await?;
                     }
+                    Some(OutboundCommand::BlockEntityData { position, block_entity_type, nbt }) => {
+                        write_packet(
+                            writer,
+                            &ClientboundBlockEntityData {
+                                position: pack_block_pos(position.x, position.y, position.z),
+                                block_entity_type,
+                                nbt,
+                            },
+                            compression,
+                        )
+                        .await?;
+                    }
                     Some(OutboundCommand::FurnaceSlots { position, slots }) => {
                         if let Some(state) = interaction.as_deref_mut()
                             && let Some(ActiveContainer::Furnace(mut window)) = state.active_container.take()
@@ -7540,7 +7638,7 @@ where
                     let mut body = frame.body;
                     let sign_update = ServerboundSignUpdate::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_sign_update(state, sign_update).await;
+                        handle_sign_update(state, writer, sign_update).await?;
                     } else {
                         debug!("SignUpdate ignored — no world configured");
                     }

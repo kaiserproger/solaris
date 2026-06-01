@@ -602,6 +602,28 @@ impl WorldStorage {
         Ok(true)
     }
 
+    pub fn set_opaque_block_entity(
+        &mut self,
+        pos: BlockPos,
+        bytes: Vec<u8>,
+    ) -> Result<bool, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(false);
+        }
+        let chunk = self
+            .cache
+            .get_mut(&cpos)
+            .expect("ensure_chunk placed the chunk in cache");
+        let chunk = Arc::make_mut(chunk);
+        if chunk.block_entities.get(&pos) == Some(&bytes) {
+            return Ok(true);
+        }
+        chunk.block_entities.insert(pos, bytes);
+        chunk.dirty = true;
+        Ok(true)
+    }
+
     pub fn scheduled_block_ticks(
         &mut self,
         cpos: ChunkPos,

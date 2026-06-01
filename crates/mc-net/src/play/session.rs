@@ -31,6 +31,11 @@ pub(super) enum OutboundCommand {
     AnimatePlayer {
         entity_id: i32,
     },
+    BlockEntityData {
+        position: mc_world::BlockPos,
+        block_entity_type: i32,
+        nbt: Tag,
+    },
     FurnaceSlots {
         position: mc_world::BlockPos,
         slots: [ItemStack; 3],
@@ -67,6 +72,7 @@ impl OutboundCommand {
             | Self::DamagePlayer { .. }
             | Self::TakeItemEntity { .. }
             | Self::DespawnEntity(_)
+            | Self::BlockEntityData { .. }
             | Self::FurnaceSlots { .. }
             | Self::ChestSlots { .. }
             | Self::FurnaceData { .. } => OutboundLane::Reliable,
@@ -576,6 +582,33 @@ impl SessionRegistry {
                 command: OutboundCommand::ChestSlots {
                     position,
                     slots: slots.clone(),
+                },
+            })
+            .collect()
+    }
+
+    pub(super) fn block_entity_data_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        except: SessionId,
+        block_entity_type: i32,
+        nbt: Tag,
+    ) -> Vec<VisibilityDispatch> {
+        let chunk = (position.x.div_euclid(16), position.z.div_euclid(16));
+        let inner = self.lock_inner("block entity data dispatches");
+        inner
+            .sessions
+            .iter()
+            .filter(|&(&id, session)| id != except && session.loaded.contains(&chunk))
+            .map(|(&id, session)| VisibilityDispatch {
+                recipient: SessionRecipient {
+                    id,
+                    tx: session.tx.clone(),
+                },
+                command: OutboundCommand::BlockEntityData {
+                    position,
+                    block_entity_type,
+                    nbt: nbt.clone(),
                 },
             })
             .collect()
