@@ -91,6 +91,14 @@ client files.
   exact sweet berry drop RNG or collision behavior, exact cocoa placement/support
   parity, exact cocoa loot/RNG parity, and immature crop harvest harness coverage
   are not claimed yet.
+- Plant support semantics are local and deterministic: crop item placement checks
+  exact clicked support blocks for farmland crops and soul sand for nether wart,
+  plus a clear target cell, but crop growth/bonemeal/random ticks advance by block
+  state and do not re-check soil, moisture, light, or survival support. Mature
+  stems scan north, south, west, then east for the first air fruit cell and do not
+  validate fruit support below. Cocoa placement accepts horizontal jungle-log
+  faces with a clear target cell; later cocoa growth and drops do not re-check log
+  support. These are scoped Solaris semantics, not vanilla support parity.
 - Sugar cane, cactus, and bamboo have partial vertical-plant growth support:
   random ticks can grow supported clear columns by one block up to the local
   height-three cap, and samples from any block in the column grow only above the
@@ -100,6 +108,12 @@ client files.
   neighbor survivability, bamboo age/stage/leaf-size transitions, cactus/bamboo
   random-tick growth harness coverage, bonemeal, particles/sounds/statistics/game
   events are not claimed yet.
+- Vertical-plant growth support is intentionally coarse: the bottom of the
+  contiguous column must have any non-air support block, the cell above the top
+  must be air, and the local height cap is three blocks. Support-break cascades
+  remove sugar cane, cactus, and bamboo blocks above a removed support. Exact
+  sugar cane water adjacency, cactus side-neighbor survival, and bamboo-specific
+  age/stage/leaf support semantics are not implemented.
 - Common one-by-one saplings have partial tree-growth support: using bonemeal on
   a clear oak, birch, spruce, jungle, acacia, or dark oak sapling creates a
   deterministic Solaris-owned small tree through existing block-edit paths, and
