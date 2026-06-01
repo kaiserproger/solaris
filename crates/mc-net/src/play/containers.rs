@@ -53,6 +53,10 @@ impl FurnaceWindow {
             state_id: 1,
         }
     }
+
+    pub(super) fn menu_type(&self) -> i32 {
+        self.kind.menu_type()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,16 @@ pub(super) enum FurnaceKind {
     Furnace,
     Smoker,
     BlastFurnace,
+}
+
+impl FurnaceKind {
+    pub(super) fn menu_type(self) -> i32 {
+        match self {
+            Self::Furnace => FURNACE_MENU_TYPE_ID,
+            Self::Smoker => SMOKER_MENU_TYPE_ID,
+            Self::BlastFurnace => BLAST_FURNACE_MENU_TYPE_ID,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

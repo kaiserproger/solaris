@@ -25,6 +25,7 @@ use mc_data::items::ItemRegistry;
 use mc_nbt::{ListTag, Tag, tag_type};
 use thiserror::Error;
 
+use crate::SECTION_DIM;
 use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
@@ -182,7 +183,7 @@ pub fn chunk_from_nbt_with_items(
             let by = get_int(cmp, "y")?;
             let bz = get_int(cmp, "z")?;
             let block_entity_id = get_string(cmp, "id").ok();
-            if block_entity_id.is_some_and(|id| id == "minecraft:furnace")
+            if block_entity_id.is_some_and(|id| is_furnace_block_entity_id(id))
                 && let Some(items) = items
             {
                 chunk.furnaces.insert(
@@ -542,7 +543,12 @@ pub fn chunk_to_nbt_with_items(
         let mut furnaces: Vec<(&BlockPos, &FurnaceBlockEntity)> = chunk.furnaces.iter().collect();
         furnaces.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
         for (pos, furnace) in furnaces {
-            be_list.push(encode_furnace(pos, furnace, items)?);
+            be_list.push(encode_furnace(
+                pos,
+                furnace,
+                items,
+                furnace_block_entity_id_for_block(chunk, registry, *pos),
+            )?);
         }
         let mut chests: Vec<(&BlockPos, &ChestBlockEntity)> = chunk.chests.iter().collect();
         chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
@@ -808,9 +814,10 @@ fn encode_furnace(
     pos: &BlockPos,
     furnace: &FurnaceBlockEntity,
     items: &ItemRegistry,
+    block_entity_id: &str,
 ) -> Result<Tag, ChunkNbtError> {
     let mut compound = vec![
-        ("id".into(), Tag::String("minecraft:furnace".into())),
+        ("id".into(), Tag::String(block_entity_id.to_string())),
         ("x".into(), Tag::Int(pos.x)),
         ("y".into(), Tag::Int(pos.y)),
         ("z".into(), Tag::Int(pos.z)),
@@ -852,6 +859,33 @@ fn encode_furnace(
     ));
     compound.push(("cooking_total_time".into(), Tag::Short(furnace.cook_total)));
     Ok(Tag::Compound(compound))
+}
+
+fn is_furnace_block_entity_id(id: &str) -> bool {
+    matches!(
+        id,
+        "minecraft:furnace" | "minecraft:smoker" | "minecraft:blast_furnace"
+    )
+}
+
+fn furnace_block_entity_id_for_block(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    pos: BlockPos,
+) -> &'static str {
+    let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+    let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+    let Some(state_id) = chunk.get_block(local_x, pos.y, local_z) else {
+        return "minecraft:furnace";
+    };
+    let Some(state) = registry.by_id(state_id) else {
+        return "minecraft:furnace";
+    };
+    match state.block.id.as_str() {
+        "minecraft:smoker" => "minecraft:smoker",
+        "minecraft:blast_furnace" => "minecraft:blast_furnace",
+        _ => "minecraft:furnace",
+    }
 }
 
 fn encode_chest(
@@ -1085,6 +1119,87 @@ mod tests {
         (MIN_Y..MAX_Y)
             .rev()
             .find(|&y| chunk.get_block(x, y, z) != Some(air))
+    }
+
+    #[test]
+    fn furnace_family_block_entity_ids_follow_block_state() {
+        fn block_report(id: u32, name: &str) -> mc_data::blocks::BlockReport {
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse(name).unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            }
+        }
+
+        let registry = BlockRegistry::from_report(&[
+            block_report(0, "minecraft:air"),
+            block_report(1, "minecraft:furnace"),
+            block_report(2, "minecraft:smoker"),
+            block_report(3, "minecraft:blast_furnace"),
+        ])
+        .unwrap();
+        let items = mc_data::items::ItemRegistry::from_report(&[]);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome);
+        let entries = [
+            (
+                BlockPos { x: 1, y: 64, z: 1 },
+                BlockStateId(1),
+                "minecraft:furnace",
+            ),
+            (
+                BlockPos { x: 2, y: 64, z: 1 },
+                BlockStateId(2),
+                "minecraft:smoker",
+            ),
+            (
+                BlockPos { x: 3, y: 64, z: 1 },
+                BlockStateId(3),
+                "minecraft:blast_furnace",
+            ),
+        ];
+        for &(pos, state, _) in &entries {
+            chunk
+                .set_block(pos.x as u8, pos.y, pos.z as u8, state)
+                .unwrap();
+            chunk.furnaces.insert(pos, FurnaceBlockEntity::default());
+        }
+
+        let root = chunk_to_nbt_with_items(&chunk, &registry, Some(&items)).unwrap();
+        let Tag::Compound(root_cmp) = &root else {
+            panic!("chunk root must be a compound");
+        };
+        let Tag::List(block_entities) = root_cmp
+            .iter()
+            .find(|(key, _)| key == "block_entities")
+            .map(|(_, tag)| tag)
+            .expect("block_entities list")
+        else {
+            panic!("block_entities must be a list");
+        };
+        let ids: Vec<&str> = block_entities
+            .elements
+            .iter()
+            .map(|tag| {
+                let Tag::Compound(cmp) = tag else {
+                    panic!("block entity must be a compound");
+                };
+                get_string(cmp, "id").unwrap().as_str()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            entries.iter().map(|(_, _, id)| *id).collect::<Vec<&str>>()
+        );
+
+        let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
+        for &(pos, _, _) in &entries {
+            assert!(decoded.furnaces.contains_key(&pos));
+        }
     }
 
     /// The big M2 acceptance test: load every chunk in the real

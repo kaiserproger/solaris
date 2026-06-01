@@ -2789,6 +2789,12 @@ fn common_container_paper_cuts_resolve_to_existing_menus() {
         super::containers::furnace_menu_title_for_block_id("minecraft:blast_furnace"),
         Some("Blast Furnace")
     );
+    assert_eq!(FurnaceKind::Furnace.menu_type(), FURNACE_MENU_TYPE_ID);
+    assert_eq!(FurnaceKind::Smoker.menu_type(), SMOKER_MENU_TYPE_ID);
+    assert_eq!(
+        FurnaceKind::BlastFurnace.menu_type(),
+        BLAST_FURNACE_MENU_TYPE_ID
+    );
 }
 
 #[test]

@@ -226,6 +226,7 @@ const CRAFTING_MENU_TYPE_ID: i32 = 12;
 const CRAFTING_MENU_SLOT_COUNT: usize = 46;
 const CHEST_MENU_TYPE_ID: i32 = 2;
 const DOUBLE_CHEST_MENU_TYPE_ID: i32 = 5;
+const BLAST_FURNACE_MENU_TYPE_ID: i32 = 10;
 const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;
 const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,6 +316,7 @@ impl Drop for RegisteredSessionCleanup {
     }
 }
 const FURNACE_MENU_TYPE_ID: i32 = 14;
+const SMOKER_MENU_TYPE_ID: i32 = 22;
 const FURNACE_CONTAINER_ID_MIN: i32 = 1;
 const FURNACE_CONTAINER_ID_MAX: i32 = 100;
 const FURNACE_MENU_SLOT_COUNT: usize = 39;
@@ -2006,7 +2008,7 @@ where
         writer,
         &ClientboundOpenScreen {
             container_id,
-            menu_type: FURNACE_MENU_TYPE_ID,
+            menu_type: window.menu_type(),
             title_nbt: furnace_menu_title_nbt(title),
         },
         state.compression,
