@@ -1304,15 +1304,17 @@ fn apply_crafting_swap_click(
         return false;
     };
     let swap = state.inventory.slots[player_slot].clone();
-    if !can_place_in_crafting_menu_slot(state, menu_slot, &swap)
-        || !can_place_in_player_slot(state, player_slot, &clicked)
-    {
+    let can_place_swap = can_place_in_crafting_menu_slot(state, menu_slot, &swap);
+    let can_place_clicked = can_place_in_player_slot(state, player_slot, &clicked);
+    let Some((new_clicked, new_swap)) =
+        apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
+    else {
+        return false;
+    };
+    if !set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_clicked) {
         return false;
     }
-    if !set_crafting_menu_stack(window, &mut state.inventory, menu_slot, swap) {
-        return false;
-    }
-    state.inventory.slots[player_slot] = clicked;
+    state.inventory.slots[player_slot] = new_swap;
     refresh_crafting_result(state, window);
     true
 }
@@ -1326,8 +1328,10 @@ fn apply_crafting_throw_click(
     if menu_slot >= CRAFTING_MENU_SLOT_COUNT || menu_slot == 0 {
         return None;
     }
-    let mut stack = crafting_menu_stack(window, &state.inventory, menu_slot)?;
-    let dropped = take_throw_stack(&mut stack, button)?;
+    let (stack, dropped) = apply_regular_throw_slot(
+        crafting_menu_stack(window, &state.inventory, menu_slot)?,
+        button,
+    )?;
     if !set_crafting_menu_stack(window, &mut state.inventory, menu_slot, stack) {
         return None;
     }
@@ -1467,59 +1471,17 @@ fn apply_crafting_pickup_click(
     } else {
         item_max_stack(&state.item_facts, &state.items, &cursor)
     };
-
-    let changed = if button == 0 {
-        if cursor.is_empty() {
-            if slot_stack.is_empty() {
-                false
-            } else {
-                state.carried_item = slot_stack;
-                set_crafting_menu_stack(window, &mut state.inventory, menu_slot, ItemStack::EMPTY)
-            }
-        } else if slot_stack.is_empty() {
-            state.carried_item = ItemStack::EMPTY;
-            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, cursor)
-        } else if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
-            let moved = (max_stack - slot_stack.count).min(cursor.count);
-            let mut new_slot = slot_stack;
-            new_slot.count += moved;
-            state.carried_item.count -= moved;
-            if state.carried_item.count <= 0 {
-                state.carried_item = ItemStack::EMPTY;
-            }
-            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_slot)
-        } else {
-            state.carried_item = slot_stack;
-            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, cursor)
-        }
-    } else if cursor.is_empty() {
-        if slot_stack.is_empty() {
-            false
-        } else {
-            let moved = (slot_stack.count + 1) / 2;
-            let mut new_cursor = slot_stack.clone();
-            new_cursor.count = moved;
-            let mut remaining = slot_stack;
-            remaining.count -= moved;
-            if remaining.count <= 0 {
-                remaining = ItemStack::EMPTY;
-            }
-            state.carried_item = new_cursor;
-            set_crafting_menu_stack(window, &mut state.inventory, menu_slot, remaining)
-        }
-    } else if slot_stack.is_empty() {
-        let mut one = cursor;
-        one.count = 1;
-        decrement_cursor(&mut state.carried_item);
-        set_crafting_menu_stack(window, &mut state.inventory, menu_slot, one)
-    } else if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
-        let mut new_slot = slot_stack;
-        new_slot.count += 1;
-        decrement_cursor(&mut state.carried_item);
-        set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_slot)
-    } else {
-        false
+    let can_place_cursor = can_place_in_crafting_menu_slot(state, menu_slot, &cursor);
+    let Some(new_slot) = apply_regular_pickup_slot(
+        &mut state.carried_item,
+        slot_stack,
+        button,
+        max_stack,
+        can_place_cursor,
+    ) else {
+        return false;
     };
+    let changed = set_crafting_menu_stack(window, &mut state.inventory, menu_slot, new_slot);
     if changed {
         refresh_crafting_result(state, window);
     }
@@ -2196,6 +2158,98 @@ fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
     }
 }
 
+fn apply_regular_pickup_slot(
+    carried_item: &mut ItemStack,
+    slot_stack: ItemStack,
+    button: i8,
+    max_stack: i32,
+    can_place_carried: bool,
+) -> Option<ItemStack> {
+    if !(button == 0 || button == 1) {
+        return None;
+    }
+
+    let cursor = carried_item.clone();
+    if button == 0 {
+        if cursor.is_empty() {
+            if slot_stack.is_empty() {
+                return None;
+            }
+            *carried_item = slot_stack;
+            return Some(ItemStack::EMPTY);
+        }
+        if !can_place_carried {
+            return None;
+        }
+        if slot_stack.is_empty() {
+            *carried_item = ItemStack::EMPTY;
+            return Some(cursor);
+        }
+        if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
+            let moved = (max_stack - slot_stack.count).min(cursor.count);
+            if moved <= 0 {
+                return None;
+            }
+            let mut new_slot = slot_stack;
+            new_slot.count += moved;
+            carried_item.count -= moved;
+            if carried_item.count <= 0 {
+                *carried_item = ItemStack::EMPTY;
+            }
+            return Some(new_slot);
+        }
+        *carried_item = slot_stack;
+        return Some(cursor);
+    }
+
+    if cursor.is_empty() {
+        if slot_stack.is_empty() {
+            return None;
+        }
+        let moved = (slot_stack.count + 1) / 2;
+        let mut new_cursor = slot_stack.clone();
+        new_cursor.count = moved;
+        let mut remaining = slot_stack;
+        remaining.count -= moved;
+        if remaining.count <= 0 {
+            remaining = ItemStack::EMPTY;
+        }
+        *carried_item = new_cursor;
+        return Some(remaining);
+    }
+    if !can_place_carried {
+        return None;
+    }
+    if slot_stack.is_empty() {
+        let mut one = cursor;
+        one.count = 1;
+        decrement_cursor(carried_item);
+        return Some(one);
+    }
+    if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
+        let mut new_slot = slot_stack;
+        new_slot.count += 1;
+        decrement_cursor(carried_item);
+        return Some(new_slot);
+    }
+    None
+}
+
+fn apply_regular_swap_slot(
+    clicked: ItemStack,
+    swap: ItemStack,
+    can_place_swap: bool,
+    can_place_clicked: bool,
+) -> Option<(ItemStack, ItemStack)> {
+    (can_place_swap && can_place_clicked).then_some((swap, clicked))
+}
+
+fn apply_regular_throw_slot(slot_stack: ItemStack, button: i8) -> Option<(ItemStack, ItemStack)> {
+    let mut stack = slot_stack;
+    let dropped = take_throw_stack(&mut stack, button)?;
+    Some((stack, dropped))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContainerClickAction {
     Pickup { slot: usize, button: i8 },
@@ -2421,68 +2475,22 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
 
     let slot_stack = state.inventory.slots[slot].clone();
     let cursor = state.carried_item.clone();
-    if button == 0 {
-        if cursor.is_empty() {
-            if slot_stack.is_empty() {
-                return false;
-            }
-            state.carried_item = std::mem::take(&mut state.inventory.slots[slot]);
-        } else if slot_stack.is_empty() {
-            if !can_place_in_player_slot(state, slot, &cursor) {
-                return false;
-            }
-            state.inventory.slots[slot] = std::mem::take(&mut state.carried_item);
-        } else if can_stack(&slot_stack, &cursor)
-            && can_place_in_player_slot(state, slot, &cursor)
-            && slot_stack.count < item_max_stack(&state.item_facts, &state.items, &cursor)
-        {
-            let max_stack = item_max_stack(&state.item_facts, &state.items, &cursor);
-            let moved =
-                (max_stack - state.inventory.slots[slot].count).min(state.carried_item.count);
-            if moved <= 0 {
-                return false;
-            }
-            state.inventory.slots[slot].count += moved;
-            state.carried_item.count -= moved;
-            if state.carried_item.count <= 0 {
-                state.carried_item = ItemStack::EMPTY;
-            }
-        } else {
-            if !can_place_in_player_slot(state, slot, &cursor) {
-                return false;
-            }
-            state.inventory.slots[slot] = cursor;
-            state.carried_item = slot_stack;
-        }
-        if (1..=4).contains(&slot) {
-            refresh_inventory_crafting_result(state);
-        }
-        return true;
-    }
-
-    if cursor.is_empty() {
-        if slot_stack.is_empty() {
-            return false;
-        }
-        let moved = (slot_stack.count + 1) / 2;
-        state.carried_item = take_from_slot(&mut state.inventory.slots[slot], moved);
-    } else if slot_stack.is_empty() {
-        if !can_place_in_player_slot(state, slot, &cursor) {
-            return false;
-        }
-        let mut one = cursor;
-        one.count = 1;
-        state.inventory.slots[slot] = one;
-        decrement_cursor(&mut state.carried_item);
-    } else if can_stack(&slot_stack, &cursor)
-        && can_place_in_player_slot(state, slot, &cursor)
-        && slot_stack.count < item_max_stack(&state.item_facts, &state.items, &cursor)
-    {
-        state.inventory.slots[slot].count += 1;
-        decrement_cursor(&mut state.carried_item);
+    let max_stack = if cursor.is_empty() {
+        item_max_stack(&state.item_facts, &state.items, &slot_stack)
     } else {
+        item_max_stack(&state.item_facts, &state.items, &cursor)
+    };
+    let can_place_cursor = can_place_in_player_slot(state, slot, &cursor);
+    let Some(new_slot) = apply_regular_pickup_slot(
+        &mut state.carried_item,
+        slot_stack,
+        button,
+        max_stack,
+        can_place_cursor,
+    ) else {
         return false;
-    }
+    };
+    state.inventory.slots[slot] = new_slot;
     if (1..=4).contains(&slot) {
         refresh_inventory_crafting_result(state);
     }
@@ -2501,13 +2509,15 @@ fn apply_swap_click(state: &mut InteractionState, slot: usize, button: i8) -> bo
     }
     let clicked = state.inventory.slots[slot].clone();
     let swap = state.inventory.slots[swap_slot].clone();
-    if !can_place_in_player_slot(state, slot, &swap)
-        || !can_place_in_player_slot(state, swap_slot, &clicked)
-    {
+    let can_place_swap = can_place_in_player_slot(state, slot, &swap);
+    let can_place_clicked = can_place_in_player_slot(state, swap_slot, &clicked);
+    let Some((new_clicked, new_swap)) =
+        apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
+    else {
         return false;
-    }
-    state.inventory.slots[slot] = swap;
-    state.inventory.slots[swap_slot] = clicked;
+    };
+    state.inventory.slots[slot] = new_clicked;
+    state.inventory.slots[swap_slot] = new_swap;
     if (1..=4).contains(&slot) || (1..=4).contains(&swap_slot) {
         refresh_inventory_crafting_result(state);
     }
@@ -2518,11 +2528,13 @@ fn apply_throw_click(state: &mut InteractionState, slot: usize, button: i8) -> O
     if slot == 0 || slot >= state.inventory.slots.len() {
         return None;
     }
-    let dropped = take_throw_stack(&mut state.inventory.slots[slot], button);
-    if dropped.is_some() && (1..=4).contains(&slot) {
+    let (new_slot, dropped) =
+        apply_regular_throw_slot(state.inventory.slots[slot].clone(), button)?;
+    state.inventory.slots[slot] = new_slot;
+    if (1..=4).contains(&slot) {
         refresh_inventory_crafting_result(state);
     }
-    dropped
+    Some(dropped)
 }
 
 fn can_place_in_player_slot(state: &InteractionState, slot: usize, stack: &ItemStack) -> bool {
@@ -2668,15 +2680,17 @@ fn apply_furnace_swap_click(
         return false;
     };
     let swap = state.inventory.slots[player_slot].clone();
-    if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &swap)
-        || !can_place_in_player_slot(state, player_slot, &clicked)
-    {
+    let can_place_swap = can_place_in_furnace_menu_slot(state, kind, menu_slot, &swap);
+    let can_place_clicked = can_place_in_player_slot(state, player_slot, &clicked);
+    let Some((new_clicked, new_swap)) =
+        apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
+    else {
+        return false;
+    };
+    if !set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_clicked) {
         return false;
     }
-    if !set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, swap) {
-        return false;
-    }
-    state.inventory.slots[player_slot] = clicked;
+    state.inventory.slots[player_slot] = new_swap;
     true
 }
 
@@ -2689,8 +2703,10 @@ fn apply_furnace_throw_click(
     if menu_slot >= FURNACE_MENU_SLOT_COUNT || menu_slot == 2 {
         return None;
     }
-    let mut stack = furnace_menu_stack(furnace, &state.inventory, menu_slot)?;
-    let dropped = take_throw_stack(&mut stack, button)?;
+    let (stack, dropped) = apply_regular_throw_slot(
+        furnace_menu_stack(furnace, &state.inventory, menu_slot)?,
+        button,
+    )?;
     if !set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, stack) {
         return None;
     }
@@ -2740,71 +2756,17 @@ fn apply_furnace_pickup_click(
         return false;
     }
 
-    if button == 0 {
-        if cursor.is_empty() {
-            if slot_stack.is_empty() {
-                return false;
-            }
-            state.carried_item = slot_stack;
-            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, ItemStack::EMPTY)
-        } else if slot_stack.is_empty() {
-            if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
-                return false;
-            }
-            state.carried_item = ItemStack::EMPTY;
-            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, cursor)
-        } else if can_stack(&slot_stack, &cursor)
-            && can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor)
-            && slot_stack.count < max_stack
-        {
-            let moved = (max_stack - slot_stack.count).min(cursor.count);
-            let mut new_slot = slot_stack;
-            new_slot.count += moved;
-            state.carried_item.count -= moved;
-            if state.carried_item.count <= 0 {
-                state.carried_item = ItemStack::EMPTY;
-            }
-            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
-        } else {
-            if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
-                return false;
-            }
-            state.carried_item = slot_stack;
-            set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, cursor)
-        }
-    } else if cursor.is_empty() {
-        if slot_stack.is_empty() {
-            return false;
-        }
-        let moved = (slot_stack.count + 1) / 2;
-        let mut new_cursor = slot_stack.clone();
-        new_cursor.count = moved;
-        let mut remaining = slot_stack;
-        remaining.count -= moved;
-        if remaining.count <= 0 {
-            remaining = ItemStack::EMPTY;
-        }
-        state.carried_item = new_cursor;
-        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, remaining)
-    } else if slot_stack.is_empty() {
-        if !can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor) {
-            return false;
-        }
-        let mut one = cursor;
-        one.count = 1;
-        decrement_cursor(&mut state.carried_item);
-        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, one)
-    } else if can_stack(&slot_stack, &cursor)
-        && can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor)
-        && slot_stack.count < max_stack
-    {
-        let mut new_slot = slot_stack;
-        new_slot.count += 1;
-        decrement_cursor(&mut state.carried_item);
-        set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
-    } else {
-        false
-    }
+    let can_place_cursor = can_place_in_furnace_menu_slot(state, kind, menu_slot, &cursor);
+    let Some(new_slot) = apply_regular_pickup_slot(
+        &mut state.carried_item,
+        slot_stack,
+        button,
+        max_stack,
+        can_place_cursor,
+    ) else {
+        return false;
+    };
+    set_furnace_menu_stack(furnace, &mut state.inventory, menu_slot, new_slot)
 }
 
 fn merge_stack_into_furnace_slot(
@@ -2929,72 +2891,18 @@ fn apply_chest_pickup_click(
     } else {
         item_max_stack(&state.item_facts, &state.items, &cursor)
     };
-
-    if button == 0 {
-        if cursor.is_empty() {
-            if slot_stack.is_empty() {
-                return false;
-            }
-            state.carried_item = slot_stack;
-            set_chest_menu_stack(view, &mut state.inventory, menu_slot, ItemStack::EMPTY)
-        } else if slot_stack.is_empty() {
-            if !can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor) {
-                return false;
-            }
-            state.carried_item = ItemStack::EMPTY;
-            set_chest_menu_stack(view, &mut state.inventory, menu_slot, cursor)
-        } else if can_stack(&slot_stack, &cursor)
-            && can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor)
-            && slot_stack.count < max_stack
-        {
-            let moved = (max_stack - slot_stack.count).min(cursor.count);
-            let mut new_slot = slot_stack;
-            new_slot.count += moved;
-            state.carried_item.count -= moved;
-            if state.carried_item.count <= 0 {
-                state.carried_item = ItemStack::EMPTY;
-            }
-            set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_slot)
-        } else {
-            if !can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor) {
-                return false;
-            }
-            state.carried_item = slot_stack;
-            set_chest_menu_stack(view, &mut state.inventory, menu_slot, cursor)
-        }
-    } else if cursor.is_empty() {
-        if slot_stack.is_empty() {
-            return false;
-        }
-        let moved = (slot_stack.count + 1) / 2;
-        let mut new_cursor = slot_stack.clone();
-        new_cursor.count = moved;
-        let mut remaining = slot_stack;
-        remaining.count -= moved;
-        if remaining.count <= 0 {
-            remaining = ItemStack::EMPTY;
-        }
-        state.carried_item = new_cursor;
-        set_chest_menu_stack(view, &mut state.inventory, menu_slot, remaining)
-    } else if slot_stack.is_empty() {
-        if !can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor) {
-            return false;
-        }
-        let mut one = cursor;
-        one.count = 1;
-        decrement_cursor(&mut state.carried_item);
-        set_chest_menu_stack(view, &mut state.inventory, menu_slot, one)
-    } else if can_stack(&slot_stack, &cursor)
-        && can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor)
-        && slot_stack.count < max_stack
-    {
-        let mut new_slot = slot_stack;
-        new_slot.count += 1;
-        decrement_cursor(&mut state.carried_item);
-        set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_slot)
-    } else {
-        false
-    }
+    let can_place_cursor =
+        can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor);
+    let Some(new_slot) = apply_regular_pickup_slot(
+        &mut state.carried_item,
+        slot_stack,
+        button,
+        max_stack,
+        can_place_cursor,
+    ) else {
+        return false;
+    };
+    set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_slot)
 }
 
 fn merge_stack_into_chest(
@@ -3088,15 +2996,17 @@ fn apply_chest_swap_click(
         return false;
     };
     let swap = state.inventory.slots[player_slot].clone();
-    if !can_place_in_chest_menu_slot(state, storage_slots, menu_slot, &swap)
-        || !can_place_in_player_slot(state, player_slot, &clicked)
-    {
+    let can_place_swap = can_place_in_chest_menu_slot(state, storage_slots, menu_slot, &swap);
+    let can_place_clicked = can_place_in_player_slot(state, player_slot, &clicked);
+    let Some((new_clicked, new_swap)) =
+        apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
+    else {
+        return false;
+    };
+    if !set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_clicked) {
         return false;
     }
-    if !set_chest_menu_stack(view, &mut state.inventory, menu_slot, swap) {
-        return false;
-    }
-    state.inventory.slots[player_slot] = clicked;
+    state.inventory.slots[player_slot] = new_swap;
     true
 }
 
@@ -3109,8 +3019,8 @@ fn apply_chest_throw_click(
     if menu_slot >= view.storage_slots() + PLAYER_CONTAINER_STORAGE_SLOTS {
         return None;
     }
-    let mut stack = chest_menu_stack(view, &state.inventory, menu_slot)?;
-    let dropped = take_throw_stack(&mut stack, button)?;
+    let (stack, dropped) =
+        apply_regular_throw_slot(chest_menu_stack(view, &state.inventory, menu_slot)?, button)?;
     if !set_chest_menu_stack(view, &mut state.inventory, menu_slot, stack) {
         return None;
     }

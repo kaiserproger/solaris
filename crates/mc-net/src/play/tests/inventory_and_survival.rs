@@ -67,6 +67,49 @@ fn throw_click_takes_one_or_full_stack() {
 }
 
 #[test]
+fn regular_pickup_slot_merges_cursor_into_clicked_stack() {
+    let mut cursor = ItemStack::new(42, 3);
+
+    let slot = apply_regular_pickup_slot(&mut cursor, ItemStack::new(42, 62), 0, 64, true);
+
+    assert_eq!(slot, Some(ItemStack::new(42, 64)));
+    assert_eq!(cursor, ItemStack::new(42, 1));
+}
+
+#[test]
+fn regular_pickup_slot_respects_menu_placement_rules() {
+    let mut cursor = ItemStack::new(42, 3);
+
+    let slot = apply_regular_pickup_slot(&mut cursor, ItemStack::EMPTY, 0, 64, false);
+
+    assert_eq!(slot, None);
+    assert_eq!(cursor, ItemStack::new(42, 3));
+}
+
+#[test]
+fn regular_swap_slot_requires_both_destinations_to_accept_stacks() {
+    let clicked = ItemStack::new(1, 1);
+    let swap = ItemStack::new(2, 1);
+
+    assert_eq!(
+        apply_regular_swap_slot(clicked.clone(), swap.clone(), true, false),
+        None
+    );
+    assert_eq!(
+        apply_regular_swap_slot(clicked, swap, true, true),
+        Some((ItemStack::new(2, 1), ItemStack::new(1, 1)))
+    );
+}
+
+#[test]
+fn regular_throw_slot_returns_remaining_stack_and_drop() {
+    let (remaining, dropped) = apply_regular_throw_slot(ItemStack::new(42, 3), 0).unwrap();
+
+    assert_eq!(remaining, ItemStack::new(42, 2));
+    assert_eq!(dropped, ItemStack::new(42, 1));
+}
+
+#[test]
 fn death_drops_inventory_and_carried_item() {
     let mut inventory = PlayerInventory::empty();
     inventory.slots[0] = ItemStack::new(1, 1);
