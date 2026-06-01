@@ -25,8 +25,9 @@ client files.
 - Overworld chunk streaming and lighting.
 - Block breaking/placing, doors/trapdoors, buckets, signs as placeable blocks,
   beds as respawn anchors, and save/restart persistence.
-- Crafting table, chest, barrel-style storage, furnace, smoker, and blast furnace.
-  Smokers and blast furnaces use their own client menu ids and persisted
+- Crafting table, chest, barrel, furnace, smoker, and blast furnace. Barrels use
+  single-container 27-slot storage and persist with barrel block-entity ids;
+  smokers and blast furnaces use their own client menu ids and persisted
   block-entity ids while sharing the current furnace-family cooking runtime.
 - Recipe loading accepts furnace, blasting, smoking, and campfire variants;
   furnace runtime routes furnace, blast furnace, and smoker categories.
@@ -42,7 +43,8 @@ client files.
 - Smokers/blast furnaces share the furnace-family runtime; lit-state block
   updates, sounds/particles, hopper/comparator automation, and full vanilla
   block-specific state-machine parity are not claimed.
-- Barrels use chest storage; barrel animation parity is not claimed.
+- Barrels share chest storage mechanics; open/close animation, sounds, game
+  events, and automation parity are not claimed.
 - Campfire cooking has usable partial support with Solaris harness coverage for
   consuming matching held inputs and dropping cooked results, but visual
   item-on-campfire metadata, in-flight persistence across restart, smoke/sound

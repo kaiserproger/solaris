@@ -196,7 +196,7 @@ pub fn chunk_from_nbt_with_items(
                 );
                 continue;
             }
-            if block_entity_id.is_some_and(|id| id == "minecraft:chest")
+            if block_entity_id.is_some_and(|id| is_chest_storage_block_entity_id(id))
                 && let Some(items) = items
             {
                 chunk.chests.insert(
@@ -553,7 +553,12 @@ pub fn chunk_to_nbt_with_items(
         let mut chests: Vec<(&BlockPos, &ChestBlockEntity)> = chunk.chests.iter().collect();
         chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
         for (pos, chest) in chests {
-            be_list.push(encode_chest(pos, chest, items)?);
+            be_list.push(encode_chest(
+                pos,
+                chest,
+                items,
+                chest_storage_block_entity_id_for_block(chunk, registry, *pos),
+            )?);
         }
     }
     root.push((
@@ -892,9 +897,10 @@ fn encode_chest(
     pos: &BlockPos,
     chest: &ChestBlockEntity,
     items: &ItemRegistry,
+    block_entity_id: &str,
 ) -> Result<Tag, ChunkNbtError> {
     let mut compound = vec![
-        ("id".into(), Tag::String("minecraft:chest".into())),
+        ("id".into(), Tag::String(block_entity_id.to_string())),
         ("x".into(), Tag::Int(pos.x)),
         ("y".into(), Tag::Int(pos.y)),
         ("z".into(), Tag::Int(pos.z)),
@@ -926,6 +932,29 @@ fn encode_chest(
         }),
     ));
     Ok(Tag::Compound(compound))
+}
+
+fn is_chest_storage_block_entity_id(id: &str) -> bool {
+    matches!(id, "minecraft:chest" | "minecraft:barrel")
+}
+
+fn chest_storage_block_entity_id_for_block(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    pos: BlockPos,
+) -> &'static str {
+    let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+    let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+    let Some(state_id) = chunk.get_block(local_x, pos.y, local_z) else {
+        return "minecraft:chest";
+    };
+    let Some(state) = registry.by_id(state_id) else {
+        return "minecraft:chest";
+    };
+    match state.block.id.as_str() {
+        "minecraft:barrel" => "minecraft:barrel",
+        _ => "minecraft:chest",
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1199,6 +1228,81 @@ mod tests {
         let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
         for &(pos, _, _) in &entries {
             assert!(decoded.furnaces.contains_key(&pos));
+        }
+    }
+
+    #[test]
+    fn barrel_block_entity_id_follows_block_state() {
+        fn block_report(id: u32, name: &str) -> mc_data::blocks::BlockReport {
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse(name).unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            }
+        }
+
+        let registry = BlockRegistry::from_report(&[
+            block_report(0, "minecraft:air"),
+            block_report(1, "minecraft:chest"),
+            block_report(2, "minecraft:barrel"),
+        ])
+        .unwrap();
+        let items = mc_data::items::ItemRegistry::from_report(&[]);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome);
+        let entries = [
+            (
+                BlockPos { x: 1, y: 64, z: 1 },
+                BlockStateId(1),
+                "minecraft:chest",
+            ),
+            (
+                BlockPos { x: 2, y: 64, z: 1 },
+                BlockStateId(2),
+                "minecraft:barrel",
+            ),
+        ];
+        for &(pos, state, _) in &entries {
+            chunk
+                .set_block(pos.x as u8, pos.y, pos.z as u8, state)
+                .unwrap();
+            chunk.chests.insert(pos, ChestBlockEntity::default());
+        }
+
+        let root = chunk_to_nbt_with_items(&chunk, &registry, Some(&items)).unwrap();
+        let Tag::Compound(root_cmp) = &root else {
+            panic!("chunk root must be a compound");
+        };
+        let Tag::List(block_entities) = root_cmp
+            .iter()
+            .find(|(key, _)| key == "block_entities")
+            .map(|(_, tag)| tag)
+            .expect("block_entities list")
+        else {
+            panic!("block_entities must be a list");
+        };
+        let ids: Vec<&str> = block_entities
+            .elements
+            .iter()
+            .map(|tag| {
+                let Tag::Compound(cmp) = tag else {
+                    panic!("block entity must be a compound");
+                };
+                get_string(cmp, "id").unwrap().as_str()
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            entries.iter().map(|(_, _, id)| *id).collect::<Vec<&str>>()
+        );
+
+        let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
+        for &(pos, _, _) in &entries {
+            assert!(decoded.chests.contains_key(&pos));
         }
     }
 
