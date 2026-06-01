@@ -41,25 +41,26 @@ use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
     ClientboundChangeDifficulty, ClientboundCommandSuggestions, ClientboundContainerSetContent,
     ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundInitializeBorder,
-    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData,
-    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
-    ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
-    Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
-    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
-    EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX,
-    InteractionHand, ItemStack, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
-    MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
-    PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput,
-    PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange, SectionBlocksUpdate,
-    ServerboundAttack, ServerboundChangeGameMode, ServerboundChatAck, ServerboundChatCommand,
-    ServerboundChunkBatchReceived, ServerboundClientCommand, ServerboundClientInformation,
-    ServerboundClientTickEnd, ServerboundCommandSuggestion, ServerboundContainerClick,
-    ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
-    ServerboundMovePlayerPos, ServerboundMovePlayerPosRot, ServerboundMovePlayerRot,
-    ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe, ServerboundPlayerAction,
-    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
-    ServerboundRecipeBookChangeSettings, ServerboundRecipeBookSeenRecipe, ServerboundResourcePack,
-    ServerboundSetCarriedItem, ServerboundSwing, ServerboundUseItem, ServerboundUseItemOn,
+    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundOpenSignEditor, ClientboundRespawn,
+    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundTakeItemEntity,
+    ConfirmTeleportation, ContainerInput, Direction, ENTITY_DATA_POSE_INDEX,
+    ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction, EntityDataValue,
+    EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode,
+    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack, LevelChunkWithLight, LightData,
+    LightUpdate, LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
+    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
+    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SectionBlockChange,
+    SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode, ServerboundChatAck,
+    ServerboundChatCommand, ServerboundChunkBatchReceived, ServerboundClientCommand,
+    ServerboundClientInformation, ServerboundClientTickEnd, ServerboundCommandSuggestion,
+    ServerboundContainerClick, ServerboundContainerClose, ServerboundCustomPayload,
+    ServerboundInteract, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundPlayerCommand,
+    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundRecipeBookChangeSettings,
+    ServerboundRecipeBookSeenRecipe, ServerboundResourcePack, ServerboundSetCarriedItem,
+    ServerboundSignUpdate, ServerboundSwing, ServerboundUseItem, ServerboundUseItemOn,
     SetCenterChunk, SetDefaultSpawnPosition, SetEntityMotion, SynchronizePlayerPosition,
     pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
@@ -895,6 +896,7 @@ where
             active_container: None,
             pending_break: None,
             pending_use: None,
+            pending_sign_edit: None,
             shield_use: None,
             last_hostile_damage_at: None,
             last_entity_attack_at: None,
@@ -989,6 +991,7 @@ struct InteractionState {
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
     pending_use: Option<PendingUse>,
+    pending_sign_edit: Option<mc_world::BlockPos>,
     shield_use: Option<ShieldUseState>,
     last_hostile_damage_at: Option<Instant>,
     last_entity_attack_at: Option<Instant>,
@@ -6387,6 +6390,18 @@ where
         state.compression,
     )
     .await?;
+    if let Some(pos) = placed_sign_edit_position(&state.blocks, &outcome.applied) {
+        state.pending_sign_edit = Some(pos);
+        write_packet(
+            writer,
+            &ClientboundOpenSignEditor {
+                position: pack_block_pos(pos.x, pos.y, pos.z),
+                is_front_text: true,
+            },
+            state.compression,
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -6577,6 +6592,55 @@ fn sign_placement_state(
         );
     }
     None
+}
+
+fn placed_sign_edit_position(
+    blocks: &mc_world::BlockRegistry,
+    applied: &[AppliedBlockEdit],
+) -> Option<mc_world::BlockPos> {
+    applied.iter().find_map(|edit| {
+        blocks
+            .by_id(edit.new_state)
+            .filter(|state| is_editable_sign_state(state))
+            .map(|_| edit.pos)
+    })
+}
+
+fn is_editable_sign_state(state: &mc_world::BlockState) -> bool {
+    let path = state.block.id.path();
+    path.ends_with("_sign") && !path.ends_with("_hanging_sign")
+}
+
+async fn handle_sign_update(state: &mut InteractionState, packet: ServerboundSignUpdate) {
+    let (x, y, z) = unpack_block_pos(packet.position);
+    let pos = mc_world::BlockPos { x, y, z };
+    if state.pending_sign_edit != Some(pos) {
+        debug!(
+            ?pos,
+            "sign update ignored without matching open editor state"
+        );
+        return;
+    }
+    let is_sign = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(pos) {
+            Ok(Some(state_id)) => state
+                .blocks
+                .by_id(state_id)
+                .is_some_and(is_editable_sign_state),
+            Ok(None) => false,
+            Err(err) => {
+                warn!(error = %err, ?pos, "sign update target read failed");
+                false
+            }
+        }
+    };
+    if !is_sign {
+        debug!(?pos, "sign update ignored for non-sign block");
+        return;
+    }
+    state.pending_sign_edit = None;
+    debug!(?pos, lines = ?packet.lines, front = packet.is_front_text, "sign update accepted");
 }
 
 fn direction_to_horizontal_facing(direction: Direction) -> Option<&'static str> {
@@ -7471,6 +7535,14 @@ where
                             sequence = use_item.sequence,
                             "UseItem ignored — no world configured"
                         );
+                    }
+                } else if frame.id == ServerboundSignUpdate::ID {
+                    let mut body = frame.body;
+                    let sign_update = ServerboundSignUpdate::decode(&mut body)?;
+                    if let Some(state) = interaction.as_deref_mut() {
+                        handle_sign_update(state, sign_update).await;
+                    } else {
+                        debug!("SignUpdate ignored — no world configured");
                     }
                 } else if frame.id == ServerboundAttack::ID {
                     let mut body = frame.body;

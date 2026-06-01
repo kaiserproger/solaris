@@ -119,6 +119,66 @@ fn set_default_spawn_round_trip() {
 }
 
 #[test]
+fn block_entity_data_id_and_layout_match_protocol_dump() {
+    assert_eq!(ClientboundBlockEntityData::ID, 0x06);
+    let packet = ClientboundBlockEntityData {
+        position: pack_block_pos(1, 2, 3),
+        block_entity_type: 7,
+        nbt: Tag::Compound(vec![("id".into(), Tag::String("minecraft:sign".into()))]),
+    };
+
+    round_trip(packet);
+}
+
+#[test]
+fn open_sign_editor_id_and_layout_match_protocol_dump() {
+    assert_eq!(ClientboundOpenSignEditor::ID, 0x3C);
+    let packet = ClientboundOpenSignEditor {
+        position: pack_block_pos(-1, 64, 2),
+        is_front_text: true,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+
+    let mut expected = Vec::new();
+    expected.write_i64(packet.position);
+    expected.write_bool(true);
+    assert_eq!(buf, expected);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundOpenSignEditor::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_sign_update_id_and_layout_match_protocol_dump() {
+    assert_eq!(ServerboundSignUpdate::ID, 0x3D);
+    let packet = ServerboundSignUpdate {
+        position: pack_block_pos(1, 65, -2),
+        lines: vec!["one".into(), "two".into(), "three".into(), "four".into()],
+        is_front_text: false,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+
+    let mut expected = Vec::new();
+    expected.write_i64(packet.position);
+    expected.write_string("one", MAX_COMMAND_LEN).unwrap();
+    expected.write_string("two", MAX_COMMAND_LEN).unwrap();
+    expected.write_string("three", MAX_COMMAND_LEN).unwrap();
+    expected.write_string("four", MAX_COMMAND_LEN).unwrap();
+    expected.write_bool(false);
+    assert_eq!(buf, expected);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundSignUpdate::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn synchronize_player_position_round_trip() {
     round_trip(SynchronizePlayerPosition {
         teleport_id: 1,

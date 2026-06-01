@@ -39,6 +39,7 @@ const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
 const MAX_COMMAND_LEN: usize = 32_767;
 const MAX_COMMAND_NODE_COUNT: usize = 1024;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
+const SIGN_LINE_COUNT: usize = 4;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ENTITY_DATA_BYTE_SERIALIZER_ID: i32 = 0;
 pub const ENTITY_DATA_POSE_SERIALIZER_ID: i32 = 20;
@@ -849,6 +850,61 @@ impl Packet for ClientboundPlayerAbilities {
             instabuild: flags & 0x08 != 0,
             flying_speed: buf.read_f32()?,
             walking_speed: buf.read_f32()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundBlockEntityData {
+    pub position: i64,
+    pub block_entity_type: i32,
+    pub nbt: Tag,
+}
+
+impl Packet for ClientboundBlockEntityData {
+    // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_BLOCK_ENTITY_DATA
+    // is game-CB index 6 = wire id 0x06. Declared field order is BlockPos,
+    // BlockEntityType registry id, then network-NBT compound tag.
+    const ID: i32 = 0x06;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.position);
+        buf.write_varint(self.block_entity_type);
+        mc_nbt::write_network(buf, &self.nbt)?;
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: buf.read_i64()?,
+            block_entity_type: buf.read_varint()?,
+            nbt: mc_nbt::read_network(buf)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientboundOpenSignEditor {
+    pub position: i64,
+    pub is_front_text: bool,
+}
+
+impl Packet for ClientboundOpenSignEditor {
+    // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_OPEN_SIGN_EDITOR
+    // is game-CB index 60 = wire id 0x3C. Declared field order is BlockPos,
+    // then front/back text boolean.
+    const ID: i32 = 0x3C;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i64(self.position);
+        buf.write_bool(self.is_front_text);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            position: buf.read_i64()?,
+            is_front_text: buf.read_bool()?,
         })
     }
 }
@@ -2021,6 +2077,47 @@ impl Packet for ServerboundCommandSuggestion {
         Ok(Self {
             id: buf.read_varint()?,
             command: buf.read_string(32_500)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundSignUpdate {
+    pub position: i64,
+    pub lines: Vec<String>,
+    pub is_front_text: bool,
+}
+
+impl Packet for ServerboundSignUpdate {
+    // Verified from `.analysis/protocol-dump.txt`: SERVERBOUND_SIGN_UPDATE is
+    // game-SB index 61 = wire id 0x3D. Declared field order is BlockPos,
+    // String[4] lines, then front/back text boolean.
+    const ID: i32 = 0x3D;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.lines.len() != SIGN_LINE_COUNT {
+            return Err(CodecError::NotSupported(
+                "sign update must contain four lines",
+            ));
+        }
+        buf.write_i64(self.position);
+        for line in &self.lines {
+            buf.write_string(line, MAX_COMMAND_LEN)?;
+        }
+        buf.write_bool(self.is_front_text);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let position = buf.read_i64()?;
+        let mut lines = Vec::with_capacity(SIGN_LINE_COUNT);
+        for _ in 0..SIGN_LINE_COUNT {
+            lines.push(buf.read_string(MAX_COMMAND_LEN)?);
+        }
+        Ok(Self {
+            position,
+            lines,
+            is_front_text: buf.read_bool()?,
         })
     }
 }

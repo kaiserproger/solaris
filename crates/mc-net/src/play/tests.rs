@@ -2639,6 +2639,18 @@ fn sign_placement_sets_wall_facing_and_floor_rotation() {
         ),
         Some(mc_world::BlockStateId(4))
     );
+
+    assert_eq!(
+        placed_sign_edit_position(
+            &blocks,
+            &[AppliedBlockEdit {
+                pos: mc_world::BlockPos { x: 1, y: 2, z: 3 },
+                previous: mc_world::BlockStateId(0),
+                new_state: mc_world::BlockStateId(2),
+            }],
+        ),
+        Some(mc_world::BlockPos { x: 1, y: 2, z: 3 })
+    );
 }
 
 #[test]
