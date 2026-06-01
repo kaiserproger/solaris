@@ -45,6 +45,7 @@ const VIEW_DISTANCE: i32 = 2;
 include!("block_edit/breaks_and_crafting.rs");
 include!("block_edit/campfire.rs");
 include!("block_edit/crop_bonemeal.rs");
+include!("block_edit/plant_harvest.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/sapling_growth.rs");
 include!("block_edit/survival_lifecycle.rs");
