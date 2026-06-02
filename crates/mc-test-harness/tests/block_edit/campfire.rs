@@ -45,6 +45,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     let cooked_porkchop_id = items
         .id_of(&cooked_porkchop)
         .expect("cooked porkchop item");
+    let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
         .expect("item entity type") as i32;
@@ -143,12 +144,14 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
         })
         .await
         .expect("start campfire cooking");
-    wait_for_container_slot(&mut client, 0, 36, |stack| stack.is_empty()).await;
+    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
     let mut item_entity_id = None;
     let mut saw_cooked_stack = false;
+    let mut saw_empty_visual = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !saw_cooked_stack {
+    while !(saw_cooked_stack && saw_empty_visual) {
         let frame = client
             .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await
@@ -186,6 +189,73 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
             let pkt = ClientboundContainerSetSlot::decode(&mut body)
                 .expect("decode campfire pickup slot");
             saw_cooked_stack = pkt.item_stack.item_id == cooked_porkchop_id && pkt.item_stack.count >= 1;
+        } else if frame.id == ClientboundBlockEntityData::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundBlockEntityData::decode(&mut body)
+                .expect("decode campfire clear BlockEntityData");
+            if pkt.position == campfire_pos {
+                saw_empty_visual = campfire_items(&pkt.nbt).is_some_and(|items| items.is_empty());
+            }
         }
     }
+}
+
+async fn wait_for_campfire_input_visual_and_slot(
+    client: &mut Client,
+    campfire_pos: i64,
+    input_item: &str,
+) {
+    let mut saw_slot_empty = false;
+    let mut saw_input_visual = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_slot_empty && saw_input_visual) {
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .await
+            .expect("campfire input visual");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode campfire input SetSlot");
+            saw_slot_empty |= pkt.container_id == 0 && pkt.slot == 36 && pkt.item_stack.is_empty();
+        } else if frame.id == ClientboundBlockEntityData::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundBlockEntityData::decode(&mut body)
+                .expect("decode campfire input BlockEntityData");
+            if pkt.position == campfire_pos {
+                saw_input_visual = campfire_items(&pkt.nbt)
+                    .is_some_and(|items| items.iter().any(|item| campfire_item_matches(item, input_item)));
+            }
+        }
+    }
+}
+
+fn campfire_items(nbt: &mc_nbt::Tag) -> Option<&[mc_nbt::Tag]> {
+    let mc_nbt::Tag::Compound(fields) = nbt else {
+        return None;
+    };
+    let items = fields
+        .iter()
+        .find_map(|(name, value)| (name == "Items").then_some(value))?;
+    let mc_nbt::Tag::List(list) = items else {
+        return None;
+    };
+    Some(&list.elements)
+}
+
+fn campfire_item_matches(item: &mc_nbt::Tag, expected_id: &str) -> bool {
+    let mc_nbt::Tag::Compound(fields) = item else {
+        return false;
+    };
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find_map(|(field, value)| (field == name).then_some(value))
+    };
+    matches!(field("Slot"), Some(mc_nbt::Tag::Int(0)))
+        && matches!(field("id"), Some(mc_nbt::Tag::String(id)) if id == expected_id)
+        && matches!(field("count"), Some(mc_nbt::Tag::Int(1)))
 }
