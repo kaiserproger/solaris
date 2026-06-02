@@ -508,6 +508,21 @@ pub(super) async fn wait_for_block_update(
     }
 }
 
+pub(super) fn top_non_air_y(
+    world: &mut mc_world::WorldStorage,
+    x: i32,
+    z: i32,
+    air: mc_world::BlockStateId,
+) -> Option<i32> {
+    (mc_world::MIN_Y..mc_world::MAX_Y).rev().find(|&y| {
+        world
+            .get_block(mc_world::BlockPos { x, y, z })
+            .ok()
+            .flatten()
+            != Some(air)
+    })
+}
+
 pub(super) fn mask_to_u64(longs: &[i64]) -> u64 {
     longs.first().copied().unwrap_or(0) as u64
 }

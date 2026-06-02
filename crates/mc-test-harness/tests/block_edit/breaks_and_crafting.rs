@@ -525,16 +525,42 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|b| b.default)
+        .expect("air in registry");
+    let stone_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .map(|b| b.default)
+        .expect("stone in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let seeded_y = top_non_air_y(&mut storage, 0, 0, air_state_id).expect("spawn column has terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 0,
+                y: seeded_y,
+                z: 0,
+            },
+            stone_state_id,
+        )
+        .expect("seed stone target")
+        .expect("replace generated top block");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let cobblestone_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:cobblestone").unwrap())
+        .expect("cobblestone item");
+    let pickaxe_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:iron_pickaxe").unwrap())
+        .expect("iron pickaxe item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
     let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
@@ -554,7 +580,13 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
+        loot: Arc::new(mc_data::loot::LootTables::from_maps(
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::from([(
+                mc_data::Identifier::parse("minecraft:stone").unwrap(),
+                mc_data::Identifier::parse("minecraft:cobblestone").unwrap(),
+            )]),
+        )),
         block_light: None,
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -574,8 +606,16 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
 
     let (mut client, sync) = connect_to_play(addr, "M22PickupMiner").await;
     drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:iron_pickaxe 1 0".into(),
+        })
+        .await
+        .expect("give pickaxe");
+    wait_for_slot_stack(&mut client, pickaxe_id, 1).await;
 
     let target_y = sync.y.floor() as i32 - 2;
+    assert_eq!(target_y, seeded_y, "client spawn should expose seeded target");
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -587,7 +627,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 31, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(1_700)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -658,6 +698,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
                     _ => None,
                 });
                 if let Some(stack) = stack {
+                    assert_eq!(stack.item_id, cobblestone_item_id);
                     assert_eq!(stack.count, 1);
                     saw_slot = slot_stacks.iter().any(
                         |slot_stack: &mc_protocol::packets::play::ItemStack| {
