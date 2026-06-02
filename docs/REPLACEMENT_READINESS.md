@@ -100,17 +100,15 @@ client files.
   registry and missing ids are omitted safely. Solaris harness coverage exists
   for young wheat growth, mature wheat no-consume behavior, mature wheat harvest
   drops, mature carrot/potato/beetroot/nether wart harvest drops, mature melon
-  stem fruit placement, cocoa placement, and sweet berry harvest; immature crop
-  harvest variants, pumpkin stem fruit lifecycle, and cocoa harvest remain
-  unit-covered only.
+  and pumpkin stem fruit placement, cocoa placement, mature cocoa harvest, and
+  sweet berry harvest; immature crop harvest variants remain unit-covered only.
   Particles/sounds/statistics/game events, vanilla RNG/growth-rate or loot-table
   parity,
   exact soil/moisture/light growth rules beyond the existing random-tick
   sampling, poisonous potato chance, exact crop loot/RNG/fortune parity, exact
-  vanilla stem fruit placement/support/RNG parity, pumpkin stem harness coverage,
-  exact sweet berry drop RNG or collision behavior, exact cocoa placement/support
-  parity, exact cocoa loot/RNG parity, and immature crop harvest harness coverage
-  are not claimed yet.
+  vanilla stem fruit placement/support/RNG parity, exact sweet berry drop RNG or
+  collision behavior, exact cocoa placement/support parity, exact cocoa loot/RNG
+  parity, and immature crop harvest harness coverage are not claimed yet.
 - Plant support semantics are local and deterministic: crop item placement checks
   exact clicked support blocks for farmland crops and soul sand for nether wart,
   plus a clear target cell, but crop growth/bonemeal/random ticks advance by block
@@ -122,18 +120,22 @@ client files.
 - Sugar cane, cactus, and bamboo have partial vertical-plant growth support:
   random ticks can grow supported clear columns by one block up to the local
   height-three cap, and samples from any block in the column grow only above the
-  contiguous top. Existing support-break cascade behavior is preserved. Solaris
-  harness coverage exists for visible sugar cane random-tick growth. Vanilla
-  age-counter/RNG/timing parity, exact sugar cane water adjacency, cactus
-  neighbor survivability, bamboo age/stage/leaf-size transitions, cactus/bamboo
-  random-tick growth harness coverage, bonemeal, particles/sounds/statistics/game
-  events are not claimed yet.
+  contiguous top. Sugar cane growth requires adjacent water at the base support,
+  and cactus growth requires air on the horizontal sides of the new growth cell.
+  Existing support-break cascade behavior is preserved. Solaris harness coverage
+  exists for visible sugar cane, cactus, and bamboo random-tick growth. Vanilla
+  age-counter/RNG/timing parity, exact sugar cane support-block whitelist, cactus
+  damage/collision or full neighbor survivability, bamboo age/stage/leaf-size
+  transitions, bonemeal, particles/sounds/statistics/game events are not claimed
+  yet.
 - Vertical-plant growth support is intentionally coarse: the bottom of the
-  contiguous column must have any non-air support block, the cell above the top
-  must be air, and the local height cap is three blocks. Support-break cascades
-  remove sugar cane, cactus, and bamboo blocks above a removed support. Exact
-  sugar cane water adjacency, cactus side-neighbor survival, and bamboo-specific
-  age/stage/leaf support semantics are not implemented.
+  contiguous column must have any non-air support block, sugar cane additionally
+  requires adjacent base water, the cell above the top must be air, cactus growth
+  requires clear horizontal sides around the new cell, and the local height cap is
+  three blocks. Support-break cascades remove sugar cane, cactus, and bamboo
+  blocks above a removed support. Exact sugar cane support-block whitelist, full
+  cactus side-neighbor survival after arbitrary neighbor edits, and
+  bamboo-specific age/stage/leaf support semantics are not implemented.
 - Common one-by-one saplings have partial tree-growth support: using bonemeal on
   a clear oak, birch, spruce, jungle, acacia, or dark oak sapling creates a
   deterministic Solaris-owned small tree through existing block-edit paths, and
