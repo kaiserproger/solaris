@@ -35,7 +35,8 @@ client files.
   multiplayer visibility/pickups. Runtime block/entity drops use embedded
   repo-owned loot by default, or a configured local vanilla data sidecar's simple
   loot-table subset when `data.vanilla_data_dir` is present and contains loadable
-  simple drops.
+  simple drops. The sidecar subset only accepts one-item drops with no loot
+  functions and no conditions except `minecraft:survives_explosion`.
 - Runtime metrics and budgets from M37 for debug-load visibility.
 
 ## Partial Scope

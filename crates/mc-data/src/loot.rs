@@ -176,7 +176,7 @@ fn simple_drop_from_table(
         return Ok(None);
     };
     for pool in pools {
-        if has_unsupported_conditions(pool) {
+        if has_unsupported_conditions(pool) || has_unsupported_functions(pool) {
             continue;
         }
         let Some(entries) = pool.get("entries").and_then(serde_json::Value::as_array) else {
@@ -197,7 +197,7 @@ fn simple_drop_from_entry(
 ) -> Result<Option<Identifier>, LootError> {
     match entry.get("type").and_then(serde_json::Value::as_str) {
         Some("minecraft:item") => {
-            if has_unsupported_conditions(entry) {
+            if has_unsupported_conditions(entry) || has_unsupported_functions(entry) {
                 return Ok(None);
             }
             let Some(name) = entry.get("name").and_then(serde_json::Value::as_str) else {
@@ -234,6 +234,13 @@ fn has_unsupported_conditions(value: &serde_json::Value) -> bool {
                 )
             })
         })
+}
+
+fn has_unsupported_functions(value: &serde_json::Value) -> bool {
+    value
+        .get("functions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|functions| !functions.is_empty())
 }
 
 fn from_str(raw: &str, path: &Path) -> Result<LootTables, LootError> {
@@ -345,6 +352,37 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::create_dir_all(entities.join("passive")).unwrap();
+        fs::write(
+            entities.join("passive").join("cow.json"),
+            r#"{
+              "pools": [{
+                "entries": [{
+                  "type": "minecraft:item",
+                  "name": "minecraft:beef"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let loot = load_vanilla_subset(tmp.path()).unwrap();
+
+        assert_eq!(
+            loot.block_drop(&Identifier::parse("minecraft:stone").unwrap()),
+            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
+        );
+        assert_eq!(
+            loot.entity_drop(&Identifier::parse("minecraft:passive/cow").unwrap()),
+            Some(&Identifier::parse("minecraft:beef").unwrap())
+        );
+    }
+
+    #[test]
+    fn skips_vanilla_tables_with_unsupported_functions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entities = tmp.path().join("entities");
+        fs::create_dir_all(&entities).unwrap();
         fs::write(
             entities.join("zombie.json"),
             r#"{
@@ -362,12 +400,35 @@ mod tests {
         let loot = load_vanilla_subset(tmp.path()).unwrap();
 
         assert_eq!(
-            loot.block_drop(&Identifier::parse("minecraft:stone").unwrap()),
-            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
-        );
-        assert_eq!(
             loot.entity_drop(&Identifier::parse("minecraft:zombie").unwrap()),
-            Some(&Identifier::parse("minecraft:rotten_flesh").unwrap())
+            None
+        );
+    }
+
+    #[test]
+    fn skips_pool_level_functions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocks = tmp.path().join("blocks");
+        fs::create_dir_all(&blocks).unwrap();
+        fs::write(
+            blocks.join("oak_leaves.json"),
+            r#"{
+              "pools": [{
+                "functions": [{ "function": "minecraft:set_count" }],
+                "entries": [{
+                  "type": "minecraft:item",
+                  "name": "minecraft:apple"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let loot = load_vanilla_subset(tmp.path()).unwrap();
+
+        assert_eq!(
+            loot.block_drop(&Identifier::parse("minecraft:oak_leaves").unwrap()),
+            None
         );
     }
 
@@ -388,10 +449,6 @@ mod tests {
         assert_eq!(
             loot.block_drop(&Identifier::parse("minecraft:grass_block").unwrap()),
             Some(&Identifier::parse("minecraft:dirt").unwrap())
-        );
-        assert_eq!(
-            loot.entity_drop(&Identifier::parse("minecraft:zombie").unwrap()),
-            Some(&Identifier::parse("minecraft:rotten_flesh").unwrap())
         );
     }
 

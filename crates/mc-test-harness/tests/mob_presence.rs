@@ -335,14 +335,11 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         .id_of(&mc_data::Identifier::parse("minecraft:rotten_flesh").unwrap())
         .expect("rotten_flesh item");
     let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
-    let loot = Arc::new(
-        mc_data::loot::load_vanilla_subset(vanilla_dir.join("data/minecraft/loot_table"))
-            .expect("loot tables load"),
-    );
+    let loot = Arc::new(mc_data::loot::builtin().clone());
     assert_eq!(
         loot.entity_drop(&zombie),
         Some(&mc_data::Identifier::parse("minecraft:rotten_flesh").unwrap()),
-        "zombie drop must come from sidecar loot tables"
+        "zombie drop must remain available through embedded fallback loot"
     );
     let biome_spawns =
         mc_data::biomes::load_biome_spawn_rules(vanilla_dir.join("data/minecraft/worldgen/biome"))
