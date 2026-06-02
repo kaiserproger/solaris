@@ -1592,6 +1592,7 @@ fn cactus_random_tick_unsupported_or_obstructed_columns_are_noop() {
     let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
     let cactus = mc_world::BlockPos { x: 4, y: 65, z: 4 };
     let above = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    let side = mc_world::BlockPos { x: 5, y: 66, z: 4 };
     world.set_block_at(cactus, BlockStateId(19)).unwrap();
     assert_eq!(
         random_tick_edit(
@@ -1607,6 +1608,20 @@ fn cactus_random_tick_unsupported_or_obstructed_columns_are_noop() {
 
     world.set_block_at(support, BlockStateId(1)).unwrap();
     world.set_block_at(above, BlockStateId(1)).unwrap();
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cactus,
+            BlockStateId(19),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        None
+    );
+
+    world.set_block_at(above, BlockStateId(0)).unwrap();
+    world.set_block_at(side, BlockStateId(1)).unwrap();
     assert_eq!(
         random_tick_edit(
             registry.as_ref(),
@@ -1638,10 +1653,12 @@ fn sugar_cane_random_tick_grows_supported_column_to_height_three() {
         .unwrap();
 
     let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let water = mc_world::BlockPos { x: 5, y: 64, z: 4 };
     let cane_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
     let cane_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
     let cane_3 = mc_world::BlockPos { x: 4, y: 67, z: 4 };
     world.set_block_at(support, BlockStateId(1)).unwrap();
+    world.set_block_at(water, BlockStateId(2)).unwrap();
     world.set_block_at(cane_1, BlockStateId(21)).unwrap();
 
     assert_eq!(
@@ -1707,6 +1724,7 @@ fn sugar_cane_random_tick_unsupported_or_obstructed_columns_are_noop() {
         .unwrap();
 
     let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    let water = mc_world::BlockPos { x: 5, y: 64, z: 4 };
     let cane = mc_world::BlockPos { x: 4, y: 65, z: 4 };
     let above = mc_world::BlockPos { x: 4, y: 66, z: 4 };
     world.set_block_at(cane, BlockStateId(21)).unwrap();
@@ -1723,6 +1741,19 @@ fn sugar_cane_random_tick_unsupported_or_obstructed_columns_are_noop() {
     );
 
     world.set_block_at(support, BlockStateId(1)).unwrap();
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            cane,
+            BlockStateId(21),
+            mc_data::block_facts::RandomTickFamily::Crop,
+        ),
+        None
+    );
+
+    world.set_block_at(water, BlockStateId(2)).unwrap();
     world.set_block_at(above, BlockStateId(1)).unwrap();
     assert_eq!(
         random_tick_edit(

@@ -15,6 +15,7 @@ pub(super) fn vertical_plant_growth_edit(
     if !matches!(current.block.id.path(), "sugar_cane" | "cactus" | "bamboo") {
         return None;
     }
+    let plant_path = current.block.id.path();
     let plant_state = blocks.block(&current.block.id).map(|block| block.default)?;
     let air = named_block_default(blocks, "minecraft:air")?;
 
@@ -22,7 +23,7 @@ pub(super) fn vertical_plant_growth_edit(
     while same_block_at(
         blocks,
         storage,
-        current.block.id.path(),
+        plant_path,
         mc_world::BlockPos {
             y: bottom_y - 1,
             ..pos
@@ -34,12 +35,7 @@ pub(super) fn vertical_plant_growth_edit(
         y: bottom_y - 1,
         ..pos
     };
-    if storage
-        .get_block(support)
-        .ok()
-        .flatten()
-        .is_none_or(|found| found == air)
-    {
+    if !vertical_plant_supported_base(blocks, storage, plant_path, support, air) {
         return None;
     }
 
@@ -47,7 +43,7 @@ pub(super) fn vertical_plant_growth_edit(
     while same_block_at(
         blocks,
         storage,
-        current.block.id.path(),
+        plant_path,
         mc_world::BlockPos {
             y: top_y + 1,
             ..pos
@@ -63,6 +59,9 @@ pub(super) fn vertical_plant_growth_edit(
         y: top_y + 1,
         ..pos
     };
+    if plant_path == "cactus" && !cactus_growth_target_clear(storage, above, air) {
+        return None;
+    }
     match storage.get_block(above) {
         Ok(Some(found)) if found == air => Some(BlockEdit {
             pos: above,
@@ -74,6 +73,59 @@ pub(super) fn vertical_plant_growth_edit(
             None
         }
     }
+}
+
+fn vertical_plant_supported_base(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    path: &str,
+    support: mc_world::BlockPos,
+    air: mc_world::BlockStateId,
+) -> bool {
+    if !matches!(storage.get_block(support), Ok(Some(found)) if found != air) {
+        return false;
+    }
+    path != "sugar_cane" || has_adjacent_block(blocks, storage, support, "water")
+}
+
+fn cactus_growth_target_clear(
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    air: mc_world::BlockStateId,
+) -> bool {
+    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .into_iter()
+        .all(|(dx, dz)| {
+            let side = mc_world::BlockPos {
+                x: pos.x + dx,
+                z: pos.z + dz,
+                ..pos
+            };
+            matches!(storage.get_block(side), Ok(Some(found)) if found == air)
+        })
+}
+
+fn has_adjacent_block(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    path: &str,
+) -> bool {
+    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .into_iter()
+        .any(|(dx, dz)| {
+            same_block_at(
+                blocks,
+                storage,
+                path,
+                mc_world::BlockPos {
+                    x: pos.x + dx,
+                    z: pos.z + dz,
+                    ..pos
+                },
+            )
+            .unwrap_or(false)
+        })
 }
 
 fn same_block_at(

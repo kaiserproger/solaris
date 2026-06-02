@@ -27,16 +27,32 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
     ));
 
     let sand = crop_test_state(&blocks, "minecraft:sand", &[]);
+    let water = crop_test_state(&blocks, "minecraft:water", &[]);
     let cases = [
-        ("sugar_cane", crop_test_state(&blocks, "minecraft:sugar_cane", &[])),
-        ("cactus", crop_test_state(&blocks, "minecraft:cactus", &[])),
-        ("bamboo", crop_test_state(&blocks, "minecraft:bamboo", &[])),
+        (
+            "sugar_cane",
+            crop_test_state(&blocks, "minecraft:sugar_cane", &[]),
+            true,
+            false,
+        ),
+        (
+            "cactus",
+            crop_test_state(&blocks, "minecraft:cactus", &[]),
+            false,
+            true,
+        ),
+        (
+            "bamboo",
+            crop_test_state(&blocks, "minecraft:bamboo", &[]),
+            false,
+            false,
+        ),
     ];
     let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
         &report,
     ));
 
-    for (name, plant) in cases {
+    for (name, plant, needs_water, needs_spacing) in cases {
         let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
         let storage = mc_world::WorldStorage::in_memory_with_capacity(
             Arc::clone(&blocks),
@@ -85,19 +101,29 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
         let growth_y = support_y + 2;
         {
             let mut storage = world.lock().await;
-            for x in 0..16 {
-                for z in 0..16 {
+            let x_step = if needs_spacing { 2 } else { 1 };
+            let z_step = if needs_water || needs_spacing { 2 } else { 1 };
+            for x in (0..16).step_by(x_step) {
+                for z in (0..16).step_by(z_step) {
                     crop_test_set(&mut storage, (x, support_y, z), sand);
                     crop_test_set(&mut storage, (x, plant_y, z), plant);
+                    if needs_water && z + 1 < 16 {
+                        crop_test_set(&mut storage, (x, support_y, z + 1), water);
+                    }
                 }
             }
         }
 
-        wait_for_any_vertical_growth_delta(&mut client, growth_y, plant.0 as i32).await;
+        wait_for_any_vertical_growth_delta(&mut client, name, growth_y, plant.0 as i32).await;
     }
 }
 
-async fn wait_for_any_vertical_growth_delta(client: &mut Client, y: i32, state_id: i32) {
+async fn wait_for_any_vertical_growth_delta(
+    client: &mut Client,
+    case_name: &str,
+    y: i32,
+    state_id: i32,
+) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let frame = client
@@ -105,7 +131,7 @@ async fn wait_for_any_vertical_growth_delta(client: &mut Client, y: i32, state_i
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("vertical plant growth delta");
+            .unwrap_or_else(|err| panic!("{case_name} vertical plant growth delta: {err}"));
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
