@@ -21,18 +21,19 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ClientCommandAction, ClientboundContainerSetContent,
-    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundOpenScreen, ClientboundRespawn, ClientboundSetEntityData, ClientboundSetHealth,
-    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
-    EntityAnimationAction, EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientCommandAction, ClientboundBlockEntityData,
+    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
+    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundOpenSignEditor, ClientboundRespawn,
+    ClientboundSetEntityData, ClientboundSetHealth, ClientboundTakeItemEntity,
+    ConfirmTeleportation, ContainerInput, Direction, EntityAnimation, EntityAnimationAction,
+    EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
     ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate,
     MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, RemoveEntities, SectionBlocksUpdate,
     ServerboundChatCommand, ServerboundClientCommand, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundUseItem, ServerboundUseItemOn,
-    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_pos,
-    pack_section_relative_pos, unpack_block_pos,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundSignUpdate, ServerboundUseItem,
+    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    pack_block_pos, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -50,6 +51,7 @@ include!("block_edit/plant_harvest.rs");
 include!("block_edit/plant_lifecycle.rs");
 include!("block_edit/furnace_and_chests.rs");
 include!("block_edit/sapling_growth.rs");
+include!("block_edit/sign_edit.rs");
 include!("block_edit/survival_lifecycle.rs");
 include!("block_edit/vertical_plant_growth.rs");
 include!("block_edit/wheat_harvest.rs");
