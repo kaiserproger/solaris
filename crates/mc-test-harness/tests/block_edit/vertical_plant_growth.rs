@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn survival_random_tick_grows_visible_sugar_cane_column() {
+async fn survival_random_tick_grows_visible_vertical_plant_columns() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -17,13 +17,6 @@ async fn survival_random_tick_grows_visible_sugar_cane_column() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
-        Arc::clone(&blocks),
-        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .with_generator(generator);
-    let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
@@ -34,60 +27,74 @@ async fn survival_random_tick_grows_visible_sugar_cane_column() {
     ));
 
     let sand = crop_test_state(&blocks, "minecraft:sand", &[]);
-    let sugar_cane = crop_test_state(&blocks, "minecraft:sugar_cane", &[]);
+    let cases = [
+        ("sugar_cane", crop_test_state(&blocks, "minecraft:sugar_cane", &[])),
+        ("cactus", crop_test_state(&blocks, "minecraft:cactus", &[])),
+        ("bamboo", crop_test_state(&blocks, "minecraft:bamboo", &[])),
+    ];
     let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
         &report,
     ));
 
-    let cfg = mc_net::ServerConfig {
-        bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M72 vertical plant growth".into(),
-        max_players: 8,
-        view_distance: VIEW_DISTANCE,
-        data,
-        blocks: Arc::clone(&blocks),
-        world: Some(Arc::clone(&world)),
-        tags,
-        recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
-        block_light: None,
-        items,
-        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-        block_facts,
-        entity_types,
-        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy {
-            random_tick_speed: 512,
-            chunk_budget: ((2 * VIEW_DISTANCE + 1) as usize).pow(2),
-            ..mc_net::RandomTickPolicy::default()
-        },
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        shutdown: mc_net::ShutdownHandle::default(),
-    };
-    let bound = mc_net::bind(cfg).await.expect("bind");
-    let addr = bound.local_addr().expect("local_addr");
-    tokio::spawn(async move {
-        let _ = bound.serve().await;
-    });
+    for (name, plant) in cases {
+        let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+        let storage = mc_world::WorldStorage::in_memory_with_capacity(
+            Arc::clone(&blocks),
+            ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+        )
+        .with_generator(generator);
+        let world = Arc::new(tokio::sync::Mutex::new(storage));
+        let cfg = mc_net::ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: format!("M76 {name} growth"),
+            max_players: 8,
+            view_distance: VIEW_DISTANCE,
+            data: Arc::clone(&data),
+            blocks: Arc::clone(&blocks),
+            world: Some(Arc::clone(&world)),
+            tags: Arc::clone(&tags),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items: Arc::clone(&items),
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::clone(&block_facts),
+            entity_types: Arc::clone(&entity_types),
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+            random_tick: mc_net::RandomTickPolicy {
+                random_tick_speed: 512,
+                chunk_budget: ((2 * VIEW_DISTANCE + 1) as usize).pow(2),
+                ..mc_net::RandomTickPolicy::default()
+            },
+            command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+            shutdown: mc_net::ShutdownHandle::default(),
+        };
+        let bound = mc_net::bind(cfg).await.expect("bind");
+        let addr = bound.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = bound.serve().await;
+        });
 
-    let (mut client, sync) = connect_to_play(addr, "M72CaneGrow").await;
-    drain_until_chunk(&mut client, (0, 0)).await;
+        let username = format!("M76{name}");
+        let (mut client, sync) = connect_to_play(addr, &username).await;
+        drain_until_chunk(&mut client, (0, 0)).await;
 
-    let support_y = sync.y.floor() as i32 - 2;
-    let cane_y = support_y + 1;
-    let growth_y = support_y + 2;
-    {
-        let mut storage = world.lock().await;
-        for x in 0..16 {
-            for z in 0..16 {
-                crop_test_set(&mut storage, (x, support_y, z), sand);
-                crop_test_set(&mut storage, (x, cane_y, z), sugar_cane);
+        let support_y = sync.y.floor() as i32 - 2;
+        let plant_y = support_y + 1;
+        let growth_y = support_y + 2;
+        {
+            let mut storage = world.lock().await;
+            for x in 0..16 {
+                for z in 0..16 {
+                    crop_test_set(&mut storage, (x, support_y, z), sand);
+                    crop_test_set(&mut storage, (x, plant_y, z), plant);
+                }
             }
         }
-    }
 
-    wait_for_any_vertical_growth_delta(&mut client, growth_y, sugar_cane.0 as i32).await;
+        wait_for_any_vertical_growth_delta(&mut client, growth_y, plant.0 as i32).await;
+    }
 }
 
 async fn wait_for_any_vertical_growth_delta(client: &mut Client, y: i32, state_id: i32) {
