@@ -70,6 +70,11 @@ pub struct NetworkSection {
 pub struct DataSection {
     #[serde(default)]
     pub world_dir: Option<PathBuf>,
+    /// Optional local vanilla data sidecar root. Mojang-owned files stay outside
+    /// the repo; when omitted or when loot tables are absent, Solaris uses its
+    /// embedded repo-owned loot fallback.
+    #[serde(default)]
+    pub vanilla_data_dir: Option<PathBuf>,
     /// World seed for the M7 terrain generator. Defaults to `0` —
     /// every run starts on the same terrain unless this is overridden.
     /// Operators bumping this between runs will see fresh terrain in
@@ -385,7 +390,29 @@ mod tests {
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
         assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 256);
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
+        assert!(cfg.data.vanilla_data_dir.is_none());
         assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+    }
+
+    #[test]
+    fn parses_optional_vanilla_data_dir() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [data]
+            vanilla_data_dir = "data/vanilla"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(
+            cfg.data.vanilla_data_dir,
+            Some(PathBuf::from("data/vanilla"))
+        );
     }
 
     #[test]

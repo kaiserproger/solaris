@@ -191,8 +191,13 @@ async fn serve(path: &Path) -> Result<()> {
     );
     let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
     tracing::info!(entries = recipes.len(), "embedded recipe registry loaded");
-    let loot = Arc::new(mc_data::loot::builtin().clone());
-    tracing::info!(drops = loot.total_drops(), "embedded loot tables loaded");
+    let loot_source = load_effective_loot(cfg.data.vanilla_data_dir.as_deref())?;
+    let loot = Arc::new(loot_source.tables);
+    tracing::info!(
+        drops = loot.total_drops(),
+        source = loot_source.source,
+        "survival loot tables loaded"
+    );
 
     let block_light = Arc::new(
         mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&blocks_report),
@@ -457,6 +462,33 @@ fn count_region_files(world_dir: &Path) -> usize {
     total
 }
 
+struct EffectiveLootTables {
+    tables: mc_data::loot::LootTables,
+    source: &'static str,
+}
+
+fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootTables> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let root = vanilla_data_dir
+            .join("data")
+            .join("minecraft")
+            .join("loot_table");
+        let tables = mc_data::loot::load_vanilla_subset(&root)
+            .with_context(|| format!("loading vanilla loot tables from {}", root.display()))?;
+        if tables.total_drops() > 0 {
+            return Ok(EffectiveLootTables {
+                tables,
+                source: "vanilla_sidecar_simple_subset",
+            });
+        }
+    }
+
+    Ok(EffectiveLootTables {
+        tables: mc_data::loot::builtin().clone(),
+        source: "embedded_solaris_fallback",
+    })
+}
+
 fn ensure_world_region_root(world_dir: &Path) -> Result<()> {
     let modern = world_dir
         .join("dimensions")
@@ -501,6 +533,7 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mc_data::Identifier;
 
     #[test]
     fn ensure_world_region_root_creates_legacy_layout_for_missing_world() {
@@ -534,6 +567,62 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
         assert_eq!(chunk_cache_size_for_view_distance(10), 529);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn effective_loot_uses_embedded_fallback_without_sidecar() {
+        let loot = load_effective_loot(None).unwrap();
+
+        assert_eq!(loot.source, "embedded_solaris_fallback");
+        assert_eq!(
+            loot.tables
+                .block_drop(&Identifier::parse("minecraft:stone").unwrap()),
+            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
+        );
+    }
+
+    #[test]
+    fn effective_loot_uses_simple_vanilla_sidecar_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocks = tmp
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("loot_table")
+            .join("blocks");
+        std::fs::create_dir_all(&blocks).unwrap();
+        std::fs::write(
+            blocks.join("stone.json"),
+            r#"{
+              "pools": [{
+                "entries": [{
+                  "type": "minecraft:item",
+                  "name": "minecraft:cobblestone"
+                }]
+              }]
+            }"#,
+        )
+        .unwrap();
+
+        let loot = load_effective_loot(Some(tmp.path())).unwrap();
+
+        assert_eq!(loot.source, "vanilla_sidecar_simple_subset");
+        assert_eq!(loot.tables.total_drops(), 1);
+        assert_eq!(
+            loot.tables
+                .block_drop(&Identifier::parse("minecraft:stone").unwrap()),
+            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
+        );
+    }
+
+    #[test]
+    fn effective_loot_falls_back_when_sidecar_has_no_simple_loot() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let loot = load_effective_loot(Some(tmp.path())).unwrap();
+
+        assert_eq!(loot.source, "embedded_solaris_fallback");
+        assert!(loot.tables.total_drops() > 1);
     }
 
     #[tokio::test]

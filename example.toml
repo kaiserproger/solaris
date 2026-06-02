@@ -9,6 +9,10 @@ port = 25565
 
 [data]
 world_dir = ".analysis/test-world"
+# Optional local vanilla data sidecar root. When present, Solaris loads simple
+# block/entity loot tables from data/minecraft/loot_table and falls back to
+# embedded repo-owned loot if no simple sidecar loot is available.
+# vanilla_data_dir = "data/vanilla"
 # World seed for deterministic Solaris generation. Chunks already on
 # disk in `world_dir` win over fallback generation, so changing this
 # affects only missing chunks unless the world is regenerated. Defaults

@@ -32,7 +32,10 @@ client files.
 - Recipe loading accepts furnace, blasting, smoking, and campfire variants;
   furnace runtime routes furnace, blast furnace, and smoker categories.
 - Basic farming, fluids, mobs/combat, death/respawn, XP, drops, inventory, and
-  multiplayer visibility/pickups.
+  multiplayer visibility/pickups. Runtime block/entity drops use embedded
+  repo-owned loot by default, or a configured local vanilla data sidecar's simple
+  loot-table subset when `data.vanilla_data_dir` is present and contains loadable
+  simple drops.
 - Runtime metrics and budgets from M37 for debug-load visibility.
 
 ## Partial Scope
