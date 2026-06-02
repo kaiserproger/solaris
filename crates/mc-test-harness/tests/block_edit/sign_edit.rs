@@ -83,10 +83,24 @@ async fn survival_places_sign_and_updates_plain_text() {
             inside: false,
             world_border_hit: false,
             sequence: 74,
+    })
+    .await
+    .expect("place sign");
+    wait_for_open_sign_editor(&mut client, packed_sign_pos).await;
+
+    let mismatched_pos = pack_block_pos(sign_pos.0, sign_pos.1, sign_pos.2 + 1);
+    client
+        .write_packet(&ServerboundSignUpdate {
+            position: mismatched_pos,
+            lines: ["bad", "position", "must", "skip"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            is_front_text: true,
         })
         .await
-        .expect("place sign");
-    wait_for_open_sign_editor(&mut client, packed_sign_pos).await;
+        .expect("send mismatched sign update");
+    assert_no_sign_block_entity_data(&mut client, mismatched_pos, Duration::from_millis(250)).await;
 
     let lines = ["Solaris", "M74", "plain", "text"];
     client
@@ -148,6 +162,32 @@ async fn wait_for_sign_block_entity_data(
             if pkt.position == position {
                 return pkt;
             }
+        }
+    }
+}
+
+async fn assert_no_sign_block_entity_data(client: &mut Client, position: i64, duration: Duration) {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        let frame = match client.read_frame_with_timeout(remaining).await {
+            Ok(frame) => frame,
+            Err(_) => return,
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundBlockEntityData::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundBlockEntityData::decode(&mut body)
+                .expect("decode rejected BlockEntityData");
+            assert_ne!(
+                pkt.position, position,
+                "mismatched sign update must not emit block entity data"
+            );
         }
     }
 }
