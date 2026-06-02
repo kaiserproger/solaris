@@ -42,8 +42,13 @@ client files.
 ## Partial Scope
 
 - Beds set respawn points; sleeping and time-skip are not implemented.
-- Signs place; sign text editing is deferred until the serverbound packet is
-  verified from the local vanilla oracle.
+- Signs have partial plain-text editing support: regular sign placement opens the
+  vanilla sign editor, matching serverbound updates store plain four-line text in
+  vanilla-shaped block-entity NBT, and loaded clients receive the block-entity
+  update. Solaris harness coverage verifies editor open, mismatched-position
+  rejection, and client-visible text updates. Hanging signs,
+  styled/filtered/clickable text, waxed sign editing semantics,
+  sounds/statistics/game events, and full visual/manual parity are not claimed.
 - Smokers/blast furnaces share the furnace-family runtime; lit-state block
   updates, sounds/particles, hopper/comparator automation, and full vanilla
   block-specific state-machine parity are not claimed.
