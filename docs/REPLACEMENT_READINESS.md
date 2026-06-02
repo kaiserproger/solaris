@@ -54,6 +54,16 @@ client files.
   item-on-campfire metadata, in-flight persistence across restart, smoke/sound
   particles, exact ejection vector parity, and hopper/comparator automation are
   not claimed.
+- Loot/drop parity remains partial and scoped. Solaris executes deterministic
+  one-stack block/entity drops from the effective loot table, with embedded
+  repo-owned fallback data available by default and a local vanilla sidecar
+  simple subset available when configured. Harness coverage includes stone to
+  cobblestone through configured block loot, configured passive mob drops,
+  zombie fallback drops, visible item entities, pickup slot updates, and entity
+  removal. Full vanilla loot execution is not implemented: `set_count`/random
+  rolls, fortune/silk touch, tool predicates, entity/killer predicates,
+  explosion decay, looting, equipment drops, exact XP ranges, and
+  sounds/particles/statistics/game events remain out of scope.
 - Farming has partial crop growth, bonemeal, wheat harvest drop support, carrot
   harvest drop support, potato harvest drop support, beetroot harvest drop
   support, and nether wart harvest drop support:
@@ -140,9 +150,9 @@ client files.
 ## Not Claimed
 
 - Other dimensions, portals, structures, full biome parity, villages/trading,
-  redstone parity, full bow/arrow combat parity, full shield parity, boats,
-  minecarts, full recipe-book parity, weather parity, or M39 lock-free ownership
-  hardening.
+  redstone parity, full vanilla loot-table parity, full bow/arrow combat parity,
+  full shield parity, boats, minecarts, full recipe-book parity, weather parity,
+  or M39 lock-free ownership hardening.
 
 ## Manual Gate
 
