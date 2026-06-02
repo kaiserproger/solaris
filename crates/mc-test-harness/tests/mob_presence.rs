@@ -168,7 +168,7 @@ async fn two_clients_receive_same_server_owned_mob() {
 }
 
 #[tokio::test]
-async fn survival_attack_passive_mob_drops_food() {
+async fn survival_attack_passive_mob_uses_configured_drop() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -204,6 +204,28 @@ async fn survival_attack_passive_mob_drops_food() {
     ));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let configured_drop = mc_data::Identifier::parse("minecraft:apple").unwrap();
+    let loot = Arc::new(mc_data::loot::LootTables::from_maps(
+        std::collections::BTreeMap::from([
+            (
+                mc_data::Identifier::parse("minecraft:chicken").unwrap(),
+                configured_drop.clone(),
+            ),
+            (
+                mc_data::Identifier::parse("minecraft:cow").unwrap(),
+                configured_drop.clone(),
+            ),
+            (
+                mc_data::Identifier::parse("minecraft:pig").unwrap(),
+                configured_drop.clone(),
+            ),
+            (
+                mc_data::Identifier::parse("minecraft:sheep").unwrap(),
+                configured_drop.clone(),
+            ),
+        ]),
+        std::collections::BTreeMap::new(),
+    ));
     let biome_spawns =
         mc_data::biomes::load_biome_spawn_rules(vanilla_dir.join("data/minecraft/worldgen/biome"))
             .map(Arc::new)
@@ -219,7 +241,7 @@ async fn survival_attack_passive_mob_drops_food() {
         world,
         tags,
         recipes: Arc::new(Vec::new()),
-        loot: Arc::new(mc_data::loot::LootTables::default()),
+        loot: Arc::clone(&loot),
         block_light,
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
@@ -239,7 +261,7 @@ async fn survival_attack_passive_mob_drops_food() {
 
     let (mut client, _) = connect_to_play(addr, "M23MobFood").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-    let (mob, drop_item) = wait_for_food_mob_spawn(&mut client, &entity_report).await;
+    let (mob, drop_item) = wait_for_configured_mob_spawn(&mut client, &entity_report, &loot).await;
     let drop_item_id = items.id_of(&drop_item).expect("drop item id");
 
     client
@@ -679,9 +701,10 @@ async fn wait_for_passive_mob_spawn(client: &mut Client) -> AddEntity {
     }
 }
 
-async fn wait_for_food_mob_spawn(
+async fn wait_for_configured_mob_spawn(
     client: &mut Client,
     entity_report: &[mc_data::entity_types::EntityTypeReport],
+    loot: &mc_data::loot::LootTables,
 ) -> (AddEntity, mc_data::Identifier) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -697,14 +720,15 @@ async fn wait_for_food_mob_spawn(
         if frame.id == AddEntity::ID {
             let mut body = frame.body;
             let pkt = AddEntity::decode(&mut body).expect("decode AddEntity");
-            let Some(entity_type) = entity_report
+            let Some(entity) = entity_report
                 .iter()
                 .find(|entry| entry.protocol_id as i32 == pkt.entity_type_id)
                 .map(|entry| entry.id.as_str())
+                .and_then(|id| mc_data::Identifier::parse(id).ok())
             else {
                 continue;
             };
-            if let Some(drop) = passive_food_drop(entity_type) {
+            if let Some(drop) = loot.entity_drop(&entity).cloned() {
                 return (pkt, drop);
             }
         }
@@ -872,11 +896,6 @@ async fn wait_for_blocked_zombie_damage(client: &mut Client, entity_id: i32) {
             }
         }
     }
-}
-
-fn passive_food_drop(entity_type: &str) -> Option<mc_data::Identifier> {
-    let entity = mc_data::Identifier::parse(entity_type).ok()?;
-    mc_data::loot::builtin().entity_drop(&entity).cloned()
 }
 
 async fn wait_for_mob_motion_after_spawn(client: &mut Client, entity_id: i32) {
