@@ -55,10 +55,11 @@ client files.
 - Barrels share chest storage mechanics; open/close animation, sounds, game
   events, and automation parity are not claimed.
 - Campfire cooking has usable partial support with Solaris harness coverage for
-  consuming matching held inputs and dropping cooked results, but visual
-  item-on-campfire metadata, in-flight persistence across restart, smoke/sound
-  particles, exact ejection vector parity, and hopper/comparator automation are
-  not claimed.
+  consuming matching held inputs, sending vanilla-shaped `Items` block-entity
+  updates for the visible input and completion clear paths, dropping cooked
+  results as item entities, and picking those results up. In-flight persistence
+  across restart, hopper/comparator automation, smoke/sound particles, exact
+  ejection vector/timing parity, and broader block-state parity are not claimed.
 - Loot/drop parity remains partial and scoped. Solaris executes deterministic
   one-stack block/entity drops from the effective loot table, with embedded
   repo-owned fallback data available by default and a local vanilla sidecar
