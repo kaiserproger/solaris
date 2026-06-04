@@ -42,8 +42,12 @@ plus vanilla oracle or real-client evidence.
   focused implementation and test coverage from earlier milestones, but still
   require current oracle/client and soak evidence before they count as broad
   M100 coverage.
-- Beds set respawn points; sleeping, time-skip, weather, and full spawn/default
-  spawn packet behavior are not claimed.
+- Beds set respawn points. A bounded draft sleep path skips a lone player from
+  Solaris-defined night to the next morning through the existing `SetTime` path,
+  but client-visible clock-map/time-sync behavior and sleep skip save/restart
+  persistence are not proven. Multiplayer sleep quorum, weather, and
+  client-visible bed animation parity are not claimed. Weather is currently
+  disabled: Solaris does not start rain/thunder or send weather transitions.
 - Signs support regular plain-text editing through Solaris harness coverage;
   hanging signs, styled/filtered/clickable text, waxed semantics,
   sounds/statistics/game events, and visual/manual parity are not claimed.
@@ -103,7 +107,10 @@ plus vanilla oracle or real-client evidence.
 - Other dimensions, Nether/End parity, full portal travel, structures, villages,
   trading, full biome parity, modded clients, plugin APIs, custom datapacks
   beyond the local sidecar, and resource-pack-specific behavior are outside the
-  M100 core MVP unless a later ADR changes scope.
+  M100 core MVP unless a later ADR changes scope. Solaris now prefers the
+  `minecraft:overworld` dimension type when present and otherwise falls back to
+  the first configured dimension for degraded/test data; it does not implement
+  portal transfer.
 - Full redstone computer parity, pistons, observers, quasi-connectivity, and
   exact redstone update order are non-goals for M81 redstone-lite.
 - Full vanilla worldgen and bit-perfect loot/RNG/sounds/particles/statistics/game
