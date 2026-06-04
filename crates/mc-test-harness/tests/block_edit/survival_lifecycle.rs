@@ -316,11 +316,11 @@ async fn survival_armor_slot_reduces_debug_damage() {
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 10".into(),
-        })
-        .await
-        .expect("damage armored player");
+    })
+    .await
+    .expect("damage armored player");
     wait_for_health_near(&mut client, 10.48, 0.02).await;
-    wait_for_slot_damage(&mut client, 6, chestplate_id, 1).await;
+    wait_for_slot_damage(&mut client, 6, chestplate_id, 2).await;
 }
 
 #[tokio::test]

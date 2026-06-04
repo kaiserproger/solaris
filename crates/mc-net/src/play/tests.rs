@@ -3837,6 +3837,7 @@ async fn hostile_melee_shield_block_writes_break_clear_slot_update() {
             health: 20.0,
             attributes,
             goal: mc_entity::GoalState::Idle,
+            vehicle: None,
         }]);
     let mut survival_state = SurvivalState::FULL;
     let mut writer = Vec::new();

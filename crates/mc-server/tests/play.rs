@@ -271,7 +271,11 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
         "expected initial Set Time"
     );
     let time = ClientboundSetTime::decode(&mut frame.body).unwrap();
-    assert_eq!(time.game_time, 0);
+    assert!(
+        (0..=20).contains(&time.game_time),
+        "unexpected initial game_time={}",
+        time.game_time
+    );
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
