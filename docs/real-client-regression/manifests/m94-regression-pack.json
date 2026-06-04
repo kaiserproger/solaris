@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "pack_id": "m94-real-client-regression-pack",
+  "quality_label": "stabilization",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config example.toml",
+  "client_requirement": "Normal vanilla 26.1.2 client launched directly or through PrismLauncher; protocol harnesses do not satisfy this gate.",
+  "artifact_root": ".analysis/real-client-runs",
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt"
+  ],
+  "scoped_rows_manual_pending": [
+    {
+      "row": "P2",
+      "reason": "Login compression remains scoped M100 protocol debt; no real-client compression run is available in this M94 scaffold."
+    },
+    {
+      "row": "P3",
+      "reason": "Online/offline auth, duplicate names, whitelist, banlist, and op persistence remain manual-pending for public-safety review."
+    },
+    {
+      "row": "B6",
+      "reason": "Falling-block landing, placement/removal, and drops need a dedicated real-client/oracle route; M94 does not count prior start-only evidence as full coverage."
+    }
+  ],
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client"
+  ],
+  "scenarios": [
+    {
+      "id": "m94-01-join-rejoin-chunks-movement",
+      "title": "Join, chunk visibility, movement, disconnect, and rejoin",
+      "ledger_rows": ["P1", "P4", "W3", "C1", "C2", "B4", "B5"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris with the configured debug server command and record server logs from startup.",
+        "Connect one vanilla 26.1.2 client to 127.0.0.1:25565.",
+        "Wait until the spawn area is visible and record whether missing chunks, black chunks, or lighting artifacts remain after 30 seconds.",
+        "Walk, sprint, jump, and enter/leave nearby water if present; record swim feel and any rubber-banding.",
+        "Disconnect, reconnect with the same profile, and verify position, inventory hotbar, and visible chunk state are stable."
+      ],
+      "expected_observations": [
+        "Client reaches play without disconnect.",
+        "Spawn chunks become visible without persistent lighting holes.",
+        "Movement remains interactive and rejoin does not strand the player in unloaded terrain."
+      ]
+    },
+    {
+      "id": "m94-02-blocks-fluids-farming-drops",
+      "title": "Block edits, fluids, farming, and visible drops",
+      "ledger_rows": ["B1", "B2", "B3", "F1", "F2", "F3", "F4", "L1", "L2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 18,
+      "screenshots_required": true,
+      "steps": [
+        "Break and place common solid blocks near spawn; record rejection, ghost block, or relight desyncs.",
+        "Use a door or trapdoor and a bucket where available; record visible state and nearby fluid behavior.",
+        "Exercise the named M40/M41 route: visible drops/pickup, sugar cane support/cascade/drop behavior, and nearby water movement feel.",
+        "Harvest or bonemeal one available crop or plant family and record mature/immature drops as observed by the client."
+      ],
+      "expected_observations": [
+        "Block acknowledgements do not leave persistent ghost blocks.",
+        "Drops are visible, can be picked up, and disappear for the player after pickup.",
+        "Sugar cane or substitute vertical-plant behavior is classified as pass, degraded, or blocked with notes."
+      ]
+    },
+    {
+      "id": "m94-03-inventory-crafting-containers-stations",
+      "title": "Inventory, crafting, containers, and common stations",
+      "ledger_rows": ["I1", "I2", "K1", "K2", "A1"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 18,
+      "screenshots_required": true,
+      "steps": [
+        "Move items between hotbar, inventory, and cursor; record item loss, duplication, or cursor recovery failures.",
+        "Craft one shaped or shapeless recipe and record recipe output plus inventory conservation.",
+        "Open, click in, and close a chest or barrel; repeat with one furnace-family UI if available.",
+        "Classify unavailable common stations as degraded, accepted divergence, or blocked instead of skipping silently."
+      ],
+      "expected_observations": [
+        "Inventory and cursor state match visible client actions after close/reopen.",
+        "Container contents remain stable across close/open within the same run.",
+        "Unsupported stations are named explicitly in observations."
+      ]
+    },
+    {
+      "id": "m94-04-signs-beds-campfires-and-block-entities",
+      "title": "Signs, beds, campfires, and block-entity visuals",
+      "ledger_rows": ["E1", "E2", "E3", "S1"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 16,
+      "screenshots_required": true,
+      "steps": [
+        "Place or interact with a regular sign; enter plain text and verify the text is visible after closing the editor.",
+        "Use a bed to set respawn if available and record any time/sleep/weather behavior without claiming untested parity.",
+        "Place or use a campfire with a cookable item if available; record visual item state, cooked drop, and pickup behavior.",
+        "Restart the server only if the run owner has time; otherwise record persistence as not run for this scenario."
+      ],
+      "expected_observations": [
+        "Plain sign text remains visible to the client after edit.",
+        "Bed and campfire behavior is classified with explicit unsupported or degraded notes.",
+        "Any restart persistence claim names the before/after artifacts."
+      ]
+    },
+    {
+      "id": "m94-05-entities-combat-death-respawn",
+      "title": "Entities, combat, death, and respawn",
+      "ledger_rows": ["V1", "N1", "N2", "G1", "G2", "G3", "G4"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "steps": [
+        "Observe nearby passive, hostile, or aquatic entity movement if present; record pathing stalls or visibility desyncs.",
+        "Exercise melee combat with a common mob if available and record damage, knockback, drops, and XP visibility.",
+        "Exercise one projectile or shield path only if equipment is available; otherwise mark that sub-row degraded/not run.",
+        "Die and respawn only if safe to reproduce in the prepared world; record death screen, respawn location, item/XP consequences, and reconnect state."
+      ],
+      "expected_observations": [
+        "Entity presence and movement are recorded as real-client observations, not inferred from server logs.",
+        "Combat and respawn claims are limited to the exact paths executed.",
+        "Vehicles remain explicit unknown/deferred if no real-client vehicle path is available."
+      ]
+    },
+    {
+      "id": "m94-06-save-restart-two-client-visibility",
+      "title": "Save/restart and two-client visibility",
+      "ledger_rows": ["S1", "S2", "L2", "K1", "N1", "G4"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 25,
+      "screenshots_required": true,
+      "steps": [
+        "Connect two vanilla clients and verify each can see the other join, move, and perform one block edit.",
+        "Have both clients observe one shared drop, pickup, or container interaction; record whether both views converge.",
+        "Stop Solaris cleanly, restart with the same config, reconnect, and record persisted player, chunk, container, entity, and drop state for only the paths exercised.",
+        "Record any disconnect/reconnect or contention failures as M97 candidate blockers."
+      ],
+      "expected_observations": [
+        "Two-client observations are made from both clients, not only server logs.",
+        "Restart evidence names exact state that persisted and exact state not tested.",
+        "Visibility or contention failures are marked blocked with artifacts."
+      ]
+    },
+    {
+      "id": "m94-07-m40-m41-route-with-metrics",
+      "title": "Named M40/M41 water, drops, sugar cane, mobs, TPS, and lock route",
+      "ledger_rows": ["B3", "B4", "F3", "L2", "N1", "O1", "O2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "steps": [
+        "Run the debug server with logging sufficient to capture TPS/tick budget and lock-pressure warnings.",
+        "Use the original owner-facing water route when available: enter water, sprint-swim, surface, leave water, and record swim feel.",
+        "Break or harvest a block that produces a visible drop, pick it up, and record client/server convergence.",
+        "Exercise sugar cane support/cascade/drop behavior if the world provides it, or record the exact setup gap.",
+        "Observe nearby mob or aquatic movement and capture the server log section for TPS/lock evidence."
+      ],
+      "expected_observations": [
+        "The historical water/frozen-world symptom is either reproduced, cleared by real-client observation, or left blocked.",
+        "TPS/lock log capture is attached to the run artifacts.",
+        "The scenario does not substitute protocol-harness metrics for real-client observations."
+      ]
+    }
+  ]
+}
