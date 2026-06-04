@@ -18,7 +18,9 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::ClientboundKnownPacks;
 use mc_protocol::packets::handshake::{Handshake, NextState};
-use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
+use mc_protocol::packets::login::{
+    LoginAcknowledged, LoginDisconnect, LoginStart, LoginSuccess, SetCompression,
+};
 use mc_protocol::packets::status::{StatusRequest, StatusResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -29,6 +31,17 @@ async fn start_server() -> SocketAddr {
 }
 
 async fn start_server_with_policy(chunk_pipeline: mc_net::ChunkPipelinePolicy) -> SocketAddr {
+    start_server_with_policy_and_permissions(
+        chunk_pipeline,
+        mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+    )
+    .await
+}
+
+async fn start_server_with_policy_and_permissions(
+    chunk_pipeline: mc_net::ChunkPipelinePolicy,
+    command_permissions: mc_net::CommandPermissionConfig,
+) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.d login".into(),
@@ -50,7 +63,7 @@ async fn start_server_with_policy(chunk_pipeline: mc_net::ChunkPipelinePolicy) -
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
-        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        command_permissions,
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
@@ -59,6 +72,64 @@ async fn start_server_with_policy(chunk_pipeline: mc_net::ChunkPipelinePolicy) -
         let _ = bound.serve().await;
     });
     addr
+}
+
+fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
+    let cfg: mc_server::ServerConfig = toml::from_str(toml_src).expect("parse config");
+    cfg.to_network(
+        std::sync::Arc::new(mc_data::testing::stub()),
+        std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        None,
+        std::sync::Arc::new(mc_data::tags::TagsData::default()),
+        std::sync::Arc::new(Vec::new()),
+        std::sync::Arc::new(mc_data::loot::LootTables::default()),
+        None,
+        std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+    )
+    .expect("network config")
+}
+
+async fn start_server_from_toml(toml_src: &str) -> SocketAddr {
+    let bound = mc_net::bind(network_config_from_toml(toml_src))
+        .await
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    addr
+}
+
+async fn send_login_start(addr: SocketAddr, name: &str) -> (TcpStream, BytesMut) {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let rbuf = BytesMut::with_capacity(4096);
+    write_frame(
+        &mut stream,
+        &Handshake {
+            protocol_version: PROTOCOL_VERSION,
+            server_address: "127.0.0.1".into(),
+            server_port: addr.port(),
+            next_state: NextState::Login,
+        },
+        Compression::Disabled,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &LoginStart {
+            name: name.into(),
+            player_uuid: Uuid::nil(),
+        },
+        Compression::Disabled,
+    )
+    .await;
+    (stream, rbuf)
 }
 
 async fn drive_to_set_compression(addr: SocketAddr, name: &str) -> SetCompression {
@@ -185,6 +256,83 @@ async fn login_uses_configured_compression_threshold() {
     let set_compression = drive_to_set_compression(addr, "ThresholdProbe").await;
 
     assert_eq!(set_compression.threshold, 128);
+}
+
+#[tokio::test]
+async fn login_whitelist_rejects_before_compression() {
+    let permissions = mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false)
+        .with_login_access(mc_net::LoginAccessConfig::normalized(
+            false,
+            true,
+            ["Allowed"],
+            std::iter::empty::<&str>(),
+        ));
+    let addr = start_server_with_policy_and_permissions(
+        mc_net::ChunkPipelinePolicy::default(),
+        permissions,
+    )
+    .await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "Blocked").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, LoginDisconnect::ID);
+    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+    assert!(disconnect.reason_json.contains("not whitelisted"));
+}
+
+#[tokio::test]
+async fn login_toml_online_mode_rejects_before_compression() {
+    let addr = start_server_from_toml(
+        r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+
+            [auth]
+            online_mode = true
+        "#,
+    )
+    .await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "Notch").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, LoginDisconnect::ID);
+    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+    assert!(
+        disconnect
+            .reason_json
+            .contains("only supports offline-mode")
+    );
+}
+
+#[tokio::test]
+async fn login_toml_ban_rejects_before_compression() {
+    let addr = start_server_from_toml(
+        r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+
+            [auth]
+            online_mode = false
+            banned_players = ["Notch"]
+        "#,
+    )
+    .await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "Notch").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, LoginDisconnect::ID);
+    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
+    assert!(disconnect.reason_json.contains("banned"));
 }
 
 #[tokio::test]

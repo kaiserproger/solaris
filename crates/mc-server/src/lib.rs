@@ -27,6 +27,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level server configuration loaded from a TOML file at startup.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub server: ServerSection,
     pub network: NetworkSection,
@@ -38,10 +39,13 @@ pub struct ServerConfig {
     pub simulation: SimulationSection,
     #[serde(default)]
     pub admin: AdminSection,
+    #[serde(default)]
+    pub auth: AuthSection,
 }
 
 /// Identity-level server settings.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerSection {
     pub name: String,
     pub motd: String,
@@ -55,6 +59,7 @@ pub struct ServerSection {
 
 /// Network-level server settings.
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkSection {
     pub bind_address: String,
     pub port: u16,
@@ -150,11 +155,25 @@ pub struct SimulationSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AdminSection {
     #[serde(default)]
     pub operators: Vec<String>,
     #[serde(default = "default_allow_local_dev_operators")]
     pub allow_local_dev_operators: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct AuthSection {
+    #[serde(default)]
+    pub online_mode: bool,
+    #[serde(default)]
+    pub whitelist_enabled: bool,
+    #[serde(default)]
+    pub whitelist: Vec<String>,
+    #[serde(default)]
+    pub banned_players: Vec<String>,
 }
 
 impl Default for AdminSection {
@@ -309,7 +328,7 @@ fn default_save_interval_ticks() -> u64 {
 }
 
 fn default_allow_local_dev_operators() -> bool {
-    true
+    false
 }
 
 impl ServerConfig {
@@ -355,7 +374,13 @@ impl ServerConfig {
             command_permissions: mc_net::CommandPermissionConfig::new(
                 self.admin.operators.clone(),
                 self.admin.allow_local_dev_operators,
-            ),
+            )
+            .with_login_access(mc_net::LoginAccessConfig::normalized(
+                self.auth.online_mode,
+                self.auth.whitelist_enabled,
+                self.auth.whitelist.clone(),
+                self.auth.banned_players.clone(),
+            )),
             shutdown: mc_net::ShutdownHandle::default(),
         })
     }
@@ -392,6 +417,38 @@ mod tests {
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
         assert!(cfg.data.vanilla_data_dir.is_none());
         assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+        assert!(!cfg.admin.allow_local_dev_operators);
+        assert!(!cfg.auth.online_mode);
+        assert!(!cfg.auth.whitelist_enabled);
+    }
+
+    #[test]
+    fn parses_explicit_auth_and_admin_policy() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [admin]
+            operators = ["Notch"]
+            allow_local_dev_operators = true
+
+            [auth]
+            online_mode = false
+            whitelist_enabled = true
+            whitelist = ["Notch"]
+            banned_players = ["BadActor"]
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.admin.operators, ["Notch"]);
+        assert!(cfg.admin.allow_local_dev_operators);
+        assert!(cfg.auth.whitelist_enabled);
+        assert_eq!(cfg.auth.whitelist, ["Notch"]);
+        assert_eq!(cfg.auth.banned_players, ["BadActor"]);
     }
 
     #[test]
@@ -450,6 +507,80 @@ mod tests {
 
         let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
         assert!(err.to_string().contains("unknown field `vanilla_dir`"));
+    }
+
+    #[test]
+    fn server_section_rejects_unknown_fields() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+            online_mode = false
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `online_mode`"));
+    }
+
+    #[test]
+    fn network_section_rejects_unknown_fields() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+            online_mode = false
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `online_mode`"));
+    }
+
+    #[test]
+    fn admin_section_rejects_unknown_fields() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [admin]
+            operators = []
+            op_everyone = true
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `op_everyone`"));
+    }
+
+    #[test]
+    fn auth_section_rejects_unknown_fields() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [auth]
+            online_mode = false
+            ops = ["Notch"]
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `ops`"));
     }
 
     #[test]
