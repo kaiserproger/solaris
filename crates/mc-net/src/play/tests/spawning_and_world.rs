@@ -767,6 +767,7 @@ fn chunk_herd_materialization_dedupes_restored_herd_uuid() {
         health: 10.0,
         attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
         goal: GoalState::Idle,
+        vehicle: None,
     };
 
     assert_eq!(registry.restore_persisted_entities([restored]), 1);
@@ -806,6 +807,7 @@ fn entity_physics_skips_persisted_entities_without_loaded_players() {
         health: 10.0,
         attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
         goal: GoalState::Idle,
+        vehicle: None,
     };
 
     assert_eq!(registry.restore_persisted_entities([restored]), 1);
@@ -847,6 +849,7 @@ fn entity_physics_skips_loaded_entities_outside_simulation_distance() {
         health: 10.0,
         attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
         goal: GoalState::Idle,
+        vehicle: None,
     };
     let far = mc_entity::EntitySnapshot {
         id: EntityId(2),
@@ -864,6 +867,7 @@ fn entity_physics_skips_loaded_entities_outside_simulation_distance() {
         health: 10.0,
         attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
         goal: GoalState::Idle,
+        vehicle: None,
     };
 
     assert_eq!(registry.restore_persisted_entities([near, far]), 2);

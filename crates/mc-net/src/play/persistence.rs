@@ -400,6 +400,7 @@ pub(crate) fn load_persisted_entities(
                     period_ticks: 80,
                 }
             },
+            vehicle: None,
         });
     }
     Ok(entities)
@@ -1074,6 +1075,7 @@ mod tests {
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
+            vehicle: None,
         };
         let cow = EntitySnapshot {
             id: EntityId(101),
@@ -1098,6 +1100,7 @@ mod tests {
                 speed: 0.8,
                 period_ticks: 80,
             },
+            vehicle: None,
         };
         let falling_block = EntitySnapshot {
             id: EntityId(102),
@@ -1115,6 +1118,7 @@ mod tests {
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
+            vehicle: None,
         };
 
         save_persisted_entities(
@@ -1183,6 +1187,7 @@ mod tests {
             health: 3.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
+            vehicle: None,
         };
 
         save_persisted_entities(tmp.path(), &items, &[cod]).unwrap();
@@ -1214,6 +1219,7 @@ mod tests {
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
+            vehicle: None,
         };
 
         std::thread::scope(|scope| {
