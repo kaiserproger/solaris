@@ -33,6 +33,7 @@ pub(super) enum ChunkStreamStep {
 }
 
 const INITIAL_CHUNK_MIN_RING: i32 = 2;
+const CHUNK_STAGE_SLOW_MS: u64 = 50;
 
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
@@ -66,6 +67,19 @@ pub(super) struct ChunkStreamState {
     packet_encode_ms: u64,
     frame_ms: u64,
     socket_write_ms: u64,
+    max_fetch_ms: u64,
+    max_chunk_data_ms: u64,
+    max_heightmap_ms: u64,
+    max_light_compute_ms: u64,
+    max_light_encode_ms: u64,
+    max_packet_encode_ms: u64,
+    max_frame_ms: u64,
+    max_socket_write_ms: u64,
+    slow_fetch_chunks: usize,
+    slow_light_compute_chunks: usize,
+    slow_packet_encode_chunks: usize,
+    slow_frame_chunks: usize,
+    slow_socket_write_chunks: usize,
     framed_bytes: usize,
     first_chunk_ms: Option<u64>,
     ring1_complete_ms: Option<u64>,
@@ -92,6 +106,17 @@ pub(super) struct PreparedChunkFrame {
     pub(super) packet_data_len: usize,
     pub(super) build_timing: ChunkBuildTiming,
     pub(super) write_timing: ChunkWriteTiming,
+}
+
+impl PreparedChunkFrame {
+    fn prepared_cache_hit(&self) -> Self {
+        let mut cached = self.clone();
+        let framed_bytes = cached.write_timing.framed_bytes;
+        cached.build_timing = ChunkBuildTiming::default();
+        cached.write_timing = ChunkWriteTiming::default();
+        cached.write_timing.framed_bytes = framed_bytes;
+        cached
+    }
 }
 
 enum ChunkPrepareOutcome {
@@ -615,6 +640,19 @@ impl ChunkStreamState {
             packet_encode_ms: 0,
             frame_ms: 0,
             socket_write_ms: 0,
+            max_fetch_ms: 0,
+            max_chunk_data_ms: 0,
+            max_heightmap_ms: 0,
+            max_light_compute_ms: 0,
+            max_light_encode_ms: 0,
+            max_packet_encode_ms: 0,
+            max_frame_ms: 0,
+            max_socket_write_ms: 0,
+            slow_fetch_chunks: 0,
+            slow_light_compute_chunks: 0,
+            slow_packet_encode_chunks: 0,
+            slow_frame_chunks: 0,
+            slow_socket_write_chunks: 0,
             framed_bytes: 0,
             first_chunk_ms: None,
             ring1_complete_ms: None,
@@ -693,6 +731,19 @@ impl ChunkStreamState {
         self.packet_encode_ms = 0;
         self.frame_ms = 0;
         self.socket_write_ms = 0;
+        self.max_fetch_ms = 0;
+        self.max_chunk_data_ms = 0;
+        self.max_heightmap_ms = 0;
+        self.max_light_compute_ms = 0;
+        self.max_light_encode_ms = 0;
+        self.max_packet_encode_ms = 0;
+        self.max_frame_ms = 0;
+        self.max_socket_write_ms = 0;
+        self.slow_fetch_chunks = 0;
+        self.slow_light_compute_chunks = 0;
+        self.slow_packet_encode_chunks = 0;
+        self.slow_frame_chunks = 0;
+        self.slow_socket_write_chunks = 0;
         self.framed_bytes = 0;
         self.first_chunk_ms = None;
         self.ring1_complete_ms = None;
@@ -793,7 +844,7 @@ impl ChunkStreamState {
                     request,
                     fetch_ms: 0,
                     staged: Vec::new(),
-                    outcome: ChunkPrepareOutcome::Ready(Box::new((*prepared).clone())),
+                    outcome: ChunkPrepareOutcome::Ready(Box::new(prepared.prepared_cache_hit())),
                 });
                 dispatched_this_turn += 1;
                 self.dispatched += 1;
@@ -866,6 +917,10 @@ impl ChunkStreamState {
         let cx = request.chunk_x;
         let cz = request.chunk_z;
         self.fetch_ms += result.fetch_ms;
+        self.max_fetch_ms = self.max_fetch_ms.max(result.fetch_ms);
+        if result.fetch_ms >= CHUNK_STAGE_SLOW_MS {
+            self.slow_fetch_chunks += 1;
+        }
         self.staged.extend(result.staged);
 
         match result.outcome {
@@ -884,6 +939,7 @@ impl ChunkStreamState {
                 dispatch_visibility_commands(visibility);
                 self.sessions
                     .cache_prepared_chunk((cx, cz), Arc::new((*prepared).clone()));
+                self.record_stage_maxima(prepared.build_timing, write_timing);
                 self.build_timing.add(prepared.build_timing);
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
@@ -898,6 +954,32 @@ impl ChunkStreamState {
 
         self.scheduler.mark_finished(request);
         Ok(true)
+    }
+
+    fn record_stage_maxima(
+        &mut self,
+        build_timing: ChunkBuildTiming,
+        write_timing: ChunkWriteTiming,
+    ) {
+        self.max_chunk_data_ms = self.max_chunk_data_ms.max(build_timing.chunk_data_ms);
+        self.max_heightmap_ms = self.max_heightmap_ms.max(build_timing.heightmap_ms);
+        self.max_light_compute_ms = self.max_light_compute_ms.max(build_timing.light_compute_ms);
+        self.max_light_encode_ms = self.max_light_encode_ms.max(build_timing.light_encode_ms);
+        self.max_packet_encode_ms = self.max_packet_encode_ms.max(write_timing.packet_encode_ms);
+        self.max_frame_ms = self.max_frame_ms.max(write_timing.frame_ms);
+        self.max_socket_write_ms = self.max_socket_write_ms.max(write_timing.socket_write_ms);
+        if build_timing.light_compute_ms >= CHUNK_STAGE_SLOW_MS {
+            self.slow_light_compute_chunks += 1;
+        }
+        if write_timing.packet_encode_ms >= CHUNK_STAGE_SLOW_MS {
+            self.slow_packet_encode_chunks += 1;
+        }
+        if write_timing.frame_ms >= CHUNK_STAGE_SLOW_MS {
+            self.slow_frame_chunks += 1;
+        }
+        if write_timing.socket_write_ms >= CHUNK_STAGE_SLOW_MS {
+            self.slow_socket_write_chunks += 1;
+        }
     }
 
     fn record_emitted(
@@ -956,6 +1038,20 @@ impl ChunkStreamState {
             packet_encode_ms = self.packet_encode_ms,
             frame_ms = self.frame_ms,
             socket_write_ms = self.socket_write_ms,
+            max_fetch_ms = self.max_fetch_ms,
+            max_chunk_data_ms = self.max_chunk_data_ms,
+            max_heightmap_ms = self.max_heightmap_ms,
+            max_light_compute_ms = self.max_light_compute_ms,
+            max_light_encode_ms = self.max_light_encode_ms,
+            max_packet_encode_ms = self.max_packet_encode_ms,
+            max_frame_ms = self.max_frame_ms,
+            max_socket_write_ms = self.max_socket_write_ms,
+            slow_stage_threshold_ms = CHUNK_STAGE_SLOW_MS,
+            slow_fetch_chunks = self.slow_fetch_chunks,
+            slow_light_compute_chunks = self.slow_light_compute_chunks,
+            slow_packet_encode_chunks = self.slow_packet_encode_chunks,
+            slow_frame_chunks = self.slow_frame_chunks,
+            slow_socket_write_chunks = self.slow_socket_write_chunks,
             chunk_send_rate = self.policy.chunk_send_rate,
             chunk_load_rate = self.policy.chunk_load_rate,
             chunk_generate_rate = self.policy.chunk_generate_rate,
@@ -1569,4 +1665,44 @@ where
     let socket_write_started = Instant::now();
     writer.write_all(framed).await?;
     Ok(socket_write_started.elapsed().as_millis() as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_cache_hit_drops_historical_cpu_and_encode_timings() {
+        let prepared = PreparedChunkFrame {
+            frame: Bytes::from_static(b"chunk-frame"),
+            light: None,
+            herd_spawns: Vec::new(),
+            packet_data_len: 123,
+            build_timing: ChunkBuildTiming {
+                chunk_data_ms: 10,
+                heightmap_ms: 11,
+                light_compute_ms: 12,
+                light_encode_ms: 13,
+            },
+            write_timing: ChunkWriteTiming {
+                packet_encode_ms: 14,
+                frame_ms: 15,
+                socket_write_ms: 16,
+                framed_bytes: 17,
+            },
+        };
+
+        let cached = prepared.prepared_cache_hit();
+
+        assert_eq!(cached.frame, prepared.frame);
+        assert_eq!(cached.packet_data_len, prepared.packet_data_len);
+        assert_eq!(cached.build_timing.chunk_data_ms, 0);
+        assert_eq!(cached.build_timing.heightmap_ms, 0);
+        assert_eq!(cached.build_timing.light_compute_ms, 0);
+        assert_eq!(cached.build_timing.light_encode_ms, 0);
+        assert_eq!(cached.write_timing.packet_encode_ms, 0);
+        assert_eq!(cached.write_timing.frame_ms, 0);
+        assert_eq!(cached.write_timing.socket_write_ms, 0);
+        assert_eq!(cached.write_timing.framed_bytes, 17);
+    }
 }
