@@ -396,6 +396,10 @@ pub struct Chunk {
     /// this to `false` so loading a fresh region from disk does not
     /// re-trigger a write.
     pub dirty: bool,
+    /// Monotonic token bumped when runtime-owned state marks this chunk dirty.
+    /// Dirty flush commit can compare this token instead of re-encoding under
+    /// the world lock when no post-plan mutation happened.
+    pub dirty_generation: u64,
 }
 
 /// M7: production interface every chunk generator implements. Lives
@@ -441,7 +445,13 @@ impl Chunk {
             section_lights: vec![SectionLight::default(); SECTION_COUNT],
             extras: Vec::new(),
             dirty: false,
+            dirty_generation: 0,
         }
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.dirty_generation = self.dirty_generation.wrapping_add(1).max(1);
     }
 
     /// Look up a block by chunk-local (x, z) and absolute world y.
@@ -484,7 +494,7 @@ impl Chunk {
         if prev == state {
             return Some(prev);
         }
-        self.dirty = true;
+        self.mark_dirty();
         // Heightmap entries store `height + 1`-style values (the Y of
         // the first air cell above the column), matching vanilla's
         // on-disk packing. Recompute the column for every present
@@ -537,7 +547,7 @@ impl Chunk {
         self.scheduled_block_ticks.push(tick);
         self.scheduled_block_ticks
             .sort_by_key(ScheduledBlockTick::sort_key);
-        self.dirty = true;
+        self.mark_dirty();
         true
     }
 
@@ -563,7 +573,7 @@ impl Chunk {
             }
         });
         if self.scheduled_block_ticks.len() != before {
-            self.dirty = true;
+            self.mark_dirty();
         }
         removed
     }
@@ -583,7 +593,7 @@ impl Chunk {
         if due_count == 0 {
             return Vec::new();
         }
-        self.dirty = true;
+        self.mark_dirty();
         self.scheduled_block_ticks.drain(0..due_count).collect()
     }
 
@@ -607,7 +617,7 @@ impl Chunk {
         self.scheduled_fluid_ticks.push(tick);
         self.scheduled_fluid_ticks
             .sort_by_key(ScheduledFluidTick::sort_key);
-        self.dirty = true;
+        self.mark_dirty();
         true
     }
 
@@ -633,7 +643,7 @@ impl Chunk {
             }
         });
         if self.scheduled_fluid_ticks.len() != before {
-            self.dirty = true;
+            self.mark_dirty();
         }
         removed
     }
@@ -653,7 +663,7 @@ impl Chunk {
         if due_count == 0 {
             return Vec::new();
         }
-        self.dirty = true;
+        self.mark_dirty();
         self.scheduled_fluid_ticks.drain(0..due_count).collect()
     }
 

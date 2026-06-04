@@ -1432,7 +1432,7 @@ async fn generate_fresh_chunk(
     match tokio::task::spawn_blocking(move || {
         let _permit = permit;
         let mut chunk = generator.generate(pos);
-        chunk.dirty = true;
+        chunk.mark_dirty();
         chunk
     })
     .await
