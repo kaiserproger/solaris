@@ -789,6 +789,63 @@ fn fluid_test_facts() -> mc_data::block_facts::BlockFactsTable {
     mc_data::block_facts::BlockFactsTable::from_blocks_report(&fluid_test_reports())
 }
 
+fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> InteractionState {
+    let items = Arc::new(ItemRegistry::from_report(&[]));
+    let world = Arc::new(tokio::sync::Mutex::new(mc_world::WorldStorage::in_memory(
+        Arc::clone(&blocks),
+    )));
+    let item_to_block = ItemToBlockTable::build(&items, &blocks);
+    InteractionState {
+        world,
+        blocks,
+        block_light: None,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        water: None,
+        sessions: Arc::new(SessionRegistry::new()),
+        session_id: 1,
+        workspace: LightWorkspace::new(),
+        light_cache: LightCache::new(),
+        compression: Compression::Disabled,
+        selected_hotbar_slot: 0,
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::EMPTY,
+        inventory_state_id: 1,
+        items,
+        item_facts: Arc::new(ItemFactsTable::default()),
+        entity_types: Arc::new(EntityTypeRegistry::default()),
+        item_to_block,
+        tags: Arc::new(TagsData::default()),
+        recipes: Vec::new(),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        next_container_id: FURNACE_CONTAINER_ID_MIN,
+        active_container: None,
+        pending_break: None,
+        pending_use: None,
+        pending_sign_edit: None,
+        shield_use: None,
+        last_hostile_damage_at: None,
+        last_entity_attack_at: None,
+        fluid_schedule_tick: 0,
+    }
+}
+
+async fn insert_fluid_test_chunk(state: &InteractionState) {
+    let cpos = ChunkPos { x: 0, z: 0 };
+    state
+        .world
+        .lock()
+        .await
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+}
+
 #[test]
 fn entity_tick_cadence_matches_vanilla_cow_tracking() {
     assert_eq!(ENTITY_TICK_PERIOD, Duration::from_millis(50));
@@ -1528,6 +1585,200 @@ fn cactus_column_cascades_when_support_breaks() {
             },
         ]
     );
+}
+
+#[test]
+fn cactus_column_cascades_when_solid_side_neighbor_is_placed() {
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let placed = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    let cactus_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cactus_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(cactus_1, BlockStateId(19)).unwrap();
+    world.set_block_at(cactus_2, BlockStateId(19)).unwrap();
+    let mut edits = vec![BlockEdit {
+        pos: placed,
+        new_state: BlockStateId(1),
+    }];
+
+    append_cactus_side_neighbor_cascades(
+        blocks,
+        &mut world,
+        &mut edits,
+        placed,
+        BlockStateId(1),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![
+            BlockEdit {
+                pos: placed,
+                new_state: BlockStateId(1),
+            },
+            BlockEdit {
+                pos: cactus_1,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: cactus_2,
+                new_state: BlockStateId(0),
+            },
+        ]
+    );
+}
+
+#[test]
+fn cactus_column_does_not_cascade_when_cactus_side_neighbor_is_placed() {
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let placed = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    let cactus_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cactus_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    world.set_block_at(cactus_1, BlockStateId(19)).unwrap();
+    world.set_block_at(cactus_2, BlockStateId(19)).unwrap();
+    let mut edits = vec![BlockEdit {
+        pos: placed,
+        new_state: BlockStateId(19),
+    }];
+
+    append_cactus_side_neighbor_cascades(
+        blocks,
+        &mut world,
+        &mut edits,
+        placed,
+        BlockStateId(19),
+        BlockStateId(0),
+    );
+
+    assert_eq!(
+        edits,
+        vec![BlockEdit {
+            pos: placed,
+            new_state: BlockStateId(19),
+        }]
+    );
+}
+
+#[tokio::test]
+async fn cactus_placement_path_cascades_when_solid_side_neighbor_is_placed() {
+    let state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    insert_fluid_test_chunk(&state).await;
+    let placed = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    let cactus_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cactus_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    {
+        let mut world = state.world.lock().await;
+        world.set_block_at(cactus_1, BlockStateId(19)).unwrap();
+        world.set_block_at(cactus_2, BlockStateId(19)).unwrap();
+    }
+
+    let edits = plan_place_block_edits(
+        &state,
+        placed,
+        BlockStateId(1),
+        PlayerPose::new(0.5, 64.0, 0.5),
+        Direction::Up,
+    )
+    .await;
+
+    assert_eq!(
+        edits,
+        Some(vec![
+            BlockEdit {
+                pos: placed,
+                new_state: BlockStateId(1),
+            },
+            BlockEdit {
+                pos: cactus_1,
+                new_state: BlockStateId(0),
+            },
+            BlockEdit {
+                pos: cactus_2,
+                new_state: BlockStateId(0),
+            },
+        ])
+    );
+}
+
+#[tokio::test]
+async fn cactus_placement_path_does_not_cascade_for_non_solid_side_neighbor() {
+    let state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    insert_fluid_test_chunk(&state).await;
+    let placed = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    let cactus_1 = mc_world::BlockPos { x: 4, y: 65, z: 4 };
+    let cactus_2 = mc_world::BlockPos { x: 4, y: 66, z: 4 };
+    {
+        let mut world = state.world.lock().await;
+        world.set_block_at(cactus_1, BlockStateId(19)).unwrap();
+        world.set_block_at(cactus_2, BlockStateId(19)).unwrap();
+    }
+
+    let edits = plan_place_block_edits(
+        &state,
+        placed,
+        BlockStateId(20),
+        PlayerPose::new(0.5, 64.0, 0.5),
+        Direction::Up,
+    )
+    .await;
+
+    assert_eq!(
+        edits,
+        Some(vec![BlockEdit {
+            pos: placed,
+            new_state: BlockStateId(20),
+        }])
+    );
+}
+
+#[tokio::test]
+async fn cactus_placement_path_rejects_adjacent_cactus() {
+    let state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    insert_fluid_test_chunk(&state).await;
+    let placed = mc_world::BlockPos { x: 5, y: 65, z: 4 };
+    {
+        let mut world = state.world.lock().await;
+        world
+            .set_block_at(mc_world::BlockPos { x: 4, y: 65, z: 4 }, BlockStateId(19))
+            .unwrap();
+    }
+
+    let edits = plan_place_block_edits(
+        &state,
+        placed,
+        BlockStateId(19),
+        PlayerPose::new(0.5, 64.0, 0.5),
+        Direction::Up,
+    )
+    .await;
+
+    assert_eq!(edits, None);
 }
 
 #[test]

@@ -6706,10 +6706,26 @@ async fn plan_place_block_edits(
         return Some(vec![BlockEdit { pos, new_state }]);
     }
     if !placed.block.id.path().ends_with("_door") {
-        return Some(vec![BlockEdit {
+        let air = air_state_id(&state.blocks);
+        let mut storage = state.world.lock().await;
+        if placed.block.id.path() == "cactus"
+            && cactus_has_side_neighbor(&state.blocks, &mut storage, pos)
+        {
+            return None;
+        }
+        let mut edits = vec![BlockEdit {
             pos,
             new_state: placed_state,
-        }]);
+        }];
+        append_cactus_side_neighbor_cascades(
+            &state.blocks,
+            &mut storage,
+            &mut edits,
+            pos,
+            placed_state,
+            air,
+        );
+        return Some(edits);
     }
     let upper_pos = mc_world::BlockPos {
         y: pos.y + 1,
@@ -6736,6 +6752,122 @@ async fn plan_place_block_edits(
             new_state: upper,
         },
     ])
+}
+
+fn append_cactus_side_neighbor_cascades(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    edits: &mut Vec<BlockEdit>,
+    placed: mc_world::BlockPos,
+    placed_state: mc_world::BlockStateId,
+    air: mc_world::BlockStateId,
+) {
+    if blocks
+        .by_id(placed_state)
+        .is_none_or(|state| !is_known_cactus_side_obstructor(state.block.id.path()))
+    {
+        return;
+    }
+
+    for (dx, dz) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+        let mut y = placed.y;
+        loop {
+            let pos = mc_world::BlockPos {
+                x: placed.x + dx,
+                y,
+                z: placed.z + dz,
+            };
+            let Ok(Some(state_id)) = storage.get_block(pos) else {
+                break;
+            };
+            let Some(state) = blocks.by_id(state_id) else {
+                break;
+            };
+            if state.block.id.path() != "cactus" {
+                break;
+            }
+            push_unique_block_edit(
+                edits,
+                BlockEdit {
+                    pos,
+                    new_state: air,
+                },
+            );
+            y += 1;
+        }
+    }
+}
+
+fn cactus_has_side_neighbor(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    placed: mc_world::BlockPos,
+) -> bool {
+    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .into_iter()
+        .any(|(dx, dz)| {
+            let pos = mc_world::BlockPos {
+                x: placed.x + dx,
+                y: placed.y,
+                z: placed.z + dz,
+            };
+            let Ok(Some(state_id)) = storage.get_block(pos) else {
+                return false;
+            };
+            blocks
+                .by_id(state_id)
+                .is_some_and(|state| state.block.id.path() == "cactus")
+        })
+}
+
+fn is_known_cactus_side_obstructor(path: &str) -> bool {
+    matches!(
+        path,
+        "stone"
+            | "granite"
+            | "polished_granite"
+            | "diorite"
+            | "polished_diorite"
+            | "andesite"
+            | "polished_andesite"
+            | "deepslate"
+            | "cobbled_deepslate"
+            | "tuff"
+            | "calcite"
+            | "dripstone_block"
+            | "grass_block"
+            | "dirt"
+            | "coarse_dirt"
+            | "podzol"
+            | "rooted_dirt"
+            | "mud"
+            | "clay"
+            | "sand"
+            | "red_sand"
+            | "gravel"
+            | "cobblestone"
+            | "mossy_cobblestone"
+            | "obsidian"
+            | "crying_obsidian"
+            | "bedrock"
+            | "netherrack"
+            | "basalt"
+            | "smooth_basalt"
+            | "blackstone"
+            | "end_stone"
+            | "anvil"
+            | "chipped_anvil"
+            | "damaged_anvil"
+    ) || path.ends_with("_planks")
+        || path.ends_with("_log")
+        || path.ends_with("_wood")
+        || path.ends_with("_stem")
+        || path.ends_with("_hyphae")
+        || path.ends_with("_leaves")
+        || path.ends_with("_wool")
+        || path.ends_with("_terracotta")
+        || path.ends_with("_concrete")
+        || path.ends_with("_concrete_powder")
 }
 
 fn sign_placement_state(

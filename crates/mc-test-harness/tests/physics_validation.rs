@@ -9,14 +9,15 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ClientboundSetEntityData,
-    ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent, GameMode,
-    LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind, PlayerCommandAction,
-    PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand,
-    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
-    ServerboundPlayerLoaded, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_block_pos, pack_section_relative_pos, unpack_block_pos,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
+    ClientboundSetEntityData, ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent,
+    GameMode, InteractionHand, LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind,
+    PlayerCommandAction, PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode,
+    ServerboundChatCommand, ServerboundClientTickEnd, ServerboundKeepAlive,
+    ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerCommand,
+    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -85,6 +86,16 @@ fn deterministic_physics_fixture_materializes_named_shapes() {
         world.get_block(BlockPos { x: 6, y: 63, z: 4 }).unwrap(),
         Some(states.farmland),
         "farmland trampling scenario should have a target block"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 6, y: 64, z: 6 }).unwrap(),
+        Some(states.cactus),
+        "cactus side-neighbor fixture should contain a cactus column"
+    );
+    assert_eq!(
+        world.get_block(BlockPos { x: 7, y: 64, z: 6 }).unwrap(),
+        Some(states.air),
+        "cactus side-neighbor fixture should leave placement target open"
     );
     assert_eq!(
         world.get_block(BlockPos { x: 4, y: 64, z: 10 }).unwrap(),
@@ -551,6 +562,85 @@ async fn falling_blocks_start_when_support_breaks() {
 }
 
 #[tokio::test]
+async fn cactus_dirt_side_neighbor_placement_cascades_visible_column_removal() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let Some(items) = load_item_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let dirt_item = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item id");
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M82CactusSide").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 7.5,
+            y: 64.0,
+            z: 8.5,
+            yaw: 180.0,
+            pitch: 20.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within cactus side-neighbor placement reach");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 1 0".into(),
+        })
+        .await
+        .expect("give dirt");
+    wait_for_slot_stack(&mut client, dirt_item, 1).await;
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(7, 63, 6),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 182,
+        })
+        .await
+        .expect("place dirt beside cactus");
+
+    let observation =
+        wait_for_block_action_observation(&mut client, 182, &[(7, 64, 6), (6, 64, 6), (6, 65, 6)])
+            .await;
+    assert_eq!(
+        observation.last_target_state(),
+        Some(states.dirt.0 as i32),
+        "placed side-neighbor should remain visible"
+    );
+    for y in 64..=65 {
+        assert_eq!(
+            observation.last_state_at((6, y, 6)),
+            Some(states.air.0 as i32),
+            "cactus at y={y} should clear when a dirt side neighbor is placed"
+        );
+    }
+    assert!(
+        observation.saw_ack,
+        "cactus dirt side-neighbor placement should acknowledge sequence"
+    );
+}
+
+#[tokio::test]
 async fn external_vanilla_sugar_cane_support_break_oracle() {
     let Ok(addr) = std::env::var("M43_VANILLA_ADDR") else {
         eprintln!("skipping: M43_VANILLA_ADDR not set");
@@ -640,6 +730,9 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
         .ok()
         .map(Arc::new);
     let registries_path = vanilla_dir.join("reports/registries.json");
+    let items = mc_data::items::load_items_report(&registries_path)
+        .map(|report| mc_data::items::ItemRegistry::from_report(&report))
+        .unwrap_or_default();
     let entity_types = mc_data::entity_types::load_entity_types_report(&registries_path)
         .map(|report| mc_data::entity_types::EntityTypeRegistry::from_report(&report))
         .unwrap_or_default();
@@ -656,7 +749,7 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
         recipes: Arc::new(Vec::new()),
         loot: Arc::new(mc_data::loot::LootTables::default()),
         block_light,
-        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        items: Arc::new(items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts,
         entity_types: Arc::new(entity_types),
@@ -683,6 +776,17 @@ fn load_block_registry() -> Option<Arc<BlockRegistry>> {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     Some(Arc::new(
         mc_world::BlockRegistry::from_report(&report).expect("block registry builds"),
+    ))
+}
+
+fn load_item_registry() -> Option<mc_data::items::ItemRegistry> {
+    let registries_json = vanilla_data_dir().join("reports/registries.json");
+    if !registries_json.exists() {
+        eprintln!("skipping: {} missing", registries_json.display());
+        return None;
+    }
+    Some(mc_data::items::ItemRegistry::from_report(
+        &mc_data::items::load_items_report(&registries_json).expect("items report loads"),
     ))
 }
 
@@ -746,6 +850,9 @@ fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureSt
     set(&mut world, 12, 66, 2, states.stone);
     set(&mut world, 12, 67, 2, states.anvil);
     set(&mut world, 6, 63, 4, states.farmland);
+    set(&mut world, 6, 63, 6, states.sand);
+    set(&mut world, 6, 64, 6, states.cactus);
+    set(&mut world, 6, 65, 6, states.cactus);
 
     set(&mut world, 4, 63, 10, states.stone);
     set(&mut world, 4, 64, 10, states.water);
@@ -780,6 +887,7 @@ struct FixtureStates {
     water: BlockStateId,
     flowing_water: BlockStateId,
     sugar_cane: BlockStateId,
+    cactus: BlockStateId,
     sand: BlockStateId,
     gravel: BlockStateId,
     anvil: BlockStateId,
@@ -796,6 +904,7 @@ impl FixtureStates {
             water: default_state(blocks, "minecraft:water"),
             flowing_water: state_with_props(blocks, "minecraft:water", &[("level", "1")]),
             sugar_cane: default_state(blocks, "minecraft:sugar_cane"),
+            cactus: default_state(blocks, "minecraft:cactus"),
             sand: default_state(blocks, "minecraft:sand"),
             gravel: default_state(blocks, "minecraft:gravel"),
             anvil: default_state(blocks, "minecraft:anvil"),
@@ -1038,6 +1147,31 @@ async fn wait_for_health_near(client: &mut Client, health: f32, tolerance: f32) 
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode set health");
             if (pkt.health - health).abs() <= tolerance {
+                return;
+            }
+        }
+    }
+}
+
+async fn wait_for_slot_stack(client: &mut Client, item_id: u32, count: i32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for slot stack item={item_id} count={count}"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("slot stack update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
+            if pkt.item_stack.item_id == item_id && pkt.item_stack.count == count {
                 return;
             }
         }
