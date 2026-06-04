@@ -730,6 +730,7 @@ dependencies = [
  "mc-protocol",
  "mc-world",
  "mc-worldgen",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",
