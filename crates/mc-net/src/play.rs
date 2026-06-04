@@ -188,6 +188,7 @@ pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
 const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.0;
+const SHIELD_FALLBACK_MAX_DAMAGE: i32 = 336;
 
 const SPAWN_X: f64 = 0.5;
 // The bundled test world uses vanilla's flat-preset surface: bedrock
@@ -3816,7 +3817,9 @@ where
         );
         return Ok(());
     };
-    damage_held_weapon_after_attack(state, writer).await?;
+    if weapon_attacks_damage_held_item(game_mode) {
+        damage_held_weapon_after_attack(state, writer).await?;
+    }
     if game_mode == GameMode::Survival
         && survival_state.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION)
     {
@@ -4389,6 +4392,64 @@ fn refresh_shield_use_state(state: &mut InteractionState) {
     }
 }
 
+fn shield_durability_damage(blocked_damage: f32) -> i32 {
+    if blocked_damage < 3.0 {
+        return 0;
+    }
+    if !blocked_damage.is_finite() {
+        return i32::MAX;
+    }
+    let scaled = blocked_damage.max(0.0).floor();
+    if scaled >= (i32::MAX - 1) as f32 {
+        i32::MAX
+    } else {
+        (scaled as i32).saturating_add(1).max(1)
+    }
+}
+
+fn damage_active_shield(
+    state: &mut InteractionState,
+    blocked_damage: f32,
+) -> Option<(usize, ItemStack)> {
+    let shield_use = state.shield_use.clone()?;
+    if shield_hand_slot(state, shield_use.hand) != shield_use.slot
+        || !stack_is_shield(state, &state.inventory.slots[shield_use.slot])
+    {
+        clear_shield_use(state);
+        return None;
+    }
+
+    let max_damage = state
+        .items
+        .name_of(state.inventory.slots[shield_use.slot].item_id)
+        .and_then(|item| state.item_facts.get(item))
+        .and_then(|facts| facts.max_damage)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(SHIELD_FALLBACK_MAX_DAMAGE)
+        .max(1);
+
+    let durability_damage = shield_durability_damage(blocked_damage);
+    if durability_damage <= 0 {
+        return None;
+    }
+
+    let stack = &mut state.inventory.slots[shield_use.slot];
+    let next_damage = stack.damage.unwrap_or(0).saturating_add(durability_damage);
+    if next_damage >= max_damage {
+        *stack = ItemStack::EMPTY;
+        clear_shield_use(state);
+    } else {
+        stack.damage = Some(next_damage);
+        if let Some(active) = &mut state.shield_use {
+            active.stack = stack.clone();
+        }
+    }
+    Some((
+        shield_use.slot,
+        state.inventory.slots[shield_use.slot].clone(),
+    ))
+}
+
 fn shield_blocks_damage(
     player_position: Vec3,
     player_yaw: f32,
@@ -4434,6 +4495,10 @@ fn shield_blocks_current_damage(
         SHIELD_ACTIVATION_DELAY_TICKS,
         state.shield_use.as_ref(),
     )
+}
+
+fn weapon_attacks_damage_held_item(game_mode: GameMode) -> bool {
+    game_mode == GameMode::Survival
 }
 
 fn arrow_velocity(pose: PlayerPose, power: f64) -> Vec3 {
@@ -5503,6 +5568,9 @@ where
     if let Some(state) = state.as_deref_mut()
         && shield_blocks_current_damage(state, damage.player_pose, damage.source_origin)
     {
+        if let Some(changed) = damage_active_shield(state, damage.amount) {
+            write_inventory_slot_updates(state, writer, vec![changed]).await?;
+        }
         return Ok(());
     }
     let was_dead = survival_state.is_dead();
@@ -7100,18 +7168,25 @@ where
         state.compression,
     )
     .await?;
-    let damage = if shield_blocks_current_damage(state, player_pose, Some(hostile.position)) {
+    let attack_damage = hostile.attack_damage.unwrap_or(3.0) as f32;
+    let blocked_by_shield =
+        shield_blocks_current_damage(state, player_pose, Some(hostile.position));
+    let damage = if blocked_by_shield {
         0.0
     } else {
-        survival_damage_after_armor(Some(state), hostile.attack_damage.unwrap_or(3.0) as f32)
+        survival_damage_after_armor(Some(state), attack_damage)
     };
     let was_dead = survival_state.is_dead();
     if damage > 0.0 {
         survival_state.apply_damage(damage);
     }
     state.last_hostile_damage_at = Some(now);
-    let armor_changed = if damage > 0.0 {
-        damage_equipped_armor(state)
+    let armor_changed = if blocked_by_shield {
+        damage_active_shield(state, attack_damage)
+            .into_iter()
+            .collect()
+    } else if damage > 0.0 {
+        damage_equipped_armor(state, attack_damage)
     } else {
         Vec::new()
     };
@@ -8428,7 +8503,7 @@ where
             if amount > 0.0
                 && let Some(interaction) = interaction.as_deref_mut()
             {
-                armor_changed = damage_equipped_armor(interaction);
+                armor_changed = damage_equipped_armor(interaction, amount);
             }
         }
         SurvivalCommand::Heal(amount) => state.heal(amount),

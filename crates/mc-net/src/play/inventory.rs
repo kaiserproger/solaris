@@ -302,7 +302,29 @@ pub(crate) fn survival_damage_after_armor(state: Option<&InteractionState>, amou
     armor_reduced_damage(amount, equipped_armor_stats(&state.items, &state.inventory))
 }
 
-pub(crate) fn damage_equipped_armor(state: &mut InteractionState) -> Vec<(usize, ItemStack)> {
+fn armor_durability_damage(incoming_damage: f32) -> i32 {
+    if incoming_damage <= 0.0 {
+        return 0;
+    }
+    if !incoming_damage.is_finite() {
+        return i32::MAX;
+    }
+    let scaled = (incoming_damage / 4.0).floor().max(1.0);
+    if scaled >= i32::MAX as f32 {
+        i32::MAX
+    } else {
+        scaled as i32
+    }
+}
+
+pub(crate) fn damage_equipped_armor(
+    state: &mut InteractionState,
+    incoming_damage: f32,
+) -> Vec<(usize, ItemStack)> {
+    let damage = armor_durability_damage(incoming_damage);
+    if damage <= 0 {
+        return Vec::new();
+    }
     let mut changed = Vec::new();
     for slot in 5..=8 {
         let stack = &mut state.inventory.slots[slot];
@@ -312,7 +334,7 @@ pub(crate) fn damage_equipped_armor(state: &mut InteractionState) -> Vec<(usize,
         let Some(entry) = armor_entry_for_item(&state.items, stack.item_id) else {
             continue;
         };
-        let next_damage = stack.damage.unwrap_or(0) + 1;
+        let next_damage = stack.damage.unwrap_or(0).saturating_add(damage);
         if next_damage >= entry.max_damage {
             *stack = ItemStack::EMPTY;
         } else {
