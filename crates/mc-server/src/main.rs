@@ -671,7 +671,7 @@ mod tests {
                 let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
                 let mut chunk = mc_world::Chunk::empty(pos, air, biome);
                 chunk.status = "minecraft:full".into();
-                chunk.dirty = true;
+                chunk.mark_dirty();
                 self.active.fetch_sub(1, Ordering::SeqCst);
                 chunk
             }

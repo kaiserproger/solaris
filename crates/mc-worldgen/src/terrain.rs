@@ -2082,7 +2082,7 @@ impl ChunkGenerator for TerrainGenerator {
         self.apply_decorations(&mut chunk, &columns);
         self.apply_structures(&mut chunk);
         chunk.status = "minecraft:full".into();
-        chunk.dirty = true;
+        chunk.mark_dirty();
         chunk
     }
 }

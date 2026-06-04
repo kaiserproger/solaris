@@ -123,6 +123,7 @@ struct RegionFileVersion {
 #[derive(Debug, Clone)]
 struct PlannedChunkPayload {
     pos: ChunkPos,
+    dirty_generation: u64,
     payload: ChunkPayload,
 }
 
@@ -140,6 +141,7 @@ struct DirtyFlushRegionCommit {
 #[derive(Debug, Clone)]
 struct CommittedChunkPayload {
     pos: ChunkPos,
+    dirty_generation: u64,
     uncompressed_nbt: Vec<u8>,
 }
 
@@ -230,6 +232,7 @@ impl DirtyFlushPlan {
                     .into_iter()
                     .map(|planned| CommittedChunkPayload {
                         pos: planned.pos,
+                        dirty_generation: planned.dirty_generation,
                         uncompressed_nbt: planned.payload.uncompressed_nbt,
                     })
                     .collect(),
@@ -698,7 +701,7 @@ impl WorldStorage {
             return Ok(true);
         }
         chunk.furnaces.insert(pos, furnace);
-        chunk.dirty = true;
+        chunk.mark_dirty();
         Ok(true)
     }
 
@@ -735,7 +738,7 @@ impl WorldStorage {
             return Ok(true);
         }
         chunk.chests.insert(pos, chest);
-        chunk.dirty = true;
+        chunk.mark_dirty();
         Ok(true)
     }
 
@@ -757,7 +760,7 @@ impl WorldStorage {
             return Ok(true);
         }
         chunk.block_entities.insert(pos, bytes);
-        chunk.dirty = true;
+        chunk.mark_dirty();
         Ok(true)
     }
 
@@ -901,7 +904,7 @@ impl WorldStorage {
         cpos: ChunkPos,
         mut chunk: Chunk,
     ) -> Result<(), WorldError> {
-        chunk.dirty = true;
+        chunk.mark_dirty();
         self.insert_chunk(cpos, chunk)
     }
 
@@ -937,7 +940,7 @@ impl WorldStorage {
         // M7: no on-disk chunk → ask the generator (if any).
         if allow_generation && let Some(generator) = self.generator.as_ref().map(Arc::clone) {
             let mut chunk = generator.generate(cpos);
-            chunk.dirty = true; // belt-and-braces; generator already sets this
+            chunk.mark_dirty(); // belt-and-braces; generator already sets this
             self.insert_chunk(cpos, chunk)?;
             return Ok(self.cache.get(&cpos).map(Arc::as_ref));
         }
@@ -1100,7 +1103,11 @@ impl WorldStorage {
                     self.item_registry.as_deref(),
                     now,
                 )?;
-                dirty_payloads.push(PlannedChunkPayload { pos: cpos, payload });
+                dirty_payloads.push(PlannedChunkPayload {
+                    pos: cpos,
+                    dirty_generation: chunk.dirty_generation,
+                    payload,
+                });
                 chunks += 1;
             }
             regions.push(DirtyFlushRegionPlan {
@@ -1113,9 +1120,10 @@ impl WorldStorage {
         Ok(DirtyFlushPlan { regions, chunks })
     }
 
-    /// Commit a written flush plan. Chunks are marked clean only if
-    /// their current encoded payload still matches the payload that
-    /// was written; chunks changed after planning remain dirty.
+    /// Commit a written flush plan. Chunks are marked clean only if their dirty
+    /// generation still permits the comparison and the encoded payload still
+    /// matches the payload that was written. Chunks changed after planning
+    /// remain dirty.
     pub fn commit_dirty_flush(&mut self, commit: DirtyFlushCommit) -> Result<usize, WorldError> {
         let mut clean = Vec::new();
         for region in &commit.regions {
@@ -1124,6 +1132,11 @@ impl WorldStorage {
                     continue;
                 };
                 if !chunk.dirty {
+                    continue;
+                }
+                if planned.dirty_generation != 0
+                    && chunk.dirty_generation != planned.dirty_generation
+                {
                     continue;
                 }
                 let current = chunk_to_payload_with_items(
@@ -1212,6 +1225,47 @@ mod tests {
             .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
             .map(|b| b.default)
             .unwrap()
+    }
+
+    fn single_air_registry() -> Arc<BlockRegistry> {
+        Arc::new(
+            BlockRegistry::from_report(&[mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            }])
+            .unwrap(),
+        )
+    }
+
+    fn air_stone_registry() -> Arc<BlockRegistry> {
+        Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        )
     }
 
     #[test]
@@ -1721,7 +1775,7 @@ mod tests {
                 let mut chunk = Chunk::empty(pos, air, biome);
                 chunk.set_block(3, 0, 5, self.stone);
                 chunk.status = "minecraft:full".into();
-                chunk.dirty = true;
+                chunk.mark_dirty();
                 chunk
             }
         }
@@ -1933,7 +1987,7 @@ mod tests {
                 let mut chunk = Chunk::empty(pos, air, biome);
                 chunk.set_block(3, 0, 5, self.stone);
                 chunk.status = "minecraft:full".into();
-                chunk.dirty = true;
+                chunk.mark_dirty();
                 chunk
             }
         }
@@ -2109,6 +2163,137 @@ mod tests {
     }
 
     #[test]
+    fn get_chunk_mut_does_not_mark_read_like_access_dirty() {
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        world
+            .insert_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+
+        let chunk = world.get_chunk_mut(cpos).unwrap().unwrap();
+
+        assert_eq!(chunk.dirty_generation, 0);
+        assert_eq!(world.dirty_count(), 0);
+    }
+
+    #[test]
+    fn dirty_flush_commit_keeps_matching_nonzero_generation_dirty_on_payload_mismatch() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.mark_dirty();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        let mut commit = plan.write().unwrap();
+        commit.regions[0].chunks[0].uncompressed_nbt.clear();
+
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = air_stone_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.mark_dirty();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        let planned_generation = world.cache.get(&cpos).unwrap().dirty_generation;
+        world
+            .get_chunk_mut(cpos)
+            .unwrap()
+            .unwrap()
+            .set_block(1, 0, 1, BlockStateId(1));
+        assert_eq!(
+            world.cache.get(&cpos).unwrap().dirty_generation,
+            planned_generation
+        );
+
+        let commit = plan.write().unwrap();
+
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+        assert_eq!(world.dirty_count(), 1);
+        assert_eq!(
+            world.get_block(BlockPos { x: 1, y: 0, z: 1 }).unwrap(),
+            Some(BlockStateId(1))
+        );
+    }
+
+    #[test]
+    fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty_even_if_payload_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.mark_dirty();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().mark_dirty();
+        let matching_payload = chunk_to_payload_with_items(
+            world.cache.get(&cpos).unwrap(),
+            &registry,
+            world.item_registry.as_deref(),
+            0,
+        )
+        .unwrap()
+        .uncompressed_nbt;
+        let mut commit = plan.write().unwrap();
+        commit.regions[0].chunks[0].uncompressed_nbt = matching_payload;
+
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn dirty_flush_commit_uses_payload_fallback_for_legacy_zero_generation_dirty() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.dirty = true;
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        let matching_payload = chunk_to_payload_with_items(
+            world.cache.get(&cpos).unwrap(),
+            &registry,
+            world.item_registry.as_deref(),
+            0,
+        )
+        .unwrap()
+        .uncompressed_nbt;
+        let mut commit = plan.write().unwrap();
+        commit.regions[0].chunks[0].uncompressed_nbt = matching_payload;
+
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
+        assert_eq!(world.dirty_count(), 0);
+    }
+
+    #[test]
     fn dirty_lru_eviction_does_not_flush_under_insert() {
         use crate::chunk::ChunkGenerator;
         use mc_data::Identifier;
@@ -2122,7 +2307,7 @@ mod tests {
                 let mut chunk = Chunk::empty(pos, air, biome);
                 chunk.set_block(0, 0, 0, BlockStateId(1));
                 chunk.status = "minecraft:full".into();
-                chunk.dirty = true;
+                chunk.mark_dirty();
                 chunk
             }
         }
