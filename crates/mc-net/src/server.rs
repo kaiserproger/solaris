@@ -1544,6 +1544,7 @@ mod tests {
             health: 20.0,
             attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
             goal: mc_entity::GoalState::Idle,
+            vehicle: None,
         }]);
         let config = ServerConfig {
             bind_address: "127.0.0.1:0".parse().unwrap(),

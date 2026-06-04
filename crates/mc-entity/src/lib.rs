@@ -122,6 +122,7 @@ pub struct SpawnEntity {
     pub block_state: Option<u32>,
     pub attributes: AttributeSet,
     pub goal: GoalState,
+    pub vehicle: Option<VehicleState>,
 }
 
 impl SpawnEntity {
@@ -140,7 +141,21 @@ impl SpawnEntity {
             block_state: None,
             attributes: AttributeSet::vanilla_mob_defaults(),
             goal: GoalState::Idle,
+            vehicle: None,
         }
+    }
+
+    #[must_use]
+    pub fn vehicle(
+        kind: VehicleKind,
+        type_id: i32,
+        type_name: impl Into<String>,
+        position: Vec3,
+    ) -> Self {
+        let mut entity = Self::new(type_id, type_name, position);
+        entity.vehicle = Some(VehicleState::new(kind));
+        entity.attributes = AttributeSet::new();
+        entity
     }
 }
 
@@ -161,6 +176,7 @@ pub struct EntitySnapshot {
     pub health: f32,
     pub attributes: AttributeSet,
     pub goal: GoalState,
+    pub vehicle: Option<VehicleState>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -180,12 +196,69 @@ pub struct EntityView<'a> {
     pub health: f32,
     pub attributes: &'a AttributeSet,
     pub goal: &'a GoalState,
+    pub vehicle: Option<VehicleState>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityDamage {
     pub snapshot: EntitySnapshot,
     pub killed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleKind {
+    Boat,
+    Minecart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VehicleState {
+    pub kind: VehicleKind,
+    pub passenger: Option<EntityId>,
+}
+
+impl VehicleState {
+    #[must_use]
+    pub const fn new(kind: VehicleKind) -> Self {
+        Self {
+            kind,
+            passenger: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VehicleInput {
+    pub left: bool,
+    pub right: bool,
+    pub forward: bool,
+    pub backward: bool,
+}
+
+impl VehicleInput {
+    #[must_use]
+    pub const fn forward() -> Self {
+        Self {
+            left: false,
+            right: false,
+            forward: true,
+            backward: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VehicleError {
+    MissingVehicle,
+    MissingPassenger,
+    NotVehicle,
+    SelfMount,
+    Cycle,
+    InvalidLifecycle,
+    AlreadyMounted,
+    PassengerAlreadyMounted,
+    PassengerMismatch,
+    UnsupportedSteering,
 }
 
 /// Small vanilla attribute subset needed before real mob AI/combat.
@@ -309,6 +382,7 @@ pub struct EntityStore {
     healths: Vec<f32>,
     attributes: Vec<AttributeSet>,
     goals: Vec<GoalState>,
+    vehicles: Vec<Option<VehicleState>>,
 }
 
 impl EntityStore {
@@ -369,6 +443,7 @@ impl EntityStore {
         self.healths.push(health);
         self.attributes.push(entity.attributes);
         self.goals.push(entity.goal);
+        self.vehicles.push(entity.vehicle);
         id
     }
 
@@ -381,6 +456,8 @@ impl EntityStore {
         if self.slots_by_id.contains_key(&snapshot.id) {
             return false;
         }
+        let vehicle =
+            self.sanitized_snapshot_vehicle(snapshot.id, snapshot.lifecycle, snapshot.vehicle);
         let slot = self.ids.len();
         self.next_id = self.next_id.max(snapshot.id.0);
         self.slots_by_id.insert(snapshot.id, slot);
@@ -399,6 +476,7 @@ impl EntityStore {
         self.healths.push(snapshot.health);
         self.attributes.push(snapshot.attributes);
         self.goals.push(snapshot.goal);
+        self.vehicles.push(vehicle);
         true
     }
 
@@ -438,6 +516,7 @@ impl EntityStore {
     pub fn remove(&mut self, id: EntityId) -> Option<EntitySnapshot> {
         let slot = self.slots_by_id.remove(&id)?;
         let removed = self.snapshot_slot(slot);
+        self.clear_vehicle_passenger_refs(id);
         self.swap_remove_slot(slot);
         Some(removed)
     }
@@ -496,6 +575,176 @@ impl EntityStore {
             snapshot: self.snapshot_slot(slot),
             killed,
         })
+    }
+
+    pub fn mount_vehicle(
+        &mut self,
+        vehicle: EntityId,
+        passenger: EntityId,
+    ) -> Result<(), VehicleError> {
+        if vehicle == passenger {
+            return Err(VehicleError::SelfMount);
+        }
+        let vehicle_slot = *self
+            .slots_by_id
+            .get(&vehicle)
+            .ok_or(VehicleError::MissingVehicle)?;
+        let passenger_slot = *self
+            .slots_by_id
+            .get(&passenger)
+            .ok_or(VehicleError::MissingPassenger)?;
+        if self.lifecycles[vehicle_slot] != EntityLifecycle::Alive
+            || self.lifecycles[passenger_slot] != EntityLifecycle::Alive
+        {
+            return Err(VehicleError::InvalidLifecycle);
+        }
+        if self.vehicle_for_passenger(passenger).is_some() {
+            return Err(VehicleError::PassengerAlreadyMounted);
+        }
+        if self.passenger_chain_contains(passenger, vehicle) {
+            return Err(VehicleError::Cycle);
+        }
+        let state = self.vehicles[vehicle_slot]
+            .as_mut()
+            .ok_or(VehicleError::NotVehicle)?;
+        if state.passenger.is_some() {
+            return Err(VehicleError::AlreadyMounted);
+        }
+        state.passenger = Some(passenger);
+        Ok(())
+    }
+
+    pub fn dismount_vehicle(
+        &mut self,
+        vehicle: EntityId,
+        passenger: EntityId,
+    ) -> Result<(), VehicleError> {
+        let vehicle_slot = *self
+            .slots_by_id
+            .get(&vehicle)
+            .ok_or(VehicleError::MissingVehicle)?;
+        let state = self.vehicles[vehicle_slot]
+            .as_mut()
+            .ok_or(VehicleError::NotVehicle)?;
+        if state.passenger != Some(passenger) {
+            return Err(VehicleError::PassengerMismatch);
+        }
+        state.passenger = None;
+        Ok(())
+    }
+
+    pub fn apply_vehicle_input(
+        &mut self,
+        vehicle: EntityId,
+        passenger: EntityId,
+        input: VehicleInput,
+    ) -> Result<(), VehicleError> {
+        let vehicle_slot = *self
+            .slots_by_id
+            .get(&vehicle)
+            .ok_or(VehicleError::MissingVehicle)?;
+        let passenger_slot = *self
+            .slots_by_id
+            .get(&passenger)
+            .ok_or(VehicleError::MissingPassenger)?;
+        if self.lifecycles[vehicle_slot] != EntityLifecycle::Alive
+            || self.lifecycles[passenger_slot] != EntityLifecycle::Alive
+        {
+            return Err(VehicleError::InvalidLifecycle);
+        }
+        let state = self.vehicles[vehicle_slot].ok_or(VehicleError::NotVehicle)?;
+        if state.passenger != Some(passenger) {
+            return Err(VehicleError::PassengerMismatch);
+        }
+        match state.kind {
+            VehicleKind::Boat => {
+                let yaw_delta = match (input.left, input.right) {
+                    (true, false) => -4.0,
+                    (false, true) => 4.0,
+                    _ => 0.0,
+                };
+                self.rotations[vehicle_slot].yaw += yaw_delta;
+                self.rotations[vehicle_slot].head_yaw = self.rotations[vehicle_slot].yaw;
+
+                let speed = match (input.forward, input.backward) {
+                    (true, false) => 0.35,
+                    (false, true) => -0.12,
+                    _ => 0.0,
+                };
+                let radians = f64::from(self.rotations[vehicle_slot].yaw).to_radians();
+                self.velocities[vehicle_slot].x = -radians.sin() * speed;
+                self.velocities[vehicle_slot].z = radians.cos() * speed;
+                self.velocities[vehicle_slot].y = 0.0;
+                Ok(())
+            }
+            VehicleKind::Minecart => Err(VehicleError::UnsupportedSteering),
+        }
+    }
+
+    #[must_use]
+    pub fn vehicle_for_passenger(&self, passenger: EntityId) -> Option<EntityId> {
+        self.vehicles.iter().enumerate().find_map(|(slot, state)| {
+            (state.as_ref()?.passenger == Some(passenger)).then_some(self.ids[slot])
+        })
+    }
+
+    fn passenger_chain_contains(&self, start: EntityId, target: EntityId) -> bool {
+        let mut current = Some(start);
+        for _ in 0..self.len() {
+            let Some(id) = current else {
+                return false;
+            };
+            if id == target {
+                return true;
+            }
+            let Some(&slot) = self.slots_by_id.get(&id) else {
+                return false;
+            };
+            current = self.vehicles[slot].and_then(|state| state.passenger);
+        }
+        false
+    }
+
+    fn sanitized_snapshot_vehicle(
+        &self,
+        id: EntityId,
+        lifecycle: EntityLifecycle,
+        vehicle: Option<VehicleState>,
+    ) -> Option<VehicleState> {
+        if lifecycle != EntityLifecycle::Alive {
+            return None;
+        }
+        let state = vehicle?;
+        let Some(passenger) = state.passenger else {
+            return Some(state);
+        };
+        if passenger == id || self.vehicle_for_passenger(passenger).is_some() {
+            return None;
+        }
+
+        let mut current = Some(passenger);
+        for _ in 0..=self.len() {
+            let Some(current_id) = current else {
+                return Some(state);
+            };
+            if current_id == id {
+                return None;
+            }
+            let &slot = self.slots_by_id.get(&current_id)?;
+            if self.lifecycles[slot] != EntityLifecycle::Alive {
+                return None;
+            }
+            current = self.vehicles[slot].and_then(|state| state.passenger);
+        }
+        None
+    }
+
+    fn clear_vehicle_passenger_refs(&mut self, passenger: EntityId) {
+        for state in self.vehicles.iter_mut().flatten() {
+            if state.passenger == Some(passenger) {
+                state.passenger = None;
+            }
+        }
     }
 
     pub fn attributes_mut(&mut self, id: EntityId) -> Option<&mut AttributeSet> {
@@ -619,6 +868,7 @@ impl EntityStore {
             health: self.healths[slot],
             attributes: self.attributes[slot].clone(),
             goal: self.goals[slot].clone(),
+            vehicle: self.vehicles[slot],
         }
     }
 
@@ -639,6 +889,7 @@ impl EntityStore {
             health: self.healths[slot],
             attributes: &self.attributes[slot],
             goal: &self.goals[slot],
+            vehicle: self.vehicles[slot],
         }
     }
 
@@ -658,6 +909,7 @@ impl EntityStore {
         self.healths.swap_remove(slot);
         self.attributes.swap_remove(slot);
         self.goals.swap_remove(slot);
+        self.vehicles.swap_remove(slot);
 
         if slot < self.ids.len() {
             self.slots_by_id.insert(self.ids[slot], slot);
@@ -715,6 +967,34 @@ mod tests {
 
     fn cow(position: Vec3) -> SpawnEntity {
         SpawnEntity::new(144, "minecraft:cow", position)
+    }
+
+    fn vehicle_snapshot(
+        id: EntityId,
+        lifecycle: EntityLifecycle,
+        passenger: Option<EntityId>,
+    ) -> EntitySnapshot {
+        EntitySnapshot {
+            id,
+            uuid: deterministic_uuid(id),
+            type_id: 15,
+            type_name: "minecraft:oak_boat".to_owned(),
+            position: Vec3::new(0.0, 63.0, 0.0),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            lifecycle,
+            health: 20.0,
+            attributes: AttributeSet::new(),
+            goal: GoalState::Idle,
+            vehicle: Some(VehicleState {
+                kind: VehicleKind::Boat,
+                passenger,
+            }),
+        }
     }
 
     #[test]
@@ -943,5 +1223,251 @@ mod tests {
         let velocity = store.snapshot(follower).unwrap().velocity;
         assert_eq!(velocity.x, 0.0);
         assert!((velocity.z - 0.5).abs() < 0.000_001);
+    }
+
+    #[test]
+    fn boat_vehicle_mount_steer_and_dismount_updates_runtime_store() {
+        let mut store = EntityStore::new();
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(10.0, 63.0, 10.0),
+        ));
+
+        store.mount_vehicle(boat, passenger).unwrap();
+        assert_eq!(store.vehicle_for_passenger(passenger), Some(boat));
+
+        store
+            .apply_vehicle_input(
+                boat,
+                passenger,
+                VehicleInput {
+                    right: true,
+                    forward: true,
+                    ..VehicleInput::default()
+                },
+            )
+            .unwrap();
+        let steered = store.snapshot(boat).unwrap();
+        assert_eq!(steered.vehicle.unwrap().passenger, Some(passenger));
+        assert_eq!(steered.rotation.yaw, 4.0);
+        assert_eq!(steered.rotation.head_yaw, 4.0);
+        assert!(steered.velocity.horizontal_len() > 0.0);
+
+        store.tick_positions(1.0);
+        let moved = store.snapshot(boat).unwrap();
+        assert_ne!(moved.position, Vec3::new(10.0, 63.0, 10.0));
+
+        store.dismount_vehicle(boat, passenger).unwrap();
+        assert_eq!(store.vehicle_for_passenger(passenger), None);
+        assert_eq!(
+            store.snapshot(boat).unwrap().vehicle.unwrap().passenger,
+            None
+        );
+    }
+
+    #[test]
+    fn vehicle_mount_rejects_non_vehicle_and_double_mount() {
+        let mut store = EntityStore::new();
+        let first_passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let second_passenger = store.spawn(cow(Vec3::new(1.0, 64.0, 0.0)));
+        let cow = store.spawn(cow(Vec3::new(2.0, 64.0, 0.0)));
+        let boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+
+        assert_eq!(
+            store.mount_vehicle(cow, first_passenger),
+            Err(VehicleError::NotVehicle)
+        );
+        store.mount_vehicle(boat, first_passenger).unwrap();
+        assert_eq!(
+            store.mount_vehicle(boat, second_passenger),
+            Err(VehicleError::AlreadyMounted)
+        );
+        assert_eq!(
+            store.mount_vehicle(cow, first_passenger),
+            Err(VehicleError::PassengerAlreadyMounted)
+        );
+    }
+
+    #[test]
+    fn vehicle_mount_rejects_self_mount_and_cycles() {
+        let mut store = EntityStore::new();
+        let first_boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(0.0, 63.0, 0.0),
+        ));
+        let second_boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+
+        assert_eq!(
+            store.mount_vehicle(first_boat, first_boat),
+            Err(VehicleError::SelfMount)
+        );
+        store.mount_vehicle(second_boat, first_boat).unwrap();
+        assert_eq!(
+            store.mount_vehicle(first_boat, second_boat),
+            Err(VehicleError::Cycle)
+        );
+    }
+
+    #[test]
+    fn vehicle_mount_and_input_reject_non_alive_entities() {
+        let mut store = EntityStore::new();
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let despawning_passenger = store.spawn(cow(Vec3::new(1.0, 64.0, 0.0)));
+        let boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+        let despawning_boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(6.0, 63.0, 0.0),
+        ));
+
+        store.mark_despawning(despawning_passenger);
+        store.mark_despawning(despawning_boat);
+
+        assert_eq!(
+            store.mount_vehicle(boat, despawning_passenger),
+            Err(VehicleError::InvalidLifecycle)
+        );
+        assert_eq!(
+            store.mount_vehicle(despawning_boat, passenger),
+            Err(VehicleError::InvalidLifecycle)
+        );
+
+        store.mount_vehicle(boat, passenger).unwrap();
+        store.mark_despawning(passenger);
+        assert_eq!(
+            store.apply_vehicle_input(boat, passenger, VehicleInput::forward()),
+            Err(VehicleError::InvalidLifecycle)
+        );
+    }
+
+    #[test]
+    fn insert_snapshot_keeps_valid_vehicle_graphs() {
+        let mut store = EntityStore::new();
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let vehicle = EntityId(40);
+
+        assert!(store.insert_snapshot(vehicle_snapshot(
+            vehicle,
+            EntityLifecycle::Alive,
+            Some(passenger),
+        )));
+
+        assert_eq!(store.vehicle_for_passenger(passenger), Some(vehicle));
+        assert_eq!(
+            store.snapshot(vehicle).unwrap().vehicle.unwrap().passenger,
+            Some(passenger)
+        );
+    }
+
+    #[test]
+    fn insert_snapshot_drops_invalid_vehicle_graphs() {
+        let mut store = EntityStore::new();
+        let alive_passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let despawning_passenger = store.spawn(cow(Vec3::new(1.0, 64.0, 0.0)));
+        store.mark_despawning(despawning_passenger);
+
+        let cases = [
+            (EntityId(40), EntityLifecycle::Alive, Some(EntityId(40))),
+            (EntityId(41), EntityLifecycle::Alive, Some(EntityId(999))),
+            (
+                EntityId(42),
+                EntityLifecycle::Alive,
+                Some(despawning_passenger),
+            ),
+            (
+                EntityId(43),
+                EntityLifecycle::Despawning,
+                Some(alive_passenger),
+            ),
+        ];
+
+        for (vehicle, lifecycle, passenger) in cases {
+            assert!(store.insert_snapshot(vehicle_snapshot(vehicle, lifecycle, passenger)));
+            assert_eq!(store.snapshot(vehicle).unwrap().vehicle, None);
+        }
+        assert_eq!(store.vehicle_for_passenger(alive_passenger), None);
+        assert_eq!(store.vehicle_for_passenger(despawning_passenger), None);
+    }
+
+    #[test]
+    fn insert_snapshot_drops_vehicle_graph_cycles() {
+        let mut store = EntityStore::new();
+        let existing_vehicle = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+        let inserted_vehicle = EntityId(40);
+        let existing_slot = store.slots_by_id[&existing_vehicle];
+        store.vehicles[existing_slot].as_mut().unwrap().passenger = Some(inserted_vehicle);
+
+        assert!(store.insert_snapshot(vehicle_snapshot(
+            inserted_vehicle,
+            EntityLifecycle::Alive,
+            Some(existing_vehicle),
+        )));
+
+        assert_eq!(store.snapshot(inserted_vehicle).unwrap().vehicle, None);
+    }
+
+    #[test]
+    fn removing_passenger_clears_vehicle_mount() {
+        let mut store = EntityStore::new();
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let boat = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            15,
+            "minecraft:oak_boat",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+        store.mount_vehicle(boat, passenger).unwrap();
+
+        store.remove(passenger).unwrap();
+
+        assert_eq!(
+            store.snapshot(boat).unwrap().vehicle.unwrap().passenger,
+            None
+        );
+        assert_eq!(store.vehicle_for_passenger(passenger), None);
+    }
+
+    #[test]
+    fn minecart_mount_exists_but_steering_is_explicitly_unsupported() {
+        let mut store = EntityStore::new();
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let minecart = store.spawn(SpawnEntity::vehicle(
+            VehicleKind::Minecart,
+            63,
+            "minecraft:minecart",
+            Vec3::new(3.0, 63.0, 0.0),
+        ));
+        store.mount_vehicle(minecart, passenger).unwrap();
+
+        assert_eq!(
+            store.apply_vehicle_input(minecart, passenger, VehicleInput::forward()),
+            Err(VehicleError::UnsupportedSteering)
+        );
     }
 }
