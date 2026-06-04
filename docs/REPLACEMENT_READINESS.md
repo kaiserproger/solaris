@@ -33,7 +33,16 @@ M77 freezes the M100 denominator in
 broad `Ready Scope` list: broad login, chunk, lighting, block, farming, loot,
 combat, persistence, multiplayer, performance, or ops claims remain
 `stabilization` claims until the exact ledger row has normal-path runtime tests
-plus vanilla oracle or real-client evidence.
+plus separate vanilla oracle or real-client evidence.
+
+The M95 conservative coverage audit reports 46 in-scope rows, 0 countable
+`ready` rows, and 0.00% current conservative coverage. The result is
+reproducible with `cargo run -p mc-test-harness --bin coverage-audit --
+docs/VALIDATION_LEDGER.md` and summarized in
+[VALIDATION_COVERAGE_AUDIT.md](VALIDATION_COVERAGE_AUDIT.md). Unit-only,
+Solaris-only, wire-probe-only, protocol-metadata-only, negated, partial,
+blocked, unknown, draft-debt, accepted-divergence, and non-goal rows do not
+count toward the 80% target.
 
 ## Evidence-Backed Partial Scope
 

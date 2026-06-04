@@ -8,9 +8,10 @@ the non-gameplay evidence gates needed to claim replacement readiness.
 
 Rows marked in scope are the M100 coverage denominator. Later removals
 require owner approval and must remain visible in the denominator appendix.
-Rows with only unit tests, Solaris-only harness tests, or implementation
-existence do not count toward the 80% coverage numerator until they also
-have linked vanilla oracle or real-client evidence.
+Rows with only unit tests, Solaris-only harness tests, wire-probe-only or
+protocol-metadata-only evidence, negated evidence, or implementation existence
+do not count toward the 80% coverage numerator until they also have linked
+vanilla oracle or real-client evidence.
 
 ## Status Vocabulary
 
@@ -145,3 +146,30 @@ the required oracle/client evidence:
 - S1 crash recovery and persistence breadth.
 - S2 multiplayer soak and contention evidence.
 - M60-M76 farming/plant/campfire/sign/container/loot rows that are currently Solaris-harness-only or deterministic-divergence-only.
+
+## M95 Conservative Coverage Audit
+
+The M95 audit is reproducible with:
+
+```sh
+cargo run -p mc-test-harness --bin coverage-audit -- docs/VALIDATION_LEDGER.md
+```
+
+Current frozen-denominator accounting is conservative: only `ready` rows with
+focused runtime coverage plus separate vanilla oracle or real-client evidence
+for the exact row enter the numerator. Unit-only, Solaris-only,
+wire-probe-only, protocol-metadata-only, negated, partial, blocked, unknown,
+draft-debt, accepted-divergence, and non-goal rows do not count.
+
+| Metric | Value |
+|---|---:|
+| In-scope denominator rows | 46 |
+| Conservative numerator rows | 0 |
+| Current conservative coverage | 0.00% |
+| Rows needed for 80% | 37 |
+| Gap to 80% | 37 rows |
+
+Status breakdown: 28 `partial`, 5 `blocked`, 7 `unknown`, 4 `draft debt`, 2
+`accepted divergence`, and 0 `ready`. See
+[`VALIDATION_COVERAGE_AUDIT.md`](VALIDATION_COVERAGE_AUDIT.md) for the M95
+snapshot and counting rule.
