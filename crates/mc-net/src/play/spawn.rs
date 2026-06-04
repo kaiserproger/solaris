@@ -5,13 +5,21 @@ pub(super) fn pack_block_pos(x: i32, y: i32, z: i32) -> i64 {
     (((x as i64) & 0x3FF_FFFF) << 38) | (((z as i64) & 0x3FF_FFFF) << 12) | ((y as i64) & 0xFFF)
 }
 
-/// Pick the dimension that the player will spawn into. We pick the first
-/// alphabetical entry of `dimension_type` for both real vanilla data
-/// (`minecraft:overworld`) and test stubs (`minecraft:alpha`).
+/// Pick the dimension that the player will spawn into. Solaris is currently
+/// an overworld-only server, so prefer `minecraft:overworld` when present and
+/// keep the old first-entry fallback for test stubs and degraded data.
 pub(super) fn spawn_dimension(data: &VanillaData) -> Option<(i32, &Identifier, &[Identifier])> {
     let registry = data.registry("dimension_type")?;
-    let first = registry.entries.first()?;
-    Some((0, first, registry.entries.as_slice()))
+    if registry.entries.is_empty() {
+        return None;
+    }
+    let index = registry
+        .entries
+        .iter()
+        .position(|entry| entry.as_str() == "minecraft:overworld")
+        .unwrap_or(0);
+    let id = i32::try_from(index).ok()?;
+    Some((id, &registry.entries[index], registry.entries.as_slice()))
 }
 
 pub(super) async fn spawn_position(config: &ServerConfig) -> (f64, f64, f64) {

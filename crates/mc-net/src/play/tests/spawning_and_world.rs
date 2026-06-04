@@ -1237,12 +1237,42 @@ fn prioritized_spiral_prefers_player_look_direction_within_ring() {
 }
 
 #[test]
-fn spawn_dimension_prefers_alphabetical_first() {
+fn spawn_dimension_falls_back_to_alphabetical_first_for_stubs() {
     let data = mc_data::testing::stub();
     let (id, name, all) = spawn_dimension(&data).unwrap();
     assert_eq!(id, 0);
     assert_eq!(name.as_str(), "minecraft:alpha");
     assert_eq!(all.len(), 2);
+}
+
+#[test]
+fn spawn_dimension_prefers_overworld_when_present() {
+    let registry = mc_data::Registry {
+        id: mc_data::Identifier::parse("minecraft:dimension_type").unwrap(),
+        entries: vec![
+            mc_data::Identifier::parse("minecraft:the_nether").unwrap(),
+            mc_data::Identifier::parse("minecraft:overworld").unwrap(),
+            mc_data::Identifier::parse("minecraft:the_end").unwrap(),
+        ],
+    };
+    let data = mc_data::VanillaData::from_registries("", vec![registry]);
+
+    let (id, name, all) = spawn_dimension(&data).unwrap();
+
+    assert_eq!(id, 1);
+    assert_eq!(name.as_str(), "minecraft:overworld");
+    assert_eq!(all.len(), 3);
+}
+
+#[test]
+fn spawn_dimension_rejects_empty_registry() {
+    let registry = mc_data::Registry {
+        id: mc_data::Identifier::parse("minecraft:dimension_type").unwrap(),
+        entries: Vec::new(),
+    };
+    let data = mc_data::VanillaData::from_registries("", vec![registry]);
+
+    assert!(spawn_dimension(&data).is_none());
 }
 
 #[test]

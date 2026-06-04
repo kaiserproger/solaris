@@ -23,6 +23,15 @@ fn player_pose_metadata_reports_swimming_and_shared_flags() {
     assert_eq!(pose.shared_flags() & 0x08, 0x08);
 }
 
+#[test]
+fn clientbound_session_world_time_uses_current_tick_with_saturation() {
+    let sessions = SessionRegistry::new();
+    sessions.set_world_time(12_345);
+    assert_eq!(clientbound_session_world_time(&sessions).game_time, 12_345);
+
+    assert_eq!(clientbound_world_time(u64::MAX).game_time, i64::MAX);
+}
+
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
     BlockStateReport {
         id,
@@ -3082,6 +3091,18 @@ fn bed_respawn_pose_uses_block_above_bed() {
     );
 
     assert_eq!((pose.x, pose.y, pose.z, pose.yaw), (3.5, 65.0, -1.5, 180.0));
+}
+
+#[test]
+fn single_player_sleep_skips_to_next_morning_at_night() {
+    assert_eq!(plan_sleep_skip(12_542, 1), SleepPlan::SkipTo(24_000));
+    assert_eq!(plan_sleep_skip(47_999, 1), SleepPlan::SkipTo(48_000));
+}
+
+#[test]
+fn sleep_policy_keeps_daytime_and_multiplayer_bounded() {
+    assert_eq!(plan_sleep_skip(1_000, 1), SleepPlan::Daytime);
+    assert_eq!(plan_sleep_skip(12_542, 2), SleepPlan::MultiplayerDeferred);
 }
 
 #[test]

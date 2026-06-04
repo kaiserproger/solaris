@@ -202,6 +202,9 @@ const DEFAULT_SEA_LEVEL: i32 = 63;
 const PLAYER_ENTITY_TYPE_ID: i32 = 155;
 const SERVER_ENTITY_ID_START: i32 = 1_000_000;
 pub(crate) const ENTITY_TICK_PERIOD: Duration = Duration::from_millis(50);
+const DAY_LENGTH_TICKS: u64 = 24_000;
+const NIGHT_START_TICK: u64 = 12_542;
+const DAY_START_TICK: u64 = 0;
 const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
 const SIGN_BLOCK_ENTITY_TYPE_ID: i32 = 7;
 const CAMPFIRE_BLOCK_ENTITY_TYPE_ID: i32 = 33;
@@ -775,7 +778,12 @@ where
         compression,
     )
     .await?;
-    write_packet(writer, &ClientboundSetTime { game_time: 0 }, compression).await?;
+    write_packet(
+        writer,
+        &clientbound_session_world_time(&sessions),
+        compression,
+    )
+    .await?;
     write_packet(
         writer,
         &SetDefaultSpawnPosition {
@@ -5564,8 +5572,95 @@ where
 
     *respawn_pose = bed_respawn_pose(pos, block_state);
     write_block_ack(writer, state.compression, sequence).await?;
-    send_command_feedback(writer, state.compression, "Respawn point set").await?;
+    match plan_sleep_skip(
+        state.sessions.world_time(),
+        state.sessions.active_session_count(),
+    ) {
+        SleepPlan::SkipTo(new_time) => {
+            send_player_pose(
+                writer,
+                state.compression,
+                state.session_id,
+                EntityPose::Sleeping,
+            )
+            .await?;
+            state.sessions.set_world_time(new_time);
+            send_world_time(writer, state.compression, &state.sessions).await?;
+            send_player_pose(
+                writer,
+                state.compression,
+                state.session_id,
+                EntityPose::Standing,
+            )
+            .await?;
+            send_command_feedback(
+                writer,
+                state.compression,
+                "Respawn point set; skipped to morning",
+            )
+            .await?;
+        }
+        SleepPlan::Daytime => {
+            send_command_feedback(writer, state.compression, "Respawn point set").await?;
+        }
+        SleepPlan::MultiplayerDeferred => {
+            send_command_feedback(
+                writer,
+                state.compression,
+                "Respawn point set; multiplayer sleep quorum is not implemented",
+            )
+            .await?;
+        }
+    }
     Ok(true)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SleepPlan {
+    SkipTo(u64),
+    Daytime,
+    MultiplayerDeferred,
+}
+
+fn plan_sleep_skip(world_time: u64, active_sessions: usize) -> SleepPlan {
+    if world_time % DAY_LENGTH_TICKS < NIGHT_START_TICK {
+        return SleepPlan::Daytime;
+    }
+    if active_sessions == 1 {
+        SleepPlan::SkipTo(next_morning_time(world_time))
+    } else {
+        SleepPlan::MultiplayerDeferred
+    }
+}
+
+fn next_morning_time(world_time: u64) -> u64 {
+    let day = world_time / DAY_LENGTH_TICKS;
+    day.saturating_add(1)
+        .saturating_mul(DAY_LENGTH_TICKS)
+        .saturating_add(DAY_START_TICK)
+}
+
+async fn send_player_pose<W>(
+    writer: &mut W,
+    compression: Compression,
+    session_id: SessionId,
+    pose: EntityPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundSetEntityData {
+            entity_id: i32::try_from(session_id).unwrap_or(i32::MAX),
+            values: vec![EntityDataValue::Pose {
+                index: ENTITY_DATA_POSE_INDEX,
+                pose,
+            }],
+        },
+        compression,
+    )
+    .await
 }
 
 fn bed_respawn_pose(pos: mc_world::BlockPos, state: &mc_world::BlockState) -> PlayerPose {
@@ -7895,6 +7990,10 @@ where
                         PlayerCommandAction::StopSprinting => player_pose.sprinting = false,
                         PlayerCommandAction::PressShiftKey => player_pose.shifting = true,
                         PlayerCommandAction::ReleaseShiftKey => player_pose.shifting = false,
+                        PlayerCommandAction::StopSleeping => {
+                            send_player_pose(writer, compression, session_id, EntityPose::Standing)
+                                .await?;
+                        }
                         _ => {}
                     }
                     refresh_player_water_state(interaction.as_deref(), &mut player_pose).await;
@@ -8435,15 +8534,22 @@ async fn send_world_time<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let time = sessions.world_time();
     write_packet(
         writer,
-        &ClientboundSetTime {
-            game_time: i64::try_from(time).unwrap_or(i64::MAX),
-        },
+        &clientbound_session_world_time(sessions),
         compression,
     )
     .await
+}
+
+fn clientbound_session_world_time(sessions: &SessionRegistry) -> ClientboundSetTime {
+    clientbound_world_time(sessions.world_time())
+}
+
+fn clientbound_world_time(time: u64) -> ClientboundSetTime {
+    ClientboundSetTime {
+        game_time: i64::try_from(time).unwrap_or(i64::MAX),
+    }
 }
 
 fn text_component_nbt(text: &str) -> Vec<u8> {
