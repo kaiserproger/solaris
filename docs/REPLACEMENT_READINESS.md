@@ -65,9 +65,11 @@ plus vanilla oracle or real-client evidence.
   equipment drops, exact XP, sounds/particles/statistics/events are not claimed.
 - Farming and plants have partial deterministic Solaris support for common crops,
   nether wart, stems, sweet berries, cocoa, saplings, sugar cane, cactus, and
-  bamboo. Exact vanilla RNG, soil/moisture/light/support survivability, loot RNG,
-  collision/damage, particles/sounds/statistics/events, and several
-  harness/client/oracle paths remain open.
+  bamboo. Cactus now clears visible existing columns when a player places a side
+  neighbor through the normal placement path. Exact vanilla RNG,
+  soil/moisture/light/support survivability, loot RNG, cactus damage/collision,
+  particles/sounds/statistics/events, and several harness/client/oracle paths
+  remain open.
 - Bows/arrows and shields have partial local combat behavior. Exact projectile
   physics/metadata, durability, axe-disable, shield pose/timing/angle,
   attribution, effects, and broader damage-source parity are not claimed.
