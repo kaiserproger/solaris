@@ -12,6 +12,7 @@
 mod chunk_pipeline;
 mod configuration;
 mod connection;
+mod control_plane;
 mod error;
 mod lock_metrics;
 mod login;
@@ -23,6 +24,10 @@ pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
     ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPriority, ChunkRequest,
     ChunkScheduler, PreparedChunk,
+};
+pub use control_plane::{
+    AutoscaleAction, AutoscaleDecision, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,
+    RuntimeControlInput, RuntimeControlLimits, RuntimeControlPlane, RuntimeControlSnapshot,
 };
 pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};

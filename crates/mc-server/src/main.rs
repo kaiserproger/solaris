@@ -49,6 +49,7 @@ struct EffectiveConfig<'a> {
     #[serde(flatten)]
     config: &'a ServerConfig,
     effective_chunk_pipeline: EffectiveChunkPipeline,
+    effective_autoscale: EffectiveAutoscale,
 }
 
 impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
@@ -58,6 +59,7 @@ impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
             effective_chunk_pipeline: EffectiveChunkPipeline::from(
                 config.chunk_pipeline.to_network(),
             ),
+            effective_autoscale: EffectiveAutoscale::from(config),
         }
     }
 }
@@ -75,6 +77,93 @@ impl From<mc_net::ChunkPipelinePolicy> for EffectiveChunkPipeline {
             chunk_io_threads: policy.chunk_io_threads,
             chunk_worker_threads: policy.chunk_worker_threads,
             entity_worker_threads: policy.entity_worker_threads,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EffectiveAutoscale {
+    enabled: bool,
+    runtime_mode: &'static str,
+    profile: mc_server::AutoscaleProfile,
+    initial_limits: EffectiveAutoscaleLimits,
+    policy: EffectiveAutoscalePolicy,
+}
+
+impl From<&ServerConfig> for EffectiveAutoscale {
+    fn from(config: &ServerConfig) -> Self {
+        Self {
+            enabled: config.autoscale.enabled,
+            runtime_mode: "draft_noop_not_wired",
+            profile: config.autoscale.profile,
+            initial_limits: EffectiveAutoscaleLimits::from(
+                config
+                    .autoscale
+                    .initial_limits(&config.server, &config.chunk_pipeline),
+            ),
+            policy: EffectiveAutoscalePolicy::from(
+                config.autoscale.to_policy(&config.chunk_pipeline),
+            ),
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EffectiveAutoscaleLimits {
+    view_distance: i32,
+    chunk_send_rate: u32,
+    chunk_load_rate: u32,
+    chunk_generate_rate: u32,
+}
+
+impl From<mc_net::RuntimeControlLimits> for EffectiveAutoscaleLimits {
+    fn from(limits: mc_net::RuntimeControlLimits) -> Self {
+        Self {
+            view_distance: limits.view_distance,
+            chunk_send_rate: limits.chunk_send_rate,
+            chunk_load_rate: limits.chunk_load_rate,
+            chunk_generate_rate: limits.chunk_generate_rate,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct EffectiveAutoscalePolicy {
+    min_view_distance: i32,
+    max_view_distance: i32,
+    min_chunk_send_rate: u32,
+    max_chunk_send_rate: u32,
+    min_chunk_load_rate: u32,
+    max_chunk_load_rate: u32,
+    min_chunk_generate_rate: u32,
+    max_chunk_generate_rate: u32,
+    target_tick_ms: u64,
+    target_first_chunk_ms: u64,
+    queue_pressure_percent: u8,
+    worker_pressure_percent: u8,
+    memory_pressure_percent: u8,
+    scale_down_after_ticks: u32,
+    scale_up_after_ticks: u32,
+}
+
+impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
+    fn from(policy: mc_net::AutoscalePolicy) -> Self {
+        Self {
+            min_view_distance: policy.min_view_distance,
+            max_view_distance: policy.max_view_distance,
+            min_chunk_send_rate: policy.min_chunk_send_rate,
+            max_chunk_send_rate: policy.max_chunk_send_rate,
+            min_chunk_load_rate: policy.min_chunk_load_rate,
+            max_chunk_load_rate: policy.max_chunk_load_rate,
+            min_chunk_generate_rate: policy.min_chunk_generate_rate,
+            max_chunk_generate_rate: policy.max_chunk_generate_rate,
+            target_tick_ms: policy.target_tick_ms,
+            target_first_chunk_ms: policy.target_first_chunk_ms,
+            queue_pressure_percent: policy.queue_pressure_percent,
+            worker_pressure_percent: policy.worker_pressure_percent,
+            memory_pressure_percent: policy.memory_pressure_percent,
+            scale_down_after_ticks: policy.scale_down_after_ticks,
+            scale_up_after_ticks: policy.scale_up_after_ticks,
         }
     }
 }
@@ -534,6 +623,7 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use mc_data::Identifier;
+    use serde_json::Value;
 
     #[test]
     fn ensure_world_region_root_creates_legacy_layout_for_missing_world() {
@@ -705,5 +795,48 @@ mod tests {
             max_active.load(Ordering::SeqCst) > 1,
             "startup pre-generation should use worker threads"
         );
+    }
+
+    #[test]
+    fn check_output_marks_autoscale_draft_noop_and_normalized_bounds() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+            view_distance = 12
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [chunk_pipeline]
+            chunk_send_rate = 3
+            chunk_load_rate = 5
+            chunk_generate_rate = 7
+
+            [autoscale]
+            enabled = true
+            min_view_distance = 0
+            max_view_distance = 1
+            scale_down_after_ticks = 0
+            scale_up_after_ticks = 0
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        let rendered = serde_json::to_value(EffectiveConfig::from(&cfg)).expect("serialize");
+        let autoscale = &rendered["effective_autoscale"];
+        let policy = &autoscale["policy"];
+
+        assert_eq!(autoscale["enabled"], Value::Bool(true));
+        assert_eq!(autoscale["runtime_mode"], "draft_noop_not_wired");
+        assert_eq!(policy["min_view_distance"], 2);
+        assert_eq!(policy["max_view_distance"], 2);
+        assert_eq!(policy["min_chunk_send_rate"], 3);
+        assert_eq!(policy["max_chunk_send_rate"], 16);
+        assert_eq!(policy["min_chunk_load_rate"], 5);
+        assert_eq!(policy["max_chunk_load_rate"], 64);
+        assert_eq!(policy["min_chunk_generate_rate"], 7);
+        assert_eq!(policy["max_chunk_generate_rate"], 32);
+        assert_eq!(policy["scale_down_after_ticks"], 1);
+        assert_eq!(policy["scale_up_after_ticks"], 1);
     }
 }

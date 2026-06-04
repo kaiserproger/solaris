@@ -47,3 +47,17 @@ region_cache_size = 9
 # Optional zlib level for compressed protocol frames. Omit for flate2's
 # fast default; values above 9 are clamped.
 # compression_level = 1
+
+[autoscale]
+# Draft M92 runtime-control primitive. The live server does not yet consume
+# decisions, so even enabled=true is reported as draft_noop_not_wired by
+# --check; --check still renders normalized effective bounds.
+enabled = false
+profile = "balanced"
+# Optional overrides. Omit to use the profile defaults.
+# min_view_distance = 6
+# max_view_distance = 10
+# target_tick_ms = 50
+# target_first_chunk_ms = 1500
+# scale_down_after_ticks = 3
+# scale_up_after_ticks = 10
