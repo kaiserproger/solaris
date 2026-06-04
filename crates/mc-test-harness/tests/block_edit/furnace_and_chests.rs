@@ -1102,3 +1102,166 @@ async fn survival_container_click_moves_stack_through_server_cursor() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn unsupported_station_use_is_safe_noop_instead_of_block_placement() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let stonecutter_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stonecutter").unwrap())
+        .map(|b| b.default.0 as i32)
+        .expect("stonecutter in registry");
+    let dirt_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .map(|b| b.default.0 as i32)
+        .expect("dirt in registry");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let stonecutter_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:stonecutter").unwrap())
+        .expect("stonecutter item");
+    let dirt_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M87 station no-op".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M87StationNoop").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:stonecutter 1 0".into(),
+        })
+        .await
+        .expect("give stonecutter");
+    wait_for_slot_stack(&mut client, stonecutter_id, 1).await;
+
+    let support_y = sync.y.floor() as i32 - 2;
+    let station_y = support_y + 1;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, support_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 701,
+        })
+        .await
+        .expect("place stonecutter");
+    wait_for_block_update(&mut client, (0, station_y, 0), stonecutter_state_id).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 1 0".into(),
+        })
+        .await
+        .expect("give dirt");
+    wait_for_slot_stack(&mut client, dirt_id, 1).await;
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, station_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 702,
+        })
+        .await
+        .expect("use unsupported station");
+    read_station_noop_ack(&mut client, 702, (0, station_y + 1, 0), dirt_state_id).await;
+}
+
+async fn read_station_noop_ack(
+    client: &mut Client,
+    sequence: i32,
+    fallthrough_pos: (i32, i32, i32),
+    fallthrough_state_id: i32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("station no-op ack");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundOpenScreen::ID {
+            panic!("unsupported station must not open an unimplemented menu");
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
+            assert!(
+                unpack_block_pos(pkt.position) != fallthrough_pos
+                    || pkt.state_id != fallthrough_state_id,
+                "unsupported station use fell through into adjacent block placement"
+            );
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if pkt.sequence == sequence {
+                return;
+            }
+        }
+    }
+}
