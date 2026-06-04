@@ -689,6 +689,85 @@ fn hostile_entities_follow_nearby_player_position() {
 }
 
 #[test]
+fn hostile_pathing_detours_around_unloaded_target_chunk() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "target".to_string(),
+    };
+    let (session_id, _) = registry.register(
+        &profile,
+        (1, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(20.5, DEFAULT_SPAWN_Y + 1.0, 0.5),
+    );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.ensure_chunk_herd(
+        (0, 0),
+        &[HerdSpawn {
+            chunk: (0, 0),
+            slot: 0,
+            entity_type_id: 1,
+            entity_type_name: "minecraft:zombie".to_string(),
+            position: Vec3::new(15.5, DEFAULT_SPAWN_Y, 0.5),
+            hostile: true,
+        }],
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    let zombie = queries
+        .iter()
+        .find(|query| query.position.x == 15.5 && query.position.z == 0.5)
+        .expect("zombie physics query");
+
+    assert_ne!(zombie.velocity, Vec3::ZERO);
+    assert!(zombie.position.x + zombie.velocity.x < 16.0);
+}
+
+#[test]
+fn hostile_pathing_uses_speed_scaled_boundary_probe() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(1);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "target".to_string(),
+    };
+    let (session_id, _) = registry.register(
+        &profile,
+        (1, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(20.5, DEFAULT_SPAWN_Y + 1.0, 0.5),
+    );
+    let _ = registry.mark_loaded(session_id, (0, 0));
+    let _ = registry.ensure_chunk_herd(
+        (0, 0),
+        &[HerdSpawn {
+            chunk: (0, 0),
+            slot: 0,
+            entity_type_id: 1,
+            entity_type_name: "minecraft:zombie".to_string(),
+            position: Vec3::new(14.9, DEFAULT_SPAWN_Y, 0.5),
+            hostile: true,
+        }],
+    );
+
+    let queries = registry.tick_entities_and_collect_physics_queries(1);
+    let zombie = queries
+        .iter()
+        .find(|query| query.position.x == 14.9 && query.position.z == 0.5)
+        .expect("zombie physics query");
+
+    assert_ne!(zombie.velocity, Vec3::ZERO);
+    assert!(zombie.velocity.x < 1.25);
+    assert!(zombie.position.x + zombie.velocity.x < 16.0);
+}
+
+#[test]
 fn chunk_herd_materialization_applies_caps_and_player_distance() {
     let registry = SessionRegistry::new();
     let (tx, _rx) = mpsc::channel(1);

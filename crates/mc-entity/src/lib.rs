@@ -346,6 +346,43 @@ pub enum GoalState {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathingProbeResult {
+    Walkable,
+    Blocked,
+    Unloaded,
+}
+
+pub trait PathingProbe {
+    fn can_stand_at(&self, position: Vec3) -> PathingProbeResult;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PathingBudget {
+    pub max_candidates_per_entity: usize,
+    pub step_height: f64,
+}
+
+impl PathingBudget {
+    pub const DEFAULT: Self = Self {
+        max_candidates_per_entity: 8,
+        step_height: 1.0,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathingDecisionKind {
+    Move,
+    Blocked,
+    Unloaded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PathingDecision {
+    velocity: Vec3,
+    kind: PathingDecisionKind,
+}
+
 /// Observable counters from an AI goal tick.
 ///
 /// These counters intentionally describe the read-only decision/application
@@ -358,6 +395,9 @@ pub struct GoalTickStats {
     pub decisions_applied: usize,
     pub skipped_non_alive: usize,
     pub missing_follow_targets: usize,
+    pub pathing_moves: usize,
+    pub pathing_blocked: usize,
+    pub pathing_unloaded: usize,
 }
 
 /// Dense entity storage. Hot state is kept in parallel vectors so later
@@ -757,6 +797,23 @@ impl EntityStore {
     }
 
     pub fn tick_goals_with_stats(&mut self, tick: u64) -> GoalTickStats {
+        self.tick_goals_internal(tick, None)
+    }
+
+    pub fn tick_goals_with_pathing<P: PathingProbe>(
+        &mut self,
+        tick: u64,
+        probe: &P,
+        budget: PathingBudget,
+    ) -> GoalTickStats {
+        self.tick_goals_internal(tick, Some((probe, budget)))
+    }
+
+    fn tick_goals_internal(
+        &mut self,
+        tick: u64,
+        pathing: Option<(&dyn PathingProbe, PathingBudget)>,
+    ) -> GoalTickStats {
         let mut stats = GoalTickStats::default();
         for slot in 0..self.len() {
             if self.lifecycles[slot] != EntityLifecycle::Alive {
@@ -813,13 +870,35 @@ impl EntityStore {
                     self.rotations[slot].head_yaw = self.rotations[slot].yaw;
                 }
                 GoalState::FollowPosition { target, speed } => {
-                    let velocity = Vec3 {
-                        x: target.x - self.positions[slot].x,
-                        y: 0.0,
-                        z: target.z - self.positions[slot].z,
-                    }
-                    .horizontal_normalized();
+                    let vertical_velocity = self.velocities[slot].y;
+                    let velocity = if let Some((probe, budget)) = pathing {
+                        let decision = bounded_pathing_step(
+                            self.positions[slot],
+                            target,
+                            speed,
+                            probe,
+                            budget,
+                        );
+                        match decision.kind {
+                            PathingDecisionKind::Move => stats.pathing_moves += 1,
+                            PathingDecisionKind::Blocked => stats.pathing_blocked += 1,
+                            PathingDecisionKind::Unloaded => stats.pathing_unloaded += 1,
+                        }
+                        decision.velocity
+                    } else {
+                        Vec3 {
+                            x: target.x - self.positions[slot].x,
+                            y: 0.0,
+                            z: target.z - self.positions[slot].z,
+                        }
+                        .horizontal_normalized()
+                    };
                     self.velocities[slot].x = velocity.x * speed;
+                    if velocity.y != 0.0 {
+                        self.velocities[slot].y = velocity.y * speed;
+                    } else {
+                        self.velocities[slot].y = vertical_velocity;
+                    }
                     self.velocities[slot].z = velocity.z * speed;
                     self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
                     self.rotations[slot].head_yaw = self.rotations[slot].yaw;
@@ -917,6 +996,151 @@ impl EntityStore {
     }
 }
 
+fn bounded_pathing_step(
+    current: Vec3,
+    target: Vec3,
+    speed: f64,
+    probe: &dyn PathingProbe,
+    budget: PathingBudget,
+) -> PathingDecision {
+    if speed <= 0.0 {
+        return PathingDecision {
+            velocity: Vec3::ZERO,
+            kind: PathingDecisionKind::Blocked,
+        };
+    }
+    let goal = Vec3 {
+        x: target.x - current.x,
+        y: 0.0,
+        z: target.z - current.z,
+    };
+    let direct = goal.horizontal_normalized();
+    if direct == Vec3::ZERO {
+        return PathingDecision {
+            velocity: Vec3::ZERO,
+            kind: PathingDecisionKind::Move,
+        };
+    }
+
+    let candidates = pathing_candidates(direct);
+    let limit = budget
+        .max_candidates_per_entity
+        .min(candidates.len())
+        .max(1);
+    let mut saw_unloaded = false;
+    let mut best: Option<(f64, Vec3)> = None;
+    for candidate in candidates.into_iter().take(limit) {
+        let flat = Vec3 {
+            x: current.x + candidate.x * speed,
+            y: current.y,
+            z: current.z + candidate.z * speed,
+        };
+        let accepted = match probe.can_stand_at(flat) {
+            PathingProbeResult::Walkable => Some(Vec3 {
+                x: candidate.x,
+                y: 0.0,
+                z: candidate.z,
+            }),
+            PathingProbeResult::Blocked => {
+                let stepped = Vec3 {
+                    y: flat.y + budget.step_height.max(0.0),
+                    ..flat
+                };
+                match probe.can_stand_at(stepped) {
+                    PathingProbeResult::Walkable => Some(Vec3 {
+                        x: candidate.x,
+                        y: budget.step_height.max(0.0),
+                        z: candidate.z,
+                    }),
+                    PathingProbeResult::Unloaded => {
+                        saw_unloaded = true;
+                        None
+                    }
+                    PathingProbeResult::Blocked => None,
+                }
+            }
+            PathingProbeResult::Unloaded => {
+                saw_unloaded = true;
+                None
+            }
+        };
+        let Some(velocity) = accepted else {
+            continue;
+        };
+        let next = Vec3 {
+            x: current.x + velocity.x * speed,
+            y: current.y,
+            z: current.z + velocity.z * speed,
+        };
+        let score = (target.x - next.x).hypot(target.z - next.z);
+        if best.is_none_or(|(best_score, _)| score < best_score) {
+            best = Some((score, velocity));
+        }
+    }
+
+    if let Some((_, velocity)) = best {
+        PathingDecision {
+            velocity,
+            kind: PathingDecisionKind::Move,
+        }
+    } else {
+        PathingDecision {
+            velocity: Vec3::ZERO,
+            kind: if saw_unloaded {
+                PathingDecisionKind::Unloaded
+            } else {
+                PathingDecisionKind::Blocked
+            },
+        }
+    }
+}
+
+fn pathing_candidates(direct: Vec3) -> [Vec3; 8] {
+    let side = Vec3 {
+        x: -direct.z,
+        y: 0.0,
+        z: direct.x,
+    };
+    [
+        direct,
+        Vec3 {
+            x: direct.x + side.x,
+            y: 0.0,
+            z: direct.z + side.z,
+        }
+        .horizontal_normalized(),
+        Vec3 {
+            x: direct.x - side.x,
+            y: 0.0,
+            z: direct.z - side.z,
+        }
+        .horizontal_normalized(),
+        side,
+        Vec3 {
+            x: -side.x,
+            y: 0.0,
+            z: -side.z,
+        },
+        Vec3 {
+            x: direct.x + 0.5 * side.x,
+            y: 0.0,
+            z: direct.z + 0.5 * side.z,
+        }
+        .horizontal_normalized(),
+        Vec3 {
+            x: direct.x - 0.5 * side.x,
+            y: 0.0,
+            z: direct.z - 0.5 * side.z,
+        }
+        .horizontal_normalized(),
+        Vec3 {
+            x: -direct.x,
+            y: 0.0,
+            z: -direct.z,
+        },
+    ]
+}
+
 fn deterministic_uuid(id: EntityId) -> Uuid {
     let low = id.0 as u32 as u128;
     Uuid::from_u128(0x5f1a_0000_0000_0000_0000_0000_0000_0000 | low)
@@ -963,7 +1187,40 @@ fn aquatic_rotation_from_velocity(velocity: Vec3) -> Rotation {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
+
+    #[derive(Debug)]
+    struct TestPathingProbe {
+        default: PathingProbeResult,
+        overrides: HashMap<(i32, i32, i32), PathingProbeResult>,
+    }
+
+    impl TestPathingProbe {
+        fn new(default: PathingProbeResult) -> Self {
+            Self {
+                default,
+                overrides: HashMap::new(),
+            }
+        }
+
+        fn with(mut self, x: i32, y: i32, z: i32, result: PathingProbeResult) -> Self {
+            self.overrides.insert((x, y, z), result);
+            self
+        }
+    }
+
+    impl PathingProbe for TestPathingProbe {
+        fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
+            let key = (
+                position.x.round() as i32,
+                position.y.round() as i32,
+                position.z.round() as i32,
+            );
+            self.overrides.get(&key).copied().unwrap_or(self.default)
+        }
+    }
 
     fn cow(position: Vec3) -> SpawnEntity {
         SpawnEntity::new(144, "minecraft:cow", position)
@@ -1193,6 +1450,9 @@ mod tests {
                 decisions_applied: 2,
                 skipped_non_alive: 1,
                 missing_follow_targets: 1,
+                pathing_moves: 0,
+                pathing_blocked: 0,
+                pathing_unloaded: 0,
             }
         );
         assert_eq!(
@@ -1210,6 +1470,7 @@ mod tests {
     fn follow_position_sets_horizontal_velocity() {
         let mut store = EntityStore::new();
         let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_velocity(follower, Vec3::new(0.0, -0.25, 0.0));
         store.set_goal(
             follower,
             GoalState::FollowPosition {
@@ -1222,6 +1483,7 @@ mod tests {
 
         let velocity = store.snapshot(follower).unwrap().velocity;
         assert_eq!(velocity.x, 0.0);
+        assert_eq!(velocity.y, -0.25);
         assert!((velocity.z - 0.5).abs() < 0.000_001);
     }
 
@@ -1469,5 +1731,181 @@ mod tests {
             store.apply_vehicle_input(minecart, passenger, VehicleInput::forward()),
             Err(VehicleError::UnsupportedSteering)
         );
+    }
+
+    #[test]
+    fn bounded_pathing_moves_over_flat_loaded_terrain() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_velocity(follower, Vec3::new(0.0, -0.25, 0.0));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(stats.pathing_moves, 1);
+        assert!((velocity.x - 0.5).abs() < 0.000_001);
+        assert_eq!(velocity.y, -0.25);
+        assert_eq!(velocity.z, 0.0);
+    }
+
+    #[test]
+    fn bounded_pathing_probes_speed_scaled_next_position() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.25,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Unloaded).with(
+            0,
+            64,
+            0,
+            PathingProbeResult::Walkable,
+        );
+
+        let stats = store.tick_goals_with_pathing(
+            1,
+            &probe,
+            PathingBudget {
+                max_candidates_per_entity: 1,
+                ..PathingBudget::DEFAULT
+            },
+        );
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(stats.pathing_moves, 1);
+        assert!((velocity.x - 0.25).abs() < 0.000_001);
+        assert_eq!(velocity.y, 0.0);
+        assert_eq!(velocity.z, 0.0);
+    }
+
+    #[test]
+    fn bounded_pathing_steps_up_one_block_when_flat_route_is_blocked() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Blocked).with(
+            1,
+            65,
+            0,
+            PathingProbeResult::Walkable,
+        );
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(stats.pathing_moves, 1);
+        assert!((velocity.x - 0.5).abs() < 0.000_001);
+        assert!((velocity.y - 0.5).abs() < 0.000_001);
+        assert_eq!(velocity.z, 0.0);
+    }
+
+    #[test]
+    fn bounded_pathing_detours_around_blocked_direct_step() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Blocked).with(
+            0,
+            64,
+            0,
+            PathingProbeResult::Walkable,
+        );
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(stats.pathing_moves, 1);
+        assert!(velocity.x > 0.0);
+        assert!(velocity.z.abs() > 0.0);
+        assert!(velocity.horizontal_len() <= 0.5 + 0.000_001);
+    }
+
+    #[test]
+    fn bounded_pathing_detours_around_unloaded_direct_step() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Walkable).with(
+            1,
+            64,
+            0,
+            PathingProbeResult::Unloaded,
+        );
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        let velocity = store.snapshot(follower).unwrap().velocity;
+        assert_eq!(stats.pathing_moves, 1);
+        assert!(velocity.x > 0.0);
+        assert!(velocity.z.abs() > 0.0);
+        assert!(velocity.horizontal_len() <= 0.5 + 0.000_001);
+    }
+
+    #[test]
+    fn bounded_pathing_refuses_blocked_terrain() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Blocked);
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        assert_eq!(stats.pathing_blocked, 1);
+        assert_eq!(store.snapshot(follower).unwrap().velocity, Vec3::ZERO);
+    }
+
+    #[test]
+    fn bounded_pathing_refuses_unloaded_terrain() {
+        let mut store = EntityStore::new();
+        let follower = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        store.set_goal(
+            follower,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.0, 64.0, 0.0),
+                speed: 0.5,
+            },
+        );
+        let probe = TestPathingProbe::new(PathingProbeResult::Unloaded);
+
+        let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
+
+        assert_eq!(stats.pathing_unloaded, 1);
+        assert_eq!(store.snapshot(follower).unwrap().velocity, Vec3::ZERO);
     }
 }
