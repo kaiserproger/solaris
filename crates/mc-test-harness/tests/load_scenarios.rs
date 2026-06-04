@@ -1,7 +1,8 @@
 //! Load-oriented scenarios.
 //!
-//! Non-ignored tests are coarse debug-build regression gates. The ignored M37
-//! report remains diagnostic-only and can be run explicitly with:
+//! Sidecar-dependent load tests are ignored so missing local vanilla sidecars
+//! are reported as degraded coverage instead of a silent green pass. If run
+//! without sidecars, they fail with an explicit degraded message. Run them with:
 //!
 //! ```text
 //! cargo test -p mc-test-harness --test load_scenarios -- --ignored --nocapture
@@ -13,10 +14,10 @@ use std::time::{Duration, Instant};
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
-    InteractionHand, LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction,
+    GameEvent, InteractionHand, LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand,
     ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos,
+    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -28,12 +29,214 @@ const M52_BASELINE_SUMMONS: usize = 8;
 const M52_SLOW_READER_SUMMONS: usize = 256;
 const M52_BASELINE_ELAPSED_BUDGET: Duration = Duration::from_secs(30);
 const M52_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
+const M96_REPLAY_CLIENTS: usize = 4;
+const M96_REPLAY_ELAPSED_BUDGET: Duration = Duration::from_secs(45);
+const M96_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla sidecars; degraded when absent"]
+async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_slow_reader() {
+    let server = start_load_server().await;
+    let addr = server.addr;
+    let started = Instant::now();
+
+    let paused_reader = PausedReaderClient::connect(addr, "M96PausedReader").await;
+    let pressure_before = server.outbound_pressure_snapshot();
+
+    let mut client_tasks = Vec::new();
+    for idx in 0..M96_REPLAY_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let (mut client, sync) = connect_to_play(addr, &format!("M96Soak{idx}")).await;
+            drain_until_chunk(&mut client, (0, 0)).await;
+            (client, sync)
+        }));
+    }
+
+    let mut clients = Vec::new();
+    for task in client_tasks {
+        clients.push(task.await.expect("M96 replay client task joins"));
+    }
+
+    let (mut editor_a, sync_a) = clients.remove(0);
+    let (mut editor_b, sync_b) = clients.remove(0);
+    let (mut observer, _) = clients.remove(0);
+    let (mut reconnecting, reconnect_sync) = clients.remove(0);
+
+    editor_a
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".to_string(),
+        })
+        .await
+        .expect("set creative for editor A");
+    editor_b
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".to_string(),
+        })
+        .await
+        .expect("set creative for editor B");
+    editor_a
+        .write_packet(&ServerboundChatCommand {
+            command: "give minecraft:dirt 64".to_string(),
+        })
+        .await
+        .expect("give dirt to editor A");
+    editor_b
+        .write_packet(&ServerboundChatCommand {
+            command: "give minecraft:stone 64".to_string(),
+        })
+        .await
+        .expect("give stone to editor B");
+
+    let base_y = sync_a.y.floor() as i32 - 1;
+    let target = (4, base_y + 1, 0);
+    let support = pack_block_pos(target.0, base_y, target.2);
+    let target_pos = pack_block_pos(target.0, target.1, target.2);
+    editor_a
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: support,
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 1,
+        })
+        .await
+        .expect("editor A places same-block contender");
+    editor_b
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: support,
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 2,
+        })
+        .await
+        .expect("editor B places same-block contender");
+
+    let ack_a = wait_for_ack(&mut editor_a, 1).await;
+    let ack_b = wait_for_ack(&mut editor_b, 2).await;
+    let observer_updates =
+        drain_target_block_updates(&mut observer, target_pos, Duration::from_secs(5)).await;
+    assert!(
+        ack_a && ack_b,
+        "both sequential same-block edit attempts should receive BlockChangedAck"
+    );
+    assert!(
+        (1..=2).contains(&observer_updates),
+        "observer should see one bounded final/resync update for sequential same-block contention surrogate, got {observer_updates}"
+    );
+
+    let chunk_before_disconnect = server.chunk_pipeline_metrics.snapshot();
+    reconnecting
+        .write_packet(&ServerboundMovePlayerPos {
+            x: reconnect_sync.x + 48.0,
+            y: reconnect_sync.y,
+            z: reconnect_sync.z,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("start chunk work before reconnect");
+    drop(reconnecting);
+    let (mut rejoined, _) = connect_to_play(addr, "M96SoakReconnect").await;
+    drain_until_chunk(&mut rejoined, (0, 0)).await;
+    let chunk_after_rejoin = server.chunk_pipeline_metrics.snapshot();
+    assert!(
+        chunk_after_rejoin.max_cpu_active >= chunk_before_disconnect.max_cpu_active,
+        "disconnect-after-move must not poison later chunk streaming: before={chunk_before_disconnect:?} after={chunk_after_rejoin:?}"
+    );
+
+    let spawn_y = sync_b.y.floor() as i32;
+    for idx in 0..M52_BASELINE_SUMMONS {
+        editor_b
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    6 + idx % 4,
+                    spawn_y,
+                    2 + idx / 4
+                ),
+            })
+            .await
+            .expect("summon replay zombie");
+    }
+    let spawns = drain_counting(&mut observer, Duration::from_secs(5), AddEntity::ID).await;
+    assert!(
+        spawns > 0,
+        "observer should receive replay entity broadcasts"
+    );
+
+    let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
+    assert_ne!(
+        pressure_after, pressure_before,
+        "paused reader should produce a measured outbound pressure delta"
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= M96_REPLAY_ELAPSED_BUDGET,
+        "M96 bounded replay exceeded debug elapsed budget: elapsed={elapsed:?} budget={M96_REPLAY_ELAPSED_BUDGET:?}"
+    );
+
+    let chunk_snapshot = server.chunk_pipeline_metrics.snapshot();
+    assert_eq!(
+        chunk_snapshot.active_cpu, 0,
+        "chunk CPU work should not remain active after M96 replay sample: {:?}",
+        chunk_snapshot
+    );
+    assert_eq!(
+        chunk_snapshot.active_io, 0,
+        "chunk IO work should not remain active after M96 replay sample: {:?}",
+        chunk_snapshot
+    );
+    assert!(
+        chunk_snapshot.max_cpu_active <= server.chunk_worker_threads,
+        "chunk CPU permits exceeded during M96 replay: {:?}",
+        chunk_snapshot
+    );
+    assert!(
+        chunk_snapshot.max_io_active <= server.chunk_io_threads,
+        "chunk IO permits exceeded during M96 replay: {:?}",
+        chunk_snapshot
+    );
+
+    let pressure = mc_net::lock_pressure_snapshot();
+    assert!(
+        pressure.session_registry.max_hold_us <= M96_LOCK_MAX_HOLD_BUDGET_US,
+        "session registry lock hold exceeded M96 replay budget: {:?}",
+        pressure.session_registry
+    );
+    assert!(
+        pressure.world_storage.max_hold_us <= M96_LOCK_MAX_HOLD_BUDGET_US,
+        "world storage lock hold exceeded M96 replay budget: {:?}",
+        pressure.world_storage
+    );
+    eprintln!(
+        "M96 bounded_replay clients={} sequential_same_block_updates={} spawns={} elapsed_ms={} outbound_before={:?} outbound_after={:?} chunk_before_disconnect={:?} chunk_pipeline={:?} session_lock={:?} world_lock={:?}",
+        M96_REPLAY_CLIENTS + 1,
+        observer_updates,
+        spawns,
+        elapsed.as_millis(),
+        pressure_before,
+        pressure_after,
+        chunk_before_disconnect,
+        chunk_snapshot,
+        pressure.session_registry,
+        pressure.world_storage,
+    );
+
+    paused_reader.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla sidecars; degraded when absent"]
 async fn multicore_login_chunk_stream_and_broadcast_stays_within_budgets() {
-    let Some(server) = start_load_server().await else {
-        return;
-    };
+    let server = start_load_server().await;
     let addr = server.addr;
     let started = Instant::now();
 
@@ -120,10 +323,9 @@ async fn multicore_login_chunk_stream_and_broadcast_stays_within_budgets() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla sidecars; degraded when absent"]
 async fn paused_reader_does_not_stall_active_entity_broadcasts() {
-    let Some(server) = start_load_server().await else {
-        return;
-    };
+    let server = start_load_server().await;
     let addr = server.addr;
 
     let paused_reader = PausedReaderClient::connect(addr, "M52PausedReader").await;
@@ -175,9 +377,7 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
 #[tokio::test]
 #[ignore = "M37 load report; run explicitly with --ignored --nocapture"]
 async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
-    let Some(server) = start_load_server().await else {
-        return;
-    };
+    let server = start_load_server().await;
     let addr = server.addr;
 
     let started = Instant::now();
@@ -320,18 +520,17 @@ impl LoadServer {
     }
 }
 
-async fn start_load_server() -> Option<LoadServer> {
+async fn start_load_server() -> LoadServer {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
     let registries_json = vanilla_dir.join("reports/registries.json");
     if !blocks_json.exists() || !registries_json.exists() {
-        eprintln!(
-            "skipping M37 load scenarios: missing {} or {}",
+        panic!(
+            "load scenarios degraded: missing {} or {}; tests are ignored unless local vanilla sidecars are available",
             blocks_json.display(),
             registries_json.display()
         );
-        return None;
     }
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
@@ -401,13 +600,13 @@ async fn start_load_server() -> Option<LoadServer> {
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
-    Some(LoadServer {
+    LoadServer {
         addr,
         chunk_pipeline_metrics,
         outbound_pressure,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
-    })
+    }
 }
 
 struct PausedReaderClient {
@@ -515,6 +714,58 @@ async fn drain_counting(client: &mut Client, duration: Duration, packet_id: i32)
         }
         if frame.id == packet_id {
             count += 1;
+        }
+    }
+}
+
+async fn wait_for_ack(client: &mut Client, expected_sequence: i32) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return false;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if pkt.sequence == expected_sequence {
+                return true;
+            }
+        }
+    }
+}
+
+async fn drain_target_block_updates(
+    client: &mut Client,
+    target_pos: i64,
+    duration: Duration,
+) -> usize {
+    let target = unpack_block_pos(target_pos);
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut updates = 0usize;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return updates;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return updates;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
+            if unpack_block_pos(pkt.position) == target {
+                updates += 1;
+            }
         }
     }
 }
