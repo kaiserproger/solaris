@@ -53,6 +53,7 @@ const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct CommandPermissionConfig {
     operators: BTreeSet<String>,
     allow_local_dev_operators: bool,
+    login_access: login::LoginAccessConfig,
 }
 
 impl CommandPermissionConfig {
@@ -69,7 +70,14 @@ impl CommandPermissionConfig {
                 .map(|entry| entry.to_ascii_lowercase())
                 .collect(),
             allow_local_dev_operators,
+            login_access: login::LoginAccessConfig::offline_only(),
         }
+    }
+
+    #[must_use]
+    pub fn with_login_access(mut self, login_access: login::LoginAccessConfig) -> Self {
+        self.login_access = login_access;
+        self
     }
 
     #[must_use]
@@ -98,6 +106,10 @@ impl CommandPermissionConfig {
             || self
                 .operators
                 .contains(&profile.uuid.to_string().to_ascii_lowercase())
+    }
+
+    pub(crate) fn login_access(&self) -> &login::LoginAccessConfig {
+        &self.login_access
     }
 }
 
@@ -969,6 +981,7 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// Bind to `config.bind_address` and return a [`BoundServer`] ready to
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
+    warn_if_public_offline_bind(&config);
     let listener = TcpListener::bind(config.bind_address).await?;
     let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
     let sessions = Arc::new(play::SessionRegistry::new());
@@ -1021,6 +1034,24 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
         chunk_pipeline_resources,
         sessions,
     })
+}
+
+fn warn_if_public_offline_bind(config: &ServerConfig) {
+    if config.command_permissions.login_access().online_mode || !is_public_bind(config.bind_address)
+    {
+        return;
+    }
+    warn!(
+        bind_address = %config.bind_address,
+        "offline-mode Solaris authentication is private/local only; public binds are not production-security-ready"
+    );
+}
+
+fn is_public_bind(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_private() && !ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unique_local(),
+    }
 }
 
 pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -> SaveAllReport {
@@ -1284,8 +1315,12 @@ async fn handle_connection(
                 config.chunk_pipeline.compression_threshold,
                 &mut compression,
                 config.chunk_pipeline.compression_level,
+                config.command_permissions.login_access(),
             )
             .await?;
+            let Some(profile) = profile else {
+                return Ok(());
+            };
             configuration::handle(
                 &mut reader,
                 &mut writer,
@@ -1585,5 +1620,14 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(metadata.world_time, 42);
+    }
+
+    #[test]
+    fn public_bind_detection_is_conservative() {
+        assert!(!is_public_bind("127.0.0.1:25565".parse().unwrap()));
+        assert!(!is_public_bind("10.0.0.1:25565".parse().unwrap()));
+        assert!(!is_public_bind("192.168.1.5:25565".parse().unwrap()));
+        assert!(is_public_bind("0.0.0.0:25565".parse().unwrap()));
+        assert!(is_public_bind("8.8.8.8:25565".parse().unwrap()));
     }
 }

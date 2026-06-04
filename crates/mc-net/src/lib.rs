@@ -26,7 +26,7 @@ pub use chunk_pipeline::{
 };
 pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
-pub use login::offline_uuid;
+pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
 pub use server::{
     BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,

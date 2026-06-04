@@ -4,8 +4,23 @@ motd = "First server powered by Solaris: Innovative Minecraft server engine writ
 view_distance = 8
 
 [network]
-bind_address = "0.0.0.0"
+bind_address = "127.0.0.1"
 port = 25565
+
+[auth]
+# M89 scope: Solaris is offline-mode only. This is suitable for private/local
+# MVP testing, not production public authentication. Keep the example bound to
+# loopback unless you have an explicit external access plan.
+online_mode = false
+whitelist_enabled = false
+whitelist = []
+banned_players = []
+
+[admin]
+# OP access is fail-closed by default. Add names or offline UUIDs here, or set
+# allow_local_dev_operators = true only for throwaway local development.
+operators = []
+allow_local_dev_operators = false
 
 [data]
 world_dir = ".analysis/test-world"
