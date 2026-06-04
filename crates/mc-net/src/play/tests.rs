@@ -2826,6 +2826,53 @@ fn common_container_paper_cuts_resolve_to_existing_menus() {
         FurnaceKind::BlastFurnace.menu_type(),
         BLAST_FURNACE_MENU_TYPE_ID
     );
+
+    let expected_unsupported_stations = [
+        ("minecraft:brewing_stand", "brewing stand"),
+        ("minecraft:anvil", "anvil"),
+        ("minecraft:chipped_anvil", "anvil"),
+        ("minecraft:damaged_anvil", "anvil"),
+        ("minecraft:enchanting_table", "enchanting table"),
+        ("minecraft:smithing_table", "smithing table"),
+        ("minecraft:grindstone", "grindstone"),
+        ("minecraft:stonecutter", "stonecutter"),
+        ("minecraft:loom", "loom"),
+        ("minecraft:cartography_table", "cartography table"),
+        ("minecraft:composter", "composter"),
+        ("minecraft:cauldron", "cauldron"),
+        ("minecraft:water_cauldron", "cauldron"),
+        ("minecraft:lava_cauldron", "cauldron"),
+        ("minecraft:powder_snow_cauldron", "cauldron"),
+        ("minecraft:lectern", "lectern"),
+        ("minecraft:fletching_table", "fletching table"),
+        ("minecraft:beacon", "beacon"),
+        ("minecraft:crafter", "crafter"),
+    ];
+    for (block_id, station) in expected_unsupported_stations {
+        assert_eq!(
+            super::containers::unsupported_survival_station_for_block_id(block_id),
+            Some(station),
+            "{block_id} must be covered by the M87 safe-rejection policy"
+        );
+    }
+}
+
+#[test]
+fn cauldron_variants_are_safe_interaction_targets() {
+    let cauldron_variants = [
+        "minecraft:cauldron",
+        "minecraft:water_cauldron",
+        "minecraft:lava_cauldron",
+        "minecraft:powder_snow_cauldron",
+    ];
+
+    for block_id in cauldron_variants {
+        assert_eq!(
+            super::containers::unsupported_survival_station_for_block_id(block_id),
+            Some("cauldron"),
+            "{block_id} must not fall through into adjacent block placement"
+        );
+    }
 }
 
 fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {

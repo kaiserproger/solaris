@@ -195,6 +195,38 @@ pub(super) fn is_crafting_table_state(
         .is_some_and(|block_state| block_state.block.id.as_str() == "minecraft:crafting_table")
 }
 
+pub(super) fn unsupported_survival_station_for_state(
+    state: &InteractionState,
+    block_state: mc_world::BlockStateId,
+) -> Option<&'static str> {
+    state.blocks.by_id(block_state).and_then(|block_state| {
+        unsupported_survival_station_for_block_id(block_state.block.id.as_str())
+    })
+}
+
+pub(super) fn unsupported_survival_station_for_block_id(id: &str) -> Option<&'static str> {
+    match id {
+        "minecraft:brewing_stand" => Some("brewing stand"),
+        "minecraft:anvil" | "minecraft:chipped_anvil" | "minecraft:damaged_anvil" => Some("anvil"),
+        "minecraft:enchanting_table" => Some("enchanting table"),
+        "minecraft:smithing_table" => Some("smithing table"),
+        "minecraft:grindstone" => Some("grindstone"),
+        "minecraft:stonecutter" => Some("stonecutter"),
+        "minecraft:loom" => Some("loom"),
+        "minecraft:cartography_table" => Some("cartography table"),
+        "minecraft:composter" => Some("composter"),
+        "minecraft:cauldron"
+        | "minecraft:water_cauldron"
+        | "minecraft:lava_cauldron"
+        | "minecraft:powder_snow_cauldron" => Some("cauldron"),
+        "minecraft:lectern" => Some("lectern"),
+        "minecraft:fletching_table" => Some("fletching table"),
+        "minecraft:beacon" => Some("beacon"),
+        "minecraft:crafter" => Some("crafter"),
+        _ => None,
+    }
+}
+
 pub(super) fn find_smelting_recipe_for_item(
     state: &InteractionState,
     kind: FurnaceKind,

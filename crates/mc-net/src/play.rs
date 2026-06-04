@@ -130,6 +130,7 @@ use containers::{
     find_smelting_recipe_for_item, furnace_kind_for_state, furnace_menu_title_for_state,
     furnace_menu_title_nbt, is_barrel_state, is_chest_state, is_crafting_table_state, is_fuel_item,
     is_furnace_state, next_container_id, store_active_container,
+    unsupported_survival_station_for_state,
 };
 #[cfg(test)]
 use inventory::{ArmorStats, armor_reduced_damage};
@@ -2020,6 +2021,41 @@ where
         .sessions
         .register_furnace_viewer(state.session_id, window.position);
     state.active_container = Some(ActiveContainer::Furnace(window));
+    write_block_ack(writer, state.compression, sequence).await?;
+    Ok(true)
+}
+
+async fn reject_unsupported_survival_station_use<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    x: i32,
+    y: i32,
+    z: i32,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let position = mc_world::BlockPos { x, y, z };
+    let station = {
+        let mut storage = state.world.lock().await;
+        let clicked = storage
+            .get_block(position)
+            .map_err(|err| {
+                warn!(error = %err, x, y, z, "station use target read failed");
+                err
+            })?
+            .and_then(|block_state| unsupported_survival_station_for_state(state, block_state));
+        let Some(station) = clicked else {
+            return Ok(false);
+        };
+        station
+    };
+
+    debug!(
+        station,
+        x, y, z, "unsupported survival station use rejected safely"
+    );
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
 }
@@ -6343,6 +6379,11 @@ where
             return Ok(UseItemOnOutcome::Handled);
         }
         if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
+            return Ok(UseItemOnOutcome::Handled);
+        }
+        if reject_unsupported_survival_station_use(state, writer, action.sequence, cx, cy, cz)
+            .await?
+        {
             return Ok(UseItemOnOutcome::Handled);
         }
         if interact_with_bed(

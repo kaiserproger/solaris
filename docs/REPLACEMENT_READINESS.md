@@ -52,6 +52,12 @@ plus vanilla oracle or real-client evidence.
   smokers and blast furnaces share the furnace-family runtime. Barrel animation,
   sounds/events, furnace lit-state, hopper/comparator automation, and exact
   state-machine parity are not claimed.
+- Common survival stations beyond crafting/furnace-family support are safe
+  rejected in M87: brewing stand, anvil variants, enchanting table, smithing
+  table, grindstone, stonecutter, loom, cartography table, composter,
+  cauldron variants, lectern, fletching table, beacon, and crafter right-clicks
+  are acknowledged without opening unimplemented menus or placing a held block
+  through the station interaction. Their actual gameplay remains deferred.
 - Recipe loading and runtime support are partial for furnace, blasting, smoking,
   and campfire variants. Recipe-book/window sync and broader recipe execution
   need M80/M87 validation.
@@ -89,9 +95,9 @@ plus vanilla oracle or real-client evidence.
   blocked until rerun green or explicitly reclassified.
 - Online-mode/session auth, public-safety defaults, duplicate-name handling,
   permissions, chat policy, and malformed-action fail-closed behavior need M89.
-- Boats, minecarts, common survival stations beyond the currently supported
-  crafting/furnace-family paths, and redstone-lite automation need M81/M83/M87
-  decisions or implementation.
+- Boats, minecarts, common survival station gameplay beyond M87 safe rejection,
+  and redstone-lite automation need M81/M83/M94/M95 decisions, implementation,
+  or evidence-backed deferral.
 - Crash recovery, LZ4 Anvil compression, persisted light arrays, dropped-item
   lifecycle, long multiplayer soak, and autoscale behavior need M88-M96 evidence.
 - Generated-world join/chunk streaming must be fixed or explicitly carried as
