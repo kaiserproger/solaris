@@ -41,6 +41,8 @@ pub struct ServerConfig {
     pub admin: AdminSection,
     #[serde(default)]
     pub auth: AuthSection,
+    #[serde(default)]
+    pub autoscale: AutoscaleSection,
 }
 
 /// Identity-level server settings.
@@ -174,6 +176,122 @@ pub struct AuthSection {
     pub whitelist: Vec<String>,
     #[serde(default)]
     pub banned_players: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoscaleProfile {
+    LowEnd,
+    #[default]
+    Balanced,
+    HighEnd,
+}
+
+impl AutoscaleProfile {
+    #[must_use]
+    pub fn to_network(self) -> mc_net::AutoscaleProfile {
+        match self {
+            Self::LowEnd => mc_net::AutoscaleProfile::LowEnd,
+            Self::Balanced => mc_net::AutoscaleProfile::Balanced,
+            Self::HighEnd => mc_net::AutoscaleProfile::HighEnd,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoscaleSection {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub profile: AutoscaleProfile,
+    #[serde(default)]
+    pub min_view_distance: Option<i32>,
+    #[serde(default)]
+    pub max_view_distance: Option<i32>,
+    #[serde(default)]
+    pub target_tick_ms: Option<u64>,
+    #[serde(default)]
+    pub target_first_chunk_ms: Option<u64>,
+    #[serde(default)]
+    pub scale_down_after_ticks: Option<u32>,
+    #[serde(default)]
+    pub scale_up_after_ticks: Option<u32>,
+}
+
+impl Default for AutoscaleSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            profile: AutoscaleProfile::Balanced,
+            min_view_distance: None,
+            max_view_distance: None,
+            target_tick_ms: None,
+            target_first_chunk_ms: None,
+            scale_down_after_ticks: None,
+            scale_up_after_ticks: None,
+        }
+    }
+}
+
+impl AutoscaleSection {
+    #[must_use]
+    pub fn to_policy(&self, chunk_pipeline: &ChunkPipelineSection) -> mc_net::AutoscalePolicy {
+        let mut policy = mc_net::AutoscalePolicy::for_profile(self.profile.to_network());
+        if let Some(value) = self.min_view_distance {
+            policy.min_view_distance = value;
+        }
+        if let Some(value) = self.max_view_distance {
+            policy.max_view_distance = value;
+        }
+        if let Some(value) = self.target_tick_ms {
+            policy.target_tick_ms = value;
+        }
+        if let Some(value) = self.target_first_chunk_ms {
+            policy.target_first_chunk_ms = value;
+        }
+        if let Some(value) = self.scale_down_after_ticks {
+            policy.scale_down_after_ticks = value;
+        }
+        if let Some(value) = self.scale_up_after_ticks {
+            policy.scale_up_after_ticks = value;
+        }
+
+        policy.min_chunk_send_rate = policy
+            .min_chunk_send_rate
+            .min(chunk_pipeline.chunk_send_rate.max(1));
+        policy.max_chunk_send_rate = policy
+            .max_chunk_send_rate
+            .max(chunk_pipeline.chunk_send_rate.max(1));
+        policy.min_chunk_load_rate = policy
+            .min_chunk_load_rate
+            .min(chunk_pipeline.chunk_load_rate.max(1));
+        policy.max_chunk_load_rate = policy
+            .max_chunk_load_rate
+            .max(chunk_pipeline.chunk_load_rate.max(1));
+        policy.min_chunk_generate_rate = policy
+            .min_chunk_generate_rate
+            .min(chunk_pipeline.chunk_generate_rate.max(1));
+        policy.max_chunk_generate_rate = policy
+            .max_chunk_generate_rate
+            .max(chunk_pipeline.chunk_generate_rate.max(1));
+        policy.normalized()
+    }
+
+    #[must_use]
+    pub fn initial_limits(
+        &self,
+        server: &ServerSection,
+        chunk_pipeline: &ChunkPipelineSection,
+    ) -> mc_net::RuntimeControlLimits {
+        mc_net::RuntimeControlLimits {
+            view_distance: server.view_distance,
+            chunk_send_rate: chunk_pipeline.chunk_send_rate.max(1),
+            chunk_load_rate: chunk_pipeline.chunk_load_rate.max(1),
+            chunk_generate_rate: chunk_pipeline.chunk_generate_rate.max(1),
+        }
+        .bounded(self.to_policy(chunk_pipeline))
+    }
 }
 
 impl Default for AdminSection {
@@ -420,6 +538,8 @@ mod tests {
         assert!(!cfg.admin.allow_local_dev_operators);
         assert!(!cfg.auth.online_mode);
         assert!(!cfg.auth.whitelist_enabled);
+        assert!(!cfg.autoscale.enabled);
+        assert_eq!(cfg.autoscale.profile, AutoscaleProfile::Balanced);
     }
 
     #[test]
@@ -676,6 +796,73 @@ mod tests {
         assert_eq!(cfg.simulation.random_tick_chunk_budget, 11);
         assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 13);
         assert_eq!(cfg.simulation.save_interval_ticks, 40);
+    }
+
+    #[test]
+    fn parses_autoscale_overrides_and_builds_bounded_policy() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+            view_distance = 8
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [chunk_pipeline]
+            chunk_send_rate = 8
+            chunk_load_rate = 16
+            chunk_generate_rate = 16
+
+            [autoscale]
+            enabled = true
+            profile = "low_end"
+            min_view_distance = 3
+            max_view_distance = 6
+            target_tick_ms = 45
+            target_first_chunk_ms = 1200
+            scale_down_after_ticks = 2
+            scale_up_after_ticks = 7
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        let policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
+        let limits = cfg
+            .autoscale
+            .initial_limits(&cfg.server, &cfg.chunk_pipeline);
+
+        assert!(cfg.autoscale.enabled);
+        assert_eq!(cfg.autoscale.profile, AutoscaleProfile::LowEnd);
+        assert_eq!(policy.min_view_distance, 3);
+        assert_eq!(policy.max_view_distance, 6);
+        assert_eq!(policy.target_tick_ms, 45);
+        assert_eq!(policy.target_first_chunk_ms, 1200);
+        assert_eq!(policy.scale_down_after_ticks, 2);
+        assert_eq!(policy.scale_up_after_ticks, 7);
+        assert_eq!(limits.view_distance, 6);
+        assert_eq!(limits.chunk_send_rate, 8);
+        assert_eq!(limits.chunk_load_rate, 16);
+        assert_eq!(limits.chunk_generate_rate, 16);
+    }
+
+    #[test]
+    fn autoscale_section_rejects_unknown_fields() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "0.0.0.0"
+            port = 25565
+
+            [autoscale]
+            enabled = false
+            unexpected = true
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(err.to_string().contains("unknown field `unexpected`"));
     }
 
     #[test]

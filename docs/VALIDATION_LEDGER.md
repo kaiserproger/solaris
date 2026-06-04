@@ -139,6 +139,9 @@ the required oracle/client evidence:
 - K2 common survival stations gameplay beyond M87 safe rejection: station menus/recipes/effects are explicitly deferred and lack oracle/client evidence.
 - V1 vehicles remain draft debt: M83 landed only `mc-entity` domain support and explicit deferrals; client-visible spawn/mount/move/persistence/visibility evidence is still missing.
 - O1-O3 performance, concurrency, and autoscale evidence, including the M77 generated-world join/chunk-stream blocker: 289 chunks stream functionally but full window took 17.3s with repeated tick-budget and `chunk_prepare` lock warnings.
+- M92 adds draft O3 autoscale decision primitives and config visibility only;
+  live hot-path integration, health/admin output, slow-client shedding, and
+  low-end/balanced/high-end soak remain non-green until M93+ evidence.
 - S1 crash recovery and persistence breadth.
 - S2 multiplayer soak and contention evidence.
 - M60-M76 farming/plant/campfire/sign/container/loot rows that are currently Solaris-harness-only or deterministic-divergence-only.
