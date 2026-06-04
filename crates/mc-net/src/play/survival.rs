@@ -298,11 +298,12 @@ pub(super) fn mob_drop_stack_from(
     entity_type: &str,
 ) -> Option<ItemStack> {
     let entity = Identifier::parse(entity_type.to_string()).ok()?;
-    let item = loot
-        .entity_drop(&entity)
-        .or_else(|| mc_data::loot::builtin().entity_drop(&entity))?;
-    let item_id = items.id_of(item)?;
-    Some(ItemStack::new(item_id, 1))
+    let drop = loot
+        .entity_drop_stack(&entity)
+        .or_else(|| mc_data::loot::builtin().entity_drop_stack(&entity))?;
+    let item_id = items.id_of(&drop.item)?;
+    let count = i32::try_from(drop.count).ok()?;
+    Some(ItemStack::new(item_id, count))
 }
 
 pub(super) fn mob_drop_stack(state: &InteractionState, entity_type: &str) -> Option<ItemStack> {
@@ -330,13 +331,16 @@ pub(super) fn block_drop_stacks_from(
         return crop_drops;
     }
 
-    let item = loot
-        .block_drop(&block.block.id)
-        .or_else(|| mc_data::loot::builtin().block_drop(&block.block.id))
-        .unwrap_or(&block.block.id);
+    let drop = loot
+        .block_drop_stack(&block.block.id)
+        .or_else(|| mc_data::loot::builtin().block_drop_stack(&block.block.id));
+    let item = drop.map_or(&block.block.id, |drop| &drop.item);
+    let count = drop
+        .and_then(|drop| i32::try_from(drop.count).ok())
+        .unwrap_or(1);
     items
         .id_of(item)
-        .map(|item_id| vec![ItemStack::new(item_id, 1)])
+        .map(|item_id| vec![ItemStack::new(item_id, count)])
         .unwrap_or_default()
 }
 
