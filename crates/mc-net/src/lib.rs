@@ -9,6 +9,7 @@
 //! if the client asked for `Status` — answers a server-list ping. The
 //! Login → Configuration → Play path arrives in M1.d / M1.e / M1.g.
 
+mod autoscale_soak;
 mod chunk_pipeline;
 mod configuration;
 mod connection;
@@ -20,6 +21,10 @@ mod play;
 mod server;
 mod status;
 
+pub use autoscale_soak::{
+    AutoscalePrimitiveStatus, AutoscaleSoakProfile, AutoscaleSoakReport, AutoscaleSoakScenario,
+    AutoscaleSoakSnapshot,
+};
 pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
     ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPriority, ChunkRequest,
@@ -35,7 +40,7 @@ pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
 pub use server::{
     BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,
-    ServerConfig, ShutdownHandle, WorldHandle, bind, run,
+    SaveAllReport, SaveAllTimings, ServerConfig, ShutdownHandle, WorldHandle, bind, run,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.
