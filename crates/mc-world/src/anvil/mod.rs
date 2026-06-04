@@ -21,4 +21,5 @@ pub use chunk_nbt::{
 };
 pub use region::{
     CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RegionError, read_region, write_region,
+    write_region_create_new,
 };

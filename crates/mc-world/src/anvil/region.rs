@@ -21,6 +21,7 @@
 //!     idx = (cz as usize) * 32 + (cx as usize)
 //! Locations table entry sits at `idx * 4`.
 
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -223,7 +224,22 @@ pub fn read_region(path: impl AsRef<Path>) -> Result<Vec<ChunkPayload>, RegionEr
 /// Slots not represented in `chunks` are left empty (`(0, 0)` in the
 /// locations table).
 pub fn write_region(path: impl AsRef<Path>, chunks: &[ChunkPayload]) -> Result<(), RegionError> {
-    let path = path.as_ref();
+    write_region_with_options(path.as_ref(), chunks, false)
+}
+
+/// Write a fresh region file at `path`, failing if it already exists.
+pub fn write_region_create_new(
+    path: impl AsRef<Path>,
+    chunks: &[ChunkPayload],
+) -> Result<(), RegionError> {
+    write_region_with_options(path.as_ref(), chunks, true)
+}
+
+fn write_region_with_options(
+    path: &Path,
+    chunks: &[ChunkPayload],
+    create_new: bool,
+) -> Result<(), RegionError> {
     let mut locations = vec![0u32; REGION_CHUNK_COUNT];
     let mut timestamps = vec![0u32; REGION_CHUNK_COUNT];
     // Body begins at sector HEADER_SECTORS; next_sector tracks growth.
@@ -272,7 +288,20 @@ pub fn write_region(path: impl AsRef<Path>, chunks: &[ChunkPayload]) -> Result<(
     }
     out.extend_from_slice(&body);
 
-    std::fs::write(path, &out).map_err(|e| RegionError::Io {
+    let mut file = if create_new {
+        OpenOptions::new().write(true).create_new(true).open(path)
+    } else {
+        File::create(path)
+    }
+    .map_err(|e| RegionError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    file.write_all(&out).map_err(|e| RegionError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    file.sync_all().map_err(|e| RegionError::Io {
         path: path.to_path_buf(),
         source: e,
     })?;

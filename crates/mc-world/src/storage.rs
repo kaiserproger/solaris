@@ -10,8 +10,11 @@
 //! land in M3 along with chunk streaming.
 
 use std::collections::{HashMap, VecDeque};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::SystemTime;
 
 use thiserror::Error;
 
@@ -21,7 +24,7 @@ use mc_data::items::ItemRegistry;
 
 use crate::anvil::{
     ChunkNbtError, ChunkPayload, RegionError, chunk_from_nbt_with_items,
-    chunk_to_payload_with_items, read_region, write_region,
+    chunk_to_payload_with_items, read_region, write_region_create_new,
 };
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
@@ -38,6 +41,7 @@ const DEFAULT_LRU_CAPACITY: usize = 16;
 /// pragmatic default that covers the M3.e view-distance ring around
 /// a single player without growing unboundedly.
 const DEFAULT_REGION_LRU_CAPACITY: usize = 4;
+static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A decoded region: per-chunk payload bytes ready for
 /// `mc_nbt::read_named`, keyed by the chunk's local-to-region
@@ -56,6 +60,8 @@ pub enum WorldError {
     ChunkNbt(#[from] ChunkNbtError),
     #[error("NBT parse: {0}")]
     Nbt(#[from] mc_nbt::NbtError),
+    #[error("region changed before replace: {0}")]
+    StaleRegion(PathBuf),
 }
 
 /// Read-only handle to a world's chunk data.
@@ -105,8 +111,13 @@ pub struct DirtyFlushPlan {
 struct DirtyFlushRegionPlan {
     region: (i32, i32),
     region_path: PathBuf,
-    cached_payloads: Option<Vec<ChunkPayload>>,
     dirty_payloads: Vec<PlannedChunkPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegionFileVersion {
+    len: u64,
+    modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,20 +201,15 @@ impl DirtyFlushPlan {
     pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
         let mut commits = Vec::with_capacity(self.regions.len());
         for region in self.regions {
-            let mut by_slot: HashMap<(u8, u8), ChunkPayload> =
-                if let Some(payloads) = region.cached_payloads {
-                    payloads
-                        .into_iter()
-                        .map(|p| ((p.local_x, p.local_z), p))
-                        .collect()
-                } else if region.region_path.is_file() {
-                    read_region(&region.region_path)?
-                        .into_iter()
-                        .map(|p| ((p.local_x, p.local_z), p))
-                        .collect()
-                } else {
-                    HashMap::new()
-                };
+            let expected_version = region_file_version(&region.region_path)?;
+            let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if expected_version.is_some() {
+                read_region(&region.region_path)?
+                    .into_iter()
+                    .map(|p| ((p.local_x, p.local_z), p))
+                    .collect()
+            } else {
+                HashMap::new()
+            };
 
             for planned in &region.dirty_payloads {
                 by_slot.insert(
@@ -215,14 +221,7 @@ impl DirtyFlushPlan {
             let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
             payloads.sort_by_key(|p| (p.local_z, p.local_x));
 
-            let tmp_path = region.region_path.with_extension("mca.tmp");
-            write_region(&tmp_path, &payloads)?;
-            std::fs::rename(&tmp_path, &region.region_path).map_err(|e| {
-                WorldError::Region(RegionError::Io {
-                    path: region.region_path.clone(),
-                    source: e,
-                })
-            })?;
+            replace_region_file(&region.region_path, &payloads, expected_version.as_ref())?;
 
             commits.push(DirtyFlushRegionCommit {
                 region: region.region,
@@ -239,6 +238,144 @@ impl DirtyFlushPlan {
 
         Ok(DirtyFlushCommit { regions: commits })
     }
+}
+
+fn replace_region_file(
+    region_path: &Path,
+    payloads: &[ChunkPayload],
+    expected_version: Option<&RegionFileVersion>,
+) -> Result<(), WorldError> {
+    if region_file_version(region_path)?.as_ref() != expected_version {
+        return Err(WorldError::StaleRegion(region_path.to_path_buf()));
+    }
+
+    #[cfg(windows)]
+    if expected_version.is_some() {
+        return Err(WorldError::Region(RegionError::Io {
+            path: region_path.to_path_buf(),
+            source: std::io::Error::new(
+                ErrorKind::Unsupported,
+                "atomic replacement of existing region files is unsupported on Windows",
+            ),
+        }));
+    }
+
+    let tmp_path = write_unique_region_tmp(region_path, payloads)?;
+    if expected_version.is_some() {
+        install_existing_region_file(region_path, &tmp_path)?;
+    } else {
+        install_new_region_file(region_path, &tmp_path)?;
+    }
+    sync_parent_dir(region_path)?;
+    Ok(())
+}
+
+fn install_existing_region_file(region_path: &Path, tmp_path: &Path) -> Result<(), WorldError> {
+    std::fs::rename(tmp_path, region_path).map_err(|e| {
+        let _ = std::fs::remove_file(tmp_path);
+        WorldError::Region(RegionError::Io {
+            path: region_path.to_path_buf(),
+            source: e,
+        })
+    })
+}
+
+fn install_new_region_file(region_path: &Path, tmp_path: &Path) -> Result<(), WorldError> {
+    match std::fs::hard_link(tmp_path, region_path) {
+        Ok(()) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Ok(())
+        }
+        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(WorldError::StaleRegion(region_path.to_path_buf()))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(tmp_path);
+            Err(WorldError::Region(RegionError::Io {
+                path: region_path.to_path_buf(),
+                source: e,
+            }))
+        }
+    }
+}
+
+fn region_file_version(path: &Path) -> Result<Option<RegionFileVersion>, WorldError> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some(RegionFileVersion {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(WorldError::Region(RegionError::Io {
+            path: path.to_path_buf(),
+            source: e,
+        })),
+    }
+}
+
+fn write_unique_region_tmp(
+    region_path: &Path,
+    payloads: &[ChunkPayload],
+) -> Result<PathBuf, WorldError> {
+    for _ in 0..16 {
+        let tmp_path = unique_region_tmp_path(region_path);
+        match write_region_create_new(&tmp_path, payloads) {
+            Ok(()) => return Ok(tmp_path),
+            Err(RegionError::Io { source, .. }) if source.kind() == ErrorKind::AlreadyExists => {}
+            Err(err) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(WorldError::from(err));
+            }
+        }
+    }
+    Err(WorldError::Region(RegionError::Io {
+        path: region_path.to_path_buf(),
+        source: std::io::Error::new(
+            ErrorKind::AlreadyExists,
+            "could not create unique region temp file",
+        ),
+    }))
+}
+
+fn unique_region_tmp_path(region_path: &Path) -> PathBuf {
+    let seq = REGION_TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let file_name = region_path
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .unwrap_or_else(|| "region.mca".into());
+    region_path.with_file_name(format!(".{file_name}.tmp.{pid}.{seq}"))
+}
+
+fn sync_parent_dir(path: &Path) -> Result<(), WorldError> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let dir = match std::fs::File::open(parent) {
+        Ok(dir) => dir,
+        Err(e) if is_unsupported_dir_sync_error(e.kind()) => {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(WorldError::Region(RegionError::Io {
+                path: parent.to_path_buf(),
+                source: e,
+            }));
+        }
+    };
+    match dir.sync_all() {
+        Ok(()) => Ok(()),
+        Err(e) if is_unsupported_dir_sync_error(e.kind()) => Ok(()),
+        Err(e) => Err(WorldError::Region(RegionError::Io {
+            path: parent.to_path_buf(),
+            source: e,
+        })),
+    }
+}
+
+fn is_unsupported_dir_sync_error(kind: ErrorKind) -> bool {
+    kind == ErrorKind::Unsupported || cfg!(windows) && kind == ErrorKind::PermissionDenied
 }
 
 impl WorldStorage {
@@ -951,10 +1088,6 @@ impl WorldStorage {
         for ((rx, rz), mut positions) in by_region {
             positions.sort_by_key(|pos| (pos.z, pos.x));
             let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
-            let cached_payloads = self
-                .regions
-                .get(&(rx, rz))
-                .map(|region| region.values().cloned().collect());
             let mut dirty_payloads = Vec::with_capacity(positions.len());
             for cpos in positions {
                 let chunk = self
@@ -973,7 +1106,6 @@ impl WorldStorage {
             regions.push(DirtyFlushRegionPlan {
                 region: (rx, rz),
                 region_path,
-                cached_payloads,
                 dirty_payloads,
             });
         }
@@ -1666,6 +1798,126 @@ mod tests {
     }
 
     #[test]
+    fn dirty_flush_uses_unique_region_tmp_without_clobbering_stale_fixed_tmp() {
+        use crate::chunk::ChunkGenerator;
+        use mc_data::Identifier;
+
+        struct StubGen;
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, BlockStateId(0), biome);
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        let region_dir = tmp_world.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        let region_path = region_dir.join("r.0.0.mca");
+        let tmp_path = region_path.with_extension("mca.tmp");
+        let stale_tmp = b"interrupted previous flush";
+        std::fs::write(&tmp_path, stale_tmp).unwrap();
+
+        let report = vec![mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen));
+
+        assert!(world.get_chunk(ChunkPos { x: 0, z: 0 }).unwrap().is_some());
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+
+        assert!(region_path.is_file());
+        assert_eq!(std::fs::read(&tmp_path).unwrap(), stale_tmp);
+        assert_eq!(read_region(&region_path).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn region_replace_rejects_stale_expected_version() {
+        use crate::chunk::ChunkGenerator;
+        use mc_data::Identifier;
+
+        struct StubGen;
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, BlockStateId(0), biome);
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        let region_dir = tmp_world.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        let region_path = region_dir.join("r.0.0.mca");
+        let report = vec![mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+        let mut world = WorldStorage::open_with_capacity(tmp_world.path(), registry, 16)
+            .unwrap()
+            .with_generator(Arc::new(StubGen));
+        assert!(world.get_chunk(ChunkPos { x: 0, z: 0 }).unwrap().is_some());
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+
+        let expected = region_file_version(&region_path).unwrap();
+        let payloads = read_region(&region_path).unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&region_path)
+            .unwrap();
+        use std::io::Write as _;
+        file.write_all(&[0]).unwrap();
+
+        let Err(WorldError::StaleRegion(path)) =
+            replace_region_file(&region_path, &payloads, expected.as_ref())
+        else {
+            panic!("stale region version must reject replacement");
+        };
+        assert_eq!(path, region_path);
+    }
+
+    #[test]
+    fn new_region_install_rejects_concurrent_create() {
+        let tmp_world = tempfile::tempdir().unwrap();
+        let region_path = tmp_world.path().join("r.0.0.mca");
+        let tmp_path = tmp_world.path().join(".r.0.0.mca.tmp");
+        std::fs::write(&tmp_path, b"planned replacement").unwrap();
+        std::fs::write(&region_path, b"concurrent region").unwrap();
+
+        let Err(WorldError::StaleRegion(path)) = install_new_region_file(&region_path, &tmp_path)
+        else {
+            panic!("new-region install must reject a concurrently created target");
+        };
+
+        assert_eq!(path, region_path);
+        assert_eq!(std::fs::read(&region_path).unwrap(), b"concurrent region");
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
     fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
         use crate::chunk::ChunkGenerator;
         use mc_data::Identifier;
@@ -1750,6 +2002,110 @@ mod tests {
         assert_eq!(world.dirty_count(), 0);
         let mut fresh = WorldStorage::open_with_capacity(tmp_world.path(), registry, 16).unwrap();
         assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(1)));
+    }
+
+    #[test]
+    fn dirty_flush_does_not_overwrite_newer_region_with_stale_cached_snapshot() {
+        use crate::chunk::ChunkGenerator;
+        use mc_data::Identifier;
+
+        struct StubGen {
+            state: BlockStateId,
+        }
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let air = BlockStateId(0);
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, air, biome);
+                chunk.set_block(0, 0, 0, self.state);
+                chunk.status = "minecraft:full".into();
+                chunk.dirty = true;
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let report = vec![
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse("minecraft:dirt").unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id: 2,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            },
+        ];
+        let registry = Arc::new(BlockRegistry::from_report(&report).unwrap());
+
+        let mut initial =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen {
+                    state: BlockStateId(1),
+                }));
+        assert!(
+            initial
+                .get_chunk(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(initial.flush_dirty().unwrap(), 1);
+
+        let mut stale_cached =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
+        assert_eq!(
+            stale_cached
+                .get_block(BlockPos { x: 0, y: 0, z: 0 })
+                .unwrap(),
+            Some(BlockStateId(1))
+        );
+
+        let mut newer =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen {
+                    state: BlockStateId(1),
+                }));
+        assert!(newer.get_chunk(ChunkPos { x: 1, z: 0 }).unwrap().is_some());
+        assert_eq!(newer.flush_dirty().unwrap(), 1);
+
+        stale_cached
+            .set_block_at(BlockPos { x: 0, y: 0, z: 0 }, BlockStateId(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stale_cached.flush_dirty().unwrap(), 1);
+
+        let mut fresh =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
+        assert_eq!(
+            fresh.get_block(BlockPos { x: 16, y: 0, z: 0 }).unwrap(),
+            Some(BlockStateId(1))
+        );
+        assert_eq!(
+            fresh.get_block(BlockPos { x: 0, y: 0, z: 0 }).unwrap(),
+            Some(BlockStateId(2))
+        );
     }
 
     #[test]
