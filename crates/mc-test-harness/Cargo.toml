@@ -31,4 +31,5 @@ mc-data = { path = "../mc-data" }
 mc-net = { path = "../mc-net" }
 mc-world = { path = "../mc-world" }
 mc-worldgen = { path = "../mc-worldgen" }
+serde_json = { workspace = true }
 tempfile = "3"
