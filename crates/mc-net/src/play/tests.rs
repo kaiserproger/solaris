@@ -3167,6 +3167,29 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
     }
 }
 
+fn shield_item_state() -> InteractionState {
+    let shield = Identifier::parse("minecraft:shield").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: shield,
+        protocol_id: 77,
+    }]));
+    interaction_state_for_items(items)
+}
+
+fn decode_container_set_slot_packets(bytes: &[u8]) -> Vec<ClientboundContainerSetSlot> {
+    let mut buf = bytes::BytesMut::from(bytes);
+    let mut packets = Vec::new();
+    while let Some(mut frame) =
+        mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled).unwrap()
+    {
+        if frame.id == ClientboundContainerSetSlot::ID {
+            packets.push(ClientboundContainerSetSlot::decode(&mut frame.body).unwrap());
+        }
+    }
+    assert!(buf.is_empty());
+    packets
+}
+
 #[test]
 fn furnace_window_swap_and_throw_mutate_menu_slots() {
     let coal = Identifier::parse("minecraft:coal").unwrap();
@@ -3645,6 +3668,149 @@ fn shield_side_back_and_unknown_sources_are_not_blocked() {
         SHIELD_ACTIVATION_DELAY_TICKS,
         Some(&shield_use),
     ));
+}
+
+#[test]
+fn shield_block_damages_active_shield_stack() {
+    let mut state = shield_item_state();
+    let slot = PlayerInventory::HOTBAR_BASE;
+    state.inventory.slots[slot] = ItemStack::new(77, 1);
+    state.shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::MainHand,
+        slot,
+        state.inventory.slots[slot].clone(),
+        1,
+        true,
+    );
+
+    let changed = damage_active_shield(&mut state, 3.75).expect("shield should take durability");
+
+    assert_eq!(changed, (slot, ItemStack::new(77, 1).with_damage(4)));
+    assert_eq!(
+        state.inventory.slots[slot],
+        ItemStack::new(77, 1).with_damage(4)
+    );
+    assert_eq!(
+        state.shield_use.as_ref().unwrap().stack,
+        state.inventory.slots[slot]
+    );
+}
+
+#[test]
+fn shield_block_removes_broken_active_shield() {
+    let mut state = shield_item_state();
+    state.inventory.slots[45] = ItemStack::new(77, 1).with_damage(SHIELD_FALLBACK_MAX_DAMAGE - 4);
+    state.shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::OffHand,
+        45,
+        state.inventory.slots[45].clone(),
+        1,
+        true,
+    );
+
+    let changed = damage_active_shield(&mut state, 3.0).expect("shield break should update slot");
+
+    assert_eq!(changed, (45, ItemStack::EMPTY));
+    assert_eq!(state.inventory.slots[45], ItemStack::EMPTY);
+    assert!(state.shield_use.is_none());
+}
+
+#[tokio::test]
+async fn projectile_shield_block_writes_scaled_slot_update() {
+    let mut state = shield_item_state();
+    state.sessions.set_world_time(10);
+    let slot = PlayerInventory::HOTBAR_BASE;
+    state.inventory.slots[slot] = ItemStack::new(77, 1);
+    state.shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::MainHand,
+        slot,
+        state.inventory.slots[slot].clone(),
+        1,
+        true,
+    );
+    let mut survival_state = SurvivalState::FULL;
+    let mut writer = Vec::new();
+
+    apply_projectile_player_damage(
+        Some(&mut state),
+        &mut writer,
+        Compression::Disabled,
+        &mut survival_state,
+        GameMode::Survival,
+        ProjectilePlayerDamage {
+            player_pose: PlayerPose::new(0.0, 64.0, 0.0),
+            amount: 4.2,
+            source_origin: Some(Vec3::new(0.0, 64.0, 2.0)),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(survival_state.health, SurvivalState::FULL.health);
+    assert_eq!(
+        state.inventory.slots[slot],
+        ItemStack::new(77, 1).with_damage(5)
+    );
+    let packets = decode_container_set_slot_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].slot, slot as i16);
+    assert_eq!(packets[0].item_stack, ItemStack::new(77, 1).with_damage(5));
+}
+
+#[tokio::test]
+async fn hostile_melee_shield_block_writes_break_clear_slot_update() {
+    let mut state = shield_item_state();
+    state.sessions.set_world_time(10);
+    let slot = 45;
+    state.inventory.slots[slot] = ItemStack::new(77, 1).with_damage(SHIELD_FALLBACK_MAX_DAMAGE - 4);
+    state.shield_use = shield_use_from_stack(
+        mc_protocol::packets::play::InteractionHand::OffHand,
+        slot,
+        state.inventory.slots[slot].clone(),
+        1,
+        true,
+    );
+    let mut attributes = mc_entity::AttributeSet::vanilla_mob_defaults();
+    attributes.set_base(mc_entity::AttributeKind::AttackDamage, 3.0);
+    state
+        .sessions
+        .restore_persisted_entities([mc_entity::EntitySnapshot {
+            id: mc_entity::EntityId(7),
+            uuid: uuid::Uuid::nil(),
+            type_id: 1,
+            type_name: "minecraft:zombie".into(),
+            position: Vec3::new(0.0, 64.0, 1.0),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: Vec3::new(0.0, 0.0, -0.2),
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            lifecycle: mc_entity::EntityLifecycle::Alive,
+            health: 20.0,
+            attributes,
+            goal: mc_entity::GoalState::Idle,
+        }]);
+    let mut survival_state = SurvivalState::FULL;
+    let mut writer = Vec::new();
+
+    tick_hostile_pressure(
+        &mut state,
+        &mut writer,
+        GameMode::Survival,
+        &mut survival_state,
+        PlayerPose::new(0.0, 64.0, 0.0),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(survival_state.health, SurvivalState::FULL.health);
+    assert_eq!(state.inventory.slots[slot], ItemStack::EMPTY);
+    assert!(state.shield_use.is_none());
+    let packets = decode_container_set_slot_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].slot, slot as i16);
+    assert_eq!(packets[0].item_stack, ItemStack::EMPTY);
 }
 
 include!("tests/inventory_and_survival.rs");

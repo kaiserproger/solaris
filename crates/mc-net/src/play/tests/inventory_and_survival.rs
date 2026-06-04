@@ -276,6 +276,51 @@ fn armor_reduction_uses_vanilla_combat_rule_shape() {
 }
 
 #[test]
+fn armor_durability_scales_with_incoming_damage() {
+    let chestplate = Identifier::parse("minecraft:iron_chestplate").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: chestplate,
+        protocol_id: 11,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.inventory.slots[6] = ItemStack::new(11, 1);
+
+    let changed = damage_equipped_armor(&mut state, 9.0);
+
+    assert_eq!(changed, vec![(6, ItemStack::new(11, 1).with_damage(2))]);
+    assert_eq!(state.inventory.slots[6], ItemStack::new(11, 1).with_damage(2));
+}
+
+#[test]
+fn shield_durability_respects_three_damage_threshold() {
+    assert_eq!(shield_durability_damage(2.99), 0);
+    assert_eq!(shield_durability_damage(3.0), 4);
+
+    let mut state = shield_item_state();
+    let shield = ItemStack::new(77, 1);
+    state.inventory.slots[45] = shield.clone();
+    state.shield_use = shield_use_from_stack(
+        InteractionHand::OffHand,
+        45,
+        shield,
+        state.sessions.world_time(),
+        true,
+    );
+
+    assert_eq!(damage_active_shield(&mut state, 2.99), None);
+    assert_eq!(state.inventory.slots[45], ItemStack::new(77, 1));
+    assert_eq!(damage_active_shield(&mut state, 3.0), Some((45, ItemStack::new(77, 1).with_damage(4))));
+}
+
+#[test]
+fn weapon_attack_durability_is_survival_only() {
+    assert!(weapon_attacks_damage_held_item(GameMode::Survival));
+    assert!(!weapon_attacks_damage_held_item(GameMode::Creative));
+    assert!(!weapon_attacks_damage_held_item(GameMode::Adventure));
+    assert!(!weapon_attacks_damage_held_item(GameMode::Spectator));
+}
+
+#[test]
 fn survival_periodic_tick_regens_and_starves() {
     let mut fed = SurvivalState::FULL;
     fed.apply_damage(2.0);
