@@ -27,6 +27,13 @@ local git identity, do not change it.
      guessing or memory.
 4. `README.md` for the build + run summary (mirrors what's in
    `example.toml`).
+5. `docs/DEFINITION_OF_DONE.md` — the hard DoD, autonomous
+   preflight, validation labels, and stabilization rules. Read this
+   before claiming readiness or closing a milestone.
+6. `docs/NEXT_SESSION.md` when starting a fresh session without a
+   more specific milestone prompt.
+7. `docs/CORE_M77_M100_ROADMAP.md` for core-MVP stabilization work
+   through the M100 validation milestone.
 
 ## Repo layout
 
@@ -56,6 +63,12 @@ cargo fmt --all -- --check
 
 If a commit breaks the baseline, fix it in the same commit or
 the next `fix:` — don't leave the tree broken between commits.
+
+Baseline green is necessary, not sufficient. A milestone closeout must
+also say which higher-level gates were run: vanilla oracle, harness,
+manual/client, performance, and concurrency. Use the labels in
+`docs/DEFINITION_OF_DONE.md`; never collapse skipped/manual-pending
+coverage into "green".
 
 **Always use debug builds for dev.** Release has hung at the
 `mc-server` binary linking step in past sessions; debug is
@@ -92,6 +105,17 @@ Each milestone X gets its own branch and a tag on `main`:
    `git merge` into `main`, never `git tag`. The owner does
    these explicitly.
 
+Fast implementation passes are allowed when the owner asks for them,
+but they are draft work unless the hard DoD says otherwise. Label the
+state as `draft`, `stabilization`, or `release-ready` in the milestone
+doc and final response. Do not let a draft closeout sound like vanilla
+parity or production readiness.
+
+Before any milestone code, run the autonomous preflight from
+`docs/DEFINITION_OF_DONE.md` and paste a terse result into the plan or
+session update. If a preflight item is missing, either fix it, mark the
+validation coverage as degraded, or stop when it invalidates the task.
+
 ## Style
 
 - **Terse.** Updates to the owner in 1–3 sentences, not
@@ -103,6 +127,9 @@ Each milestone X gets its own branch and a tag on `main`:
 - **No fake validation.** Tests must exercise real code paths;
   manufactured data that passes by construction is worse than
   no test.
+- **Hard DoD wording.** Say exactly what was proved and what was not.
+  Phrases like "ready", "parity", "replacement-ready", and "done"
+  require the evidence matrix from `docs/DEFINITION_OF_DONE.md`.
 - **Comments only when "why" is non-obvious.** Identifiers
   carry the "what." Don't write "added for MX" / "used by Y"
   comments — those rot. PR/commit bodies are where this
@@ -134,6 +161,13 @@ PrismLauncher 26.1.2 client against a debug-build
 owner runs these; agents prepare the server and say "ready,
 connect."
 
+Manual gates are no longer an afterthought. For client-visible or
+gameplay mechanics, plan the manual/client check before implementation
+and record whether it was run by the owner, run by an agent through an
+approved client automation path, or not run. A future Minecraft-client
+MCP server is an approved direction for making this autonomous, but it
+must exercise a real vanilla client and report reproducible evidence.
+
 ## Protocol & data oracles
 
 - `.analysis/server.jar` — bundled Mojang server (any 26.1.x).
@@ -148,6 +182,11 @@ connect."
 
 Packet IDs and field layouts are **cited from the javap dump
 or a wire-probe capture, never guessed**. See ADR 0002.
+
+Gameplay parity claims also need an oracle. Prefer vanilla captures,
+decompiled source inspection, or side-by-side harness scenarios before
+Solaris fixes. Solaris-only tests are useful scaffolding, not vanilla
+parity evidence.
 
 ## Memory layout
 

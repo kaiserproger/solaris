@@ -41,7 +41,7 @@ Reasons in order of importance:
 
 Listed explicitly so scope doesn't creep:
 
-- **NOT bit-perfect vanilla parity.** Not in worldgen, not in redstone tick order, not in RNG. Goal is "mechanics behave as expected", not byte-for-byte vanilla matching.
+- **NOT bit-perfect vanilla parity.** Not in worldgen, not in redstone tick order, not in RNG. Goal is "mechanics behave as expected", not byte-for-byte vanilla matching. For release-quality scoped overworld survival, however, Solaris must prove at least 80% vanilla-observable mechanic coverage; the rest must be explicit non-goals or documented divergences.
 - **NOT compatibility with Forge/Fabric/NeoForge server-side mods.** No JNI bridge for running NeoForge mods on this server.
 - **NOT cross-platform below the minimum.** Server: Linux x86_64 as primary, Windows x86_64 best-effort, others on demand. Client mod: whatever 26.1 vanilla supports.
 - **NOT Bedrock Edition.** Java Edition only.
@@ -57,6 +57,10 @@ Version 1.0 is ready for public release when:
 3. Client mod is published on Modrinth/CurseForge with an automatic installer
 4. Server survives crash recovery without data loss
 5. Full documentation: server admin setup guide, player setup guide, plugin API reference
+6. Scoped vanilla overworld-survival mechanics reach the hard DoD in
+   [DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md): at least 80%
+   client-observable coverage, documented divergences for the rest,
+   validated performance budgets, and reviewed multithreading behavior.
 
 ---
 
@@ -425,6 +429,16 @@ reserved for server-wide lock mitigation: make Solaris as lock-free as practical
 remove long global critical sections, and move blocking world/storage/session
 work behind queues, snapshots, sharding, or actor-style ownership where it fits.
 
+Post-M34 delivery is allowed to be breadth-first draft implementation,
+but release-quality claims are governed by
+[DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md). Every stabilization pass
+must reduce known vanilla/client parity debt, performance debt, or
+multithreading debt instead of adding new breadth.
+
+The M77-M100 core-MVP stabilization vector is tracked in
+[CORE_M77_M100_ROADMAP.md](CORE_M77_M100_ROADMAP.md). M100 is a full
+validation milestone, not a feature bucket.
+
 ### 9.1 Critical gates
 
 **After M3:** if the client doesn't connect reliably or performance is dismal — STOP, reconsider the architecture. Do not move forward on a rotten foundation.
@@ -451,10 +465,14 @@ Recommended cadence for solo part-time:
 Claude Code is used for milestone-level tasks (10-40 hours when fully scoped). Not for architecture. Not for parity tasks without an oracle. The principle:
 
 1. A milestone is extracted from the project (see individual milestone documents)
-2. A prompt is built from the template (see CLAUDE_CODE_PROMPTS.md)
-3. Claude Code works on a feature branch
-4. You review, test, merge manually into main
-5. Between milestones — you do the work. Architecture, integration debugging, vanilla-comparison testing.
+2. A prompt is built from the template (see CLAUDE_CODE_PROMPTS.md) or
+   `NEXT_SESSION.md` for an unspecialized continuation
+3. Claude Code works on a feature branch and runs the autonomous
+   preflight from [DEFINITION_OF_DONE.md](DEFINITION_OF_DONE.md)
+4. The agent labels the result as `draft`, `stabilization`, or
+   `release-ready` with an evidence matrix
+5. You review, test, merge manually into main
+6. Between milestones — you do the work. Architecture, integration debugging, vanilla-comparison testing, and manual/client gates.
 
 ### 10.3 Git workflow
 

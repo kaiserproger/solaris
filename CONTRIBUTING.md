@@ -30,6 +30,13 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+These checks are only the cargo baseline. For milestone closeouts,
+replacement-readiness claims, gameplay parity, performance work, or
+multithreading changes, also follow
+[`docs/DEFINITION_OF_DONE.md`](docs/DEFINITION_OF_DONE.md): run the
+autonomous preflight, label the state as `draft`, `stabilization`, or
+`release-ready`, and record the evidence matrix.
+
 ## Architectural decisions
 
 Nontrivial decisions are recorded as ADRs under `docs/decisions/`. If a change

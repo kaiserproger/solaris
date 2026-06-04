@@ -15,7 +15,9 @@ Used for each milestone after M0. You fill it in based on the current state of t
 
 ## Context
 
-You are implementing milestone M{N} of a Rust-based Minecraft 26.1-compatible server engine. The project is owned by a strong-Rust solo developer working part-time (~15h/week). Detailed project context is in `docs/PROJECT_SPEC.md` — read it before starting work.
+You are implementing milestone M{N} of a Rust-based Minecraft 26.1-compatible server engine. The project is owned by a strong-Rust solo developer working part-time (~15h/week). Detailed project context is in `AGENTS.md`, `docs/DEFINITION_OF_DONE.md`, and `docs/PROJECT_SPEC.md` — read them before starting work.
+
+Run the autonomous preflight from `docs/DEFINITION_OF_DONE.md` before code. Report it as `full`, `degraded`, or `blocked` in the plan or first status update.
 
 **Previous milestones completed:**
 - M0: Project bootstrap (workspace, CI, base crates)
@@ -48,6 +50,10 @@ This milestone is done when:
 3. ...
 
 Each criterion must be **mechanically verifiable** — either passes a test, runs to completion, or produces a specific observable output.
+
+Closeout quality label: `{draft | stabilization | release-ready}`.
+Do not claim vanilla parity, replacement readiness, or production quality
+unless the evidence matrix in `docs/DEFINITION_OF_DONE.md` is complete.
 
 ## Technical specification
 
@@ -91,6 +97,8 @@ pub struct ... // signature
 ### Testing approach
 - {Where to put tests, what kinds: unit / integration / property}
 - {Specific test cases to include}
+- {Vanilla oracle or client/manual evidence required for gameplay/parity claims}
+- {Performance/concurrency evidence required for hot-path or multithreaded changes}
 
 ## Out-of-scope adjustments
 
@@ -103,11 +111,13 @@ If during implementation you find that achieving acceptance criteria requires ch
 ## Deliverables
 
 When complete, provide:
-1. List of files created/modified
-2. Test results (`cargo test` output)
-3. Brief explanation of any deviation from this spec
-4. List of TODOs/follow-ups discovered
-5. Recommendations for M{N+1} based on what you learned
+1. Quality label: `draft`, `stabilization`, or `release-ready`
+2. Autonomous preflight result and any degraded coverage
+3. List of files created/modified
+4. Evidence matrix from `docs/DEFINITION_OF_DONE.md`
+5. Brief explanation of any deviation from this spec
+6. Known gaps and stabilization debt
+7. Recommendations for M{N+1} based on what you learned
 ```
 
 ---
@@ -122,18 +132,25 @@ To make prompts work instead of producing garbage:
 - **Read fresh references.** wiki.vg may have changed; Pumpkin may have done something new. Freshness of knowledge is your job, not Claude's.
 - **Set a baseline** — current main is stable, tests are green, benchmarks recorded.
 - **Create the feature branch** `dev/MX-name` from clean main. Claude Code works in it.
+- **Choose the quality mode** — `draft` for fast breadth-first work,
+  `stabilization` for hardening, or `release-ready` only when the hard
+  DoD can realistically be met.
 
 ### 2.2 What you do DURING Claude Code work
 
 - **Don't interrupt every 10 minutes.** Let the agent run for a meaningful amount of work (1-3 hours) before intervening, otherwise it can't get to a coherent solution.
 - **Watch `git diff` periodically.** If you see something weird — stop, investigate.
 - **Don't let the agent commit to main.** Feature branch only.
+- **Do not let draft closeouts sound final.** Draft work is allowed, but
+  oracle/manual/performance/concurrency gaps must stay visible.
 
 ### 2.3 What you do AFTER Claude Code work
 
 - **Code review like an external PR.** Check every file. Especially: error handling, unsafe, performance hot paths.
 - **Run the tests yourself**, don't trust the agent's report.
 - **Run the benchmarks** if the milestone touches them.
+- **Run or delegate the client/manual gate** if the milestone touches
+  vanilla-client-visible behavior.
 - **Verify integration** with existing code — API not broken, no surprise dependencies appeared.
 - **Sleep on it**, then merge. Don't merge same-day as you wrote.
 
@@ -141,8 +158,8 @@ To make prompts work instead of producing garbage:
 
 - Architectural decisions (library choice, pattern choice)
 - Debugging subtle race conditions
-- Performance tuning of hot paths
-- Parity tasks against vanilla (need a diff against an oracle)
+- Performance tuning of hot paths without reproducible baseline and target metrics
+- Parity tasks against vanilla without a local oracle, capture, decompiled source check, or real-client evidence path
 - Anywhere fail-silent is more dangerous than fail-loud
 
 ---
