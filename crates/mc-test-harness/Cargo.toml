@@ -15,6 +15,10 @@ workspace = true
 name = "wire-probe"
 path = "src/bin/wire_probe.rs"
 
+[[bin]]
+name = "coverage-audit"
+path = "src/bin/coverage_audit.rs"
+
 [dependencies]
 mc-protocol = { path = "../mc-protocol" }
 mc-nbt = { path = "../mc-nbt" }
