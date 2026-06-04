@@ -10,13 +10,14 @@
 //! non-empty chunk-data blob.
 //!
 //! M4.f extends the assertions to the bundled `LightData` payload:
-//! when `block_light.json` is present, every chunk's sky / block
-//! masks must cover all 26 wire slots between the present and empty
-//! channels, the layer counts must match the mask popcount, and the
-//! spawn chunk's above-world slot must ship 0xFF nibbles (open sky).
+//! every chunk's sky / block masks must cover all 26 wire slots
+//! between the present and empty channels, the layer counts must match
+//! the mask popcount, and the spawn chunk's above-world slot must ship
+//! 0xFF nibbles (open sky).
 //!
-//! Skipped silently when `blocks.json` is missing, matching the M2
-//! round-trip oracle's pattern.
+//! The spawn-window guard is ignored by default because it requires
+//! gitignored local vanilla sidecar reports. Run it explicitly when
+//! claiming generated-world or light-path coverage.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -34,21 +35,26 @@ use mc_test_harness::client::Client;
 /// Matches the default `[server].view_distance` in `example.toml`.
 /// Hard-coded here on purpose: a regression that quietly raises the
 /// default should fail this test by overshooting the bound, not silently pass.
-const VIEW_DISTANCE: i32 = 10;
+const VIEW_DISTANCE: i32 = 8;
 const MOVEMENT_VIEW_DISTANCE: i32 = 2;
 
 #[tokio::test]
+#[ignore]
 async fn vanilla_client_receives_spawn_view_distance_window() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
-    if !blocks_json.exists() {
-        eprintln!(
-            "skipping: {} missing — run tools/extract-vanilla-data.sh --reports",
-            blocks_json.display()
-        );
-        return;
-    }
+    let block_light_path = vanilla_dir.join("reports/block_light.json");
+    assert!(
+        blocks_json.exists(),
+        "M97 generated-world blocker guard requires {}; run tools/extract-vanilla-data.sh --reports",
+        blocks_json.display()
+    );
+    assert!(
+        block_light_path.exists(),
+        "M97 generated-world light-path guard requires {}; run tools/extract-block-light.sh",
+        block_light_path.display()
+    );
 
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
@@ -63,22 +69,11 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
 
-    // block_light.json is optional — when missing, the M4.f assertions
-    // are skipped but the M3.g shape assertions still run. This keeps
-    // CI green on a fresh checkout that hasn't run extract-block-light.sh.
-    let block_light_path = vanilla_dir.join("reports/block_light.json");
-    let block_light = match mc_data::block_light::load(&block_light_path) {
-        Ok(table) => Some(Arc::new(table)),
-        Err(err) => {
-            eprintln!(
-                "M4.f light assertions skipped: {} ({err})",
-                block_light_path.display()
-            );
-            None
-        }
-    };
-    let assert_light = block_light.is_some();
+    let block_light = Some(Arc::new(
+        mc_data::block_light::load(&block_light_path).expect("block light report loads"),
+    ));
 
+    let policy = mc_net::ChunkPipelinePolicy::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M3.g chunk stream".into(),
@@ -96,13 +91,14 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline: policy,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let chunk_pipeline_metrics = bound.chunk_pipeline_metrics();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -155,7 +151,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
     // Status: empty placeholder.
     const MIN_CHUNK_DATA_BYTES: usize = 24 * 8;
 
-    let expected_count = (2 * VIEW_DISTANCE + 1).pow(2) as usize; // 21×21 = 441
+    let expected_count = (2 * VIEW_DISTANCE + 1).pow(2) as usize; // 17×17 = 289
     let mut seen: HashSet<(i32, i32)> = HashSet::new();
     // Cap per-chunk client-usage heightmaps so the spawn chunk remains
     // the explicit canary for end-to-end heightmap encoding.
@@ -221,9 +217,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         if (pkt.chunk_x, pkt.chunk_z) == (0, 0) {
             spawn_heightmaps_seen = pkt.heightmaps.len();
         }
-        if assert_light {
-            assert_light_invariants(&pkt);
-        }
+        assert_light_invariants(&pkt);
         let fresh = seen.insert((pkt.chunk_x, pkt.chunk_z));
         assert!(
             fresh,
@@ -258,6 +252,20 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         chunks_with_heightmaps >= 1,
         "no chunk in the ring carried client-usage heightmaps — \
          encode_chunk_data is probably dropping them"
+    );
+
+    let resource_metrics = chunk_pipeline_metrics.snapshot();
+    assert!(
+        resource_metrics.max_cpu_active > 0,
+        "M97 generated-world blocker guard must exercise chunk CPU pipeline metrics: {resource_metrics:?}"
+    );
+    assert!(
+        resource_metrics.max_io_active <= policy.chunk_io_threads,
+        "M97 generated-world blocker regression: chunk IO concurrency exceeded policy: {resource_metrics:?}"
+    );
+    assert!(
+        resource_metrics.max_cpu_active <= policy.chunk_worker_threads,
+        "M97 generated-world blocker regression: chunk CPU concurrency exceeded policy: {resource_metrics:?}"
     );
 }
 
