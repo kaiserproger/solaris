@@ -31,7 +31,8 @@ use mc_data::tags::TagsData;
 use mc_data::{Registry, VanillaData};
 use mc_entity::{
     AttributeKind, EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, EntityStore,
-    EntityView, GoalState, Rotation, SpawnEntity, Vec3,
+    EntityView, GoalState, PathingBudget, PathingProbe, PathingProbeResult, Rotation, SpawnEntity,
+    Vec3,
 };
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_nbt::{ListTag, Tag};

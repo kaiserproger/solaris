@@ -1318,7 +1318,12 @@ impl SessionRegistry {
             .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
             .collect();
         update_hostile_targets_locked(&mut inner);
-        inner.entities.tick_goals(tick);
+        let pathing_probe = LoadedChunkPathingProbe {
+            active_chunks: &active_chunks,
+        };
+        inner
+            .entities
+            .tick_goals_with_pathing(tick, &pathing_probe, PathingBudget::DEFAULT);
         let mut candidates: Vec<_> = inner
             .entities
             .views()
@@ -1596,6 +1601,25 @@ impl SessionRegistry {
         let mut chunks: Vec<_> = inner.tickets.keys().copied().collect();
         chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
         chunks
+    }
+}
+
+struct LoadedChunkPathingProbe<'a> {
+    active_chunks: &'a HashSet<(i32, i32)>,
+}
+
+impl PathingProbe for LoadedChunkPathingProbe<'_> {
+    fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
+        // Integrated AI pathing only gates movement to loaded chunks; terrain
+        // collision is handled by the later sampled entity physics pass.
+        if self
+            .active_chunks
+            .contains(&chunk_pos_from_coords(position.x, position.z))
+        {
+            PathingProbeResult::Walkable
+        } else {
+            PathingProbeResult::Unloaded
+        }
     }
 }
 
