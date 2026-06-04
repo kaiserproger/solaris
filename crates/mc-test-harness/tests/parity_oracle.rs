@@ -301,6 +301,7 @@ async fn vanilla_and_solaris_spawn_smoke_can_be_diffed() {
 
     let diff = diff_observations(&vanilla_observations, &solaris_observations);
     assert!(diff.is_empty(), "{diff}");
+    println!("M79_ORACLE_COMPARISON_OK spawn-smoke");
 
     vanilla.stop().expect("vanilla stops");
     solaris_task.abort();
