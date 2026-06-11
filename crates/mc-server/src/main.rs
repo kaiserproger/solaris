@@ -171,11 +171,13 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
 async fn serve(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
 
-    let data = mc_data::solaris_required_data();
+    let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
+    let data = protocol_data.data;
     tracing::info!(
         registries = data.registry_count(),
         entries = data.entry_count(),
-        "embedded registry index loaded",
+        source = protocol_data.source,
+        "registry index loaded",
     );
 
     let blocks_report = mc_data::blocks::solaris_required_blocks_report();
@@ -272,11 +274,13 @@ async fn serve(path: &Path) -> Result<()> {
     };
 
     let data = Arc::new(data);
-    let tags = Arc::new(mc_data::tags::solaris_required_item_tags(&items));
+    let tag_source = load_effective_tags(cfg.data.vanilla_data_dir.as_deref(), &data, &items)?;
+    let tags = Arc::new(tag_source.tags);
     tracing::info!(
         tags = tags.total_tags(),
         entries = tags.total_entries(),
-        "embedded tags loaded"
+        source = tag_source.source,
+        "tags loaded"
     );
     let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
     tracing::info!(entries = recipes.len(), "embedded recipe registry loaded");
@@ -554,6 +558,56 @@ fn count_region_files(world_dir: &Path) -> usize {
 struct EffectiveLootTables {
     tables: mc_data::loot::LootTables,
     source: &'static str,
+}
+
+struct EffectiveProtocolData {
+    data: mc_data::VanillaData,
+    source: &'static str,
+}
+
+fn load_effective_protocol_data(vanilla_data_dir: Option<&Path>) -> Result<EffectiveProtocolData> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let data = mc_data::load(vanilla_data_dir).with_context(|| {
+            format!(
+                "loading vanilla registry data from {}",
+                vanilla_data_dir.display()
+            )
+        })?;
+        return Ok(EffectiveProtocolData {
+            data,
+            source: "vanilla_sidecar",
+        });
+    }
+
+    Ok(EffectiveProtocolData {
+        data: mc_data::solaris_required_data(),
+        source: "embedded_solaris_fallback",
+    })
+}
+
+struct EffectiveTags {
+    tags: mc_data::tags::TagsData,
+    source: &'static str,
+}
+
+fn load_effective_tags(
+    vanilla_data_dir: Option<&Path>,
+    data: &mc_data::VanillaData,
+    items: &mc_data::items::ItemRegistry,
+) -> Result<EffectiveTags> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let tags = mc_data::tags::load(vanilla_data_dir, data)
+            .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?;
+        return Ok(EffectiveTags {
+            tags,
+            source: "vanilla_sidecar",
+        });
+    }
+
+    Ok(EffectiveTags {
+        tags: mc_data::tags::solaris_required_item_tags(items),
+        source: "embedded_solaris_fallback",
+    })
 }
 
 fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootTables> {

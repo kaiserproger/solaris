@@ -40,6 +40,7 @@ const MAX_COMMAND_LEN: usize = 32_767;
 const MAX_COMMAND_NODE_COUNT: usize = 1024;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
 const SIGN_LINE_COUNT: usize = 4;
+const MAX_SIGN_LINE_LEN: usize = 384;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ENTITY_DATA_BYTE_SERIALIZER_ID: i32 = 0;
 pub const ENTITY_DATA_POSE_SERIALIZER_ID: i32 = 20;
@@ -413,11 +414,8 @@ impl Packet for ClientboundRespawn {
 /// `Set Default Spawn Position` (CB). Tells the client where its compass
 /// should point.
 ///
-/// In 26.1.2 the body is vanilla's `LevelData$RespawnData` record:
-/// a `GlobalPos` (= dimension identifier + packed `BlockPos`) plus a
-/// yaw and pitch, mapping onto the structured fields below.
-/// Per ADR 0002, verified against `javap -p` of the unobfuscated jar:
-/// `CLIENTBOUND_SET_DEFAULT_SPAWN_POSITION`.
+/// Per ADR 0002, verified against the vanilla 26.1.2 client jar via `javap`:
+/// the payload is `LevelData.RespawnData` = `GlobalPos` plus yaw/pitch floats.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetDefaultSpawnPosition {
     pub dimension: Identifier,
@@ -730,8 +728,8 @@ impl Packet for ClientboundSetTime {
     // `.analysis/protocol-dump.txt` / `GameProtocols`: game
     // CLIENTBOUND_SET_TIME is clientbound registration index 113, wire id 0x71.
     // 26.1's `ClientboundSetTimePacket` writes `long gameTime` followed by a
-    // map of clock updates. Solaris emits an empty map for its single backed
-    // world-time value.
+    // map of clock updates. Solaris currently models only the game-time field;
+    // decode intentionally ignores the trailing clock-update payload.
     const ID: i32 = 0x71;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
@@ -742,8 +740,8 @@ impl Packet for ClientboundSetTime {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let game_time = buf.read_i64()?;
-        let clock_update_count = read_count(buf, 0)?;
-        debug_assert_eq!(clock_update_count, 0);
+        let remaining = buf.remaining();
+        buf.advance(remaining);
         Ok(Self { game_time })
     }
 }
@@ -2093,8 +2091,9 @@ pub struct ServerboundSignUpdate {
 
 impl Packet for ServerboundSignUpdate {
     // Verified from `.analysis/protocol-dump.txt`: SERVERBOUND_SIGN_UPDATE is
-    // game-SB index 61 = wire id 0x3D. Declared field order is BlockPos,
-    // String[4] lines, then front/back text boolean.
+    // game-SB index 61 = wire id 0x3D. The vanilla 26.1.2 stream codec in
+    // `.analysis/decompiled/.../ServerboundSignUpdatePacket.java` writes
+    // BlockPos, front/back text boolean, then four UTF(384) lines.
     const ID: i32 = 0x3D;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
@@ -2104,23 +2103,24 @@ impl Packet for ServerboundSignUpdate {
             ));
         }
         buf.write_i64(self.position);
-        for line in &self.lines {
-            buf.write_string(line, MAX_COMMAND_LEN)?;
-        }
         buf.write_bool(self.is_front_text);
+        for line in &self.lines {
+            buf.write_string(line, MAX_SIGN_LINE_LEN)?;
+        }
         Ok(())
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let position = buf.read_i64()?;
+        let is_front_text = buf.read_bool()?;
         let mut lines = Vec::with_capacity(SIGN_LINE_COUNT);
         for _ in 0..SIGN_LINE_COUNT {
-            lines.push(buf.read_string(MAX_COMMAND_LEN)?);
+            lines.push(buf.read_string(MAX_SIGN_LINE_LEN)?);
         }
         Ok(Self {
             position,
             lines,
-            is_front_text: buf.read_bool()?,
+            is_front_text,
         })
     }
 }

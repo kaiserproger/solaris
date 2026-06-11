@@ -38,7 +38,10 @@ const CHUNK_STAGE_SLOW_MS: u64 = 50;
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     biomes: Arc<Registry>,
+    blocks: Arc<BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
+    items: Arc<ItemRegistry>,
+    block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_passable: Arc<Vec<BlockStateId>>,
@@ -582,7 +585,10 @@ impl ChunkStreamState {
     pub(super) fn new(
         world: WorldHandle,
         biomes: Arc<Registry>,
+        blocks: Arc<BlockRegistry>,
         block_light: Option<Arc<BlockLightTable>>,
+        items: Arc<ItemRegistry>,
+        block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
         passive_herd_surface: Option<mc_world::BlockStateId>,
         passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
         passive_herd_passable: Arc<Vec<BlockStateId>>,
@@ -611,7 +617,10 @@ impl ChunkStreamState {
         Self {
             world,
             biomes,
+            blocks,
             block_light,
+            items,
+            block_entity_types,
             passive_herd_surface,
             passive_herd_water,
             passive_herd_passable,
@@ -702,9 +711,12 @@ impl ChunkStreamState {
         for chunk in &unloads {
             self.loaded.remove(chunk);
         }
-        let mut visibility =
-            self.sessions
-                .replace_view(self.session_id, (center_cx, center_cz), desired);
+        let mut visibility = self.sessions.replace_view(
+            self.session_id,
+            (center_cx, center_cz),
+            self.view_distance,
+            desired,
+        );
         visibility.extend(self.sessions.mark_unloaded(self.session_id, &unloads));
         dispatch_visibility_commands(visibility);
         self.center_cx = center_cx;
@@ -714,6 +726,44 @@ impl ChunkStreamState {
         self.scheduler.replace_view(prioritized_spiral(
             center_cx,
             center_cz,
+            self.view_distance,
+            self.direction_yaw,
+        ));
+        self.active_generation
+            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.reset_window_metrics();
+        unloads
+    }
+
+    pub(super) fn replan_view_distance(
+        &mut self,
+        view_distance: i32,
+        direction_yaw: f32,
+    ) -> Vec<(i32, i32)> {
+        let view_distance = view_distance.max(0);
+        if self.view_distance == view_distance {
+            return Vec::new();
+        }
+        self.view_distance = view_distance;
+        self.direction_yaw = direction_yaw;
+
+        let desired = desired_chunk_set(self.center_cx, self.center_cz, self.view_distance);
+        let unloads: Vec<_> = self.loaded.difference(&desired).copied().collect();
+        for chunk in &unloads {
+            self.loaded.remove(chunk);
+        }
+        let mut visibility = self.sessions.replace_view(
+            self.session_id,
+            (self.center_cx, self.center_cz),
+            self.view_distance,
+            desired,
+        );
+        visibility.extend(self.sessions.mark_unloaded(self.session_id, &unloads));
+        dispatch_visibility_commands(visibility);
+        self.ready.clear();
+        self.scheduler.replace_view(prioritized_spiral(
+            self.center_cx,
+            self.center_cz,
             self.view_distance,
             self.direction_yaw,
         ));
@@ -852,7 +902,10 @@ impl ChunkStreamState {
             }
             let world = Arc::clone(&self.world);
             let biomes = Arc::clone(&self.biomes);
+            let blocks = Arc::clone(&self.blocks);
             let block_light = self.block_light.as_ref().map(Arc::clone);
+            let items = Arc::clone(&self.items);
+            let block_entity_types = Arc::clone(&self.block_entity_types);
             let passive_herd_surface = self.passive_herd_surface;
             let passive_herd_water = Arc::clone(&self.passive_herd_water);
             let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
@@ -867,7 +920,10 @@ impl ChunkStreamState {
                     request,
                     world,
                     biomes,
+                    blocks,
                     block_light,
+                    items,
+                    block_entity_types,
                     passive_herd_surface,
                     passive_herd_water,
                     passive_herd_passable,
@@ -1173,7 +1229,10 @@ async fn prepare_chunk_request(
     request: ChunkRequest,
     world: WorldHandle,
     biomes: Arc<Registry>,
+    blocks: Arc<BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
+    items: Arc<ItemRegistry>,
+    block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_passable: Arc<Vec<BlockStateId>>,
@@ -1193,6 +1252,7 @@ async fn prepare_chunk_request(
         resources.clone(),
         request,
         Arc::clone(&active_generation),
+        block_light.is_some(),
     )
     .await
     {
@@ -1244,6 +1304,9 @@ async fn prepare_chunk_request(
                     centre.as_ref(),
                     &neighbourhood,
                     biomes.as_ref(),
+                    blocks.as_ref(),
+                    items.as_ref(),
+                    block_entity_types.as_ref(),
                     Some(table),
                     passive_herd_surface,
                     passive_herd_water.as_slice(),
@@ -1260,6 +1323,9 @@ async fn prepare_chunk_request(
                 centre.as_ref(),
                 &neighbourhood,
                 biomes.as_ref(),
+                blocks.as_ref(),
+                items.as_ref(),
+                block_entity_types.as_ref(),
                 None,
                 passive_herd_surface,
                 passive_herd_water.as_slice(),
@@ -1316,6 +1382,7 @@ async fn load_chunk_neighbourhood(
     resources: ChunkPipelineResources,
     request: ChunkRequest,
     active_generation: Arc<AtomicU64>,
+    need_full_neighbourhood: bool,
 ) -> Result<LoadedNeighbourhood, String> {
     if !is_active_request(request, &active_generation) {
         return Ok((
@@ -1415,12 +1482,12 @@ async fn load_chunk_neighbourhood(
     }
 
     if centre.is_none()
-        && let Some(generator) = generator
+        && let Some(generator) = generator.as_ref()
     {
         let chunk = match generate_fresh_chunk(
-            generator,
+            Arc::clone(generator),
             ChunkPos { x: cx, z: cz },
-            resources,
+            resources.clone(),
             request,
             Arc::clone(&active_generation),
         )
@@ -1469,6 +1536,107 @@ async fn load_chunk_neighbourhood(
             centre = Some(Arc::clone(&chunk));
             neighbourhood[1][1] = Some(chunk);
             staged.push((cx, cz));
+        }
+    }
+
+    if need_full_neighbourhood
+        && centre.is_some()
+        && let Some(generator) = generator.as_ref()
+    {
+        for dz in 0..3 {
+            for dx in 0..3 {
+                if neighbourhood[dz][dx].is_some() {
+                    continue;
+                }
+                let ncx = cx + (dx as i32 - 1);
+                let ncz = cz + (dz as i32 - 1);
+                let pos = ChunkPos { x: ncx, z: ncz };
+                let disk_plan = {
+                    let storage = crate::lock_metrics::timed_guard(
+                        crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                        "chunk prepare neighbour snapshot",
+                        Instant::now(),
+                        world.lock().await,
+                    );
+                    if !is_active_request(request, &active_generation) {
+                        return Ok((
+                            None,
+                            neighbourhood,
+                            staged,
+                            fetch_started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                    match storage.plan_chunk_snapshot_without_generation(pos) {
+                        mc_world::ChunkSnapshotPlan::Cached(chunk) => {
+                            neighbourhood[dz][dx] = Some(chunk);
+                            staged.push((ncx, ncz));
+                            continue;
+                        }
+                        mc_world::ChunkSnapshotPlan::Load(plan) => plan,
+                    }
+                };
+                let mut chunk = match load_chunk_from_disk(
+                    disk_plan,
+                    resources.clone(),
+                    request,
+                    Arc::clone(&active_generation),
+                )
+                .await
+                {
+                    Ok(Some(chunk)) => Some(chunk),
+                    Ok(None) => None,
+                    Err(err) => {
+                        warn!(cx = ncx, cz = ncz, error = %err, "neighbour chunk read failed; trying generator fallback");
+                        None
+                    }
+                };
+                if chunk.is_none() {
+                    chunk = match generate_fresh_chunk(
+                        Arc::clone(generator),
+                        pos,
+                        resources.clone(),
+                        request,
+                        Arc::clone(&active_generation),
+                    )
+                    .await
+                    {
+                        Ok(chunk) => chunk,
+                        Err(err) => {
+                            warn!(cx = ncx, cz = ncz, error = %err, "neighbour chunk generation failed; lighting may be partial");
+                            None
+                        }
+                    };
+                }
+                let Some(chunk) = chunk else {
+                    continue;
+                };
+                let committed = {
+                    let mut storage = crate::lock_metrics::timed_guard(
+                        crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                        "chunk prepare neighbour commit",
+                        Instant::now(),
+                        world.lock().await,
+                    );
+                    if !is_active_request(request, &active_generation) {
+                        return Ok((
+                            None,
+                            neighbourhood,
+                            staged,
+                            fetch_started.elapsed().as_millis() as u64,
+                        ));
+                    }
+                    storage.commit_chunk_snapshot(pos, chunk)
+                };
+                match committed {
+                    Ok(chunk) => {
+                        neighbourhood[dz][dx] = Some(chunk);
+                        staged.push((ncx, ncz));
+                    }
+                    Err(err) => {
+                        warn!(cx = ncx, cz = ncz, error = %err, "neighbour chunk commit failed; lighting may be partial")
+                    }
+                }
+            }
         }
     }
 
@@ -1550,6 +1718,9 @@ fn build_chunk_packet(
     centre: &Chunk,
     neighbourhood: &[[Option<Arc<Chunk>>; 3]; 3],
     biomes: &Registry,
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    block_entity_types: &mc_data::block_entity_types::BlockEntityTypeRegistry,
     block_light: Option<&BlockLightTable>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_water: &[mc_world::BlockStateId],
@@ -1608,6 +1779,21 @@ fn build_chunk_packet(
         }
         _ => LightData::empty(),
     };
+    let block_entities = mc_world::wire::client_block_entities(centre, blocks, items)
+        .into_iter()
+        .filter_map(|record| {
+            let type_id = block_entity_types.id_of(&record.type_name)?;
+            let packed_xz =
+                ((record.pos.x.rem_euclid(16) as u8) << 4) | record.pos.z.rem_euclid(16) as u8;
+            Some(BlockEntityInfo {
+                packed_xz,
+                y: record.pos.y.clamp(i32::from(i16::MIN), i32::from(i16::MAX)) as i16,
+                type_id: i32::try_from(type_id).ok()?,
+                nbt: record.nbt,
+            })
+        })
+        .collect();
+
     let herd_spawns = plan_passive_herd(
         centre,
         passive_herd_surface,
@@ -1622,7 +1808,7 @@ fn build_chunk_packet(
             chunk_z: cz,
             heightmaps,
             data,
-            block_entities: Vec::new(),
+            block_entities,
             light,
         },
         light: computed_light,

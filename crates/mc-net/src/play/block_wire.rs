@@ -111,18 +111,16 @@ pub(super) fn broadcast_block_deltas_to_sessions(
     if deltas.is_empty() || chunks.is_empty() {
         return;
     }
-    for recipient in sessions.loaded_recipients_for_chunks(chunks, except) {
-        if let Err(err) = recipient
-            .tx
-            .try_send(OutboundCommand::BlockDeltas(deltas.to_vec()))
-        {
-            debug!(
-                recipient = recipient.id,
-                error = %err,
-                "dropping subscriber block delta"
-            );
-        }
-    }
+    dispatch_visibility_commands(
+        sessions
+            .loaded_recipients_for_chunks(chunks, except)
+            .into_iter()
+            .map(|recipient| VisibilityDispatch {
+                recipient,
+                command: OutboundCommand::BlockDeltas(deltas.to_vec()),
+            })
+            .collect(),
+    );
 }
 
 pub(super) fn broadcast_light_updates(
@@ -145,18 +143,16 @@ pub(super) fn broadcast_light_updates_to_sessions(
         .iter()
         .map(|update| (update.pos.x, update.pos.z))
         .collect();
-    for recipient in sessions.loaded_recipients_for_chunks(&chunks, except) {
-        if let Err(err) = recipient
-            .tx
-            .try_send(OutboundCommand::LightUpdates(updates.to_vec()))
-        {
-            debug!(
-                recipient = recipient.id,
-                error = %err,
-                "dropping subscriber light update"
-            );
-        }
-    }
+    dispatch_visibility_commands(
+        sessions
+            .loaded_recipients_for_chunks(&chunks, except)
+            .into_iter()
+            .map(|recipient| VisibilityDispatch {
+                recipient,
+                command: OutboundCommand::LightUpdates(updates.to_vec()),
+            })
+            .collect(),
+    );
 }
 
 pub(super) fn plan_block_delta_packets(deltas: &[BlockDelta]) -> Vec<BlockDeltaPacket> {

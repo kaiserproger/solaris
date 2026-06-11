@@ -921,6 +921,20 @@ fn client_view_distance_is_clamped_to_server_policy() {
 }
 
 #[test]
+fn recoverable_death_xp_uses_level_cap() {
+    let mut xp = XpState {
+        total: 1_000,
+        level: 40,
+        ..XpState::default()
+    };
+
+    assert_eq!(recoverable_death_xp(&xp), 100);
+
+    xp.level = 3;
+    assert_eq!(recoverable_death_xp(&xp), 21);
+}
+
+#[test]
 fn debug_commands_parse_survival_mutations_and_give() {
     assert_eq!(
         parse_debug_command("debug survival damage 7.5"),
@@ -3776,6 +3790,7 @@ async fn projectile_shield_block_writes_scaled_slot_update() {
         true,
     );
     let mut survival_state = SurvivalState::FULL;
+    let mut xp_state = XpState::default();
     let mut writer = Vec::new();
 
     apply_projectile_player_damage(
@@ -3783,6 +3798,7 @@ async fn projectile_shield_block_writes_scaled_slot_update() {
         &mut writer,
         Compression::Disabled,
         &mut survival_state,
+        &mut xp_state,
         GameMode::Survival,
         ProjectilePlayerDamage {
             player_pose: PlayerPose::new(0.0, 64.0, 0.0),
@@ -3840,6 +3856,7 @@ async fn hostile_melee_shield_block_writes_break_clear_slot_update() {
             vehicle: None,
         }]);
     let mut survival_state = SurvivalState::FULL;
+    let mut xp_state = XpState::default();
     let mut writer = Vec::new();
 
     tick_hostile_pressure(
@@ -3847,6 +3864,7 @@ async fn hostile_melee_shield_block_writes_break_clear_slot_update() {
         &mut writer,
         GameMode::Survival,
         &mut survival_state,
+        &mut xp_state,
         PlayerPose::new(0.0, 64.0, 0.0),
     )
     .await

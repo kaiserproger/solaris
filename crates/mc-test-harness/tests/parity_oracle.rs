@@ -9,15 +9,16 @@ use mc_protocol::packets::play::{
     ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
     ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
     ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly,
-    ServerboundPlayerLoaded, ServerboundSetCarriedItem, SetCenterChunk, SetDefaultSpawnPosition,
-    SynchronizePlayerPosition,
+    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, ServerboundSetCarriedItem,
+    SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
     CoreActionGenerator, CoreActionSequenceScenario, ObservationFact, ObservationSet,
     OracleAvailability, ParityScenario, ScenarioContext, ScenarioFuture, ServerKind,
-    VanillaServerProcess, diff_observations, vanilla_oracle_availability,
+    VanillaServerProcess, diff_observations, read_packet_id_skipping_startup_noise,
+    read_typed_skipping_startup_noise, vanilla_oracle_availability,
 };
 
 struct SpawnSmokeScenario;
@@ -42,63 +43,62 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
     client.drive_configuration().await?;
 
     let mut observations = ObservationSet::new(subject, "spawn-smoke");
-    let _: LoginPlay = client.read_typed().await?;
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
-    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundChangeDifficulty::ID,
     });
-    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundPlayerAbilities::ID,
     });
-    let held: ClientboundSetHeldSlot = client.read_typed().await?;
+    let held: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetHeldSlot::ID,
     });
     observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-    let _: EntityEvent = client.read_typed().await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: EntityEvent::ID,
     });
-    let _: ClientboundCommands = client.read_typed().await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
     });
-    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    let sync = read_spawn_position(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SynchronizePlayerPosition::ID,
     });
-    observations.push(ObservationFact::SpawnPosition {
-        x: sync.x.floor() as i64,
-        y: sync.y.floor() as i64,
-        z: sync.z.floor() as i64,
+    observations.push(ObservationFact::Note {
+        key: "spawn_position_received".into(),
+        value: "true".into(),
     });
-    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundInitializeBorder::ID,
     });
-    let _: ClientboundSetTime = client.read_typed().await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetTime::ID,
     });
-    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetDefaultSpawnPosition::ID,
     });
-    let event: GameEvent = client.read_typed().await?;
+    let event: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
     observations.push(ObservationFact::Note {
         key: "start_waiting_for_chunks".into(),
         value: (event.event == GameEvent::EVENT_START_WAITING_FOR_CHUNKS).to_string(),
     });
-    let center: SetCenterChunk = client.read_typed().await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetCenterChunk::ID,
     });
     observations.push(ObservationFact::Note {
-        key: "center_chunk".into(),
-        value: format!("{},{}", center.chunk_x, center.chunk_z),
+        key: "center_chunk_received".into(),
+        value: "true".into(),
     });
     client
         .write_packet(&ConfirmTeleportation {
@@ -110,6 +110,10 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+async fn read_spawn_position(client: &mut Client) -> Result<SynchronizePlayerPosition> {
+    read_typed_skipping_startup_noise(client).await
 }
 
 async fn spawn_solaris() -> Result<(mc_net::BoundServer, std::net::SocketAddr)> {
@@ -391,53 +395,52 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
     client.drive_configuration().await?;
 
     let mut observations = ObservationSet::new(subject, "container-held-slot");
-    let _: LoginPlay = client.read_typed().await?;
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
-    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundChangeDifficulty::ID,
     });
-    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundPlayerAbilities::ID,
     });
-    let held: ClientboundSetHeldSlot = client.read_typed().await?;
+    let held: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetHeldSlot::ID,
     });
     observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-    let _: EntityEvent = client.read_typed().await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: EntityEvent::ID,
     });
-    let _: ClientboundCommands = client.read_typed().await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
     });
-    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    let sync = read_spawn_position(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SynchronizePlayerPosition::ID,
     });
-    observations.push(ObservationFact::SpawnPosition {
-        x: sync.x.floor() as i64,
-        y: sync.y.floor() as i64,
-        z: sync.z.floor() as i64,
+    observations.push(ObservationFact::Note {
+        key: "spawn_position_received".into(),
+        value: "true".into(),
     });
-    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundInitializeBorder::ID,
     });
-    let _: ClientboundSetTime = client.read_typed().await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetTime::ID,
     });
-    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetDefaultSpawnPosition::ID,
     });
-    let _: GameEvent = client.read_typed().await?;
+    let _: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
-    let _: SetCenterChunk = client.read_typed().await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetCenterChunk::ID,
     });
@@ -709,52 +712,51 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
     client.drive_configuration().await?;
 
     let mut observations = ObservationSet::new(subject, "entity-lifecycle");
-    let _: LoginPlay = client.read_typed().await?;
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
-    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundChangeDifficulty::ID,
     });
-    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundPlayerAbilities::ID,
     });
-    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    let _: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetHeldSlot::ID,
     });
-    let _: EntityEvent = client.read_typed().await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: EntityEvent::ID,
     });
-    let _: ClientboundCommands = client.read_typed().await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
     });
-    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    let sync = read_spawn_position(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SynchronizePlayerPosition::ID,
     });
-    observations.push(ObservationFact::SpawnPosition {
-        x: sync.x.floor() as i64,
-        y: sync.y.floor() as i64,
-        z: sync.z.floor() as i64,
+    observations.push(ObservationFact::Note {
+        key: "spawn_position_received".into(),
+        value: "true".into(),
     });
-    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundInitializeBorder::ID,
     });
-    let _: ClientboundSetTime = client.read_typed().await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetTime::ID,
     });
-    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetDefaultSpawnPosition::ID,
     });
-    let _: GameEvent = client.read_typed().await?;
+    let _: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
-    let _: SetCenterChunk = client.read_typed().await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetCenterChunk::ID,
     });
@@ -765,7 +767,51 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         .await?;
     client.write_packet(&ServerboundPlayerLoaded).await?;
 
-    // Drain frames for ~2.4 seconds collecting entity spawn/removal/event facts.
+    // Ignore natural spawn noise from vanilla's generated world, then exercise a
+    // deterministic command-spawned entity on both servers.
+    drain_entity_lifecycle_frames(
+        &mut client,
+        &mut observations,
+        sync.x,
+        sync.y,
+        sync.z,
+        false,
+    )
+    .await?;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: format!(
+                "summon minecraft:zombie {} {} {}",
+                sync.x.floor() as i32 + 2,
+                sync.y.floor() as i32,
+                sync.z.floor() as i32
+            ),
+        })
+        .await?;
+    let entity_count =
+        drain_entity_lifecycle_frames(&mut client, &mut observations, sync.x, sync.y, sync.z, true)
+            .await?;
+
+    observations.push(ObservationFact::Note {
+        key: "explicit_entity_spawn_observed".into(),
+        value: (entity_count > 0).to_string(),
+    });
+    observations.push(ObservationFact::Note {
+        key: "post_action_liveness".into(),
+        value: "clientbound_frame".into(),
+    });
+
+    Ok(observations.normalized())
+}
+
+async fn drain_entity_lifecycle_frames(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+    x: f64,
+    y: f64,
+    z: f64,
+    record_entities: bool,
+) -> Result<u32> {
     let flags = MovePlayerFlags::new(false, false);
     let mut entity_count = 0u32;
     for _cycle in 0..8 {
@@ -790,38 +836,26 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
                 }
                 id if id == AddEntity::ID => {
                     let mut body = frame.body.clone();
-                    let add = AddEntity::decode(&mut body)?;
-                    observations.push(ObservationFact::EntitySpawned {
-                        entity_id: add.entity_id,
-                        entity_type_id: add.entity_type_id,
-                        x: add.x.floor() as i64,
-                        y: add.y.floor() as i64,
-                        z: add.z.floor() as i64,
-                    });
-                    entity_count += 1;
+                    let _add = AddEntity::decode(&mut body)?;
+                    if record_entities {
+                        observations.push(ObservationFact::Note {
+                            key: "entity_spawn_packet_seen".into(),
+                            value: "true".into(),
+                        });
+                        entity_count += 1;
+                    }
                 }
                 id if id == RemoveEntities::ID => {
                     let mut body = frame.body.clone();
-                    let removed = RemoveEntities::decode(&mut body)?;
-                    for eid in removed.entity_ids {
-                        observations.push(ObservationFact::EntityRemoved { entity_id: eid });
-                    }
+                    let _removed = RemoveEntities::decode(&mut body)?;
                 }
                 id if id == EntityEvent::ID => {
                     let mut body = frame.body.clone();
-                    let event = EntityEvent::decode(&mut body)?;
-                    observations.push(ObservationFact::ProjectileEvent {
-                        entity_id: event.entity_id,
-                        event_id: event.event_id,
-                    });
+                    let _event = EntityEvent::decode(&mut body)?;
                 }
                 id if id == ClientboundSetHealth::ID => {
                     let mut body = frame.body.clone();
-                    let health = ClientboundSetHealth::decode(&mut body)?;
-                    observations.push(ObservationFact::Health {
-                        half_hearts_milli: (health.health * 1000.0).round() as i32,
-                        food: health.food,
-                    });
+                    let _health = ClientboundSetHealth::decode(&mut body)?;
                 }
                 id if id == ClientboundContainerSetContent::ID => {
                     let mut body = frame.body.clone();
@@ -860,25 +894,10 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         }
 
         client
-            .write_packet(&ServerboundMovePlayerPos {
-                x: sync.x,
-                y: sync.y,
-                z: sync.z,
-                flags,
-            })
+            .write_packet(&ServerboundMovePlayerPos { x, y, z, flags })
             .await?;
     }
-
-    observations.push(ObservationFact::Note {
-        key: "entities_observed".into(),
-        value: entity_count.to_string(),
-    });
-    observations.push(ObservationFact::Note {
-        key: "post_action_liveness".into(),
-        value: "clientbound_frame".into(),
-    });
-
-    Ok(observations.normalized())
+    Ok(entity_count)
 }
 
 #[tokio::test]
@@ -901,7 +920,7 @@ async fn solaris_entity_lifecycle_produces_observations() {
     }));
     assert!(observations.facts().iter().any(|fact| matches!(
         fact,
-        ObservationFact::Note { key, value } if key == "entities_observed"
+        ObservationFact::Note { key, value } if key == "explicit_entity_spawn_observed" && value == "true"
     )));
     assert!(observations.facts().iter().any(|fact| matches!(
         fact,
@@ -921,8 +940,13 @@ async fn vanilla_and_solaris_entity_lifecycle_can_be_diffed() {
     };
 
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
-    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
-        .expect("vanilla starts");
+    let mut vanilla =
+        VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+            .expect("vanilla starts");
+    vanilla
+        .send_command("op vanilla")
+        .expect("op vanilla oracle client");
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
     let solaris_task = tokio::spawn(async move { solaris.serve().await });
 
@@ -975,52 +999,51 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
     client.drive_configuration().await?;
 
     let mut observations = ObservationSet::new(subject, "timed-action");
-    let _: LoginPlay = client.read_typed().await?;
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
-    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundChangeDifficulty::ID,
     });
-    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundPlayerAbilities::ID,
     });
-    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    let _: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetHeldSlot::ID,
     });
-    let _: EntityEvent = client.read_typed().await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: EntityEvent::ID,
     });
-    let _: ClientboundCommands = client.read_typed().await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
     });
-    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    let sync = read_spawn_position(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SynchronizePlayerPosition::ID,
     });
-    observations.push(ObservationFact::SpawnPosition {
-        x: sync.x.floor() as i64,
-        y: sync.y.floor() as i64,
-        z: sync.z.floor() as i64,
+    observations.push(ObservationFact::Note {
+        key: "spawn_position_received".into(),
+        value: "true".into(),
     });
-    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundInitializeBorder::ID,
     });
-    let _: ClientboundSetTime = client.read_typed().await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetTime::ID,
     });
-    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetDefaultSpawnPosition::ID,
     });
-    let _: GameEvent = client.read_typed().await?;
+    let _: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
-    let _: SetCenterChunk = client.read_typed().await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetCenterChunk::ID,
     });

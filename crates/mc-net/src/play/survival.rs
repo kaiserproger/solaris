@@ -586,6 +586,31 @@ fn damage_held_weapon_stack(state: &mut InteractionState) -> Option<(usize, Item
     Some((wire_slot, held.clone()))
 }
 
+fn damage_held_bow_stack(state: &mut InteractionState) -> Option<(usize, ItemStack)> {
+    let hotbar_slot = state.selected_hotbar_slot;
+    let wire_slot = PlayerInventory::HOTBAR_BASE + hotbar_slot as usize;
+    {
+        let held = state.inventory.held(hotbar_slot);
+        if held.is_empty()
+            || state
+                .items
+                .name_of(held.item_id)
+                .is_none_or(|item| item.as_str() != "minecraft:bow")
+        {
+            return None;
+        }
+    }
+
+    let held = state.inventory.held_mut(hotbar_slot);
+    let new_damage = held.damage.unwrap_or(0).saturating_add(1);
+    if new_damage >= 384 {
+        *held = ItemStack::EMPTY;
+    } else {
+        held.damage = Some(new_damage);
+    }
+    Some((wire_slot, held.clone()))
+}
+
 pub(super) async fn damage_held_tool_after_mining<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -607,6 +632,19 @@ where
     W: AsyncWriteExt + Unpin,
 {
     if let Some(changed) = damage_held_weapon_stack(state) {
+        write_inventory_slot_updates(state, writer, vec![changed]).await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn damage_held_bow_after_shot<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if let Some(changed) = damage_held_bow_stack(state) {
         write_inventory_slot_updates(state, writer, vec![changed]).await?;
     }
     Ok(())

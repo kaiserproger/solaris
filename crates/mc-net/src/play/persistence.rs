@@ -26,6 +26,31 @@ pub(crate) struct WorldPersistedMetadata {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct PersistedEntityRecord {
+    pub(crate) snapshot: EntitySnapshot,
+    pub(crate) age: i32,
+    pub(crate) pickup_delay: i32,
+}
+
+impl From<EntitySnapshot> for PersistedEntityRecord {
+    fn from(snapshot: EntitySnapshot) -> Self {
+        Self {
+            snapshot,
+            age: 0,
+            pickup_delay: 0,
+        }
+    }
+}
+
+impl std::ops::Deref for PersistedEntityRecord {
+    type Target = EntitySnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct XpState {
     pub(super) level: i32,
     pub(super) progress: f32,
@@ -45,6 +70,14 @@ impl Default for XpState {
 }
 
 impl XpState {
+    pub(super) fn reset(&mut self) -> bool {
+        let changed = self.level != 0 || self.progress != 0.0 || self.total != 0;
+        self.level = 0;
+        self.progress = 0.0;
+        self.total = 0;
+        changed
+    }
+
     pub(super) fn add_points(&mut self, points: i32) -> bool {
         if points <= 0 {
             return false;
@@ -306,7 +339,7 @@ pub(crate) fn load_persisted_entities(
     world_root: &Path,
     items: &ItemRegistry,
     entity_types: &EntityTypeRegistry,
-) -> Result<Vec<EntitySnapshot>, PlayerPersistenceError> {
+) -> Result<Vec<PersistedEntityRecord>, PlayerPersistenceError> {
     let path = entities_path(world_root);
     if !path.is_file() {
         return Ok(Vec::new());
@@ -364,43 +397,49 @@ pub(crate) fn load_persisted_entities(
             uuid::Uuid::from_u128(0x5f1a_0000_0000_0000_0000_0000_0000_0000 | id)
         });
         let aquatic = persisted_entity_type_is_aquatic(type_name);
-        entities.push(EntitySnapshot {
-            id,
-            uuid,
-            type_id,
-            type_name: type_name.to_string(),
-            position: Vec3::new(pos[0], pos[1], pos[2]),
-            rotation: mc_entity::Rotation {
-                yaw: rotation[0],
-                pitch: rotation[1],
-                head_yaw: rotation[0],
+        let age = int_field(fields, "Age").unwrap_or(0).max(0);
+        let pickup_delay = int_field(fields, "PickupDelay").unwrap_or(0).max(0);
+        entities.push(PersistedEntityRecord {
+            snapshot: EntitySnapshot {
+                id,
+                uuid,
+                type_id,
+                type_name: type_name.to_string(),
+                position: Vec3::new(pos[0], pos[1], pos[2]),
+                rotation: mc_entity::Rotation {
+                    yaw: rotation[0],
+                    pitch: rotation[1],
+                    head_yaw: rotation[0],
+                },
+                velocity: Vec3::new(motion[0], motion[1], motion[2]),
+                on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0 && !aquatic,
+                item_stack,
+                experience_value,
+                block_state,
+                lifecycle: EntityLifecycle::Alive,
+                health,
+                attributes,
+                goal: if type_name == "minecraft:item"
+                    || type_name == "minecraft:falling_block"
+                    || experience_value.is_some()
+                {
+                    GoalState::Idle
+                } else if aquatic {
+                    GoalState::AquaticWander {
+                        speed: 0.72,
+                        vertical_speed: 0.18,
+                        period_ticks: 45,
+                    }
+                } else {
+                    GoalState::Wander {
+                        speed: 0.8,
+                        period_ticks: 80,
+                    }
+                },
+                vehicle: None,
             },
-            velocity: Vec3::new(motion[0], motion[1], motion[2]),
-            on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0 && !aquatic,
-            item_stack,
-            experience_value,
-            block_state,
-            lifecycle: EntityLifecycle::Alive,
-            health,
-            attributes,
-            goal: if type_name == "minecraft:item"
-                || type_name == "minecraft:falling_block"
-                || experience_value.is_some()
-            {
-                GoalState::Idle
-            } else if aquatic {
-                GoalState::AquaticWander {
-                    speed: 0.72,
-                    vertical_speed: 0.18,
-                    period_ticks: 45,
-                }
-            } else {
-                GoalState::Wander {
-                    speed: 0.8,
-                    period_ticks: 80,
-                }
-            },
-            vehicle: None,
+            age,
+            pickup_delay,
         });
     }
     Ok(entities)
@@ -442,18 +481,32 @@ fn attributes_from_entity_facts(
     attributes
 }
 
+#[cfg(test)]
 pub(crate) fn save_persisted_entities(
     world_root: &Path,
     items: &ItemRegistry,
     entities: &[EntitySnapshot],
 ) -> Result<(), PlayerPersistenceError> {
+    let records = entities
+        .iter()
+        .cloned()
+        .map(PersistedEntityRecord::from)
+        .collect::<Vec<_>>();
+    save_persisted_entity_records(world_root, items, &records)
+}
+
+pub(crate) fn save_persisted_entity_records(
+    world_root: &Path,
+    items: &ItemRegistry,
+    entities: &[PersistedEntityRecord],
+) -> Result<(), PlayerPersistenceError> {
     let path = entities_path(world_root);
     let mut elements = Vec::new();
-    for entity in entities
+    for record in entities
         .iter()
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .filter(|record| record.snapshot.lifecycle == EntityLifecycle::Alive)
     {
-        elements.push(entity_tag(items, entity)?);
+        elements.push(entity_tag(items, record)?);
     }
     let root = Tag::Compound(vec![(
         "Entities".into(),
@@ -520,8 +573,9 @@ fn entities_path(world_root: &Path) -> PathBuf {
 
 fn entity_tag(
     items: &ItemRegistry,
-    entity: &EntitySnapshot,
+    record: &PersistedEntityRecord,
 ) -> Result<Tag, PlayerPersistenceError> {
+    let entity = &record.snapshot;
     let mut fields = vec![
         ("id".into(), Tag::String(entity.type_name.clone())),
         ("SolarisEntityId".into(), Tag::Int(entity.id.0)),
@@ -540,12 +594,15 @@ fn entity_tag(
         ),
         ("OnGround".into(), Tag::Byte(i8::from(entity.on_ground))),
         ("Health".into(), Tag::Float(entity.health)),
-        ("Age".into(), Tag::Int(0)),
+        ("Age".into(), Tag::Int(record.age.max(0))),
     ];
     if let Some(stack) = entity.item_stack {
         let item = entity_item_stack_tag(items, stack)?;
         fields.push(("Item".into(), item));
-        fields.push(("PickupDelay".into(), Tag::Short(0)));
+        fields.push((
+            "PickupDelay".into(),
+            Tag::Short(record.pickup_delay.clamp(0, i32::from(i16::MAX)) as i16),
+        ));
     }
     if let Some(value) = entity.experience_value {
         fields.push(("Value".into(), Tag::Int(value.max(0))));
@@ -678,8 +735,13 @@ fn write_player_root(
             path: tmp_path.clone(),
             source,
         })?;
-    encoder
+    let file = encoder
         .finish()
+        .map_err(|source| PlayerPersistenceError::Io {
+            path: tmp_path.clone(),
+            source,
+        })?;
+    file.sync_all()
         .map_err(|source| PlayerPersistenceError::Io {
             path: tmp_path.clone(),
             source,
@@ -687,7 +749,28 @@ fn write_player_root(
     std::fs::rename(&tmp_path, path).map_err(|source| PlayerPersistenceError::Io {
         path: path.to_path_buf(),
         source,
+    })?;
+    if let Some(parent) = path.parent() {
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> Result<(), PlayerPersistenceError> {
+    let dir = File::open(path).map_err(|source| PlayerPersistenceError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    dir.sync_all().map_err(|source| PlayerPersistenceError::Io {
+        path: path.to_path_buf(),
+        source,
     })
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> Result<(), PlayerPersistenceError> {
+    Ok(())
 }
 
 fn temporary_write_path(path: &Path) -> PathBuf {
@@ -1164,6 +1247,43 @@ mod tests {
 
         let loaded = read_entity_item_stack(&fields, &items).unwrap().unwrap();
         assert_eq!(loaded, stack);
+    }
+
+    #[test]
+    fn item_entity_lifecycle_fields_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = items();
+        let entity_types = entity_types();
+        let record = PersistedEntityRecord {
+            snapshot: EntitySnapshot {
+                id: EntityId(104),
+                uuid: uuid::Uuid::from_u128(104),
+                type_id: 1,
+                type_name: "minecraft:item".into(),
+                position: Vec3::new(1.0, 65.0, 2.0),
+                rotation: mc_entity::Rotation::ZERO,
+                velocity: Vec3::ZERO,
+                on_ground: false,
+                item_stack: Some(EntityItemStack::new(1, 3)),
+                experience_value: None,
+                block_state: None,
+                lifecycle: EntityLifecycle::Alive,
+                health: 20.0,
+                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                goal: GoalState::Idle,
+                vehicle: None,
+            },
+            age: 123,
+            pickup_delay: 7,
+        };
+
+        save_persisted_entity_records(tmp.path(), &items, std::slice::from_ref(&record)).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, record.id);
+        assert_eq!(loaded[0].age, 123);
+        assert_eq!(loaded[0].pickup_delay, 7);
     }
 
     #[test]

@@ -53,10 +53,18 @@
 //! cross `i64` boundaries, so each word may have unused high bits when
 //! `64 % bits_per_entry != 0`.
 
+use std::io::Cursor;
+
+use mc_data::items::ItemRegistry;
 use mc_data::{Identifier, Registry};
+use mc_nbt::{ListTag, Tag, tag_type};
 use thiserror::Error;
 
-use crate::chunk::{BIOME_VOLUME, BiomeSection, Chunk, LIGHT_LAYER_BYTES, SECTION_COUNT};
+use crate::block::BlockRegistry;
+use crate::chunk::{
+    BIOME_VOLUME, BiomeSection, BlockPos, ChestBlockEntity, Chunk, FurnaceBlockEntity, FurnaceSlot,
+    LIGHT_LAYER_BYTES, SECTION_COUNT,
+};
 use crate::light::{ChunkLight, LightLayer};
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
@@ -102,6 +110,65 @@ pub struct HeightmapEntry {
     pub data: Vec<i64>,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockEntityWireRecord {
+    pub pos: BlockPos,
+    pub type_name: Identifier,
+    pub nbt: Tag,
+}
+
+pub fn client_block_entities(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    items: &ItemRegistry,
+) -> Vec<BlockEntityWireRecord> {
+    let mut records = Vec::new();
+    let mut opaque_entries: Vec<_> = chunk
+        .block_entities
+        .iter()
+        .filter(|(pos, _)| !chunk.furnaces.contains_key(pos) && !chunk.chests.contains_key(pos))
+        .collect();
+    opaque_entries.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    for (pos, bytes) in opaque_entries {
+        let mut cur = Cursor::new(bytes.as_slice());
+        let Ok(tag) = mc_nbt::read_network(&mut cur) else {
+            continue;
+        };
+        let Some(type_name) = block_entity_type_name(&tag) else {
+            continue;
+        };
+        records.push(BlockEntityWireRecord {
+            pos: *pos,
+            type_name,
+            nbt: strip_persistent_block_entity_fields(tag),
+        });
+    }
+
+    let mut furnaces: Vec<_> = chunk.furnaces.iter().collect();
+    furnaces.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    for (pos, furnace) in furnaces {
+        let type_name = furnace_block_entity_type_for_block(chunk, registry, *pos);
+        records.push(BlockEntityWireRecord {
+            pos: *pos,
+            type_name,
+            nbt: furnace_update_tag(furnace, items),
+        });
+    }
+
+    let mut chests: Vec<_> = chunk.chests.iter().collect();
+    chests.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    for (pos, chest) in chests {
+        let type_name = chest_block_entity_type_for_block(chunk, registry, *pos);
+        records.push(BlockEntityWireRecord {
+            pos: *pos,
+            type_name,
+            nbt: chest_update_tag(chest, items),
+        });
+    }
+
+    records
+}
+
 /// Build the CLIENT-usage heightmaps from a chunk in the order
 /// vanilla emits them (`WORLD_SURFACE`, `MOTION_BLOCKING`,
 /// `MOTION_BLOCKING_NO_LEAVES`). Entries are skipped silently when
@@ -126,6 +193,114 @@ pub fn client_heightmaps(chunk: &Chunk) -> Vec<HeightmapEntry> {
             })
         })
         .collect()
+}
+
+fn block_entity_type_name(tag: &Tag) -> Option<Identifier> {
+    let Tag::Compound(fields) = tag else {
+        return None;
+    };
+    fields.iter().find_map(|(key, value)| {
+        if key == "id"
+            && let Tag::String(id) = value
+        {
+            Identifier::parse(id.clone()).ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn strip_persistent_block_entity_fields(tag: Tag) -> Tag {
+    let Tag::Compound(fields) = tag else {
+        return tag;
+    };
+    Tag::Compound(
+        fields
+            .into_iter()
+            .filter(|(key, _)| !matches!(key.as_str(), "id" | "x" | "y" | "z"))
+            .collect(),
+    )
+}
+
+fn furnace_block_entity_type_for_block(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    pos: BlockPos,
+) -> Identifier {
+    let local_x = pos.x.rem_euclid(crate::section::SECTION_DIM as i32) as u8;
+    let local_z = pos.z.rem_euclid(crate::section::SECTION_DIM as i32) as u8;
+    let path = chunk
+        .get_block(local_x, pos.y, local_z)
+        .and_then(|state_id| registry.by_id(state_id))
+        .map(|state| state.block.id.as_str());
+    match path {
+        Some("minecraft:smoker") => Identifier::parse("minecraft:smoker").unwrap(),
+        Some("minecraft:blast_furnace") => Identifier::parse("minecraft:blast_furnace").unwrap(),
+        _ => Identifier::parse("minecraft:furnace").unwrap(),
+    }
+}
+
+fn chest_block_entity_type_for_block(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    pos: BlockPos,
+) -> Identifier {
+    let local_x = pos.x.rem_euclid(crate::section::SECTION_DIM as i32) as u8;
+    let local_z = pos.z.rem_euclid(crate::section::SECTION_DIM as i32) as u8;
+    let path = chunk
+        .get_block(local_x, pos.y, local_z)
+        .and_then(|state_id| registry.by_id(state_id))
+        .map(|state| state.block.id.as_str());
+    match path {
+        Some("minecraft:barrel") => Identifier::parse("minecraft:barrel").unwrap(),
+        _ => Identifier::parse("minecraft:chest").unwrap(),
+    }
+}
+
+fn furnace_update_tag(furnace: &FurnaceBlockEntity, items: &ItemRegistry) -> Tag {
+    Tag::Compound(vec![
+        ("Items".into(), item_list_tag(&furnace.slots, items)),
+        (
+            "lit_time_remaining".into(),
+            Tag::Short(furnace.burn_remaining),
+        ),
+        ("lit_total_time".into(), Tag::Short(furnace.burn_total)),
+        (
+            "cooking_time_spent".into(),
+            Tag::Short(furnace.cook_progress),
+        ),
+        ("cooking_total_time".into(), Tag::Short(furnace.cook_total)),
+    ])
+}
+
+fn chest_update_tag(chest: &ChestBlockEntity, items: &ItemRegistry) -> Tag {
+    Tag::Compound(vec![("Items".into(), item_list_tag(&chest.slots, items))])
+}
+
+fn item_list_tag(slots: &[FurnaceSlot], items: &ItemRegistry) -> Tag {
+    let item_tags = slots
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, stack)| {
+            if stack.is_empty() {
+                return None;
+            }
+            let name = items.name_of(stack.item_id)?;
+            Some(Tag::Compound(vec![
+                ("Slot".into(), Tag::Int(slot as i32)),
+                ("id".into(), Tag::String(name.as_str().to_string())),
+                ("count".into(), Tag::Int(stack.count)),
+            ]))
+        })
+        .collect::<Vec<_>>();
+    Tag::List(ListTag {
+        element_type: if item_tags.is_empty() {
+            tag_type::END
+        } else {
+            tag_type::COMPOUND
+        },
+        elements: item_tags,
+    })
 }
 
 /// Encode all 24 sections of `chunk` into the paletted-container blob
@@ -403,8 +578,11 @@ fn write_varint(buf: &mut Vec<u8>, value: i32) {
 mod tests {
     use super::*;
     use crate::block::BlockStateId;
-    use crate::chunk::{Chunk, ChunkPos, Heightmap};
+    use crate::chunk::{Chunk, ChunkPos, FurnaceSlot, Heightmap};
     use mc_data::Registry;
+    use mc_data::blocks::{BlockReport, BlockStateReport};
+    use mc_data::items::{ItemRegistry, ItemReport};
+    use std::collections::BTreeMap;
 
     const AIR: BlockStateId = BlockStateId(0);
     const BEDROCK: BlockStateId = BlockStateId(74);
@@ -437,6 +615,37 @@ mod tests {
         )
     }
 
+    fn air_chest_registry() -> BlockRegistry {
+        BlockRegistry::from_report(&[
+            BlockReport {
+                id: Identifier::parse("minecraft:air").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:chest").unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: 1,
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            },
+        ])
+        .unwrap()
+    }
+
+    fn item_registry() -> ItemRegistry {
+        ItemRegistry::from_report(&[ItemReport {
+            id: Identifier::parse("minecraft:stone").unwrap(),
+            protocol_id: 9,
+        }])
+    }
+
     // ---- byte-level assertions ----
 
     #[test]
@@ -465,6 +674,37 @@ mod tests {
                 "section {sec} mismatches expected all-air/all-plains layout"
             );
         }
+    }
+
+    #[test]
+    fn client_block_entities_emit_stripped_chest_update_tag() {
+        let registry = air_chest_registry();
+        let items = item_registry();
+        let mut chunk = empty_chunk();
+        let pos = BlockPos { x: 2, y: 64, z: 3 };
+        chunk.set_block(2, 64, 3, BlockStateId(1)).unwrap();
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = FurnaceSlot {
+            count: 2,
+            item_id: 9,
+            damage: None,
+        };
+        chunk.chests.insert(pos, chest);
+
+        let records = client_block_entities(&chunk, &registry, &items);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].pos, pos);
+        assert_eq!(records[0].type_name.as_str(), "minecraft:chest");
+        let Tag::Compound(fields) = &records[0].nbt else {
+            panic!("expected compound update tag");
+        };
+        assert!(
+            fields
+                .iter()
+                .all(|(key, _)| !matches!(key.as_str(), "id" | "x" | "y" | "z"))
+        );
+        assert!(fields.iter().any(|(key, _)| key == "Items"));
     }
 
     #[test]

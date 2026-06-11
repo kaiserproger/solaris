@@ -58,10 +58,51 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         "screenshots/",
         "git.txt",
         "toolchain.txt",
+        "automation-driver.txt",
     ] {
         assert!(
             artifact_ids.contains(artifact),
             "missing required artifact {artifact}"
+        );
+    }
+
+    let runner = &manifest["automation_runner"];
+    assert_eq!(
+        runner["script"].as_str(),
+        Some("tools/run-real-client-regression.sh"),
+        "M94 pack must name the approved real-client runner"
+    );
+    assert_eq!(
+        runner["command_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_COMMAND"),
+        "runner must expose the real-client command hook"
+    );
+    assert_eq!(
+        runner["kind_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_KIND"),
+        "runner must require an explicit client kind"
+    );
+    assert_eq!(
+        runner["passing_gate"].as_str(),
+        Some("agent-run real-client"),
+        "runner must distinguish completed real-client evidence from prepared scaffolding"
+    );
+    let allowed_client_kinds = runner["allowed_client_kinds"]
+        .as_array()
+        .expect("allowed client kinds are present");
+    for kind in ["prism-launcher", "vanilla-launcher", "vanilla-client"] {
+        assert!(
+            allowed_client_kinds.iter().any(|entry| entry == kind),
+            "runner must allow client kind {kind}"
+        );
+    }
+    let runner_modes = runner["modes"]
+        .as_array()
+        .expect("runner modes are present");
+    for mode in ["--check", "--prepare", "--run", "--validate-run"] {
+        assert!(
+            runner_modes.iter().any(|entry| entry == mode),
+            "runner must support mode {mode}"
         );
     }
 
@@ -130,4 +171,39 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
             "missing M94 ledger row {row}"
         );
     }
+}
+
+#[test]
+fn approved_real_client_runner_is_fail_closed() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let runner_path = repo_root.join("tools/run-real-client-regression.sh");
+    let runner = std::fs::read_to_string(&runner_path).expect("read real-client runner");
+
+    assert!(
+        runner.contains("SOLARIS_REAL_CLIENT_COMMAND") && runner.contains("M94_CLIENT_COMMAND"),
+        "runner must expose current and legacy client command env hooks"
+    );
+    assert!(
+        runner.contains("SOLARIS_REAL_CLIENT_KIND")
+            && runner.contains("prism-launcher")
+            && runner.contains("vanilla-launcher")
+            && runner.contains("vanilla-client"),
+        "runner must require an explicit approved client kind"
+    );
+    for forbidden in ["wire-probe", "mc-test-harness", "protocol-only", "mock"] {
+        assert!(
+            runner.contains(forbidden),
+            "runner must reject forbidden client evidence marker {forbidden}"
+        );
+    }
+    assert!(
+        runner.contains("agent-run real-client") && runner.contains("prepared-owner-run"),
+        "runner must distinguish completed real-client runs from prepared scaffolding"
+    );
+    assert!(
+        runner.contains("SOLARIS_REAL_CLIENT_SERVER_CONFIG")
+            && runner.contains("example.toml")
+            && runner.contains("cargo run --bin mc-server -- --config"),
+        "runner must default to the manifest server command while allowing explicit config overrides"
+    );
 }

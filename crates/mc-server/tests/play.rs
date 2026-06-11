@@ -34,6 +34,7 @@ use mc_protocol::packets::play::{
     ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime, ConfirmTeleportation,
     EntityEvent, GameEvent, LoginPlay, PlayDisconnect, ServerboundChatCommand,
     ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    unpack_block_pos,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -284,7 +285,17 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
         "expected Set Default Spawn Position"
     );
     let default_spawn = SetDefaultSpawnPosition::decode(&mut frame.body).unwrap();
-    assert_eq!(default_spawn.dimension, login.dimension_name);
+    assert_eq!(default_spawn.dimension.as_str(), "minecraft:alpha");
+    assert_eq!(default_spawn.yaw, 0.0);
+    assert_eq!(default_spawn.pitch, 0.0);
+    assert_eq!(
+        unpack_block_pos(default_spawn.position),
+        (
+            sync.x.floor() as i32,
+            sync.y.floor() as i32,
+            sync.z.floor() as i32
+        )
+    );
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(frame.id, GameEvent::ID, "expected Game Event");

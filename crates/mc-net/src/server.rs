@@ -401,11 +401,12 @@ impl BoundServer {
                     && entity_sessions.active_session_count() > 0
                     && let Some(root) = entity_world_root.as_deref()
                 {
-                    let snapshots = entity_sessions.persisted_entity_snapshots();
+                    let _save_guard = SAVE_COORDINATOR.get_or_init(|| Mutex::new(())).lock().await;
+                    let records = entity_sessions.persisted_entity_records();
                     if let Err(err) = save_entities_blocking(
                         root.to_path_buf(),
                         Arc::clone(&entity_config.items),
-                        snapshots,
+                        records,
                     )
                     .await
                     {
@@ -666,6 +667,7 @@ async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::Ses
                     config.shutdown.request();
                     return;
                 }
+                warn!("console stop aborted because save-all failed");
             }
             Ok(play::commands::AdminCommand::TimeSet(time)) => {
                 sessions.set_world_time(time);
@@ -1088,6 +1090,90 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     };
 
     let started = Instant::now();
+    let storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::SaveAllFlush,
+        "save-all dirty flush plan",
+        Instant::now(),
+        world.lock().await,
+    );
+    let storage_before = storage.stats();
+    let flush_plan = match storage.plan_dirty_flush() {
+        Ok(plan) => Some(plan),
+        Err(err) => {
+            report
+                .errors
+                .push(format!("dirty chunks: flush plan failed: {err}"));
+            None
+        }
+    };
+    drop(storage);
+    report.timings.flush_plan_us = elapsed_us(started);
+
+    if let Some(flush_plan) = flush_plan {
+        let planned_chunks = flush_plan.chunk_count();
+        let flush_started = Instant::now();
+        if flush_plan.is_empty() {
+            info!(
+                flushed = 0usize,
+                planned = 0usize,
+                flush_us = elapsed_us(flush_started),
+                chunk_cache_len = storage_before.chunk_cache_len,
+                chunk_cache_capacity = storage_before.chunk_cache_capacity,
+                region_cache_len = storage_before.region_cache_len,
+                region_cache_capacity = storage_before.region_cache_capacity,
+                dirty_before = storage_before.dirty_chunks,
+                dirty_after = storage_before.dirty_chunks,
+                "world storage save pressure"
+            );
+        } else {
+            let started = Instant::now();
+            match write_dirty_flush_blocking(flush_plan).await {
+                Ok(commit) => {
+                    report.timings.flush_write_us = elapsed_us(started);
+
+                    let started = Instant::now();
+                    let mut storage = crate::lock_metrics::timed_guard(
+                        crate::lock_metrics::LockMetricKind::SaveAllFlush,
+                        "save-all dirty flush commit",
+                        Instant::now(),
+                        world.lock().await,
+                    );
+                    match storage.commit_dirty_flush(commit) {
+                        Ok(flushed) => {
+                            report.chunks_flushed = flushed;
+                            let storage_after = storage.stats();
+                            info!(
+                                flushed,
+                                planned = planned_chunks,
+                                flush_us = elapsed_us(flush_started),
+                                chunk_cache_len = storage_after.chunk_cache_len,
+                                chunk_cache_capacity = storage_after.chunk_cache_capacity,
+                                region_cache_len = storage_after.region_cache_len,
+                                region_cache_capacity = storage_after.region_cache_capacity,
+                                dirty_before = storage_before.dirty_chunks,
+                                dirty_after = storage_after.dirty_chunks,
+                                "world storage save pressure"
+                            );
+                        }
+                        Err(err) => {
+                            report
+                                .errors
+                                .push(format!("dirty chunks: flush commit failed: {err}"));
+                        }
+                    }
+                    report.timings.flush_commit_us = elapsed_us(started);
+                }
+                Err(err) => {
+                    report
+                        .errors
+                        .push(format!("dirty chunks: flush write failed: {err}"));
+                    report.timings.flush_write_us = elapsed_us(started);
+                }
+            }
+        }
+    }
+
+    let started = Instant::now();
     let players = sessions.persisted_player_states();
     let (players_saved, player_errors) =
         save_player_states_blocking(root.clone(), Arc::clone(&config.items), players).await;
@@ -1096,7 +1182,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
     report.timings.players_us = elapsed_us(started);
 
     let started = Instant::now();
-    let entities = sessions.persisted_entity_snapshots();
+    let entities = sessions.persisted_entity_records();
     report.entities_saved = entities.len();
     if let Err(err) =
         save_entities_blocking(root.clone(), Arc::clone(&config.items), entities).await
@@ -1117,91 +1203,6 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
             .push(format!("world metadata: save failed: {err}")),
     }
     report.timings.metadata_us = elapsed_us(started);
-
-    let started = Instant::now();
-    let storage = crate::lock_metrics::timed_guard(
-        crate::lock_metrics::LockMetricKind::SaveAllFlush,
-        "save-all dirty flush plan",
-        Instant::now(),
-        world.lock().await,
-    );
-    let storage_before = storage.stats();
-    let flush_plan = match storage.plan_dirty_flush() {
-        Ok(plan) => plan,
-        Err(err) => {
-            report
-                .errors
-                .push(format!("dirty chunks: flush plan failed: {err}"));
-            report.timings.flush_plan_us = elapsed_us(started);
-            report.timings.total_us = elapsed_us(total_started);
-            return report;
-        }
-    };
-    drop(storage);
-    report.timings.flush_plan_us = elapsed_us(started);
-
-    let planned_chunks = flush_plan.chunk_count();
-    let flush_started = Instant::now();
-    if flush_plan.is_empty() {
-        info!(
-            flushed = 0usize,
-            planned = 0usize,
-            flush_us = elapsed_us(flush_started),
-            chunk_cache_len = storage_before.chunk_cache_len,
-            chunk_cache_capacity = storage_before.chunk_cache_capacity,
-            region_cache_len = storage_before.region_cache_len,
-            region_cache_capacity = storage_before.region_cache_capacity,
-            dirty_before = storage_before.dirty_chunks,
-            dirty_after = storage_before.dirty_chunks,
-            "world storage save pressure"
-        );
-        report.timings.total_us = elapsed_us(total_started);
-        return report;
-    }
-
-    let started = Instant::now();
-    let commit = match write_dirty_flush_blocking(flush_plan).await {
-        Ok(commit) => commit,
-        Err(err) => {
-            report
-                .errors
-                .push(format!("dirty chunks: flush write failed: {err}"));
-            report.timings.flush_write_us = elapsed_us(started);
-            report.timings.total_us = elapsed_us(total_started);
-            return report;
-        }
-    };
-    report.timings.flush_write_us = elapsed_us(started);
-
-    let started = Instant::now();
-    let mut storage = crate::lock_metrics::timed_guard(
-        crate::lock_metrics::LockMetricKind::SaveAllFlush,
-        "save-all dirty flush commit",
-        Instant::now(),
-        world.lock().await,
-    );
-    match storage.commit_dirty_flush(commit) {
-        Ok(flushed) => {
-            report.chunks_flushed = flushed;
-            let storage_after = storage.stats();
-            info!(
-                flushed,
-                planned = planned_chunks,
-                flush_us = elapsed_us(flush_started),
-                chunk_cache_len = storage_after.chunk_cache_len,
-                chunk_cache_capacity = storage_after.chunk_cache_capacity,
-                region_cache_len = storage_after.region_cache_len,
-                region_cache_capacity = storage_after.region_cache_capacity,
-                dirty_before = storage_before.dirty_chunks,
-                dirty_after = storage_after.dirty_chunks,
-                "world storage save pressure"
-            );
-        }
-        Err(err) => report
-            .errors
-            .push(format!("dirty chunks: flush commit failed: {err}")),
-    }
-    report.timings.flush_commit_us = elapsed_us(started);
     report.timings.total_us = elapsed_us(total_started);
 
     report
@@ -1233,10 +1234,10 @@ async fn save_player_states_blocking(
 async fn save_entities_blocking(
     root: std::path::PathBuf,
     items: Arc<ItemRegistry>,
-    entities: Vec<mc_entity::EntitySnapshot>,
+    entities: Vec<play::persistence::PersistedEntityRecord>,
 ) -> Result<(), String> {
     match tokio::task::spawn_blocking(move || {
-        play::persistence::save_persisted_entities(&root, &items, &entities)
+        play::persistence::save_persisted_entity_records(&root, &items, &entities)
     })
     .await
     {

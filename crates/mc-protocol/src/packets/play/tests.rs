@@ -111,10 +111,10 @@ fn clientbound_respawn_id_and_layout_match_javap() {
 #[test]
 fn set_default_spawn_round_trip() {
     round_trip(SetDefaultSpawnPosition {
-        dimension: sample_identifier("minecraft:overworld"),
+        dimension: Identifier::parse("minecraft:overworld").unwrap(),
         position: 0x0000_0FFF_FFFF_FFFF,
         yaw: 1.5,
-        pitch: -0.25,
+        pitch: -2.0,
     });
 }
 
@@ -154,7 +154,7 @@ fn open_sign_editor_id_and_layout_match_protocol_dump() {
 }
 
 #[test]
-fn serverbound_sign_update_id_and_layout_match_protocol_dump() {
+fn serverbound_sign_update_id_and_layout_match_vanilla_stream_codec() {
     assert_eq!(ServerboundSignUpdate::ID, 0x3D);
     let packet = ServerboundSignUpdate {
         position: pack_block_pos(1, 65, -2),
@@ -166,16 +166,32 @@ fn serverbound_sign_update_id_and_layout_match_protocol_dump() {
 
     let mut expected = Vec::new();
     expected.write_i64(packet.position);
-    expected.write_string("one", MAX_COMMAND_LEN).unwrap();
-    expected.write_string("two", MAX_COMMAND_LEN).unwrap();
-    expected.write_string("three", MAX_COMMAND_LEN).unwrap();
-    expected.write_string("four", MAX_COMMAND_LEN).unwrap();
     expected.write_bool(false);
+    expected.write_string("one", MAX_SIGN_LINE_LEN).unwrap();
+    expected.write_string("two", MAX_SIGN_LINE_LEN).unwrap();
+    expected.write_string("three", MAX_SIGN_LINE_LEN).unwrap();
+    expected.write_string("four", MAX_SIGN_LINE_LEN).unwrap();
     assert_eq!(buf, expected);
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(ServerboundSignUpdate::decode(&mut cursor).unwrap(), packet);
     assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_sign_update_rejects_overlong_vanilla_line() {
+    let packet = ServerboundSignUpdate {
+        position: pack_block_pos(1, 65, -2),
+        lines: vec![
+            "x".repeat(MAX_SIGN_LINE_LEN + 1),
+            "".into(),
+            "".into(),
+            "".into(),
+        ],
+        is_front_text: true,
+    };
+
+    assert!(packet.encode(&mut Vec::new()).is_err());
 }
 
 #[test]

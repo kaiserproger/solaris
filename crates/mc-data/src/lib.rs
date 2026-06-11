@@ -33,6 +33,7 @@ const REQUIRED_REGISTRY_INDEX: &str = include_str!("../data/required_registry_in
 
 pub mod armor;
 pub mod biomes;
+pub mod block_entity_types;
 pub mod block_facts;
 pub mod block_light;
 pub mod blocks;
@@ -133,6 +134,7 @@ pub struct Registry {
 pub struct VanillaData {
     root: PathBuf,
     registries: BTreeMap<String, Registry>,
+    sidecar_root: bool,
 }
 
 impl VanillaData {
@@ -141,6 +143,14 @@ impl VanillaData {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Filesystem sidecar root when this index came from [`load`]. Embedded or
+    /// in-memory test registries are not sidecar data even if their diagnostic
+    /// root string happens to name an existing path.
+    #[must_use]
+    pub fn sidecar_root(&self) -> Option<&Path> {
+        self.sidecar_root.then_some(self.root.as_path())
     }
 
     /// Iterate every loaded registry in registry-id order.
@@ -181,6 +191,7 @@ impl VanillaData {
         Self {
             root: root.into(),
             registries: map,
+            sidecar_root: false,
         }
     }
 }
@@ -302,7 +313,11 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
         );
     }
 
-    Ok(VanillaData { root, registries })
+    Ok(VanillaData {
+        root,
+        registries,
+        sidecar_root: true,
+    })
 }
 
 fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), DataError> {
@@ -371,6 +386,7 @@ mod tests {
     fn load_indexes_every_known_registry() {
         let dir = make_minimal_layout();
         let data = load(dir.path()).unwrap();
+        assert_eq!(data.sidecar_root(), Some(dir.path()));
         assert_eq!(data.registry_count(), KNOWN_REGISTRIES.len());
         for (registry_path, _) in KNOWN_REGISTRIES {
             let reg = data
@@ -398,6 +414,7 @@ mod tests {
     fn embedded_required_registry_index_covers_known_registries() {
         let data = solaris_required_data();
 
+        assert!(data.sidecar_root().is_none());
         assert_eq!(data.registry_count(), KNOWN_REGISTRIES.len());
         assert!(data.entry_count() > 800);
         assert!(

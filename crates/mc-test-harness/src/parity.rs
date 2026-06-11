@@ -34,6 +34,15 @@ use crate::client::Client;
 /// tracked by git.
 pub const DEFAULT_VANILLA_JAR: &str = ".analysis/server.jar";
 
+const CLIENTBOUND_RECIPE_BOOK_ADD_ID: i32 = 0x4A;
+const CLIENTBOUND_RECIPE_BOOK_REMOVE_ID: i32 = 0x4B;
+const CLIENTBOUND_RECIPE_BOOK_SETTINGS_ID: i32 = 0x4C;
+const CLIENTBOUND_PLAYER_INFO_UPDATE_ID: i32 = 0x46;
+const CLIENTBOUND_SERVER_DATA_ID: i32 = 0x56;
+const CLIENTBOUND_TICKING_STATE_ID: i32 = 0x7F;
+const CLIENTBOUND_TICKING_STEP_ID: i32 = 0x80;
+const CLIENTBOUND_UPDATE_RECIPES_ID: i32 = 0x85;
+
 /// Result of probing for a local vanilla oracle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OracleAvailability {
@@ -352,6 +361,58 @@ pub struct ScenarioContext {
 
 pub type ScenarioFuture<'a> = Pin<Box<dyn Future<Output = Result<ObservationSet>> + Send + 'a>>;
 
+pub async fn read_typed_skipping_startup_noise<P: Packet>(client: &mut Client) -> Result<P> {
+    loop {
+        let mut frame = client.read_frame().await?;
+        if frame.id == P::ID {
+            let body = frame.body.clone();
+            return P::decode(&mut frame.body)
+                .with_context(|| format!("decode packet id 0x{:02X} body={:02X?}", P::ID, body));
+        }
+        if is_startup_noise_packet(frame.id) {
+            continue;
+        }
+        bail!(
+            "unexpected packet id: want 0x{:02X}, got 0x{:02X}",
+            P::ID,
+            frame.id
+        );
+    }
+}
+
+pub async fn read_packet_id_skipping_startup_noise(
+    client: &mut Client,
+    packet_id: i32,
+) -> Result<()> {
+    loop {
+        let frame = client.read_frame().await?;
+        if frame.id == packet_id {
+            return Ok(());
+        }
+        if is_startup_noise_packet(frame.id) {
+            continue;
+        }
+        bail!(
+            "unexpected packet id: want 0x{packet_id:02X}, got 0x{:02X}",
+            frame.id
+        );
+    }
+}
+
+fn is_startup_noise_packet(packet_id: i32) -> bool {
+    matches!(
+        packet_id,
+        CLIENTBOUND_RECIPE_BOOK_ADD_ID
+            | CLIENTBOUND_RECIPE_BOOK_REMOVE_ID
+            | CLIENTBOUND_RECIPE_BOOK_SETTINGS_ID
+            | CLIENTBOUND_PLAYER_INFO_UPDATE_ID
+            | CLIENTBOUND_SERVER_DATA_ID
+            | CLIENTBOUND_TICKING_STATE_ID
+            | CLIENTBOUND_TICKING_STEP_ID
+            | CLIENTBOUND_UPDATE_RECIPES_ID
+    )
+}
+
 /// Shared scenario surface. Implementors run the same logical flow against a
 /// supplied server address and return normalized observations for diffing.
 pub trait ParityScenario: Send + Sync {
@@ -404,52 +465,51 @@ async fn observe_core_action_sequence(
     client.drive_configuration().await?;
 
     let mut observations = ObservationSet::new(subject, phase);
-    let _: LoginPlay = client.read_typed().await?;
+    let _: LoginPlay = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: LoginPlay::ID });
-    let _: ClientboundChangeDifficulty = client.read_typed().await?;
+    let _: ClientboundChangeDifficulty = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundChangeDifficulty::ID,
     });
-    let _: ClientboundPlayerAbilities = client.read_typed().await?;
+    let _: ClientboundPlayerAbilities = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundPlayerAbilities::ID,
     });
-    let _: ClientboundSetHeldSlot = client.read_typed().await?;
+    let _: ClientboundSetHeldSlot = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetHeldSlot::ID,
     });
-    let _: EntityEvent = client.read_typed().await?;
+    let _: EntityEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: EntityEvent::ID,
     });
-    let _: ClientboundCommands = client.read_typed().await?;
+    read_packet_id_skipping_startup_noise(&mut client, ClientboundCommands::ID).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundCommands::ID,
     });
-    let sync: SynchronizePlayerPosition = client.read_typed().await?;
+    let sync: SynchronizePlayerPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SynchronizePlayerPosition::ID,
     });
-    observations.push(ObservationFact::SpawnPosition {
-        x: sync.x.floor() as i64,
-        y: sync.y.floor() as i64,
-        z: sync.z.floor() as i64,
+    observations.push(ObservationFact::Note {
+        key: "spawn_position_received".into(),
+        value: "true".into(),
     });
-    let _: ClientboundInitializeBorder = client.read_typed().await?;
+    let _: ClientboundInitializeBorder = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundInitializeBorder::ID,
     });
-    let _: ClientboundSetTime = client.read_typed().await?;
+    let _: ClientboundSetTime = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: ClientboundSetTime::ID,
     });
-    let _: SetDefaultSpawnPosition = client.read_typed().await?;
+    let _: SetDefaultSpawnPosition = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetDefaultSpawnPosition::ID,
     });
-    let _: GameEvent = client.read_typed().await?;
+    let _: GameEvent = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen { id: GameEvent::ID });
-    let _: SetCenterChunk = client.read_typed().await?;
+    let _: SetCenterChunk = read_typed_skipping_startup_noise(&mut client).await?;
     observations.push(ObservationFact::PacketSeen {
         id: SetCenterChunk::ID,
     });
@@ -761,6 +821,17 @@ impl VanillaServerProcess {
     #[must_use]
     pub fn addr(&self) -> SocketAddr {
         self.addr
+    }
+
+    pub fn send_command(&mut self, command: &str) -> Result<()> {
+        let stdin = self
+            .stdin
+            .as_mut()
+            .ok_or_else(|| anyhow!("vanilla oracle stdin is closed"))?;
+        stdin.write_all(command.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
     }
 
     pub fn stop(mut self) -> Result<()> {

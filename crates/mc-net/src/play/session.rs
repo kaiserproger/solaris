@@ -63,15 +63,15 @@ enum OutboundLane {
 impl OutboundCommand {
     fn lane(&self) -> OutboundLane {
         match self {
-            Self::MovePlayer(_)
-            | Self::MoveEntityRelative(_)
-            | Self::AnimatePlayer { .. }
-            | Self::BlockDeltas(_)
-            | Self::LightUpdates(_) => OutboundLane::Coalescible,
+            Self::MovePlayer(_) | Self::MoveEntityRelative(_) | Self::AnimatePlayer { .. } => {
+                OutboundLane::Coalescible
+            }
             Self::SpawnPlayer(_)
             | Self::DespawnPlayer(_)
             | Self::SpawnEntity(_)
             | Self::UpdateEntityData(_)
+            | Self::BlockDeltas(_)
+            | Self::LightUpdates(_)
             | Self::EntityEvent { .. }
             | Self::DamagePlayer { .. }
             | Self::TakeItemEntity { .. }
@@ -221,6 +221,7 @@ struct SessionRegistryInner {
     last_sent_entity_positions: HashMap<EntityId, Vec3>,
     last_entity_damage_ticks: HashMap<EntityId, u64>,
     item_pickup_ready_ticks: HashMap<EntityId, u64>,
+    entity_spawn_ticks: HashMap<EntityId, u64>,
     arrow_spawn_ticks: HashMap<EntityId, u64>,
     arrow_owner_sessions: HashMap<EntityId, SessionId>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
@@ -230,6 +231,7 @@ struct SessionRegistryInner {
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     entity_dispatches: EntityDispatchCounters,
     world_time: u64,
+    entity_lifecycle_tick: u64,
     arrow_kill_rewards: ArrowKillRewards,
 }
 
@@ -255,6 +257,7 @@ impl Default for SessionRegistryInner {
             last_sent_entity_positions: HashMap::new(),
             last_entity_damage_ticks: HashMap::new(),
             item_pickup_ready_ticks: HashMap::new(),
+            entity_spawn_ticks: HashMap::new(),
             arrow_spawn_ticks: HashMap::new(),
             arrow_owner_sessions: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
@@ -264,6 +267,7 @@ impl Default for SessionRegistryInner {
             player_persistence: HashMap::new(),
             entity_dispatches: EntityDispatchCounters::default(),
             world_time: 0,
+            entity_lifecycle_tick: 0,
             arrow_kill_rewards: ArrowKillRewards::default(),
         }
     }
@@ -335,6 +339,7 @@ impl SessionRegistry {
     pub(crate) fn advance_world_time(&self, ticks: u64) -> u64 {
         let mut inner = self.lock_inner("advance world time");
         inner.world_time = inner.world_time.wrapping_add(ticks);
+        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.saturating_add(ticks);
         inner.world_time
     }
 
@@ -691,15 +696,17 @@ impl SessionRegistry {
         &self,
         id: SessionId,
         center: (i32, i32),
+        view_distance: i32,
         desired: HashSet<(i32, i32)>,
     ) -> Vec<VisibilityDispatch> {
         let mut inner = self.lock_inner("replace chunk view");
-        let (released, acquired, desired_len, view_distance) = {
+        let (released, acquired, desired_len) = {
             let Some(session) = inner.sessions.get_mut(&id) else {
                 return Vec::new();
             };
             let old = std::mem::replace(&mut session.desired, desired);
             session.center = center;
+            session.view_distance = view_distance;
             (
                 old.difference(&session.desired)
                     .copied()
@@ -710,7 +717,6 @@ impl SessionRegistry {
                     .copied()
                     .collect::<Vec<_>>(),
                 session.desired.len(),
-                session.view_distance,
             )
         };
 
@@ -926,6 +932,8 @@ impl SessionRegistry {
                 }
             };
             let id = inner.entities.spawn(entity);
+            let lifecycle_tick = inner.entity_lifecycle_tick;
+            inner.entity_spawn_ticks.insert(id, lifecycle_tick);
             inner
                 .entity_type_aabbs
                 .entry(spawn.entity_type_id)
@@ -998,6 +1006,8 @@ impl SessionRegistry {
         entity.block_state = Some(block_state.0);
         entity.on_ground = false;
         let id = inner.entities.spawn(entity);
+        let lifecycle_tick = inner.entity_lifecycle_tick;
+        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
         inner
             .entity_type_aabbs
             .entry(entity_type_id)
@@ -1023,8 +1033,9 @@ impl SessionRegistry {
         apply_entity_facts(&mut entity);
         let aabb = entity_aabb(&entity.type_name);
         let id = inner.entities.spawn(entity);
-        let world_time = inner.world_time;
-        inner.arrow_spawn_ticks.insert(id, world_time);
+        let lifecycle_tick = inner.entity_lifecycle_tick;
+        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
+        inner.arrow_spawn_ticks.insert(id, lifecycle_tick);
         if let Some(owner_session) = owner_session {
             inner.arrow_owner_sessions.insert(id, owner_session);
         }
@@ -1048,6 +1059,8 @@ impl SessionRegistry {
         apply_entity_facts(&mut entity);
         let aabb = entity_aabb(&entity.type_name);
         let id = inner.entities.spawn(entity);
+        let lifecycle_tick = inner.entity_lifecycle_tick;
+        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
         inner
             .entity_type_aabbs
             .entry(entity_type_id)
@@ -1185,6 +1198,7 @@ impl SessionRegistry {
             inner.last_sent_entity_positions.remove(&entity_id);
             inner.last_entity_damage_ticks.remove(&entity_id);
             inner.item_pickup_ready_ticks.remove(&entity_id);
+            inner.entity_spawn_ticks.remove(&entity_id);
             inner.arrow_spawn_ticks.remove(&entity_id);
             inner.arrow_owner_sessions.remove(&entity_id);
             untrack_entity_chunk_locked(&mut inner, entity_id);
@@ -1250,6 +1264,7 @@ impl SessionRegistry {
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
         inner.item_pickup_ready_ticks.remove(&entity_id);
+        inner.entity_spawn_ticks.remove(&entity_id);
         inner.arrow_spawn_ticks.remove(&entity_id);
         inner.arrow_owner_sessions.remove(&entity_id);
         untrack_entity_chunk_locked(&mut inner, entity_id);
@@ -1284,6 +1299,7 @@ impl SessionRegistry {
         inner.last_sent_entity_positions.remove(&entity_id);
         inner.last_entity_damage_ticks.remove(&entity_id);
         inner.item_pickup_ready_ticks.remove(&entity_id);
+        inner.entity_spawn_ticks.remove(&entity_id);
         inner.arrow_spawn_ticks.remove(&entity_id);
         inner.arrow_owner_sessions.remove(&entity_id);
         untrack_entity_chunk_locked(&mut inner, entity_id);
@@ -1369,23 +1385,54 @@ impl SessionRegistry {
 
     pub(crate) fn restore_persisted_entities(
         &self,
-        entities: impl IntoIterator<Item = mc_entity::EntitySnapshot>,
+        entities: impl IntoIterator<Item = impl Into<PersistedEntityRecord>>,
     ) -> usize {
         let mut inner = self.lock_inner("restore persisted entities");
+        let records = entities
+            .into_iter()
+            .map(Into::into)
+            .collect::<Vec<PersistedEntityRecord>>();
+        let max_age = records
+            .iter()
+            .map(|record| u64::try_from(record.age.max(0)).unwrap_or(0))
+            .max()
+            .unwrap_or(0);
+        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.max(max_age);
         let mut restored = 0;
-        for entity in entities {
+        for record in records {
+            let entity = record.snapshot;
             let aabb = entity_aabb(&entity.type_name);
             let chunk = server_entity_chunk_pos(&server_entity_snapshot_from(entity.clone()));
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
             let is_arrow = entity.type_name == "minecraft:arrow";
+            let is_item = entity.item_stack.is_some();
             if inner.entities.insert_snapshot(entity) {
                 inner.entity_type_aabbs.entry(type_id).or_insert(aabb);
                 track_entity_chunk_locked(&mut inner, entity_id, position);
+                if is_item {
+                    let age = u64::try_from(record.age.max(0)).unwrap_or(0);
+                    let spawn_tick = inner.entity_lifecycle_tick.saturating_sub(age);
+                    inner.entity_spawn_ticks.insert(entity_id, spawn_tick);
+                    if record.pickup_delay > 0 {
+                        let ready_tick = inner
+                            .entity_lifecycle_tick
+                            .saturating_add(u64::try_from(record.pickup_delay).unwrap_or(0));
+                        inner.item_pickup_ready_ticks.insert(entity_id, ready_tick);
+                    }
+                } else {
+                    let age = u64::try_from(record.age.max(0)).unwrap_or(0);
+                    let spawn_tick = inner.entity_lifecycle_tick.saturating_sub(age);
+                    inner.entity_spawn_ticks.insert(entity_id, spawn_tick);
+                }
                 if is_arrow {
-                    let world_time = inner.world_time;
-                    inner.arrow_spawn_ticks.insert(entity_id, world_time);
+                    let spawn_tick = inner
+                        .entity_spawn_ticks
+                        .get(&entity_id)
+                        .copied()
+                        .unwrap_or(inner.entity_lifecycle_tick);
+                    inner.arrow_spawn_ticks.insert(entity_id, spawn_tick);
                 }
                 inner.spawned_entity_chunks.insert(chunk);
                 restored += 1;
@@ -1394,21 +1441,42 @@ impl SessionRegistry {
         restored
     }
 
-    pub(crate) fn persisted_entity_snapshots(&self) -> Vec<mc_entity::EntitySnapshot> {
+    pub(crate) fn persisted_entity_records(&self) -> Vec<PersistedEntityRecord> {
         let inner = self.lock_inner("persisted entity snapshots");
         inner
             .entities
             .snapshots()
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+            .map(|entity| {
+                let age = inner
+                    .entity_spawn_ticks
+                    .get(&entity.id)
+                    .map(|spawn_tick| inner.entity_lifecycle_tick.saturating_sub(*spawn_tick))
+                    .unwrap_or(0)
+                    .min(i32::MAX as u64) as i32;
+                let pickup_delay = inner
+                    .item_pickup_ready_ticks
+                    .get(&entity.id)
+                    .map(|ready_tick| ready_tick.saturating_sub(inner.entity_lifecycle_tick))
+                    .unwrap_or(0)
+                    .min(i32::from(i16::MAX) as u64) as i32;
+                PersistedEntityRecord {
+                    snapshot: entity,
+                    age,
+                    pickup_delay,
+                }
+            })
             .collect()
     }
 
     pub(crate) fn apply_entity_physics_and_dispatch(&self, tick: u64, steps: &[EntityPhysicsStep]) {
         let mut inner = self.lock_inner("apply entity physics");
+        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.max(tick);
         if inner.entities.is_empty() {
             return;
         }
         let mut dispatches = despawn_expired_arrows_locked(&mut inner);
+        dispatches.extend(despawn_expired_items_locked(&mut inner));
         let old_chunks: HashMap<_, _> = steps
             .iter()
             .filter_map(|step| {
@@ -1713,7 +1781,7 @@ fn item_pickup_ready_locked(inner: &SessionRegistryInner, entity_id: EntityId) -
     inner
         .item_pickup_ready_ticks
         .get(&entity_id)
-        .is_none_or(|ready_tick| inner.world_time >= *ready_tick)
+        .is_none_or(|ready_tick| inner.entity_lifecycle_tick >= *ready_tick)
 }
 
 fn entity_is_near_player_chunk(chunk: (i32, i32), player_positions: &[Vec3]) -> bool {
@@ -2319,9 +2387,33 @@ fn despawn_expired_arrows_locked(inner: &mut SessionRegistryInner) -> Vec<Visibi
         .arrow_spawn_ticks
         .iter()
         .filter_map(|(&entity_id, &spawn_tick)| {
-            (inner.world_time.saturating_sub(spawn_tick) >= ARROW_DESPAWN_AGE_TICKS)
+            (inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ARROW_DESPAWN_AGE_TICKS)
                 .then_some(entity_id)
         })
+        .collect::<Vec<_>>();
+    expired
+        .into_iter()
+        .filter_map(|entity_id| {
+            remove_server_entity_locked(inner, entity_id).map(|(_, dispatches)| dispatches)
+        })
+        .flatten()
+        .collect()
+}
+
+fn despawn_expired_items_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
+    let expired = inner
+        .entity_spawn_ticks
+        .iter()
+        .filter_map(|(&entity_id, &spawn_tick)| {
+            let is_item = inner
+                .entities
+                .view(entity_id)
+                .is_some_and(|entity| entity.item_stack.is_some());
+            (is_item
+                && inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ITEM_DESPAWN_AGE_TICKS)
+                .then_some(entity_id)
+        })
+        .take(ITEM_DESPAWN_SWEEP_BUDGET)
         .collect::<Vec<_>>();
     expired
         .into_iter()
@@ -2439,12 +2531,17 @@ fn spawn_item_drop_locked(
     entity.velocity = Vec3::new(0.0, 0.1, 0.0);
     let id = inner.entities.spawn(entity);
     inner
+        .entity_spawn_ticks
+        .insert(id, inner.entity_lifecycle_tick);
+    inner
         .entity_type_aabbs
         .entry(entity_type_id)
         .or_insert_with(|| entity_aabb("minecraft:item"));
     track_entity_chunk_locked(inner, id, position);
     inner.last_sent_entity_positions.insert(id, position);
-    let ready_tick = inner.world_time.saturating_add(ITEM_PICKUP_DELAY_TICKS);
+    let ready_tick = inner
+        .entity_lifecycle_tick
+        .saturating_add(ITEM_PICKUP_DELAY_TICKS);
     inner.item_pickup_ready_ticks.insert(id, ready_tick);
     spawn_entity_visibility_locked(inner, id)
 }
@@ -2462,6 +2559,9 @@ fn spawn_xp_orb_locked(
     entity.experience_value = Some(value);
     entity.velocity = Vec3::new(0.0, 0.08, 0.0);
     let id = inner.entities.spawn(entity);
+    inner
+        .entity_spawn_ticks
+        .insert(id, inner.entity_lifecycle_tick);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -2539,16 +2639,16 @@ fn damage_server_entity_locked(
     entity_id: EntityId,
     amount: f32,
 ) -> Option<mc_entity::EntityDamage> {
-    let world_time = inner.world_time;
+    let tick = inner.entity_lifecycle_tick;
     if inner
         .last_entity_damage_ticks
         .get(&entity_id)
-        .is_some_and(|last| world_time.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
+        .is_some_and(|last| tick.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
     {
         return None;
     }
     let damage = inner.entities.damage(entity_id, amount)?;
-    inner.last_entity_damage_ticks.insert(entity_id, world_time);
+    inner.last_entity_damage_ticks.insert(entity_id, tick);
     Some(damage)
 }
 
@@ -2704,6 +2804,7 @@ fn remove_server_entity_locked(
     inner.last_sent_entity_positions.remove(&entity_id);
     inner.last_entity_damage_ticks.remove(&entity_id);
     inner.item_pickup_ready_ticks.remove(&entity_id);
+    inner.entity_spawn_ticks.remove(&entity_id);
     inner.arrow_spawn_ticks.remove(&entity_id);
     inner.arrow_owner_sessions.remove(&entity_id);
     untrack_entity_chunk_locked(inner, entity_id);
@@ -3463,6 +3564,30 @@ mod tests {
     }
 
     #[test]
+    fn replace_view_updates_view_distance_and_tickets() {
+        let registry = SessionRegistry::new();
+        let (tx, _rx) = mpsc::channel(8);
+        let (id, _) = registry.register(
+            &profile("ViewDistanceAlice"),
+            (0, 0),
+            3,
+            HashSet::from([(0, 0), (1, 0), (2, 0)]),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+
+        registry.replace_view(id, (0, 0), 1, HashSet::from([(0, 0)]));
+
+        let inner = registry.lock_inner("test replace view");
+        let session = inner.sessions.get(&id).unwrap();
+        assert_eq!(session.view_distance, 1);
+        assert_eq!(session.desired, HashSet::from([(0, 0)]));
+        assert!(inner.tickets.contains_key(&(0, 0)));
+        assert!(!inner.tickets.contains_key(&(1, 0)));
+        assert!(!inner.tickets.contains_key(&(2, 0)));
+    }
+
+    #[test]
     fn try_register_rejects_duplicate_profile_until_unregister() {
         let registry = SessionRegistry::new();
         let first_id = register_test_session(&registry, "DupAlice");
@@ -3613,6 +3738,132 @@ mod tests {
 
         assert_eq!(claimed.stack, EntityItemStack::new(42, 1).with_damage(17));
         assert_eq!(remaining, EntityItemStack::new(42, 2).with_damage(17));
+    }
+
+    #[test]
+    fn item_drop_records_age_and_remaining_pickup_delay() {
+        let registry = SessionRegistry::new();
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        registry.advance_world_time(2);
+
+        let records = registry.persisted_entity_records();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].age, 2);
+        assert_eq!(records[0].pickup_delay, 2);
+    }
+
+    #[test]
+    fn setting_world_time_does_not_age_item_lifecycle() {
+        let registry = SessionRegistry::new();
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        registry.advance_world_time(2);
+        registry.set_world_time(100_000);
+
+        let records = registry.persisted_entity_records();
+
+        assert_eq!(records[0].age, 2);
+        assert_eq!(records[0].pickup_delay, 2);
+    }
+
+    #[test]
+    fn restored_item_respects_remaining_pickup_delay() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "RestorePickupAlice");
+        let record = PersistedEntityRecord {
+            snapshot: mc_entity::EntitySnapshot {
+                id: mc_entity::EntityId(77),
+                uuid: uuid::Uuid::nil(),
+                type_id: 1,
+                type_name: "minecraft:item".into(),
+                position: Vec3::new(0.5, 64.0, 0.5),
+                rotation: mc_entity::Rotation::ZERO,
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                item_stack: Some(EntityItemStack::new(42, 3)),
+                experience_value: None,
+                block_state: None,
+                lifecycle: mc_entity::EntityLifecycle::Alive,
+                health: 20.0,
+                attributes: mc_entity::AttributeSet::new(),
+                goal: mc_entity::GoalState::Idle,
+                vehicle: None,
+            },
+            age: 12,
+            pickup_delay: 3,
+        };
+        assert_eq!(registry.restore_persisted_entities([record]), 1);
+
+        assert!(
+            registry
+                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
+                .is_empty()
+        );
+        registry.advance_world_time(3);
+        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
+        assert!(registry.claim_item_pickup(entity_id, alice, 3).is_some());
+    }
+
+    #[test]
+    fn item_drop_despawns_after_lifetime() {
+        let registry = SessionRegistry::new();
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        registry.advance_world_time(ITEM_DESPAWN_AGE_TICKS);
+
+        registry.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
+
+        assert!(registry.persisted_entity_records().is_empty());
+    }
+
+    #[test]
+    fn item_despawn_sweep_is_budgeted() {
+        let registry = SessionRegistry::new();
+        for index in 0..(ITEM_DESPAWN_SWEEP_BUDGET + 10) {
+            registry.spawn_item_drop(
+                1,
+                Vec3::new(index as f64, 64.0, 0.5),
+                EntityItemStack::new(42, 1),
+            );
+        }
+        registry.advance_world_time(ITEM_DESPAWN_AGE_TICKS);
+
+        registry.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
+
+        let remaining = registry.persisted_entity_records().len();
+        assert_eq!(remaining, 10);
+    }
+
+    #[test]
+    fn restored_arrow_age_controls_despawn_timer() {
+        let registry = SessionRegistry::new();
+        let record = PersistedEntityRecord {
+            snapshot: mc_entity::EntitySnapshot {
+                id: mc_entity::EntityId(88),
+                uuid: uuid::Uuid::nil(),
+                type_id: 2,
+                type_name: "minecraft:arrow".into(),
+                position: Vec3::new(0.5, 64.0, 0.5),
+                rotation: mc_entity::Rotation::ZERO,
+                velocity: Vec3::ZERO,
+                on_ground: true,
+                item_stack: None,
+                experience_value: None,
+                block_state: None,
+                lifecycle: mc_entity::EntityLifecycle::Alive,
+                health: 20.0,
+                attributes: mc_entity::AttributeSet::new(),
+                goal: mc_entity::GoalState::Idle,
+                vehicle: None,
+            },
+            age: (ARROW_DESPAWN_AGE_TICKS - 1) as i32,
+            pickup_delay: 0,
+        };
+        assert_eq!(registry.restore_persisted_entities([record]), 1);
+        registry.advance_world_time(1);
+
+        registry.apply_entity_physics_and_dispatch(1, &[]);
+
+        assert!(registry.persisted_entity_records().is_empty());
     }
 
     #[test]

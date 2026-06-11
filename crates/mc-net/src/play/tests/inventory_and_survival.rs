@@ -110,6 +110,40 @@ fn regular_throw_slot_returns_remaining_stack_and_drop() {
 }
 
 #[test]
+fn quick_move_crafting_result_is_transactional_when_inventory_has_partial_room() {
+    let mut state = interaction_state_for_items(Arc::new(ItemRegistry::from_report(&[])));
+    state.inventory.slots[0] = ItemStack::new(42, 4);
+    state.inventory.slots[1] = ItemStack::new(7, 1);
+    state.inventory.slots[9] = ItemStack::new(42, 62);
+    for slot in 10..=44 {
+        state.inventory.slots[slot] = ItemStack::new(99, 64);
+    }
+
+    assert!(!apply_quick_move_click(&mut state, 0));
+
+    assert_eq!(state.inventory.slots[0], ItemStack::new(42, 4));
+    assert_eq!(state.inventory.slots[1], ItemStack::new(7, 1));
+    assert_eq!(state.inventory.slots[9], ItemStack::new(42, 62));
+}
+
+#[test]
+fn outside_pickup_click_drops_from_cursor() {
+    let mut state = interaction_state_for_items(Arc::new(ItemRegistry::from_report(&[])));
+    state.carried_item = ItemStack::new(42, 3);
+
+    let dropped = apply_outside_pickup_click(&mut state, 0);
+
+    assert_eq!(dropped, Some(ItemStack::new(42, 3)));
+    assert!(state.carried_item.is_empty());
+
+    state.carried_item = ItemStack::new(42, 3);
+    let dropped = apply_outside_pickup_click(&mut state, 1);
+
+    assert_eq!(dropped, Some(ItemStack::new(42, 1)));
+    assert_eq!(state.carried_item, ItemStack::new(42, 2));
+}
+
+#[test]
 fn death_drops_inventory_and_carried_item() {
     let mut inventory = PlayerInventory::empty();
     inventory.slots[0] = ItemStack::new(1, 1);
@@ -289,6 +323,81 @@ fn armor_durability_scales_with_incoming_damage() {
 
     assert_eq!(changed, vec![(6, ItemStack::new(11, 1).with_damage(2))]);
     assert_eq!(state.inventory.slots[6], ItemStack::new(11, 1).with_damage(2));
+}
+
+#[tokio::test]
+async fn projectile_damage_uses_armor_and_damages_armor() {
+    let chestplate = Identifier::parse("minecraft:iron_chestplate").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: chestplate,
+        protocol_id: 11,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.inventory.slots[6] = ItemStack::new(11, 1);
+    let mut survival_state = SurvivalState::FULL;
+    let mut xp_state = XpState::default();
+    let mut writer = Vec::new();
+
+    apply_projectile_player_damage(
+        Some(&mut state),
+        &mut writer,
+        Compression::Disabled,
+        &mut survival_state,
+        &mut xp_state,
+        GameMode::Survival,
+        ProjectilePlayerDamage {
+            player_pose: PlayerPose::new(0.0, 64.0, 0.0),
+            amount: 10.0,
+            source_origin: Some(Vec3::new(0.0, 64.0, 2.0)),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!((survival_state.health - 10.48).abs() < 0.001);
+    assert_eq!(state.inventory.slots[6], ItemStack::new(11, 1).with_damage(2));
+}
+
+#[tokio::test]
+async fn bow_release_damages_held_bow() {
+    let bow = Identifier::parse("minecraft:bow").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: bow,
+        protocol_id: 12,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(12, 1);
+    let mut writer = Vec::new();
+
+    damage_held_bow_after_shot(&mut state, &mut writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::new(12, 1).with_damage(1)
+    );
+}
+
+#[tokio::test]
+async fn bow_melee_attack_does_not_damage_bow() {
+    let bow = Identifier::parse("minecraft:bow").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: bow,
+        protocol_id: 12,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(12, 1);
+    let mut writer = Vec::new();
+
+    damage_held_weapon_after_attack(&mut state, &mut writer)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::new(12, 1)
+    );
 }
 
 #[test]

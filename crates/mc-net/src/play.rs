@@ -39,7 +39,7 @@ use mc_nbt::{ListTag, Tag};
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ChunkHeightmap, ClientCommandAction,
+    AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate, ChunkHeightmap, ClientCommandAction,
     ClientboundBlockEntityData, ClientboundChangeDifficulty, ClientboundCommandSuggestions,
     ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
     ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
@@ -141,7 +141,8 @@ use inventory::{
 };
 use item_blocks::ItemToBlockTable;
 use persistence::{
-    PlayerPersistedState, SpawnState, XpState, load_player_state, save_player_state,
+    PersistedEntityRecord, PlayerPersistedState, SpawnState, XpState, load_player_state,
+    save_player_state,
 };
 #[cfg(test)]
 use plants::bonemeal_growth_edit;
@@ -153,7 +154,8 @@ use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
     ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration,
-    dispatch_visibility_commands, entity_aabb, within_block_reach, within_entity_reach,
+    VisibilityDispatch, dispatch_visibility_commands, entity_aabb, within_block_reach,
+    within_entity_reach,
 };
 #[cfg(test)]
 use spawn::spawn_chunk_pos;
@@ -162,12 +164,12 @@ use spawn::spawn_y_from_chunk;
 use spawn::{chunk_pos_from_coords, pack_block_pos, spawn_dimension, spawn_position};
 use survival::{
     PendingBreak, PendingUse, SurvivalState, UseKind, arrow_entity_type_id, block_break_is_denied,
-    block_drop_stacks, bow_draw_power, consume_arrow, damage_held_tool_after_mining,
-    damage_held_weapon_after_attack, entity_item_stack, falling_block_entity_type_id,
-    held_attack_damage, held_food_use, held_item_id, is_bow_item, is_hostile_entity,
-    item_entity_type_id, max_tool_damage_for_path, mining_time_for_target, mob_drop_stack,
-    mob_drop_stack_from, mob_xp_value, pending_break_is_complete, pending_break_matches,
-    pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
+    block_drop_stacks, bow_draw_power, consume_arrow, damage_held_bow_after_shot,
+    damage_held_tool_after_mining, damage_held_weapon_after_attack, entity_item_stack,
+    falling_block_entity_type_id, held_attack_damage, held_food_use, held_item_id, is_bow_item,
+    is_hostile_entity, item_entity_type_id, max_tool_damage_for_path, mining_time_for_target,
+    mob_drop_stack, mob_drop_stack_from, mob_xp_value, pending_break_is_complete,
+    pending_break_matches, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{
@@ -211,6 +213,32 @@ const DAY_START_TICK: u64 = 0;
 const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
 const SIGN_BLOCK_ENTITY_TYPE_ID: i32 = 7;
 const CAMPFIRE_BLOCK_ENTITY_TYPE_ID: i32 = 33;
+
+fn effective_block_entity_types(
+    data: &VanillaData,
+) -> mc_data::block_entity_types::BlockEntityTypeRegistry {
+    if let Some(sidecar_root) = data.sidecar_root() {
+        let registries_report = sidecar_root.join("reports").join("registries.json");
+        if !registries_report.is_file() {
+            warn!(
+                path = %registries_report.display(),
+                "block-entity type registry report missing; using embedded fallback",
+            );
+            return mc_data::block_entity_types::solaris_required_block_entity_types();
+        }
+        match mc_data::block_entity_types::load_block_entity_types_report(&registries_report) {
+            Ok(report) => {
+                return mc_data::block_entity_types::BlockEntityTypeRegistry::from_report(&report);
+            }
+            Err(err) => warn!(
+                path = %registries_report.display(),
+                error = %err,
+                "block-entity type registry unavailable; using embedded fallback",
+            ),
+        }
+    }
+    mc_data::block_entity_types::solaris_required_block_entity_types()
+}
 
 pub(crate) fn configure_session_arrow_kill_rewards(
     sessions: &SessionRegistry,
@@ -341,6 +369,8 @@ const MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER: f64 = 0.5;
 const PLAYER_ENTITY_ATTACK_COOLDOWN: Duration = Duration::from_millis(350);
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
+const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
+const ITEM_DESPAWN_SWEEP_BUDGET: usize = 256;
 const ARROW_DESPAWN_AGE_TICKS: u64 = 1_200;
 const ARROW_ENTITY_HIT_DAMAGE: f32 = 4.0;
 const ARROW_ENTITY_HIT_KNOCKBACK: f64 = 0.6;
@@ -841,13 +871,17 @@ where
         passive_herd_water,
     ));
     let passive_herd_passable = Arc::new(passive_entity_passable_blocks(&config.blocks));
+    let block_entity_types = Arc::new(effective_block_entity_types(data));
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
         Some(ChunkStreamState::new(
             Arc::clone(world),
             Arc::new(biomes.clone()),
+            Arc::clone(&config.blocks),
             config.block_light.as_ref().map(Arc::clone),
+            Arc::clone(&config.items),
+            Arc::clone(&block_entity_types),
             passive_herd_surface,
             Arc::clone(&passive_herd_water_states),
             Arc::clone(&passive_herd_passable),
@@ -1442,6 +1476,22 @@ fn consume_inventory_crafting_ingredients(state: &mut InteractionState) {
     refresh_inventory_crafting_result(state);
 }
 
+fn store_inventory_crafting_inputs(state: &mut InteractionState, player_pose: PlayerPose) {
+    state.inventory.slots[0] = ItemStack::EMPTY;
+    for slot in 1..=4 {
+        let stack = std::mem::replace(&mut state.inventory.slots[slot], ItemStack::EMPTY);
+        if stack.is_empty() {
+            continue;
+        }
+        let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
+        let (remaining, _) = state.inventory.merge_stack(stack, max_stack);
+        if !remaining.is_empty() {
+            dispatch_inventory_drop(state, player_pose, remaining);
+        }
+    }
+    refresh_inventory_crafting_result(state);
+}
+
 fn take_inventory_crafting_result(state: &mut InteractionState) -> bool {
     refresh_inventory_crafting_result(state);
     let result = state.inventory.slots[0].clone();
@@ -1537,10 +1587,12 @@ fn apply_crafting_quick_move_click(
             return false;
         }
         let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
-        let (remaining, _) = state.inventory.merge_stack(result.clone(), max_stack);
+        let mut merged = state.inventory.clone();
+        let (remaining, _) = merged.merge_stack(result.clone(), max_stack);
         if !remaining.is_empty() {
             return false;
         }
+        state.inventory = merged;
         consume_crafting_ingredients(state, window);
         return true;
     }
@@ -1564,6 +1616,7 @@ fn apply_crafting_quick_move_click(
 async fn open_crafting_table_container<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    player_pose: PlayerPose,
     sequence: i32,
     x: i32,
     y: i32,
@@ -1584,7 +1637,7 @@ where
         return Ok(false);
     }
 
-    store_active_container(state);
+    store_active_container(state, player_pose);
     let mut window = CraftingTableWindow::new(next_container_id(state));
     refresh_crafting_result(state, &mut window);
     write_packet(
@@ -1621,6 +1674,10 @@ where
     let changed = match classify_container_click(&packet) {
         ContainerClickAction::Pickup { slot, button } => {
             apply_crafting_pickup_click(state, &mut window, slot, button)
+        }
+        ContainerClickAction::OutsidePickup { button } => {
+            dropped = apply_outside_pickup_click(state, button);
+            dropped.is_some()
         }
         ContainerClickAction::QuickMove { slot } => {
             apply_crafting_quick_move_click(state, &mut window, slot)
@@ -1894,6 +1951,7 @@ where
 async fn open_chest_container<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    player_pose: PlayerPose,
     sequence: i32,
     x: i32,
     y: i32,
@@ -1944,7 +2002,7 @@ where
         (positions, title)
     };
 
-    store_active_container(state);
+    store_active_container(state, player_pose);
     let container_id = next_container_id(state);
     let window = ChestWindow::new(positions, container_id);
     let view = load_chest_view(state, &window).await?;
@@ -1970,6 +2028,7 @@ where
 async fn open_furnace_container<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    player_pose: PlayerPose,
     sequence: i32,
     x: i32,
     y: i32,
@@ -2004,7 +2063,7 @@ where
         (title, kind)
     };
 
-    store_active_container(state);
+    store_active_container(state, player_pose);
     let container_id = next_container_id(state);
     let window = FurnaceWindow::new(position, container_id, kind);
     let furnace = {
@@ -2323,6 +2382,7 @@ fn apply_regular_throw_slot(slot_stack: ItemStack, button: i8) -> Option<(ItemSt
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContainerClickAction {
     Pickup { slot: usize, button: i8 },
+    OutsidePickup { button: i8 },
     QuickMove { slot: usize },
     Swap { slot: usize, button: i8 },
     Throw { slot: usize, button: i8 },
@@ -2330,6 +2390,14 @@ enum ContainerClickAction {
 }
 
 fn classify_container_click(packet: &ServerboundContainerClick) -> ContainerClickAction {
+    if packet.slot_num < 0 {
+        return match packet.container_input {
+            ContainerInput::Pickup => ContainerClickAction::OutsidePickup {
+                button: packet.button_num,
+            },
+            _ => ContainerClickAction::Unsupported,
+        };
+    }
     let Ok(slot) = usize::try_from(packet.slot_num) else {
         return ContainerClickAction::Unsupported;
     };
@@ -2637,6 +2705,37 @@ where
     write_inventory_content(state, writer).await
 }
 
+async fn reset_xp_on_death<W>(
+    state: Option<&InteractionState>,
+    xp_state: &mut XpState,
+    writer: &mut W,
+    compression: Compression,
+    player_pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let dropped_xp = recoverable_death_xp(xp_state);
+    if dropped_xp > 0
+        && let Some(state) = state
+        && let Some(entity_type_id) = xp_orb_entity_type_id(&state.entity_types)
+    {
+        dispatch_visibility_commands(state.sessions.spawn_xp_orb(
+            entity_type_id,
+            Vec3::new(player_pose.x, player_pose.y, player_pose.z),
+            dropped_xp,
+        ));
+    }
+    if xp_state.reset() {
+        write_packet(writer, &xp_state.as_packet(), compression).await?;
+    }
+    Ok(())
+}
+
+fn recoverable_death_xp(xp_state: &XpState) -> i32 {
+    xp_state.level.saturating_mul(7).clamp(0, 100)
+}
+
 fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> bool {
     if slot >= state.inventory.slots.len() || !(button == 0 || button == 1) {
         return false;
@@ -2709,6 +2808,22 @@ fn apply_throw_click(state: &mut InteractionState, slot: usize, button: i8) -> O
     Some(dropped)
 }
 
+fn apply_outside_pickup_click(state: &mut InteractionState, button: i8) -> Option<ItemStack> {
+    if state.carried_item.is_empty() {
+        return None;
+    }
+    match button {
+        0 => Some(std::mem::take(&mut state.carried_item)),
+        1 => {
+            let mut dropped = state.carried_item.clone();
+            dropped.count = 1;
+            decrement_cursor(&mut state.carried_item);
+            Some(dropped)
+        }
+        _ => None,
+    }
+}
+
 fn can_place_in_player_slot(state: &InteractionState, slot: usize, stack: &ItemStack) -> bool {
     if stack.is_empty() {
         return true;
@@ -2727,10 +2842,12 @@ fn apply_quick_move_click(state: &mut InteractionState, slot: usize) -> bool {
     if slot == 0 {
         let result = state.inventory.slots[0].clone();
         let max_stack = item_max_stack(&state.item_facts, &state.items, &result);
-        let (remaining, _) = state.inventory.merge_stack(result, max_stack);
+        let mut merged = state.inventory.clone();
+        let (remaining, _) = merged.merge_stack(result, max_stack);
         if !remaining.is_empty() {
             return false;
         }
+        state.inventory = merged;
         consume_inventory_crafting_ingredients(state);
         return true;
     }
@@ -3236,6 +3353,10 @@ where
             ContainerClickAction::Pickup { slot, button } => {
                 apply_chest_pickup_click(state, &mut view, slot, button)
             }
+            ContainerClickAction::OutsidePickup { button } => {
+                dropped = apply_outside_pickup_click(state, button);
+                dropped.is_some()
+            }
             ContainerClickAction::QuickMove { slot } => {
                 apply_chest_quick_move_click(state, &mut view, slot)
             }
@@ -3309,6 +3430,10 @@ where
         changed = match classify_container_click(&packet) {
             ContainerClickAction::Pickup { slot, button } => {
                 apply_furnace_pickup_click(state, &mut furnace, window.kind, slot, button)
+            }
+            ContainerClickAction::OutsidePickup { button } => {
+                dropped = apply_outside_pickup_click(state, button);
+                dropped.is_some()
             }
             ContainerClickAction::QuickMove { slot } => {
                 apply_furnace_quick_move_click(state, &mut furnace, window.kind, slot)
@@ -3619,6 +3744,10 @@ where
     let mut dropped = None;
     let changed = match classify_container_click(&packet) {
         ContainerClickAction::Pickup { slot, button } => apply_pickup_click(state, slot, button),
+        ContainerClickAction::OutsidePickup { button } => {
+            dropped = apply_outside_pickup_click(state, button);
+            dropped.is_some()
+        }
         ContainerClickAction::QuickMove { slot } => apply_quick_move_click(state, slot),
         ContainerClickAction::Swap { slot, button } => apply_swap_click(state, slot, button),
         ContainerClickAction::Throw { slot, button } => {
@@ -4195,6 +4324,7 @@ where
             ));
             let slot_value = state.inventory.slots[slot].clone();
             write_inventory_slot_updates(state, writer, vec![(slot, slot_value)]).await?;
+            damage_held_bow_after_shot(state, writer).await?;
         } else {
             state.pending_use = None;
         }
@@ -5558,6 +5688,7 @@ async fn apply_fall_damage<W>(
     writer: &mut W,
     compression: Compression,
     survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
     old_pose: PlayerPose,
     new_pose: PlayerPose,
 ) -> Result<(), ConnectionError>
@@ -5585,6 +5716,7 @@ where
         state.pending_use = None;
         clear_shield_use(state);
         drop_inventory_on_death(state, writer, new_pose).await?;
+        reset_xp_on_death(Some(state), xp_state, writer, compression, new_pose).await?;
     }
     Ok(())
 }
@@ -5600,6 +5732,7 @@ async fn apply_projectile_player_damage<W>(
     writer: &mut W,
     compression: Compression,
     survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
     game_mode: GameMode,
     damage: ProjectilePlayerDamage,
 ) -> Result<(), ConnectionError>
@@ -5618,8 +5751,24 @@ where
         }
         return Ok(());
     }
+    let applied_damage = survival_damage_after_armor(state.as_deref(), damage.amount);
     let was_dead = survival_state.is_dead();
-    survival_state.apply_damage(damage.amount);
+    if applied_damage > 0.0 {
+        survival_state.apply_damage(applied_damage);
+    }
+    let armor_changed = if applied_damage > 0.0 {
+        state
+            .as_deref_mut()
+            .map(|state| damage_equipped_armor(state, damage.amount))
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
+    if !armor_changed.is_empty()
+        && let Some(state) = state.as_deref_mut()
+    {
+        write_inventory_slot_updates(state, writer, armor_changed).await?;
+    }
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     if !was_dead
         && survival_state.is_dead()
@@ -5629,6 +5778,14 @@ where
         state.pending_use = None;
         clear_shield_use(state);
         drop_inventory_on_death(state, writer, damage.player_pose).await?;
+        reset_xp_on_death(
+            Some(state),
+            xp_state,
+            writer,
+            compression,
+            damage.player_pose,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -6536,13 +6693,15 @@ where
 {
     let (cx, cy, cz) = target.coords;
     if !player_pose.shifting {
-        if open_crafting_table_container(state, writer, action.sequence, cx, cy, cz).await? {
+        if open_crafting_table_container(state, writer, player_pose, action.sequence, cx, cy, cz)
+            .await?
+        {
             return Ok(UseItemOnOutcome::Handled);
         }
-        if open_furnace_container(state, writer, action.sequence, cx, cy, cz).await? {
+        if open_furnace_container(state, writer, player_pose, action.sequence, cx, cy, cz).await? {
             return Ok(UseItemOnOutcome::Handled);
         }
-        if open_chest_container(state, writer, action.sequence, cx, cy, cz).await? {
+        if open_chest_container(state, writer, player_pose, action.sequence, cx, cy, cz).await? {
             return Ok(UseItemOnOutcome::Handled);
         }
         if reject_unsupported_survival_station_use(state, writer, action.sequence, cx, cy, cz)
@@ -7401,6 +7560,7 @@ async fn tick_hostile_pressure<W>(
     writer: &mut W,
     game_mode: GameMode,
     survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
     player_pose: PlayerPose,
 ) -> Result<(), ConnectionError>
 where
@@ -7468,6 +7628,14 @@ where
         state.pending_use = None;
         clear_shield_use(state);
         drop_inventory_on_death(state, writer, player_pose).await?;
+        reset_xp_on_death(
+            Some(state),
+            xp_state,
+            writer,
+            state.compression,
+            player_pose,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -7668,17 +7836,13 @@ where
     let mut next_teleport_id: i32 = 4;
     let mut client_brand: Option<String> = None;
     let mut client_preferences: Option<ClientPreferences> = None;
+    let mut effective_client_view_distance = server_view_distance;
     let mut pending_outbound = VecDeque::new();
     send_world_time(writer, compression, &sessions).await?;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
     loop {
-        let _effective_client_view_distance = client_preferences
-            .as_ref()
-            .map_or(server_view_distance, |preferences| {
-                preferences.clamped_view_distance
-            });
         sync_player_persistence(
             &player_save_state,
             player_pose,
@@ -7763,6 +7927,7 @@ where
                             writer,
                             compression,
                             &mut survival_state,
+                            &mut xp_state,
                             game_mode,
                             ProjectilePlayerDamage {
                                 player_pose,
@@ -7904,6 +8069,14 @@ where
                         {
                             clear_shield_use(state);
                             drop_inventory_on_death(state, writer, player_pose).await?;
+                            reset_xp_on_death(
+                                Some(state),
+                                &mut xp_state,
+                                writer,
+                                compression,
+                                player_pose,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -7914,7 +8087,15 @@ where
                     tick_active_container(state, writer).await?;
                     tick_campfire_cooking(state).await;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
-                    tick_hostile_pressure(state, writer, game_mode, &mut survival_state, player_pose).await?;
+                    tick_hostile_pressure(
+                        state,
+                        writer,
+                        game_mode,
+                        &mut survival_state,
+                        &mut xp_state,
+                        player_pose,
+                    )
+                    .await?;
                     pickup_nearby_items(state, writer, player_pose).await?;
                     pickup_nearby_arrows(state, writer, player_pose).await?;
                     pickup_nearby_xp(state, writer, &mut xp_state, player_pose).await?;
@@ -7982,6 +8163,7 @@ where
                                 writer,
                                 compression,
                                 &mut survival_state,
+                                &mut xp_state,
                                 old_pose,
                                 player_pose,
                             )
@@ -8038,6 +8220,7 @@ where
                                 writer,
                                 compression,
                                 &mut survival_state,
+                                &mut xp_state,
                                 old_pose,
                                 player_pose,
                             )
@@ -8237,7 +8420,9 @@ where
                                 .as_ref()
                                 .is_some_and(|active| active.container_id() == close.container_id);
                         if should_store {
-                            store_active_container(state);
+                            store_active_container(state, player_pose);
+                        } else if close.container_id == 0 {
+                            store_inventory_crafting_inputs(state, player_pose);
                         }
                     }
                     debug!(container_id = close.container_id, "container close acknowledged");
@@ -8302,6 +8487,19 @@ where
                         brand = ?preferences.brand,
                         "client information updated"
                     );
+                    if preferences.clamped_view_distance != effective_client_view_distance {
+                        effective_client_view_distance = preferences.clamped_view_distance;
+                        if let Some(stream) = chunk_stream.as_mut() {
+                            let unloads = stream.replan_view_distance(
+                                effective_client_view_distance,
+                                player_pose.yaw,
+                            );
+                            for (chunk_x, chunk_z) in unloads {
+                                write_packet(writer, &ForgetLevelChunk { chunk_x, chunk_z }, compression)
+                                    .await?;
+                            }
+                        }
+                    }
                     client_preferences = Some(preferences);
                 } else if frame.id == ServerboundCustomPayload::ID {
                     if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
@@ -8393,6 +8591,7 @@ where
                         permissions,
                         &mut game_mode,
                         &mut survival_state,
+                        &mut xp_state,
                         config,
                         &sessions,
                         session_id,
@@ -8429,6 +8628,7 @@ async fn execute_player_command<W>(
     permissions: CommandPermissions,
     game_mode: &mut GameMode,
     survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
     config: &ServerConfig,
     sessions: &SessionRegistry,
     session_id: SessionId,
@@ -8483,12 +8683,12 @@ where
         AdminCommand::Stop => {
             let report = crate::server::save_all(config, sessions).await;
             if report.is_ok() {
+                config.shutdown.request();
                 send_command_feedback(writer, compression, "Saved all state; stopping server")
                     .await?;
-                config.shutdown.request();
             } else {
                 warn!(errors = report.errors.len(), "stop command save-all failed");
-                send_command_feedback(writer, compression, "Stop aborted: save-all failed").await?;
+                send_command_feedback(writer, compression, "Stop aborted; save-all failed").await?;
             }
             Ok(())
         }
@@ -8544,6 +8744,14 @@ where
                 state.pending_use = None;
                 clear_shield_use(state);
                 drop_inventory_on_death(state, writer, *player_pose).await?;
+                reset_xp_on_death(
+                    interaction.as_deref(),
+                    xp_state,
+                    writer,
+                    compression,
+                    *player_pose,
+                )
+                .await?;
             }
             send_command_feedback(writer, compression, "Killed player").await
         }
@@ -8583,6 +8791,7 @@ where
                 writer,
                 compression,
                 survival_state,
+                xp_state,
                 interaction,
                 *player_pose,
                 command,
@@ -8694,10 +8903,12 @@ fn command_error_message(error: CommandError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_debug_command<W>(
     writer: &mut W,
     compression: Compression,
     survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
     mut interaction: Option<&mut InteractionState>,
     player_pose: PlayerPose,
     command: DebugCommand,
@@ -8717,6 +8928,7 @@ where
                 writer,
                 compression,
                 survival_state,
+                xp_state,
                 interaction.as_deref_mut(),
                 player_pose,
                 command,
@@ -8768,6 +8980,7 @@ async fn apply_survival_command<W>(
     writer: &mut W,
     compression: Compression,
     state: &mut SurvivalState,
+    xp_state: &mut XpState,
     mut interaction: Option<&mut InteractionState>,
     player_pose: PlayerPose,
     command: SurvivalCommand,
@@ -8809,6 +9022,14 @@ where
         interaction.pending_use = None;
         clear_shield_use(interaction);
         drop_inventory_on_death(interaction, writer, player_pose).await?;
+        reset_xp_on_death(
+            Some(interaction),
+            xp_state,
+            writer,
+            compression,
+            player_pose,
+        )
+        .await?;
     }
     Ok(())
 }

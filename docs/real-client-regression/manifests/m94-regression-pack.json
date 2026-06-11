@@ -6,6 +6,16 @@
   "server_command": "cargo run --bin mc-server -- --config example.toml",
   "client_requirement": "Normal vanilla 26.1.2 client launched directly or through PrismLauncher; protocol harnesses do not satisfy this gate.",
   "artifact_root": ".analysis/real-client-runs",
+  "automation_runner": {
+    "script": "tools/run-real-client-regression.sh",
+    "command_env": "SOLARIS_REAL_CLIENT_COMMAND",
+    "legacy_command_env": "M94_CLIENT_COMMAND",
+    "kind_env": "SOLARIS_REAL_CLIENT_KIND",
+    "allowed_client_kinds": ["prism-launcher", "vanilla-launcher", "vanilla-client"],
+    "modes": ["--check", "--prepare", "--run", "--validate-run"],
+    "prepared_status": "prepared-owner-run",
+    "passing_gate": "agent-run real-client"
+  },
   "required_artifacts": [
     "manifest.json",
     "client.log",
@@ -13,7 +23,8 @@
     "observations.json",
     "screenshots/",
     "git.txt",
-    "toolchain.txt"
+    "toolchain.txt",
+    "automation-driver.txt"
   ],
   "scoped_rows_manual_pending": [
     {

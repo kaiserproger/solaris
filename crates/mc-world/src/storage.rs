@@ -630,6 +630,7 @@ impl WorldStorage {
             .block(&Identifier::parse("minecraft:air").expect("static identifier"))
             .map(|b| b.default)
             .unwrap_or(BlockStateId(0));
+        let registry = Arc::clone(&self.registry);
         let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
         let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
         let chunk = self
@@ -637,7 +638,11 @@ impl WorldStorage {
             .get_mut(&cpos)
             .expect("ensure_chunk placed the chunk in cache");
         let chunk = Arc::make_mut(chunk);
-        Ok(chunk.set_block_and_update(local_x, pos.y, local_z, state, air))
+        let prev = chunk.set_block_and_update(local_x, pos.y, local_z, state, air);
+        if prev.is_some_and(|prev| prev != state) {
+            prune_incompatible_block_entities(chunk, pos, &registry, state);
+        }
+        Ok(prev)
     }
 
     pub fn update_highest_opaque_at(
@@ -1186,6 +1191,65 @@ impl WorldStorage {
     }
 }
 
+fn prune_incompatible_block_entities(
+    chunk: &mut Chunk,
+    pos: BlockPos,
+    registry: &BlockRegistry,
+    state: BlockStateId,
+) {
+    let path = registry.by_id(state).map(|state| state.block.id.path());
+    let keeps_chest = path.is_some_and(|path| matches!(path, "chest" | "barrel"));
+    let keeps_furnace =
+        path.is_some_and(|path| matches!(path, "furnace" | "blast_furnace" | "smoker"));
+    let keeps_opaque = path.is_some_and(block_path_may_have_opaque_block_entity);
+
+    let removed = (!keeps_chest && chunk.chests.remove(&pos).is_some())
+        | (!keeps_furnace && chunk.furnaces.remove(&pos).is_some())
+        | (!keeps_opaque && chunk.block_entities.remove(&pos).is_some());
+    if removed {
+        chunk.mark_dirty();
+    }
+}
+
+fn block_path_may_have_opaque_block_entity(path: &str) -> bool {
+    path.ends_with("_sign")
+        || path.ends_with("_hanging_sign")
+        || path.ends_with("_banner")
+        || path.ends_with("_head")
+        || path.ends_with("_skull")
+        || path.ends_with("_shulker_box")
+        || matches!(
+            path,
+            "beacon"
+                | "bed"
+                | "bell"
+                | "brewing_stand"
+                | "campfire"
+                | "command_block"
+                | "comparator"
+                | "conduit"
+                | "daylight_detector"
+                | "decorated_pot"
+                | "enchanting_table"
+                | "ender_chest"
+                | "end_gateway"
+                | "flower_pot"
+                | "jigsaw"
+                | "jukebox"
+                | "lectern"
+                | "mob_spawner"
+                | "moving_piston"
+                | "piston_head"
+                | "sculk_sensor"
+                | "sculk_shrieker"
+                | "soul_campfire"
+                | "structure_block"
+                | "trapped_chest"
+                | "trial_spawner"
+                | "vault"
+        )
+}
+
 fn chunk_pos_of(pos: BlockPos) -> ChunkPos {
     ChunkPos {
         x: pos.x.div_euclid(SECTION_DIM as i32),
@@ -1259,6 +1323,41 @@ mod tests {
                     properties: std::collections::BTreeMap::new(),
                     states: vec![mc_data::blocks::BlockStateReport {
                         id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn air_stone_chest_registry() -> Arc<BlockRegistry> {
+        Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:chest").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 2,
                         default: true,
                         properties: std::collections::BTreeMap::new(),
                     }],
@@ -1634,6 +1733,31 @@ mod tests {
             .unwrap()
             .with_item_registry(items);
         assert_eq!(fresh.chest_block_entity(pos).unwrap(), Some(chest));
+    }
+
+    #[test]
+    fn replacing_chest_block_prunes_stale_block_entity() {
+        let registry = air_stone_chest_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = crate::chunk::FurnaceSlot {
+            count: 1,
+            item_id: 10,
+            damage: None,
+        };
+        world.set_chest_block_entity(pos, chest).unwrap();
+
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+        let chunk = world.cache.get(&cpos).unwrap();
+        assert!(!chunk.chests.contains_key(&pos));
     }
 
     /// End-to-end: open the generated flat test world, query known

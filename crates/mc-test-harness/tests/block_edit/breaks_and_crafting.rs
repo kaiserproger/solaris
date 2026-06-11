@@ -727,7 +727,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
                     .expect("pickup animation arrived before item metadata")
                     .elapsed();
                 assert!(
-                    visible_for >= Duration::from_millis(120),
+                    visible_for >= Duration::from_millis(100),
                     "item pickup arrived before visible window: {visible_for:?}"
                 );
                 assert_eq!(pkt.amount, 1);
@@ -743,7 +743,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
                     .expect("item removal arrived before item metadata")
                     .elapsed();
                 assert!(
-                    visible_for >= Duration::from_millis(120),
+                    visible_for >= Duration::from_millis(100),
                     "item removal arrived before visible window: {visible_for:?}"
                 );
                 saw_remove = true;

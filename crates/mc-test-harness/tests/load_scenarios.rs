@@ -14,10 +14,11 @@ use std::time::{Duration, Instant};
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction,
-    GameEvent, InteractionHand, LevelChunkWithLight, MovePlayerFlags, ServerboundChatCommand,
-    ServerboundKeepAlive, ServerboundMovePlayerPos, ServerboundUseItemOn, SetCenterChunk,
-    SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
+    ConfirmTeleportation, Direction, GameEvent, InteractionHand, LevelChunkWithLight,
+    MovePlayerFlags, SectionBlocksUpdate, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
+    pack_block_pos, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -30,6 +31,7 @@ const M52_SLOW_READER_SUMMONS: usize = 256;
 const M52_BASELINE_ELAPSED_BUDGET: Duration = Duration::from_secs(30);
 const M52_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 const M96_REPLAY_CLIENTS: usize = 4;
+const M96_PRESSURE_SUMMONS: usize = 128;
 const M96_REPLAY_ELAPSED_BUDGET: Duration = Duration::from_secs(45);
 const M96_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 
@@ -76,20 +78,21 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
         .expect("set creative for editor B");
     editor_a
         .write_packet(&ServerboundChatCommand {
-            command: "give minecraft:dirt 64".to_string(),
+            command: "debug give minecraft:dirt 64 0".to_string(),
         })
         .await
         .expect("give dirt to editor A");
     editor_b
         .write_packet(&ServerboundChatCommand {
-            command: "give minecraft:stone 64".to_string(),
+            command: "debug give minecraft:stone 64 0".to_string(),
         })
         .await
         .expect("give stone to editor B");
+    wait_for_inventory_stack(&mut editor_a).await;
+    wait_for_inventory_stack(&mut editor_b).await;
 
-    let base_y = sync_a.y.floor() as i32 - 1;
-    let target = (4, base_y + 1, 0);
-    let support = pack_block_pos(target.0, base_y, target.2);
+    let target = find_placeable_target(&server, 4, 0, sync_a.y.floor() as i32).await;
+    let support = pack_block_pos(target.0, target.1 - 1, target.2);
     let target_pos = pack_block_pos(target.0, target.1, target.2);
     editor_a
         .write_packet(&ServerboundUseItemOn {
@@ -171,6 +174,20 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
         spawns > 0,
         "observer should receive replay entity broadcasts"
     );
+
+    for idx in 0..M96_PRESSURE_SUMMONS {
+        editor_b
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    10 + idx % 16,
+                    spawn_y,
+                    6 + idx / 16
+                ),
+            })
+            .await
+            .expect("summon replay pressure zombie");
+    }
 
     let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
     assert_ne!(
@@ -508,6 +525,7 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
 
 struct LoadServer {
     addr: std::net::SocketAddr,
+    world: Arc<tokio::sync::Mutex<mc_world::WorldStorage>>,
     chunk_pipeline_metrics: mc_net::ChunkPipelineResourceMetrics,
     outbound_pressure: mc_net::OutboundPressureHandle,
     chunk_io_threads: usize,
@@ -542,7 +560,7 @@ async fn start_load_server() -> LoadServer {
         ((2 * VIEW_DISTANCE + 5) as usize).pow(2),
     )
     .with_generator(generator);
-    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let block_light = mc_data::block_light::load(vanilla_dir.join("reports/block_light.json"))
         .ok()
@@ -566,7 +584,7 @@ async fn start_load_server() -> LoadServer {
         view_distance: VIEW_DISTANCE,
         data,
         blocks,
-        world,
+        world: Some(Arc::clone(&world)),
         tags,
         recipes: Arc::new(Vec::new()),
         loot: Arc::new(mc_data::loot::LootTables::default()),
@@ -602,6 +620,7 @@ async fn start_load_server() -> LoadServer {
     });
     LoadServer {
         addr,
+        world,
         chunk_pipeline_metrics,
         outbound_pressure,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
@@ -616,13 +635,45 @@ struct PausedReaderClient {
 
 impl PausedReaderClient {
     async fn connect(addr: std::net::SocketAddr, name: &str) -> Self {
-        let (client, sync) = connect_to_play(addr, name).await;
+        let (mut client, sync) = connect_to_play(addr, name).await;
+        drain_until_chunk(&mut client, (0, 0)).await;
         Self { client, sync }
     }
 
     fn close(self) {
         drop(self.client);
     }
+}
+
+async fn find_placeable_target(
+    server: &LoadServer,
+    x: i32,
+    z: i32,
+    around_y: i32,
+) -> (i32, i32, i32) {
+    let mut world = server.world.lock().await;
+    for support_y in (-64..=around_y + 8).rev() {
+        let support = mc_world::BlockPos { x, y: support_y, z };
+        let target = mc_world::BlockPos {
+            x,
+            y: support_y + 1,
+            z,
+        };
+        let support_state = world.get_block(support).expect("load support column block");
+        let target_state = world.get_block(target).expect("load target column block");
+        if support_state.is_some_and(|state| !block_state_is_air(world.registry(), state))
+            && target_state.is_none_or(|state| block_state_is_air(world.registry(), state))
+        {
+            return (x, support_y + 1, z);
+        }
+    }
+    panic!("no placeable air block above support found near {x},{z}");
+}
+
+fn block_state_is_air(registry: &mc_world::BlockRegistry, state: mc_world::BlockStateId) -> bool {
+    registry
+        .by_id(state)
+        .is_some_and(|entry| entry.block.id.path() == "air")
 }
 
 async fn wait_for_outbound_pressure_increase(
@@ -741,12 +792,44 @@ async fn wait_for_ack(client: &mut Client, expected_sequence: i32) -> bool {
     }
 }
 
+async fn wait_for_inventory_stack(client: &mut Client) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for server-authoritative inventory stack"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("inventory stack sync frame");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode inventory ContainerSetSlot");
+            if pkt.container_id == 0 && !pkt.item_stack.is_empty() {
+                return;
+            }
+        }
+    }
+}
+
 async fn drain_target_block_updates(
     client: &mut Client,
     target_pos: i64,
     duration: Duration,
 ) -> usize {
     let target = unpack_block_pos(target_pos);
+    let target_section = pack_section_pos(
+        target.0.div_euclid(16),
+        target.1.div_euclid(16),
+        target.2.div_euclid(16),
+    );
+    let target_relative = pack_section_relative_pos(target.0, target.1, target.2);
     let deadline = tokio::time::Instant::now() + duration;
     let mut updates = 0usize;
     loop {
@@ -765,6 +848,16 @@ async fn drain_target_block_updates(
             let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
             if unpack_block_pos(pkt.position) == target {
                 updates += 1;
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let pkt = SectionBlocksUpdate::decode(&mut body).expect("decode SectionBlocksUpdate");
+            if pkt.section_pos == target_section {
+                updates += pkt
+                    .changes
+                    .iter()
+                    .filter(|change| change.relative_pos == target_relative)
+                    .count();
             }
         }
     }

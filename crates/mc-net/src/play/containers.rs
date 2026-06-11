@@ -328,7 +328,7 @@ pub(super) fn next_container_id(state: &mut InteractionState) -> i32 {
     id
 }
 
-pub(super) fn store_active_container(state: &mut InteractionState) {
+pub(super) fn store_active_container(state: &mut InteractionState, player_pose: PlayerPose) {
     match state.active_container.take() {
         Some(ActiveContainer::Furnace(window)) => {
             state
@@ -345,11 +345,7 @@ pub(super) fn store_active_container(state: &mut InteractionState) {
                 let max_stack = item_max_stack(&state.item_facts, &state.items, &stack);
                 let (remaining, _) = state.inventory.merge_stack(stack, max_stack);
                 if !remaining.is_empty() {
-                    debug!(
-                        item_id = remaining.item_id,
-                        count = remaining.count,
-                        "dropping crafting remainder because inventory is full"
-                    );
+                    dispatch_inventory_drop(state, player_pose, remaining);
                 }
             }
         }
