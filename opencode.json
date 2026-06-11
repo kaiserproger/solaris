@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": [
+    "AGENTS.md"
+  ],
+  "references": {
+    "rtk": {
+      "repository": "rtk-ai/rtk",
+      "branch": "develop",
+      "description": "Use for RTK OpenCode plugin and CLI output rewriting details.",
+      "hidden": true
+    },
+    "headroom": {
+      "repository": "chopratejas/headroom",
+      "branch": "main",
+      "description": "Use for Headroom proxy, MCP, wrap, learn, and compression setup details.",
+      "hidden": true
+    }
+  },
+  "plugin": [
+    "./.opencode/plugins/negative-code-guard.ts"
+  ],
+  "permission": {
+    "*": {
+      "*": "allow"
+    }
+  }
+}

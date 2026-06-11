@@ -188,16 +188,46 @@ decompiled source inspection, or side-by-side harness scenarios before
 Solaris fixes. Solaris-only tests are useful scaffolding, not vanilla
 parity evidence.
 
-## Memory layout
+## Agent memory
 
-Persistent agent memory lives under
-`~/.claude/projects/-home-user-solaris/memory/`. The same
-content also seeds opencode via `~/.config/opencode/` mirrors.
+Use Serena memories on demand, not as a blanket startup read. First call
+Serena's onboarding check, then load only the memories needed for the
+active domain.
 
-Important entries:
-- `project-status.md` — current branch + cumulative milestone
-  state. Read at session start; update at milestone closeout.
-- `feedback-*.md` — owner conventions (terse + no-stalls,
-  git author, no external artifacts, verify claims).
-- `project-adrs.md` — ADRs 0001 + 0002 in force.
-- `reference-*.md` — local paths and validation workflow.
+| Domain | Load these memories |
+|---|---|
+| Any code change | `project/status`, `project/structure`, `style-and-conventions`, `feedback/terse-no-stalls`, `feedback/use-subagents-and-verify` |
+| Protocol or packets | `project/adrs`, `project/26-1-2-is-real`, `reference/validation-workflow`, `feedback/verify-claims`, `feedback/protocol-oracles-prefer-decompiled` |
+| Vanilla data, assets, or local artifacts | `project/adrs`, `reference/local-paths`, `feedback/no-external-artifacts` |
+| Milestone plan or closeout | `project/status`, `task-completion`, `reference/validation-workflow`, `feedback/verify-claims` |
+| Validation, CI, or gates | `suggested_commands`, `task-completion`, `reference/validation-workflow`, `feedback/verify-claims` |
+| Agent/tooling setup | `reference/agent-tooling`, `feedback/terse-no-stalls`, `feedback/use-subagents-and-verify` |
+| User communication only | `user-profile`, `feedback/terse-no-stalls` |
+
+Update memory only when the new fact is likely to help future sessions:
+milestone state, oracle paths, validation workflow, owner preference, or
+tooling setup. Do not store transient command output or guessed parity.
+
+## Agent tooling
+
+- `docs/AGENT_TOOLING.md` is the detailed local setup reference for
+  opencode commands, harnesses, RTK, Headroom, Context7, and session logs.
+- Serena is available through opencode MCP and should be preferred for
+  Rust symbol navigation/edits before full-file reads.
+- Context7 is available and was verified on 2026-06-11. Use it for
+  external library/framework docs; call library resolution before docs
+  queries. If Context7 is down, fall back to local docs or direct web
+  sources and state that fallback.
+- RTK is installed at `/home/kaiserroman/.cargo/bin/rtk`; the global
+  opencode RTK plugin rewrites Bash commands after opencode restart.
+- Headroom is installed at `/home/kaiserroman/.local/bin/headroom` via
+  `uv tool install "headroom-ai[all]"`. Do not route opencode provider
+  traffic through `headroom proxy` unless the owner explicitly asks.
+- Prior opencode sessions are part of project evidence when prior-session
+  context matters. Start with `opencode session list`; for details query
+  `~/.local/share/opencode/opencode.db`, especially `session`, `message`,
+  and `part` tables. Useful text usually lives in `part.data` with JSON
+  `type == "text"`.
+- For non-trivial diffs, run a negative-code review before finalizing.
+  Prefer the `harness-slop-reviewer` subagent or `/negative-code-review`;
+  for small diffs, a direct self-review of `git diff` is acceptable.
