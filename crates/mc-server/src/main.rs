@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use mc_server::ServerConfig;
 
@@ -292,13 +292,14 @@ async fn serve(path: &Path) -> Result<()> {
         "survival loot tables loaded"
     );
 
-    let block_light = Arc::new(
-        mc_data::block_light::BlockLightTable::conservative_from_blocks_report(&blocks_report),
-    );
+    let block_light_source =
+        load_effective_block_light(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
+    let block_light = Arc::new(block_light_source.table);
     tracing::info!(
         version = %block_light.version,
         states = block_light.len(),
-        "block-light table built from blocks report",
+        source = block_light_source.source,
+        "block-light table loaded",
     );
 
     let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
@@ -598,6 +599,25 @@ fn load_effective_tags(
     if let Some(vanilla_data_dir) = vanilla_data_dir {
         let tags = mc_data::tags::load(vanilla_data_dir, data)
             .with_context(|| format!("loading vanilla tags from {}", vanilla_data_dir.display()))?;
+        if tags.total_tags() == 0 {
+            bail!(
+                "vanilla tags from {} were empty; run tools/extract-vanilla-data.sh with tag data",
+                vanilla_data_dir.display()
+            );
+        }
+        for registry in ["minecraft:block", "minecraft:item", "minecraft:entity_type"] {
+            let registry_id = mc_data::Identifier::parse(registry).expect("static registry id");
+            let missing = match tags.registries.get(&registry_id) {
+                Some(entries) => !entries.values().any(|ids| !ids.is_empty()),
+                None => true,
+            };
+            if missing {
+                bail!(
+                    "vanilla tags from {} missing required resolved entries for tag registry {registry}",
+                    vanilla_data_dir.display()
+                );
+            }
+        }
         return Ok(EffectiveTags {
             tags,
             source: "vanilla_sidecar",
@@ -624,10 +644,62 @@ fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootT
                 source: "vanilla_sidecar_simple_subset",
             });
         }
+        bail!(
+            "vanilla loot tables from {} had no supported simple drops; run tools/extract-vanilla-data.sh with loot_table data",
+            root.display()
+        );
     }
 
     Ok(EffectiveLootTables {
         tables: mc_data::loot::builtin().clone(),
+        source: "embedded_solaris_fallback",
+    })
+}
+
+struct EffectiveBlockLight {
+    table: mc_data::block_light::BlockLightTable,
+    source: &'static str,
+}
+
+fn load_effective_block_light(
+    vanilla_data_dir: Option<&Path>,
+    blocks_report: &[mc_data::blocks::BlockReport],
+) -> Result<EffectiveBlockLight> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let path = vanilla_data_dir.join("reports").join("block_light.json");
+        let table = mc_data::block_light::load(&path).with_context(|| {
+            format!("loading vanilla block-light table from {}", path.display())
+        })?;
+        if let Some(max_state_id) = blocks_report
+            .iter()
+            .flat_map(|block| block.states.iter().map(|state| state.id as usize))
+            .max()
+            && table.len() <= max_state_id
+        {
+            bail!(
+                "vanilla block-light table from {} has {} states but blocks report requires state id {max_state_id}",
+                path.display(),
+                table.len()
+            );
+        }
+        if table.version != mc_protocol::TARGET_RELEASE {
+            bail!(
+                "vanilla block-light table from {} targets {} but Solaris targets {}",
+                path.display(),
+                table.version,
+                mc_protocol::TARGET_RELEASE
+            );
+        }
+        return Ok(EffectiveBlockLight {
+            table,
+            source: "vanilla_sidecar",
+        });
+    }
+
+    Ok(EffectiveBlockLight {
+        table: mc_data::block_light::BlockLightTable::conservative_from_blocks_report(
+            blocks_report,
+        ),
         source: "embedded_solaris_fallback",
     })
 }
@@ -714,6 +786,219 @@ mod tests {
     }
 
     #[test]
+    fn effective_protocol_data_rejects_missing_sidecar_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-vanilla");
+
+        let err = match load_effective_protocol_data(Some(&missing)) {
+            Ok(_) => panic!("missing sidecar root must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("loading vanilla registry data"));
+    }
+
+    #[test]
+    fn effective_tags_reject_empty_vanilla_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("registries.json"), "{}").unwrap();
+        let data = mc_data::VanillaData::from_registries("", vec![]);
+        let items = mc_data::items::ItemRegistry::default();
+
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+            Ok(_) => panic!("empty vanilla tag sidecar must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("vanilla tags"));
+        assert!(err.to_string().contains("were empty"));
+    }
+
+    #[test]
+    fn effective_tags_reject_missing_required_vanilla_tag_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("registries.json"),
+            r#"{
+                "minecraft:item": {
+                    "entries": {
+                        "minecraft:apple": { "protocol_id": 5 }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        let tags_item = tmp
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("tags")
+            .join("item");
+        std::fs::create_dir_all(&tags_item).unwrap();
+        std::fs::write(
+            tags_item.join("food.json"),
+            r#"{ "values": [ "minecraft:apple" ] }"#,
+        )
+        .unwrap();
+        let data = mc_data::VanillaData::from_registries("", vec![]);
+        let items = mc_data::items::ItemRegistry::default();
+
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+            Ok(_) => panic!("partial vanilla tag sidecar must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("missing required resolved entries")
+        );
+        assert!(err.to_string().contains("minecraft:block"));
+    }
+
+    #[test]
+    fn effective_tags_reject_required_tag_registries_without_protocol_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("registries.json"), "{}").unwrap();
+        for (root, entry) in [
+            ("block", "minecraft:stone"),
+            ("item", "minecraft:apple"),
+            ("entity_type", "minecraft:pig"),
+        ] {
+            let tags_root = tmp
+                .path()
+                .join("data")
+                .join("minecraft")
+                .join("tags")
+                .join(root);
+            std::fs::create_dir_all(&tags_root).unwrap();
+            std::fs::write(
+                tags_root.join("sample.json"),
+                format!(r#"{{ "values": [ "{entry}" ] }}"#),
+            )
+            .unwrap();
+        }
+        let data = mc_data::VanillaData::from_registries("", vec![]);
+        let items = mc_data::items::ItemRegistry::default();
+
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+            Ok(_) => panic!("unresolved required tag registries must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("missing required resolved entries")
+        );
+    }
+
+    #[test]
+    fn effective_block_light_requires_sidecar_file_when_vanilla_dir_is_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+
+        let err = match load_effective_block_light(Some(tmp.path()), &report) {
+            Ok(_) => panic!("missing block_light.json must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("loading vanilla block-light table")
+        );
+        assert!(err.to_string().contains("block_light.json"));
+    }
+
+    #[test]
+    fn effective_block_light_rejects_sidecar_that_does_not_cover_blocks_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("block_light.json"),
+            r#"{"version":"26.1.2-test","max_state_id":0,"entries":[[0,0,1]]}"#,
+        )
+        .unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:stone").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 1,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+
+        let err = match load_effective_block_light(Some(tmp.path()), &report) {
+            Ok(_) => panic!("stale block-light sidecar must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("requires state id 1"));
+    }
+
+    #[test]
+    fn effective_block_light_rejects_wrong_target_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("block_light.json"),
+            r#"{"version":"not-the-target","max_state_id":0,"entries":[[0,0,1]]}"#,
+        )
+        .unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+
+        let err = match load_effective_block_light(Some(tmp.path()), &report) {
+            Ok(_) => panic!("wrong block-light target version must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("not-the-target"));
+        assert!(err.to_string().contains(mc_protocol::TARGET_RELEASE));
+    }
+
+    #[test]
+    fn effective_block_light_uses_embedded_fallback_without_sidecar() {
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+
+        let light = load_effective_block_light(None, &report).unwrap();
+
+        assert_eq!(light.source, "embedded_solaris_fallback");
+        assert_eq!(light.table.version, "blocks-report-conservative");
+        assert_eq!(light.table.len(), 1);
+    }
+
+    #[test]
     fn effective_loot_uses_embedded_fallback_without_sidecar() {
         let loot = load_effective_loot(None).unwrap();
 
@@ -760,13 +1045,16 @@ mod tests {
     }
 
     #[test]
-    fn effective_loot_falls_back_when_sidecar_has_no_simple_loot() {
+    fn effective_loot_rejects_sidecar_with_no_simple_loot() {
         let tmp = tempfile::tempdir().unwrap();
 
-        let loot = load_effective_loot(Some(tmp.path())).unwrap();
+        let err = match load_effective_loot(Some(tmp.path())) {
+            Ok(_) => panic!("configured vanilla loot sidecar without usable drops must fail"),
+            Err(err) => err,
+        };
 
-        assert_eq!(loot.source, "embedded_solaris_fallback");
-        assert!(loot.tables.total_drops() > 1);
+        assert!(err.to_string().contains("vanilla loot tables"));
+        assert!(err.to_string().contains("no supported simple drops"));
     }
 
     #[tokio::test]

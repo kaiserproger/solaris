@@ -78,8 +78,8 @@ pub struct DataSection {
     #[serde(default)]
     pub world_dir: Option<PathBuf>,
     /// Optional local vanilla data sidecar root. Mojang-owned files stay outside
-    /// the repo; when omitted or when loot tables are absent, Solaris uses its
-    /// embedded repo-owned loot fallback.
+    /// the repo; when set, Solaris treats the sidecar as authoritative and
+    /// requires supported registries, tags, reports, and simple loot data.
     #[serde(default)]
     pub vanilla_data_dir: Option<PathBuf>,
     /// World seed for the M7 terrain generator. Defaults to `0` —

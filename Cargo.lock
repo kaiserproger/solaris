@@ -702,6 +702,7 @@ dependencies = [
  "bytes",
  "clap",
  "mc-data",
+ "mc-extension",
  "mc-net",
  "mc-protocol",
  "mc-world",

@@ -1,7 +1,7 @@
-//! Per-block-state light metadata. Solaris can load the old local
-//! `data/vanilla/reports/block_light.json` oracle, but normal runtime
-//! builds a conservative table from the already-required `blocks.json`
-//! report so startup does not depend on a second extracted sidecar.
+//! Per-block-state light metadata. When a vanilla sidecar is configured,
+//! Solaris loads `data/vanilla/reports/block_light.json` as a required
+//! runtime oracle. Without a sidecar, local fallback mode builds a
+//! conservative table from the embedded blocks report.
 //!
 //! - `emission` — `BlockState.getLightEmission()`, 0..=15 (luminance
 //!   the block radiates; torches=14, glowstone=15, soul_lantern=10).

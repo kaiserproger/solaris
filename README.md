@@ -28,9 +28,10 @@ checks.
 Solaris ships its required registry/data baseline as repo-owned JSON assets
 embedded into the server binary. No external vanilla data sidecar is required
 to start the server. If `data.vanilla_data_dir` points at a local extracted
-vanilla sidecar, Solaris can load simple block/entity loot tables from that
-sidecar and falls back to embedded repo-owned loot when no simple sidecar loot is
-available.
+vanilla sidecar, that sidecar is treated as authoritative: registries, tags,
+`reports/block_light.json`, and supported simple loot must be present. Generate
+it with `tools/extract-vanilla-data.sh`; without `data.vanilla_data_dir`, Solaris
+uses embedded repo-owned fallback data.
 
 ## Run
 

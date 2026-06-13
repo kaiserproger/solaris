@@ -1,29 +1,34 @@
-//! End-to-end test for the M1.e Configuration state.
+//! End-to-end tests for the Configuration state.
 //!
 //! Drives a raw TCP client all the way from Handshake through the
 //! Configuration handshake (Known Packs round trip + Finish/Ack) and
-//! asserts the server drops the connection after acknowledgement —
-//! because Play state is M1.g, not implemented yet.
+//! asserts the server emits registry/tag data only after the client
+//! acknowledges the advertised built-in pack.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
+use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::TARGET_RELEASE;
+use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
-use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
-    RegistryData, ServerboundClientInformation, ServerboundKnownPacks, UpdateTags,
+    RegistryData, ServerboundClientInformation, ServerboundCustomPayload, ServerboundKnownPacks,
+    UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::LoginPlay;
 use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
+use mc_protocol::packets::{CustomPayload, Packet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
+
+const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
 
 async fn start_server() -> SocketAddr {
     let cfg = mc_net::ServerConfig {
@@ -77,6 +82,56 @@ async fn read_one_frame(
         let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
+}
+
+async fn read_optional_frame(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> Option<mc_protocol::RawFrame> {
+    loop {
+        if let Some(frame) = try_decode_frame(buf, compression).unwrap() {
+            return Some(frame);
+        }
+        let read = stream.read_buf(buf).await.unwrap();
+        if read == 0 {
+            return None;
+        }
+    }
+}
+
+fn client_information_packet() -> ServerboundClientInformation {
+    ServerboundClientInformation {
+        information: ClientInformation {
+            language: "en_us".to_string(),
+            view_distance: 8,
+            chat_visibility: ChatVisibility::Full,
+            chat_colors: true,
+            model_customisation: 0x7f,
+            main_hand: MainHand::Right,
+            text_filtering_enabled: false,
+            allows_listing: true,
+            particle_status: ParticleStatus::All,
+        },
+    }
+}
+
+async fn read_to_finish_configuration(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) {
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let mut frame = read_one_frame(stream, buf, compression).await;
+        assert_eq!(frame.id, RegistryData::ID);
+        let _ = RegistryData::decode(&mut frame.body).unwrap();
+    }
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, FinishConfiguration::ID);
+    let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
 }
 
 /// Walk the protocol up to (and including) `LoginAcknowledged`, leaving
@@ -234,6 +289,205 @@ async fn configuration_known_packs_and_finish_complete() {
 }
 
 #[tokio::test]
+async fn configuration_rejects_missing_known_pack_echo() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Alex").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    assert_eq!(known.packs.len(), 1);
+
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: Vec::new() },
+        compression,
+    )
+    .await;
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_optional_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not reject missing Known Packs echo within 2s");
+    assert!(
+        next.is_none(),
+        "server must close before sending has_data=false Registry Data without a confirmed built-in pack"
+    );
+}
+
+#[tokio::test]
+async fn configuration_rejects_excess_unsolicited_packets_before_known_packs() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Spammy").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+
+    for _ in 0..33 {
+        let information = client_information_packet();
+        write_frame(&mut stream, &information, compression).await;
+    }
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_optional_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not enforce Configuration ignored-packet budget within 2s");
+    assert!(
+        next.is_none(),
+        "server must close before a client can keep Configuration alive with endless optional packets"
+    );
+}
+
+#[tokio::test]
+async fn configuration_ignores_unknown_custom_payload_before_known_packs() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadDeny").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: b"small".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+}
+
+#[tokio::test]
+async fn configuration_ignores_oversized_custom_payload_before_known_packs() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadBig").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
+            },
+        },
+        compression,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+}
+
+#[tokio::test]
+async fn configuration_rejects_excess_unsolicited_packets_before_finish_ack() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "AckSpam").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+
+    for _ in 0..33 {
+        let information = client_information_packet();
+        write_frame(&mut stream, &information, compression).await;
+    }
+
+    let next = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_optional_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not enforce Configuration ack ignored-packet budget within 2s");
+    assert!(
+        next.is_none(),
+        "server must close before a client can keep the finish-ack wait alive with optional packets"
+    );
+}
+
+#[tokio::test]
+async fn configuration_ignores_oversized_custom_payload_before_finish_ack() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "AckPayloadBig").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
+            },
+        },
+        compression,
+    )
+    .await;
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_one_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not advance to Play after oversized Configuration payload before ack");
+    assert_eq!(frame.id, LoginPlay::ID);
+}
+
+#[tokio::test]
 async fn configuration_skips_unexpected_packets() {
     // The handler must tolerate packets the client sends in Configuration
     // state that aren't `Serverbound Known Packs` yet (e.g. Client
@@ -252,24 +506,8 @@ async fn configuration_skips_unexpected_packets() {
 
     // Send valid Client Information before Known Packs. The handler should
     // decode and ignore it while waiting for the expected response.
-    write_frame(
-        &mut stream,
-        &ServerboundClientInformation {
-            information: ClientInformation {
-                language: "en_us".to_string(),
-                view_distance: 8,
-                chat_visibility: ChatVisibility::Full,
-                chat_colors: true,
-                model_customisation: 0x7f,
-                main_hand: MainHand::Right,
-                text_filtering_enabled: false,
-                allows_listing: true,
-                particle_status: ParticleStatus::All,
-            },
-        },
-        compression,
-    )
-    .await;
+    let information = client_information_packet();
+    write_frame(&mut stream, &information, compression).await;
 
     // Now send the real Known Packs response.
     write_frame(
@@ -301,24 +539,8 @@ async fn configuration_skips_unexpected_packets() {
 
     // Send another valid-but-out-of-order Client Information before the ack —
     // handler should ignore it too while waiting for AcknowledgeFinishConfiguration.
-    write_frame(
-        &mut stream,
-        &ServerboundClientInformation {
-            information: ClientInformation {
-                language: "en_us".to_string(),
-                view_distance: 8,
-                chat_visibility: ChatVisibility::Full,
-                chat_colors: true,
-                model_customisation: 0x7f,
-                main_hand: MainHand::Right,
-                text_filtering_enabled: false,
-                allows_listing: true,
-                particle_status: ParticleStatus::All,
-            },
-        },
-        compression,
-    )
-    .await;
+    let information = client_information_packet();
+    write_frame(&mut stream, &information, compression).await;
 
     write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
     // Same as above: verify the state transition by waiting for the

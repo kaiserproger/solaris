@@ -6,7 +6,7 @@ use mc_protocol::packets::status::{PingRequest, PongResponse, StatusRequest, Sta
 use mc_protocol::{PROTOCOL_VERSION, State, TARGET_RELEASE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::connection::{read_packet, write_packet};
+use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout, write_packet};
 use crate::error::ConnectionError;
 use crate::server::ServerConfig;
 
@@ -44,16 +44,28 @@ where
     // It's tempting to skip the StatusRequest read and just wait for the
     // ping, but mcstatus-style clients always send the empty status
     // request first.
-    let _ =
-        read_packet::<StatusRequest, _>(reader, buf, Compression::Disabled, State::Status).await?;
+    let _ = read_packet_with_timeout::<StatusRequest, _>(
+        reader,
+        buf,
+        Compression::Disabled,
+        State::Status,
+        PRE_PLAY_READ_TIMEOUT,
+    )
+    .await?;
 
     let response = StatusResponse {
         json: build_status_json(config),
     };
     write_packet(writer, &response, Compression::Disabled).await?;
 
-    let ping =
-        read_packet::<PingRequest, _>(reader, buf, Compression::Disabled, State::Status).await?;
+    let ping = read_packet_with_timeout::<PingRequest, _>(
+        reader,
+        buf,
+        Compression::Disabled,
+        State::Status,
+        PRE_PLAY_READ_TIMEOUT,
+    )
+    .await?;
     write_packet(
         writer,
         &PongResponse {

@@ -19,9 +19,10 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
+use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_protocol::PROTOCOL_VERSION;
+use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
-use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
     ServerboundKnownPacks, UpdateTags,
@@ -33,12 +34,15 @@ use mc_protocol::packets::play::{
     ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundPlayerAbilities,
     ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime, ConfirmTeleportation,
     EntityEvent, GameEvent, LoginPlay, PlayDisconnect, ServerboundChatCommand,
-    ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
-    unpack_block_pos,
+    ServerboundCustomPayload, ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition, unpack_block_pos,
 };
+use mc_protocol::packets::{CustomPayload, Packet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
+
+const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
 
 async fn start_server() -> SocketAddr {
     start_server_with_max(8).await
@@ -96,6 +100,34 @@ async fn read_one_frame(
         let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
+}
+
+async fn assert_damage_command_still_processed(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) {
+    write_frame(
+        stream,
+        &ServerboundChatCommand {
+            command: "debug survival damage 7.5".to_string(),
+        },
+        compression,
+    )
+    .await;
+
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    for _ in 0..64 {
+        if frame.id == ClientboundSetHealth::ID {
+            break;
+        }
+        frame = read_one_frame(stream, buf, compression).await;
+    }
+    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
+    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
+    assert_eq!(health.health, 12.5);
+    assert_eq!(health.food, 20);
+    assert_eq!(health.saturation, 5.0);
 }
 
 /// Walk the full protocol up to and including
@@ -445,6 +477,60 @@ async fn play_state_handles_serverbound_keepalive_echo() {
 }
 
 #[tokio::test]
+async fn play_state_ignores_unknown_custom_payload() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayPayload").await;
+
+    for _ in 0..15 {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: b"small".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+
+    assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
+    drop(stream);
+}
+
+#[tokio::test]
+async fn play_state_ignores_oversized_custom_payload() {
+    let addr = start_server().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayPayloadBig").await;
+
+    for _ in 0..15 {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
+            },
+        },
+        compression,
+    )
+    .await;
+
+    assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
+    drop(stream);
+}
+
+#[tokio::test]
 async fn play_state_survival_damage_command_updates_health() {
     let addr = start_server().await;
     let mut stream = TcpStream::connect(addr).await.unwrap();
@@ -455,27 +541,7 @@ async fn play_state_survival_damage_command_updates_health() {
         let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
     }
 
-    write_frame(
-        &mut stream,
-        &ServerboundChatCommand {
-            command: "debug survival damage 7.5".to_string(),
-        },
-        compression,
-    )
-    .await;
-
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    for _ in 0..64 {
-        if frame.id == ClientboundSetHealth::ID {
-            break;
-        }
-        frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
-    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
-    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
-    assert_eq!(health.health, 12.5);
-    assert_eq!(health.food, 20);
-    assert_eq!(health.saturation, 5.0);
+    assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
 
     drop(stream);
 }

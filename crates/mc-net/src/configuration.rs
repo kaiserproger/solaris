@@ -18,11 +18,11 @@
 //! level, and discarded — robust to optional `Client Information` and
 //! `Plugin Message` traffic the client may emit at any point.
 
-use bytes::BytesMut;
+use bytes::{Buf, Bytes, BytesMut};
 use mc_data::VanillaData;
 use mc_data::tags::TagsData;
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
-use mc_protocol::TARGET_RELEASE;
+use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, ReadMc};
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::CustomPayload;
 use mc_protocol::packets::Packet;
@@ -32,12 +32,15 @@ use mc_protocol::packets::configuration::{
     ServerboundKnownPacks, ServerboundResourcePack, UpdateTags, UpdateTagsEntry,
     UpdateTagsRegistry,
 };
+use mc_protocol::{State, TARGET_RELEASE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
-use crate::connection::{read_frame, write_packet};
+use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_frame_with_timeout, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
+
+const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
 
 /// The Known Packs entry we advertise as the data pack the running
 /// game version corresponds to. Built from [`TARGET_RELEASE`] so a
@@ -64,7 +67,6 @@ where
     W: AsyncWriteExt + Unpin,
 {
     debug!(player = %profile.name, uuid = %profile.uuid, "entering Configuration state");
-
     // Step 1: advertise our known data packs.
     let our_pack = server_known_pack();
     write_packet(
@@ -77,12 +79,27 @@ where
     .await?;
 
     // Step 2: read frames until we see the client's KnownPacks response.
+    let mut ignored_packets = 0usize;
     let client_packs = loop {
-        let frame = read_frame(reader, buf, compression).await?;
+        let frame = read_frame_with_timeout(
+            reader,
+            buf,
+            compression,
+            State::Configuration,
+            PRE_PLAY_READ_TIMEOUT,
+        )
+        .await?;
         if frame.id == ServerboundKnownPacks::ID {
             let mut body = frame.body;
             let parsed = ServerboundKnownPacks::decode(&mut body)?;
             break parsed.packs;
+        }
+        ignored_packets += 1;
+        if ignored_packets > MAX_IGNORED_CONFIGURATION_PACKETS {
+            return Err(ConnectionError::IgnoredPacketBudgetExceeded {
+                state: State::Configuration,
+                max: MAX_IGNORED_CONFIGURATION_PACKETS,
+            });
         }
         if frame.id == ServerboundClientInformation::ID {
             let mut body = frame.body;
@@ -102,26 +119,7 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
-                warn!(
-                    len = frame.body.len(),
-                    max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
-                    "oversized Configuration custom payload rejected before decode"
-                );
-                continue;
-            }
-            let mut body = frame.body;
-            match ServerboundCustomPayload::decode(&mut body)?.payload {
-                CustomPayload::Brand(brand) => {
-                    debug!(brand = %brand, "client brand noted during Configuration")
-                }
-                CustomPayload::Unknown { channel, payload } => {
-                    // Future extension forwarding should pass this borrowed
-                    // channel/body through `mc_extension::CustomPayloadPolicy`
-                    // before enqueueing an `InboundEvent::CustomPayload`.
-                    debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored");
-                }
-            }
+            handle_configuration_custom_payload(frame.body, "before_known_packs")?;
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
@@ -143,22 +141,25 @@ where
     };
 
     // If the client did not echo back our pack the `has_data = false`
-    // shortcut is unsound — they have no built-in data to fall back on
-    // and Solaris would otherwise be silently sending empty registries.
-    // We still proceed (so the connection at least gets through
-    // Configuration cleanly) but log a loud warning so the operator
-    // knows the resulting Play session will probably misbehave.
+    // shortcut is unsound: they have no confirmed built-in data to fall
+    // back on and Solaris cannot yet send full registry NBT payloads.
     let client_has_our_pack = client_packs.iter().any(|p| {
         p.namespace == our_pack.namespace && p.id == our_pack.id && p.version == our_pack.version
     });
     if !client_has_our_pack {
+        let advertised_pack = format!(
+            "{}:{}:{}",
+            our_pack.namespace, our_pack.id, our_pack.version
+        );
         warn!(
             player = %profile.name,
-            advertised = %format!("{}:{}:{}", our_pack.namespace, our_pack.id, our_pack.version),
+            advertised = %advertised_pack,
             client_packs = ?client_packs,
-            "client did not acknowledge our core pack; subsequent registries \
-             will reference built-in data the client does not have"
+            "client did not acknowledge our core pack; closing before unsound Registry Data"
         );
+        return Err(ConnectionError::MissingKnownPack {
+            advertised: advertised_pack,
+        });
     }
 
     // Step 3: send a Registry Data packet for every built-in registry,
@@ -224,10 +225,25 @@ where
 
     // Step 5: wait for AcknowledgeFinishConfiguration, ignoring
     // anything else.
+    let mut ignored_packets = 0usize;
     loop {
-        let frame = read_frame(reader, buf, compression).await?;
+        let frame = read_frame_with_timeout(
+            reader,
+            buf,
+            compression,
+            State::Configuration,
+            PRE_PLAY_READ_TIMEOUT,
+        )
+        .await?;
         if frame.id == AcknowledgeFinishConfiguration::ID {
             break;
+        }
+        ignored_packets += 1;
+        if ignored_packets > MAX_IGNORED_CONFIGURATION_PACKETS {
+            return Err(ConnectionError::IgnoredPacketBudgetExceeded {
+                state: State::Configuration,
+                max: MAX_IGNORED_CONFIGURATION_PACKETS,
+            });
         }
         if frame.id == ServerboundClientInformation::ID {
             let mut body = frame.body;
@@ -240,26 +256,7 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
-                warn!(
-                    len = frame.body.len(),
-                    max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
-                    "oversized Configuration custom payload rejected before decode while waiting for ack"
-                );
-                continue;
-            }
-            let mut body = frame.body;
-            match ServerboundCustomPayload::decode(&mut body)?.payload {
-                CustomPayload::Brand(brand) => {
-                    debug!(brand = %brand, "client brand noted while waiting for Configuration ack")
-                }
-                CustomPayload::Unknown { channel, payload } => {
-                    // Future extension forwarding should pass this borrowed
-                    // channel/body through `mc_extension::CustomPayloadPolicy`
-                    // before enqueueing an `InboundEvent::CustomPayload`.
-                    debug!(channel = %channel.as_str(), len = payload.len(), "Configuration custom payload ignored while waiting for ack");
-                }
-            }
+            handle_configuration_custom_payload(frame.body, "before_finish_ack")?;
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
@@ -283,6 +280,38 @@ where
         player = %profile.name,
         client_pack_count = client_packs.len(),
         "configuration complete; entering Play state"
+    );
+
+    Ok(())
+}
+
+fn handle_configuration_custom_payload(
+    mut body: Bytes,
+    context: &'static str,
+) -> Result<(), ConnectionError> {
+    if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+        warn!(
+            len = body.len(),
+            max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+            context,
+            "oversized Configuration custom payload rejected before decode"
+        );
+        return Ok(());
+    }
+
+    let channel = body.read_identifier()?;
+    if channel == *CustomPayload::brand_channel() {
+        let brand = body.read_string(DEFAULT_MAX_STRING_LEN)?;
+        debug!(brand = %brand, context, "client brand noted during Configuration");
+        return Ok(());
+    }
+
+    let payload_len = body.remaining();
+    debug!(
+        channel = %channel.as_str(),
+        len = payload_len,
+        context,
+        "Configuration custom payload ignored"
     );
 
     Ok(())

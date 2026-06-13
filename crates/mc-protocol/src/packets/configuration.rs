@@ -221,9 +221,9 @@ impl Packet for AcknowledgeFinishConfiguration {
 }
 
 // -----------------------------------------------------------------------
-// Registry Data (0x07 CB) — defined for completeness but the M1.e handler
-// does not send any. Encoding entries with NBT payloads is deferred to
-// the milestone that actually needs them.
+// Registry Data (0x07 CB). Solaris currently emits entries that rely on
+// client built-in data (`has_data=false`); encoding full NBT payloads is
+// still deferred.
 // -----------------------------------------------------------------------
 
 /// One registry entry. If `has_data` is `false` the client uses its
@@ -231,8 +231,8 @@ impl Packet for AcknowledgeFinishConfiguration {
 ///
 /// The `nbt_payload` field is intentionally `Vec<u8>`-typed and assumed
 /// to be a pre-serialised, root-less Network-NBT blob. We do not have a
-/// typed NBT codec yet (M1.f); for M1.e all entries we emit have
-/// `has_data = false` and the field is never inspected.
+/// typed NBT codec yet; current Configuration handling emits
+/// `has_data = false` entries and never inspects this field.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEntry {
     pub name: Identifier,

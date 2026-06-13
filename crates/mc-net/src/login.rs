@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::connection::{read_packet, write_packet};
+use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout, write_packet};
 use crate::error::ConnectionError;
 
 pub(crate) const LOGIN_COMPRESSION_THRESHOLD: i32 = 256;
@@ -134,8 +134,14 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let login_start =
-        read_packet::<LoginStart, _>(reader, buf, Compression::Disabled, State::Login).await?;
+    let login_start = read_packet_with_timeout::<LoginStart, _>(
+        reader,
+        buf,
+        Compression::Disabled,
+        State::Login,
+        PRE_PLAY_READ_TIMEOUT,
+    )
+    .await?;
     // Offline mode: ignore the UUID the client just sent us and stamp our
     // own derived one. This is what vanilla does too — clients always send
     // *some* UUID (since 1.20.2 it is mandatory in LoginStart) but it is
@@ -170,7 +176,14 @@ where
     };
     write_packet(writer, &success, *compression).await?;
 
-    let _ack = read_packet::<LoginAcknowledged, _>(reader, buf, *compression, State::Login).await?;
+    let _ack = read_packet_with_timeout::<LoginAcknowledged, _>(
+        reader,
+        buf,
+        *compression,
+        State::Login,
+        PRE_PLAY_READ_TIMEOUT,
+    )
+    .await?;
 
     Ok(Some(LoggedInProfile { uuid, name }))
 }

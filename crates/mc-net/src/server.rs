@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 use crate::ChunkPipelinePolicy;
 use crate::chunk_pipeline::ChunkPipelineResources;
-use crate::connection::read_packet;
+use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
 use crate::error::ConnectionError;
 use crate::{configuration, login, play, status};
 
@@ -983,7 +983,7 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// Bind to `config.bind_address` and return a [`BoundServer`] ready to
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
-    warn_if_public_offline_bind(&config);
+    validate_public_security_config(config.bind_address, &config.command_permissions)?;
     let listener = TcpListener::bind(config.bind_address).await?;
     let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
     let sessions = Arc::new(play::SessionRegistry::new());
@@ -1038,15 +1038,30 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     })
 }
 
-fn warn_if_public_offline_bind(config: &ServerConfig) {
-    if config.command_permissions.login_access().online_mode || !is_public_bind(config.bind_address)
-    {
-        return;
+fn validate_public_security_config(
+    bind_address: SocketAddr,
+    command_permissions: &CommandPermissionConfig,
+) -> std::io::Result<()> {
+    if !is_public_bind(bind_address) {
+        return Ok(());
     }
-    warn!(
-        bind_address = %config.bind_address,
-        "offline-mode Solaris authentication is private/local only; public binds are not production-security-ready"
-    );
+    if command_permissions.allow_local_dev_operators {
+        return Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "allow_local_dev_operators cannot be enabled on a public bind address",
+        ));
+    }
+    if command_permissions.login_access().online_mode {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "online-mode authentication is not implemented; public bind addresses are disabled",
+        ))
+    } else {
+        Err(std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            "offline-mode Solaris authentication cannot be used on a public bind address",
+        ))
+    }
 }
 
 fn is_public_bind(addr: SocketAddr) -> bool {
@@ -1291,11 +1306,12 @@ async fn handle_connection(
     let mut buf = BytesMut::with_capacity(4096);
     let mut compression = Compression::Disabled;
 
-    let handshake = read_packet::<Handshake, _>(
+    let handshake = read_packet_with_timeout::<Handshake, _>(
         &mut reader,
         &mut buf,
         Compression::Disabled,
         State::Handshake,
+        PRE_PLAY_READ_TIMEOUT,
     )
     .await?;
     debug!(
@@ -1630,5 +1646,59 @@ mod tests {
         assert!(!is_public_bind("192.168.1.5:25565".parse().unwrap()));
         assert!(is_public_bind("0.0.0.0:25565".parse().unwrap()));
         assert!(is_public_bind("8.8.8.8:25565".parse().unwrap()));
+    }
+
+    #[test]
+    fn public_security_rejects_offline_auth() {
+        let err = validate_public_security_config(
+            "0.0.0.0:25565".parse().unwrap(),
+            &CommandPermissionConfig::new(Vec::<String>::new(), false),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("offline-mode"));
+    }
+
+    #[test]
+    fn public_security_rejects_local_dev_operator_fallback() {
+        let permissions = CommandPermissionConfig::new(Vec::<String>::new(), true)
+            .with_login_access(login::LoginAccessConfig::normalized(
+                true,
+                false,
+                std::iter::empty::<&str>(),
+                std::iter::empty::<&str>(),
+            ));
+        let err = validate_public_security_config("8.8.8.8:25565".parse().unwrap(), &permissions)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("allow_local_dev_operators"));
+    }
+
+    #[test]
+    fn public_security_rejects_online_mode_until_auth_exists() {
+        let permissions = CommandPermissionConfig::new(["Notch"], false).with_login_access(
+            login::LoginAccessConfig::normalized(
+                true,
+                false,
+                std::iter::empty::<&str>(),
+                std::iter::empty::<&str>(),
+            ),
+        );
+        let err = validate_public_security_config("8.8.8.8:25565".parse().unwrap(), &permissions)
+            .unwrap_err();
+
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+        assert!(err.to_string().contains("online-mode authentication"));
+    }
+
+    #[test]
+    fn private_security_allows_local_offline_dev() {
+        validate_public_security_config(
+            "127.0.0.1:25565".parse().unwrap(),
+            &CommandPermissionConfig::new(Vec::<String>::new(), true),
+        )
+        .unwrap();
     }
 }

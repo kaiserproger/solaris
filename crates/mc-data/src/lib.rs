@@ -1,12 +1,10 @@
 //! # mc-data
 //!
-//! Read-only index into the vanilla data sidecar described in
-//! [`docs/decisions/0001-vanilla-data-as-runtime-input.md`]. M1.f-scope:
-//! enumerate the entries in each registry by scanning for JSON files in
-//! `<data_dir>/data/<namespace>/<registry>/**/*.json`. The actual
-//! contents are not parsed — M1.g sends `Registry Data` with
-//! `has_data = false` for every entry and lets the client read its own
-//! built-in pack via Known Packs.
+//! Read-only indexes into the vanilla data sidecar described in
+//! [`docs/decisions/0001-vanilla-data-as-runtime-input.md`]. Registry
+//! entries are discovered from `<data_dir>/data/<namespace>/<registry>/**/*.json`;
+//! selected reports, tags, recipes, item facts, block facts, and worldgen
+//! facts are parsed by focused loaders.
 //!
 //! Concrete file layout (per registry):
 //!

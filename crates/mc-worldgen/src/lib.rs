@@ -2,9 +2,9 @@
 //!
 //! Generation pipeline, biomes, structures.
 //!
-//! M7 baseline: hash-noise terrain, single biome, no caves / ores /
-//! structures. The terrain function is Solaris's own — no vanilla
-//! algorithm. See `docs/milestones/M7.md` for scope decisions.
+//! Solaris-owned hash-noise terrain with data-fed biomes, caves, ores,
+//! decorations, and optional structure markers. This crate does not
+//! implement Mojang's vanilla worldgen algorithms.
 
 pub mod noise;
 pub mod structures;

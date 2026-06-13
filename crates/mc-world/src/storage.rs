@@ -1,13 +1,11 @@
-//! Lazy, read-only world storage on top of the Anvil codec.
+//! Lazy world storage on top of the Anvil codec.
 //!
 //! Opens a vanilla world directory (the one containing
 //! `dimensions/minecraft/overworld/region/` or, on older saves,
 //! `region/` directly), and serves block queries by loading the
-//! covering region file on demand. A small LRU keeps the recently
-//! used regions resident; everything else is reloaded as needed.
-//!
-//! M2 is read-only: no writes, no save-back. Modifications will
-//! land in M3 along with chunk streaming.
+//! covering region file on demand. Chunk and decoded-region LRUs keep
+//! recent data resident; dirty chunks are flushed back through region
+//! planning/write/commit paths.
 
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
@@ -64,7 +62,7 @@ pub enum WorldError {
     StaleRegion(PathBuf),
 }
 
-/// Read-only handle to a world's chunk data.
+/// Handle to a world's chunk data, generated chunks, and dirty flush state.
 pub struct WorldStorage {
     world_root: Option<PathBuf>,
     region_root: PathBuf,

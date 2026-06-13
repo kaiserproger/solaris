@@ -1,27 +1,24 @@
 //! Play state handler.
 //!
-//! M1.g.3 scope: send the four packets a vanilla client expects when
-//! transitioning into Play state, then run a `ClientboundKeepAlive` →
-//! `ServerboundKeepAlive` loop until the client disconnects or the
-//! peer-side keepalive timeout fires.
+//! Sends the vanilla-client Play transition burst, streams chunks,
+//! tracks player/world interaction, and runs the keepalive loop until
+//! the client disconnects or the peer-side keepalive timeout fires.
 //!
 //! ```text
 //! S → C  Login (Play)
 //! S → C  Synchronize Player Position
 //! S → C  Set Default Spawn Position
 //! S → C  Game Event (start_waiting_for_level_chunks)
+//! S → C  Level Chunk With Light / Light Update / entity + inventory state
 //! S → C  Keep Alive   (every 15 s; client must echo within 30 s)
 //! ```
-//!
-//! No chunk data is sent — the client renders a black world. That is the
-//! M1.g bar; chunk streaming is M2-M3 territory.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use mc_data::block_facts::{FluidKind, FluidStateFacts};
 use mc_data::block_light::BlockLightTable;
 use mc_data::entity_types::EntityTypeRegistry;
@@ -36,7 +33,7 @@ use mc_entity::{
 };
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
 use mc_nbt::{ListTag, Tag};
-use mc_protocol::codec::Identifier;
+use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, Identifier, ReadMc};
 use mc_protocol::frame::{Compression, encode_frame};
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate, ChunkHeightmap, ClientCommandAction,
@@ -1110,6 +1107,32 @@ impl ClientPreferences {
             brand,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlayCustomPayloadAction {
+    Brand(String),
+    Ignored { channel: String, payload_len: usize },
+    Oversized { len: usize },
+}
+
+fn classify_play_custom_payload(
+    mut body: Bytes,
+) -> Result<PlayCustomPayloadAction, ConnectionError> {
+    if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
+        return Ok(PlayCustomPayloadAction::Oversized { len: body.len() });
+    }
+
+    let channel = body.read_identifier()?;
+    if channel == *CustomPayload::brand_channel() {
+        let brand = body.read_string(DEFAULT_MAX_STRING_LEN)?;
+        return Ok(PlayCustomPayloadAction::Brand(brand));
+    }
+
+    Ok(PlayCustomPayloadAction::Ignored {
+        channel: channel.as_str().to_string(),
+        payload_len: body.remaining(),
+    })
 }
 
 fn clamp_client_view_distance(requested: i8, server_view_distance: i32) -> i32 {
@@ -8502,28 +8525,26 @@ where
                     }
                     client_preferences = Some(preferences);
                 } else if frame.id == ServerboundCustomPayload::ID {
-                    if frame.body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
-                        warn!(
-                            len = frame.body.len(),
-                            max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
-                            "oversized custom payload rejected before decode"
-                        );
-                        continue;
-                    }
-                    let mut body = frame.body;
-                    match ServerboundCustomPayload::decode(&mut body)?.payload {
-                        CustomPayload::Brand(brand) => {
+                    match classify_play_custom_payload(frame.body)? {
+                        PlayCustomPayloadAction::Brand(brand) => {
                             debug!(brand = %brand, "client brand noted");
                             if let Some(preferences) = client_preferences.as_mut() {
                                 preferences.brand = Some(brand.clone());
                             }
                             client_brand = Some(brand);
                         }
-                        CustomPayload::Unknown { channel, payload } => {
-                            // Future extension forwarding should pass this borrowed
-                            // channel/body through `mc_extension::CustomPayloadPolicy`
-                            // before enqueueing an `InboundEvent::CustomPayload`.
-                            debug!(channel = %channel.as_str(), len = payload.len(), "custom payload ignored");
+                        PlayCustomPayloadAction::Ignored {
+                            channel,
+                            payload_len,
+                        } => {
+                            debug!(channel = %channel, len = payload_len, "custom payload ignored");
+                        }
+                        PlayCustomPayloadAction::Oversized { len } => {
+                            warn!(
+                                len,
+                                max = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES,
+                                "oversized custom payload rejected before decode"
+                            );
                         }
                     }
                 } else if frame.id == ServerboundResourcePack::ID {
