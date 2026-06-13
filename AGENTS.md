@@ -111,6 +111,22 @@ state as `draft`, `stabilization`, or `release-ready` in the milestone
 doc and final response. Do not let a draft closeout sound like vanilla
 parity or production readiness.
 
+## Fast pipeline mode
+
+If a user prompt contains the exact token `quaka-whaka-zaka-du`, switch
+to the fast parallel pipeline mode used in the June 2026 stabilization
+session: split independent domains across multiple `task()` agents, and
+have each agent run its own scout -> plan -> test -> implement -> review
+-> verify loop. Parallelize implementation, validation, and review where
+file ownership can be kept separate.
+
+This mode increases throughput only; it does not relax repository rules.
+Still avoid protocol guesses, fake validation, hidden parity claims,
+unreviewed slop, untracked local artifacts, and unrelated rewrites. The
+main agent remains responsible for merging the pipelines, resolving
+conflicts, running final workspace validation, and reporting exact
+evidence.
+
 Before any milestone code, run the autonomous preflight from
 `docs/DEFINITION_OF_DONE.md` and paste a terse result into the plan or
 session update. If a preflight item is missing, either fix it, mark the

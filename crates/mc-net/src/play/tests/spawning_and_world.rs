@@ -56,6 +56,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &chunk,
         Some(grass),
+        &[],
         Some(&[water]),
         &passable,
         &rules,
@@ -87,6 +88,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let unsupported_spawns = plan_passive_herd(
         &unsupported_chunk,
         Some(grass),
+        &[],
         None,
         &passable,
         &rules,
@@ -117,6 +119,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &ocean_chunk,
         Some(grass),
+        &[],
         Some(&[water]),
         &passable,
         &ocean_rules,
@@ -155,6 +158,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
     let spawns = plan_passive_herd(
         &water_only_chunk,
         Some(grass),
+        &[],
         Some(&[water]),
         &passable,
         &ocean_rules,
@@ -217,6 +221,7 @@ fn water_spawn_planner_uses_mid_column_and_all_water_states() {
     let spawns = plan_passive_herd(
         &chunk,
         None,
+        &[],
         Some(&[water_source, water_flowing]),
         &[mc_world::BlockStateId(0)],
         &rules,
@@ -303,7 +308,15 @@ fn hostile_spawn_planner_uses_multiple_monster_facts() {
         }
     }
 
-    let spawns = plan_passive_herd(&chunk, Some(grass), None, &passable, &rules, &entity_types);
+    let spawns = plan_passive_herd(
+        &chunk,
+        Some(grass),
+        &[],
+        None,
+        &passable,
+        &rules,
+        &entity_types,
+    );
 
     let spawned_types: HashSet<_> = spawns
         .iter()
@@ -367,10 +380,19 @@ fn hostile_spawn_planner_requires_cover_outside_bootstrap_chunk() {
         }
     }
 
-    let open_spawns = plan_passive_herd(&open, Some(grass), None, &passable, &rules, &entity_types);
+    let open_spawns = plan_passive_herd(
+        &open,
+        Some(grass),
+        &[],
+        None,
+        &passable,
+        &rules,
+        &entity_types,
+    );
     let covered_spawns = plan_passive_herd(
         &covered,
         Some(grass),
+        &[],
         None,
         &passable,
         &rules,

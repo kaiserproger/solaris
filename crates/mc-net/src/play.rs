@@ -100,7 +100,9 @@ mod spawn;
 mod survival;
 mod wire_entities;
 
-pub(crate) use chunk_stream::passive_entity_passable_blocks;
+pub(crate) use chunk_stream::{
+    passive_entity_passable_blocks, passive_herd_fallback_surface_blocks,
+};
 pub(crate) use session::SessionRegistry;
 
 use block_wire::{
@@ -187,8 +189,9 @@ thread_local! {
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 /// How long we wait for the client's echo before disconnecting. Vanilla's value.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_PENDING_TELEPORT_RESYNCS: u8 = 3;
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
-const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.0;
+const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.5;
 const SHIELD_FALLBACK_MAX_DAMAGE: i32 = 336;
 
 const SPAWN_X: f64 = 0.5;
@@ -681,7 +684,7 @@ where
             write_packet(
                 writer,
                 &PlayDisconnect {
-                    reason_nbt: text_component_nbt(reason),
+                    reason_nbt: text_component_nbt(reason)?,
                 },
                 compression,
             )
@@ -768,10 +771,8 @@ where
     write_packet(writer, &command_tree_packet(permissions), compression).await?;
     dispatch_visibility_commands(visibility);
 
-    // 2. Synchronize Player Position. teleport_id=1; we'll watch for
-    //    `ConfirmTeleportation(1)` in the loop below but don't block
-    //    on it — if the client ignores it the world still loads, just
-    //    desynced.
+    // 2. Synchronize Player Position. teleport_id=1; Play movement is gated
+    //    until the client confirms this teleport.
     write_packet(
         writer,
         &SynchronizePlayerPosition {
@@ -868,6 +869,8 @@ where
         passive_herd_water,
     ));
     let passive_herd_passable = Arc::new(passive_entity_passable_blocks(&config.blocks));
+    let passive_herd_fallback_surfaces =
+        Arc::new(passive_herd_fallback_surface_blocks(&config.blocks));
     let block_entity_types = Arc::new(effective_block_entity_types(data));
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
@@ -880,6 +883,7 @@ where
             Arc::clone(&config.items),
             Arc::clone(&block_entity_types),
             passive_herd_surface,
+            Arc::clone(&passive_herd_fallback_surfaces),
             Arc::clone(&passive_herd_water_states),
             Arc::clone(&passive_herd_passable),
             Arc::clone(&config.biome_spawns),
@@ -993,7 +997,13 @@ where
     if let Some(root) = world_root.as_deref() {
         let snapshot = player_save_state
             .lock()
-            .expect("player persistence state poisoned")
+            .unwrap_or_else(|poisoned| {
+                warn!(
+                    player = %profile.name,
+                    "player persistence mutex was poisoned before save; recovering state"
+                );
+                poisoned.into_inner()
+            })
             .clone();
         match save_player_state(root, profile.uuid, &config.items, &snapshot) {
             Ok(()) => info!(player = %profile.name, state = %snapshot, "saved player state"),
@@ -1668,7 +1678,7 @@ where
         &ClientboundOpenScreen {
             container_id: window.container_id,
             menu_type: CRAFTING_MENU_TYPE_ID,
-            title_nbt: crafting_menu_title_nbt(),
+            title_nbt: crafting_menu_title_nbt()?,
         },
         state.compression,
     )
@@ -2034,7 +2044,7 @@ where
         &ClientboundOpenScreen {
             container_id,
             menu_type: window.menu_type(),
-            title_nbt: chest_menu_title_nbt(title),
+            title_nbt: chest_menu_title_nbt(title)?,
         },
         state.compression,
     )
@@ -2102,7 +2112,7 @@ where
         &ClientboundOpenScreen {
             container_id,
             menu_type: window.menu_type(),
-            title_nbt: furnace_menu_title_nbt(title),
+            title_nbt: furnace_menu_title_nbt(title)?,
         },
         state.compression,
     )
@@ -4676,7 +4686,7 @@ fn shield_blocks_damage(
     }
     let look = player_horizontal_look_direction(player_yaw);
     let dot = (look.x * incoming.x + look.z * incoming.z) / incoming_len;
-    dot > SHIELD_FRONT_ARC_DOT_MIN
+    dot >= SHIELD_FRONT_ARC_DOT_MIN
 }
 
 fn shield_blocks_current_damage(
@@ -5615,6 +5625,7 @@ async fn correct_player_collision<W>(
     old_pose: PlayerPose,
     new_pose: PlayerPose,
     next_teleport_id: &mut i32,
+    pending_teleport: &mut Option<PendingTeleport>,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -5622,26 +5633,130 @@ where
     if !player_pose_collides_with_solid(state, new_pose).await {
         return Ok(false);
     }
-    let teleport_id = *next_teleport_id;
-    *next_teleport_id = (*next_teleport_id).saturating_add(1);
+    let teleport_id = next_player_teleport_id(next_teleport_id);
+    send_player_position_sync(writer, compression, teleport_id, old_pose).await?;
+    *pending_teleport = Some(PendingTeleport::new(teleport_id, old_pose));
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingTeleport {
+    id: i32,
+    pose: PlayerPose,
+    resyncs_sent: u8,
+}
+
+impl PendingTeleport {
+    fn new(id: i32, pose: PlayerPose) -> Self {
+        Self {
+            id,
+            pose,
+            resyncs_sent: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TeleportConfirmResult {
+    Confirmed,
+    Mismatched { expected: i32 },
+    Unexpected,
+}
+
+fn confirm_pending_teleport(
+    pending: &mut Option<PendingTeleport>,
+    teleport_id: i32,
+) -> TeleportConfirmResult {
+    let Some(current) = *pending else {
+        return TeleportConfirmResult::Unexpected;
+    };
+    if current.id != teleport_id {
+        return TeleportConfirmResult::Mismatched {
+            expected: current.id,
+        };
+    }
+    *pending = None;
+    TeleportConfirmResult::Confirmed
+}
+
+async fn send_player_position_sync<W>(
+    writer: &mut W,
+    compression: Compression,
+    teleport_id: i32,
+    pose: PlayerPose,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     write_packet(
         writer,
         &SynchronizePlayerPosition {
             teleport_id,
-            x: old_pose.x,
-            y: old_pose.y,
-            z: old_pose.z,
+            x: pose.x,
+            y: pose.y,
+            z: pose.z,
             dx: 0.0,
             dy: 0.0,
             dz: 0.0,
-            yaw: old_pose.yaw,
-            pitch: old_pose.pitch,
+            yaw: pose.yaw,
+            pitch: pose.pitch,
             relative_flags: 0,
         },
         compression,
     )
-    .await?;
+    .await
+}
+
+async fn resync_pending_teleport<W>(
+    writer: &mut W,
+    compression: Compression,
+    pending: PendingTeleport,
+    packet: &'static str,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(
+        teleport_id = pending.id,
+        packet, "movement ignored until teleport is confirmed; resyncing"
+    );
+    send_player_position_sync(writer, compression, pending.id, pending.pose).await
+}
+
+async fn guard_pending_teleport_movement<W>(
+    pending: &mut Option<PendingTeleport>,
+    writer: &mut W,
+    compression: Compression,
+    packet: &'static str,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(current) = pending.as_mut() else {
+        return Ok(false);
+    };
+    if current.resyncs_sent < MAX_PENDING_TELEPORT_RESYNCS {
+        current.resyncs_sent += 1;
+        resync_pending_teleport(writer, compression, *current, packet).await?;
+    } else {
+        debug!(
+            teleport_id = current.id,
+            resyncs_sent = current.resyncs_sent,
+            packet,
+            "movement ignored until teleport is confirmed; resync already sent"
+        );
+    }
     Ok(true)
+}
+
+fn next_player_teleport_id(next_teleport_id: &mut i32) -> i32 {
+    let teleport_id = (*next_teleport_id).max(1);
+    *next_teleport_id = if teleport_id == i32::MAX {
+        1
+    } else {
+        teleport_id + 1
+    };
+    teleport_id
 }
 
 fn state_is_water(
@@ -6595,8 +6710,19 @@ async fn schedule_fluid_ticks_for_interaction(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UseItemOnOutcome {
     Handled,
-    NoOp,
+    NoOp { reason: UseItemOnNoOpReason },
     PlaceBlock,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UseItemOnNoOpReason {
+    DeadPlayer,
+    UnsupportedGameMode,
+    OutOfReach,
+    EmptyHeldItem,
+    ClickedCellUnavailable,
+    TargetBlockedOrUnplaceable,
+    PlacementPlanRejected,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -6620,10 +6746,10 @@ where
     state.pending_use = None;
     clear_shield_use(state);
 
-    if classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action)
-        == UseItemOnOutcome::NoOp
+    if let UseItemOnOutcome::NoOp { reason } =
+        classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action)
     {
-        return ack_use_item_on_noop(writer, state.compression, action.sequence).await;
+        return ack_use_item_on_noop(writer, state.compression, action.sequence, reason).await;
     }
 
     let (cx, cy, cz) = unpack_block_pos(action.position);
@@ -6649,8 +6775,8 @@ where
     .await?
     {
         UseItemOnOutcome::Handled => Ok(()),
-        UseItemOnOutcome::NoOp => {
-            ack_use_item_on_noop(writer, state.compression, action.sequence).await
+        UseItemOnOutcome::NoOp { reason } => {
+            ack_use_item_on_noop(writer, state.compression, action.sequence, reason).await
         }
         UseItemOnOutcome::PlaceBlock => {
             handle_block_item_placement(
@@ -6677,7 +6803,9 @@ fn classify_use_item_on_preflight(
             sequence = action.sequence,
             "survival block placement ignored for dead player"
         );
-        return UseItemOnOutcome::NoOp;
+        return UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::DeadPlayer,
+        };
     }
 
     if !matches!(game_mode, GameMode::Creative | GameMode::Survival) {
@@ -6686,7 +6814,9 @@ fn classify_use_item_on_preflight(
             sequence = action.sequence,
             "block placement denied outside creative/survival"
         );
-        return UseItemOnOutcome::NoOp;
+        return UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::UnsupportedGameMode,
+        };
     }
 
     if game_mode == GameMode::Survival
@@ -6696,7 +6826,9 @@ fn classify_use_item_on_preflight(
             sequence = action.sequence,
             "survival block placement ignored: target out of reach"
         );
-        return UseItemOnOutcome::NoOp;
+        return UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::OutOfReach,
+        };
     }
 
     UseItemOnOutcome::PlaceBlock
@@ -6824,7 +6956,13 @@ where
             held_count = held.count,
             "UseItemOn: held item is empty or not placeable; skipping"
         );
-        return ack_use_item_on_noop(writer, state.compression, sequence).await;
+        return ack_use_item_on_noop(
+            writer,
+            state.compression,
+            sequence,
+            UseItemOnNoOpReason::EmptyHeldItem,
+        )
+        .await;
     };
 
     if handle_bonemeal_use_on(
@@ -6858,11 +6996,23 @@ where
                     z = cz,
                     "UseItemOn clicked cell absent; skipping placement"
                 );
-                return ack_use_item_on_noop(writer, state.compression, sequence).await;
+                return ack_use_item_on_noop(
+                    writer,
+                    state.compression,
+                    sequence,
+                    UseItemOnNoOpReason::ClickedCellUnavailable,
+                )
+                .await;
             }
             Err(err) => {
                 warn!(error = %err, x = cx, y = cy, z = cz, "UseItemOn clicked read failed");
-                return ack_use_item_on_noop(writer, state.compression, sequence).await;
+                return ack_use_item_on_noop(
+                    writer,
+                    state.compression,
+                    sequence,
+                    UseItemOnNoOpReason::ClickedCellUnavailable,
+                )
+                .await;
             }
         };
         let target_is_air = match storage.get_block(mc_world::BlockPos {
@@ -6897,7 +7047,13 @@ where
             held_item = held.item_id,
             "UseItemOn target invalid or held item not placeable; skipping placement"
         );
-        return ack_use_item_on_noop(writer, state.compression, sequence).await;
+        return ack_use_item_on_noop(
+            writer,
+            state.compression,
+            sequence,
+            UseItemOnNoOpReason::TargetBlockedOrUnplaceable,
+        )
+        .await;
     };
 
     let Some(edits) = plan_place_block_edits(
@@ -6913,7 +7069,13 @@ where
     )
     .await
     else {
-        return ack_use_item_on_noop(writer, state.compression, sequence).await;
+        return ack_use_item_on_noop(
+            writer,
+            state.compression,
+            sequence,
+            UseItemOnNoOpReason::PlacementPlanRejected,
+        )
+        .await;
     };
     let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
     if outcome.applied.is_empty() {
@@ -6962,10 +7124,25 @@ async fn ack_use_item_on_noop<W>(
     writer: &mut W,
     compression: Compression,
     sequence: i32,
+    reason: UseItemOnNoOpReason,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    debug!(sequence, reason = ?reason, "UseItemOn noop acknowledged");
+    write_block_ack(writer, compression, sequence).await
+}
+
+async fn ack_use_item_noop<W>(
+    writer: &mut W,
+    compression: Compression,
+    sequence: i32,
+    reason: &'static str,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    debug!(sequence, reason, "UseItem noop acknowledged");
     write_block_ack(writer, compression, sequence).await
 }
 
@@ -7467,10 +7644,16 @@ where
     W: AsyncWriteExt + Unpin,
 {
     if game_mode != GameMode::Survival {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_noop(
+            writer,
+            state.compression,
+            action.sequence,
+            "non_survival_mode",
+        )
+        .await;
     }
     if survival_state.is_dead() {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_noop(writer, state.compression, action.sequence, "dead_player").await;
     }
 
     if start_shield_use(state, action.hand) {
@@ -7478,12 +7661,18 @@ where
     }
 
     if action.hand != mc_protocol::packets::play::InteractionHand::MainHand {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_noop(writer, state.compression, action.sequence, "offhand").await;
     }
 
     if is_bow_item(state) {
         let Some(held_item_id) = held_item_id(state) else {
-            return write_block_ack(writer, state.compression, action.sequence).await;
+            return ack_use_item_noop(
+                writer,
+                state.compression,
+                action.sequence,
+                "bow_without_item",
+            )
+            .await;
         };
         state.pending_break = None;
         state.pending_use = Some(PendingUse {
@@ -7497,11 +7686,17 @@ where
     }
 
     if survival_state.food >= SurvivalState::MAX_FOOD {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_noop(writer, state.compression, action.sequence, "full_food").await;
     }
 
     let Some((held_item_id, rule, required_time)) = held_food_use(state) else {
-        return write_block_ack(writer, state.compression, action.sequence).await;
+        return ack_use_item_noop(
+            writer,
+            state.compression,
+            action.sequence,
+            "unsupported_item",
+        )
+        .await;
     };
 
     state.pending_break = None;
@@ -7751,9 +7946,10 @@ fn sync_player_persistence(
     let Some(player_save_state) = player_save_state else {
         return;
     };
-    let mut state = player_save_state
-        .lock()
-        .expect("player persistence state poisoned");
+    let mut state = player_save_state.lock().unwrap_or_else(|poisoned| {
+        warn!("player persistence mutex was poisoned during sync; recovering state");
+        poisoned.into_inner()
+    });
     state.pose = pose;
     state.spawn = SpawnState::from_pose(respawn_pose);
     state.survival = survival;
@@ -7856,7 +8052,8 @@ where
     let mut last_response_at = Instant::now();
     let mut pending_id: Option<i64> = None;
     let mut survival_tick: u32 = 0;
-    let mut next_teleport_id: i32 = 4;
+    let mut next_teleport_id: i32 = 2;
+    let mut pending_teleport = Some(PendingTeleport::new(1, player_pose));
     let mut client_brand: Option<String> = None;
     let mut client_preferences: Option<ClientPreferences> = None;
     let mut effective_client_view_distance = server_view_distance;
@@ -8149,8 +8346,32 @@ where
                 } else if frame.id == ConfirmTeleportation::ID {
                     let mut body = frame.body;
                     let confirm = ConfirmTeleportation::decode(&mut body)?;
-                    debug!(teleport_id = confirm.teleport_id, "teleport confirmed");
+                    match confirm_pending_teleport(&mut pending_teleport, confirm.teleport_id) {
+                        TeleportConfirmResult::Confirmed => {
+                            debug!(teleport_id = confirm.teleport_id, "teleport confirmed");
+                        }
+                        TeleportConfirmResult::Mismatched { expected } => {
+                            warn!(
+                                expected,
+                                received = confirm.teleport_id,
+                                "teleport confirmation id mismatch"
+                            );
+                        }
+                        TeleportConfirmResult::Unexpected => {
+                            debug!(teleport_id = confirm.teleport_id, "unexpected teleport confirmation ignored");
+                        }
+                    }
                 } else if frame.id == ServerboundMovePlayerPos::ID {
+                    if guard_pending_teleport_movement(
+                        &mut pending_teleport,
+                        writer,
+                        compression,
+                        "ServerboundMovePlayerPos",
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPos::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
@@ -8169,6 +8390,7 @@ where
                         old_pose,
                         new_pose,
                         &mut next_teleport_id,
+                        &mut pending_teleport,
                     )
                     .await?
                     {
@@ -8206,6 +8428,16 @@ where
                         .await?;
                     }
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
+                    if guard_pending_teleport_movement(
+                        &mut pending_teleport,
+                        writer,
+                        compression,
+                        "ServerboundMovePlayerPosRot",
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
                     let old_center = player_pose.chunk_pos();
@@ -8226,6 +8458,7 @@ where
                         old_pose,
                         new_pose,
                         &mut next_teleport_id,
+                        &mut pending_teleport,
                     )
                     .await?
                     {
@@ -8263,6 +8496,16 @@ where
                         .await?;
                     }
                 } else if frame.id == ServerboundMovePlayerRot::ID {
+                    if guard_pending_teleport_movement(
+                        &mut pending_teleport,
+                        writer,
+                        compression,
+                        "ServerboundMovePlayerRot",
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerRot::decode(&mut body)?;
                     player_pose.yaw = movement.yaw;
@@ -8281,6 +8524,16 @@ where
                     )
                     .await?;
                 } else if frame.id == ServerboundMovePlayerStatusOnly::ID {
+                    if guard_pending_teleport_movement(
+                        &mut pending_teleport,
+                        writer,
+                        compression,
+                        "ServerboundMovePlayerStatusOnly",
+                    )
+                    .await?
+                    {
+                        continue;
+                    }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerStatusOnly::decode(&mut body)?;
                     player_pose.flags = movement.flags;
@@ -8484,6 +8737,8 @@ where
                         respawn_pose,
                         &mut survival_state,
                         &respawn,
+                        &mut next_teleport_id,
+                        &mut pending_teleport,
                         command,
                     )
                     .await?;
@@ -8619,6 +8874,8 @@ where
                         interaction.as_deref_mut(),
                         &mut player_pose,
                         &mut chunk_stream,
+                        &mut next_teleport_id,
+                        &mut pending_teleport,
                     )
                     .await?;
                 } else if frame.id == ServerboundChangeGameMode::ID {
@@ -8656,6 +8913,8 @@ async fn execute_player_command<W>(
     mut interaction: Option<&mut InteractionState>,
     player_pose: &mut PlayerPose,
     chunk_stream: &mut Option<ChunkStreamState>,
+    next_teleport_id: &mut i32,
+    pending_teleport: &mut Option<PendingTeleport>,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
@@ -8724,23 +8983,9 @@ where
             }
             let new_center = player_pose.chunk_pos();
             dispatch_visibility_commands(sessions.update_pose(session_id, *player_pose));
-            write_packet(
-                writer,
-                &SynchronizePlayerPosition {
-                    teleport_id: 3,
-                    x,
-                    y,
-                    z,
-                    dx: 0.0,
-                    dy: 0.0,
-                    dz: 0.0,
-                    yaw: player_pose.yaw,
-                    pitch: player_pose.pitch,
-                    relative_flags: 0,
-                },
-                compression,
-            )
-            .await?;
+            let teleport_id = next_player_teleport_id(next_teleport_id);
+            send_player_position_sync(writer, compression, teleport_id, *player_pose).await?;
+            *pending_teleport = Some(PendingTeleport::new(teleport_id, *player_pose));
             replan_after_movement(
                 writer,
                 compression,
@@ -8865,7 +9110,7 @@ where
     write_packet(
         writer,
         &ClientboundSystemChat {
-            content_nbt: text_component_nbt(message),
+            content_nbt: text_component_nbt(message)?,
             overlay: false,
         },
         compression,
@@ -8899,14 +9144,13 @@ fn clientbound_world_time(time: u64) -> ClientboundSetTime {
     }
 }
 
-fn text_component_nbt(text: &str) -> Vec<u8> {
+fn text_component_nbt(text: &str) -> Result<Vec<u8>, mc_protocol::CodecError> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
         &Tag::Compound(vec![("text".to_string(), Tag::String(text.to_string()))]),
-    )
-    .expect("text component is valid NBT");
-    out
+    )?;
+    Ok(out)
 }
 
 fn session_admission_message(error: &SessionAdmissionError) -> &'static str {
@@ -9094,6 +9338,8 @@ async fn handle_client_command<W>(
     respawn_pose: PlayerPose,
     survival_state: &mut SurvivalState,
     respawn: &ClientboundRespawn,
+    next_teleport_id: &mut i32,
+    pending_teleport: &mut Option<PendingTeleport>,
     command: ServerboundClientCommand,
 ) -> Result<(), ConnectionError>
 where
@@ -9110,23 +9356,9 @@ where
             }
             *player_pose = respawn_pose;
             write_packet(writer, respawn, compression).await?;
-            write_packet(
-                writer,
-                &SynchronizePlayerPosition {
-                    teleport_id: 2,
-                    x: player_pose.x,
-                    y: player_pose.y,
-                    z: player_pose.z,
-                    dx: 0.0,
-                    dy: 0.0,
-                    dz: 0.0,
-                    yaw: player_pose.yaw,
-                    pitch: player_pose.pitch,
-                    relative_flags: 0,
-                },
-                compression,
-            )
-            .await?;
+            let teleport_id = next_player_teleport_id(next_teleport_id);
+            send_player_position_sync(writer, compression, teleport_id, *player_pose).await?;
+            *pending_teleport = Some(PendingTeleport::new(teleport_id, *player_pose));
             write_packet(writer, &survival_state.as_packet(), compression).await
         }
         ClientCommandAction::RequestStats | ClientCommandAction::RequestGameruleValues => {

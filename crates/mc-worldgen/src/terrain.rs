@@ -32,6 +32,12 @@ use mc_world::{
 use crate::noise::fbm_2d;
 use crate::structures::{StructureRules, StructureTemplate};
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TerrainGeneratorError {
+    #[error("block registry missing required terrain block {name}")]
+    MissingRequiredBlock { name: &'static str },
+}
+
 /// Default terrain centre. Chosen so the player spawns on top of
 /// the surface without needing to fall.
 const BASE_HEIGHT: f64 = 70.0;
@@ -39,8 +45,8 @@ const BASE_HEIGHT: f64 = 70.0;
 /// below `BASE_HEIGHT`).
 const HEIGHT_AMPLITUDE: f64 = 12.0;
 /// Lattice spacing of the noise. Smaller = lumpier; this gives
-/// ~24-block hills.
-const NOISE_FREQUENCY: f64 = 1.0 / 24.0;
+/// broad hills instead of one-chunk bumps.
+const NOISE_FREQUENCY: f64 = 1.0 / 40.0;
 /// Octaves of fbm noise. Three is enough to round off the smooth
 /// blobs of single-octave value-noise into something hill-shaped.
 const NOISE_OCTAVES: u32 = 3;
@@ -50,7 +56,15 @@ pub const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
 pub const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
 const CONTINENT_FREQUENCY: f64 = 1.0 / 420.0;
 const COAST_DETAIL_FREQUENCY: f64 = 1.0 / 96.0;
-const FOREST_FREQUENCY: f64 = 1.0 / 160.0;
+const FOREST_FREQUENCY: f64 = 1.0 / 520.0;
+const TEMPERATURE_SCALE: f64 = 900.0;
+const BIOME_PICK_WARP_SCALE: f64 = 520.0;
+const BIOME_PICK_WARP_AMPLITUDE: f64 = 54.0;
+const BIOME_PICK_NOISE_SCALE: f64 = 460.0;
+const RIVER_SIGNAL_SCALE: f64 = 360.0;
+const RIVER_TERRAIN_CORE_WIDTH: f64 = 0.04;
+const RIVER_TERRAIN_WIDTH: f64 = 0.16;
+const RIVER_BIOME_WIDTH: f64 = 0.09;
 const OCEAN_THRESHOLD: f64 = -0.16;
 const BEACH_HEIGHT_ABOVE_SEA: i32 = 2;
 const COAST_BLEND_WIDTH: f64 = 0.28;
@@ -621,12 +635,15 @@ impl BiomeScope {
     }
 }
 
-fn resolve_block(registry: &BlockRegistry, name: &str) -> BlockStateId {
+fn try_resolve_block(
+    registry: &BlockRegistry,
+    name: &'static str,
+) -> Result<BlockStateId, TerrainGeneratorError> {
     let id = Identifier::parse(name).expect("static identifier");
     registry
         .block(&id)
         .map(|b| b.default)
-        .unwrap_or_else(|| panic!("registry missing required block {name}"))
+        .ok_or(TerrainGeneratorError::MissingRequiredBlock { name })
 }
 
 fn resolve_block_or(registry: &BlockRegistry, name: &str, fallback: BlockStateId) -> BlockStateId {
@@ -848,7 +865,34 @@ impl BiomeRules {
         if bucket.is_empty() {
             return self.default.clone();
         }
-        let idx = feature_hash(0, x, 0, z, salt) as usize % bucket.len();
+        if bucket.len() == 1 {
+            return bucket[0].clone();
+        }
+
+        let warp_x = fbm_2d(
+            x as f64 / BIOME_PICK_WARP_SCALE,
+            z as f64 / BIOME_PICK_WARP_SCALE,
+            (salt ^ 0x4257_4152_5058) as i64,
+            2,
+            0.5,
+        ) * BIOME_PICK_WARP_AMPLITUDE;
+        let warp_z = fbm_2d(
+            x as f64 / BIOME_PICK_WARP_SCALE,
+            z as f64 / BIOME_PICK_WARP_SCALE,
+            (salt ^ 0x4257_4152_505A) as i64,
+            2,
+            0.5,
+        ) * BIOME_PICK_WARP_AMPLITUDE;
+        let value = fbm_2d(
+            (x as f64 + warp_x) / BIOME_PICK_NOISE_SCALE,
+            (z as f64 + warp_z) / BIOME_PICK_NOISE_SCALE,
+            salt as i64,
+            3,
+            0.55,
+        );
+        let band = (((value + 1.0) * 0.5).clamp(0.0, 0.999_999) * bucket.len() as f64) as usize;
+        let offset = feature_hash(0, bucket.len() as i32, 0, 0, salt) as usize % bucket.len();
+        let idx = (band + offset) % bucket.len();
         bucket[idx].clone()
     }
 
@@ -937,23 +981,44 @@ fn ore_spacing(placement: &mc_data::worldgen_ores::OrePlacement, y: YRange) -> O
 }
 
 impl TerrainGenerator {
-    /// Build a generator from a seed plus a block registry. Panics
-    /// if any of the four required blocks (air, bedrock, stone,
-    /// dirt, grass_block) is missing from the registry — they are
-    /// vanilla-mandatory for any 26.1.2 world and resolving them
-    /// once at construction time keeps `generate` hot-path-free.
+    /// Build a generator from a seed plus a block registry.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry is missing required vanilla terrain blocks. Use
+    /// [`TerrainGenerator::try_with_biome_rules`] for fallible startup validation.
     #[must_use]
     pub fn new(seed: i64, registry: Arc<BlockRegistry>) -> Self {
         Self::with_biome_rules(seed, registry, BiomeRules::vanilla_overworld())
     }
 
+    /// Build a generator with explicit biome rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry is missing required vanilla terrain blocks. Use
+    /// [`TerrainGenerator::try_with_biome_rules`] for fallible startup validation.
     #[must_use]
     pub fn with_biome_rules(seed: i64, registry: Arc<BlockRegistry>, biomes: BiomeRules) -> Self {
-        let stone = resolve_block(registry.as_ref(), "minecraft:stone");
-        let ores = OreRules::solaris_default(registry.as_ref(), &biomes, stone);
-        Self::with_rules(seed, registry, biomes, ores)
+        Self::try_with_biome_rules(seed, registry, biomes).unwrap_or_else(|err| panic!("{err}"))
     }
 
+    pub fn try_with_biome_rules(
+        seed: i64,
+        registry: Arc<BlockRegistry>,
+        biomes: BiomeRules,
+    ) -> Result<Self, TerrainGeneratorError> {
+        let stone = try_resolve_block(registry.as_ref(), "minecraft:stone")?;
+        let ores = OreRules::solaris_default(registry.as_ref(), &biomes, stone);
+        Self::try_with_rules(seed, registry, biomes, ores)
+    }
+
+    /// Build a generator and set its worldgen mode.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry is missing required vanilla terrain blocks. Use
+    /// [`TerrainGenerator::try_with_biome_rules`] for fallible startup validation.
     #[must_use]
     pub fn with_worldgen_mode(seed: i64, registry: Arc<BlockRegistry>, mode: WorldgenMode) -> Self {
         let mut generator = Self::new(seed, registry);
@@ -967,6 +1032,12 @@ impl TerrainGenerator {
         self
     }
 
+    /// Build a generator with explicit biome and ore rules.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the registry is missing required vanilla terrain blocks. Use
+    /// [`TerrainGenerator::try_with_rules`] for fallible startup validation.
     #[must_use]
     pub fn with_rules(
         seed: i64,
@@ -974,15 +1045,36 @@ impl TerrainGenerator {
         biomes: BiomeRules,
         ores: OreRules,
     ) -> Self {
-        let air = resolve_block(registry.as_ref(), "minecraft:air");
-        let stone = resolve_block(registry.as_ref(), "minecraft:stone");
-        Self {
+        Self::try_with_rules(seed, registry, biomes, ores).unwrap_or_else(|err| panic!("{err}"))
+    }
+
+    /// Build a generator with explicit biome and ore rules, returning startup
+    /// validation errors instead of panicking.
+    ///
+    /// Required terrain blocks fail construction when absent. Optional surface,
+    /// fluid, and decoration blocks keep Solaris' existing fallback behavior so
+    /// reduced test registries can still exercise generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TerrainGeneratorError::MissingRequiredBlock`] when the block
+    /// registry is missing `minecraft:air`, `minecraft:bedrock`,
+    /// `minecraft:stone`, `minecraft:dirt`, or `minecraft:grass_block`.
+    pub fn try_with_rules(
+        seed: i64,
+        registry: Arc<BlockRegistry>,
+        biomes: BiomeRules,
+        ores: OreRules,
+    ) -> Result<Self, TerrainGeneratorError> {
+        let air = try_resolve_block(registry.as_ref(), "minecraft:air")?;
+        let stone = try_resolve_block(registry.as_ref(), "minecraft:stone")?;
+        Ok(Self {
             seed,
             air,
-            bedrock: resolve_block(registry.as_ref(), "minecraft:bedrock"),
+            bedrock: try_resolve_block(registry.as_ref(), "minecraft:bedrock")?,
             stone,
-            dirt: resolve_block(registry.as_ref(), "minecraft:dirt"),
-            grass_block: resolve_block(registry.as_ref(), "minecraft:grass_block"),
+            dirt: try_resolve_block(registry.as_ref(), "minecraft:dirt")?,
+            grass_block: try_resolve_block(registry.as_ref(), "minecraft:grass_block")?,
             sand: resolve_block_or(registry.as_ref(), "minecraft:sand", stone),
             red_sand: resolve_block_or(registry.as_ref(), "minecraft:red_sand", stone),
             gravel: resolve_block_or(registry.as_ref(), "minecraft:gravel", stone),
@@ -996,7 +1088,7 @@ impl TerrainGenerator {
             decorations: DecorationBlocks::new(registry.as_ref()),
             worldgen_mode: WorldgenMode::VanillaLike,
             registry,
-        }
+        })
     }
 
     #[must_use]
@@ -1037,18 +1129,15 @@ impl TerrainGenerator {
         let depth = (OCEAN_THRESHOLD - COAST_BLEND_WIDTH - continental).max(0.0) * 40.0;
         let ocean = SEA_LEVEL as f64 - 5.0 - depth + hills * 4.0;
         let uplift = continental.max(0.0) * 20.0;
-        let river_cut = if river.abs() < 0.06 {
-            8.0 * (1.0 - river.abs() / 0.06)
-        } else {
-            0.0
-        };
-        let land =
-            BASE_HEIGHT + uplift + hills * HEIGHT_AMPLITUDE + self.ridges(world_x, world_z) * 18.0
-                - river_cut;
+        let river_blend = river_valley_blend(river);
+        let upland =
+            BASE_HEIGHT + uplift + hills * HEIGHT_AMPLITUDE + self.ridges(world_x, world_z) * 18.0;
+        let river_floor = SEA_LEVEL as f64 - 4.0 + hills.abs() * 2.0;
+        let land = upland * (1.0 - river_blend) + river_floor * river_blend;
         let coast_t = ((continental - (OCEAN_THRESHOLD - COAST_BLEND_WIDTH))
             / (COAST_BLEND_WIDTH * 2.0))
             .clamp(0.0, 1.0);
-        let smooth = coast_t * coast_t * (3.0 - 2.0 * coast_t);
+        let smooth = smoothstep01(coast_t);
         let raw = ocean * (1.0 - smooth) + land * smooth;
         // Guard against extreme outputs even though fbm_2d is bounded.
         raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
@@ -1189,6 +1278,11 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.deep_ocean, world_x, world_z, 0x4445_4550);
         }
+        if river.abs() < RIVER_BIOME_WIDTH && continental > -0.08 {
+            return self
+                .biomes
+                .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
+        }
         if height < SEA_LEVEL - 1 {
             return self
                 .biomes
@@ -1198,11 +1292,6 @@ impl TerrainGenerator {
             return self
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x4245_4143);
-        }
-        if river.abs() < 0.06 && continental > -0.08 {
-            return self
-                .biomes
-                .pick(&self.biomes.river, world_x, world_z, 0x5249_5645);
         }
         if height > 118 || ridges > 0.55 {
             return self
@@ -1273,7 +1362,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
         }
-        if settings.water_enabled && river.abs() < 0.035 && land_mask > -0.02 {
+        if settings.water_enabled && river.abs() < RIVER_BIOME_WIDTH * 0.65 && land_mask > -0.02 {
             return self
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
@@ -1344,8 +1433,8 @@ impl TerrainGenerator {
 
     fn temperature(&self, world_x: i32, world_z: i32) -> f64 {
         fbm_2d(
-            world_x as f64 / 360.0,
-            world_z as f64 / 360.0,
+            world_x as f64 / TEMPERATURE_SCALE,
+            world_z as f64 / TEMPERATURE_SCALE,
             self.seed ^ 0x5445_4D50,
             3,
             0.55,
@@ -1387,8 +1476,8 @@ impl TerrainGenerator {
 
     fn river_signal(&self, world_x: i32, world_z: i32) -> f64 {
         fbm_2d(
-            world_x as f64 / 150.0,
-            world_z as f64 / 150.0,
+            world_x as f64 / RIVER_SIGNAL_SCALE,
+            world_z as f64 / RIVER_SIGNAL_SCALE,
             self.seed ^ 0x5249_5645_5200,
             2,
             0.5,
@@ -2010,6 +2099,24 @@ fn peaked_spacing(
     min_spacing + (distance * range as f64).round() as u64
 }
 
+fn smoothstep01(t: f64) -> f64 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn river_valley_blend(signal: f64) -> f64 {
+    let distance = signal.abs();
+    if distance <= RIVER_TERRAIN_CORE_WIDTH {
+        1.0
+    } else if distance < RIVER_TERRAIN_WIDTH {
+        let bank =
+            (RIVER_TERRAIN_WIDTH - distance) / (RIVER_TERRAIN_WIDTH - RIVER_TERRAIN_CORE_WIDTH);
+        smoothstep01(bank)
+    } else {
+        0.0
+    }
+}
+
 fn feature_hash(seed: i64, x: i32, y: i32, z: i32, salt: u64) -> u64 {
     let mut h = seed as u64 ^ salt;
     h ^= (x as i64 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
@@ -2486,6 +2593,105 @@ mod tests {
         Arc::new(BlockRegistry::from_report(&report).unwrap())
     }
 
+    fn registry_without_block(missing: &str) -> Arc<BlockRegistry> {
+        use mc_data::blocks::{BlockReport, BlockStateReport};
+        let names = [
+            "minecraft:air",
+            "minecraft:bedrock",
+            "minecraft:stone",
+            "minecraft:dirt",
+            "minecraft:grass_block",
+        ];
+        let report = names
+            .into_iter()
+            .filter(|name| *name != missing)
+            .enumerate()
+            .map(|(id, name)| BlockReport {
+                id: Identifier::parse(name).unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: u32::try_from(id).unwrap(),
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        Arc::new(BlockRegistry::from_report(&report).unwrap())
+    }
+
+    fn required_only_registry() -> Arc<BlockRegistry> {
+        registry_without_block("minecraft:not_present")
+    }
+
+    fn land_biome_family(g: &TerrainGenerator, biome: &Identifier) -> Option<&'static str> {
+        if g.biomes.is_surface_water(biome)
+            || g.biomes.is_beach_or_shore(biome)
+            || g.biomes.mountain.contains(biome)
+            || g.biomes.cave.contains(biome)
+        {
+            None
+        } else if g.biomes.swamp.contains(biome) {
+            Some("swamp")
+        } else if g.biomes.cold.contains(biome) {
+            Some("cold")
+        } else if g.biomes.hot_dry.contains(biome) {
+            Some("hot_dry")
+        } else if g.biomes.jungle.contains(biome) {
+            Some("jungle")
+        } else if g.biomes.temperate_forest.contains(biome) {
+            Some("temperate_forest")
+        } else if g.biomes.grassland.contains(biome) {
+            Some("grassland")
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn try_with_rules_reports_missing_required_block() {
+        let err = match TerrainGenerator::try_with_rules(
+            42,
+            registry_without_block("minecraft:grass_block"),
+            BiomeRules::vanilla_overworld(),
+            OreRules::new(Vec::new()),
+        ) {
+            Ok(_) => panic!("missing required terrain block must fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(
+            err,
+            TerrainGeneratorError::MissingRequiredBlock {
+                name: "minecraft:grass_block"
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "block registry missing required terrain block minecraft:grass_block"
+        );
+    }
+
+    #[test]
+    fn try_with_rules_allows_missing_optional_blocks_with_fallbacks() {
+        let generator = TerrainGenerator::try_with_rules(
+            42,
+            required_only_registry(),
+            BiomeRules::vanilla_overworld(),
+            OreRules::new(Vec::new()),
+        )
+        .expect("optional terrain blocks should use fallbacks");
+
+        assert_eq!(generator.sand, generator.stone);
+        assert_eq!(generator.red_sand, generator.stone);
+        assert_eq!(generator.gravel, generator.stone);
+        assert_eq!(generator.podzol, generator.stone);
+        assert_eq!(generator.snow_block, generator.stone);
+        assert_eq!(generator.deepslate, generator.stone);
+        assert_eq!(generator.water, generator.air);
+        assert_eq!(generator.decorations.oak_log, None);
+        assert!(generator.decorations.flower_patch.is_empty());
+    }
+
     #[test]
     fn tellus_mercator_projection_round_trips_and_clamps_latitude() {
         let projection = MercatorProjection::from_settings(TellusWorldgenSettings::default());
@@ -2926,6 +3132,313 @@ mod tests {
     }
 
     #[test]
+    fn solaris_owned_land_biomes_form_chunk_scale_regions() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut stable_windows = 0usize;
+
+        for wx in (-1_536..=1_536).step_by(64) {
+            for wz in (-1_536..=1_536).step_by(64) {
+                let mut expected = None;
+                let mut stable = true;
+                for dx in [0, 16, 32, 48] {
+                    for dz in [0, 16, 32, 48] {
+                        let x = wx + dx;
+                        let z = wz + dz;
+                        let height = g.surface_height(x, z);
+                        if height <= SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA + 2 {
+                            stable = false;
+                            continue;
+                        }
+                        let biome = g.biome_for(x, z, height);
+                        if land_biome_family(&g, &biome).is_none() {
+                            stable = false;
+                            continue;
+                        }
+                        match &expected {
+                            Some(expected) if expected != &biome => stable = false,
+                            None => expected = Some(biome),
+                            _ => {}
+                        }
+                    }
+                }
+                if stable && expected.is_some() {
+                    stable_windows += 1;
+                }
+            }
+        }
+
+        assert!(
+            stable_windows >= 12,
+            "expected multiple 4x4-chunk land windows to keep one exact biome, saw {stable_windows}"
+        );
+    }
+
+    #[test]
+    fn solaris_owned_biome_choices_do_not_track_192_block_grid_lines() {
+        const OLD_GRID_SIZE: i32 = 192;
+
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut aligned_pairs = 0usize;
+        let mut aligned_flips = 0usize;
+        let mut control_pairs = 0usize;
+        let mut control_flips = 0usize;
+
+        for grid_x in (-1_536..=1_536).step_by(OLD_GRID_SIZE as usize) {
+            for wz in (-2_048..=2_048).step_by(16) {
+                for (left, right, pairs, flips) in [
+                    (
+                        grid_x - 4,
+                        grid_x + 4,
+                        &mut aligned_pairs,
+                        &mut aligned_flips,
+                    ),
+                    (
+                        grid_x + 72,
+                        grid_x + 80,
+                        &mut control_pairs,
+                        &mut control_flips,
+                    ),
+                ] {
+                    let left_height = g.surface_height(left, wz);
+                    let right_height = g.surface_height(right, wz);
+                    let left_biome = g.biome_for(left, wz, left_height);
+                    let right_biome = g.biome_for(right, wz, right_height);
+                    let Some(left_family) = land_biome_family(&g, &left_biome) else {
+                        continue;
+                    };
+                    let Some(right_family) = land_biome_family(&g, &right_biome) else {
+                        continue;
+                    };
+                    if left_family != right_family {
+                        continue;
+                    }
+                    *pairs += 1;
+                    if left_biome != right_biome {
+                        *flips += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            aligned_pairs > 150,
+            "sample should include enough grid-line land pairs"
+        );
+        assert!(
+            control_pairs > 150,
+            "sample should include enough control land pairs"
+        );
+        assert!(
+            aligned_flips * control_pairs
+                <= (control_flips * aligned_pairs) + (aligned_pairs * control_pairs / 50),
+            "biome flips should not concentrate on 192-block grid lines: aligned {aligned_flips}/{aligned_pairs}, control {control_flips}/{control_pairs}"
+        );
+    }
+
+    #[test]
+    fn solaris_owned_nearby_land_samples_avoid_excessive_family_flips() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut comparable = 0usize;
+        let mut flips = 0usize;
+
+        for wx in (-1_024..=1_024).step_by(16) {
+            for wz in (-1_024..=1_024).step_by(16) {
+                let height = g.surface_height(wx, wz);
+                let biome = g.biome_for(wx, wz, height);
+                let Some(family) = land_biome_family(&g, &biome) else {
+                    continue;
+                };
+                for (nx, nz) in [(wx + 16, wz), (wx, wz + 16)] {
+                    let nheight = g.surface_height(nx, nz);
+                    let nbiome = g.biome_for(nx, nz, nheight);
+                    let Some(nfamily) = land_biome_family(&g, &nbiome) else {
+                        continue;
+                    };
+                    comparable += 1;
+                    if family != nfamily {
+                        flips += 1;
+                    }
+                }
+            }
+        }
+
+        assert!(comparable > 200, "sample should include enough land pairs");
+        assert!(
+            flips * 5 <= comparable,
+            "too many 16-block land biome family flips: {flips}/{comparable}"
+        );
+    }
+
+    #[test]
+    fn solaris_owned_river_masks_are_broad_when_reachable() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+
+        for wx in (-2_048..=2_048).step_by(4) {
+            for wz in (-2_048..=2_048).step_by(4) {
+                let height = g.surface_height(wx, wz);
+                let biome = g.biome_for(wx, wz, height);
+                if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                    continue;
+                }
+
+                let mut width_x = 1usize;
+                for dx in 1..=32 {
+                    let height = g.surface_height(wx + dx, wz);
+                    let biome = g.biome_for(wx + dx, wz, height);
+                    if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                        break;
+                    }
+                    width_x += 1;
+                }
+                for dx in 1..=32 {
+                    let height = g.surface_height(wx - dx, wz);
+                    let biome = g.biome_for(wx - dx, wz, height);
+                    if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                        break;
+                    }
+                    width_x += 1;
+                }
+                let mut width_z = 1usize;
+                for dz in 1..=32 {
+                    let height = g.surface_height(wx, wz + dz);
+                    let biome = g.biome_for(wx, wz + dz, height);
+                    if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                        break;
+                    }
+                    width_z += 1;
+                }
+                for dz in 1..=32 {
+                    let height = g.surface_height(wx, wz - dz);
+                    let biome = g.biome_for(wx, wz - dz, height);
+                    if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                        break;
+                    }
+                    width_z += 1;
+                }
+                if width_x < 8 || width_z < 8 {
+                    continue;
+                }
+
+                let mut nearby_river_water = 0usize;
+                for dx in -4..=4 {
+                    for dz in -4..=4 {
+                        let height = g.surface_height(wx + dx, wz + dz);
+                        let biome = g.biome_for(wx + dx, wz + dz, height);
+                        if g.biomes.is_river(&biome) && height <= SEA_LEVEL {
+                            nearby_river_water += 1;
+                        }
+                    }
+                }
+                assert!(
+                    nearby_river_water >= 24,
+                    "river should occupy a broad local cross-section near ({wx}, {wz}), saw {nearby_river_water}/81 water-level river columns"
+                );
+
+                let chunk = g.generate(ChunkPos {
+                    x: wx.div_euclid(16),
+                    z: wz.div_euclid(16),
+                });
+                assert_eq!(
+                    chunk.get_block(wx.rem_euclid(16) as u8, SEA_LEVEL, wz.rem_euclid(16) as u8),
+                    Some(BlockStateId(5))
+                );
+                return;
+            }
+        }
+
+        panic!("sampled area should contain a reachable broad river cross-section");
+    }
+
+    #[test]
+    fn solaris_owned_river_valleys_keep_continuous_water_floors() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        let mut checked = 0usize;
+
+        for wx in (-2_048..=2_048).step_by(4) {
+            for wz in (-2_048..=2_048).step_by(4) {
+                let height = g.surface_height(wx, wz);
+                let biome = g.biome_for(wx, wz, height);
+                if !g.biomes.is_river(&biome) || height > SEA_LEVEL {
+                    continue;
+                }
+
+                for (axis_x, axis_z) in [(1, 0), (0, 1)] {
+                    let mut wet_floor = true;
+                    let mut center_height = i32::MAX;
+                    for offset in [-12, -8, -4, 0, 4, 8, 12] {
+                        let x = wx + axis_x * offset;
+                        let z = wz + axis_z * offset;
+                        let sample_height = g.surface_height(x, z);
+                        let sample_biome = g.biome_for(x, z, sample_height);
+                        center_height = center_height.min(sample_height);
+                        if !g.biomes.is_river(&sample_biome) || sample_height > SEA_LEVEL {
+                            wet_floor = false;
+                            break;
+                        }
+                    }
+                    if !wet_floor {
+                        continue;
+                    }
+
+                    let mut previous_height = None;
+                    for offset in (-28..=28).step_by(4) {
+                        let x = wx + axis_x * offset;
+                        let z = wz + axis_z * offset;
+                        let sample_height = g.surface_height(x, z);
+                        if let Some(previous_height) = previous_height {
+                            let step: i32 = sample_height - previous_height;
+                            assert!(
+                                step.abs() <= 10,
+                                "river cross-section should rise gradually near ({wx}, {wz}) on axis ({axis_x}, {axis_z}): offset {offset}, step {step}"
+                            );
+                        }
+                        previous_height = Some(sample_height);
+                    }
+
+                    for offset in [-28, 28] {
+                        let x = wx + axis_x * offset;
+                        let z = wz + axis_z * offset;
+                        let bank_height = g.surface_height(x, z);
+                        assert!(
+                            bank_height >= center_height,
+                            "river bank should not undercut wet floor near ({wx}, {wz}) on axis ({axis_x}, {axis_z}): center {center_height}, bank {bank_height}"
+                        );
+                    }
+                    checked += 1;
+                    if checked >= 6 {
+                        return;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            checked >= 3,
+            "sampled area should contain several continuous river water-floor cross-sections, saw {checked}"
+        );
+    }
+
+    #[test]
+    fn solaris_owned_local_terrain_steps_stay_bounded() {
+        let g = TerrainGenerator::new(42, tiny_registry());
+        for wx in (-512..=512).step_by(4) {
+            for wz in (-512..=512).step_by(4) {
+                let h = g.surface_height(wx, wz);
+                let hx = g.surface_height(wx + 4, wz);
+                let hz = g.surface_height(wx, wz + 4);
+                assert!(
+                    (h - hx).abs() <= 10,
+                    "sharp x terrain step at ({wx}, {wz}): {h} -> {hx}"
+                );
+                assert!(
+                    (h - hz).abs() <= 10,
+                    "sharp z terrain step at ({wx}, {wz}): {h} -> {hz}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn generated_chunk_biomes_are_not_all_default() {
         let g = TerrainGenerator::new(42, tiny_registry());
         let mut saw_non_default = false;
@@ -3093,8 +3606,8 @@ mod tests {
         let grass = BlockStateId(4);
         let data_fed_plant = BlockStateId(30);
 
-        for cx in -8..=8 {
-            for cz in -8..=8 {
+        for cx in -16..=16 {
+            for cz in -16..=16 {
                 let chunk = g.generate(ChunkPos { x: cx, z: cz });
                 for lx in 0..16u8 {
                     for lz in 0..16u8 {

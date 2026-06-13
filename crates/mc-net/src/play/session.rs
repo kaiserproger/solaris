@@ -327,7 +327,13 @@ impl SessionRegistry {
             crate::lock_metrics::LockMetricKind::SessionRegistry,
             operation,
             Instant::now(),
-            self.inner.lock().expect("session registry poisoned"),
+            self.inner.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    operation,
+                    "session registry mutex was poisoned; recovering state"
+                );
+                poisoned.into_inner()
+            }),
         )
     }
 
@@ -378,7 +384,12 @@ impl SessionRegistry {
                     crate::lock_metrics::LockMetricKind::PlayerPersistence,
                     "save-all player persistence snapshot",
                     Instant::now(),
-                    state.lock().expect("player persistence state poisoned"),
+                    state.lock().unwrap_or_else(|poisoned| {
+                        warn!(
+                            "player persistence mutex was poisoned during save-all; recovering state"
+                        );
+                        poisoned.into_inner()
+                    }),
                 );
                 (uuid, (*state).clone())
             })
@@ -1325,6 +1336,7 @@ impl SessionRegistry {
             .values()
             .flat_map(|session| session.loaded.iter().copied())
             .collect();
+        update_hostile_targets_locked(&mut inner);
         if active_chunks.is_empty() {
             return Vec::new();
         }
@@ -1333,7 +1345,6 @@ impl SessionRegistry {
             .values()
             .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
             .collect();
-        update_hostile_targets_locked(&mut inner);
         let pathing_probe = LoadedChunkPathingProbe {
             active_chunks: &active_chunks,
         };
@@ -1678,8 +1689,16 @@ struct LoadedChunkPathingProbe<'a> {
 
 impl PathingProbe for LoadedChunkPathingProbe<'_> {
     fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
-        // Integrated AI pathing only gates movement to loaded chunks; terrain
-        // collision is handled by the later sampled entity physics pass.
+        if !position.y.is_finite()
+            || position.y.floor() < f64::from(mc_world::chunk::MIN_Y)
+            || position.y.floor() >= f64::from(mc_world::chunk::MAX_Y)
+        {
+            return PathingProbeResult::Blocked;
+        }
+
+        // Integrated AI pathing gates movement to loaded chunks and obvious
+        // world-height bounds; terrain collision is handled by the later
+        // sampled entity physics pass.
         if self
             .active_chunks
             .contains(&chunk_pos_from_coords(position.x, position.z))
@@ -1831,9 +1850,6 @@ fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
         .values()
         .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
         .collect();
-    if players.is_empty() {
-        return;
-    }
     let hostiles: Vec<_> = inner
         .entities
         .views()
@@ -1847,6 +1863,12 @@ fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
             (entity.id, entity.position, follow_range)
         })
         .collect();
+    if players.is_empty() {
+        for (hostile_id, _, _) in hostiles {
+            let _ = inner.entities.set_goal(hostile_id, hostile_wander_goal());
+        }
+        return;
+    }
     for (hostile_id, hostile_position, follow_range) in hostiles {
         let max_distance_sq = follow_range * follow_range;
         let target = players
@@ -1857,17 +1879,18 @@ fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
                 distance_sq(*left, hostile_position)
                     .total_cmp(&distance_sq(*right, hostile_position))
             });
-        let goal = target.map_or(
-            GoalState::Wander {
-                speed: HOSTILE_FOLLOW_SPEED,
-                period_ticks: 20,
-            },
-            |target| GoalState::FollowPosition {
-                target,
-                speed: HOSTILE_FOLLOW_SPEED,
-            },
-        );
+        let goal = target.map_or(hostile_wander_goal(), |target| GoalState::FollowPosition {
+            target,
+            speed: HOSTILE_FOLLOW_SPEED,
+        });
         let _ = inner.entities.set_goal(hostile_id, goal);
+    }
+}
+
+fn hostile_wander_goal() -> GoalState {
+    GoalState::Wander {
+        speed: HOSTILE_FOLLOW_SPEED,
+        period_ticks: 20,
     }
 }
 
@@ -3027,6 +3050,109 @@ mod tests {
         let snapshot = server_entity_snapshot_from(store.snapshot(id).unwrap());
 
         assert_eq!(snapshot.attack_damage, Some(2.0));
+    }
+
+    #[test]
+    fn hostile_forgets_target_when_last_player_unregisters() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "TargetAlice");
+        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
+        registry.spawn_command_entity(1, "minecraft:zombie".to_string(), Vec3::new(4.5, 64.0, 0.5));
+
+        let queries = registry.tick_entities_and_collect_physics_queries(1);
+        assert_eq!(queries.len(), 1);
+        {
+            let inner = registry.inner.lock().expect("session registry poisoned");
+            let entity = inner.entities.views().next().expect("spawned hostile");
+            assert!(matches!(entity.goal, GoalState::FollowPosition { .. }));
+        }
+
+        registry.unregister(alice);
+        assert!(
+            registry
+                .tick_entities_and_collect_physics_queries(2)
+                .is_empty()
+        );
+
+        let inner = registry.inner.lock().expect("session registry poisoned");
+        let entity = inner.entities.views().next().expect("spawned hostile");
+        assert!(matches!(entity.goal, GoalState::Wander { .. }));
+    }
+
+    #[test]
+    fn loaded_chunk_pathing_probe_accepts_loaded_world_height_position() {
+        let active_chunks = HashSet::from([(0, 0)]);
+        let probe = LoadedChunkPathingProbe {
+            active_chunks: &active_chunks,
+        };
+
+        assert_eq!(
+            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MIN_Y), 0.5)),
+            PathingProbeResult::Walkable
+        );
+    }
+
+    #[test]
+    fn loaded_chunk_pathing_probe_blocks_out_of_world_height_position() {
+        let active_chunks = HashSet::from([(0, 0)]);
+        let probe = LoadedChunkPathingProbe {
+            active_chunks: &active_chunks,
+        };
+
+        assert_eq!(
+            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MIN_Y) - 0.1, 0.5,)),
+            PathingProbeResult::Blocked
+        );
+        assert_eq!(
+            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MAX_Y), 0.5)),
+            PathingProbeResult::Blocked
+        );
+    }
+
+    #[test]
+    fn loaded_chunk_pathing_probe_reports_unloaded_chunk_in_world_height() {
+        let active_chunks = HashSet::from([(0, 0)]);
+        let probe = LoadedChunkPathingProbe {
+            active_chunks: &active_chunks,
+        };
+
+        assert_eq!(
+            probe.can_stand_at(Vec3::new(16.5, 64.0, 0.5)),
+            PathingProbeResult::Unloaded
+        );
+    }
+
+    #[test]
+    fn registry_recovers_after_inner_mutex_poison() {
+        let registry = SessionRegistry::new();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = registry.inner.lock().unwrap();
+            panic!("poison registry");
+        }));
+
+        let id = register_test_session(&registry, "PoisonAlice");
+
+        assert_eq!(registry.active_session_count(), 1);
+        assert_eq!(id, 1);
+    }
+
+    #[test]
+    fn save_all_recovers_after_player_persistence_mutex_poison() {
+        let registry = SessionRegistry::new();
+        let session_id = register_test_session(&registry, "PoisonPersist");
+        let state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.5),
+        )));
+        registry.register_player_persistence(session_id, Arc::clone(&state));
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = state.lock().unwrap();
+            panic!("poison player persistence");
+        }));
+
+        let snapshots = registry.persisted_player_states();
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].0, profile("PoisonPersist").uuid);
     }
 
     #[test]

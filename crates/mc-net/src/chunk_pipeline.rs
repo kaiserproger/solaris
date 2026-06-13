@@ -255,14 +255,33 @@ impl ChunkScheduler {
         }
 
         let coord = (request.chunk_x, request.chunk_z);
-        let Some(generation) = self.in_flight.remove(&coord) else {
+        let Some(generation) = self.in_flight.get(&coord).copied() else {
             return false;
         };
         if generation != request.generation {
             return false;
         }
 
+        self.in_flight.remove(&coord);
         self.finished.insert(coord);
+        true
+    }
+
+    pub fn defer(&mut self, request: ChunkRequest) -> bool {
+        if !self.is_current(request) {
+            return false;
+        }
+
+        let coord = (request.chunk_x, request.chunk_z);
+        let Some(generation) = self.in_flight.get(&coord).copied() else {
+            return false;
+        };
+        if generation != request.generation {
+            return false;
+        }
+
+        self.in_flight.remove(&coord);
+        self.queue.push_back(request);
         true
     }
 
@@ -365,6 +384,32 @@ mod tests {
         assert_eq!((current.chunk_x, current.chunk_z), (0, 0));
         assert!(scheduler.mark_finished(current));
         assert!(scheduler.is_complete());
+    }
+
+    #[test]
+    fn scheduler_defer_requeues_without_finishing() {
+        let mut scheduler = ChunkScheduler::new([(0, 0, priority(0))]);
+
+        let request = scheduler.poll_next().expect("request");
+        assert!(scheduler.defer(request));
+
+        assert_eq!(scheduler.finished_len(), 0);
+        assert_eq!(scheduler.in_flight_len(), 0);
+        assert_eq!(scheduler.queued_len(), 1);
+        let retried = scheduler.poll_next().expect("retried request");
+        assert_eq!((retried.chunk_x, retried.chunk_z), (0, 0));
+        assert_eq!(retried.generation, request.generation);
+    }
+
+    #[test]
+    fn scheduler_defer_rejects_generation_mismatch_without_dropping_in_flight() {
+        let mut scheduler = ChunkScheduler::new([(0, 0, priority(0))]);
+        let mut request = scheduler.poll_next().expect("request");
+        request.generation = ChunkPipelineGeneration(request.generation.0 + 1);
+
+        assert!(!scheduler.defer(request));
+        assert_eq!(scheduler.in_flight_len(), 1);
+        assert_eq!(scheduler.queued_len(), 0);
     }
 
     #[test]

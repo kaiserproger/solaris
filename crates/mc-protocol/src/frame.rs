@@ -119,9 +119,14 @@ pub enum FramingError {
     NegativeLength(i32),
 
     /// `data_length` claimed the uncompressed body would be this long, but
-    /// once compressed bytes were decompressed the length differed.
-    #[error("compressed payload decompressed to {actual} bytes, header claimed {claimed}")]
-    DecompressedLengthMismatch { claimed: usize, actual: usize },
+    /// a bounded decompression pass observed a different length.
+    #[error(
+        "compressed payload decompressed to at least {decompressed_at_least} bytes, header claimed {claimed}"
+    )]
+    DecompressedLengthMismatch {
+        claimed: usize,
+        decompressed_at_least: usize,
+    },
 
     /// A frame had compression enabled and a positive `data_length`, but
     /// `data_length` was smaller than the per-connection threshold, which
@@ -201,13 +206,14 @@ pub fn try_decode_frame(
                     return Err(FramingError::FrameTooLarge { got: data_length });
                 }
                 // `body` here is the compressed payload.
-                let mut decoder = ZlibDecoder::new(body.as_ref());
+                let decoder = ZlibDecoder::new(body.as_ref());
+                let mut decoder = decoder.take(data_length as u64 + 1);
                 let mut decompressed = Vec::with_capacity(data_length);
                 decoder.read_to_end(&mut decompressed)?;
                 if decompressed.len() != data_length {
                     return Err(FramingError::DecompressedLengthMismatch {
                         claimed: data_length,
-                        actual: decompressed.len(),
+                        decompressed_at_least: decompressed.len(),
                     });
                 }
                 let mut cursor: &[u8] = &decompressed;
@@ -492,7 +498,10 @@ mod tests {
         let err = try_decode_frame(&mut buf, Compression::Threshold(16)).unwrap_err();
         assert!(matches!(
             err,
-            FramingError::DecompressedLengthMismatch { .. }
+            FramingError::DecompressedLengthMismatch {
+                claimed: 50,
+                decompressed_at_least: 51
+            }
         ));
     }
 

@@ -198,7 +198,7 @@ async fn serve(path: &Path) -> Result<()> {
         cfg.data.worldgen_mode.to_worldgen(),
         Arc::clone(&blocks),
         structure_rules,
-    );
+    )?;
     let items = Arc::new(mc_data::items::solaris_required_items());
     tracing::info!(entries = items.len(), "embedded item registry loaded");
     let item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
@@ -414,20 +414,15 @@ fn build_terrain_generator(
     worldgen_mode: mc_worldgen::WorldgenMode,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
-) -> Arc<mc_worldgen::TerrainGenerator> {
+) -> Result<Arc<mc_worldgen::TerrainGenerator>> {
     let biomes = mc_worldgen::BiomeRules::vanilla_overworld();
 
-    let stone = blocks
-        .block(&mc_data::Identifier::parse("minecraft:stone").expect("static identifier"))
-        .map(|block| block.default)
-        .expect("block registry contains stone");
-    let ores = mc_worldgen::OreRules::solaris_default(blocks.as_ref(), &biomes, stone);
-
-    Arc::new(
-        mc_worldgen::TerrainGenerator::with_rules(seed, blocks, biomes, ores)
+    Ok(Arc::new(
+        mc_worldgen::TerrainGenerator::try_with_biome_rules(seed, blocks, biomes)
+            .context("building terrain generator")?
             .with_mode(worldgen_mode)
             .with_structures(structure_rules),
-    )
+    ))
 }
 
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
@@ -491,6 +486,14 @@ fn generate_spawn_window(
     let mut generated = 0usize;
     for batch in rx {
         for (pos, chunk) in batch {
+            if storage.stats().dirty_chunk_cache_saturated {
+                storage.flush_dirty().with_context(|| {
+                    format!(
+                        "flushing dirty chunks before pre-generating spawn chunk ({}, {})",
+                        pos.x, pos.z
+                    )
+                })?;
+            }
             storage
                 .insert_generated_chunk(pos, chunk)
                 .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))?;
@@ -748,8 +751,34 @@ async fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use mc_data::Identifier;
     use serde_json::Value;
+
+    fn terrain_registry_missing_grass_block() -> Arc<mc_world::BlockRegistry> {
+        use mc_data::blocks::{BlockReport, BlockStateReport};
+        let names = [
+            "minecraft:air",
+            "minecraft:bedrock",
+            "minecraft:stone",
+            "minecraft:dirt",
+        ];
+        let report = names
+            .into_iter()
+            .enumerate()
+            .map(|(id, name)| BlockReport {
+                id: Identifier::parse(name).unwrap(),
+                properties: BTreeMap::new(),
+                states: vec![BlockStateReport {
+                    id: u32::try_from(id).unwrap(),
+                    default: true,
+                    properties: BTreeMap::new(),
+                }],
+            })
+            .collect::<Vec<_>>();
+        Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap())
+    }
 
     #[test]
     fn ensure_world_region_root_creates_legacy_layout_for_missing_world() {
@@ -783,6 +812,31 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
         assert_eq!(chunk_cache_size_for_view_distance(10), 529);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn build_terrain_generator_rejects_missing_required_block() {
+        let blocks = terrain_registry_missing_grass_block();
+
+        let err = match build_terrain_generator(
+            42,
+            mc_worldgen::WorldgenMode::VanillaLike,
+            blocks,
+            mc_worldgen::StructureRules::none(),
+        ) {
+            Ok(_) => panic!("missing required terrain block must fail"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("building terrain generator"),
+            "{err:#}"
+        );
+        assert!(
+            format!("{err:#}")
+                .contains("block registry missing required terrain block minecraft:grass_block"),
+            "{err:#}"
+        );
     }
 
     #[test]

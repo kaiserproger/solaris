@@ -97,6 +97,7 @@ pub struct WorldStorageStats {
     pub region_cache_len: usize,
     pub region_cache_capacity: usize,
     pub dirty_chunks: usize,
+    pub dirty_chunk_cache_saturated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +110,7 @@ pub struct DirtyFlushPlan {
 struct DirtyFlushRegionPlan {
     region: (i32, i32),
     region_path: PathBuf,
+    expected_version: Option<RegionFileVersion>,
     dirty_payloads: Vec<PlannedChunkPayload>,
 }
 
@@ -201,8 +203,13 @@ impl DirtyFlushPlan {
     pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
         let mut commits = Vec::with_capacity(self.regions.len());
         for region in self.regions {
-            let expected_version = region_file_version(&region.region_path)?;
-            let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if expected_version.is_some() {
+            if region_file_version(&region.region_path)?.as_ref()
+                != region.expected_version.as_ref()
+            {
+                return Err(WorldError::StaleRegion(region.region_path));
+            }
+            let mut by_slot: HashMap<(u8, u8), ChunkPayload> = if region.expected_version.is_some()
+            {
                 read_region(&region.region_path)?
                     .into_iter()
                     .map(|p| ((p.local_x, p.local_z), p))
@@ -221,7 +228,11 @@ impl DirtyFlushPlan {
             let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
             payloads.sort_by_key(|p| (p.local_z, p.local_x));
 
-            replace_region_file(&region.region_path, &payloads, expected_version.as_ref())?;
+            replace_region_file(
+                &region.region_path,
+                &payloads,
+                region.expected_version.as_ref(),
+            )?;
 
             commits.push(DirtyFlushRegionCommit {
                 region: region.region,
@@ -263,7 +274,7 @@ fn replace_region_file(
 
     let tmp_path = write_unique_region_tmp(region_path, payloads)?;
     if expected_version.is_some() {
-        install_existing_region_file(region_path, &tmp_path)?;
+        install_existing_region_file(region_path, &tmp_path, expected_version)?;
     } else {
         install_new_region_file(region_path, &tmp_path)?;
     }
@@ -271,7 +282,16 @@ fn replace_region_file(
     Ok(())
 }
 
-fn install_existing_region_file(region_path: &Path, tmp_path: &Path) -> Result<(), WorldError> {
+fn install_existing_region_file(
+    region_path: &Path,
+    tmp_path: &Path,
+    expected_version: Option<&RegionFileVersion>,
+) -> Result<(), WorldError> {
+    if region_file_version(region_path)?.as_ref() != expected_version {
+        let _ = std::fs::remove_file(tmp_path);
+        return Err(WorldError::StaleRegion(region_path.to_path_buf()));
+    }
+
     std::fs::rename(tmp_path, region_path).map_err(|e| {
         let _ = std::fs::remove_file(tmp_path);
         WorldError::Region(RegionError::Io {
@@ -590,6 +610,22 @@ impl WorldStorage {
             .get(&cpos)
             .expect("chunk snapshot commit leaves chunk cached")
             .clone())
+    }
+
+    pub fn try_commit_chunk_snapshot(
+        &mut self,
+        cpos: ChunkPos,
+        chunk: Chunk,
+    ) -> Result<Option<ChunkSnapshot>, WorldError> {
+        if !self.can_cache_new_chunk(cpos) {
+            return Ok(None);
+        }
+        self.commit_chunk_snapshot(cpos, chunk).map(Some)
+    }
+
+    #[must_use]
+    pub fn can_cache_new_chunk(&self, cpos: ChunkPos) -> bool {
+        self.cache.contains_key(&cpos) || !self.dirty_chunk_cache_saturated()
     }
 
     /// Clone a resident chunk without disk IO or generation.
@@ -911,6 +947,19 @@ impl WorldStorage {
         self.insert_chunk(cpos, chunk)
     }
 
+    pub fn try_insert_generated_chunk(
+        &mut self,
+        cpos: ChunkPos,
+        mut chunk: Chunk,
+    ) -> Result<bool, WorldError> {
+        if !self.can_cache_new_chunk(cpos) {
+            return Ok(false);
+        }
+        chunk.mark_dirty();
+        self.insert_chunk(cpos, chunk)?;
+        Ok(true)
+    }
+
     fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
         self.ensure_chunk_loaded(cpos, true)
     }
@@ -1062,12 +1111,19 @@ impl WorldStorage {
             region_cache_len: self.regions.len(),
             region_cache_capacity: self.region_capacity,
             dirty_chunks: self.dirty_count(),
+            dirty_chunk_cache_saturated: self.dirty_chunk_cache_saturated(),
         }
     }
 
-    /// Build a dirty chunk flush plan without touching disk. The plan
-    /// owns the encoded chunk payloads so callers can write the region
-    /// files after releasing any outer world mutex.
+    #[must_use]
+    pub fn dirty_chunk_cache_saturated(&self) -> bool {
+        self.cache.len() >= self.capacity && self.cache.values().all(|chunk| chunk.dirty)
+    }
+
+    /// Build a dirty chunk flush plan. The plan owns the encoded chunk
+    /// payloads and the region versions observed while planning so callers can
+    /// write region files after releasing any outer world mutex without
+    /// replacing a newer region snapshot.
     pub fn plan_dirty_flush(&self) -> Result<DirtyFlushPlan, WorldError> {
         let dirty_positions: Vec<ChunkPos> = self
             .cache
@@ -1094,6 +1150,7 @@ impl WorldStorage {
         for ((rx, rz), mut positions) in by_region {
             positions.sort_by_key(|pos| (pos.z, pos.x));
             let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
+            let expected_version = region_file_version(&region_path)?;
             let mut dirty_payloads = Vec::with_capacity(positions.len());
             for cpos in positions {
                 let chunk = self
@@ -1116,6 +1173,7 @@ impl WorldStorage {
             regions.push(DirtyFlushRegionPlan {
                 region: (rx, rz),
                 region_path,
+                expected_version,
                 dirty_payloads,
             });
         }
@@ -1429,6 +1487,58 @@ mod tests {
         assert_eq!(stats.region_cache_len, 0);
         assert_eq!(stats.region_cache_capacity, 4);
         assert_eq!(stats.dirty_chunks, 1);
+        assert!(!stats.dirty_chunk_cache_saturated);
+    }
+
+    #[test]
+    fn dirty_pressure_try_insert_defers_without_growth() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1);
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+
+        world
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome.clone()),
+            )
+            .unwrap();
+        assert!(world.stats().dirty_chunk_cache_saturated);
+
+        let inserted = world
+            .try_insert_generated_chunk(
+                ChunkPos { x: 1, z: 0 },
+                Chunk::empty(ChunkPos { x: 1, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+
+        assert!(!inserted);
+        assert_eq!(world.cache_len(), 1);
+        assert!(world.cached_chunk(ChunkPos { x: 1, z: 0 }).is_none());
+    }
+
+    #[test]
+    fn dirty_pressure_try_commit_defers_loaded_chunk_without_growth() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1);
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+
+        world
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome.clone()),
+            )
+            .unwrap();
+
+        let committed = world
+            .try_commit_chunk_snapshot(
+                ChunkPos { x: 1, z: 0 },
+                Chunk::empty(ChunkPos { x: 1, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+
+        assert!(committed.is_none());
+        assert_eq!(world.cache_len(), 1);
+        assert!(world.cached_chunk(ChunkPos { x: 1, z: 0 }).is_none());
     }
 
     #[test]
@@ -2073,6 +2183,91 @@ mod tests {
             panic!("stale region version must reject replacement");
         };
         assert_eq!(path, region_path);
+    }
+
+    #[test]
+    fn existing_region_install_rechecks_stale_target_before_rename() {
+        use std::io::Write as _;
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        let region_path = tmp_world.path().join("r.0.0.mca");
+        let tmp_path = tmp_world.path().join(".r.0.0.mca.tmp");
+        std::fs::write(&region_path, b"old region").unwrap();
+        std::fs::write(&tmp_path, b"planned replacement").unwrap();
+        let expected = region_file_version(&region_path).unwrap();
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&region_path)
+            .unwrap();
+        file.write_all(b" changed").unwrap();
+
+        let Err(WorldError::StaleRegion(path)) =
+            install_existing_region_file(&region_path, &tmp_path, expected.as_ref())
+        else {
+            panic!("existing-region install must reject a stale target before rename");
+        };
+
+        assert_eq!(path, region_path);
+        assert_eq!(std::fs::read(&region_path).unwrap(), b"old region changed");
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn dirty_flush_write_rejects_region_changed_after_planning() {
+        use crate::chunk::ChunkGenerator;
+        use std::io::Write as _;
+
+        struct StubGen;
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, BlockStateId(0), biome);
+                chunk.set_block(0, 0, 0, BlockStateId(1));
+                chunk.status = "minecraft:full".into();
+                chunk.mark_dirty();
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        let region_dir = tmp_world.path().join("region");
+        std::fs::create_dir_all(&region_dir).unwrap();
+        let region_path = region_dir.join("r.0.0.mca");
+        let registry = air_stone_registry();
+
+        let mut initial =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen));
+        assert!(
+            initial
+                .get_chunk(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(initial.flush_dirty().unwrap(), 1);
+
+        let mut stale = WorldStorage::open_with_capacity(tmp_world.path(), registry, 16).unwrap();
+        stale
+            .set_block_at(BlockPos { x: 0, y: 0, z: 0 }, BlockStateId(0))
+            .unwrap()
+            .unwrap();
+        let plan = stale.plan_dirty_flush().unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&region_path)
+            .unwrap();
+        file.write_all(&[0]).unwrap();
+
+        let Err(WorldError::StaleRegion(path)) = plan.write() else {
+            panic!("flush write must reject a region changed after planning");
+        };
+        assert_eq!(path, region_path);
+        assert_eq!(stale.dirty_count(), 1);
     }
 
     #[test]

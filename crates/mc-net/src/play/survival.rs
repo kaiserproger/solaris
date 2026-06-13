@@ -487,7 +487,14 @@ pub(super) fn attack_damage_for_item(
     }
     let path = item.path();
     if path.ends_with("_sword") {
-        8.0
+        match path.strip_suffix("_sword").unwrap_or_default() {
+            "wooden" | "golden" => 4.0,
+            "stone" => 5.0,
+            "iron" => 6.0,
+            "diamond" => 7.0,
+            "netherite" => 8.0,
+            _ => 2.0,
+        }
     } else if path.ends_with("_axe") {
         7.0
     } else if path.ends_with("_pickaxe") || path.ends_with("_shovel") {

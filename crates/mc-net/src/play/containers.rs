@@ -286,17 +286,16 @@ pub(super) fn is_fuel_item(state: &InteractionState, item_id: u32) -> bool {
     Some(item_id) == coal || Some(item_id) == charcoal
 }
 
-pub(super) fn furnace_menu_title_nbt(title: &str) -> Vec<u8> {
+pub(super) fn furnace_menu_title_nbt(title: &str) -> Result<Vec<u8>, mc_protocol::CodecError> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
         &Tag::Compound(vec![("text".to_string(), Tag::String(title.to_string()))]),
-    )
-    .expect("static text component is valid NBT");
-    out
+    )?;
+    Ok(out)
 }
 
-pub(super) fn crafting_menu_title_nbt() -> Vec<u8> {
+pub(super) fn crafting_menu_title_nbt() -> Result<Vec<u8>, mc_protocol::CodecError> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
@@ -304,19 +303,17 @@ pub(super) fn crafting_menu_title_nbt() -> Vec<u8> {
             "text".to_string(),
             Tag::String("Crafting".to_string()),
         )]),
-    )
-    .expect("static text component is valid NBT");
-    out
+    )?;
+    Ok(out)
 }
 
-pub(super) fn chest_menu_title_nbt(title: &str) -> Vec<u8> {
+pub(super) fn chest_menu_title_nbt(title: &str) -> Result<Vec<u8>, mc_protocol::CodecError> {
     let mut out = Vec::new();
     mc_nbt::write_network(
         &mut out,
         &Tag::Compound(vec![("text".to_string(), Tag::String(title.to_string()))]),
-    )
-    .expect("static text component is valid NBT");
-    out
+    )?;
+    Ok(out)
 }
 
 pub(super) fn next_container_id(state: &mut InteractionState) -> i32 {

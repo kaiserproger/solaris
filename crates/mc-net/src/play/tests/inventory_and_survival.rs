@@ -422,6 +422,61 @@ fn shield_durability_respects_three_damage_threshold() {
 }
 
 #[test]
+fn shield_blocks_only_after_delay_and_inside_front_cone() {
+    let mut state = shield_item_state();
+    let shield = ItemStack::new(77, 1);
+    state.inventory.slots[45] = shield.clone();
+    state.shield_use = shield_use_from_stack(InteractionHand::OffHand, 45, shield, 10, true);
+    state.sessions.set_world_time(10 + SHIELD_ACTIVATION_DELAY_TICKS - 1);
+    let pose = PlayerPose::new(0.0, 64.0, 0.0);
+
+    assert!(!shield_blocks_current_damage(
+        &mut state,
+        pose,
+        Some(Vec3::new(0.0, 64.0, 2.0))
+    ));
+
+    state.sessions.set_world_time(10 + SHIELD_ACTIVATION_DELAY_TICKS);
+    assert!(shield_blocks_current_damage(
+        &mut state,
+        pose,
+        Some(Vec3::new(0.0, 64.0, 2.0))
+    ));
+    assert!(shield_blocks_current_damage(
+        &mut state,
+        pose,
+        Some(Vec3::new(3.464_101_615_137_754_4, 64.0, 2.0))
+    ));
+    assert!(!shield_blocks_current_damage(
+        &mut state,
+        pose,
+        Some(Vec3::new(2.0, 64.0, 0.0))
+    ));
+    assert!(!shield_blocks_current_damage(
+        &mut state,
+        pose,
+        Some(Vec3::new(0.0, 64.0, -2.0))
+    ));
+}
+
+#[test]
+fn shield_blocking_clears_stale_active_shield() {
+    let mut state = shield_item_state();
+    let shield = ItemStack::new(77, 1);
+    state.inventory.slots[45] = shield.clone();
+    state.shield_use = shield_use_from_stack(InteractionHand::OffHand, 45, shield, 0, true);
+    state.sessions.set_world_time(SHIELD_ACTIVATION_DELAY_TICKS);
+    state.inventory.slots[45] = ItemStack::EMPTY;
+
+    assert!(!shield_blocks_current_damage(
+        &mut state,
+        PlayerPose::new(0.0, 64.0, 0.0),
+        Some(Vec3::new(0.0, 64.0, 2.0))
+    ));
+    assert!(state.shield_use.is_none());
+}
+
+#[test]
 fn weapon_attack_durability_is_survival_only() {
     assert!(weapon_attacks_damage_held_item(GameMode::Survival));
     assert!(!weapon_attacks_damage_held_item(GameMode::Creative));
@@ -790,6 +845,38 @@ fn attack_damage_prefers_item_component_modifiers() {
     assert_eq!(attack_damage_for_item(&facts, &items, Some(1)), 7.0);
     assert_eq!(attack_damage_for_item(&facts, &items, Some(2)), 2.0);
     assert_eq!(attack_damage_for_item(&facts, &items, None), 2.0);
+}
+
+#[test]
+fn fallback_sword_damage_uses_material_tier() {
+    use mc_data::items::ItemReport;
+
+    let reports: Vec<_> = [
+        "wooden_sword",
+        "stone_sword",
+        "iron_sword",
+        "diamond_sword",
+        "netherite_sword",
+        "golden_sword",
+        "custom_sword",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, path)| ItemReport {
+        id: mc_data::Identifier::parse(format!("minecraft:{path}")).unwrap(),
+        protocol_id: u32::try_from(index + 1).unwrap(),
+    })
+    .collect();
+    let items = ItemRegistry::from_report(&reports);
+    let facts = ItemFactsTable::default();
+
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(1)), 4.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(2)), 5.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(3)), 6.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(4)), 7.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(5)), 8.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(6)), 4.0);
+    assert_eq!(attack_damage_for_item(&facts, &items, Some(7)), 2.0);
 }
 
 #[test]

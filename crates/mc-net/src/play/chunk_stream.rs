@@ -34,6 +34,9 @@ pub(super) enum ChunkStreamStep {
 
 const INITIAL_CHUNK_MIN_RING: i32 = 2;
 const CHUNK_STAGE_SLOW_MS: u64 = 50;
+const CHUNK_BACKPRESSURE_COOLDOWN_TURNS: usize = 8;
+const CHUNK_BACKPRESSURE_MAX_COOLDOWN_TURNS: usize = 64;
+const CHUNK_BACKPRESSURE_MAX_RETRIES: usize = 16;
 
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
@@ -43,6 +46,7 @@ pub(super) struct ChunkStreamState {
     items: Arc<ItemRegistry>,
     block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
@@ -55,6 +59,8 @@ pub(super) struct ChunkStreamState {
     result_tx: mpsc::Sender<ChunkPrepareResult>,
     result_rx: mpsc::Receiver<ChunkPrepareResult>,
     ready: BTreeMap<u32, ChunkPrepareResult>,
+    pressure_retries: HashMap<(i32, i32), usize>,
+    pressure_cooldowns: HashMap<(i32, i32), usize>,
     policy: ChunkPipelinePolicy,
     result_queue_size: usize,
     center_cx: i32,
@@ -90,6 +96,8 @@ pub(super) struct ChunkStreamState {
     ring_emitted: Vec<usize>,
     emitted: usize,
     absent: usize,
+    pressure_abandoned: usize,
+    pressure_staged_by_chunk: HashMap<(i32, i32), HashSet<(i32, i32)>>,
     bytes: usize,
     dispatch_turns: usize,
     yielded_turns: usize,
@@ -111,6 +119,12 @@ pub(super) struct PreparedChunkFrame {
     pub(super) write_timing: ChunkWriteTiming,
 }
 
+#[derive(Clone, Copy)]
+struct LandSpawnSurfaces<'a> {
+    preferred: mc_world::BlockStateId,
+    fallbacks: &'a [mc_world::BlockStateId],
+}
+
 impl PreparedChunkFrame {
     fn prepared_cache_hit(&self) -> Self {
         let mut cached = self.clone();
@@ -125,7 +139,16 @@ impl PreparedChunkFrame {
 enum ChunkPrepareOutcome {
     Ready(Box<PreparedChunkFrame>),
     Absent,
+    Backpressured,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitReadyResult {
+    SentPacket,
+    DrainedNoPacket,
+    Blocked,
+    Empty,
 }
 
 struct ChunkPrepareResult {
@@ -173,6 +196,7 @@ pub(super) fn herd_uuid(chunk: (i32, i32), slot: u8) -> uuid::Uuid {
 pub(super) fn plan_passive_herd(
     chunk: &Chunk,
     land_surface: Option<mc_world::BlockStateId>,
+    land_fallback_surfaces: &[mc_world::BlockStateId],
     water: Option<&[mc_world::BlockStateId]>,
     passable: &[BlockStateId],
     rules: &mc_data::biomes::BiomeSpawnRules,
@@ -183,16 +207,20 @@ pub(super) fn plan_passive_herd(
     if passive_chunk_spawns(chunk_pos)
         && let Some(surface) = land_surface
     {
+        let surfaces = LandSpawnSurfaces {
+            preferred: surface,
+            fallbacks: land_fallback_surfaces,
+        };
         plan_group_spawns(
             chunk,
-            surface,
+            surfaces,
             passable,
             "creature",
             rules,
             entity_types,
             &mut spawns,
         );
-        plan_hostile_spawns(chunk, surface, passable, rules, entity_types, &mut spawns);
+        plan_hostile_spawns(chunk, surfaces, passable, rules, entity_types, &mut spawns);
     }
     if let Some(water) = water.filter(|states| !states.is_empty()) {
         plan_water_group_spawns(
@@ -217,7 +245,7 @@ pub(super) fn plan_passive_herd(
 
 fn plan_hostile_spawns(
     chunk: &Chunk,
-    surface: mc_world::BlockStateId,
+    surfaces: LandSpawnSurfaces<'_>,
     passable: &[BlockStateId],
     rules: &mc_data::biomes::BiomeSpawnRules,
     entity_types: &mc_data::entity_types::EntityTypeRegistry,
@@ -229,7 +257,7 @@ fn plan_hostile_spawns(
     }
     let slot_base = out.len() as u8;
     let h = herd_hash(chunk_pos, slot_base, 0x5A4F_4D42_4945_0000);
-    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surface, passable, h) else {
+    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surfaces, passable, h) else {
         return;
     };
     if !hostile_spawn_light_allows(chunk, lx, y, lz, passable) {
@@ -296,7 +324,7 @@ fn hostile_spawn_light_allows(
 
 fn plan_group_spawns(
     chunk: &Chunk,
-    surface: mc_world::BlockStateId,
+    surfaces: LandSpawnSurfaces<'_>,
     passable: &[BlockStateId],
     group: &str,
     rules: &mc_data::biomes::BiomeSpawnRules,
@@ -306,7 +334,7 @@ fn plan_group_spawns(
     let chunk_pos = (chunk.pos.x, chunk.pos.z);
     let slot_base = out.len() as u8;
     let h = herd_hash(chunk_pos, slot_base, 0x5350_4157_4E00_0000);
-    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surface, passable, h) else {
+    let Some((lx, y, lz)) = herd_spawn_surface(chunk, surfaces, passable, h) else {
         return;
     };
     let Some(biome) = chunk_biome_at(chunk, lx, y, lz) else {
@@ -455,20 +483,31 @@ fn chunk_biome_at(chunk: &Chunk, lx: u8, y: i32, lz: u8) -> Option<&mc_data::Ide
     Some(section.get(lx / 4, local_y, lz / 4))
 }
 
-fn herd_surface_y(chunk: &Chunk, lx: u8, lz: u8, surface: mc_world::BlockStateId) -> Option<i32> {
+fn herd_surface_y(
+    chunk: &Chunk,
+    lx: u8,
+    lz: u8,
+    surface: mc_world::BlockStateId,
+    fallback_surfaces: &[BlockStateId],
+    passable: &[BlockStateId],
+) -> Option<(i32, BlockStateId)> {
     if let Some(y) = chunk.highest_opaque_y(lx, lz)
         && chunk.get_block(lx, y, lz) == Some(surface)
     {
-        return Some(y);
+        return Some((y, surface));
     }
-    (mc_world::MIN_Y..mc_world::MAX_Y)
+    if let Some(y) = (mc_world::MIN_Y..mc_world::MAX_Y)
         .rev()
         .find(|&y| chunk.get_block(lx, y, lz) == Some(surface))
+    {
+        return Some((y, surface));
+    }
+    herd_land_surface_y(chunk, lx, lz, fallback_surfaces, passable)
 }
 
 fn herd_spawn_surface(
     chunk: &Chunk,
-    surface: BlockStateId,
+    surfaces: LandSpawnSurfaces<'_>,
     passable: &[BlockStateId],
     h: u64,
 ) -> Option<(u8, i32, u8)> {
@@ -476,14 +515,62 @@ fn herd_spawn_surface(
         let candidate = h.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let lx = 3 + (candidate as u8 % 10);
         let lz = 3 + ((candidate >> 8) as u8 % 10);
-        let Some(y) = herd_surface_y(chunk, lx, lz, surface) else {
+        let Some((y, actual_surface)) = herd_surface_y(
+            chunk,
+            lx,
+            lz,
+            surfaces.preferred,
+            surfaces.fallbacks,
+            passable,
+        ) else {
             continue;
         };
-        if herd_spawn_clearance(chunk, lx, y + 1, lz, surface, passable) {
+        if herd_spawn_clearance(chunk, lx, y + 1, lz, actual_surface, passable) {
+            return Some((lx, y, lz));
+        }
+    }
+    for attempt in 0..100u64 {
+        let candidate = h.wrapping_add(attempt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let lx = 3 + (candidate as u8 % 10);
+        let lz = 3 + ((candidate >> 8) as u8 % 10);
+        let Some((y, actual_surface)) = herd_surface_y(
+            chunk,
+            lx,
+            lz,
+            surfaces.preferred,
+            surfaces.fallbacks,
+            passable,
+        ) else {
+            continue;
+        };
+        if herd_spawn_minimal_clearance(chunk, lx, y + 1, lz, actual_surface, passable) {
             return Some((lx, y, lz));
         }
     }
     None
+}
+
+fn herd_land_surface_y(
+    chunk: &Chunk,
+    lx: u8,
+    lz: u8,
+    fallback_surfaces: &[BlockStateId],
+    passable: &[BlockStateId],
+) -> Option<(i32, BlockStateId)> {
+    let y = chunk.highest_opaque_y(lx, lz)?;
+    let state = chunk.get_block(lx, y, lz)?;
+    if passable.contains(&state) || !fallback_surfaces.contains(&state) {
+        return None;
+    }
+    if (y + 1..=y + 2).all(|air_y| {
+        chunk
+            .get_block(lx, air_y, lz)
+            .is_some_and(|state| passable.contains(&state))
+    }) {
+        Some((y, state))
+    } else {
+        None
+    }
 }
 
 fn safe_land_spawn_offset(bits: u64) -> f64 {
@@ -524,12 +611,68 @@ fn herd_spawn_clearance(
     true
 }
 
+fn herd_spawn_minimal_clearance(
+    chunk: &Chunk,
+    lx: u8,
+    spawn_y: i32,
+    lz: u8,
+    surface: BlockStateId,
+    passable: &[BlockStateId],
+) -> bool {
+    if chunk.get_block(lx, spawn_y - 1, lz) != Some(surface) {
+        return false;
+    }
+    if !(spawn_y..=spawn_y + 1).all(|y| {
+        chunk
+            .get_block(lx, y, lz)
+            .is_some_and(|state| passable.contains(&state))
+    }) {
+        return false;
+    }
+    [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        .into_iter()
+        .any(|(dx, dz)| {
+            let x = i32::from(lx) + dx;
+            let z = i32::from(lz) + dz;
+            (0..mc_world::SECTION_DIM as i32).contains(&x)
+                && (0..mc_world::SECTION_DIM as i32).contains(&z)
+                && chunk.get_block(x as u8, spawn_y - 1, z as u8) == Some(surface)
+                && (spawn_y..=spawn_y + 1).all(|y| {
+                    chunk
+                        .get_block(x as u8, y, z as u8)
+                        .is_some_and(|state| passable.contains(&state))
+                })
+        })
+}
+
 pub(crate) fn passive_entity_passable_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {
     blocks
         .states()
         .filter(|state| passable_block_name(state.block.id.as_str()))
         .map(|state| state.id)
         .collect()
+}
+
+pub(crate) fn passive_herd_fallback_surface_blocks(blocks: &BlockRegistry) -> Vec<BlockStateId> {
+    blocks
+        .states()
+        .filter(|state| passive_herd_fallback_surface_name(state.block.id.as_str()))
+        .map(|state| state.id)
+        .collect()
+}
+
+fn passive_herd_fallback_surface_name(name: &str) -> bool {
+    matches!(
+        name,
+        "minecraft:dirt"
+            | "minecraft:coarse_dirt"
+            | "minecraft:podzol"
+            | "minecraft:sand"
+            | "minecraft:red_sand"
+            | "minecraft:snow_block"
+            | "minecraft:moss_block"
+            | "minecraft:mycelium"
+    )
 }
 
 pub(crate) fn passable_block_name(name: &str) -> bool {
@@ -590,6 +733,7 @@ impl ChunkStreamState {
         items: Arc<ItemRegistry>,
         block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
         passive_herd_surface: Option<mc_world::BlockStateId>,
+        passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
         passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
         passive_herd_passable: Arc<Vec<BlockStateId>>,
         passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
@@ -622,6 +766,7 @@ impl ChunkStreamState {
             items,
             block_entity_types,
             passive_herd_surface,
+            passive_herd_fallback_surfaces,
             passive_herd_water,
             passive_herd_passable,
             passive_spawn_rules,
@@ -634,6 +779,8 @@ impl ChunkStreamState {
             result_tx,
             result_rx,
             ready: BTreeMap::new(),
+            pressure_retries: HashMap::new(),
+            pressure_cooldowns: HashMap::new(),
             policy,
             result_queue_size: policy.chunk_result_queue_size,
             center_cx,
@@ -669,6 +816,8 @@ impl ChunkStreamState {
             ring_emitted: vec![0; (vd + 1) as usize],
             emitted: 0,
             absent: 0,
+            pressure_abandoned: 0,
+            pressure_staged_by_chunk: HashMap::new(),
             bytes: 0,
             dispatch_turns: 0,
             yielded_turns: 0,
@@ -694,6 +843,7 @@ impl ChunkStreamState {
         if (self.center_cx, self.center_cz) == (center_cx, center_cz) {
             if (self.direction_yaw - direction_yaw).abs() >= 22.5 && !self.scheduler.is_complete() {
                 self.ready.clear();
+                self.reset_pressure_tracking();
                 self.scheduler.replace_view(prioritized_spiral(
                     center_cx,
                     center_cz,
@@ -723,6 +873,7 @@ impl ChunkStreamState {
         self.center_cz = center_cz;
         self.direction_yaw = direction_yaw;
         self.ready.clear();
+        self.reset_pressure_tracking();
         self.scheduler.replace_view(prioritized_spiral(
             center_cx,
             center_cz,
@@ -761,6 +912,7 @@ impl ChunkStreamState {
         visibility.extend(self.sessions.mark_unloaded(self.session_id, &unloads));
         dispatch_visibility_commands(visibility);
         self.ready.clear();
+        self.reset_pressure_tracking();
         self.scheduler.replace_view(prioritized_spiral(
             self.center_cx,
             self.center_cz,
@@ -801,6 +953,8 @@ impl ChunkStreamState {
         self.ring_emitted = vec![0; (self.view_distance.max(0) + 1) as usize];
         self.emitted = 0;
         self.absent = 0;
+        self.pressure_abandoned = 0;
+        self.reset_pressure_tracking();
         self.bytes = 0;
         self.dispatch_turns = 0;
         self.yielded_turns = 0;
@@ -849,20 +1003,24 @@ impl ChunkStreamState {
         W: AsyncWriteExt + Unpin,
     {
         let limit = self.policy.chunk_send_rate.max(1) as usize;
-        let mut emitted = 0usize;
-        while emitted < limit && self.emit_next_ready(writer, light_cache).await? {
-            emitted += 1;
+        let mut processed = 0usize;
+        while processed < limit {
+            match self.emit_next_ready(writer, light_cache).await? {
+                EmitReadyResult::SentPacket | EmitReadyResult::DrainedNoPacket => processed += 1,
+                EmitReadyResult::Blocked | EmitReadyResult::Empty => break,
+            }
         }
-        if emitted == limit && !self.ready.is_empty() {
+        if processed == limit && !self.ready.is_empty() {
             self.last_stop_reason = ChunkPipelineStopReason::SendBudget;
         }
-        Ok(emitted > 0)
+        Ok(processed > 0)
     }
 
     fn dispatch_available(&mut self) {
         self.dispatch_turns += 1;
         let started = Instant::now();
         let mut dispatched_this_turn = 0usize;
+        let mut cooldown_deferrals = 0usize;
         loop {
             if self.scheduler.in_flight_len() >= self.result_queue_size {
                 self.last_stop_reason = ChunkPipelineStopReason::QueueFull;
@@ -900,6 +1058,14 @@ impl ChunkStreamState {
                 self.dispatched += 1;
                 continue;
             }
+            if self.defer_for_pressure_cooldown(request) {
+                cooldown_deferrals += 1;
+                if cooldown_deferrals >= self.scheduler.queued_len().max(1) {
+                    self.last_stop_reason = ChunkPipelineStopReason::QueueEmpty;
+                    break;
+                }
+                continue;
+            }
             let world = Arc::clone(&self.world);
             let biomes = Arc::clone(&self.biomes);
             let blocks = Arc::clone(&self.blocks);
@@ -907,6 +1073,7 @@ impl ChunkStreamState {
             let items = Arc::clone(&self.items);
             let block_entity_types = Arc::clone(&self.block_entity_types);
             let passive_herd_surface = self.passive_herd_surface;
+            let passive_herd_fallback_surfaces = Arc::clone(&self.passive_herd_fallback_surfaces);
             let passive_herd_water = Arc::clone(&self.passive_herd_water);
             let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
             let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
@@ -925,6 +1092,7 @@ impl ChunkStreamState {
                     items,
                     block_entity_types,
                     passive_herd_surface,
+                    passive_herd_fallback_surfaces,
                     passive_herd_water,
                     passive_herd_passable,
                     passive_spawn_rules,
@@ -962,12 +1130,12 @@ impl ChunkStreamState {
         &mut self,
         writer: &mut W,
         light_cache: &mut LightCache,
-    ) -> Result<bool, ConnectionError>
+    ) -> Result<EmitReadyResult, ConnectionError>
     where
         W: AsyncWriteExt + Unpin,
     {
         let Some((_, result)) = self.ready.pop_first() else {
-            return Ok(false);
+            return Ok(EmitReadyResult::Empty);
         };
         let request = result.request;
         let cx = request.chunk_x;
@@ -977,10 +1145,13 @@ impl ChunkStreamState {
         if result.fetch_ms >= CHUNK_STAGE_SLOW_MS {
             self.slow_fetch_chunks += 1;
         }
-        self.staged.extend(result.staged);
 
         match result.outcome {
             ChunkPrepareOutcome::Ready(prepared) => {
+                self.pressure_retries.remove(&(cx, cz));
+                self.pressure_cooldowns.remove(&(cx, cz));
+                self.clear_pressure_staged((cx, cz));
+                self.staged.extend(result.staged);
                 if let Some(light) = prepared.light.clone() {
                     light_cache.insert(ChunkPos { x: cx, z: cz }, light);
                 }
@@ -1000,16 +1171,130 @@ impl ChunkStreamState {
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
             ChunkPrepareOutcome::Absent => {
+                self.pressure_retries.remove(&(cx, cz));
+                self.pressure_cooldowns.remove(&(cx, cz));
+                self.clear_pressure_staged((cx, cz));
+                self.staged.extend(result.staged);
                 self.absent += 1;
                 info!(cx, cz, "no chunk in storage");
+                self.scheduler.mark_finished(request);
+                return Ok(EmitReadyResult::DrainedNoPacket);
+            }
+            ChunkPrepareOutcome::Backpressured => {
+                self.set_pressure_staged((cx, cz), &result.staged);
+                let retries = self.pressure_retries.entry((cx, cz)).or_default();
+                *retries += 1;
+                if *retries > CHUNK_BACKPRESSURE_MAX_RETRIES {
+                    self.pressure_retries.remove(&(cx, cz));
+                    self.pressure_cooldowns.remove(&(cx, cz));
+                    self.clear_pressure_staged((cx, cz));
+                    self.pressure_abandoned += 1;
+                    warn!(
+                        cx,
+                        cz,
+                        retries = CHUNK_BACKPRESSURE_MAX_RETRIES,
+                        pressure_abandoned = self.pressure_abandoned,
+                        "chunk preparation abandoned after repeated dirty chunk cache pressure"
+                    );
+                    self.scheduler.mark_finished(request);
+                    return Ok(EmitReadyResult::DrainedNoPacket);
+                }
+                let cooldown = (*retries * CHUNK_BACKPRESSURE_COOLDOWN_TURNS)
+                    .min(CHUNK_BACKPRESSURE_MAX_COOLDOWN_TURNS);
+                self.pressure_cooldowns.insert((cx, cz), cooldown);
+                if !self.scheduler.defer(request) {
+                    self.pressure_retries.remove(&(cx, cz));
+                    self.pressure_cooldowns.remove(&(cx, cz));
+                    self.clear_pressure_staged((cx, cz));
+                    self.pressure_abandoned += 1;
+                    warn!(
+                        cx,
+                        cz,
+                        pressure_abandoned = self.pressure_abandoned,
+                        "dirty chunk pressure defer failed after request left in-flight set"
+                    );
+                    return Ok(EmitReadyResult::Blocked);
+                }
+                info!(
+                    cx,
+                    cz,
+                    retry = *retries,
+                    cooldown_turns = cooldown,
+                    "chunk preparation deferred by dirty chunk cache pressure"
+                );
+                return Ok(EmitReadyResult::Blocked);
             }
             ChunkPrepareOutcome::Failed(err) => {
+                self.pressure_retries.remove(&(cx, cz));
+                self.pressure_cooldowns.remove(&(cx, cz));
+                self.clear_pressure_staged((cx, cz));
                 warn!(cx, cz, error = %err, "chunk encode failed; skipping");
+                self.scheduler.mark_finished(request);
+                return Ok(EmitReadyResult::DrainedNoPacket);
             }
         }
 
         self.scheduler.mark_finished(request);
-        Ok(true)
+        Ok(EmitReadyResult::SentPacket)
+    }
+
+    fn defer_for_pressure_cooldown(&mut self, request: ChunkRequest) -> bool {
+        let coord = (request.chunk_x, request.chunk_z);
+        let Some(turns) = self.pressure_cooldowns.get_mut(&coord) else {
+            return false;
+        };
+        if *turns == 0 {
+            self.pressure_cooldowns.remove(&coord);
+            return false;
+        }
+        *turns -= 1;
+        if *turns == 0 {
+            self.pressure_cooldowns.remove(&coord);
+        }
+        if !self.scheduler.defer(request) {
+            self.pressure_cooldowns.remove(&coord);
+            self.pressure_retries.remove(&coord);
+            self.clear_pressure_staged(coord);
+            return false;
+        }
+        true
+    }
+
+    fn set_pressure_staged(&mut self, coord: (i32, i32), staged: &[(i32, i32)]) {
+        self.pressure_staged_by_chunk
+            .insert(coord, staged.iter().copied().collect());
+    }
+
+    fn clear_pressure_staged(&mut self, coord: (i32, i32)) {
+        self.pressure_staged_by_chunk.remove(&coord);
+    }
+
+    fn reset_pressure_tracking(&mut self) {
+        self.pressure_retries.clear();
+        self.pressure_cooldowns.clear();
+        self.pressure_staged_by_chunk.clear();
+    }
+
+    fn pressure_staged_count(&self) -> usize {
+        self.pressure_staged_by_chunk
+            .values()
+            .flat_map(|staged| staged.iter().copied())
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    #[cfg(test)]
+    fn pressure_staged_contains(&self, coord: (i32, i32)) -> bool {
+        self.pressure_staged_by_chunk
+            .values()
+            .any(|staged| staged.contains(&coord))
+    }
+
+    #[cfg(test)]
+    fn pressure_staged_is_empty(&self) -> bool {
+        self.pressure_staged_by_chunk
+            .values()
+            .all(HashSet::is_empty)
     }
 
     fn record_stage_maxima(
@@ -1084,6 +1369,9 @@ impl ChunkStreamState {
             staged = self.staged.len(),
             emitted = self.emitted,
             absent = self.absent,
+            pressure_abandoned = self.pressure_abandoned,
+            pressure_staged = self.pressure_staged_count(),
+            degraded_delivery = self.pressure_abandoned > 0,
             bytes = self.bytes,
             framed_bytes = self.framed_bytes,
             fetch_ms = self.fetch_ms,
@@ -1234,6 +1522,7 @@ async fn prepare_chunk_request(
     items: Arc<ItemRegistry>,
     block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_water: Arc<Vec<mc_world::BlockStateId>>,
     passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
@@ -1245,7 +1534,7 @@ async fn prepare_chunk_request(
     if !is_active_request(request, &active_generation) {
         return stale_chunk_result(request);
     }
-    let (centre, neighbourhood, staged, fetch_ms) = match load_chunk_neighbourhood(
+    let (centre, neighbourhood, staged, fetch_ms, backpressured) = match load_chunk_neighbourhood(
         Arc::clone(&world),
         request.chunk_x,
         request.chunk_z,
@@ -1268,6 +1557,17 @@ async fn prepare_chunk_request(
     };
 
     let Some(centre) = centre else {
+        if backpressured {
+            if let Err(err) = flush_dirty_chunks_for_pressure(Arc::clone(&world), request).await {
+                warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
+            }
+            return ChunkPrepareResult {
+                request,
+                fetch_ms,
+                staged,
+                outcome: ChunkPrepareOutcome::Backpressured,
+            };
+        }
         return ChunkPrepareResult {
             request,
             fetch_ms,
@@ -1275,6 +1575,18 @@ async fn prepare_chunk_request(
             outcome: ChunkPrepareOutcome::Absent,
         };
     };
+
+    if backpressured {
+        if let Err(err) = flush_dirty_chunks_for_pressure(Arc::clone(&world), request).await {
+            warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
+        }
+        return ChunkPrepareResult {
+            request,
+            fetch_ms,
+            staged,
+            outcome: ChunkPrepareOutcome::Backpressured,
+        };
+    }
 
     if !is_active_request(request, &active_generation) {
         return stale_chunk_result(request);
@@ -1309,6 +1621,7 @@ async fn prepare_chunk_request(
                     block_entity_types.as_ref(),
                     Some(table),
                     passive_herd_surface,
+                    passive_herd_fallback_surfaces.as_ref(),
                     passive_herd_water.as_slice(),
                     passive_herd_passable.as_ref(),
                     passive_spawn_rules.as_ref(),
@@ -1328,6 +1641,7 @@ async fn prepare_chunk_request(
                 block_entity_types.as_ref(),
                 None,
                 passive_herd_surface,
+                passive_herd_fallback_surfaces.as_ref(),
                 passive_herd_water.as_slice(),
                 passive_herd_passable.as_ref(),
                 passive_spawn_rules.as_ref(),
@@ -1368,11 +1682,57 @@ fn stale_chunk_result(request: ChunkRequest) -> ChunkPrepareResult {
     }
 }
 
+async fn flush_dirty_chunks_for_pressure(
+    world: WorldHandle,
+    request: ChunkRequest,
+) -> Result<usize, String> {
+    let plan = {
+        let storage = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::ChunkPrepare,
+            "chunk pressure flush plan",
+            Instant::now(),
+            world.lock().await,
+        );
+        if storage.world_root().is_none() || !storage.dirty_chunk_cache_saturated() {
+            return Ok(0);
+        }
+        storage.plan_dirty_flush().map_err(|err| err.to_string())?
+    };
+    if plan.is_empty() {
+        return Ok(0);
+    }
+    let planned_chunks = plan.chunk_count();
+    let commit = tokio::task::spawn_blocking(move || plan.write())
+        .await
+        .map_err(|err| err.to_string())?
+        .map_err(|err| err.to_string())?;
+    let flushed = {
+        let mut storage = crate::lock_metrics::timed_guard(
+            crate::lock_metrics::LockMetricKind::ChunkPrepare,
+            "chunk pressure flush commit",
+            Instant::now(),
+            world.lock().await,
+        );
+        storage
+            .commit_dirty_flush(commit)
+            .map_err(|err| err.to_string())?
+    };
+    info!(
+        cx = request.chunk_x,
+        cz = request.chunk_z,
+        planned_chunks,
+        flushed,
+        "dirty pressure flush completed"
+    );
+    Ok(flushed)
+}
+
 type LoadedNeighbourhood = (
     Option<Arc<Chunk>>,
     [[Option<Arc<Chunk>>; 3]; 3],
     Vec<(i32, i32)>,
     u64,
+    bool,
 );
 
 async fn load_chunk_neighbourhood(
@@ -1390,6 +1750,7 @@ async fn load_chunk_neighbourhood(
             std::array::from_fn(|_| std::array::from_fn(|_| None)),
             Vec::new(),
             0,
+            false,
         ));
     }
     let fetch_started = Instant::now();
@@ -1398,6 +1759,7 @@ async fn load_chunk_neighbourhood(
     let mut centre = None;
     let mut staged = Vec::new();
     let mut disk_plan = None;
+    let mut backpressured = false;
 
     let generator = {
         let storage = crate::lock_metrics::timed_guard(
@@ -1412,6 +1774,7 @@ async fn load_chunk_neighbourhood(
                 neighbourhood,
                 staged,
                 fetch_started.elapsed().as_millis() as u64,
+                false,
             ));
         }
         match storage.plan_chunk_snapshot_without_generation(ChunkPos { x: cx, z: cz }) {
@@ -1463,16 +1826,18 @@ async fn load_chunk_neighbourhood(
                             neighbourhood,
                             staged,
                             fetch_started.elapsed().as_millis() as u64,
+                            false,
                         ));
                     }
-                    storage.commit_chunk_snapshot(ChunkPos { x: cx, z: cz }, chunk)
+                    storage.try_commit_chunk_snapshot(ChunkPos { x: cx, z: cz }, chunk)
                 };
                 match chunk {
-                    Ok(chunk) => {
+                    Ok(Some(chunk)) => {
                         centre = Some(Arc::clone(&chunk));
                         neighbourhood[1][1] = Some(chunk);
                         staged.push((cx, cz));
                     }
+                    Ok(None) => backpressured = true,
                     Err(err) => warn!(cx, cz, error = %err, "chunk commit failed; skipping"),
                 }
             }
@@ -1482,8 +1847,27 @@ async fn load_chunk_neighbourhood(
     }
 
     if centre.is_none()
+        && !backpressured
         && let Some(generator) = generator.as_ref()
     {
+        let can_cache = {
+            let storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                "chunk prepare generation pressure check",
+                Instant::now(),
+                world.lock().await,
+            );
+            storage.can_cache_new_chunk(ChunkPos { x: cx, z: cz })
+        };
+        if !can_cache {
+            return Ok((
+                None,
+                neighbourhood,
+                staged,
+                fetch_started.elapsed().as_millis() as u64,
+                true,
+            ));
+        }
         let chunk = match generate_fresh_chunk(
             Arc::clone(generator),
             ChunkPos { x: cx, z: cz },
@@ -1500,6 +1884,7 @@ async fn load_chunk_neighbourhood(
                     neighbourhood,
                     staged,
                     fetch_started.elapsed().as_millis() as u64,
+                    false,
                 ));
             }
             Err(err) => {
@@ -1509,6 +1894,7 @@ async fn load_chunk_neighbourhood(
                     neighbourhood,
                     staged,
                     fetch_started.elapsed().as_millis() as u64,
+                    false,
                 ));
             }
         };
@@ -1525,10 +1911,13 @@ async fn load_chunk_neighbourhood(
                     neighbourhood,
                     staged,
                     fetch_started.elapsed().as_millis() as u64,
+                    false,
                 ));
             }
-            if let Err(err) = storage.insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
-                warn!(cx, cz, error = %err, "generated chunk insert failed; skipping");
+            match storage.try_insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
+                Ok(true) => {}
+                Ok(false) => backpressured = true,
+                Err(err) => warn!(cx, cz, error = %err, "generated chunk insert failed; skipping"),
             }
             storage.cached_chunk_snapshot(ChunkPos { x: cx, z: cz })
         };
@@ -1564,6 +1953,7 @@ async fn load_chunk_neighbourhood(
                             neighbourhood,
                             staged,
                             fetch_started.elapsed().as_millis() as u64,
+                            false,
                         ));
                     }
                     match storage.plan_chunk_snapshot_without_generation(pos) {
@@ -1591,6 +1981,24 @@ async fn load_chunk_neighbourhood(
                     }
                 };
                 if chunk.is_none() {
+                    let can_generate = {
+                        let storage = crate::lock_metrics::timed_guard(
+                            crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                            "chunk prepare neighbour generation pressure check",
+                            Instant::now(),
+                            world.lock().await,
+                        );
+                        storage.can_cache_new_chunk(pos)
+                    };
+                    if !can_generate {
+                        return Ok((
+                            centre,
+                            neighbourhood,
+                            staged,
+                            fetch_started.elapsed().as_millis() as u64,
+                            true,
+                        ));
+                    }
                     chunk = match generate_fresh_chunk(
                         Arc::clone(generator),
                         pos,
@@ -1623,14 +2031,24 @@ async fn load_chunk_neighbourhood(
                             neighbourhood,
                             staged,
                             fetch_started.elapsed().as_millis() as u64,
+                            false,
                         ));
                     }
-                    storage.commit_chunk_snapshot(pos, chunk)
+                    storage.try_commit_chunk_snapshot(pos, chunk)
                 };
                 match committed {
-                    Ok(chunk) => {
+                    Ok(Some(chunk)) => {
                         neighbourhood[dz][dx] = Some(chunk);
                         staged.push((ncx, ncz));
+                    }
+                    Ok(None) => {
+                        return Ok((
+                            centre,
+                            neighbourhood,
+                            staged,
+                            fetch_started.elapsed().as_millis() as u64,
+                            true,
+                        ));
                     }
                     Err(err) => {
                         warn!(cx = ncx, cz = ncz, error = %err, "neighbour chunk commit failed; lighting may be partial")
@@ -1645,6 +2063,7 @@ async fn load_chunk_neighbourhood(
         neighbourhood,
         staged,
         fetch_started.elapsed().as_millis() as u64,
+        backpressured,
     ))
 }
 
@@ -1723,6 +2142,7 @@ fn build_chunk_packet(
     block_entity_types: &mc_data::block_entity_types::BlockEntityTypeRegistry,
     block_light: Option<&BlockLightTable>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
+    passive_herd_fallback_surfaces: &[mc_world::BlockStateId],
     passive_herd_water: &[mc_world::BlockStateId],
     passive_herd_passable: &[BlockStateId],
     passive_spawn_rules: &mc_data::biomes::BiomeSpawnRules,
@@ -1797,6 +2217,7 @@ fn build_chunk_packet(
     let herd_spawns = plan_passive_herd(
         centre,
         passive_herd_surface,
+        passive_herd_fallback_surfaces,
         Some(passive_herd_water),
         passive_herd_passable,
         passive_spawn_rules,
@@ -1856,6 +2277,119 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChunkPipelineGeneration;
+    use mc_data::Identifier;
+    use mc_data::blocks::{BlockReport, BlockStateReport};
+    use mc_protocol::frame::Compression;
+    use mc_world::{BlockStateId, ChunkGenerator, ChunkPos, WorldStorage};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Mutex;
+
+    struct CountingGenerator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ChunkGenerator for CountingGenerator {
+        fn generate(&self, pos: ChunkPos) -> Chunk {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            Chunk::empty(
+                pos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            )
+        }
+    }
+
+    fn test_biome_registry() -> Registry {
+        Registry {
+            id: Identifier::parse("minecraft:worldgen/biome").unwrap(),
+            entries: vec![Identifier::parse("minecraft:plains").unwrap()],
+        }
+    }
+
+    fn air_block_registry() -> BlockRegistry {
+        BlockRegistry::from_report(&[BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![BlockStateReport {
+                id: 0,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        }])
+        .expect("air registry builds")
+    }
+
+    #[test]
+    fn herd_surface_prefers_grass_before_fallbacks() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let air = BlockStateId(0);
+        let grass = BlockStateId(1);
+        let dirt = BlockStateId(2);
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains);
+        chunk.set_block(8, 63, 8, dirt).unwrap();
+        chunk.set_block(8, 64, 8, grass).unwrap();
+
+        assert_eq!(
+            herd_surface_y(&chunk, 8, 8, grass, &[dirt], &[air]),
+            Some((64, grass))
+        );
+    }
+
+    #[test]
+    fn herd_surface_fallback_allows_explicit_generated_land() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let air = BlockStateId(0);
+        let grass = BlockStateId(1);
+        let dirt = BlockStateId(2);
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains);
+        chunk.set_block(8, 64, 8, dirt).unwrap();
+        chunk
+            .highest_opaque
+            .set(8, 8, (64 - mc_world::MIN_Y + 1) as u32);
+
+        assert_eq!(
+            herd_surface_y(&chunk, 8, 8, grass, &[dirt], &[air]),
+            Some((64, dirt))
+        );
+    }
+
+    #[test]
+    fn herd_surface_fallback_rejects_unnatural_tops() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let air = BlockStateId(0);
+        let grass = BlockStateId(1);
+        let dirt = BlockStateId(2);
+        for rejected in [BlockStateId(3), BlockStateId(4), BlockStateId(5)] {
+            let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, plains.clone());
+            chunk.set_block(8, 64, 8, rejected).unwrap();
+            chunk
+                .highest_opaque
+                .set(8, 8, (64 - mc_world::MIN_Y + 1) as u32);
+
+            assert_eq!(herd_surface_y(&chunk, 8, 8, grass, &[dirt], &[air]), None);
+        }
+        assert!(!passive_herd_fallback_surface_name("minecraft:stone"));
+        assert!(!passive_herd_fallback_surface_name("minecraft:oak_planks"));
+        assert!(!passive_herd_fallback_surface_name("minecraft:oak_leaves"));
+    }
+
+    #[test]
+    fn herd_surface_fallback_names_cover_natural_generated_land() {
+        for name in [
+            "minecraft:dirt",
+            "minecraft:coarse_dirt",
+            "minecraft:podzol",
+            "minecraft:sand",
+            "minecraft:red_sand",
+            "minecraft:snow_block",
+            "minecraft:moss_block",
+            "minecraft:mycelium",
+        ] {
+            assert!(passive_herd_fallback_surface_name(name));
+        }
+    }
 
     #[test]
     fn prepared_cache_hit_drops_historical_cpu_and_encode_timings() {
@@ -1890,5 +2424,632 @@ mod tests {
         assert_eq!(cached.write_timing.frame_ms, 0);
         assert_eq!(cached.write_timing.socket_write_ms, 0);
         assert_eq!(cached.write_timing.framed_bytes, 17);
+    }
+
+    #[tokio::test]
+    async fn dirty_pressure_defers_generated_stream_chunk_instead_of_absent() {
+        let registry = Arc::new(air_block_registry());
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut storage = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1)
+            .with_generator(Arc::new(CountingGenerator {
+                calls: Arc::clone(&calls),
+            }));
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let world = Arc::new(Mutex::new(storage));
+        let request = ChunkRequest {
+            chunk_x: 1,
+            chunk_z: 0,
+            priority: ChunkPriority {
+                ring: 0,
+                sequence: 0,
+            },
+            generation: ChunkPipelineGeneration(1),
+        };
+
+        let (centre, _neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+            Arc::clone(&world),
+            1,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            request,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(centre.is_none());
+        assert_eq!(staged, vec![(0, 0)]);
+        assert!(backpressured);
+        assert_eq!(world.lock().await.cache_len(), 1);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn absent_disk_chunk_counts_absent_even_under_dirty_pressure_without_generator() {
+        let registry = Arc::new(air_block_registry());
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut storage = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1);
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let world = Arc::new(Mutex::new(storage));
+        let request = ChunkRequest {
+            chunk_x: 1,
+            chunk_z: 0,
+            priority: ChunkPriority {
+                ring: 0,
+                sequence: 0,
+            },
+            generation: ChunkPipelineGeneration(1),
+        };
+
+        let (centre, _neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+            Arc::clone(&world),
+            1,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            request,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(centre.is_none());
+        assert_eq!(staged, vec![(0, 0)]);
+        assert!(!backpressured);
+        assert_eq!(world.lock().await.cache_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn neighbour_dirty_pressure_backpressures_full_neighbourhood() {
+        let registry = Arc::new(air_block_registry());
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut storage = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1)
+            .with_generator(Arc::new(CountingGenerator {
+                calls: Arc::clone(&calls),
+            }));
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let world = Arc::new(Mutex::new(storage));
+        let request = ChunkRequest {
+            chunk_x: 0,
+            chunk_z: 0,
+            priority: ChunkPriority {
+                ring: 0,
+                sequence: 0,
+            },
+            generation: ChunkPipelineGeneration(1),
+        };
+
+        let (centre, neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+            Arc::clone(&world),
+            0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            request,
+            Arc::new(AtomicU64::new(1)),
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(centre.is_some());
+        assert!(neighbourhood[1][1].is_some());
+        assert_eq!(staged, vec![(0, 0)]);
+        assert!(backpressured);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn stream_step_retains_backpressured_chunk_without_absent_success() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut storage = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1)
+            .with_generator(Arc::new(CountingGenerator {
+                calls: Arc::clone(&calls),
+            }));
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let world = Arc::new(Mutex::new(storage));
+        let policy = ChunkPipelinePolicy {
+            chunk_send_rate: 1,
+            chunk_prepare_batch_size: 1,
+            chunk_result_queue_size: 1,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        let request = stream.scheduler.poll_next().expect("request");
+        let result = prepare_chunk_request(
+            request,
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            ChunkPipelineResources::with_limits(1, 1),
+            Arc::clone(&stream.active_generation),
+        )
+        .await;
+        assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
+        stream.accept_result(result);
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::Blocked
+        );
+
+        assert!(!stream.is_complete());
+        assert!(stream.pressure_retries.contains_key(&(1, 0)));
+        assert_eq!(stream.absent, 0);
+        assert_eq!(stream.emitted, 0);
+        assert_eq!(stream.pressure_abandoned, 0);
+        assert!(stream.staged.is_empty());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        assert_eq!(world.lock().await.cache_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backpressured_result_counts_staged_chunks_without_marking_success() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            staged: vec![(0, 0)],
+            outcome: ChunkPrepareOutcome::Backpressured,
+        });
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::Blocked
+        );
+
+        assert_eq!(stream.pressure_staged_count(), 1);
+        assert!(stream.pressure_staged_contains((0, 0)));
+        assert_eq!(stream.pressure_abandoned, 0);
+        assert_eq!(stream.absent, 0);
+        assert_eq!(stream.emitted, 0);
+        assert!(stream.staged.is_empty());
+        assert_eq!(stream.scheduler.queued_len(), 1);
+        assert_eq!(stream.scheduler.finished_len(), 0);
+
+        for _ in 0..CHUNK_BACKPRESSURE_MAX_RETRIES {
+            let request = stream.scheduler.poll_next().expect("deferred request");
+            stream.accept_result(ChunkPrepareResult {
+                request,
+                fetch_ms: 0,
+                staged: vec![(0, 0)],
+                outcome: ChunkPrepareOutcome::Backpressured,
+            });
+            let _ = stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(stream.pressure_abandoned, 1);
+        assert_eq!(stream.scheduler.finished_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn backpressured_result_is_not_send_progress() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            staged: vec![(0, 0)],
+            outcome: ChunkPrepareOutcome::Backpressured,
+        });
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        assert_eq!(stream.yielded_turns, 0);
+        assert_eq!(
+            stream.step(&mut writer, &mut light_cache).await.unwrap(),
+            ChunkStreamStep::Progress
+        );
+
+        assert_eq!(stream.yielded_turns, 1);
+        assert_eq!(stream.emitted, 0);
+        assert_eq!(stream.scheduler.queued_len(), 1);
+        assert_eq!(stream.scheduler.finished_len(), 0);
+
+        assert!(stream.replan_center(1, 0, 45.0).is_empty());
+        assert!(stream.pressure_retries.is_empty());
+        assert!(stream.pressure_staged_is_empty());
+    }
+
+    #[tokio::test]
+    async fn pressure_cooldown_does_not_block_later_dispatches() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 2,
+            chunk_result_queue_size: 2,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            1,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        stream.pressure_cooldowns.insert((0, 0), 1);
+
+        stream.dispatch_available();
+
+        assert!(stream.scheduler.in_flight_len() >= 1);
+        assert!(!stream.pressure_cooldowns.contains_key(&(0, 0)));
+    }
+
+    #[tokio::test]
+    async fn absent_result_drains_without_counting_as_backpressure_yield() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Absent,
+        });
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        assert_eq!(
+            stream.step(&mut writer, &mut light_cache).await.unwrap(),
+            ChunkStreamStep::Complete
+        );
+
+        assert_eq!(stream.absent, 1);
+        assert_eq!(stream.emitted, 0);
+        assert_eq!(stream.yielded_turns, 0);
+        assert_eq!(stream.pressure_abandoned, 0);
+    }
+
+    #[tokio::test]
+    async fn successful_retry_clears_pressure_staged_for_chunk() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            staged: vec![(0, 0), (1, 0)],
+            outcome: ChunkPrepareOutcome::Backpressured,
+        });
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::Blocked
+        );
+        assert!(stream.pressure_staged_contains((0, 0)));
+        assert!(stream.pressure_staged_contains((1, 0)));
+
+        let request = stream.scheduler.poll_next().expect("deferred request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            staged: vec![(0, 0)],
+            outcome: ChunkPrepareOutcome::Ready(Box::new(PreparedChunkFrame {
+                frame: Bytes::new(),
+                light: None,
+                herd_spawns: Vec::new(),
+                packet_data_len: 0,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            })),
+        });
+
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::SentPacket
+        );
+        assert!(stream.pressure_staged_is_empty());
+        assert!(stream.pressure_staged_by_chunk.is_empty());
+        assert_eq!(stream.emitted, 1);
+    }
+
+    #[tokio::test]
+    async fn stream_recovers_deferred_chunk_after_dirty_pressure_clears() {
+        let registry = Arc::new(air_block_registry());
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("region")).unwrap();
+        let mut storage = WorldStorage::open_with_capacity(temp.path(), Arc::clone(&registry), 1)
+            .unwrap()
+            .with_generator(Arc::new(CountingGenerator {
+                calls: Arc::clone(&calls),
+            }));
+        storage
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let world = Arc::new(Mutex::new(storage));
+        let policy = ChunkPipelinePolicy {
+            chunk_send_rate: 1,
+            chunk_prepare_batch_size: 1,
+            chunk_result_queue_size: 1,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            1,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        let request = stream.scheduler.poll_next().expect("request");
+        let result = prepare_chunk_request(
+            request,
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            ChunkPipelineResources::with_limits(1, 1),
+            Arc::clone(&stream.active_generation),
+        )
+        .await;
+        assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
+        stream.accept_result(result);
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::Blocked
+        );
+
+        assert_eq!(stream.emitted, 0);
+        assert_eq!(stream.pressure_abandoned, 0);
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        {
+            let storage = world.lock().await;
+            assert_eq!(storage.dirty_count(), 0);
+        }
+
+        for _ in 0..1024 {
+            if stream.step(&mut writer, &mut light_cache).await.unwrap()
+                == ChunkStreamStep::Complete
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        assert!(stream.is_complete());
+        assert_eq!(stream.emitted, 1);
+        assert_eq!(stream.absent, 0);
+        assert_eq!(stream.pressure_abandoned, 0);
+        assert!(stream.pressure_staged_is_empty());
+        assert!(stream.pressure_staged_by_chunk.is_empty());
+        assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 }

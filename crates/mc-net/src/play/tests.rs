@@ -32,6 +32,253 @@ fn clientbound_session_world_time_uses_current_tick_with_saturation() {
     assert_eq!(clientbound_world_time(u64::MAX).game_time, i64::MAX);
 }
 
+#[test]
+fn text_component_nbt_reports_oversized_text_instead_of_panicking() {
+    let oversized = "x".repeat(usize::from(u16::MAX) + 1);
+
+    let err = text_component_nbt(&oversized).expect_err("oversized NBT string should fail");
+
+    assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
+}
+
+#[test]
+fn container_title_nbt_reports_oversized_text_instead_of_panicking() {
+    let oversized = "x".repeat(usize::from(u16::MAX) + 1);
+
+    let err = chest_menu_title_nbt(&oversized).expect_err("oversized NBT title should fail");
+
+    assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
+}
+
+#[test]
+fn teleport_id_allocator_advances_and_wraps_to_positive_ids() {
+    let mut next = 2;
+
+    assert_eq!(next_player_teleport_id(&mut next), 2);
+    assert_eq!(next_player_teleport_id(&mut next), 3);
+    assert_eq!(next, 4);
+
+    next = i32::MAX;
+    assert_eq!(next_player_teleport_id(&mut next), i32::MAX);
+    assert_eq!(next_player_teleport_id(&mut next), 1);
+}
+
+#[test]
+fn pending_teleport_confirm_clears_only_matching_id() {
+    let pose = PlayerPose::new(1.0, 65.0, 2.0);
+    let mut pending = Some(PendingTeleport::new(7, pose));
+
+    assert_eq!(
+        confirm_pending_teleport(&mut pending, 8),
+        TeleportConfirmResult::Mismatched { expected: 7 }
+    );
+    assert!(pending.is_some());
+
+    assert_eq!(
+        confirm_pending_teleport(&mut pending, 7),
+        TeleportConfirmResult::Confirmed
+    );
+    assert!(pending.is_none());
+}
+
+#[test]
+fn pending_teleport_reports_unexpected_confirm_without_pending_state() {
+    let mut pending = None;
+
+    assert_eq!(
+        confirm_pending_teleport(&mut pending, 1),
+        TeleportConfirmResult::Unexpected
+    );
+    assert!(pending.is_none());
+}
+
+#[tokio::test]
+async fn pending_teleport_movement_gate_resyncs_then_suppresses_duplicates() {
+    let mut pose = PlayerPose::new(10.0, 70.0, -3.0);
+    pose.yaw = 90.0;
+    pose.pitch = 12.5;
+    let mut pending = Some(PendingTeleport::new(12, pose));
+    let mut writer = Vec::new();
+
+    for expected_resyncs in 1..=MAX_PENDING_TELEPORT_RESYNCS {
+        assert!(
+            guard_pending_teleport_movement(
+                &mut pending,
+                &mut writer,
+                Compression::Disabled,
+                "ServerboundMovePlayerPos"
+            )
+            .await
+            .unwrap()
+        );
+        let resync = pending.expect("pending teleport remains gated");
+        assert_eq!(resync.id, 12);
+        assert_eq!(resync.pose.x, 10.0);
+        assert_eq!(resync.pose.y, 70.0);
+        assert_eq!(resync.pose.z, -3.0);
+        assert_eq!(resync.pose.yaw, 90.0);
+        assert_eq!(resync.pose.pitch, 12.5);
+        assert_eq!(resync.resyncs_sent, expected_resyncs);
+    }
+
+    assert!(
+        guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos"
+        )
+        .await
+        .unwrap()
+    );
+    let suppressed = pending.expect("pending teleport remains gated");
+    assert_eq!(suppressed.id, 12);
+
+    let packets = decode_player_position_sync_packets(&writer);
+    assert_eq!(packets.len(), usize::from(MAX_PENDING_TELEPORT_RESYNCS));
+    assert!(packets.iter().all(|packet| packet.teleport_id == 12));
+    assert_eq!(suppressed.resyncs_sent, MAX_PENDING_TELEPORT_RESYNCS);
+}
+
+#[tokio::test]
+async fn pending_teleport_confirm_behaviour_after_unconfirmed_movement() {
+    let pose = PlayerPose::new(1.0, 65.0, 2.0);
+    let mut pending = Some(PendingTeleport::new(7, pose));
+    let mut writer = Vec::new();
+
+    assert!(
+        guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos"
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(pending.unwrap().resyncs_sent, 1);
+
+    assert_eq!(
+        confirm_pending_teleport(&mut pending, 8),
+        TeleportConfirmResult::Mismatched { expected: 7 }
+    );
+    assert_eq!(pending.unwrap().resyncs_sent, 1);
+
+    assert_eq!(
+        confirm_pending_teleport(&mut pending, 7),
+        TeleportConfirmResult::Confirmed
+    );
+    assert!(pending.is_none());
+    assert!(
+        !guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos"
+        )
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn pending_teleport_resync_writes_authoritative_position_packet() {
+    let mut pose = PlayerPose::new(10.0, 70.0, -3.0);
+    pose.yaw = 90.0;
+    pose.pitch = 12.5;
+    let pending = PendingTeleport::new(12, pose);
+    let mut writer = Vec::new();
+
+    resync_pending_teleport(
+        &mut writer,
+        Compression::Disabled,
+        pending,
+        "ServerboundMovePlayerPos",
+    )
+    .await
+    .unwrap();
+
+    let packets = decode_player_position_sync_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].teleport_id, 12);
+    assert_eq!(packets[0].x, 10.0);
+    assert_eq!(packets[0].y, 70.0);
+    assert_eq!(packets[0].z, -3.0);
+    assert_eq!(packets[0].yaw, 90.0);
+    assert_eq!(packets[0].pitch, 12.5);
+    assert_eq!(packets[0].relative_flags, 0);
+}
+
+#[tokio::test]
+async fn pending_teleport_movement_guard_suppresses_after_resync_budget() {
+    let pose = PlayerPose::new(10.0, 70.0, -3.0);
+    let mut pending = Some(PendingTeleport::new(12, pose));
+    let mut writer = Vec::new();
+
+    for _ in 0..MAX_PENDING_TELEPORT_RESYNCS {
+        assert!(
+            guard_pending_teleport_movement(
+                &mut pending,
+                &mut writer,
+                Compression::Disabled,
+                "ServerboundMovePlayerPos"
+            )
+            .await
+            .unwrap()
+        );
+    }
+
+    assert!(
+        guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos",
+        )
+        .await
+        .unwrap()
+    );
+
+    assert_eq!(pending.unwrap().resyncs_sent, MAX_PENDING_TELEPORT_RESYNCS);
+    assert_eq!(
+        decode_player_position_sync_packets(&writer).len(),
+        usize::from(MAX_PENDING_TELEPORT_RESYNCS)
+    );
+
+    assert!(
+        guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos",
+        )
+        .await
+        .unwrap()
+    );
+    assert_eq!(
+        decode_player_position_sync_packets(&writer).len(),
+        usize::from(MAX_PENDING_TELEPORT_RESYNCS)
+    );
+}
+
+#[tokio::test]
+async fn pending_teleport_movement_guard_returns_false_without_pending_teleport() {
+    let mut pending = None;
+    let mut writer = Vec::new();
+
+    assert!(
+        !guard_pending_teleport_movement(
+            &mut pending,
+            &mut writer,
+            Compression::Disabled,
+            "ServerboundMovePlayerPos",
+        )
+        .await
+        .unwrap()
+    );
+    assert!(writer.is_empty());
+}
+
 fn state(id: u32, default: bool, properties: &[(&str, &str)]) -> BlockStateReport {
     BlockStateReport {
         id,
@@ -931,6 +1178,97 @@ fn oversized_play_custom_payload_is_rejected_before_decode() {
         PlayCustomPayloadAction::Oversized {
             len: DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1
         }
+    );
+}
+
+fn test_use_item_on(position: i64) -> ServerboundUseItemOn {
+    ServerboundUseItemOn {
+        hand: mc_protocol::packets::play::InteractionHand::MainHand,
+        position,
+        direction: mc_protocol::packets::play::Direction::Up,
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: 4,
+    }
+}
+
+#[test]
+fn use_item_on_preflight_reports_dead_survival_player() {
+    let mut survival = SurvivalState::FULL;
+    survival.health = 0.0;
+    let action = test_use_item_on(pack_block_pos(0, 64, 0));
+
+    assert_eq!(
+        classify_use_item_on_preflight(
+            GameMode::Survival,
+            survival,
+            PlayerPose::new(0.5, 64.0, 0.5),
+            &action,
+        ),
+        UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::DeadPlayer,
+        }
+    );
+}
+
+#[test]
+fn use_item_on_preflight_reports_unsupported_game_mode() {
+    let action = test_use_item_on(pack_block_pos(0, 64, 0));
+
+    assert_eq!(
+        classify_use_item_on_preflight(
+            GameMode::Adventure,
+            SurvivalState::FULL,
+            PlayerPose::new(0.5, 64.0, 0.5),
+            &action,
+        ),
+        UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::UnsupportedGameMode,
+        }
+    );
+}
+
+#[test]
+fn use_item_on_preflight_reports_out_of_reach_survival_target() {
+    let action = test_use_item_on(pack_block_pos(128, 64, 0));
+
+    assert_eq!(
+        classify_use_item_on_preflight(
+            GameMode::Survival,
+            SurvivalState::FULL,
+            PlayerPose::new(0.5, 64.0, 0.5),
+            &action,
+        ),
+        UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::OutOfReach,
+        }
+    );
+}
+
+#[test]
+fn use_item_on_preflight_allows_creative_and_reachable_survival_targets() {
+    let action = test_use_item_on(pack_block_pos(0, 64, 0));
+
+    assert_eq!(
+        classify_use_item_on_preflight(
+            GameMode::Creative,
+            SurvivalState::FULL,
+            PlayerPose::new(100.5, 64.0, 100.5),
+            &action,
+        ),
+        UseItemOnOutcome::PlaceBlock
+    );
+    assert_eq!(
+        classify_use_item_on_preflight(
+            GameMode::Survival,
+            SurvivalState::FULL,
+            PlayerPose::new(0.5, 64.0, 0.5),
+            &action,
+        ),
+        UseItemOnOutcome::PlaceBlock
     );
 }
 
@@ -3259,6 +3597,20 @@ fn decode_container_set_slot_packets(bytes: &[u8]) -> Vec<ClientboundContainerSe
     {
         if frame.id == ClientboundContainerSetSlot::ID {
             packets.push(ClientboundContainerSetSlot::decode(&mut frame.body).unwrap());
+        }
+    }
+    assert!(buf.is_empty());
+    packets
+}
+
+fn decode_player_position_sync_packets(bytes: &[u8]) -> Vec<SynchronizePlayerPosition> {
+    let mut buf = bytes::BytesMut::from(bytes);
+    let mut packets = Vec::new();
+    while let Some(mut frame) =
+        mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled).unwrap()
+    {
+        if frame.id == SynchronizePlayerPosition::ID {
+            packets.push(SynchronizePlayerPosition::decode(&mut frame.body).unwrap());
         }
     }
     assert!(buf.is_empty());

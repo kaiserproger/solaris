@@ -13,7 +13,7 @@ pub mod terrain;
 pub use structures::{StructureError, StructureRules, StructureTemplate, TemplateBlock};
 pub use terrain::{
     BiomeRules, BiomeScope, OreRule, OreRules, OreSpacing, TellusWorldgenSettings,
-    TerrainGenerator, WorldgenMode, YRange,
+    TerrainGenerator, TerrainGeneratorError, WorldgenMode, YRange,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.
