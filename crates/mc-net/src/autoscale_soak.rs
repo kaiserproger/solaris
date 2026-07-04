@@ -83,7 +83,7 @@ impl AutoscaleSoakReport {
         let mut gaps = vec![
             "dynamic runtime scale-up/scale-down controller is absent",
             "profile validation is config-level only, not measured against low-end/balanced/high-end hardware",
-            "memory-pressure detection and shedding are absent",
+            "memory-pressure shedding, recovery, and soak evidence are absent",
         ];
 
         for (scenario, gap) in [

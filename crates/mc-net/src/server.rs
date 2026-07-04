@@ -467,17 +467,13 @@ impl BoundServer {
 
                 let tick_us = elapsed_us(tick_started);
                 if let Some(control) = entity_runtime_control.as_ref() {
+                    control.refresh_memory_pressure_from_system();
                     let resources = entity_chunk_pipeline_resources.metrics().snapshot();
-                    control.observe(RuntimeControlInput {
-                        tick_ms: tick_us.div_ceil(1_000),
-                        queued_chunks: 0,
-                        queue_capacity: 0,
-                        active_workers: resources.active_cpu,
-                        worker_capacity: entity_config.chunk_pipeline.chunk_worker_threads.max(1),
-                        memory_used_mb: 0,
-                        memory_limit_mb: 0,
-                        first_chunk_ms: None,
-                    });
+                    control.observe(runtime_control_tick_input(
+                        tick_us,
+                        resources,
+                        entity_config.chunk_pipeline.chunk_worker_threads.max(1),
+                    ));
                 }
                 if should_log_runtime_metrics(tick, tick_us, metrics_policy) {
                     let pressure = entity_sessions.pressure_snapshot();
@@ -719,6 +715,23 @@ async fn drain_chunk_pipeline(resources: &ChunkPipelineResources) {
 
 fn elapsed_us(started: Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn runtime_control_tick_input(
+    tick_us: u64,
+    resources: crate::ChunkPipelineResourceSnapshot,
+    worker_capacity: usize,
+) -> RuntimeControlInput {
+    RuntimeControlInput {
+        tick_ms: tick_us.div_ceil(1_000),
+        queued_chunks: 0,
+        queue_capacity: 0,
+        active_workers: resources.active_cpu,
+        worker_capacity: worker_capacity.max(1),
+        memory_used_mb: 0,
+        memory_limit_mb: 0,
+        first_chunk_ms: None,
+    }
 }
 
 fn should_log_runtime_metrics(tick: u64, tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
@@ -1517,6 +1530,59 @@ mod tests {
         assert!(should_log_runtime_metrics(10, 1, policy));
         assert!(should_log_runtime_metrics(11, 50_000, policy));
         assert!(!should_log_runtime_metrics(11, 49_999, policy));
+    }
+
+    #[test]
+    fn runtime_control_tick_observe_applies_memory_pressure_snapshot() {
+        let resources = crate::ChunkPipelineResourceSnapshot {
+            active_io: 0,
+            max_io_active: 4,
+            active_cpu: 3,
+            max_cpu_active: 8,
+        };
+        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            },
+        );
+        let control = crate::RuntimeControlHandle::new_with_memory_pressure(
+            crate::RuntimeControlConfig {
+                policy: crate::AutoscalePolicy {
+                    memory_pressure_percent: 50,
+                    scale_down_after_ticks: 1,
+                    ..crate::AutoscalePolicy::default()
+                },
+                initial_limits: crate::RuntimeControlLimits {
+                    view_distance: 8,
+                    chunk_send_rate: 16,
+                    chunk_load_rate: 32,
+                    chunk_generate_rate: 16,
+                },
+            },
+            memory_pressure,
+        );
+        let input = runtime_control_tick_input(49_001, resources, 6);
+        assert_eq!(input.tick_ms, 50);
+        assert_eq!(input.active_workers, 3);
+        assert_eq!(input.worker_capacity, 6);
+        assert_eq!(input.memory_used_mb, 0);
+        assert_eq!(input.memory_limit_mb, 0);
+
+        let decision = control.observe(input);
+        assert_eq!(decision.pressure, Some(crate::AutoscalePressure::Memory));
+        assert_eq!(decision.action, crate::AutoscaleAction::ScaleDown);
+        assert_eq!(
+            control.snapshot().last_decision.pressure,
+            Some(crate::AutoscalePressure::Memory)
+        );
+        assert_eq!(
+            control.memory_pressure_snapshot(),
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            }
+        );
     }
 
     fn report(id: &str, props: &[(&str, &[&str])], states: &[StateSpec<'_>]) -> BlockReport {

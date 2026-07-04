@@ -3396,6 +3396,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_control_memory_pressure_scales_live_stream_limits() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            },
+        );
+        let control = crate::RuntimeControlHandle::new_with_memory_pressure(
+            crate::RuntimeControlConfig {
+                policy: crate::AutoscalePolicy {
+                    min_view_distance: 2,
+                    max_view_distance: 2,
+                    min_chunk_send_rate: 1,
+                    max_chunk_send_rate: 4,
+                    min_chunk_load_rate: 1,
+                    max_chunk_load_rate: 64,
+                    min_chunk_generate_rate: 1,
+                    max_chunk_generate_rate: 32,
+                    memory_pressure_percent: 50,
+                    scale_down_after_ticks: 1,
+                    ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+                },
+                initial_limits: crate::RuntimeControlLimits {
+                    view_distance: 2,
+                    chunk_send_rate: 4,
+                    chunk_load_rate: 64,
+                    chunk_generate_rate: 32,
+                },
+            },
+            memory_pressure,
+        );
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            2,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        )
+        .with_runtime_control(Some(control.clone()));
+
+        stream.observe_runtime_control();
+        let snapshot = control.snapshot();
+
+        assert_eq!(
+            snapshot.last_decision.pressure,
+            Some(crate::AutoscalePressure::Memory)
+        );
+        assert_eq!(
+            snapshot.last_decision.action,
+            crate::AutoscaleAction::ScaleDown
+        );
+        assert_eq!(snapshot.limits.chunk_send_rate, 2);
+    }
+
+    #[tokio::test]
     async fn runtime_control_queue_pressure_replans_live_view_distance() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(

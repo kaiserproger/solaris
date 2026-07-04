@@ -19,6 +19,7 @@ mod dirty_flush;
 mod error;
 mod lock_metrics;
 mod login;
+mod memory_pressure;
 mod play;
 mod server;
 mod status;

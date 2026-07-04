@@ -6,6 +6,10 @@
 
 use std::sync::{Arc, Mutex};
 
+use crate::memory_pressure::MemoryPressureHandle;
+#[cfg(test)]
+use crate::memory_pressure::MemoryPressureSnapshot;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoscaleProfile {
     LowEnd,
@@ -214,6 +218,7 @@ pub struct RuntimeControlConfig {
 #[derive(Debug, Clone)]
 pub struct RuntimeControlHandle {
     controller: Arc<Mutex<RuntimeControlPlane>>,
+    memory_pressure: MemoryPressureHandle,
 }
 
 #[derive(Debug, Clone)]
@@ -433,6 +438,7 @@ impl RuntimeControlHandle {
                 config.policy,
                 config.initial_limits,
             ))),
+            memory_pressure: MemoryPressureHandle::default(),
         }
     }
 
@@ -441,12 +447,45 @@ impl RuntimeControlHandle {
     }
 
     pub fn observe(&self, input: RuntimeControlInput) -> AutoscaleDecision {
+        let input = self.with_memory_pressure(input);
         self.with_controller(|controller| controller.observe(input))
     }
 
     #[must_use]
     pub fn snapshot(&self) -> RuntimeControlSnapshot {
         self.with_controller(|controller| controller.snapshot())
+    }
+
+    pub(crate) fn refresh_memory_pressure_from_system(&self) {
+        self.memory_pressure.refresh_from_system();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_with_memory_pressure(
+        config: RuntimeControlConfig,
+        memory_pressure: MemoryPressureHandle,
+    ) -> Self {
+        Self {
+            controller: Arc::new(Mutex::new(RuntimeControlPlane::new(
+                config.policy,
+                config.initial_limits,
+            ))),
+            memory_pressure,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn memory_pressure_snapshot(&self) -> MemoryPressureSnapshot {
+        self.memory_pressure.snapshot()
+    }
+
+    fn with_memory_pressure(&self, mut input: RuntimeControlInput) -> RuntimeControlInput {
+        let memory = self.memory_pressure.snapshot();
+        if memory.limit_mb > 0 {
+            input.memory_used_mb = memory.used_mb;
+            input.memory_limit_mb = memory.limit_mb;
+        }
+        input
     }
 
     fn with_controller<T>(&self, f: impl FnOnce(&mut RuntimeControlPlane) -> T) -> T {
@@ -593,6 +632,72 @@ mod tests {
         assert_eq!(after.action, AutoscaleAction::Hold);
         assert_eq!(after.limits, drain.limits);
         assert!(controller.snapshot().draining);
+    }
+
+    #[test]
+    fn runtime_control_handle_applies_memory_snapshot_to_all_observations() {
+        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            },
+        );
+        let control = RuntimeControlHandle::new_with_memory_pressure(
+            RuntimeControlConfig {
+                policy: AutoscalePolicy {
+                    memory_pressure_percent: 50,
+                    scale_down_after_ticks: 1,
+                    ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
+                },
+                initial_limits: RuntimeControlLimits {
+                    view_distance: 8,
+                    chunk_send_rate: 16,
+                    chunk_load_rate: 32,
+                    chunk_generate_rate: 16,
+                },
+            },
+            memory_pressure,
+        );
+
+        let decision = control.observe(RuntimeControlInput {
+            memory_used_mb: 0,
+            memory_limit_mb: 0,
+            ..healthy_input()
+        });
+
+        assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(decision.pressure, Some(AutoscalePressure::Memory));
+        assert_eq!(decision.limits.view_distance, 7);
+    }
+
+    #[test]
+    fn runtime_control_unknown_memory_snapshot_is_inert() {
+        let control = RuntimeControlHandle::new_with_memory_pressure(
+            RuntimeControlConfig {
+                policy: AutoscalePolicy {
+                    memory_pressure_percent: 1,
+                    scale_down_after_ticks: 1,
+                    ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
+                },
+                initial_limits: RuntimeControlLimits {
+                    view_distance: 8,
+                    chunk_send_rate: 16,
+                    chunk_load_rate: 32,
+                    chunk_generate_rate: 16,
+                },
+            },
+            crate::memory_pressure::MemoryPressureHandle::default(),
+        );
+
+        let decision = control.observe(RuntimeControlInput {
+            memory_used_mb: 0,
+            memory_limit_mb: 0,
+            ..healthy_input()
+        });
+
+        assert_eq!(decision.action, AutoscaleAction::Hold);
+        assert_eq!(decision.pressure, None);
+        assert_eq!(decision.limits.view_distance, 8);
     }
 
     #[test]
