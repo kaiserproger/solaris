@@ -4057,31 +4057,44 @@ async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_w
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
-    let mut storage = world.lock().await;
-    assert_eq!(generated_chunks.load(Ordering::Relaxed), 0);
-    assert_eq!(storage.cache_len(), 1);
-    let source = storage
-        .chest_block_entity(source_pos)
-        .unwrap()
-        .expect("source chest");
-    let hopper = storage
-        .hopper_block_entity(hopper_pos)
-        .unwrap()
-        .expect("hopper");
-    let target = storage
-        .chest_block_entity(target_pos)
-        .unwrap()
-        .expect("target chest");
-    assert_eq!(source.slots[0].count, 1);
-    assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
-    assert_eq!(
-        target.slots[0],
-        mc_world::FurnaceSlot {
-            count: 1,
-            item_id: 42,
-            damage: None,
-        }
-    );
+    {
+        let mut storage = world.lock().await;
+        assert_eq!(generated_chunks.load(Ordering::Relaxed), 0);
+        assert_eq!(storage.cache_len(), 1);
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let hopper = storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .expect("hopper");
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert_eq!(source.slots[0].count, 1);
+        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert_eq!(
+            target.slots[0],
+            mc_world::FurnaceSlot {
+                count: 1,
+                item_id: 42,
+                damage: None,
+            }
+        );
+        let scheduled = storage
+            .scheduled_block_ticks(ChunkPos { x: 0, z: 0 })
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(
+            scheduled[0].block,
+            Identifier::parse("minecraft:hopper").unwrap()
+        );
+    }
     match source_rx
         .try_recv()
         .expect("source viewer receives chest slots")
@@ -4109,6 +4122,63 @@ async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_w
             assert_eq!(position, target_pos);
             assert_eq!(state_id, 2);
             assert_eq!(slots[0], ItemStack::new(42, 1));
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 28).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        assert_eq!(generated_chunks.load(Ordering::Relaxed), 0);
+        assert_eq!(storage.cache_len(), 1);
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert_eq!(
+            target.slots[0],
+            mc_world::FurnaceSlot {
+                count: 2,
+                item_id: 42,
+                damage: None,
+            }
+        );
+    }
+    match source_rx
+        .try_recv()
+        .expect("source viewer receives second chest slots")
+    {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, source_pos);
+            assert_eq!(state_id, 3);
+            assert_eq!(slots[0], ItemStack::EMPTY);
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+    match target_rx
+        .try_recv()
+        .expect("target viewer receives second chest slots")
+    {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, target_pos);
+            assert_eq!(state_id, 3);
+            assert_eq!(slots[0], ItemStack::new(42, 2));
         }
         other => panic!("unexpected outbound command: {other:?}"),
     }

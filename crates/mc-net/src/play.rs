@@ -5560,6 +5560,14 @@ pub(crate) async fn run_scheduled_block_ticks(
                 {
                     applied_mutations += 1;
                     chest_updates.extend(updates);
+                    if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
+                        tick.pos,
+                        state.block.id.clone(),
+                        world_tick.saturating_add(HOPPER_TRANSFER_DELAY_TICKS),
+                        0,
+                    )) {
+                        warn!(error = %err, pos = ?tick.pos, "hopper transfer tick scheduling failed");
+                    }
                     continue;
                 }
                 let Some(edits) =
@@ -5587,7 +5595,7 @@ pub(crate) async fn run_scheduled_block_ticks(
         );
     }
 
-    if !outcome.applied.is_empty() {
+    if !outcome.applied.is_empty() || applied_mutations > 0 {
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
         broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
         if let Some(table) = table
@@ -5606,7 +5614,7 @@ pub(crate) async fn run_scheduled_block_ticks(
             world_tick,
             drained,
             applied = outcome.applied.len() + applied_mutations,
-            "scheduled block ticks applied edits"
+            "scheduled block ticks applied work"
         );
     }
     ScheduledBlockTickReport {
@@ -7287,6 +7295,9 @@ fn target_hopper_insert_slot(target: &ChestBlockEntity, moving: &FurnaceSlot) ->
 }
 
 const HOPPER_TRANSFER_MAX_STACK: i32 = 64;
+// 26.1.2 HopperBlockEntity.MOVE_ITEM_SPEED. Full TransferCooldown persistence
+// and same-tick hopper-chain skip rules remain outside this foundation.
+const HOPPER_TRANSFER_DELAY_TICKS: u64 = 8;
 
 fn chest_slots_from_block_entity(chest: &ChestBlockEntity) -> Vec<ItemStack> {
     chest.slots.iter().map(furnace_slot_to_stack).collect()
