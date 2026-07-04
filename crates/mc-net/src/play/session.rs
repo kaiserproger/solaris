@@ -839,6 +839,44 @@ impl SessionRegistry {
         )
     }
 
+    pub(super) fn server_furnace_slot_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        slots: [ItemStack; 3],
+    ) -> (i32, Vec<VisibilityDispatch>) {
+        let (state_id, recipients) = {
+            let mut inner = self.lock_inner("server furnace slot dispatches");
+            let recipients = furnace_recipients(&inner, position);
+            if recipients.is_empty() {
+                (
+                    inner.furnace_state_ids.get(&position).copied().unwrap_or(1),
+                    recipients,
+                )
+            } else {
+                let state_id = inner
+                    .furnace_state_ids
+                    .entry(position)
+                    .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
+                    .or_insert(2);
+                (*state_id, recipients)
+            }
+        };
+        if recipients.is_empty() {
+            return (state_id, Vec::new());
+        }
+        (
+            state_id,
+            visibility_dispatches(
+                recipients,
+                OutboundCommand::FurnaceSlots {
+                    position,
+                    state_id,
+                    slots,
+                },
+            ),
+        )
+    }
+
     pub(super) fn furnace_data_dispatches(
         &self,
         position: mc_world::BlockPos,
@@ -2229,6 +2267,22 @@ fn furnace_recipients_except(
         .collect()
 }
 
+fn furnace_recipients(
+    inner: &SessionRegistryInner,
+    position: mc_world::BlockPos,
+) -> Vec<SessionRecipient> {
+    inner
+        .furnace_viewers
+        .get(&position)
+        .into_iter()
+        .flat_map(|viewers| viewers.iter())
+        .map(|(&id, viewer)| SessionRecipient {
+            id,
+            tx: viewer.tx.clone(),
+        })
+        .collect()
+}
+
 fn chest_recipients(
     inner: &SessionRegistryInner,
     position: mc_world::BlockPos,
@@ -3431,6 +3485,21 @@ mod tests {
         registry.unregister_furnace_viewer(alice, position);
         registry.unregister_furnace_viewer(bob, position);
         registry.unregister_furnace_viewer(charlie, position);
+        assert_eq!(registry.furnace_state_id(position), 1);
+    }
+
+    #[test]
+    fn server_furnace_slot_dispatches_do_not_allocate_state_without_viewers() {
+        let registry = SessionRegistry::new();
+        let position = mc_world::BlockPos { x: 7, y: 64, z: 7 };
+
+        let (state_id, dispatches) = registry.server_furnace_slot_dispatches(
+            position,
+            [ItemStack::new(10, 1), ItemStack::EMPTY, ItemStack::EMPTY],
+        );
+
+        assert_eq!(state_id, 1);
+        assert!(dispatches.is_empty());
         assert_eq!(registry.furnace_state_id(position), 1);
     }
 

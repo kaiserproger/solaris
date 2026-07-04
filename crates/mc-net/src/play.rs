@@ -130,10 +130,11 @@ use commands::{parse_debug_command, parse_gamemode_command};
 use containers::{
     ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceKind, FurnaceWindow,
     chest_menu_title_nbt, crafting_menu_title_nbt, find_campfire_recipe_for_item,
-    find_campfire_recipe_in, find_smelting_recipe_for_item, furnace_kind_for_state,
-    furnace_menu_title_for_state, furnace_menu_title_nbt, is_barrel_state, is_chest_state,
-    is_crafting_table_state, is_fuel_item, is_furnace_state, next_container_id,
-    store_active_container, unsupported_survival_station_for_state,
+    find_campfire_recipe_in, find_cooking_recipe_for_item, find_smelting_recipe_for_item,
+    furnace_kind_for_block_id, furnace_kind_for_state, furnace_menu_title_for_state,
+    furnace_menu_title_nbt, is_barrel_state, is_chest_state, is_crafting_table_state, is_fuel_item,
+    is_furnace_state, next_container_id, store_active_container,
+    unsupported_survival_station_for_state,
 };
 #[cfg(test)]
 use inventory::{ArmorStats, armor_reduced_damage};
@@ -5533,7 +5534,7 @@ pub(crate) async fn run_scheduled_block_ticks(
     let table = config.block_light.as_deref();
     let mut drained = 0usize;
     let mut applied_mutations = 0usize;
-    let mut chest_updates = Vec::new();
+    let mut hopper_updates = Vec::new();
     let mut outcome = BlockEditBatchOutcome::default();
     {
         let mut storage = world.lock().await;
@@ -5561,11 +5562,17 @@ pub(crate) async fn run_scheduled_block_ticks(
                 if state.block.id != tick.block {
                     continue;
                 }
-                if let Some(updates) =
-                    scheduled_hopper_transfer(&config.blocks, &mut storage, tick.pos, state_id)
-                {
+                if let Some(updates) = scheduled_hopper_transfer(
+                    &config.blocks,
+                    &config.items,
+                    &config.tags,
+                    config.recipes.as_slice(),
+                    &mut storage,
+                    tick.pos,
+                    state_id,
+                ) {
                     applied_mutations += 1;
-                    chest_updates.extend(updates);
+                    hopper_updates.extend(updates);
                     if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
                         tick.pos,
                         state.block.id.clone(),
@@ -5587,9 +5594,17 @@ pub(crate) async fn run_scheduled_block_ticks(
             }
         }
     }
-    for (position, slots) in chest_updates {
-        let (_, dispatches) = sessions.server_chest_slot_dispatches(position, slots);
-        dispatch_visibility_commands(dispatches);
+    for update in hopper_updates {
+        match update {
+            HopperTransferUpdate::Chest { position, slots } => {
+                let (_, dispatches) = sessions.server_chest_slot_dispatches(position, slots);
+                dispatch_visibility_commands(dispatches);
+            }
+            HopperTransferUpdate::Furnace { position, slots } => {
+                let (_, dispatches) = sessions.server_furnace_slot_dispatches(position, slots);
+                dispatch_visibility_commands(dispatches);
+            }
+        }
     }
     let budget_exhausted = drained >= policy.fluid_tick_budget;
     if budget_exhausted {
@@ -7181,10 +7196,13 @@ fn scheduled_block_tick_edits(
 
 fn scheduled_hopper_transfer(
     blocks: &mc_world::BlockRegistry,
+    items: &ItemRegistry,
+    tags: &TagsData,
+    recipes: &[mc_data::recipes::Recipe],
     storage: &mut mc_world::WorldStorage,
     pos: mc_world::BlockPos,
     state_id: mc_world::BlockStateId,
-) -> Option<Vec<(mc_world::BlockPos, Vec<ItemStack>)>> {
+) -> Option<Vec<HopperTransferUpdate>> {
     let state = blocks.by_id(state_id)?;
     if state.block.id.path() != "hopper" {
         return None;
@@ -7195,8 +7213,14 @@ fn scheduled_hopper_transfer(
         ..pos
     };
     let target_pos = hopper_facing_target(pos, facing)?;
+    let target_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, target_pos);
+    let target_furnace_kind = if facing == "down" {
+        cached_furnace_kind(blocks, storage, target_pos)
+    } else {
+        None
+    };
     if !cached_storage_block_is_chest_like(blocks, storage, source_pos)
-        || !cached_storage_block_is_chest_like(blocks, storage, target_pos)
+        || (!target_is_chest_like && target_furnace_kind.is_none())
     {
         return None;
     }
@@ -7209,12 +7233,7 @@ fn scheduled_hopper_transfer(
     if hopper.slots.iter().any(|slot| !slot.is_empty()) {
         return None;
     }
-    let Ok(Some(mut target)) = storage.chest_block_entity(target_pos) else {
-        return None;
-    };
-
     let source_before = source.clone();
-    let target_before = target.clone();
 
     let source_slot = source.slots.iter().position(|slot| !slot.is_empty())?;
     let moving = FurnaceSlot {
@@ -7222,36 +7241,90 @@ fn scheduled_hopper_transfer(
         item_id: source.slots[source_slot].item_id,
         damage: source.slots[source_slot].damage,
     };
-    let target_slot = target_hopper_insert_slot(&target, &moving)?;
-
-    source.slots[source_slot].count -= 1;
-    if source.slots[source_slot].count <= 0 {
-        source.slots[source_slot] = FurnaceSlot::EMPTY;
-    }
-    if target.slots[target_slot].is_empty() {
-        target.slots[target_slot] = moving;
-    } else {
-        target.slots[target_slot].count += 1;
-    }
-
-    if !storage
-        .set_chest_block_entity(source_pos, source.clone())
-        .unwrap_or(false)
-        || !storage
-            .set_chest_block_entity(target_pos, target.clone())
-            .unwrap_or(false)
-    {
-        return None;
-    }
-
     let mut updates = Vec::new();
-    if source != source_before {
-        updates.push((source_pos, chest_slots_from_block_entity(&source)));
+
+    if target_is_chest_like {
+        let Ok(Some(mut target)) = storage.chest_block_entity(target_pos) else {
+            return None;
+        };
+        let target_before = target.clone();
+        let target_slot = target_hopper_insert_slot(&target, &moving)?;
+
+        source.slots[source_slot].count -= 1;
+        if source.slots[source_slot].count <= 0 {
+            source.slots[source_slot] = FurnaceSlot::EMPTY;
+        }
+        if target.slots[target_slot].is_empty() {
+            target.slots[target_slot] = moving;
+        } else {
+            target.slots[target_slot].count += 1;
+        }
+
+        if !storage
+            .set_chest_block_entity(source_pos, source.clone())
+            .unwrap_or(false)
+            || !storage
+                .set_chest_block_entity(target_pos, target.clone())
+                .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if target != target_before {
+            updates.push(HopperTransferUpdate::Chest {
+                position: target_pos,
+                slots: chest_slots_from_block_entity(&target),
+            });
+        }
+    } else {
+        let furnace_kind = target_furnace_kind?;
+        let Ok(Some(mut target)) = storage.furnace_block_entity(target_pos) else {
+            return None;
+        };
+        let target_before = target.clone();
+        insert_hopper_input_into_furnace(items, tags, recipes, furnace_kind, &mut target, &moving)?;
+
+        source.slots[source_slot].count -= 1;
+        if source.slots[source_slot].count <= 0 {
+            source.slots[source_slot] = FurnaceSlot::EMPTY;
+        }
+
+        if !storage
+            .set_chest_block_entity(source_pos, source.clone())
+            .unwrap_or(false)
+            || !storage
+                .set_furnace_block_entity(target_pos, target.clone())
+                .unwrap_or(false)
+        {
+            return None;
+        }
+
+        if target != target_before {
+            updates.push(HopperTransferUpdate::Furnace {
+                position: target_pos,
+                slots: furnace_slot_stacks(&target),
+            });
+        }
     }
-    if target != target_before {
-        updates.push((target_pos, chest_slots_from_block_entity(&target)));
+
+    if source != source_before {
+        updates.push(HopperTransferUpdate::Chest {
+            position: source_pos,
+            slots: chest_slots_from_block_entity(&source),
+        });
     }
     Some(updates)
+}
+
+enum HopperTransferUpdate {
+    Chest {
+        position: mc_world::BlockPos,
+        slots: Vec<ItemStack>,
+    },
+    Furnace {
+        position: mc_world::BlockPos,
+        slots: [ItemStack; 3],
+    },
 }
 
 fn hopper_facing_target(pos: mc_world::BlockPos, facing: &str) -> Option<mc_world::BlockPos> {
@@ -7291,6 +7364,17 @@ fn cached_storage_block_is_chest_like(
         .is_some_and(|state| matches!(state.block.id.path(), "chest" | "barrel"))
 }
 
+fn cached_furnace_kind(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> Option<FurnaceKind> {
+    storage
+        .get_cached_block(pos)
+        .and_then(|state_id| blocks.by_id(state_id))
+        .and_then(|state| furnace_kind_for_block_id(state.block.id.as_str()))
+}
+
 fn target_hopper_insert_slot(target: &ChestBlockEntity, moving: &FurnaceSlot) -> Option<usize> {
     target.slots.iter().position(|slot| {
         slot.is_empty()
@@ -7298,6 +7382,39 @@ fn target_hopper_insert_slot(target: &ChestBlockEntity, moving: &FurnaceSlot) ->
                 && slot.damage == moving.damage
                 && slot.count < HOPPER_TRANSFER_MAX_STACK)
     })
+}
+
+fn insert_hopper_input_into_furnace(
+    items: &ItemRegistry,
+    tags: &TagsData,
+    recipes: &[mc_data::recipes::Recipe],
+    furnace_kind: FurnaceKind,
+    furnace: &mut FurnaceBlockEntity,
+    moving: &FurnaceSlot,
+) -> Option<()> {
+    if moving.is_empty()
+        || find_cooking_recipe_for_item(recipes, items, tags, furnace_kind, moving.item_id)
+            .is_none()
+    {
+        return None;
+    }
+    let target = &mut furnace.slots[0];
+    if target.is_empty() {
+        *target = FurnaceSlot {
+            count: 1,
+            item_id: moving.item_id,
+            damage: moving.damage,
+        };
+        Some(())
+    } else if target.item_id == moving.item_id
+        && target.damage == moving.damage
+        && target.count < HOPPER_TRANSFER_MAX_STACK
+    {
+        target.count += 1;
+        Some(())
+    } else {
+        None
+    }
 }
 
 const HOPPER_TRANSFER_MAX_STACK: i32 = 64;

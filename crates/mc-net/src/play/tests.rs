@@ -4459,6 +4459,209 @@ async fn scheduled_block_pass_does_not_duplicate_existing_hopper_tick() {
 }
 
 #[tokio::test]
+async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, SmeltingRecipe,
+    };
+
+    let iron_ore = Identifier::parse("minecraft:iron_ore").unwrap();
+    let iron_ingot = Identifier::parse("minecraft:iron_ingot").unwrap();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["down"])]),
+                states: vec![state(2, true, &[("facing", "down")])],
+            },
+            simple_block(3, "minecraft:furnace"),
+        ])
+        .unwrap(),
+    );
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: iron_ore.clone(),
+            protocol_id: 42,
+        },
+        ItemReport {
+            id: iron_ingot.clone(),
+            protocol_id: 43,
+        },
+    ]));
+    let recipes = Arc::new(vec![Recipe {
+        id: Identifier::parse("minecraft:test_iron_ore").unwrap(),
+        kind: RecipeKind::Smelting(SmeltingRecipe {
+            ingredient: Ingredient {
+                alternatives: vec![IngredientAlternative::Item(iron_ore)],
+            },
+            cooking_time: 200,
+        }),
+        result: RecipeResult {
+            item: iron_ingot,
+            count: 1,
+        },
+    }]);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let source_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let furnace_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
+    let mut source = mc_world::ChestBlockEntity::default();
+    source.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_chest_block_entity(source_pos, source).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        items,
+        tags: Arc::new(TagsData::default()),
+        recipes,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let source_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(44),
+        name: "HopperFurnaceSourceViewer".to_string(),
+    };
+    let furnace_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(45),
+        name: "HopperFurnaceViewer".to_string(),
+    };
+    let (source_tx, mut source_rx) = mpsc::channel(16);
+    let (source_session_id, _) = sessions.register(
+        &source_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        source_tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let (furnace_tx, mut furnace_rx) = mpsc::channel(16);
+    let (furnace_session_id, _) = sessions.register(
+        &furnace_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        furnace_tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let _ = sessions.mark_loaded(source_session_id, (0, 0));
+    let _ = sessions.mark_loaded(furnace_session_id, (0, 0));
+    assert_eq!(
+        sessions.register_chest_viewer(source_session_id, source_pos),
+        1
+    );
+    assert_eq!(
+        sessions.register_furnace_viewer(furnace_session_id, furnace_pos),
+        1
+    );
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let hopper = storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .expect("hopper");
+        let furnace = storage
+            .furnace_block_entity(furnace_pos)
+            .unwrap()
+            .expect("furnace");
+        assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert_eq!(
+            furnace.slots[0],
+            mc_world::FurnaceSlot {
+                count: 1,
+                item_id: 42,
+                damage: None,
+            }
+        );
+        assert!(furnace.slots[1].is_empty());
+        assert!(furnace.slots[2].is_empty());
+        let scheduled = storage
+            .scheduled_block_ticks(cpos)
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 28);
+    }
+    match source_rx
+        .try_recv()
+        .expect("source viewer receives chest slots")
+    {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, source_pos);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots[0], ItemStack::EMPTY);
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+    match furnace_rx
+        .try_recv()
+        .expect("furnace viewer receives furnace slots")
+    {
+        OutboundCommand::FurnaceSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, furnace_pos);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots[0], ItemStack::new(42, 1));
+            assert_eq!(slots[1], ItemStack::EMPTY);
+            assert_eq!(slots[2], ItemStack::EMPTY);
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn scheduled_button_tick_ignores_ticketed_chunk_until_loaded() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(
