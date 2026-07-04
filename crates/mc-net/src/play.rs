@@ -2371,11 +2371,32 @@ where
     W: AsyncWriteExt + Unpin,
 {
     state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+    write_inventory_content_with_state_id(state, writer, state.inventory_state_id).await
+}
+
+async fn write_inventory_content_resync<W>(
+    state: &InteractionState,
+    writer: &mut W,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_inventory_content_with_state_id(state, writer, state.inventory_state_id).await
+}
+
+async fn write_inventory_content_with_state_id<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    state_id: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     write_packet(
         writer,
         &ClientboundContainerSetContent {
             container_id: 0,
-            state_id: state.inventory_state_id,
+            state_id,
             items: state.inventory.as_wire_list(),
             carried_item: state.carried_item.clone(),
         },
@@ -3844,7 +3865,7 @@ where
         || matches!(game_mode, GameMode::Survival | GameMode::Adventure) && survival_state.is_dead()
     {
         if packet.container_id == 0 {
-            write_inventory_content(state, writer).await?;
+            write_inventory_content_resync(state, writer).await?;
         } else if let Some(active) = state.active_container.take() {
             match active {
                 ActiveContainer::Furnace(window) => {
@@ -3877,7 +3898,7 @@ where
 
     if packet.container_id != 0 {
         let Some(active) = state.active_container.take() else {
-            write_inventory_content(state, writer).await?;
+            write_inventory_content_resync(state, writer).await?;
             return Ok(());
         };
         match active {
@@ -3918,7 +3939,7 @@ where
             server_state = state.inventory_state_id,
             "container click resynced stale state"
         );
-        write_inventory_content(state, writer).await?;
+        write_inventory_content_resync(state, writer).await?;
         return Ok(());
     }
 
@@ -3947,7 +3968,7 @@ where
         debug!("container click resynced mismatched carried item");
         state.inventory = before_inventory;
         state.carried_item = before_carried_item;
-        write_inventory_content(state, writer).await?;
+        write_inventory_content_resync(state, writer).await?;
         return Ok(());
     }
 
@@ -3958,6 +3979,8 @@ where
             input = ?packet.container_input,
             "container click unsupported or no-op; resyncing"
         );
+        write_inventory_content_resync(state, writer).await?;
+        return Ok(());
     }
     if let Some(stack) = dropped {
         dispatch_inventory_drop(state, player_pose, stack);
