@@ -96,6 +96,57 @@ fn agent_driver_writes_passed_observation_from_loopback_bridge() {
 }
 
 #[test]
+fn agent_driver_rejects_non_loopback_server_addr() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let bridge = FakeBridge::start_with_deadline(6, Duration::from_millis(200));
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+        .arg("--secret")
+        .arg("test-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("m94-02b-rejected-block-resync")
+        .arg("--server-addr")
+        .arg("example.com:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        !output.status.success(),
+        "driver accepted a non-loopback server_addr\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("failed observations.json exists"),
+    )
+    .expect("failed observations.json is valid JSON");
+    assert_eq!(observations["result"], "failed");
+    assert!(
+        observations["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("server_addr") && message.contains("loopback")),
+        "failed observations must report loopback server_addr policy\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = bridge.join();
+    assert!(
+        requests.is_empty(),
+        "driver must reject non-loopback server_addr before bridge RPCs"
+    );
+}
+
+#[test]
 fn agent_driver_connects_when_client_is_not_already_in_play() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
@@ -1343,6 +1394,18 @@ impl FakeBridge {
         Self::start_with_wait_play(expected_requests, vec![true])
     }
 
+    fn start_with_deadline(expected_requests: usize, deadline: Duration) -> Self {
+        Self::start_with_options_and_deadline(
+            expected_requests,
+            vec![wait_play_payload(true)],
+            Duration::ZERO,
+            None,
+            "passed",
+            VALID_PNG_1X1,
+            deadline,
+        )
+    }
+
     fn start_with_wait_play(expected_requests: usize, wait_play_results: Vec<bool>) -> Self {
         Self::start_with_wait_play_payloads(
             expected_requests,
@@ -1425,6 +1488,26 @@ impl FakeBridge {
         scenario_result: &'static str,
         screenshot_bytes: &'static [u8],
     ) -> Self {
+        Self::start_with_options_and_deadline(
+            expected_requests,
+            wait_play_results,
+            screenshot_delay,
+            server_release_log_path,
+            scenario_result,
+            screenshot_bytes,
+            Duration::from_secs(5),
+        )
+    }
+
+    fn start_with_options_and_deadline(
+        expected_requests: usize,
+        wait_play_results: Vec<Value>,
+        screenshot_delay: Duration,
+        server_release_log_path: Option<std::path::PathBuf>,
+        scenario_result: &'static str,
+        screenshot_bytes: &'static [u8],
+        deadline_duration: Duration,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake bridge");
         listener
             .set_nonblocking(true)
@@ -1440,7 +1523,7 @@ impl FakeBridge {
         let thread_play_state = Arc::clone(&play_state);
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + deadline_duration;
             while Instant::now() < deadline {
                 if thread_requests.lock().expect("requests lock").len() >= expected_requests {
                     break;

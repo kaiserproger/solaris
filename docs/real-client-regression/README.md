@@ -106,8 +106,9 @@ PrismLauncher can route the second command to the existing launcher process and
 the second Java agent bridge never starts.
 
 Set `SOLARIS_REAL_CLIENT_SERVER_ADDR=<host:port>` when the in-client driver
-should connect somewhere other than `127.0.0.1:25565`. The default scenario is
-`m94-02b-rejected-block-resync`; override it with
+should connect to a different loopback Solaris address than `127.0.0.1:25565`;
+the driver accepts only `127.0.0.1`, `localhost`, or `[::1]` targets. The
+default scenario is `m94-02b-rejected-block-resync`; override it with
 `SOLARIS_REAL_CLIENT_AGENT_SCENARIO`.
 
 The Java-agent `m94-02a-solid-place-break-drop` scenario prepares held items

@@ -88,6 +88,42 @@ def validate_loopback_url(bridge_url: str) -> str:
     return parse.urlunparse(parsed)
 
 
+def validate_loopback_server_addr(server_addr: str) -> str:
+    host, port = parse_server_addr(server_addr)
+    normalized_host = host.lower()
+    if normalized_host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError("server_addr must target loopback")
+    if normalized_host == "::1":
+        return f"[::1]:{port}"
+    return f"{normalized_host}:{port}"
+
+
+def parse_server_addr(server_addr: str) -> tuple[str, int]:
+    if not server_addr or any(character.isspace() for character in server_addr):
+        raise ValueError("server_addr must be host:port")
+    if server_addr.startswith("["):
+        bracket_end = server_addr.find("]")
+        if bracket_end <= 1 or bracket_end + 2 > len(server_addr):
+            raise ValueError("server_addr must be host:port")
+        if server_addr[bracket_end + 1] != ":":
+            raise ValueError("server_addr must be host:port")
+        host = server_addr[1:bracket_end]
+        port_text = server_addr[bracket_end + 2 :]
+    else:
+        if server_addr.count(":") != 1:
+            raise ValueError("server_addr must be host:port")
+        host, port_text = server_addr.rsplit(":", 1)
+    if not host or not port_text:
+        raise ValueError("server_addr must be host:port")
+    try:
+        port = int(port_text, 10)
+    except ValueError as exc:
+        raise ValueError("server_addr port must be numeric") from exc
+    if port < 1 or port > 65535:
+        raise ValueError("server_addr port must be between 1 and 65535")
+    return host, port
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
@@ -1212,6 +1248,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     run_dir = Path(args.run_dir)
+    server_addr = args.server_addr
     transcript: list[dict[str, Any]] = []
 
     try:
@@ -1219,6 +1256,7 @@ def main() -> int:
             raise ValueError("bridge secret must not be empty")
         if args.timeout_seconds <= 0:
             raise ValueError("timeout must be positive")
+        server_addr = validate_loopback_server_addr(args.server_addr)
         client = AgentClient(args.bridge_url, args.secret)
         secondary_client = None
         if bool(args.secondary_bridge_url) != bool(args.secondary_secret):
@@ -1229,7 +1267,7 @@ def main() -> int:
             client,
             run_dir,
             args.scenario,
-            args.server_addr,
+            server_addr,
             args.timeout_seconds,
             transcript,
             secondary_client=secondary_client,
@@ -1239,7 +1277,7 @@ def main() -> int:
             args.scenario,
             transcript,
             result,
-            server_addr=args.server_addr,
+            server_addr=server_addr,
             final_state=final_state,
             screenshots=screenshots,
             scenario_report=scenario_report,
@@ -1253,7 +1291,7 @@ def main() -> int:
             args.scenario,
             transcript,
             "failed",
-            server_addr=args.server_addr,
+            server_addr=server_addr,
             error_message=str(exc),
             append_observations=args.append_observations,
         )
