@@ -383,14 +383,16 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         "persistent campfire block entity should retain the cooking input"
     );
     assert!(
-        compound_int_array(&tag, "solaris_cooking_remaining")
-            .is_some_and(|remaining| remaining.first().is_some_and(|ticks| *ticks > 0)),
-        "persistent campfire block entity should retain remaining cook time"
+        compound_int_array(&tag, "CookingTimes")
+            .is_some_and(|times| times.first().is_some_and(|ticks| (0..200).contains(ticks))),
+        "persistent campfire block entity should retain vanilla spent cook time"
     );
     assert_eq!(
-        compound_int_array(&tag, "solaris_cooking_total").and_then(|total| total.first().copied()),
+        compound_int_array(&tag, "CookingTotalTimes").and_then(|total| total.first().copied()),
         Some(200)
     );
+    assert_eq!(compound_int_array(&tag, "solaris_cooking_remaining"), None);
+    assert_eq!(compound_int_array(&tag, "solaris_cooking_total"), None);
 }
 
 #[tokio::test]

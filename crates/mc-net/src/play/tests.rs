@@ -4357,6 +4357,101 @@ fn campfire_cooking_outputs_after_cooking_time() {
 }
 
 #[test]
+fn campfire_persistent_nbt_uses_vanilla_cooking_arrays_and_reads_legacy() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, SmeltingRecipe,
+    };
+
+    let porkchop = Identifier::parse("minecraft:porkchop").unwrap();
+    let cooked_porkchop = Identifier::parse("minecraft:cooked_porkchop").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: porkchop.clone(),
+            protocol_id: 13,
+        },
+        ItemReport {
+            id: cooked_porkchop.clone(),
+            protocol_id: 22,
+        },
+    ]);
+    let recipes = vec![Recipe {
+        id: Identifier::parse("minecraft:test_campfire").unwrap(),
+        kind: RecipeKind::CampfireCooking(SmeltingRecipe {
+            ingredient: Ingredient {
+                alternatives: vec![IngredientAlternative::Item(porkchop.clone())],
+            },
+            cooking_time: 100,
+        }),
+        result: RecipeResult {
+            item: cooked_porkchop,
+            count: 1,
+        },
+    }];
+    let tags = TagsData::default();
+
+    let mut cooking = CampfireCookingState::default();
+    assert!(cooking.insert(ItemStack::new(13, 1), ItemStack::new(22, 1), 100));
+    cooking.slots[0].as_mut().unwrap().ticks_remaining = 75;
+    let tag = campfire_block_entity_persistent_nbt(
+        "minecraft:campfire",
+        mc_world::BlockPos { x: 1, y: 2, z: 3 },
+        &items,
+        &cooking,
+    )
+    .expect("persistent campfire tag");
+    assert_eq!(
+        compound_int_array_field(&tag, CAMPFIRE_NBT_COOKING_TIMES),
+        Some(&[25, 0, 0, 0][..])
+    );
+    assert_eq!(
+        compound_int_array_field(&tag, CAMPFIRE_NBT_COOKING_TOTAL_TIMES),
+        Some(&[100, 0, 0, 0][..])
+    );
+    assert_eq!(
+        compound_int_array_field(&tag, LEGACY_CAMPFIRE_NBT_REMAINING),
+        None
+    );
+
+    let mut bytes = Vec::new();
+    mc_nbt::write_network(&mut bytes, &tag).expect("encode vanilla campfire tag");
+    let restored =
+        campfire_cooking_state_from_persistent_nbt(&bytes, &recipes, &items, &tags).unwrap();
+    let restored_slot = restored.slots[0].as_ref().unwrap();
+    assert_eq!(restored_slot.ticks_remaining, 75);
+    assert_eq!(restored_slot.cooking_time_total, 100);
+
+    let legacy_tag = Tag::Compound(vec![
+        ("id".into(), Tag::String("minecraft:campfire".into())),
+        (
+            "Items".into(),
+            Tag::List(ListTag {
+                element_type: mc_nbt::tag_type::COMPOUND,
+                elements: vec![Tag::Compound(vec![
+                    ("Slot".into(), Tag::Int(0)),
+                    ("id".into(), Tag::String(porkchop.as_str().to_string())),
+                    ("count".into(), Tag::Int(1)),
+                ])],
+            }),
+        ),
+        (
+            LEGACY_CAMPFIRE_NBT_REMAINING.into(),
+            Tag::IntArray(vec![33, 0, 0, 0]),
+        ),
+        (
+            LEGACY_CAMPFIRE_NBT_TOTAL.into(),
+            Tag::IntArray(vec![100, 0, 0, 0]),
+        ),
+    ]);
+    let mut legacy_bytes = Vec::new();
+    mc_nbt::write_network(&mut legacy_bytes, &legacy_tag).expect("encode legacy campfire tag");
+    let restored_legacy =
+        campfire_cooking_state_from_persistent_nbt(&legacy_bytes, &recipes, &items, &tags).unwrap();
+    let restored_legacy_slot = restored_legacy.slots[0].as_ref().unwrap();
+    assert_eq!(restored_legacy_slot.ticks_remaining, 33);
+    assert_eq!(restored_legacy_slot.cooking_time_total, 100);
+}
+
+#[test]
 fn hostile_melee_requires_moving_toward_player() {
     let hostile = |velocity: Vec3| ServerEntitySnapshot {
         id: mc_entity::EntityId(7),

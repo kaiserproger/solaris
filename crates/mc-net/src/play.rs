@@ -211,6 +211,10 @@ const DAY_LENGTH_TICKS: u64 = 24_000;
 const NIGHT_START_TICK: u64 = 12_542;
 const DAY_START_TICK: u64 = 0;
 const CAMPFIRE_COOKING_SLOT_COUNT: usize = 4;
+const CAMPFIRE_NBT_COOKING_TIMES: &str = "CookingTimes";
+const CAMPFIRE_NBT_COOKING_TOTAL_TIMES: &str = "CookingTotalTimes";
+const LEGACY_CAMPFIRE_NBT_REMAINING: &str = "solaris_cooking_remaining";
+const LEGACY_CAMPFIRE_NBT_TOTAL: &str = "solaris_cooking_total";
 const SIGN_BLOCK_ENTITY_TYPE_ID: i32 = 7;
 const CAMPFIRE_BLOCK_ENTITY_TYPE_ID: i32 = 33;
 
@@ -2699,8 +2703,6 @@ fn campfire_cooking_state_from_persistent_nbt(
     if !matches!(id, "minecraft:campfire" | "minecraft:soul_campfire") {
         return None;
     }
-    let remaining = compound_int_array_field(&tag, "solaris_cooking_remaining")?;
-    let total = compound_int_array_field(&tag, "solaris_cooking_total")?;
     let Tag::List(item_list) = compound_field(&tag, "Items")? else {
         return None;
     };
@@ -2712,11 +2714,10 @@ fn campfire_cooking_state_from_persistent_nbt(
         if cooking.slots[slot].is_some() {
             continue;
         }
-        let ticks_remaining = u32::try_from(*remaining.get(slot)?).ok()?;
-        let cooking_time_total = u32::try_from(*total.get(slot)?).ok()?;
-        if ticks_remaining == 0 || cooking_time_total == 0 {
+        let Some((ticks_remaining, cooking_time_total)) = campfire_persistent_timing(&tag, slot)
+        else {
             continue;
-        }
+        };
         let recipe = find_campfire_recipe_in(recipes, items, tags, input.item_id)?;
         let result = campfire_recipe_result_stack(items, &recipe)?;
         cooking.slots[slot] = Some(CampfireCookingEntry {
@@ -2770,6 +2771,34 @@ fn compound_int_array_field<'a>(tag: &'a Tag, name: &str) -> Option<&'a [i32]> {
     }
 }
 
+fn campfire_persistent_timing(tag: &Tag, slot: usize) -> Option<(u32, u32)> {
+    campfire_vanilla_persistent_timing(tag, slot)
+        .or_else(|| campfire_legacy_persistent_timing(tag, slot))
+}
+
+fn campfire_vanilla_persistent_timing(tag: &Tag, slot: usize) -> Option<(u32, u32)> {
+    let progress =
+        u32::try_from(*compound_int_array_field(tag, CAMPFIRE_NBT_COOKING_TIMES)?.get(slot)?)
+            .ok()?;
+    let total =
+        u32::try_from(*compound_int_array_field(tag, CAMPFIRE_NBT_COOKING_TOTAL_TIMES)?.get(slot)?)
+            .ok()?;
+    if total == 0 {
+        return None;
+    }
+    Some((total.saturating_sub(progress).max(1), total))
+}
+
+fn campfire_legacy_persistent_timing(tag: &Tag, slot: usize) -> Option<(u32, u32)> {
+    let remaining =
+        u32::try_from(*compound_int_array_field(tag, LEGACY_CAMPFIRE_NBT_REMAINING)?.get(slot)?)
+            .ok()?;
+    let total =
+        u32::try_from(*compound_int_array_field(tag, LEGACY_CAMPFIRE_NBT_TOTAL)?.get(slot)?)
+            .ok()?;
+    (remaining > 0 && total > 0).then_some((remaining, total))
+}
+
 fn campfire_block_entity_update_nbt(
     items: &ItemRegistry,
     cooking: &CampfireCookingState,
@@ -2813,21 +2842,26 @@ fn campfire_block_entity_persistent_nbt(
     fields.push(("y".into(), Tag::Int(position.y)));
     fields.push(("z".into(), Tag::Int(position.z)));
     fields.push((
-        "solaris_cooking_remaining".into(),
+        CAMPFIRE_NBT_COOKING_TIMES.into(),
         Tag::IntArray(
             cooking
                 .slots
                 .iter()
                 .map(|slot| {
                     slot.as_ref().map_or(0, |entry| {
-                        i32::try_from(entry.ticks_remaining).unwrap_or(i32::MAX)
+                        i32::try_from(
+                            entry
+                                .cooking_time_total
+                                .saturating_sub(entry.ticks_remaining),
+                        )
+                        .unwrap_or(i32::MAX)
                     })
                 })
                 .collect(),
         ),
     ));
     fields.push((
-        "solaris_cooking_total".into(),
+        CAMPFIRE_NBT_COOKING_TOTAL_TIMES.into(),
         Tag::IntArray(
             cooking
                 .slots

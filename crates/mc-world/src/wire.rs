@@ -220,7 +220,13 @@ fn strip_persistent_block_entity_fields(tag: Tag) -> Tag {
             .filter(|(key, _)| {
                 !matches!(
                     key.as_str(),
-                    "id" | "x" | "y" | "z" | "solaris_cooking_remaining" | "solaris_cooking_total"
+                    "id" | "x"
+                        | "y"
+                        | "z"
+                        | "CookingTimes"
+                        | "CookingTotalTimes"
+                        | "solaris_cooking_remaining"
+                        | "solaris_cooking_total"
                 )
             })
             .collect(),
@@ -730,6 +736,8 @@ mod tests {
                     elements: Vec::new(),
                 }),
             ),
+            ("CookingTimes".into(), Tag::IntArray(vec![1, 0, 0, 0])),
+            ("CookingTotalTimes".into(), Tag::IntArray(vec![4, 0, 0, 0])),
             (
                 "solaris_cooking_remaining".into(),
                 Tag::IntArray(vec![3, 0, 0, 0]),
@@ -754,7 +762,13 @@ mod tests {
         assert!(fields.iter().all(|(key, _)| {
             !matches!(
                 key.as_str(),
-                "id" | "x" | "y" | "z" | "solaris_cooking_remaining" | "solaris_cooking_total"
+                "id" | "x"
+                    | "y"
+                    | "z"
+                    | "CookingTimes"
+                    | "CookingTotalTimes"
+                    | "solaris_cooking_remaining"
+                    | "solaris_cooking_total"
             )
         }));
     }
