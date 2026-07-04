@@ -206,6 +206,37 @@ fn check_reports_public_bind_security_warnings() {
 }
 
 #[test]
+fn check_reports_online_mode_warning_on_loopback() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(
+        br#"
+            [server]
+            name = "OnlineModeTest"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [auth]
+            online_mode = true
+        "#,
+    )
+    .expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("online_mode_unsupported"))
+        .stdout(contains("public_bind_online_mode").not());
+}
+
+#[test]
 fn check_reports_missing_world_dir_warning() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");

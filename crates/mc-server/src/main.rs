@@ -227,6 +227,13 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         }
     }
 
+    if config.auth.online_mode {
+        warnings.push(OperatorWarning {
+            code: "online_mode_unsupported",
+            message: "auth.online_mode is configured, but Solaris does not implement Mojang online-mode authentication; serve will reject logins",
+        });
+    }
+
     let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
         return warnings;
     };
