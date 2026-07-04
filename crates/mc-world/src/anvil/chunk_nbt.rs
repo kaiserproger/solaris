@@ -33,8 +33,8 @@ use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BIOME_VOLUME, BiomeSection, BlockPos, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
-    FurnaceSlot, Heightmap, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT, ScheduledBlockTick,
-    ScheduledFluidTick, SectionLight,
+    FurnaceSlot, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT,
+    ScheduledBlockTick, ScheduledFluidTick, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
@@ -219,6 +219,19 @@ pub fn chunk_from_nbt_with_items(
                         z: bz,
                     },
                     decode_chest(cmp, items)?,
+                );
+                continue;
+            }
+            if block_entity_id.is_some_and(|id| is_hopper_block_entity_id(id))
+                && let Some(items) = items
+            {
+                chunk.hoppers.insert(
+                    BlockPos {
+                        x: bx,
+                        y: by,
+                        z: bz,
+                    },
+                    decode_hopper(cmp, items)?,
                 );
                 continue;
             }
@@ -559,7 +572,11 @@ pub fn chunk_to_nbt_with_items_at_tick(
     let mut be_entries: Vec<(&BlockPos, &Vec<u8>)> = chunk
         .block_entities
         .iter()
-        .filter(|(pos, _)| !chunk.furnaces.contains_key(pos) && !chunk.chests.contains_key(pos))
+        .filter(|(pos, _)| {
+            !chunk.furnaces.contains_key(pos)
+                && !chunk.chests.contains_key(pos)
+                && !chunk.hoppers.contains_key(pos)
+        })
         .collect();
     be_entries.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
     for (_, bytes) in be_entries {
@@ -587,6 +604,11 @@ pub fn chunk_to_nbt_with_items_at_tick(
                 items,
                 chest_storage_block_entity_id_for_block(chunk, registry, *pos),
             )?);
+        }
+        let mut hoppers: Vec<(&BlockPos, &HopperBlockEntity)> = chunk.hoppers.iter().collect();
+        hoppers.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+        for (pos, hopper) in hoppers {
+            be_list.push(encode_hopper(pos, hopper, items)?);
         }
     }
     root.push((
@@ -862,6 +884,34 @@ fn decode_chest(
     Ok(chest)
 }
 
+fn decode_hopper(
+    cmp: &[(String, Tag)],
+    items: &ItemRegistry,
+) -> Result<HopperBlockEntity, ChunkNbtError> {
+    let mut hopper = HopperBlockEntity::default();
+    if let Some(list) = get_optional_list(cmp, "Items")? {
+        for tag in &list.elements {
+            let item = expect_compound(tag, "Items[]")?;
+            let slot = get_int(item, "Slot")?;
+            if !(0..=4).contains(&slot) {
+                continue;
+            }
+            let item_name = get_string(item, "id")?;
+            let parsed = Identifier::parse(item_name.clone())
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
+            let item_id = items
+                .id_of(&parsed)
+                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
+            hopper.slots[slot as usize] = FurnaceSlot {
+                count: get_int(item, "count")?,
+                item_id,
+                damage: None,
+            };
+        }
+    }
+    Ok(hopper)
+}
+
 fn encode_furnace(
     pos: &BlockPos,
     furnace: &FurnaceBlockEntity,
@@ -983,6 +1033,50 @@ fn encode_chest(
 
 fn is_chest_storage_block_entity_id(id: &str) -> bool {
     matches!(id, "minecraft:chest" | "minecraft:barrel")
+}
+
+fn encode_hopper(
+    pos: &BlockPos,
+    hopper: &HopperBlockEntity,
+    items: &ItemRegistry,
+) -> Result<Tag, ChunkNbtError> {
+    let mut compound = vec![
+        ("id".into(), Tag::String("minecraft:hopper".to_string())),
+        ("x".into(), Tag::Int(pos.x)),
+        ("y".into(), Tag::Int(pos.y)),
+        ("z".into(), Tag::Int(pos.z)),
+    ];
+
+    let mut item_tags = Vec::new();
+    for (slot, stack) in hopper.slots.iter().enumerate() {
+        if stack.is_empty() {
+            continue;
+        }
+        let name = items
+            .name_of(stack.item_id)
+            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
+        item_tags.push(Tag::Compound(vec![
+            ("Slot".into(), Tag::Int(slot as i32)),
+            ("id".into(), Tag::String(name.as_str().to_string())),
+            ("count".into(), Tag::Int(stack.count)),
+        ]));
+    }
+    compound.push((
+        "Items".into(),
+        Tag::List(ListTag {
+            element_type: if item_tags.is_empty() {
+                tag_type::END
+            } else {
+                tag_type::COMPOUND
+            },
+            elements: item_tags,
+        }),
+    ));
+    Ok(Tag::Compound(compound))
+}
+
+fn is_hopper_block_entity_id(id: &str) -> bool {
+    id == "minecraft:hopper"
 }
 
 fn chest_storage_block_entity_id_for_block(
@@ -1351,6 +1445,74 @@ mod tests {
         for &(pos, _, _) in &entries {
             assert!(decoded.chests.contains_key(&pos));
         }
+    }
+
+    #[test]
+    fn hopper_block_entity_items_round_trip_through_anvil() {
+        fn block_report(id: u32, name: &str) -> mc_data::blocks::BlockReport {
+            mc_data::blocks::BlockReport {
+                id: Identifier::parse(name).unwrap(),
+                properties: std::collections::BTreeMap::new(),
+                states: vec![mc_data::blocks::BlockStateReport {
+                    id,
+                    default: true,
+                    properties: std::collections::BTreeMap::new(),
+                }],
+            }
+        }
+
+        let registry = BlockRegistry::from_report(&[
+            block_report(0, "minecraft:air"),
+            block_report(1, "minecraft:hopper"),
+        ])
+        .unwrap();
+        let items = mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: Identifier::parse("minecraft:cobblestone").unwrap(),
+                protocol_id: 10,
+            },
+            mc_data::items::ItemReport {
+                id: Identifier::parse("minecraft:apple").unwrap(),
+                protocol_id: 11,
+            },
+        ]);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome);
+        let pos = BlockPos { x: 4, y: 64, z: 5 };
+        chunk.set_block(4, 64, 5, BlockStateId(1)).unwrap();
+        let mut hopper = HopperBlockEntity::default();
+        hopper.slots[0] = FurnaceSlot {
+            count: 64,
+            item_id: 10,
+            damage: None,
+        };
+        hopper.slots[4] = FurnaceSlot {
+            count: 3,
+            item_id: 11,
+            damage: None,
+        };
+        chunk.hoppers.insert(pos, hopper.clone());
+
+        let root = chunk_to_nbt_with_items(&chunk, &registry, Some(&items)).unwrap();
+        let Tag::Compound(root_cmp) = &root else {
+            panic!("chunk root must be a compound");
+        };
+        let Tag::List(block_entities) = root_cmp
+            .iter()
+            .find(|(key, _)| key == "block_entities")
+            .map(|(_, tag)| tag)
+            .expect("block_entities list")
+        else {
+            panic!("block_entities must be a list");
+        };
+        assert_eq!(block_entities.elements.len(), 1);
+        let Tag::Compound(cmp) = &block_entities.elements[0] else {
+            panic!("hopper block entity must be a compound");
+        };
+        assert_eq!(get_string(cmp, "id").unwrap(), "minecraft:hopper");
+
+        let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
+        assert_eq!(decoded.hoppers.get(&pos), Some(&hopper));
     }
 
     /// The big M2 acceptance test: load every chunk in the real

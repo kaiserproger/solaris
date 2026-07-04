@@ -28,7 +28,7 @@ use crate::anvil::{
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
     BlockPos, ChestBlockEntity, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity,
-    ScheduledBlockTick, ScheduledFluidTick,
+    HopperBlockEntity, ScheduledBlockTick, ScheduledFluidTick,
 };
 use crate::section::SECTION_DIM;
 
@@ -912,6 +912,33 @@ impl WorldStorage {
         Ok(true)
     }
 
+    pub fn hopper_block_entity(
+        &mut self,
+        pos: BlockPos,
+    ) -> Result<Option<HopperBlockEntity>, WorldError> {
+        let cpos = chunk_pos_of(pos);
+        let Some(chunk) = self.ensure_chunk(cpos)? else {
+            return Ok(None);
+        };
+        Ok(Some(chunk.hoppers.get(&pos).cloned().unwrap_or_default()))
+    }
+
+    pub fn set_hopper_block_entity(
+        &mut self,
+        pos: BlockPos,
+        hopper: HopperBlockEntity,
+    ) -> Result<bool, WorldError> {
+        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+            return Ok(false);
+        };
+        if chunk.hoppers.get(&pos) == Some(&hopper) {
+            return Ok(true);
+        }
+        chunk.hoppers.insert(pos, hopper);
+        chunk.mark_dirty();
+        Ok(true)
+    }
+
     pub fn set_opaque_block_entity(
         &mut self,
         pos: BlockPos,
@@ -1394,10 +1421,12 @@ fn prune_incompatible_block_entities(
     let keeps_chest = path.is_some_and(|path| matches!(path, "chest" | "barrel"));
     let keeps_furnace =
         path.is_some_and(|path| matches!(path, "furnace" | "blast_furnace" | "smoker"));
+    let keeps_hopper = path.is_some_and(|path| path == "hopper");
     let keeps_opaque = path.is_some_and(block_path_may_have_opaque_block_entity);
 
     let removed = (!keeps_chest && chunk.chests.remove(&pos).is_some())
         | (!keeps_furnace && chunk.furnaces.remove(&pos).is_some())
+        | (!keeps_hopper && chunk.hoppers.remove(&pos).is_some())
         | (!keeps_opaque && chunk.block_entities.remove(&pos).is_some());
     if removed {
         chunk.mark_dirty();
@@ -1559,6 +1588,41 @@ mod tests {
                 },
                 mc_data::blocks::BlockReport {
                     id: Identifier::parse("minecraft:chest").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        )
+    }
+
+    fn air_stone_hopper_registry() -> Arc<BlockRegistry> {
+        Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:hopper").unwrap(),
                     properties: std::collections::BTreeMap::new(),
                     states: vec![mc_data::blocks::BlockStateReport {
                         id: 2,
@@ -1761,6 +1825,31 @@ mod tests {
         );
         assert_eq!(world.dirty_count(), 1);
         assert_eq!(world.furnace_block_entity(pos).unwrap(), Some(furnace));
+    }
+
+    #[test]
+    fn hopper_block_entities_are_chunk_scoped_runtime_state() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        let mut hopper = world.hopper_block_entity(pos).unwrap().unwrap();
+        assert!(hopper.slots[0].is_empty());
+        hopper.slots[4] = crate::chunk::FurnaceSlot {
+            count: 2,
+            item_id: 42,
+            damage: Some(7),
+        };
+
+        assert!(world.set_hopper_block_entity(pos, hopper.clone()).unwrap());
+        assert_eq!(world.dirty_count(), 1);
+        assert_eq!(world.hopper_block_entity(pos).unwrap(), Some(hopper));
     }
 
     #[test]
@@ -1992,6 +2081,53 @@ mod tests {
     }
 
     #[test]
+    fn hopper_block_entity_survives_flush_and_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = air_stone_hopper_registry();
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:cobblestone").unwrap(),
+                protocol_id: 10,
+            },
+            mc_data::items::ItemReport {
+                id: mc_data::Identifier::parse("minecraft:apple").unwrap(),
+                protocol_id: 11,
+            },
+        ]));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4)
+            .unwrap()
+            .with_item_registry(Arc::clone(&items));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
+
+        let mut hopper = crate::chunk::HopperBlockEntity::default();
+        hopper.slots[0] = crate::chunk::FurnaceSlot {
+            count: 64,
+            item_id: 10,
+            damage: None,
+        };
+        hopper.slots[4] = crate::chunk::FurnaceSlot {
+            count: 3,
+            item_id: 11,
+            damage: None,
+        };
+        world.set_hopper_block_entity(pos, hopper.clone()).unwrap();
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+
+        let mut fresh = WorldStorage::open(tmp.path(), Arc::clone(&registry))
+            .unwrap()
+            .with_item_registry(items);
+        assert_eq!(fresh.hopper_block_entity(pos).unwrap(), Some(hopper));
+    }
+
+    #[test]
     fn replacing_chest_block_prunes_stale_block_entity() {
         let registry = air_stone_chest_registry();
         let cpos = ChunkPos { x: 0, z: 0 };
@@ -2014,6 +2150,31 @@ mod tests {
 
         let chunk = world.cache.get(&cpos).unwrap();
         assert!(!chunk.chests.contains_key(&pos));
+    }
+
+    #[test]
+    fn replacing_hopper_block_prunes_stale_block_entity() {
+        let registry = air_stone_hopper_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        let mut hopper = crate::chunk::HopperBlockEntity::default();
+        hopper.slots[0] = crate::chunk::FurnaceSlot {
+            count: 1,
+            item_id: 10,
+            damage: None,
+        };
+        world.set_hopper_block_entity(pos, hopper).unwrap();
+
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+        let chunk = world.cache.get(&cpos).unwrap();
+        assert!(!chunk.hoppers.contains_key(&pos));
     }
 
     /// End-to-end: open the generated flat test world, query known

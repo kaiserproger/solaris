@@ -5532,6 +5532,8 @@ pub(crate) async fn run_scheduled_block_ticks(
 
     let table = config.block_light.as_deref();
     let mut drained = 0usize;
+    let mut applied_mutations = 0usize;
+    let mut chest_updates = Vec::new();
     let mut outcome = BlockEditBatchOutcome::default();
     {
         let mut storage = world.lock().await;
@@ -5553,6 +5555,13 @@ pub(crate) async fn run_scheduled_block_ticks(
                 if state.block.id != tick.block {
                     continue;
                 }
+                if let Some(updates) =
+                    scheduled_hopper_transfer(&config.blocks, &mut storage, tick.pos, state_id)
+                {
+                    applied_mutations += 1;
+                    chest_updates.extend(updates);
+                    continue;
+                }
                 let Some(edits) =
                     scheduled_block_tick_edits(&config.blocks, &mut storage, tick.pos, state_id)
                 else {
@@ -5563,6 +5572,10 @@ pub(crate) async fn run_scheduled_block_ticks(
                 }
             }
         }
+    }
+    for (position, slots) in chest_updates {
+        let (_, dispatches) = sessions.server_chest_slot_dispatches(position, slots);
+        dispatch_visibility_commands(dispatches);
     }
     let budget_exhausted = drained >= policy.fluid_tick_budget;
     if budget_exhausted {
@@ -5592,13 +5605,13 @@ pub(crate) async fn run_scheduled_block_ticks(
         debug!(
             world_tick,
             drained,
-            applied = outcome.applied.len(),
+            applied = outcome.applied.len() + applied_mutations,
             "scheduled block ticks applied edits"
         );
     }
     ScheduledBlockTickReport {
         drained,
-        applied: outcome.applied.len(),
+        applied: outcome.applied.len() + applied_mutations,
         budget: policy.fluid_tick_budget,
         budget_exhausted,
     }
@@ -7150,6 +7163,133 @@ fn scheduled_block_tick_edits(
     }];
     extend_adjacent_power_target_edits(blocks, storage, pos, false, &mut edits);
     Some(edits)
+}
+
+fn scheduled_hopper_transfer(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state_id: mc_world::BlockStateId,
+) -> Option<Vec<(mc_world::BlockPos, Vec<ItemStack>)>> {
+    let state = blocks.by_id(state_id)?;
+    if state.block.id.path() != "hopper" {
+        return None;
+    }
+    let facing = block_state_property(state, "facing")?;
+    let source_pos = mc_world::BlockPos {
+        y: pos.y + 1,
+        ..pos
+    };
+    let target_pos = hopper_facing_target(pos, facing)?;
+    if !cached_storage_block_is_chest_like(blocks, storage, source_pos)
+        || !cached_storage_block_is_chest_like(blocks, storage, target_pos)
+    {
+        return None;
+    }
+    let Ok(Some(mut source)) = storage.chest_block_entity(source_pos) else {
+        return None;
+    };
+    let Ok(Some(hopper)) = storage.hopper_block_entity(pos) else {
+        return None;
+    };
+    if hopper.slots.iter().any(|slot| !slot.is_empty()) {
+        return None;
+    }
+    let Ok(Some(mut target)) = storage.chest_block_entity(target_pos) else {
+        return None;
+    };
+
+    let source_before = source.clone();
+    let target_before = target.clone();
+
+    let source_slot = source.slots.iter().position(|slot| !slot.is_empty())?;
+    let moving = FurnaceSlot {
+        count: 1,
+        item_id: source.slots[source_slot].item_id,
+        damage: source.slots[source_slot].damage,
+    };
+    let target_slot = target_hopper_insert_slot(&target, &moving)?;
+
+    source.slots[source_slot].count -= 1;
+    if source.slots[source_slot].count <= 0 {
+        source.slots[source_slot] = FurnaceSlot::EMPTY;
+    }
+    if target.slots[target_slot].is_empty() {
+        target.slots[target_slot] = moving;
+    } else {
+        target.slots[target_slot].count += 1;
+    }
+
+    if !storage
+        .set_chest_block_entity(source_pos, source.clone())
+        .unwrap_or(false)
+        || !storage
+            .set_chest_block_entity(target_pos, target.clone())
+            .unwrap_or(false)
+    {
+        return None;
+    }
+
+    let mut updates = Vec::new();
+    if source != source_before {
+        updates.push((source_pos, chest_slots_from_block_entity(&source)));
+    }
+    if target != target_before {
+        updates.push((target_pos, chest_slots_from_block_entity(&target)));
+    }
+    Some(updates)
+}
+
+fn hopper_facing_target(pos: mc_world::BlockPos, facing: &str) -> Option<mc_world::BlockPos> {
+    Some(match facing {
+        "down" => mc_world::BlockPos {
+            y: pos.y - 1,
+            ..pos
+        },
+        "north" => mc_world::BlockPos {
+            z: pos.z - 1,
+            ..pos
+        },
+        "south" => mc_world::BlockPos {
+            z: pos.z + 1,
+            ..pos
+        },
+        "west" => mc_world::BlockPos {
+            x: pos.x - 1,
+            ..pos
+        },
+        "east" => mc_world::BlockPos {
+            x: pos.x + 1,
+            ..pos
+        },
+        _ => return None,
+    })
+}
+
+fn cached_storage_block_is_chest_like(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> bool {
+    storage
+        .get_cached_block(pos)
+        .and_then(|state_id| blocks.by_id(state_id))
+        .is_some_and(|state| matches!(state.block.id.path(), "chest" | "barrel"))
+}
+
+fn target_hopper_insert_slot(target: &ChestBlockEntity, moving: &FurnaceSlot) -> Option<usize> {
+    target.slots.iter().position(|slot| {
+        slot.is_empty()
+            || (slot.item_id == moving.item_id
+                && slot.damage == moving.damage
+                && slot.count < HOPPER_TRANSFER_MAX_STACK)
+    })
+}
+
+const HOPPER_TRANSFER_MAX_STACK: i32 = 64;
+
+fn chest_slots_from_block_entity(chest: &ChestBlockEntity) -> Vec<ItemStack> {
+    chest.slots.iter().map(furnace_slot_to_stack).collect()
 }
 
 fn extend_adjacent_power_target_edits(

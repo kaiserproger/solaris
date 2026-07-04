@@ -199,7 +199,20 @@ pub struct ChestBlockEntity {
     pub slots: [FurnaceSlot; 27],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopperBlockEntity {
+    pub slots: [FurnaceSlot; 5],
+}
+
 impl Default for ChestBlockEntity {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| FurnaceSlot::EMPTY),
+        }
+    }
+}
+
+impl Default for HopperBlockEntity {
     fn default() -> Self {
         Self {
             slots: std::array::from_fn(|_| FurnaceSlot::EMPTY),
@@ -365,6 +378,8 @@ pub struct Chunk {
     pub furnaces: HashMap<BlockPos, FurnaceBlockEntity>,
     /// Runtime-typed single chest state keyed by absolute world position.
     pub chests: HashMap<BlockPos, ChestBlockEntity>,
+    /// Runtime-typed hopper state keyed by absolute world position.
+    pub hoppers: HashMap<BlockPos, HopperBlockEntity>,
     /// Chunk-owned scheduled block ticks. Runtime code orders by
     /// trigger tick, priority, and insertion sequence; Anvil persistence
     /// is wired in separately once the local 26.1.2 shape is verified.
@@ -438,6 +453,7 @@ impl Chunk {
             block_entities: HashMap::new(),
             furnaces: HashMap::new(),
             chests: HashMap::new(),
+            hoppers: HashMap::new(),
             scheduled_block_ticks: Vec::new(),
             next_scheduled_block_tick_sequence: 0,
             scheduled_fluid_ticks: Vec::new(),

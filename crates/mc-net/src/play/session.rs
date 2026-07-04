@@ -725,19 +725,47 @@ impl SessionRegistry {
                 .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
                 .or_insert(2);
             let state_id = *state_id;
-            let recipients = inner
-                .chest_viewers
-                .get(&position)
-                .into_iter()
-                .flat_map(|viewers| viewers.iter())
-                .filter(|&(&id, _)| id != except)
-                .map(|(&id, viewer)| SessionRecipient {
-                    id,
-                    tx: viewer.tx.clone(),
-                })
-                .collect::<Vec<_>>();
+            let recipients = chest_recipients(&inner, position, Some(except));
             (state_id, recipients)
         };
+        (
+            state_id,
+            visibility_dispatches(
+                recipients,
+                OutboundCommand::ChestSlots {
+                    position,
+                    state_id,
+                    slots,
+                },
+            ),
+        )
+    }
+
+    pub(super) fn server_chest_slot_dispatches(
+        &self,
+        position: mc_world::BlockPos,
+        slots: Vec<ItemStack>,
+    ) -> (i32, Vec<VisibilityDispatch>) {
+        let (state_id, recipients) = {
+            let mut inner = self.lock_inner("server chest slot dispatches");
+            let recipients = chest_recipients(&inner, position, None);
+            if recipients.is_empty() {
+                (
+                    inner.chest_state_ids.get(&position).copied().unwrap_or(1),
+                    recipients,
+                )
+            } else {
+                let state_id = inner
+                    .chest_state_ids
+                    .entry(position)
+                    .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
+                    .or_insert(2);
+                (*state_id, recipients)
+            }
+        };
+        if recipients.is_empty() {
+            return (state_id, Vec::new());
+        }
         (
             state_id,
             visibility_dispatches(
@@ -2201,6 +2229,24 @@ fn furnace_recipients_except(
         .collect()
 }
 
+fn chest_recipients(
+    inner: &SessionRegistryInner,
+    position: mc_world::BlockPos,
+    except: Option<SessionId>,
+) -> Vec<SessionRecipient> {
+    inner
+        .chest_viewers
+        .get(&position)
+        .into_iter()
+        .flat_map(|viewers| viewers.iter())
+        .filter(|&(&id, _)| except != Some(id))
+        .map(|(&id, viewer)| SessionRecipient {
+            id,
+            tx: viewer.tx.clone(),
+        })
+        .collect()
+}
+
 fn visibility_dispatches(
     recipients: Vec<SessionRecipient>,
     command: OutboundCommand,
@@ -3333,6 +3379,19 @@ mod tests {
         registry.unregister_chest_viewer(alice, position);
         registry.unregister_chest_viewer(bob, position);
         registry.unregister_chest_viewer(charlie, position);
+        assert_eq!(registry.chest_state_id(position), 1);
+    }
+
+    #[test]
+    fn server_chest_slot_dispatches_do_not_allocate_state_without_viewers() {
+        let registry = SessionRegistry::new();
+        let position = mc_world::BlockPos { x: 7, y: 64, z: 7 };
+
+        let (state_id, dispatches) =
+            registry.server_chest_slot_dispatches(position, vec![ItemStack::new(10, 1)]);
+
+        assert_eq!(state_id, 1);
+        assert!(dispatches.is_empty());
         assert_eq!(registry.chest_state_id(position), 1);
     }
 
