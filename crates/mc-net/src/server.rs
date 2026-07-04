@@ -604,6 +604,7 @@ impl BoundServer {
         tokio::spawn(run_console_commands(
             Arc::clone(&config),
             Arc::clone(&sessions),
+            runtime_control.clone(),
         ));
         loop {
             tokio::select! {
@@ -678,7 +679,11 @@ fn is_slow_tick(tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
     policy.slow_tick_ms > 0 && tick_us >= policy.slow_tick_ms.saturating_mul(1_000)
 }
 
-async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::SessionRegistry>) {
+async fn run_console_commands(
+    config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
+    runtime_control: Option<RuntimeControlHandle>,
+) {
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
     loop {
@@ -709,6 +714,9 @@ async fn run_console_commands(config: Arc<ServerConfig>, sessions: Arc<play::Ses
                 log_save_report("console save-all", &report);
             }
             Ok(play::commands::AdminCommand::Stop) => {
+                if let Some(runtime_control) = runtime_control.as_ref() {
+                    runtime_control.request_drain();
+                }
                 let report = save_all(&config, &sessions).await;
                 log_save_report("console stop", &report);
                 if report.is_ok() {

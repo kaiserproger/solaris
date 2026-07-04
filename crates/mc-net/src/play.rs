@@ -10044,6 +10044,9 @@ where
             }
         }
         AdminCommand::Stop => {
+            if let Some(runtime_control) = runtime_control {
+                runtime_control.request_drain();
+            }
             let report = crate::server::save_all(config, sessions).await;
             if report.is_ok() {
                 config.shutdown.request();

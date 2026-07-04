@@ -59,6 +59,12 @@ async fn start_server_with_shutdown_and_chunk_pipeline(
 }
 
 async fn start_server_with_runtime_control() -> (SocketAddr, mc_net::RuntimeControlHandle) {
+    start_server_with_runtime_control_and_shutdown(mc_net::ShutdownHandle::default()).await
+}
+
+async fn start_server_with_runtime_control_and_shutdown(
+    shutdown: mc_net::ShutdownHandle,
+) -> (SocketAddr, mc_net::RuntimeControlHandle) {
     let chunk_pipeline = mc_net::ChunkPipelinePolicy {
         runtime_control: Some(mc_net::RuntimeControlConfig {
             policy: mc_net::AutoscalePolicy {
@@ -101,7 +107,7 @@ async fn start_server_with_runtime_control() -> (SocketAddr, mc_net::RuntimeCont
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        shutdown: mc_net::ShutdownHandle::default(),
+        shutdown,
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
@@ -230,6 +236,36 @@ async fn status_command_reports_runtime_control_drain_snapshot() {
         next_system_chat_text(&mut client).await,
         "Runtime control: draining=true action=hold pressure=none limits=view_distance:2,send:1,load:2,generate:3 pressure_ticks=0 healthy_ticks=0 reason=drain active; holding minimum limits"
     );
+}
+
+#[tokio::test]
+async fn stop_command_requests_runtime_control_drain() {
+    let shutdown = mc_net::ShutdownHandle::default();
+    let (addr, runtime_control) =
+        start_server_with_runtime_control_and_shutdown(shutdown.clone()).await;
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "M100StopDrain")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "stop".to_string(),
+        })
+        .await
+        .expect("send stop command");
+
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "Saved all state; stopping server"
+    );
+    assert!(shutdown.is_requested());
+    assert!(runtime_control.snapshot().draining);
 }
 
 #[tokio::test]

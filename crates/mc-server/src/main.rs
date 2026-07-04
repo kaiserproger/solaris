@@ -706,6 +706,7 @@ async fn serve(path: &Path) -> Result<()> {
     let shutdown_handle = net.shutdown.clone();
     let bound = mc_net::bind(net).await.context("network bind")?;
     let save_handle = bound.save_handle();
+    let runtime_control = bound.runtime_control_handle();
     let mut run_fut = std::pin::pin!(bound.serve());
     let shutdown = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
@@ -722,6 +723,7 @@ async fn serve(path: &Path) -> Result<()> {
             tracing::info!("shutdown signal received");
             let (drain_result, report) = request_shutdown_drain_then_save(
                 &shutdown_handle,
+                runtime_control.as_ref(),
                 run_fut.as_mut(),
                 save_handle.save_all(),
             ).await;
@@ -751,6 +753,7 @@ async fn serve(path: &Path) -> Result<()> {
 
 async fn request_shutdown_drain_then_save<D, S, SR>(
     shutdown: &mc_net::ShutdownHandle,
+    runtime_control: Option<&mc_net::RuntimeControlHandle>,
     drain: Pin<&mut D>,
     save: S,
 ) -> (Result<D::Output, tokio::time::error::Elapsed>, SR)
@@ -758,6 +761,9 @@ where
     D: Future,
     S: Future<Output = SR>,
 {
+    if let Some(runtime_control) = runtime_control {
+        runtime_control.request_drain();
+    }
     shutdown.request();
     let drain_result = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await;
     let save_result = save.await;
@@ -1796,25 +1802,53 @@ mod tests {
     #[tokio::test]
     async fn shutdown_sequence_requests_and_drains_before_save() {
         let shutdown = mc_net::ShutdownHandle::default();
+        let runtime_control = mc_net::RuntimeControlHandle::new(mc_net::RuntimeControlConfig {
+            policy: mc_net::AutoscalePolicy {
+                min_view_distance: 2,
+                max_view_distance: 8,
+                min_chunk_send_rate: 1,
+                max_chunk_send_rate: 16,
+                min_chunk_load_rate: 2,
+                max_chunk_load_rate: 64,
+                min_chunk_generate_rate: 3,
+                max_chunk_generate_rate: 32,
+                ..mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced)
+            },
+            initial_limits: mc_net::RuntimeControlLimits {
+                view_distance: 8,
+                chunk_send_rate: 16,
+                chunk_load_rate: 64,
+                chunk_generate_rate: 32,
+            },
+        });
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));
         let drain_shutdown = shutdown.clone();
+        let drain_runtime_control = runtime_control.clone();
         let drain_events = Arc::clone(&events);
         let mut drain = std::pin::pin!(async move {
             assert!(drain_shutdown.is_requested());
+            assert!(drain_runtime_control.snapshot().draining);
             drain_events.lock().unwrap().push("drain");
             Ok::<(), std::io::Error>(())
         });
         let save_shutdown = shutdown.clone();
+        let save_runtime_control = runtime_control.clone();
         let save_events = Arc::clone(&events);
         let save = async move {
             assert!(save_shutdown.is_requested());
+            assert!(save_runtime_control.snapshot().draining);
             assert_eq!(save_events.lock().unwrap().as_slice(), ["drain"]);
             save_events.lock().unwrap().push("save");
             42
         };
 
-        let (drain_result, save_result) =
-            request_shutdown_drain_then_save(&shutdown, drain.as_mut(), save).await;
+        let (drain_result, save_result) = request_shutdown_drain_then_save(
+            &shutdown,
+            Some(&runtime_control),
+            drain.as_mut(),
+            save,
+        )
+        .await;
 
         assert!(drain_result.unwrap().is_ok());
         assert_eq!(save_result, 42);
