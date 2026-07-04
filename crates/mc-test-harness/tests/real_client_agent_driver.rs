@@ -320,6 +320,61 @@ fn agent_driver_waits_for_async_screenshot_file() {
 }
 
 #[test]
+fn agent_driver_rejects_invalid_screenshot_artifact() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let bridge = FakeBridge::start_with_screenshot_bytes(5, b"fake png");
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+        .arg("--secret")
+        .arg("test-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("m94-02b-rejected-block-resync")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        !output.status.success(),
+        "driver accepted an invalid screenshot artifact\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("failed observations.json exists"),
+    )
+    .expect("failed observations.json is valid JSON");
+    assert_eq!(observations["result"], "failed");
+    assert!(
+        observations["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("invalid PNG")),
+        "failed observations must report invalid PNG screenshot bytes\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = bridge.join();
+    let commands: Vec<_> = requests
+        .iter()
+        .map(|request| request["command"].as_str().expect("command is present"))
+        .collect();
+    assert_eq!(
+        commands,
+        ["ping", "wait_play", "run_scenario", "state", "screenshot"]
+    );
+}
+
+#[test]
 fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
@@ -1245,6 +1300,7 @@ impl FakeBridge {
             Duration::ZERO,
             None,
             "passed",
+            VALID_PNG_1X1,
         )
     }
 
@@ -1255,6 +1311,21 @@ impl FakeBridge {
             screenshot_delay,
             None,
             "passed",
+            VALID_PNG_1X1,
+        )
+    }
+
+    fn start_with_screenshot_bytes(
+        expected_requests: usize,
+        screenshot_bytes: &'static [u8],
+    ) -> Self {
+        Self::start_with_options(
+            expected_requests,
+            vec![wait_play_payload(true)],
+            Duration::ZERO,
+            None,
+            "passed",
+            screenshot_bytes,
         )
     }
 
@@ -1268,6 +1339,7 @@ impl FakeBridge {
             Duration::ZERO,
             Some(server_release_log_path),
             "passed",
+            VALID_PNG_1X1,
         )
     }
 
@@ -1278,6 +1350,7 @@ impl FakeBridge {
             Duration::ZERO,
             None,
             scenario_result,
+            VALID_PNG_1X1,
         )
     }
 
@@ -1287,6 +1360,7 @@ impl FakeBridge {
         screenshot_delay: Duration,
         server_release_log_path: Option<std::path::PathBuf>,
         scenario_result: &'static str,
+        screenshot_bytes: &'static [u8],
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake bridge");
         listener
@@ -1317,9 +1391,12 @@ impl FakeBridge {
                             &thread_wait_play_results,
                             &thread_movement_count,
                             &thread_play_state,
-                            screenshot_delay,
-                            server_release_log_path.as_ref(),
-                            scenario_result,
+                            BridgeResponseOptions {
+                                screenshot_delay,
+                                server_release_log_path: server_release_log_path.as_deref(),
+                                scenario_result,
+                                screenshot_bytes,
+                            },
                         );
                         thread_requests.lock().expect("requests lock").push(request);
                         write_json_response(&mut stream, &response);
@@ -1392,13 +1469,13 @@ fn bridge_response(
     wait_play_results: &Mutex<VecDeque<Value>>,
     movement_count: &Mutex<u32>,
     play_state: &Mutex<bool>,
-    screenshot_delay: Duration,
-    server_release_log_path: Option<&std::path::PathBuf>,
-    scenario_result: &'static str,
+    options: BridgeResponseOptions<'_>,
 ) -> Value {
     let request_id = request["id"].as_u64().expect("request id");
     if request["command"].as_str() == Some("connect")
-        && server_release_log_path.is_some_and(|path| !server_session_release_logged(path))
+        && options
+            .server_release_log_path
+            .is_some_and(|path| !server_session_release_logged(path))
     {
         return json!({
             "id": request_id,
@@ -1430,7 +1507,7 @@ fn bridge_response(
             json!({"status": "ok"})
         }
         "run_scenario" => json!({
-            "result": scenario_result,
+            "result": options.scenario_result,
             "id": request["payload"]["id"],
             "observations": [
                 "fake bridge executed the scenario action path"
@@ -1453,13 +1530,15 @@ fn bridge_response(
             let path = request["payload"]["path"]
                 .as_str()
                 .expect("screenshot path");
-            if screenshot_delay.is_zero() {
-                std::fs::write(path, b"fake png").expect("write fake screenshot");
+            if options.screenshot_delay.is_zero() {
+                std::fs::write(path, options.screenshot_bytes).expect("write fake screenshot");
             } else {
                 let path = path.to_owned();
+                let screenshot_delay = options.screenshot_delay;
+                let screenshot_bytes = options.screenshot_bytes;
                 thread::spawn(move || {
                     thread::sleep(screenshot_delay);
-                    std::fs::write(path, b"fake png").expect("write delayed fake screenshot");
+                    std::fs::write(path, screenshot_bytes).expect("write delayed fake screenshot");
                 });
             }
             json!({"path": path})
@@ -1478,6 +1557,21 @@ fn bridge_response(
         "error": null,
     })
 }
+
+struct BridgeResponseOptions<'a> {
+    screenshot_delay: Duration,
+    server_release_log_path: Option<&'a std::path::Path>,
+    scenario_result: &'static str,
+    screenshot_bytes: &'static [u8],
+}
+
+const VALID_PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
 
 fn wait_play_payload(in_play: bool) -> Value {
     if in_play {

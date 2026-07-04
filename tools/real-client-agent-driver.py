@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import binascii
 import json
 import sys
 import time
@@ -231,6 +232,9 @@ def run_bridge_scenario(
     )
     if not wait_for_file(screenshot_path, min(timeout_seconds, 5.0)):
         raise RuntimeError(f"screenshot command did not create {screenshot_path}")
+    png_error = png_validation_error(screenshot_path)
+    if png_error is not None:
+        raise RuntimeError(f"screenshot command wrote invalid PNG {screenshot_path}: {png_error}")
 
     call_and_record(client, transcript, "disconnect", {}, timeout_seconds)
     return scenario_result, final_state, [screenshot_path.relative_to(run_dir).as_posix()], scenario_report
@@ -993,6 +997,9 @@ def capture_screenshot(
     )
     if not wait_for_file(screenshot_path, min(timeout_seconds, 5.0)):
         raise RuntimeError(f"screenshot command did not create {screenshot_path}")
+    png_error = png_validation_error(screenshot_path)
+    if png_error is not None:
+        raise RuntimeError(f"screenshot command wrote invalid PNG {screenshot_path}: {png_error}")
     return screenshot_path.relative_to(run_dir).as_posix()
 
 
@@ -1037,6 +1044,48 @@ def wait_for_file(path: Path, timeout_seconds: float) -> bool:
             return True
         time.sleep(0.05)
     return path.is_file()
+
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def png_validation_error(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"could not read file: {exc}"
+
+    if not data.startswith(PNG_SIGNATURE):
+        return "missing PNG signature"
+    offset = len(PNG_SIGNATURE)
+    saw_ihdr = False
+    while True:
+        if offset + 12 > len(data):
+            return "truncated PNG chunk header"
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_start = offset + 8
+        chunk_end = chunk_start + length
+        crc_end = chunk_end + 4
+        if crc_end > len(data):
+            return f"truncated {chunk_type.decode('ascii', errors='replace')} chunk"
+        expected_crc = int.from_bytes(data[chunk_end:crc_end], "big")
+        actual_crc = binascii.crc32(chunk_type + data[chunk_start:chunk_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return f"{chunk_type.decode('ascii', errors='replace')} CRC mismatch"
+        if not saw_ihdr:
+            if chunk_type != b"IHDR":
+                return "first PNG chunk is not IHDR"
+            if length != 13:
+                return "IHDR chunk has invalid length"
+            saw_ihdr = True
+        if chunk_type == b"IEND":
+            if length != 0:
+                return "IEND chunk has invalid length"
+            if crc_end != len(data):
+                return "trailing bytes after IEND"
+            return None
+        offset = crc_end
 
 
 def write_observations(
