@@ -244,6 +244,7 @@ pub struct OutboundPressureSnapshot {
     pub visibility_command_drops: u64,
     pub reliable_command_retries: u64,
     pub reliable_command_retries_in_flight: u64,
+    pub max_reliable_command_retries_in_flight: u64,
 }
 
 #[derive(Clone)]
@@ -259,6 +260,7 @@ impl OutboundPressureHandle {
             visibility_command_drops: pressure.visibility_command_drops,
             reliable_command_retries: pressure.reliable_command_retries,
             reliable_command_retries_in_flight: pressure.reliable_command_retries_in_flight,
+            max_reliable_command_retries_in_flight: pressure.max_reliable_command_retries_in_flight,
         }
     }
 }

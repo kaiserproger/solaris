@@ -28,6 +28,7 @@ const LOAD_CHUNK_WORKER_THREADS: usize = 2;
 const M52_BASELINE_CLIENTS: usize = 4;
 const M52_BASELINE_SUMMONS: usize = 8;
 const M52_SLOW_READER_SUMMONS: usize = 256;
+const M52_HEALTHY_OBSERVER_SUMMONS: usize = 128;
 const M52_BASELINE_ELAPSED_BUDGET: Duration = Duration::from_secs(30);
 const M52_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 const M96_REPLAY_CLIENTS: usize = 4;
@@ -190,6 +191,7 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
     }
 
     let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
+    assert_slow_reader_retry_bounded(pressure_before, pressure_after);
     assert_ne!(
         pressure_after, pressure_before,
         "paused reader should produce a measured outbound pressure delta"
@@ -373,6 +375,7 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
     );
 
     let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
+    assert_slow_reader_retry_bounded(pressure_before, pressure_after);
 
     let pressure = mc_net::lock_pressure_snapshot();
     eprintln!(
@@ -386,6 +389,94 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
         pressure_after,
         pressure.session_registry.max_hold_us,
         pressure.session_registry.wait_us,
+    );
+
+    paused_reader.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla sidecars; degraded when absent"]
+async fn paused_reader_pressure_does_not_delay_healthy_observers() {
+    let server = start_load_server().await;
+    let addr = server.addr;
+
+    let paused_reader = PausedReaderClient::connect(addr, "M52PauseObs").await;
+    let (mut actor, actor_sync) = connect_to_play(addr, "M52PressureActor").await;
+    drain_until_chunk(&mut actor, (0, 0)).await;
+    let (mut observer_a, _) = connect_to_play(addr, "M52ObserverA").await;
+    drain_until_chunk(&mut observer_a, (0, 0)).await;
+    let (mut observer_b, _) = connect_to_play(addr, "M52ObserverB").await;
+    drain_until_chunk(&mut observer_b, (0, 0)).await;
+
+    let pressure_before = server.outbound_pressure_snapshot();
+    let observer_a_task = tokio::spawn(async move {
+        drain_counting_until(
+            &mut observer_a,
+            Duration::from_secs(10),
+            AddEntity::ID,
+            M52_HEALTHY_OBSERVER_SUMMONS,
+        )
+        .await
+    });
+    let observer_b_task = tokio::spawn(async move {
+        drain_counting_until(
+            &mut observer_b,
+            Duration::from_secs(10),
+            AddEntity::ID,
+            M52_HEALTHY_OBSERVER_SUMMONS,
+        )
+        .await
+    });
+
+    let spawn_y = actor_sync.y.floor() as i32;
+    let mut actor_spawns = 0usize;
+    for idx in 0..M52_HEALTHY_OBSERVER_SUMMONS {
+        actor
+            .write_packet(&ServerboundChatCommand {
+                command: format!(
+                    "summon minecraft:zombie {} {} {}",
+                    4 + idx % 4,
+                    spawn_y,
+                    4 + (idx / 4) % 4
+                ),
+            })
+            .await
+            .expect("summon zombie while healthy observers are draining");
+        if idx % 8 == 7 {
+            actor_spawns +=
+                drain_counting(&mut actor, Duration::from_millis(50), AddEntity::ID).await;
+        }
+    }
+    actor_spawns += drain_counting(&mut actor, Duration::from_millis(250), AddEntity::ID).await;
+
+    let observed_a = observer_a_task
+        .await
+        .expect("healthy observer A drain task joins");
+    let observed_b = observer_b_task
+        .await
+        .expect("healthy observer B drain task joins");
+    let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
+    assert_slow_reader_retry_bounded(pressure_before, pressure_after);
+
+    assert_eq!(
+        observed_a, M52_HEALTHY_OBSERVER_SUMMONS,
+        "healthy observer A should receive every spawn while a peer reader is paused"
+    );
+    assert_eq!(
+        observed_b, M52_HEALTHY_OBSERVER_SUMMONS,
+        "healthy observer B should receive every spawn while a peer reader is paused"
+    );
+    eprintln!(
+        "M52 slow_reader_healthy_observers summons={} observed_a={} observed_b={} actor_spawns={} paused_start=({:.1},{:.1},{:.1}) outbound_before={:?} outbound_after={:?}",
+        M52_HEALTHY_OBSERVER_SUMMONS,
+        observed_a,
+        observed_b,
+        actor_spawns,
+        paused_reader.sync.x,
+        paused_reader.sync.y,
+        paused_reader.sync.z,
+        pressure_before,
+        pressure_after,
     );
 
     paused_reader.close();
@@ -696,6 +787,21 @@ async fn wait_for_outbound_pressure_increase(
     }
 }
 
+fn assert_slow_reader_retry_bounded(
+    before: mc_net::OutboundPressureSnapshot,
+    after: mc_net::OutboundPressureSnapshot,
+) {
+    assert!(
+        after.reliable_command_retries_in_flight <= before.reliable_command_retries_in_flight + 1,
+        "one paused reader should have at most one reliable retry in flight: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.max_reliable_command_retries_in_flight
+            <= before.max_reliable_command_retries_in_flight + 1,
+        "one paused reader should not raise max pending reliable retries by more than one: before={before:?} after={after:?}"
+    );
+}
+
 async fn connect_to_play(
     addr: std::net::SocketAddr,
     name: &str,
@@ -753,6 +859,34 @@ async fn drain_counting(client: &mut Client, duration: Duration, packet_id: i32)
     let deadline = tokio::time::Instant::now() + duration;
     let mut count = 0usize;
     loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return count;
+        }
+        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
+            return count;
+        };
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == packet_id {
+            count += 1;
+        }
+    }
+}
+
+async fn drain_counting_until(
+    client: &mut Client,
+    duration: Duration,
+    packet_id: i32,
+    expected: usize,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + duration;
+    let mut count = 0usize;
+    loop {
+        if count >= expected {
+            return count;
+        }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return count;

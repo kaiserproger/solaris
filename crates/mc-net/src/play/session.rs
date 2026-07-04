@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::MutexGuard;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 pub(super) type SessionId = u64;
 
@@ -127,11 +127,42 @@ pub(crate) struct SessionPressureSnapshot {
     pub(crate) visibility_command_drops: u64,
     pub(crate) reliable_command_retries: u64,
     pub(crate) reliable_command_retries_in_flight: u64,
+    pub(crate) max_reliable_command_retries_in_flight: u64,
 }
 
 static VISIBILITY_COMMAND_DROPS: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static RELIABLE_RETRY_RECIPIENTS: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
+
+fn reliable_retry_recipients() -> &'static Mutex<HashSet<SessionId>> {
+    RELIABLE_RETRY_RECIPIENTS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn lock_reliable_retry_recipients() -> MutexGuard<'static, HashSet<SessionId>> {
+    reliable_retry_recipients()
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            warn!("reliable retry recipient set was poisoned; recovering state");
+            poisoned.into_inner()
+        })
+}
+
+fn record_reliable_retry_in_flight(current: u64) {
+    let mut observed = RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT.load(Ordering::Relaxed);
+    while current > observed {
+        match RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT.compare_exchange_weak(
+            observed,
+            current,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return,
+            Err(actual) => observed = actual,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ClaimedPickup {
@@ -535,6 +566,8 @@ impl SessionRegistry {
             visibility_command_drops: VISIBILITY_COMMAND_DROPS.load(Ordering::Relaxed),
             reliable_command_retries: RELIABLE_COMMAND_RETRIES.load(Ordering::Relaxed),
             reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_IN_FLIGHT
+                .load(Ordering::Relaxed),
+            max_reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT
                 .load(Ordering::Relaxed),
         }
     }
@@ -3083,8 +3116,20 @@ fn retry_reliable_command(
     recipient_id: SessionId,
     command: OutboundCommand,
 ) {
+    {
+        let mut recipients = lock_reliable_retry_recipients();
+        if !recipients.insert(recipient_id) {
+            VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                recipient = recipient_id,
+                "dropping reliable outbound command for already-backpressured session"
+            );
+            return;
+        }
+    }
     RELIABLE_COMMAND_RETRIES.fetch_add(1, Ordering::Relaxed);
-    RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed);
+    let in_flight = RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
+    record_reliable_retry_in_flight(in_flight);
     tokio::spawn(async move {
         if tx.send(command).await.is_err() {
             VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
@@ -3093,6 +3138,7 @@ fn retry_reliable_command(
                 "reliable outbound retry target closed"
             );
         }
+        lock_reliable_retry_recipients().remove(&recipient_id);
         RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
     });
 }
@@ -3209,7 +3255,13 @@ fn remove_ticket(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
+    use tokio::sync::{Mutex as TokioMutex, mpsc};
+
+    async fn pressure_counter_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| TokioMutex::new(())).lock().await
+    }
 
     fn profile(name: &str) -> LoggedInProfile {
         LoggedInProfile {
@@ -4485,6 +4537,7 @@ mod tests {
 
     #[tokio::test]
     async fn reliable_visibility_commands_retry_when_channel_is_full() {
+        let _guard = pressure_counter_test_lock().await;
         let registry = SessionRegistry::new();
         let start = registry.pressure_snapshot().reliable_command_retries;
         let (tx, mut rx) = mpsc::channel(1);
@@ -4531,6 +4584,82 @@ mod tests {
                 .pressure_snapshot()
                 .reliable_command_retries_in_flight,
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn reliable_visibility_retries_are_bounded_per_slow_recipient() {
+        let _guard = pressure_counter_test_lock().await;
+        let registry = SessionRegistry::new();
+        let start = registry.pressure_snapshot();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+            .expect("fill recipient queue");
+
+        let recipient = SessionRecipient { id: 97, tx };
+        let dispatches = (0..16)
+            .map(|idx| VisibilityDispatch {
+                recipient: recipient.clone(),
+                command: OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
+                    session_id: 9_700 + idx,
+                    entity_id: 9_700 + i32::try_from(idx).unwrap(),
+                    uuid: uuid::Uuid::nil(),
+                    name: format!("SlowRetry{idx}"),
+                    pose: PlayerPose::new(0.5, 64.0, 0.5),
+                }),
+            })
+            .collect();
+
+        dispatch_visibility_commands(dispatches);
+        tokio::task::yield_now().await;
+
+        let pressure = registry.pressure_snapshot();
+        assert_eq!(
+            pressure.reliable_command_retries,
+            start.reliable_command_retries + 1,
+            "one slow recipient should have at most one reliable retry task in flight"
+        );
+        assert_eq!(
+            pressure.reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight + 1,
+            "one slow recipient should not accumulate unbounded pending retry tasks"
+        );
+        assert!(
+            pressure.max_reliable_command_retries_in_flight
+                <= start.max_reliable_command_retries_in_flight + 1,
+            "one slow recipient should not raise max pending reliable retry tasks by more than one"
+        );
+        assert!(
+            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
+            "extra reliable commands for an already-backpressured recipient should be counted as dropped pressure"
+        );
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
+                session_id: 9_700,
+                ..
+            }))
+        ));
+        for _ in 0..8 {
+            if registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight
+                == start.reliable_command_retries_in_flight
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight
         );
     }
 

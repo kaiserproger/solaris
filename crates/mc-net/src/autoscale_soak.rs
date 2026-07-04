@@ -241,6 +241,7 @@ mod tests {
                 visibility_command_drops: 3,
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 0,
+                max_reliable_command_retries_in_flight: 1,
             },
             save_all: Some(&save),
         });
@@ -347,6 +348,7 @@ mod tests {
                 visibility_command_drops: 3,
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 1,
+                max_reliable_command_retries_in_flight: 1,
             },
             save_all: Some(&save),
         });
