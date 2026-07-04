@@ -127,6 +127,12 @@ The same review keeps these blockers canonical for replacement claims:
   solidification to obsidian. This passed on the first run and is not real-client
   or fresh vanilla-oracle evidence; wider lava-water topology and visual/feel
   coverage remain open.
+- Falling blocks now have focused Solaris packet/session coverage for one sand
+  landing/removal path: the harness observes the falling-block `AddEntity`,
+  requires sand to land as a block, requires a landing-chunk `LightUpdate`, and
+  requires `RemoveEntities` for that same entity. This is not broad
+  sand/gravel/anvil/drop parity, real-client evidence, or fresh vanilla-oracle
+  evidence.
 - A later broad `m94-02-blocks-fluids-farming-drops` run validated
   `.analysis/real-client-runs/20260622T180920Z-m94-regression-pack`; it composed
   the real-client solid break/drop/place and water-bucket place/pickup probes in

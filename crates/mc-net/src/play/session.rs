@@ -1625,6 +1625,51 @@ impl SessionRegistry {
         dispatch_visibility_commands(dispatches);
     }
 
+    pub(crate) fn landed_falling_blocks(
+        &self,
+        steps: &[EntityPhysicsStep],
+    ) -> Vec<LandedFallingBlock> {
+        let inner = self.lock_inner("collect landed falling blocks");
+        steps
+            .iter()
+            .filter(|step| step.on_ground)
+            .filter_map(|step| {
+                let entity = inner.entities.view(step.id)?;
+                if entity.lifecycle != EntityLifecycle::Alive
+                    || entity.type_name != "minecraft:falling_block"
+                {
+                    return None;
+                }
+                let state = entity.block_state?;
+                Some(LandedFallingBlock {
+                    id: step.id,
+                    pos: mc_world::BlockPos {
+                        x: step.position.x.floor() as i32,
+                        y: step.position.y.floor() as i32,
+                        z: step.position.z.floor() as i32,
+                    },
+                    state: mc_world::BlockStateId(state),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn remove_landed_falling_blocks(&self, ids: &[EntityId]) {
+        if ids.is_empty() {
+            return;
+        }
+        let mut inner = self.lock_inner("remove landed falling blocks");
+        let dispatches = ids
+            .iter()
+            .filter_map(|id| {
+                remove_server_entity_locked(&mut inner, *id).map(|(_, dispatches)| dispatches)
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+        drop(inner);
+        dispatch_visibility_commands(dispatches);
+    }
+
     pub(super) fn loaded_recipients_for_chunks(
         &self,
         chunks: &HashSet<(i32, i32)>,

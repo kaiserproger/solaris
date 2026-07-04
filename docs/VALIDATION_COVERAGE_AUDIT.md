@@ -103,7 +103,8 @@ manual notes, protocol metadata, or vanilla captures exist.
   including B1/B3 focused rejected occupied-target placement, occupied-target
   water-bucket fallback/resync, survival out-of-reach `UseItemOn` resync,
   early rejected survival-break target resync, scheduled water spread, and
-  lava-bucket-plus-water scheduled solidification harness coverage. Those
+  lava-bucket-plus-water scheduled solidification harness coverage. B6 also has
+  one focused packet/session falling-sand landing/removal/light-update path. Those
   regressions are local-sidecar-dependent and degrade when required
   `data/vanilla/reports` files are absent; they still lack enough row-specific
   vanilla oracle or real-client evidence to count.

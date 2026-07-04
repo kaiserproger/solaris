@@ -395,6 +395,16 @@ impl BoundServer {
                 entity_sessions.apply_entity_physics_and_dispatch(tick, &steps);
                 let entity_dispatch_us = elapsed_us(started);
 
+                let landed_falling_blocks = entity_sessions.landed_falling_blocks(&steps);
+                if !landed_falling_blocks.is_empty() {
+                    play::land_falling_blocks(
+                        &entity_config,
+                        &entity_sessions,
+                        &landed_falling_blocks,
+                    )
+                    .await;
+                }
+
                 let started = Instant::now();
                 let mut entity_save_us = 0;
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)

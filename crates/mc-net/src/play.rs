@@ -471,6 +471,13 @@ pub(crate) struct EntityPhysicsStep {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LandedFallingBlock {
+    pub id: EntityId,
+    pub pos: mc_world::BlockPos,
+    pub state: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BlockEdit {
     pos: mc_world::BlockPos,
     new_state: mc_world::BlockStateId,
@@ -5029,6 +5036,83 @@ pub(crate) async fn run_scheduled_fluid_ticks(
     }
 }
 
+pub(crate) async fn land_falling_blocks(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    candidates: &[LandedFallingBlock],
+) -> usize {
+    let Some(world) = config.world.as_ref() else {
+        return 0;
+    };
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let table = config.block_light.as_deref();
+    let mut outcome = BlockEditBatchOutcome::default();
+    let mut landed_ids = Vec::new();
+    {
+        let mut storage = world.lock().await;
+        for candidate in candidates {
+            if !(mc_world::MIN_Y..mc_world::MAX_Y).contains(&candidate.pos.y) {
+                continue;
+            }
+            let Some(current) = storage.get_cached_block(candidate.pos) else {
+                continue;
+            };
+            if falling_block_landing_cell_is_solid(config, current) {
+                continue;
+            }
+            let applied_before = outcome.applied.len();
+            apply_block_edit_to_storage(
+                &mut storage,
+                table,
+                &BlockEdit {
+                    pos: candidate.pos,
+                    new_state: candidate.state,
+                },
+                &mut outcome,
+            );
+            if outcome.applied.len() > applied_before {
+                landed_ids.push(candidate.id);
+            }
+        }
+    }
+
+    if outcome.applied.is_empty() {
+        return 0;
+    }
+    sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+    broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
+    if let Some(table) = table
+        && !outcome.light_edit_chunks.is_empty()
+    {
+        let light_updates = {
+            let mut storage = world.lock().await;
+            collect_incremental_light_updates_for_applied_edits(&mut storage, table, &outcome)
+        };
+        if !light_updates.is_empty() {
+            sessions.invalidate_prepared_chunks(&outcome.light_edit_chunks);
+            broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+        }
+    }
+    sessions.remove_landed_falling_blocks(&landed_ids);
+    outcome.applied.len()
+}
+
+fn falling_block_landing_cell_is_solid(
+    config: &ServerConfig,
+    state: mc_world::BlockStateId,
+) -> bool {
+    if config.block_facts.fluid(state.0).is_some() {
+        return false;
+    }
+    config
+        .blocks
+        .by_id(state)
+        .is_some_and(|block_state| !passable_block_name(block_state.block.id.as_str()))
+}
+
 fn fluid_tick_edits(
     blocks: &mc_world::BlockRegistry,
     facts: &mc_data::block_facts::BlockFactsTable,
@@ -5418,6 +5502,8 @@ fn collect_incremental_light_updates_for_applied_edits(
     outcome: &BlockEditBatchOutcome,
 ) -> Vec<OutboundLightUpdate> {
     let mut cache = LightCache::new();
+    let mut fallback_workspace = LightWorkspace::new();
+    let mut full_fallback_chunks = HashSet::new();
     let mut updates = Vec::new();
 
     for edit in &outcome.applied {
@@ -5428,22 +5514,9 @@ fn collect_incremental_light_updates_for_applied_edits(
             x: edit.pos.x.div_euclid(16),
             z: edit.pos.z.div_euclid(16),
         };
-        seed_background_light_cache(
-            &mut cache,
-            storage,
-            centre_pos,
-            &outcome.previous_light_chunks,
-        );
-        if !cache.contains(centre_pos) {
-            warn!(
-                x = edit.pos.x,
-                y = edit.pos.y,
-                z = edit.pos.z,
-                "background relight skipped; missing baked light seed"
-            );
+        if full_fallback_chunks.contains(&(centre_pos.x, centre_pos.z)) {
             continue;
         }
-
         let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
@@ -5469,6 +5542,20 @@ fn collect_incremental_light_updates_for_applied_edits(
             }
         }
 
+        seed_background_light_cache(
+            &mut cache,
+            storage,
+            centre_pos,
+            &outcome.previous_light_chunks,
+        );
+        if !cache.contains(centre_pos) {
+            let light = compute_chunk_light_in(&mut fallback_workspace, refs, table);
+            cache.insert(centre_pos, light.clone());
+            merge_light_updates(&mut updates, vec![outbound_light_update(centre_pos, light)]);
+            full_fallback_chunks.insert((centre_pos.x, centre_pos.z));
+            continue;
+        }
+
         let touched = apply_block_change_to_light(
             &mut cache,
             &refs,
@@ -5485,25 +5572,29 @@ fn collect_incremental_light_updates_for_applied_edits(
             let Some(light) = cache.get(pos) else {
                 continue;
             };
-            let wire = encode_chunk_light(light);
-            edit_updates.push(OutboundLightUpdate {
-                pos,
-                light: light.clone(),
-                wire: LightData {
-                    sky_y_mask: wire.sky_y_mask,
-                    block_y_mask: wire.block_y_mask,
-                    empty_sky_y_mask: wire.empty_sky_y_mask,
-                    empty_block_y_mask: wire.empty_block_y_mask,
-                    sky_updates: wire.sky_updates,
-                    block_updates: wire.block_updates,
-                },
-            });
+            edit_updates.push(outbound_light_update(pos, light.clone()));
         }
         merge_light_updates(&mut updates, edit_updates);
     }
 
     persist_baked_light_updates(storage, &updates);
     updates
+}
+
+fn outbound_light_update(pos: ChunkPos, light: ChunkLight) -> OutboundLightUpdate {
+    let wire = encode_chunk_light(&light);
+    OutboundLightUpdate {
+        pos,
+        light,
+        wire: LightData {
+            sky_y_mask: wire.sky_y_mask,
+            block_y_mask: wire.block_y_mask,
+            empty_sky_y_mask: wire.empty_sky_y_mask,
+            empty_block_y_mask: wire.empty_block_y_mask,
+            sky_updates: wire.sky_updates,
+            block_updates: wire.block_updates,
+        },
+    }
 }
 
 fn seed_background_light_cache(

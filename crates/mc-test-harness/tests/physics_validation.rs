@@ -11,13 +11,13 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
     ClientboundSetEntityData, ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent,
-    GameMode, InteractionHand, LevelChunkWithLight, LoginPlay, MovePlayerFlags, PlayerActionKind,
-    PlayerCommandAction, PlayerInput, SectionBlocksUpdate, ServerboundChangeGameMode,
-    ServerboundChatCommand, ServerboundClientTickEnd, ServerboundKeepAlive,
-    ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerCommand,
-    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundUseItemOn, SetCenterChunk,
-    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos,
-    unpack_block_pos,
+    GameMode, InteractionHand, LevelChunkWithLight, LightUpdate, LoginPlay, MovePlayerFlags,
+    PlayerActionKind, PlayerCommandAction, PlayerInput, RemoveEntities, SectionBlocksUpdate,
+    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
+    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
+    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
+    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
+    pack_block_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -559,6 +559,68 @@ async fn falling_blocks_start_when_support_breaks() {
             "falling-block support edit should acknowledge sequence"
         );
     }
+}
+
+#[tokio::test]
+async fn falling_block_lands_as_block_and_despawns_entity() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M100FallLand").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 11.5,
+            y: 67.0,
+            z: 4.5,
+            yaw: 180.0,
+            pitch: 35.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within falling-block support break reach");
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(10, 66, 2),
+            direction: Direction::Up,
+            sequence: 150,
+        })
+        .await
+        .expect("break sand support");
+    let observation =
+        wait_for_block_action_observation(&mut client, 150, &[(10, 66, 2), (10, 67, 2)]).await;
+    let falling_entity_id = observation
+        .add_entities
+        .iter()
+        .find(|entity| {
+            entity.data == states.sand.0 as i32
+                && (entity.x - 10.5).abs() < 0.01
+                && (entity.y - 67.0).abs() < 0.01
+                && (entity.z - 2.5).abs() < 0.01
+        })
+        .map(|entity| entity.entity_id)
+        .expect("sand should spawn as falling block entity");
+
+    wait_for_falling_block_landing(
+        &mut client,
+        falling_entity_id,
+        (10, 64, 2),
+        states.sand.0 as i32,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -1332,6 +1394,66 @@ async fn wait_for_block_action_observation(
         add_entities,
         primary_target,
         saw_ack,
+    }
+}
+
+async fn wait_for_falling_block_landing(
+    client: &mut Client,
+    entity_id: i32,
+    target: (i32, i32, i32),
+    state_id: i32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_landing_block = false;
+    let mut saw_landing_light = false;
+    let mut saw_remove = false;
+    loop {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for falling block landing at {target:?}, light update, and removal of entity {entity_id}"
+        );
+        if saw_landing_block && saw_landing_light && saw_remove {
+            return;
+        }
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|err| {
+                panic!(
+                    "wait for falling block landing stalled: block={saw_landing_block}, \
+                     light={saw_landing_light}, remove={saw_remove}: {err}"
+                )
+            });
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
+            saw_landing_block |=
+                unpack_block_pos(pkt.position) == target && pkt.state_id == state_id;
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let pkt = SectionBlocksUpdate::decode(&mut body).expect("decode SectionBlocksUpdate");
+            if section_pos_matches(pkt.section_pos, target) {
+                let relative = pack_section_relative_pos(target.0, target.1, target.2);
+                saw_landing_block |= pkt
+                    .changes
+                    .iter()
+                    .any(|change| change.relative_pos == relative && change.state_id == state_id);
+            }
+        } else if frame.id == RemoveEntities::ID {
+            let mut body = frame.body;
+            let pkt = RemoveEntities::decode(&mut body).expect("decode RemoveEntities");
+            saw_remove |= pkt.entity_ids.contains(&entity_id);
+        } else if frame.id == LightUpdate::ID {
+            let mut body = frame.body;
+            let pkt = LightUpdate::decode(&mut body).expect("decode LightUpdate");
+            saw_landing_light |=
+                pkt.chunk_x == target.0.div_euclid(16) && pkt.chunk_z == target.2.div_euclid(16);
+        }
     }
 }
 
