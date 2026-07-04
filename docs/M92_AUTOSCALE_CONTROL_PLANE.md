@@ -67,7 +67,9 @@ subsequent observations in an observable drain state.
   dispatch budget derived from load/generate limits. It does not yet provide
   runtime view-distance replanning or separately metered load-vs-generate
   queues.
-- No health endpoint or in-game admin command consumes the snapshot yet.
+- There is an authenticated in-game `/status` admin command for the current
+  runtime-control snapshot, but no unauthenticated health endpoint or readiness
+  model.
 - Slow-client load shedding and safe config reload are not implemented.
 - No low-end/balanced/high-end performance soak was run in this slice.
 - High-end throughput claims remain blocked on M91/M93 performance data.

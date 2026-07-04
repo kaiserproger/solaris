@@ -1423,9 +1423,14 @@ fn admin_dispatcher_parses_slash_commands_and_permissions() {
         })
     );
     assert_eq!(parse_admin_command("/kill", op), Ok(AdminCommand::Kill));
+    assert_eq!(parse_admin_command("/status", op), Ok(AdminCommand::Status));
     assert_eq!(
         parse_admin_command("/gamemode creative", not_op),
         Err(CommandError::PermissionDenied)
+    );
+    assert_eq!(
+        parse_admin_command("/status extra", op),
+        Err(CommandError::Usage("Usage: /status"))
     );
     assert_eq!(
         parse_admin_command("/gamemode", op),
@@ -1448,7 +1453,7 @@ fn command_tree_and_suggestions_are_permission_aware() {
     assert_eq!(tree.root_index, 0);
     assert_eq!(
         tree.nodes[0].children,
-        vec![1, 6, 8, 10, 11, 12, 13, 15, 17]
+        vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19]
     );
     assert_eq!(
         command_tree_packet(not_op).nodes[0].children,
@@ -1468,7 +1473,49 @@ fn command_tree_and_suggestions_are_permission_aware() {
     assert_eq!(modes.length, 1);
     assert_eq!(modes.suggestions, vec!["creative".to_string()]);
 
+    let status = command_suggestions("/st", op);
+    assert_eq!(status.start, 1);
+    assert_eq!(status.length, 2);
+    assert_eq!(
+        status.suggestions,
+        vec!["status".to_string(), "stop".to_string()]
+    );
+
     assert!(command_suggestions("/g", not_op).suggestions.is_empty());
+}
+
+#[test]
+fn runtime_control_status_message_reports_disabled_and_drain_snapshot() {
+    assert_eq!(
+        runtime_control_status_message(None),
+        "Runtime control: disabled"
+    );
+
+    let control = crate::RuntimeControlHandle::new(crate::RuntimeControlConfig {
+        policy: crate::AutoscalePolicy {
+            min_view_distance: 2,
+            max_view_distance: 8,
+            min_chunk_send_rate: 1,
+            max_chunk_send_rate: 16,
+            min_chunk_load_rate: 2,
+            max_chunk_load_rate: 64,
+            min_chunk_generate_rate: 3,
+            max_chunk_generate_rate: 32,
+            ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+        },
+        initial_limits: crate::RuntimeControlLimits {
+            view_distance: 8,
+            chunk_send_rate: 16,
+            chunk_load_rate: 64,
+            chunk_generate_rate: 32,
+        },
+    });
+    control.request_drain();
+
+    assert_eq!(
+        runtime_control_status_message(Some(&control)),
+        "Runtime control: draining=true action=scale_down pressure=none limits=view_distance:2,send:1,load:2,generate:3 pressure_ticks=0 healthy_ticks=0 reason=drain requested; clamped to minimum chunk throughput"
+    );
 }
 
 #[test]

@@ -51,6 +51,7 @@ pub(crate) enum AdminCommand {
     },
     Kill,
     SaveAll,
+    Status,
     Stop,
     Summon {
         entity: mc_data::Identifier,
@@ -81,7 +82,7 @@ pub(crate) struct CommandSuggestionSet {
 }
 
 const ROOT_COMMANDS: &[&str] = &[
-    "debug", "gamemode", "give", "kill", "save-all", "stop", "summon", "time", "tp",
+    "debug", "gamemode", "give", "kill", "save-all", "status", "stop", "summon", "time", "tp",
 ];
 const GAME_MODES: &[&str] = &["survival", "creative", "adventure", "spectator"];
 
@@ -95,7 +96,7 @@ pub(crate) fn command_tree_packet(permissions: CommandPermissions) -> Clientboun
 
     ClientboundCommands {
         nodes: vec![
-            CommandNode::root(vec![1, 6, 8, 10, 11, 12, 13, 15, 17]),
+            CommandNode::root(vec![1, 6, 8, 10, 11, 12, 13, 15, 17, 19]),
             CommandNode::literal("gamemode", vec![2, 3, 4, 5], false).restricted(true),
             CommandNode::literal("survival", Vec::new(), true).restricted(true),
             CommandNode::literal("creative", Vec::new(), true).restricted(true),
@@ -144,6 +145,7 @@ pub(crate) fn command_tree_packet(permissions: CommandPermissions) -> Clientboun
                 true,
             )
             .restricted(true),
+            CommandNode::literal("status", Vec::new(), true).restricted(true),
         ],
         root_index: 0,
     }
@@ -199,6 +201,12 @@ fn parse_admin_command_inner(command: &str) -> Result<AdminCommand, CommandError
     }
     if command.starts_with("save-all") {
         return Err(CommandError::Usage("Usage: /save-all"));
+    }
+    if command == "status" {
+        return Ok(AdminCommand::Status);
+    }
+    if command.starts_with("status") {
+        return Err(CommandError::Usage("Usage: /status"));
     }
     if command == "stop" {
         return Ok(AdminCommand::Stop);

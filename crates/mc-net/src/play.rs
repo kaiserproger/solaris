@@ -1017,6 +1017,7 @@ where
             compression,
             interaction.as_mut(),
             chunk_stream,
+            runtime_control.clone(),
             Arc::clone(&sessions),
             config,
             session_id,
@@ -9156,6 +9157,7 @@ async fn play_loop<R, W>(
     compression: Compression,
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
+    runtime_control: Option<RuntimeControlHandle>,
     sessions: Arc<SessionRegistry>,
     config: &ServerConfig,
     session_id: SessionId,
@@ -9952,6 +9954,7 @@ where
                         session_id,
                         interaction.as_deref_mut(),
                         &mut player_pose,
+                        runtime_control.as_ref(),
                         &mut chunk_stream,
                         &mut next_teleport_id,
                         &mut pending_teleport,
@@ -9991,6 +9994,7 @@ async fn execute_player_command<W>(
     session_id: SessionId,
     mut interaction: Option<&mut InteractionState>,
     player_pose: &mut PlayerPose,
+    runtime_control: Option<&RuntimeControlHandle>,
     chunk_stream: &mut Option<ChunkStreamState>,
     next_teleport_id: &mut i32,
     pending_teleport: &mut Option<PendingTeleport>,
@@ -10050,6 +10054,14 @@ where
                 send_command_feedback(writer, compression, "Stop aborted; save-all failed").await?;
             }
             Ok(())
+        }
+        AdminCommand::Status => {
+            send_command_feedback(
+                writer,
+                compression,
+                &runtime_control_status_message(runtime_control),
+            )
+            .await
         }
         AdminCommand::Teleport { x, y, z } => {
             let old_center = player_pose.chunk_pos();
@@ -10145,6 +10157,46 @@ where
             .await?;
             send_command_feedback(writer, compression, "Debug command executed").await
         }
+    }
+}
+
+fn runtime_control_status_message(runtime_control: Option<&RuntimeControlHandle>) -> String {
+    let Some(runtime_control) = runtime_control else {
+        return "Runtime control: disabled".to_string();
+    };
+    let snapshot = runtime_control.snapshot();
+    let limits = snapshot.limits;
+    format!(
+        "Runtime control: draining={} action={} pressure={} limits=view_distance:{},send:{},load:{},generate:{} pressure_ticks={} healthy_ticks={} reason={}",
+        snapshot.draining,
+        autoscale_action_label(snapshot.last_decision.action),
+        autoscale_pressure_label(snapshot.last_decision.pressure),
+        limits.view_distance,
+        limits.chunk_send_rate,
+        limits.chunk_load_rate,
+        limits.chunk_generate_rate,
+        snapshot.pressure_ticks,
+        snapshot.healthy_ticks,
+        snapshot.last_decision.reason
+    )
+}
+
+fn autoscale_action_label(action: crate::AutoscaleAction) -> &'static str {
+    match action {
+        crate::AutoscaleAction::Hold => "hold",
+        crate::AutoscaleAction::ScaleDown => "scale_down",
+        crate::AutoscaleAction::ScaleUp => "scale_up",
+    }
+}
+
+fn autoscale_pressure_label(pressure: Option<crate::AutoscalePressure>) -> &'static str {
+    match pressure {
+        None => "none",
+        Some(crate::AutoscalePressure::TickTime) => "tick_time",
+        Some(crate::AutoscalePressure::ChunkQueue) => "chunk_queue",
+        Some(crate::AutoscalePressure::WorkerSaturation) => "worker_saturation",
+        Some(crate::AutoscalePressure::Memory) => "memory",
+        Some(crate::AutoscalePressure::FirstChunkSla) => "first_chunk_sla",
     }
 }
 

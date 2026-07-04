@@ -20,6 +20,14 @@ async fn start_server() -> SocketAddr {
 }
 
 async fn start_server_with_shutdown(shutdown: mc_net::ShutdownHandle) -> SocketAddr {
+    start_server_with_shutdown_and_chunk_pipeline(shutdown, mc_net::ChunkPipelinePolicy::default())
+        .await
+}
+
+async fn start_server_with_shutdown_and_chunk_pipeline(
+    shutdown: mc_net::ShutdownHandle,
+    chunk_pipeline: mc_net::ChunkPipelinePolicy,
+) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M35 commands".into(),
@@ -37,7 +45,7 @@ async fn start_server_with_shutdown(shutdown: mc_net::ShutdownHandle) -> SocketA
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         shutdown,
@@ -48,6 +56,62 @@ async fn start_server_with_shutdown(shutdown: mc_net::ShutdownHandle) -> SocketA
         let _ = bound.serve().await;
     });
     addr
+}
+
+async fn start_server_with_runtime_control() -> (SocketAddr, mc_net::RuntimeControlHandle) {
+    let chunk_pipeline = mc_net::ChunkPipelinePolicy {
+        runtime_control: Some(mc_net::RuntimeControlConfig {
+            policy: mc_net::AutoscalePolicy {
+                min_view_distance: 2,
+                max_view_distance: 8,
+                min_chunk_send_rate: 1,
+                max_chunk_send_rate: 16,
+                min_chunk_load_rate: 2,
+                max_chunk_load_rate: 64,
+                min_chunk_generate_rate: 3,
+                max_chunk_generate_rate: 32,
+                ..mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced)
+            },
+            initial_limits: mc_net::RuntimeControlLimits {
+                view_distance: 8,
+                chunk_send_rate: 16,
+                chunk_load_rate: 64,
+                chunk_generate_rate: 32,
+            },
+        }),
+        ..mc_net::ChunkPipelinePolicy::default()
+    };
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 runtime status".into(),
+        max_players: 4,
+        view_distance: 2,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline,
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    let runtime_control = bound
+        .runtime_control_handle()
+        .expect("runtime control handle");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    (addr, runtime_control)
 }
 
 #[tokio::test]
@@ -142,6 +206,30 @@ async fn save_all_and_stop_commands_report_feedback_and_signal_shutdown() {
         "Saved all state; stopping server"
     );
     assert!(shutdown.is_requested());
+}
+
+#[tokio::test]
+async fn status_command_reports_runtime_control_drain_snapshot() {
+    let (addr, runtime_control) = start_server_with_runtime_control().await;
+    runtime_control.request_drain();
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, "M100Status").await.expect("login");
+    client.drive_configuration().await.expect("configuration");
+
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "status".to_string(),
+        })
+        .await
+        .expect("send status command");
+
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "Runtime control: draining=true action=hold pressure=none limits=view_distance:2,send:1,load:2,generate:3 pressure_ticks=0 healthy_ticks=0 reason=drain active; holding minimum limits"
+    );
 }
 
 #[tokio::test]
