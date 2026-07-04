@@ -191,6 +191,11 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                             code: "vanilla_data_recipes_unavailable",
                             message: "data.vanilla_data_dir recipes are missing, malformed, or contain no supported shaped, shapeless, smelting, blasting, smoking, or campfire cooking entries; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                         });
+                    } else if !vanilla_loot_is_usable(vanilla_data_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_loot_unavailable",
+                            message: "data.vanilla_data_dir loot tables are missing, malformed, or contain no supported simple block/entity drops; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
                     }
                 }
             }
@@ -290,6 +295,10 @@ fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
 
 fn vanilla_recipes_are_usable(vanilla_data_dir: &Path) -> bool {
     load_effective_recipes(Some(vanilla_data_dir)).is_ok()
+}
+
+fn vanilla_loot_is_usable(vanilla_data_dir: &Path) -> bool {
+    load_effective_loot(Some(vanilla_data_dir)).is_ok()
 }
 
 fn has_non_directory_ancestor(path: &Path) -> bool {
