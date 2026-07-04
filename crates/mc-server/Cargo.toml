@@ -42,3 +42,4 @@ tokio = { workspace = true }
 uuid = { workspace = true }
 mc-data = { path = "../mc-data" }
 mc-extension = { path = "../mc-extension" }
+mc-nbt = { path = "../mc-nbt" }

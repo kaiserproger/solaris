@@ -703,6 +703,7 @@ dependencies = [
  "clap",
  "mc-data",
  "mc-extension",
+ "mc-nbt",
  "mc-net",
  "mc-protocol",
  "mc-world",

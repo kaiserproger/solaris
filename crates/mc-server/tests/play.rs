@@ -20,6 +20,7 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::codec::Identifier;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
@@ -128,6 +129,18 @@ async fn assert_damage_command_still_processed(
     assert_eq!(health.health, 12.5);
     assert_eq!(health.food, 20);
     assert_eq!(health.saturation, 5.0);
+}
+
+fn disconnect_text(disconnect: &PlayDisconnect) -> String {
+    let mut cursor: &[u8] = &disconnect.reason_nbt;
+    let tag = mc_nbt::read_network(&mut cursor).expect("disconnect reason NBT decodes");
+    let Tag::Compound(fields) = tag else {
+        panic!("disconnect reason should be an NBT compound");
+    };
+    let Some((_, Tag::String(text))) = fields.into_iter().find(|(name, _)| name == "text") else {
+        panic!("disconnect reason should include a string text field");
+    };
+    text
 }
 
 /// Walk the full protocol up to and including
@@ -406,8 +419,10 @@ async fn play_state_rejects_second_client_when_server_is_full() {
     let mut second = TcpStream::connect(addr).await.unwrap();
     let mut second_buf = BytesMut::with_capacity(8192);
     let second_compression = drive_to_play(&mut second, &mut second_buf, addr, "FullSecond").await;
-    let second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
+    let mut second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
     assert_eq!(second_frame.id, PlayDisconnect::ID);
+    let disconnect = PlayDisconnect::decode(&mut second_frame.body).unwrap();
+    assert_eq!(disconnect_text(&disconnect), "Server is full");
 
     drop(first);
     drop(second);
@@ -425,8 +440,13 @@ async fn play_state_rejects_duplicate_offline_profile() {
     let mut second = TcpStream::connect(addr).await.unwrap();
     let mut second_buf = BytesMut::with_capacity(8192);
     let second_compression = drive_to_play(&mut second, &mut second_buf, addr, "DupProfile").await;
-    let second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
+    let mut second_frame = read_one_frame(&mut second, &mut second_buf, second_compression).await;
     assert_eq!(second_frame.id, PlayDisconnect::ID);
+    let disconnect = PlayDisconnect::decode(&mut second_frame.body).unwrap();
+    assert_eq!(
+        disconnect_text(&disconnect),
+        "This player is already connected"
+    );
 
     drop(first);
     drop(second);
