@@ -10047,14 +10047,16 @@ where
             if let Some(runtime_control) = runtime_control {
                 runtime_control.request_drain();
             }
+            config.shutdown.request();
+            tokio::task::yield_now().await;
             let report = crate::server::save_all(config, sessions).await;
             if report.is_ok() {
-                config.shutdown.request();
                 send_command_feedback(writer, compression, "Saved all state; stopping server")
                     .await?;
             } else {
                 warn!(errors = report.errors.len(), "stop command save-all failed");
-                send_command_feedback(writer, compression, "Stop aborted; save-all failed").await?;
+                send_command_feedback(writer, compression, "Stop requested; save-all failed")
+                    .await?;
             }
             Ok(())
         }
