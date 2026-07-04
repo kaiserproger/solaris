@@ -587,24 +587,17 @@ async fn serve(path: &Path) -> Result<()> {
                         "empty world pre-generated around spawn",
                     );
                 } else {
-                    let warmed = warm_spawn_window(&mut storage, cfg.server.view_distance)?;
-                    let baked = bake_missing_spawn_window_light(
+                    let prepared = prepare_existing_spawn_window(
                         &mut storage,
                         block_light.as_ref(),
                         cfg.server.view_distance,
                         chunk_pipeline.chunk_worker_threads,
                     )?;
-                    let flushed = if baked > 0 {
-                        tracing::info!("Preparing world... 95% (saving baked spawn light)");
-                        storage.flush_dirty()?
-                    } else {
-                        0
-                    };
                     tracing::info!(
                         path = %world_dir.display(),
-                        chunks = warmed,
-                        baked,
-                        flushed,
+                        chunks = prepared.warmed,
+                        baked = prepared.baked,
+                        flushed = prepared.flushed,
                         view_distance = cfg.server.view_distance,
                         "existing world spawn window warmed",
                     );
@@ -904,6 +897,35 @@ fn warm_spawn_window(storage: &mut mc_world::WorldStorage, view_distance: i32) -
         }
     }
     Ok(warmed)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ExistingSpawnWindowPrep {
+    warmed: usize,
+    baked: usize,
+    flushed: usize,
+}
+
+fn prepare_existing_spawn_window(
+    storage: &mut mc_world::WorldStorage,
+    block_light: &mc_data::block_light::BlockLightTable,
+    view_distance: i32,
+    worker_threads: usize,
+) -> Result<ExistingSpawnWindowPrep> {
+    let warmed = warm_spawn_window(storage, view_distance)?;
+    let baked =
+        bake_missing_spawn_window_light(storage, block_light, view_distance, worker_threads)?;
+    let flushed = if storage.dirty_count() > 0 {
+        tracing::info!("Preparing world... 95% (saving warmed spawn window)");
+        storage.flush_dirty()?
+    } else {
+        0
+    };
+    Ok(ExistingSpawnWindowPrep {
+        warmed,
+        baked,
+        flushed,
+    })
 }
 
 fn bake_spawn_window_light(
@@ -1978,6 +2000,74 @@ mod tests {
             );
         }
         assert_eq!(reopened.dirty_count(), 9);
+    }
+
+    #[test]
+    fn existing_world_startup_flushes_generated_light_border_when_view_light_is_present() {
+        struct StubGen;
+
+        impl mc_world::ChunkGenerator for StubGen {
+            fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+                let air = mc_world::BlockStateId(0);
+                let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = mc_world::Chunk::empty(pos, air, biome);
+                chunk.status = "minecraft:full".into();
+                chunk
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        let baked = mc_world::light::ChunkLight::filled(15, 0);
+        {
+            let mut storage =
+                mc_world::WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 32)
+                    .unwrap();
+            for pos in spawn_view_positions(1) {
+                let mut chunk = mc_world::Chunk::empty(
+                    pos,
+                    mc_world::BlockStateId(0),
+                    mc_data::Identifier::parse("minecraft:plains").unwrap(),
+                );
+                chunk.set_baked_light(&baked);
+                chunk.mark_dirty();
+                storage.insert_generated_chunk(pos, chunk).unwrap();
+            }
+            assert_eq!(storage.flush_dirty().unwrap(), 9);
+        }
+        let mut reopened = mc_world::WorldStorage::open_with_capacity(tmp.path(), registry, 32)
+            .unwrap()
+            .with_generator(Arc::new(StubGen));
+        let table = mc_data::block_light::BlockLightTable::from_arrays(
+            "test",
+            vec![0],
+            vec![0],
+            vec![true],
+        );
+
+        let prep = prepare_existing_spawn_window(&mut reopened, &table, 1, 4).unwrap();
+
+        assert_eq!(prep.warmed, 25);
+        assert_eq!(prep.baked, 0);
+        assert_eq!(
+            prep.flushed, 16,
+            "generated light-border chunks must be flushed even when view light was already baked"
+        );
+        assert_eq!(
+            reopened.dirty_count(),
+            0,
+            "existing-world startup should not leave dirty warm-cache chunks"
+        );
     }
 
     #[test]
