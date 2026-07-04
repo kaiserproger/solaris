@@ -170,8 +170,13 @@ M43_VANILLA_ADDR=127.0.0.1:25566 \
   external_vanilla_sugar_cane_support_break_oracle -- --nocapture
 ```
 
-Survival sugar-cane drops still need vanilla capture before they become
-assertions.
+The Solaris survival regression
+`survival_sugar_cane_support_break_drops_cascaded_cane` uses the same fixture in
+survival mode, waits for the server-timed support break, then requires the
+support replacement, all three cane blocks to cascade to air, and an inventory
+slot update carrying `minecraft:sugar_cane x3` after pickup. This is Solaris
+harness evidence only; vanilla capture for the survival drop/pickup window and
+real-client visual proof remain open.
 
 `collision-wall-step-fall` is scripted by `wire-probe` for M46. The vanilla setup
 builds the flat floor, shallow water pool, wall, and selected full-block

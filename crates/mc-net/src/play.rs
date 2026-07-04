@@ -4662,14 +4662,41 @@ where
         start_falling_blocks_after_edits(state, writer, &outcome.applied).await?;
     }
     if drop_items
-        && let (Some(prev), Some(entity_type_id)) = (prev, item_entity_type_id(&state.entity_types))
+        && changed
+        && let Some(entity_type_id) = item_entity_type_id(&state.entity_types)
     {
-        let drops = block_drop_stacks(state, prev);
+        let mut drops = Vec::new();
+        if let Some(prev) = prev {
+            drops.extend(
+                block_drop_stacks(state, prev)
+                    .into_iter()
+                    .map(|drop| (mc_world::BlockPos { x, y, z }, drop)),
+            );
+        }
+        drops.extend(
+            outcome
+                .applied
+                .iter()
+                .filter(|edit| {
+                    edit.pos != pos
+                        && edit.new_state == air
+                        && is_vertical_support_cascade_state(&state.blocks, edit.previous)
+                })
+                .flat_map(|edit| {
+                    block_drop_stacks(state, edit.previous)
+                        .into_iter()
+                        .map(move |drop| (edit.pos, drop))
+                }),
+        );
         if !drops.is_empty() {
-            for drop in drops {
+            for (drop_pos, drop) in drops {
                 dispatch_visibility_commands(state.sessions.spawn_item_drop(
                     entity_type_id,
-                    Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5),
+                    Vec3::new(
+                        f64::from(drop_pos.x) + 0.5,
+                        f64::from(drop_pos.y) + 0.5,
+                        f64::from(drop_pos.z) + 0.5,
+                    ),
                     entity_item_stack(drop),
                 ));
             }
@@ -4847,6 +4874,15 @@ fn append_vertical_support_cascade(
 
 fn is_vertical_support_cascade_block(path: &str) -> bool {
     matches!(path, "sugar_cane" | "cactus" | "bamboo")
+}
+
+fn is_vertical_support_cascade_state(
+    blocks: &mc_world::BlockRegistry,
+    state_id: mc_world::BlockStateId,
+) -> bool {
+    blocks
+        .by_id(state_id)
+        .is_some_and(|state| is_vertical_support_cascade_block(state.block.id.path()))
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the

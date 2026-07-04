@@ -489,6 +489,89 @@ async fn sugar_cane_support_break_emits_real_block_edit_observation() {
 }
 
 #[tokio::test]
+async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let Some(items) = load_item_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let sugar_cane_item = items
+        .id_of(&mc_data::Identifier::parse("minecraft:sugar_cane").unwrap())
+        .expect("sugar cane item id");
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M100CaneDrop").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Survival,
+        })
+        .await
+        .expect("switch to survival");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 8.5,
+            y: 64.0,
+            z: 2.5,
+            yaw: 180.0,
+            pitch: 20.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within support break reach");
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(8, 63, 0),
+            direction: Direction::Up,
+            sequence: 143,
+        })
+        .await
+        .expect("start breaking sugar cane support");
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: pack_block_pos(8, 63, 0),
+            direction: Direction::Up,
+            sequence: 144,
+        })
+        .await
+        .expect("finish breaking sugar cane support");
+
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        144,
+        &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+    )
+    .await;
+    assert_eq!(
+        observation.last_target_state(),
+        Some(states.flowing_water.0 as i32),
+        "support block next to water should become flowing water"
+    );
+    for y in 64..=66 {
+        assert_eq!(
+            observation.last_state_at((8, y, 0)),
+            Some(states.air.0 as i32),
+            "sugar cane at y={y} should cascade to air when support breaks"
+        );
+    }
+    assert!(
+        observation
+            .slot_updates
+            .iter()
+            .any(|(item_id, count)| *item_id == sugar_cane_item && *count == 3),
+        "support break should drop and pick up all three cascaded sugar cane items"
+    );
+}
+
+#[tokio::test]
 async fn falling_blocks_start_when_support_breaks() {
     let Some(blocks) = load_block_registry() else {
         return;
@@ -1302,6 +1385,7 @@ async fn prove_clientbound_liveness(client: &mut Client, reason: &str) -> i32 {
 struct BlockActionObservation {
     updates: Vec<((i32, i32, i32), i32)>,
     add_entities: Vec<AddEntity>,
+    slot_updates: Vec<(u32, i32)>,
     primary_target: (i32, i32, i32),
     saw_ack: bool,
 }
@@ -1328,6 +1412,7 @@ async fn wait_for_block_action_observation(
     let primary_target = targets[0];
     let mut updates = Vec::new();
     let mut add_entities = Vec::new();
+    let mut slot_updates = Vec::new();
     let mut saw_ack = false;
     let mut post_ack_deadline = None;
     loop {
@@ -1387,11 +1472,16 @@ async fn wait_for_block_action_observation(
         } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
             add_entities.push(AddEntity::decode(&mut body).expect("decode AddEntity"));
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
+            slot_updates.push((pkt.item_stack.item_id, pkt.item_stack.count));
         }
     }
     BlockActionObservation {
         updates,
         add_entities,
+        slot_updates,
         primary_target,
         saw_ack,
     }
