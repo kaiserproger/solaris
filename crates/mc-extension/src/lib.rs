@@ -157,11 +157,27 @@ pub enum QueueError<T> {
     Closed(T),
 }
 
+/// Error returned when a bounded extension queue has no item to receive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueRecvError {
+    Empty,
+    Closed,
+}
+
 impl<T> From<TrySendError<T>> for QueueError<T> {
     fn from(value: TrySendError<T>) -> Self {
         match value {
             TrySendError::Full(item) => Self::Full(item),
             TrySendError::Disconnected(item) => Self::Closed(item),
+        }
+    }
+}
+
+impl From<TryRecvError> for QueueRecvError {
+    fn from(value: TryRecvError) -> Self {
+        match value {
+            TryRecvError::Empty => Self::Empty,
+            TryRecvError::Disconnected => Self::Closed,
         }
     }
 }
@@ -180,8 +196,8 @@ impl ExtensionBoundary {
     }
 
     /// Try to receive one outbound command emitted by the extension side.
-    pub fn try_recv_command(&self) -> Result<OutboundCommand, TryRecvError> {
-        self.command_rx.try_recv()
+    pub fn try_recv_command(&self) -> Result<OutboundCommand, QueueRecvError> {
+        self.command_rx.try_recv().map_err(QueueRecvError::from)
     }
 }
 
@@ -194,8 +210,8 @@ pub struct ExtensionEndpoint {
 
 impl ExtensionEndpoint {
     /// Try to receive one inbound event snapshot without blocking.
-    pub fn try_recv_event(&self) -> Result<InboundEvent, TryRecvError> {
-        self.event_rx.try_recv()
+    pub fn try_recv_event(&self) -> Result<InboundEvent, QueueRecvError> {
+        self.event_rx.try_recv().map_err(QueueRecvError::from)
     }
 
     /// Try to submit one outbound command without blocking extension workers.
@@ -254,7 +270,7 @@ mod tests {
             Err(QueueError::Full(rejected))
         );
         assert_eq!(endpoint.try_recv_event().unwrap(), joined("first"));
-        assert_eq!(endpoint.try_recv_event(), Err(TryRecvError::Empty));
+        assert_eq!(endpoint.try_recv_event(), Err(QueueRecvError::Empty));
     }
 
     #[test]
@@ -276,7 +292,34 @@ mod tests {
             Err(QueueError::Full(second))
         );
         assert_eq!(boundary.try_recv_command().unwrap(), first);
-        assert_eq!(boundary.try_recv_command(), Err(TryRecvError::Empty));
+        assert_eq!(boundary.try_recv_command(), Err(QueueRecvError::Empty));
+    }
+
+    #[test]
+    fn try_recv_event_uses_api_owned_empty_error() {
+        let (_boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+
+        assert_eq!(endpoint.try_recv_event(), Err(QueueRecvError::Empty));
+    }
+
+    #[test]
+    fn try_recv_command_uses_api_owned_empty_error() {
+        let (boundary, _endpoint) = boundary_pair(nonzero(1), nonzero(1));
+
+        assert_eq!(boundary.try_recv_command(), Err(QueueRecvError::Empty));
+    }
+
+    #[test]
+    fn closed_extension_queue_maps_to_api_owned_closed_error() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        drop(boundary);
+
+        assert_eq!(endpoint.try_recv_event(), Err(QueueRecvError::Closed));
+
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        drop(endpoint);
+
+        assert_eq!(boundary.try_recv_command(), Err(QueueRecvError::Closed));
     }
 
     #[test]

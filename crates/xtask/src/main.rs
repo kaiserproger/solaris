@@ -1,8 +1,46 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const LOCK_OWNER_TYPES: &[&str] = &["WorldHandle", "SessionRegistry", "WorldStorage"];
+const PLUGIN_API_CRATES: &[&str] = &["mc-extension", "mc-script"];
+const FORBIDDEN_API_TYPES: &[&str] = &[
+    "WorldHandle",
+    "SessionRegistry",
+    "WorldStorage",
+    "ShutdownHandle",
+    "SaveHandle",
+    "OutboundPressureHandle",
+    "RuntimeControlPlane",
+    "EntityStore",
+    "ChunkScheduler",
+];
+const FORBIDDEN_API_TRANSPORTS: &[&str] = &[
+    "TryRecvError",
+    "std::sync::mpsc",
+    "tokio::sync",
+    "mpsc::Sender",
+    "mpsc::Receiver",
+    "SyncSender",
+    "Receiver<",
+    "Sender<",
+    "Arc<Mutex",
+    "Arc<RwLock",
+    "parking_lot",
+    "DashMap",
+    "JoinHandle",
+];
+const FORBIDDEN_API_DEPENDENCIES: &[&str] = &[
+    "mc-net",
+    "mc-world",
+    "mc-server",
+    "mc-entity",
+    "mc-physics",
+    "mc-data",
+    "mc-protocol",
+    "mc-nbt",
+    "mc-worldgen",
+];
 
 #[derive(Debug, PartialEq, Eq)]
 struct Finding {
@@ -37,6 +75,7 @@ fn run_code_health() -> Result<(), i32> {
     })?;
     let mut findings = Vec::new();
     scan_rust_sources(&root.join("crates"), &mut findings);
+    scan_api_manifests(&root, &mut findings);
 
     println!("Solaris code-health report");
     println!();
@@ -119,23 +158,124 @@ fn scan_generic_modules(path: &Path, lines: &[&str], findings: &mut Vec<Finding>
 }
 
 fn scan_api_leaks(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
-    let is_extension_api =
-        path_has_component(path, "mc-extension") || path_has_component(path, "mc-script");
+    let is_extension_api = PLUGIN_API_CRATES
+        .iter()
+        .any(|crate_name| path_has_component(path, crate_name));
     if !is_extension_api {
         return;
     }
 
+    let aliases = forbidden_api_aliases(lines);
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
         let publicish = trimmed.starts_with("pub ") || trimmed.starts_with("pub(");
-        if publicish && LOCK_OWNER_TYPES.iter().any(|name| trimmed.contains(name)) {
+        if !publicish {
+            continue;
+        }
+
+        let mut public_item = String::new();
+        for item_line in &lines[index..] {
+            public_item.push_str(item_line);
+            public_item.push('\n');
+            if public_item_end(item_line) {
+                break;
+            }
+        }
+
+        if contains_forbidden_api_surface(&public_item, &aliases) {
             findings.push(Finding {
                 path: path.to_path_buf(),
                 line: index + 1,
-                message: "plugin/script API exposes lock-owning runtime type".into(),
+                message: "plugin/script API exposes internal runtime or transport type".into(),
             });
         }
     }
+}
+
+fn scan_api_manifests(root: &Path, findings: &mut Vec<Finding>) {
+    for crate_name in PLUGIN_API_CRATES {
+        let manifest = root.join("crates").join(crate_name).join("Cargo.toml");
+        let Ok(source) = fs::read_to_string(&manifest) else {
+            continue;
+        };
+        scan_api_manifest(&manifest, &source, findings);
+    }
+}
+
+fn scan_api_manifest(path: &Path, source: &str, findings: &mut Vec<Finding>) {
+    if !PLUGIN_API_CRATES
+        .iter()
+        .any(|crate_name| path_has_component(path, crate_name))
+    {
+        return;
+    }
+
+    for (index, line) in source.lines().enumerate() {
+        let Some(dependency) = manifest_dependency_name(line.trim()) else {
+            continue;
+        };
+        if FORBIDDEN_API_DEPENDENCIES.contains(&dependency) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: index + 1,
+                message: format!("plugin/script API depends on internal crate `{dependency}`"),
+            });
+        }
+    }
+}
+
+fn manifest_dependency_name(line: &str) -> Option<&str> {
+    if let Some(section) = line
+        .strip_prefix("[dependencies.")
+        .or_else(|| line.strip_prefix("[dev-dependencies."))
+        .or_else(|| line.strip_prefix("[build-dependencies."))
+    {
+        return section.strip_suffix(']');
+    }
+
+    if line.starts_with('[') {
+        return None;
+    }
+
+    let (name, _) = line.split_once('=')?;
+    let name = name.trim().trim_matches('"');
+    (!name.is_empty()).then_some(name)
+}
+
+fn forbidden_api_aliases(lines: &[&str]) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    for line in lines {
+        let trimmed = line.trim();
+        if !(trimmed.starts_with("use ") || trimmed.starts_with("pub use ")) {
+            continue;
+        }
+        if !contains_forbidden_api_surface(trimmed, &BTreeSet::new()) {
+            continue;
+        }
+        if let Some((_, alias)) = trimmed.rsplit_once(" as ") {
+            let alias = alias.trim_end_matches(';').trim();
+            if !alias.is_empty() {
+                aliases.insert(alias.to_owned());
+            }
+        }
+    }
+    aliases
+}
+
+fn contains_forbidden_api_surface(source: &str, aliases: &BTreeSet<String>) -> bool {
+    FORBIDDEN_API_TYPES
+        .iter()
+        .chain(FORBIDDEN_API_TRANSPORTS.iter())
+        .any(|token| source.contains(token))
+        || aliases.iter().any(|alias| source.contains(alias))
+}
+
+fn public_item_end(line: &str) -> bool {
+    let trimmed = line.trim_end();
+    trimmed.ends_with(';')
+        || trimmed.ends_with('{')
+        || trimmed.ends_with('}')
+        || trimmed.ends_with(',')
 }
 
 fn path_has_component(path: &Path, needle: &str) -> bool {
@@ -184,6 +324,77 @@ mod tests {
 
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].line, 2);
+    }
+
+    #[test]
+    fn api_guard_rejects_multiline_public_runtime_handle_signature() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-extension/src/lib.rs"),
+            &[
+                "pub fn api(",
+                "    world: WorldHandle,",
+                ") -> Result<(), ExtensionError>;",
+            ],
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 1);
+    }
+
+    #[test]
+    fn api_guard_rejects_public_runtime_handle_alias() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-extension/src/lib.rs"),
+            &[
+                "use mc_net::server::WorldHandle as HostWorld;",
+                "pub type ApiWorld = HostWorld;",
+            ],
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
+    }
+
+    #[test]
+    fn api_guard_rejects_public_transport_errors() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-extension/src/lib.rs"),
+            &["pub fn try_recv_event(&self) -> Result<InboundEvent, TryRecvError> {"],
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 1);
+    }
+
+    #[test]
+    fn api_guard_rejects_internal_workspace_dependencies() {
+        let mut findings = Vec::new();
+        scan_api_manifest(
+            Path::new("crates/mc-extension/Cargo.toml"),
+            "[dependencies]\nmc-world = { path = \"../mc-world\" }\n",
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
+    }
+
+    #[test]
+    fn api_guard_allows_current_extension_payload_dependency() {
+        let mut findings = Vec::new();
+        scan_api_manifest(
+            Path::new("crates/mc-extension/Cargo.toml"),
+            "[dependencies]\nbytes = { workspace = true }\n",
+            &mut findings,
+        );
+
+        assert!(findings.is_empty());
     }
 
     #[test]
