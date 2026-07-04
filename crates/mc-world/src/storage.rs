@@ -101,10 +101,15 @@ pub struct WorldStorageStats {
     pub dirty_chunk_cache_saturated: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DirtyFlushPlan {
     regions: Vec<DirtyFlushRegionPlan>,
     chunks: usize,
+    registry: Arc<BlockRegistry>,
+    item_registry: Option<Arc<ItemRegistry>>,
+    unix_time: u32,
+    #[cfg(test)]
+    payload_encode_count: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone)]
@@ -129,9 +134,6 @@ struct PlannedChunkPayload {
     snapshot: ChunkSnapshot,
     #[cfg(test)]
     snapshot_token: ChunkSnapshotToken,
-    #[cfg(test)]
-    payload_digest: u64,
-    payload: ChunkPayload,
 }
 
 #[derive(Debug, Clone)]
@@ -178,6 +180,32 @@ fn payload_digest(bytes: &[u8]) -> u64 {
     hash
 }
 
+#[cfg(test)]
+fn encode_dirty_flush_chunk_payload(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    item_registry: Option<&ItemRegistry>,
+    now: u32,
+    current_tick: u64,
+    payload_encode_count: &AtomicU64,
+) -> Result<ChunkPayload, WorldError> {
+    payload_encode_count.fetch_add(1, Ordering::Relaxed);
+    chunk_to_payload_with_items_at_tick(chunk, registry, item_registry, now, current_tick)
+        .map_err(WorldError::from)
+}
+
+#[cfg(not(test))]
+fn encode_dirty_flush_chunk_payload(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    item_registry: Option<&ItemRegistry>,
+    now: u32,
+    current_tick: u64,
+) -> Result<ChunkPayload, WorldError> {
+    chunk_to_payload_with_items_at_tick(chunk, registry, item_registry, now, current_tick)
+        .map_err(WorldError::from)
+}
+
 fn can_fast_clean_chunk(
     chunk: &ChunkSnapshot,
     planned_generation: u64,
@@ -186,6 +214,15 @@ fn can_fast_clean_chunk(
     planned_generation != 0
         && chunk.dirty_generation == planned_generation
         && Arc::ptr_eq(chunk, planned_snapshot)
+}
+
+fn make_cached_chunk_mut(chunk: &mut ChunkSnapshot) -> &mut Chunk {
+    let invalidate_planned_flush = chunk.dirty && Arc::strong_count(chunk) > 1;
+    let chunk = Arc::make_mut(chunk);
+    if invalidate_planned_flush {
+        chunk.mark_dirty();
+    }
+    chunk
 }
 
 pub enum ChunkSnapshotPlan {
@@ -236,8 +273,17 @@ impl DirtyFlushPlan {
     }
 
     pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
-        let mut commits = Vec::with_capacity(self.regions.len());
-        for region in self.regions {
+        let DirtyFlushPlan {
+            regions,
+            registry,
+            item_registry,
+            unix_time,
+            #[cfg(test)]
+            payload_encode_count,
+            ..
+        } = self;
+        let mut commits = Vec::with_capacity(regions.len());
+        for region in regions {
             if region_file_version(&region.region_path)?.as_ref()
                 != region.expected_version.as_ref()
             {
@@ -253,11 +299,37 @@ impl DirtyFlushPlan {
                 HashMap::new()
             };
 
-            for planned in &region.dirty_payloads {
-                by_slot.insert(
-                    (planned.payload.local_x, planned.payload.local_z),
-                    planned.payload.clone(),
-                );
+            let mut committed_chunks = Vec::with_capacity(region.dirty_payloads.len());
+            for planned in region.dirty_payloads {
+                #[cfg(test)]
+                let payload = encode_dirty_flush_chunk_payload(
+                    &planned.snapshot,
+                    &registry,
+                    item_registry.as_deref(),
+                    unix_time,
+                    planned.current_tick,
+                    &payload_encode_count,
+                )?;
+                #[cfg(not(test))]
+                let payload = encode_dirty_flush_chunk_payload(
+                    &planned.snapshot,
+                    &registry,
+                    item_registry.as_deref(),
+                    unix_time,
+                    planned.current_tick,
+                )?;
+                by_slot.insert((payload.local_x, payload.local_z), payload.clone());
+                committed_chunks.push(CommittedChunkPayload {
+                    pos: planned.pos,
+                    current_tick: planned.current_tick,
+                    dirty_generation: planned.dirty_generation,
+                    snapshot: planned.snapshot,
+                    #[cfg(test)]
+                    snapshot_token: planned.snapshot_token,
+                    #[cfg(test)]
+                    payload_digest: payload_digest(&payload.uncompressed_nbt),
+                    uncompressed_nbt: payload.uncompressed_nbt,
+                });
             }
 
             let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
@@ -271,25 +343,16 @@ impl DirtyFlushPlan {
 
             commits.push(DirtyFlushRegionCommit {
                 region: region.region,
-                chunks: region
-                    .dirty_payloads
-                    .into_iter()
-                    .map(|planned| CommittedChunkPayload {
-                        pos: planned.pos,
-                        current_tick: planned.current_tick,
-                        dirty_generation: planned.dirty_generation,
-                        snapshot: planned.snapshot,
-                        #[cfg(test)]
-                        snapshot_token: planned.snapshot_token,
-                        #[cfg(test)]
-                        payload_digest: planned.payload_digest,
-                        uncompressed_nbt: planned.payload.uncompressed_nbt,
-                    })
-                    .collect(),
+                chunks: committed_chunks,
             });
         }
 
         Ok(DirtyFlushCommit { regions: commits })
+    }
+
+    #[cfg(test)]
+    fn payload_encode_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.payload_encode_count)
     }
 }
 
@@ -782,7 +845,7 @@ impl WorldStorage {
             return Ok(None);
         }
         self.touch(cpos);
-        Ok(self.cache.get_mut(&cpos).map(Arc::make_mut))
+        Ok(self.cache.get_mut(&cpos).map(make_cached_chunk_mut))
     }
 
     pub fn furnace_block_entity(
@@ -942,7 +1005,7 @@ impl WorldStorage {
         let Some(chunk) = self.cache.get_mut(&cpos) else {
             return Vec::new();
         };
-        let chunk = Arc::make_mut(chunk);
+        let chunk = make_cached_chunk_mut(chunk);
         chunk.drain_due_fluid_ticks(world_tick, max_ticks)
     }
 
@@ -978,7 +1041,7 @@ impl WorldStorage {
         if self.ensure_chunk(cpos)?.is_none() {
             return Ok(None);
         }
-        Ok(self.cache.get_mut(&cpos).map(Arc::make_mut))
+        Ok(self.cache.get_mut(&cpos).map(make_cached_chunk_mut))
     }
 
     fn ensure_chunk_mut_at(&mut self, pos: BlockPos) -> Result<Option<&mut Chunk>, WorldError> {
@@ -1141,8 +1204,8 @@ impl WorldStorage {
         self.cache.len() >= self.capacity && self.cache.values().all(|chunk| chunk.dirty)
     }
 
-    /// Build a dirty chunk flush plan. The plan owns the encoded chunk
-    /// payloads and the region versions observed while planning so callers can
+    /// Build a dirty chunk flush plan. The plan owns dirty chunk snapshots and
+    /// the region versions observed while planning so callers can encode and
     /// write region files after releasing any outer world mutex without
     /// replacing a newer region snapshot.
     pub fn plan_dirty_flush(&self) -> Result<DirtyFlushPlan, WorldError> {
@@ -1162,6 +1225,11 @@ impl WorldStorage {
             return Ok(DirtyFlushPlan {
                 regions: Vec::new(),
                 chunks: 0,
+                registry: Arc::clone(&self.registry),
+                item_registry: self.item_registry.as_ref().map(Arc::clone),
+                unix_time: 0,
+                #[cfg(test)]
+                payload_encode_count: Arc::new(AtomicU64::new(0)),
             });
         }
         let mut by_region: HashMap<(i32, i32), Vec<ChunkPos>> = HashMap::new();
@@ -1185,15 +1253,6 @@ impl WorldStorage {
                     .cache
                     .get(&cpos)
                     .expect("dirty position must still be in cache");
-                let payload = chunk_to_payload_with_items_at_tick(
-                    chunk,
-                    &self.registry,
-                    self.item_registry.as_deref(),
-                    now,
-                    current_tick,
-                )?;
-                #[cfg(test)]
-                let payload_digest = payload_digest(&payload.uncompressed_nbt);
                 dirty_payloads.push(PlannedChunkPayload {
                     pos: cpos,
                     current_tick,
@@ -1201,9 +1260,6 @@ impl WorldStorage {
                     snapshot: Arc::clone(chunk),
                     #[cfg(test)]
                     snapshot_token: chunk_snapshot_token(chunk),
-                    #[cfg(test)]
-                    payload_digest,
-                    payload,
                 });
                 chunks += 1;
             }
@@ -1215,7 +1271,15 @@ impl WorldStorage {
             });
         }
 
-        Ok(DirtyFlushPlan { regions, chunks })
+        Ok(DirtyFlushPlan {
+            regions,
+            chunks,
+            registry: Arc::clone(&self.registry),
+            item_registry: self.item_registry.as_ref().map(Arc::clone),
+            unix_time: now,
+            #[cfg(test)]
+            payload_encode_count: Arc::new(AtomicU64::new(0)),
+        })
     }
 
     /// Commit a written flush plan. Chunks are marked clean only if their dirty
@@ -2676,7 +2740,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_flush_plan_tracks_retained_snapshot_token_and_payload_digest() {
+    fn dirty_flush_plan_tracks_retained_snapshot_token_without_payload_encoding() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let registry = single_air_registry();
@@ -2694,10 +2758,35 @@ mod tests {
 
         assert!(Arc::ptr_eq(&planned.snapshot, snapshot));
         assert_eq!(planned.snapshot_token, chunk_snapshot_token(snapshot));
+    }
+
+    #[test]
+    fn dirty_flush_plan_clones_snapshots_without_encoding_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.mark_dirty();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        let payload_encode_count = plan.payload_encode_counter();
+
         assert_eq!(
-            planned.payload_digest,
-            payload_digest(&planned.payload.uncompressed_nbt)
+            payload_encode_count.load(Ordering::Relaxed),
+            0,
+            "dirty flush planning should only clone snapshots while the world lock is held"
         );
+
+        let commit = plan.write().unwrap();
+
+        assert_eq!(payload_encode_count.load(Ordering::Relaxed), 1);
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
+        assert_eq!(world.dirty_count(), 0);
     }
 
     #[test]
@@ -2717,13 +2806,15 @@ mod tests {
         let planned = &plan.regions[0].dirty_payloads[0];
         let expected_snapshot = Arc::clone(&planned.snapshot);
         let expected_snapshot_token = planned.snapshot_token;
-        let expected_payload_digest = planned.payload_digest;
         let commit = plan.write().unwrap();
         let committed = &commit.regions[0].chunks[0];
 
         assert!(Arc::ptr_eq(&committed.snapshot, &expected_snapshot));
         assert_eq!(committed.snapshot_token, expected_snapshot_token);
-        assert_eq!(committed.payload_digest, expected_payload_digest);
+        assert_eq!(
+            committed.payload_digest,
+            payload_digest(&committed.uncompressed_nbt)
+        );
     }
 
     #[test]
@@ -2755,7 +2846,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_flush_fast_path_rejects_copy_on_write_fork_without_generation_bump() {
+    fn dirty_flush_mutable_fork_after_plan_bumps_generation() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let registry = air_stone_registry();
@@ -2779,7 +2870,7 @@ mod tests {
             .set_block(1, 0, 1, BlockStateId(1));
 
         let live_snapshot = world.cache.get(&cpos).unwrap();
-        assert_eq!(live_snapshot.dirty_generation, planned_generation);
+        assert!(live_snapshot.dirty_generation > planned_generation);
         assert!(!Arc::ptr_eq(live_snapshot, &planned_snapshot));
         assert_eq!(
             planned_snapshot.get_block(1, 0, 1).unwrap(),
@@ -2791,6 +2882,34 @@ mod tests {
             planned_generation,
             &planned_snapshot,
         ));
+    }
+
+    #[test]
+    fn dirty_flush_mutable_alias_after_plan_invalidates_planned_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.mark_dirty();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+
+        let plan = world.plan_dirty_flush().unwrap();
+        let planned_generation = plan.regions[0].dirty_payloads[0].dirty_generation;
+
+        let _chunk = world.get_chunk_mut(cpos).unwrap().unwrap();
+        assert!(
+            world.cache.get(&cpos).unwrap().dirty_generation > planned_generation,
+            "mutable access after dirty flush planning must invalidate the planned generation"
+        );
+
+        let commit = plan.write().unwrap();
+
+        assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+        assert_eq!(world.dirty_count(), 1);
     }
 
     #[test]
@@ -2847,7 +2966,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_flush_commit_falls_back_to_payload_compare_for_derived_only_snapshot_change() {
+    fn dirty_flush_commit_falls_back_to_payload_compare_for_defensive_snapshot_change() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let registry = air_stone_registry();
@@ -2867,11 +2986,9 @@ mod tests {
         let planned_generation = planned.dirty_generation;
         let planned_snapshot = Arc::clone(&planned.snapshot);
 
-        world
-            .get_chunk_mut(cpos)
-            .unwrap()
-            .unwrap()
-            .update_highest_opaque_column(1, 1, &table);
+        let mut fork = (**world.cache.get(&cpos).unwrap()).clone();
+        fork.update_highest_opaque_column(1, 1, &table);
+        world.cache.insert(cpos, Arc::new(fork));
 
         let live_snapshot = world.cache.get(&cpos).unwrap();
         let commit = plan.write().unwrap();
@@ -2909,11 +3026,9 @@ mod tests {
         let planned = &plan.regions[0].dirty_payloads[0];
         let planned_generation = planned.dirty_generation;
         let planned_snapshot = Arc::clone(&planned.snapshot);
-        world
-            .get_chunk_mut(cpos)
-            .unwrap()
-            .unwrap()
-            .update_highest_opaque_column(1, 1, &table);
+        let mut fork = (**world.cache.get(&cpos).unwrap()).clone();
+        fork.update_highest_opaque_column(1, 1, &table);
+        world.cache.insert(cpos, Arc::new(fork));
         let live_snapshot = world.cache.get(&cpos).unwrap();
         let mut commit = plan.write().unwrap();
         commit.regions[0].chunks[0].uncompressed_nbt.clear();
@@ -2948,10 +3063,7 @@ mod tests {
             .unwrap()
             .unwrap()
             .set_block(1, 0, 1, BlockStateId(1));
-        assert_eq!(
-            world.cache.get(&cpos).unwrap().dirty_generation,
-            planned_generation
-        );
+        assert!(world.cache.get(&cpos).unwrap().dirty_generation > planned_generation);
 
         let commit = plan.write().unwrap();
 
