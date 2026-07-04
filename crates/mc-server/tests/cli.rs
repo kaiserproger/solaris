@@ -84,6 +84,26 @@ fn write_minimal_registries_report(vanilla_dir: &Path) {
     .expect("write registries.json");
 }
 
+fn write_minimal_resolved_tags(vanilla_dir: &Path) {
+    for (root, tag, entry) in [
+        ("block", "natural", "minecraft:stone"),
+        ("item", "food", "minecraft:apple"),
+        ("entity_type", "animals", "minecraft:pig"),
+    ] {
+        let tags_dir = vanilla_dir
+            .join("data")
+            .join("minecraft")
+            .join("tags")
+            .join(root);
+        std::fs::create_dir_all(&tags_dir).expect("create tags dir");
+        std::fs::write(
+            tags_dir.join(format!("{tag}.json")),
+            format!(r#"{{ "values": [ "{entry}" ] }}"#),
+        )
+        .expect("write tag file");
+    }
+}
+
 #[test]
 fn check_prints_parsed_config_and_exits_zero() {
     let mut file = NamedTempFile::new().expect("tempfile");
@@ -473,7 +493,8 @@ fn check_reports_version_drift_before_block_light_warning() {
         .stdout(contains("vanilla_data_protocol_mismatch"))
         .stdout(contains("vanilla_data_registry_tree_incomplete").not())
         .stdout(contains("vanilla_data_block_light_report_invalid").not())
-        .stdout(contains("vanilla_data_tags_unavailable").not());
+        .stdout(contains("vanilla_data_tags_unavailable").not())
+        .stdout(contains("vanilla_data_recipes_unavailable").not());
 }
 
 #[test]
@@ -525,7 +546,8 @@ fn check_reports_vanilla_data_registry_tree_warning() {
         .stdout(contains("vanilla_data_world_version_mismatch").not())
         .stdout(contains("vanilla_data_protocol_mismatch").not())
         .stdout(contains("vanilla_data_block_light_report_invalid").not())
-        .stdout(contains("vanilla_data_tags_unavailable").not());
+        .stdout(contains("vanilla_data_tags_unavailable").not())
+        .stdout(contains("vanilla_data_recipes_unavailable").not());
 }
 
 #[test]
@@ -579,7 +601,8 @@ fn check_reports_malformed_vanilla_block_light_warning() {
         .stdout(contains("vanilla_data_release_mismatch").not())
         .stdout(contains("vanilla_data_world_version_mismatch").not())
         .stdout(contains("vanilla_data_protocol_mismatch").not())
-        .stdout(contains("vanilla_data_tags_unavailable").not());
+        .stdout(contains("vanilla_data_tags_unavailable").not())
+        .stdout(contains("vanilla_data_recipes_unavailable").not());
 }
 
 #[test]
@@ -621,6 +644,55 @@ fn check_reports_missing_vanilla_tags_warning_after_block_light() {
         .stdout(contains("vanilla_data_tags_unavailable"))
         .stdout(contains("vanilla_data_registry_tree_incomplete").not())
         .stdout(contains("vanilla_data_block_light_report_invalid").not())
+        .stdout(contains("vanilla_data_version_missing").not())
+        .stdout(contains("vanilla_data_version_invalid").not())
+        .stdout(contains("vanilla_data_release_mismatch").not())
+        .stdout(contains("vanilla_data_world_version_mismatch").not())
+        .stdout(contains("vanilla_data_protocol_mismatch").not())
+        .stdout(contains("vanilla_data_recipes_unavailable").not());
+}
+
+#[test]
+fn check_reports_missing_vanilla_recipes_warning_after_tags() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    write_current_vanilla_version(vanilla_dir.path());
+    write_minimal_registry_tree(vanilla_dir.path());
+    write_valid_block_light_report(vanilla_dir.path());
+    write_minimal_registries_report(vanilla_dir.path());
+    write_minimal_resolved_tags(vanilla_dir.path());
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarNoRecipes"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_recipes_unavailable"))
+        .stdout(contains("vanilla_data_registry_tree_incomplete").not())
+        .stdout(contains("vanilla_data_block_light_report_invalid").not())
+        .stdout(contains("vanilla_data_tags_unavailable").not())
         .stdout(contains("vanilla_data_version_missing").not())
         .stdout(contains("vanilla_data_version_invalid").not())
         .stdout(contains("vanilla_data_release_mismatch").not())

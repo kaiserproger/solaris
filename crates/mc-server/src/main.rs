@@ -186,6 +186,11 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                             code: "vanilla_data_tags_unavailable",
                             message: "data.vanilla_data_dir tags are missing, malformed, or lack required resolved block/item/entity_type entries; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                         });
+                    } else if !vanilla_recipes_are_usable(vanilla_data_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_recipes_unavailable",
+                            message: "data.vanilla_data_dir recipes are missing, malformed, or contain no supported shaped, shapeless, smelting, blasting, smoking, or campfire cooking entries; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
                     }
                 }
             }
@@ -281,6 +286,10 @@ fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
     };
     let items = mc_data::items::solaris_required_items();
     load_effective_tags(Some(vanilla_data_dir), &protocol_data.data, &items).is_ok()
+}
+
+fn vanilla_recipes_are_usable(vanilla_data_dir: &Path) -> bool {
+    load_effective_recipes(Some(vanilla_data_dir)).is_ok()
 }
 
 fn has_non_directory_ancestor(path: &Path) -> bool {
