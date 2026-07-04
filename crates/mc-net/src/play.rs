@@ -9304,13 +9304,17 @@ where
                 } else if frame.id == ServerboundSetCarriedItem::ID {
                     let mut body = frame.body;
                     let pick = ServerboundSetCarriedItem::decode(&mut body)?;
-                    let slot = pick.slot.clamp(0, 8) as u8;
-                    if let Some(state) = interaction.as_deref_mut() {
-                        state.pending_break = None;
-                        state.pending_use = None;
-                        clear_shield_use(state);
-                        state.selected_hotbar_slot = slot;
-                        debug!(slot, "hotbar selection updated");
+                    if (0..=8).contains(&pick.slot) {
+                        let slot = pick.slot as u8;
+                        if let Some(state) = interaction.as_deref_mut() {
+                            state.pending_break = None;
+                            state.pending_use = None;
+                            clear_shield_use(state);
+                            state.selected_hotbar_slot = slot;
+                            debug!(slot, "hotbar selection updated");
+                        }
+                    } else {
+                        debug!(slot = pick.slot, "invalid hotbar selection ignored");
                     }
                 } else if frame.id == ServerboundClientCommand::ID {
                     let mut body = frame.body;

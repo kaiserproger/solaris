@@ -964,6 +964,181 @@ async fn survival_can_place_naturally_picked_up_block() {
 }
 
 #[tokio::test]
+async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let dirt_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .map(|b| b.default.0 as i32)
+        .expect("dirt in registry");
+    let stone_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .map(|b| b.default.0 as i32)
+        .expect("stone in registry");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let dirt_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+    let stone_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .expect("stone item");
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 invalid carried slot".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types,
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M100BadHotbar").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    let target_y = sync.y.floor() as i32 - 2;
+    let target_pos = pack_block_pos(0, target_y, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 91,
+        })
+        .await
+        .expect("send survival start break");
+    read_ack_without_target_update(&mut client, 91, (0, target_y, 0)).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 92,
+        })
+        .await
+        .expect("send survival stop break");
+    wait_for_slot_stack(&mut client, dirt_item_id, 1).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:stone 1 8".into(),
+        })
+        .await
+        .expect("give stone in hotbar slot 8");
+    wait_for_slot_stack(&mut client, stone_item_id, 1).await;
+
+    client
+        .write_packet(&ServerboundSetCarriedItem { slot: 99 })
+        .await
+        .expect("send invalid carried slot");
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, target_y - 1, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 93,
+        })
+        .await
+        .expect("send survival placement after invalid slot");
+
+    let mut saw_block_update = false;
+    let mut saw_ack = false;
+    let mut saw_dirt_decrement = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_block_update && saw_ack && saw_dirt_decrement) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("invalid slot placement response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode placement BlockUpdate");
+            let (px, py, pz) = unpack_block_pos(pkt.position);
+            if (px, py, pz) == (0, target_y, 0) {
+                assert_eq!(
+                    pkt.state_id, dirt_state_id,
+                    "invalid carried slot must preserve the prior selected dirt slot, not select stone ({stone_state_id})",
+                );
+                saw_block_update = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode placement ack");
+            if pkt.sequence == 93 {
+                saw_ack = true;
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode set slot");
+            assert!(
+                pkt.slot != 44 || !pkt.item_stack.is_empty(),
+                "invalid carried slot must not consume hotbar slot 8"
+            );
+            if pkt.slot == 36 && pkt.item_stack.is_empty() {
+                saw_dirt_decrement = true;
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn survival_break_damages_held_tool() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");

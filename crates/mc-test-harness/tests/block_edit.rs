@@ -31,9 +31,10 @@ use mc_protocol::packets::play::{
     MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, RemoveEntities, SectionBlocksUpdate,
     ServerboundChatCommand, ServerboundClientCommand, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
-    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundSignUpdate, ServerboundUseItem,
-    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_block_pos, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    ServerboundPlaceRecipe, ServerboundPlayerAction, ServerboundSetCarriedItem,
+    ServerboundSignUpdate, ServerboundUseItem, ServerboundUseItemOn, SetCenterChunk,
+    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
