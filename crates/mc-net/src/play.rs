@@ -127,10 +127,10 @@ use commands::{parse_debug_command, parse_gamemode_command};
 use containers::{
     ActiveContainer, ChestView, ChestWindow, CraftingTableWindow, FurnaceKind, FurnaceWindow,
     chest_menu_title_nbt, crafting_menu_title_nbt, find_campfire_recipe_for_item,
-    find_smelting_recipe_for_item, furnace_kind_for_state, furnace_menu_title_for_state,
-    furnace_menu_title_nbt, is_barrel_state, is_chest_state, is_crafting_table_state, is_fuel_item,
-    is_furnace_state, next_container_id, store_active_container,
-    unsupported_survival_station_for_state,
+    find_campfire_recipe_in, find_smelting_recipe_for_item, furnace_kind_for_state,
+    furnace_menu_title_for_state, furnace_menu_title_nbt, is_barrel_state, is_chest_state,
+    is_crafting_table_state, is_fuel_item, is_furnace_state, next_container_id,
+    store_active_container, unsupported_survival_station_for_state,
 };
 #[cfg(test)]
 use inventory::{ArmorStats, armor_reduced_damage};
@@ -905,6 +905,8 @@ where
             Arc::clone(&config.blocks),
             config.block_light.as_ref().map(Arc::clone),
             Arc::clone(&config.items),
+            Arc::clone(&config.tags),
+            Arc::clone(&config.recipes),
             Arc::clone(&block_entity_types),
             passive_herd_surface,
             Arc::clone(&passive_herd_fallback_surfaces),
@@ -2645,9 +2647,116 @@ fn campfire_result_stack(
     state: &InteractionState,
     recipe: &mc_data::recipes::Recipe,
 ) -> Option<ItemStack> {
-    let item_id = state.items.id_of(&recipe.result.item)?;
+    campfire_recipe_result_stack(&state.items, recipe)
+}
+
+fn campfire_recipe_result_stack(
+    items: &ItemRegistry,
+    recipe: &mc_data::recipes::Recipe,
+) -> Option<ItemStack> {
+    let item_id = items.id_of(&recipe.result.item)?;
     let count = i32::try_from(recipe.result.count).ok()?;
     (count > 0).then(|| ItemStack::new(item_id, count))
+}
+
+fn campfire_cooking_states_from_chunk(
+    chunk: &Chunk,
+    recipes: &[mc_data::recipes::Recipe],
+    items: &ItemRegistry,
+    tags: &TagsData,
+) -> Vec<(mc_world::BlockPos, CampfireCookingState)> {
+    let mut entries: Vec<_> = chunk.block_entities.iter().collect();
+    entries.sort_by_key(|(pos, _)| (pos.x, pos.y, pos.z));
+    entries
+        .into_iter()
+        .filter_map(|(position, bytes)| {
+            campfire_cooking_state_from_persistent_nbt(bytes, recipes, items, tags)
+                .map(|cooking| (*position, cooking))
+        })
+        .collect()
+}
+
+fn campfire_cooking_state_from_persistent_nbt(
+    bytes: &[u8],
+    recipes: &[mc_data::recipes::Recipe],
+    items: &ItemRegistry,
+    tags: &TagsData,
+) -> Option<CampfireCookingState> {
+    let mut cursor = std::io::Cursor::new(bytes);
+    let tag = mc_nbt::read_network(&mut cursor).ok()?;
+    let id = compound_string_field(&tag, "id")?;
+    if !matches!(id, "minecraft:campfire" | "minecraft:soul_campfire") {
+        return None;
+    }
+    let remaining = compound_int_array_field(&tag, "solaris_cooking_remaining")?;
+    let total = compound_int_array_field(&tag, "solaris_cooking_total")?;
+    let Tag::List(item_list) = compound_field(&tag, "Items")? else {
+        return None;
+    };
+    let mut cooking = CampfireCookingState::default();
+    for item in &item_list.elements {
+        let Some((slot, input)) = campfire_persistent_input_stack(item, items) else {
+            continue;
+        };
+        if cooking.slots[slot].is_some() {
+            continue;
+        }
+        let ticks_remaining = u32::try_from(*remaining.get(slot)?).ok()?;
+        let cooking_time_total = u32::try_from(*total.get(slot)?).ok()?;
+        if ticks_remaining == 0 || cooking_time_total == 0 {
+            continue;
+        }
+        let recipe = find_campfire_recipe_in(recipes, items, tags, input.item_id)?;
+        let result = campfire_recipe_result_stack(items, &recipe)?;
+        cooking.slots[slot] = Some(CampfireCookingEntry {
+            input,
+            result,
+            ticks_remaining,
+            cooking_time_total,
+        });
+    }
+    (!cooking.is_empty()).then_some(cooking)
+}
+
+fn campfire_persistent_input_stack(item: &Tag, items: &ItemRegistry) -> Option<(usize, ItemStack)> {
+    let slot = usize::try_from(compound_int_field(item, "Slot")?).ok()?;
+    if slot >= CAMPFIRE_COOKING_SLOT_COUNT {
+        return None;
+    }
+    let item_id = Identifier::parse(compound_string_field(item, "id")?.to_string()).ok()?;
+    let item_id = items.id_of(&item_id)?;
+    let count = compound_int_field(item, "count")?;
+    (count > 0).then_some((slot, ItemStack::new(item_id, count)))
+}
+
+fn compound_field<'a>(tag: &'a Tag, name: &str) -> Option<&'a Tag> {
+    let Tag::Compound(fields) = tag else {
+        return None;
+    };
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+}
+
+fn compound_string_field<'a>(tag: &'a Tag, name: &str) -> Option<&'a str> {
+    match compound_field(tag, name)? {
+        Tag::String(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+fn compound_int_field(tag: &Tag, name: &str) -> Option<i32> {
+    match compound_field(tag, name)? {
+        Tag::Int(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn compound_int_array_field<'a>(tag: &'a Tag, name: &str) -> Option<&'a [i32]> {
+    match compound_field(tag, name)? {
+        Tag::IntArray(values) => Some(values.as_slice()),
+        _ => None,
+    }
 }
 
 fn campfire_block_entity_update_nbt(
@@ -2764,6 +2873,11 @@ async fn persist_campfire_block_entity(
         warn!(error = %err, ?position, "campfire block entity save failed");
         return false;
     }
+    drop(storage);
+    state.sessions.invalidate_prepared_chunks(&HashSet::from([(
+        position.x.div_euclid(16),
+        position.z.div_euclid(16),
+    )]));
     true
 }
 

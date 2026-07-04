@@ -217,7 +217,12 @@ fn strip_persistent_block_entity_fields(tag: Tag) -> Tag {
     Tag::Compound(
         fields
             .into_iter()
-            .filter(|(key, _)| !matches!(key.as_str(), "id" | "x" | "y" | "z"))
+            .filter(|(key, _)| {
+                !matches!(
+                    key.as_str(),
+                    "id" | "x" | "y" | "z" | "solaris_cooking_remaining" | "solaris_cooking_total"
+                )
+            })
             .collect(),
     )
 }
@@ -705,6 +710,53 @@ mod tests {
                 .all(|(key, _)| !matches!(key.as_str(), "id" | "x" | "y" | "z"))
         );
         assert!(fields.iter().any(|(key, _)| key == "Items"));
+    }
+
+    #[test]
+    fn client_block_entities_strip_solaris_campfire_persistence_fields() {
+        let registry = air_chest_registry();
+        let items = item_registry();
+        let mut chunk = empty_chunk();
+        let pos = BlockPos { x: 2, y: 64, z: 3 };
+        let tag = Tag::Compound(vec![
+            ("id".into(), Tag::String("minecraft:campfire".into())),
+            ("x".into(), Tag::Int(pos.x)),
+            ("y".into(), Tag::Int(pos.y)),
+            ("z".into(), Tag::Int(pos.z)),
+            (
+                "Items".into(),
+                Tag::List(ListTag {
+                    element_type: tag_type::END,
+                    elements: Vec::new(),
+                }),
+            ),
+            (
+                "solaris_cooking_remaining".into(),
+                Tag::IntArray(vec![3, 0, 0, 0]),
+            ),
+            (
+                "solaris_cooking_total".into(),
+                Tag::IntArray(vec![4, 0, 0, 0]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        mc_nbt::write_network(&mut bytes, &tag).expect("encode campfire block entity");
+        chunk.block_entities.insert(pos, bytes);
+
+        let records = client_block_entities(&chunk, &registry, &items);
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].type_name.as_str(), "minecraft:campfire");
+        let Tag::Compound(fields) = &records[0].nbt else {
+            panic!("expected compound update tag");
+        };
+        assert!(fields.iter().any(|(key, _)| key == "Items"));
+        assert!(fields.iter().all(|(key, _)| {
+            !matches!(
+                key.as_str(),
+                "id" | "x" | "y" | "z" | "solaris_cooking_remaining" | "solaris_cooking_total"
+            )
+        }));
     }
 
     #[test]

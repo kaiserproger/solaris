@@ -53,6 +53,8 @@ pub(super) struct ChunkStreamState {
     blocks: Arc<BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
     items: Arc<ItemRegistry>,
+    tags: Arc<TagsData>,
+    recipes: Arc<Vec<mc_data::recipes::Recipe>>,
     block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
@@ -132,6 +134,7 @@ pub(super) struct PreparedChunkFrame {
     pub(super) frame: Bytes,
     pub(super) light: Option<ChunkLight>,
     pub(super) herd_spawns: Vec<HerdSpawn>,
+    pub(super) hydrated_campfires: Vec<(mc_world::BlockPos, CampfireCookingState)>,
     pub(super) packet_data_len: usize,
     pub(super) build_timing: ChunkBuildTiming,
     pub(super) write_timing: ChunkWriteTiming,
@@ -750,6 +753,8 @@ impl ChunkStreamState {
         blocks: Arc<BlockRegistry>,
         block_light: Option<Arc<BlockLightTable>>,
         items: Arc<ItemRegistry>,
+        tags: Arc<TagsData>,
+        recipes: Arc<Vec<mc_data::recipes::Recipe>>,
         block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
         passive_herd_surface: Option<mc_world::BlockStateId>,
         passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
@@ -783,6 +788,8 @@ impl ChunkStreamState {
             blocks,
             block_light,
             items,
+            tags,
+            recipes,
             block_entity_types,
             passive_herd_surface,
             passive_herd_fallback_surfaces,
@@ -1142,6 +1149,8 @@ impl ChunkStreamState {
         let blocks = Arc::clone(&self.blocks);
         let block_light = self.block_light.as_ref().map(Arc::clone);
         let items = Arc::clone(&self.items);
+        let tags = Arc::clone(&self.tags);
+        let recipes = Arc::clone(&self.recipes);
         let block_entity_types = Arc::clone(&self.block_entity_types);
         let passive_herd_surface = self.passive_herd_surface;
         let passive_herd_fallback_surfaces = Arc::clone(&self.passive_herd_fallback_surfaces);
@@ -1162,6 +1171,8 @@ impl ChunkStreamState {
                 blocks,
                 block_light,
                 items,
+                tags,
+                recipes,
                 block_entity_types,
                 passive_herd_surface,
                 passive_herd_fallback_surfaces,
@@ -1239,6 +1250,10 @@ impl ChunkStreamState {
                 let socket_write_started = Instant::now();
                 writer.write_all(&prepared.frame).await?;
                 write_timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
+                for (position, cooking) in &prepared.hydrated_campfires {
+                    self.sessions
+                        .restore_campfire_cooking(*position, cooking.clone());
+                }
                 self.loaded.insert((cx, cz));
                 let mut visibility = self.sessions.mark_loaded(self.session_id, (cx, cz));
                 visibility.extend(
@@ -1609,6 +1624,8 @@ async fn prepare_chunk_request(
     blocks: Arc<BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
     items: Arc<ItemRegistry>,
+    tags: Arc<TagsData>,
+    recipes: Arc<Vec<mc_data::recipes::Recipe>>,
     block_entity_types: Arc<mc_data::block_entity_types::BlockEntityTypeRegistry>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
     passive_herd_fallback_surfaces: Arc<Vec<mc_world::BlockStateId>>,
@@ -1741,6 +1758,8 @@ async fn prepare_chunk_request(
                     biomes.as_ref(),
                     blocks.as_ref(),
                     items.as_ref(),
+                    tags.as_ref(),
+                    recipes.as_ref(),
                     block_entity_types.as_ref(),
                     Some(table),
                     passive_herd_surface,
@@ -1761,6 +1780,8 @@ async fn prepare_chunk_request(
                 biomes.as_ref(),
                 blocks.as_ref(),
                 items.as_ref(),
+                tags.as_ref(),
+                recipes.as_ref(),
                 block_entity_types.as_ref(),
                 None,
                 passive_herd_surface,
@@ -2270,6 +2291,7 @@ struct BuiltChunkPacket {
     packet: LevelChunkWithLight,
     light: Option<ChunkLight>,
     herd_spawns: Vec<HerdSpawn>,
+    hydrated_campfires: Vec<(mc_world::BlockPos, CampfireCookingState)>,
     timing: ChunkBuildTiming,
 }
 
@@ -2280,6 +2302,8 @@ fn build_chunk_packet(
     biomes: &Registry,
     blocks: &BlockRegistry,
     items: &ItemRegistry,
+    tags: &TagsData,
+    recipes: &[mc_data::recipes::Recipe],
     block_entity_types: &mc_data::block_entity_types::BlockEntityTypeRegistry,
     block_light: Option<&BlockLightTable>,
     passive_herd_surface: Option<mc_world::BlockStateId>,
@@ -2370,6 +2394,7 @@ fn build_chunk_packet(
             })
         })
         .collect();
+    let hydrated_campfires = campfire_cooking_states_from_chunk(centre, recipes, items, tags);
 
     let herd_spawns = plan_passive_herd(
         centre,
@@ -2391,6 +2416,7 @@ fn build_chunk_packet(
         },
         light: computed_light,
         herd_spawns,
+        hydrated_campfires,
         timing,
     })
 }
@@ -2416,6 +2442,7 @@ fn frame_chunk_packet(
         frame: framed,
         light: built.light,
         herd_spawns: built.herd_spawns,
+        hydrated_campfires: built.hydrated_campfires,
         packet_data_len,
         build_timing: built.timing,
         write_timing: timing,
@@ -2545,6 +2572,7 @@ mod tests {
             frame: Bytes::from_static(b"chunk-frame"),
             light: None,
             herd_spawns: Vec::new(),
+            hydrated_campfires: Vec::new(),
             packet_data_len: 123,
             build_timing: ChunkBuildTiming {
                 chunk_data_ms: 10,
@@ -2597,6 +2625,8 @@ mod tests {
             &test_biome_registry(),
             &air_block_registry(),
             &ItemRegistry::from_report(&[]),
+            &TagsData::default(),
+            &[],
             &mc_data::block_entity_types::BlockEntityTypeRegistry::default(),
             Some(&table),
             None,
@@ -2777,6 +2807,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -2805,6 +2837,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -2854,6 +2888,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -2947,6 +2983,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -3009,6 +3047,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -3047,6 +3087,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -3099,6 +3141,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -3147,6 +3191,7 @@ mod tests {
                 frame: Bytes::new(),
                 light: None,
                 herd_spawns: Vec::new(),
+                hydrated_campfires: Vec::new(),
                 packet_data_len: 0,
                 build_timing: ChunkBuildTiming::default(),
                 write_timing: ChunkWriteTiming::default(),
@@ -3196,6 +3241,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),
@@ -3224,6 +3271,8 @@ mod tests {
             Arc::clone(&registry),
             None,
             Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
             Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
             None,
             Arc::new(Vec::new()),

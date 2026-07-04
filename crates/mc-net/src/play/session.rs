@@ -323,6 +323,24 @@ impl SessionRegistry {
         updates
     }
 
+    pub(super) fn restore_campfire_cooking(
+        &self,
+        position: mc_world::BlockPos,
+        cooking: CampfireCookingState,
+    ) -> bool {
+        if cooking.is_empty() {
+            return false;
+        }
+        let mut inner = self.lock_inner("restore campfire cooking");
+        match inner.campfire_cooking.entry(position) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(cooking);
+                true
+            }
+            std::collections::hash_map::Entry::Occupied(_) => false,
+        }
+    }
+
     pub(super) fn clear_campfire_cooking(&self, position: mc_world::BlockPos) -> bool {
         let mut inner = self.lock_inner("clear campfire cooking");
         inner.campfire_cooking.remove(&position).is_some()
