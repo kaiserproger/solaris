@@ -563,6 +563,8 @@ async fn serve(path: &Path) -> Result<()> {
                 // chunk per fresh world.
                 let generator: Arc<dyn mc_world::ChunkGenerator> =
                     Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
+                let startup_workers =
+                    startup_chunk_worker_threads(chunk_pipeline.chunk_worker_threads);
                 let mut storage = storage
                     .with_generator(generator)
                     .with_item_registry(Arc::clone(&items));
@@ -572,26 +574,25 @@ async fn serve(path: &Path) -> Result<()> {
                         &mut storage,
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
                         cfg.server.view_distance,
-                        chunk_pipeline.chunk_worker_threads,
+                        startup_workers,
                         Some(block_light.as_ref()),
                     )?;
-                    tracing::info!("Preparing world... 95% (saving generated chunks)");
-                    let flushed = storage.flush_dirty()?;
+                    tracing::info!("Preparing world... 95% (spawn window resident)");
                     region_count = count_region_files(world_dir);
                     tracing::info!("Preparing world... 100%");
                     tracing::info!(
                         path = %world_dir.display(),
                         chunks = generated,
-                        flushed,
+                        dirty = storage.dirty_count(),
                         region_files = region_count,
-                        "empty world pre-generated around spawn",
+                        "empty world pre-generated around spawn; disk flush deferred to save-all",
                     );
                 } else {
                     let prepared = prepare_existing_spawn_window(
                         &mut storage,
                         block_light.as_ref(),
                         cfg.server.view_distance,
-                        chunk_pipeline.chunk_worker_threads,
+                        startup_workers,
                     )?;
                     tracing::info!(
                         path = %world_dir.display(),
@@ -777,6 +778,13 @@ fn build_terrain_generator(
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
     let width = view_distance.max(0) as usize * 2 + 3;
     width * width
+}
+
+fn startup_chunk_worker_threads(configured_workers: usize) -> usize {
+    let available = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    configured_workers.max(available).max(1)
 }
 
 fn generate_spawn_window(
@@ -1420,6 +1428,16 @@ mod tests {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
         assert_eq!(chunk_cache_size_for_view_distance(10), 529);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn startup_chunk_workers_cover_configured_and_available_parallelism() {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+
+        assert_eq!(startup_chunk_worker_threads(0), available.max(1));
+        assert_eq!(startup_chunk_worker_threads(available + 3), available + 3);
     }
 
     #[test]

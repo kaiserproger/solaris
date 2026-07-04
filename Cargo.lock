@@ -706,6 +706,7 @@ dependencies = [
  "mc-nbt",
  "mc-net",
  "mc-protocol",
+ "mc-test-harness",
  "mc-world",
  "mc-worldgen",
  "predicates",
