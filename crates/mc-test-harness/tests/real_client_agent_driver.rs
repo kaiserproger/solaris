@@ -375,6 +375,69 @@ fn agent_driver_rejects_invalid_screenshot_artifact() {
 }
 
 #[test]
+fn agent_driver_rejects_passed_broad_blocked_only_scenario() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let bridge = FakeBridge::start(6);
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+        .arg("--secret")
+        .arg("test-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("m94-02-blocks-fluids-farming-drops")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        !output.status.success(),
+        "driver accepted a passed broad blocked-only scenario\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("failed observations.json exists"),
+    )
+    .expect("failed observations.json is valid JSON");
+    assert_eq!(observations["result"], "failed");
+    assert_ne!(observations["result"], "passed");
+    assert!(
+        observations["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("blocked-only")),
+        "failed observations must report blocked-only broad scenario policy\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = bridge.join();
+    let commands: Vec<_> = requests
+        .iter()
+        .map(|request| request["command"].as_str().expect("command is present"))
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "ping",
+            "wait_play",
+            "run_scenario",
+            "state",
+            "screenshot",
+            "disconnect"
+        ]
+    );
+}
+
+#[test]
 fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");

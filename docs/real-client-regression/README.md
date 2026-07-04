@@ -208,7 +208,10 @@ This path remains non-green until a real client bridge writes
 bridge tests only validate driver plumbing; they do not count as real-client
 evidence. The driver only records a passed scenario when the in-client bridge
 returns an explicit `run_scenario` result of `passed`; bridge connection,
-`wait_play`, and screenshots by themselves are not a gameplay pass.
+`wait_play`, and screenshots by themselves are not a gameplay pass. The driver
+also rejects `passed` reports for the broad blocked-only `m94-02`, `m94-03`,
+`m94-04`, `m94-05`, `m94-06`, and `m94-07` scenario ids above until their
+missing evidence is implemented.
 Validation also requires passed observed scenarios with
 `screenshots_required: true` to reference at least one existing
 `screenshots/` artifact, and both the runner and driver reject screenshots that

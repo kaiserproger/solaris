@@ -237,6 +237,7 @@ def run_bridge_scenario(
         raise RuntimeError(f"screenshot command wrote invalid PNG {screenshot_path}: {png_error}")
 
     call_and_record(client, transcript, "disconnect", {}, timeout_seconds)
+    reject_blocked_only_pass(scenario_id, scenario_result)
     return scenario_result, final_state, [screenshot_path.relative_to(run_dir).as_posix()], scenario_report
 
 
@@ -1048,6 +1049,15 @@ def wait_for_file(path: Path, timeout_seconds: float) -> bool:
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
+BLOCKED_ONLY_BROAD_SCENARIOS = {
+    "m94-02-blocks-fluids-farming-drops",
+    "m94-03-inventory-crafting-containers-stations",
+    "m94-04-signs-beds-campfires-and-block-entities",
+    "m94-05-entities-combat-death-respawn",
+    "m94-06-save-restart-two-client-visibility",
+    "m94-07-m40-m41-route-with-metrics",
+}
+
 
 def png_validation_error(path: Path) -> str | None:
     try:
@@ -1086,6 +1096,14 @@ def png_validation_error(path: Path) -> str | None:
                 return "trailing bytes after IEND"
             return None
         offset = crc_end
+
+
+def reject_blocked_only_pass(scenario_id: str, scenario_result: str) -> None:
+    if scenario_result != "passed" or scenario_id not in BLOCKED_ONLY_BROAD_SCENARIOS:
+        return
+    raise RuntimeError(
+        f"scenario {scenario_id} is blocked-only and must report blocked until broad M94 evidence is complete"
+    )
 
 
 def write_observations(
