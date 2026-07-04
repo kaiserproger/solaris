@@ -319,8 +319,19 @@ required_screenshots = {
     for scenario in manifest.get("scenarios", [])
     if scenario.get("screenshots_required") is True
 }
+manifest_scenarios = {
+    scenario.get("id")
+    for scenario in manifest.get("scenarios", [])
+    if isinstance(scenario.get("id"), str)
+}
 for scenario in observations.get("scenarios", []):
     scenario_id = scenario.get("id")
+    if not isinstance(scenario_id, str) or scenario_id not in manifest_scenarios:
+        print(
+            f"error: observations.json contains unknown scenario id: {scenario_id!r}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     if scenario_id not in required_screenshots or scenario.get("result") != "passed":
         continue
     screenshots = scenario.get("screenshots")

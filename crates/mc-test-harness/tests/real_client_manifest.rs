@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 use std::process::Command;
 
 use serde_json::{Value, json};
@@ -316,22 +317,11 @@ fn approved_real_client_runner_is_fail_closed() {
 
 #[test]
 fn validate_run_rejects_missing_required_scenario_screenshots() {
-    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
-    std::fs::write(run_dir.path().join("manifest.json"), M94_MANIFEST).expect("write manifest");
-    for artifact in [
-        "client.log",
-        "server.log",
-        "git.txt",
-        "toolchain.txt",
-        "automation-driver.txt",
-    ] {
-        std::fs::write(run_dir.path().join(artifact), "").expect("write artifact");
-    }
-    std::fs::create_dir(run_dir.path().join("screenshots")).expect("create screenshots dir");
-    std::fs::write(
-        run_dir.path().join("observations.json"),
-        serde_json::to_vec_pretty(&json!({
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
             "schema": "solaris.real_client_observations.v1",
             "client_gate": "agent-run-real-client",
             "quality_label": "stabilization",
@@ -341,17 +331,10 @@ fn validate_run_rejects_missing_required_scenario_screenshots() {
                 "result": "passed",
                 "screenshots": []
             }]
-        }))
-        .expect("serialize observations"),
-    )
-    .expect("write observations");
+        }),
+    );
 
-    let output = Command::new("bash")
-        .arg(repo_root.join("tools/run-real-client-regression.sh"))
-        .arg("--validate-run")
-        .arg(run_dir.path())
-        .output()
-        .expect("run real-client validator");
+    let output = validate_run(&repo_root, run_dir.path());
 
     assert!(
         !output.status.success(),
@@ -365,4 +348,79 @@ fn validate_run_rejects_missing_required_scenario_screenshots() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn validate_run_rejects_unknown_observed_scenario_id() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-unknown-scenario",
+                "result": "passed",
+                "screenshots": ["screenshots/m94-unknown-scenario.png"]
+            }]
+        }),
+    );
+    std::fs::write(
+        run_dir
+            .path()
+            .join("screenshots")
+            .join("m94-unknown-scenario.png"),
+        b"fake png bytes",
+    )
+    .expect("write screenshot");
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted a scenario id missing from the manifest\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("unknown scenario"),
+        "validator error should name the unknown scenario\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn repo_root() -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn write_validate_run_artifacts(run_dir: &Path, observations: Value) {
+    std::fs::write(run_dir.join("manifest.json"), M94_MANIFEST).expect("write manifest");
+    for artifact in [
+        "client.log",
+        "server.log",
+        "git.txt",
+        "toolchain.txt",
+        "automation-driver.txt",
+    ] {
+        std::fs::write(run_dir.join(artifact), "").expect("write artifact");
+    }
+    std::fs::create_dir(run_dir.join("screenshots")).expect("create screenshots dir");
+    std::fs::write(
+        run_dir.join("observations.json"),
+        serde_json::to_vec_pretty(&observations).expect("serialize observations"),
+    )
+    .expect("write observations");
+}
+
+fn validate_run(repo_root: &Path, run_dir: &Path) -> std::process::Output {
+    Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--validate-run")
+        .arg(run_dir)
+        .output()
+        .expect("run real-client validator")
 }
