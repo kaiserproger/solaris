@@ -170,11 +170,18 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                         message: "data.vanilla_data_dir version.json is not readable as UTF-8, is not valid metadata, or is missing id, world_version, or protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                     }),
                 }
-                if current_version && !vanilla_registry_tree_is_complete(vanilla_data_dir) {
-                    warnings.push(OperatorWarning {
-                        code: "vanilla_data_registry_tree_incomplete",
-                        message: "data.vanilla_data_dir is missing required registry JSON under data/minecraft; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
-                    });
+                if current_version {
+                    if !vanilla_registry_tree_is_complete(vanilla_data_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_registry_tree_incomplete",
+                            message: "data.vanilla_data_dir is missing required registry JSON under data/minecraft; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
+                    } else if !vanilla_block_light_report_matches_target(vanilla_data_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_block_light_report_invalid",
+                            message: "data.vanilla_data_dir reports/block_light.json is missing, malformed, or targets a different release; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
+                    }
                 }
             }
             Ok(_) => warnings.push(OperatorWarning {
@@ -256,6 +263,11 @@ fn registry_dir_has_json(path: &Path) -> bool {
         }
     }
     false
+}
+
+fn vanilla_block_light_report_matches_target(vanilla_data_dir: &Path) -> bool {
+    let path = vanilla_data_dir.join("reports").join("block_light.json");
+    mc_data::block_light::load(path).is_ok_and(|table| table.version == mc_protocol::TARGET_RELEASE)
 }
 
 fn has_non_directory_ancestor(path: &Path) -> bool {

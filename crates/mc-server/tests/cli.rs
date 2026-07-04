@@ -5,6 +5,7 @@
 //! `tests/status.rs` because it needs tokio and a real socket.
 
 use std::io::Write;
+use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
@@ -20,6 +21,29 @@ motd = "Hello"
 bind_address = "127.0.0.1"
 port = 30000
 "#;
+
+fn write_current_vanilla_version(vanilla_dir: &Path) {
+    std::fs::write(
+        vanilla_dir.join("version.json"),
+        format!(
+            r#"{{"id":"{}","world_version":{},"protocol_version":{}}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::WORLD_VERSION,
+            mc_protocol::PROTOCOL_VERSION
+        ),
+    )
+    .expect("write version.json");
+}
+
+fn write_minimal_registry_tree(vanilla_dir: &Path) {
+    let minecraft_root = vanilla_dir.join("data").join("minecraft");
+    for (_, fs_subpath) in mc_data::KNOWN_REGISTRIES {
+        let registry_dir = minecraft_root.join(fs_subpath);
+        std::fs::create_dir_all(&registry_dir).expect("create registry dir");
+        std::fs::write(registry_dir.join("solaris_placeholder.json"), "{}")
+            .expect("write registry placeholder");
+    }
+}
 
 #[test]
 fn check_prints_parsed_config_and_exits_zero() {
@@ -356,6 +380,63 @@ fn check_reports_vanilla_data_world_version_mismatch_warning() {
 }
 
 #[test]
+fn check_reports_version_drift_before_block_light_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("version.json"),
+        format!(
+            r#"{{"id":"{}","world_version":{},"protocol_version":999999}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::WORLD_VERSION
+        ),
+    )
+    .expect("write version.json");
+    write_minimal_registry_tree(vanilla_dir.path());
+    let reports_dir = vanilla_dir.path().join("reports");
+    std::fs::create_dir_all(&reports_dir).expect("create reports dir");
+    std::fs::write(
+        reports_dir.join("block_light.json"),
+        format!(
+            r#"{{"version":"{}","max_state_id":0,"entries":[[0,0]]}}"#,
+            mc_protocol::TARGET_RELEASE
+        ),
+    )
+    .expect("write malformed block_light.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarVersionBeforeBlockLight"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_protocol_mismatch"))
+        .stdout(contains("vanilla_data_registry_tree_incomplete").not())
+        .stdout(contains("vanilla_data_block_light_report_invalid").not());
+}
+
+#[test]
 fn check_reports_vanilla_data_registry_tree_warning() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
@@ -398,6 +479,60 @@ fn check_reports_vanilla_data_registry_tree_warning() {
         .success()
         .stdout(contains("\"operator_warnings\""))
         .stdout(contains("vanilla_data_registry_tree_incomplete"))
+        .stdout(contains("vanilla_data_version_missing").not())
+        .stdout(contains("vanilla_data_version_invalid").not())
+        .stdout(contains("vanilla_data_release_mismatch").not())
+        .stdout(contains("vanilla_data_world_version_mismatch").not())
+        .stdout(contains("vanilla_data_protocol_mismatch").not())
+        .stdout(contains("vanilla_data_block_light_report_invalid").not());
+}
+
+#[test]
+fn check_reports_malformed_vanilla_block_light_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    write_current_vanilla_version(vanilla_dir.path());
+    write_minimal_registry_tree(vanilla_dir.path());
+    let reports_dir = vanilla_dir.path().join("reports");
+    std::fs::create_dir_all(&reports_dir).expect("create reports dir");
+    std::fs::write(
+        reports_dir.join("block_light.json"),
+        format!(
+            r#"{{"version":"{}","max_state_id":0,"entries":[[0,0]]}}"#,
+            mc_protocol::TARGET_RELEASE
+        ),
+    )
+    .expect("write malformed block_light.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarBadBlockLight"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_block_light_report_invalid"))
+        .stdout(contains("vanilla_data_registry_tree_incomplete").not())
         .stdout(contains("vanilla_data_version_missing").not())
         .stdout(contains("vanilla_data_version_invalid").not())
         .stdout(contains("vanilla_data_release_mismatch").not())
