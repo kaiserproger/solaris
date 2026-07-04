@@ -74,6 +74,11 @@ struct OperatorWarning {
     message: &'static str,
 }
 
+#[derive(serde::Deserialize)]
+struct VanillaVersionMetadata {
+    protocol_version: Option<i32>,
+}
+
 fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     let mut warnings = Vec::new();
     match &config.data.world_dir {
@@ -91,6 +96,21 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
             warnings.push(OperatorWarning {
                 code: "missing_world_dir",
                 message: "no [data].world_dir configured; serve will start without persistent chunk streaming",
+            });
+        }
+    }
+
+    if let Some(vanilla_data_dir) = &config.data.vanilla_data_dir {
+        let version_path = vanilla_data_dir.join("version.json");
+        if let Ok(raw) = std::fs::read_to_string(version_path)
+            && let Ok(version) = serde_json::from_str::<VanillaVersionMetadata>(&raw)
+            && version
+                .protocol_version
+                .is_some_and(|protocol| protocol != mc_protocol::PROTOCOL_VERSION)
+        {
+            warnings.push(OperatorWarning {
+                code: "vanilla_data_protocol_mismatch",
+                message: "data.vanilla_data_dir version.json protocol_version does not match Solaris; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
             });
         }
     }

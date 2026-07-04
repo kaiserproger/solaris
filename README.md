@@ -32,8 +32,9 @@ embedded into the server binary. No external vanilla data sidecar is required
 to start the server. If `data.vanilla_data_dir` points at a local extracted
 vanilla sidecar, that sidecar is treated as authoritative: registries, tags,
 `reports/block_light.json`, and supported simple loot must be present. Generate
-it with `tools/extract-vanilla-data.sh`; without `data.vanilla_data_dir`, Solaris
-uses embedded repo-owned fallback data.
+it with `tools/extract-vanilla-data.sh`; `--check` warns when the sidecar
+`version.json` protocol does not match Solaris. Without `data.vanilla_data_dir`,
+Solaris uses embedded repo-owned fallback data.
 
 ## Run
 
@@ -48,7 +49,8 @@ cargo run --bin mc-server -- --config example.toml
 The `--check` JSON includes `operator_warnings`. Treat non-empty warnings as
 deployment readiness blockers; for example, public binds with offline-mode auth
 or `allow_local_dev_operators` are not production-safe, and a missing or
-unusable `[data].world_dir` means chunk streaming/persistence is not ready.
+unusable `[data].world_dir` or stale `data.vanilla_data_dir` means chunk
+streaming, persistence, or data/protocol readiness is not ready.
 
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
 

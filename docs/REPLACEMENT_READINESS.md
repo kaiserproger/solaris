@@ -322,10 +322,11 @@ The same review keeps these blockers canonical for replacement claims:
   and malformed-action fail-closed behavior need M89. `mc-server --check` now
   emits structured public-bind warnings for offline-mode auth and local-dev
   operators, plus missing/unusable world-dir warnings for configs that would
-  start without persistent chunk streaming/storage. That is check-output
-  evidence only; it is not online-mode auth, broad filesystem/permissions
-  validation, a public
-  deployment gate, or a broader security audit.
+  start without persistent chunk streaming/storage, plus a sidecar
+  protocol-version mismatch warning for stale `data.vanilla_data_dir`
+  extracts. That is check-output evidence only; it is not online-mode auth,
+  broad filesystem/permissions validation, a public deployment gate,
+  dependency/license/security audit, or broad data/protocol drift proof.
 - Boats, minecarts, common survival station gameplay beyond M87 safe rejection,
   and redstone-lite automation need M81/M83/M94/M95 decisions, implementation,
   or evidence-backed deferral.
