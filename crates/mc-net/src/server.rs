@@ -638,6 +638,9 @@ impl BoundServer {
                     }
                 }
                 () = shutdown.notified() => {
+                    if let Some(runtime_control) = runtime_control.as_ref() {
+                        runtime_control.request_drain();
+                    }
                     info!("shutdown requested; listener stopping");
                     break;
                 }
@@ -1643,6 +1646,60 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(cache.lock().is_ok());
+    }
+
+    #[tokio::test]
+    async fn serve_shutdown_notification_requests_runtime_control_drain() {
+        let shutdown = ShutdownHandle::default();
+        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+        let config = ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: "runtime-drain-shutdown-test".into(),
+            max_players: 0,
+            view_distance: 0,
+            data: Arc::new(mc_data::testing::stub()),
+            blocks,
+            world: None,
+            tags: Arc::new(TagsData::default()),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: ChunkPipelinePolicy {
+                runtime_control: Some(crate::RuntimeControlConfig {
+                    policy: crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced),
+                    initial_limits: crate::RuntimeControlLimits {
+                        view_distance: 4,
+                        chunk_send_rate: 8,
+                        chunk_load_rate: 16,
+                        chunk_generate_rate: 16,
+                    },
+                }),
+                ..ChunkPipelinePolicy::default()
+            },
+            random_tick: play::RandomTickPolicy::default(),
+            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            shutdown: shutdown.clone(),
+        };
+
+        let bound = bind(config).await.expect("bind");
+        let runtime_control = bound
+            .runtime_control_handle()
+            .expect("runtime control enabled");
+        let serve = tokio::spawn(bound.serve());
+
+        shutdown.request();
+        let serve_result = tokio::time::timeout(Duration::from_secs(2), serve)
+            .await
+            .expect("serve exits after shutdown")
+            .expect("serve task joins");
+        serve_result.expect("serve exits cleanly");
+
+        assert!(runtime_control.snapshot().draining);
     }
 
     fn save_all_test_config(
