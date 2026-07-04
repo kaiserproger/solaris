@@ -83,13 +83,25 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     let mut warnings = Vec::new();
     match &config.data.world_dir {
         Some(world_dir) => {
-            if let Ok(metadata) = std::fs::metadata(world_dir)
-                && !metadata.is_dir()
-            {
-                warnings.push(OperatorWarning {
-                    code: "world_dir_not_directory",
-                    message: "[data].world_dir exists but is not a directory; serve will start without usable world storage",
-                });
+            match std::fs::metadata(world_dir) {
+                Ok(metadata) => {
+                    if !metadata.is_dir() {
+                        warnings.push(OperatorWarning {
+                            code: "world_dir_not_directory",
+                            message: "[data].world_dir exists but is not a directory; serve will start without usable world storage",
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    warnings.push(OperatorWarning {
+                        code: "world_dir_missing_on_disk",
+                        message: "[data].world_dir does not exist on disk; serve will create a fresh world directory",
+                    });
+                }
+                Err(_) => warnings.push(OperatorWarning {
+                    code: "world_dir_metadata_unavailable",
+                    message: "[data].world_dir metadata is unavailable; serve may fail to open persistent world storage",
+                }),
             }
         }
         None => {
