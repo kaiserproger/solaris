@@ -50,6 +50,7 @@ type PhysicsMaterialCache = HashMap<
 static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -373,7 +374,7 @@ impl BoundServer {
         let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         let entity_cpu_permits =
             Arc::new(Semaphore::new(config.chunk_pipeline.entity_worker_threads));
-        tokio::spawn(async move {
+        let entity_ticker = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let metrics_policy = RuntimeMetricsPolicy::default().normalized();
@@ -651,10 +652,32 @@ impl BoundServer {
         drain_connections(&mut connections).await;
         drain_chunk_pipeline(&chunk_pipeline_resources).await;
         if shutdown.is_requested() && config.world.is_some() {
-            let report = save_all(&config, &sessions).await;
+            let report =
+                drain_entity_ticker_then_save(entity_ticker, save_all(&config, &sessions)).await;
             log_save_report("listener shutdown final save", &report);
+        } else {
+            drain_entity_ticker(entity_ticker).await;
         }
         Ok(())
+    }
+}
+
+async fn drain_entity_ticker_then_save<S, SR>(
+    entity_ticker: tokio::task::JoinHandle<()>,
+    save: S,
+) -> SR
+where
+    S: Future<Output = SR>,
+{
+    drain_entity_ticker(entity_ticker).await;
+    save.await
+}
+
+async fn drain_entity_ticker(entity_ticker: tokio::task::JoinHandle<()>) {
+    match tokio::time::timeout(ENTITY_TICKER_DRAIN_TIMEOUT, entity_ticker).await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => warn!(error = %err, "entity ticker task join failed"),
+        Err(_) => warn!("entity ticker drain timed out"),
     }
 }
 
@@ -1739,6 +1762,61 @@ mod tests {
         serve_result.expect("serve exits cleanly");
 
         assert!(runtime_control.snapshot().draining);
+    }
+
+    #[tokio::test]
+    async fn entity_ticker_drain_waits_for_in_flight_tick_before_final_save() {
+        let entered_tick = Arc::new(Notify::new());
+        let release_tick = Arc::new(Notify::new());
+        let task_entered = Arc::clone(&entered_tick);
+        let task_release = Arc::clone(&release_tick);
+        let ticker = tokio::spawn(async move {
+            task_entered.notify_waiters();
+            task_release.notified().await;
+        });
+        entered_tick.notified().await;
+
+        let mut drain = std::pin::pin!(drain_entity_ticker(ticker));
+        tokio::select! {
+            () = &mut drain => panic!("entity ticker drain returned before the in-flight tick completed"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+
+        release_tick.notify_waiters();
+        drain.await;
+    }
+
+    #[tokio::test]
+    async fn listener_final_save_waits_for_entity_ticker_drain() {
+        let entered_tick = Arc::new(Notify::new());
+        let release_tick = Arc::new(Notify::new());
+        let save_started = Arc::new(AtomicBool::new(false));
+        let task_entered = Arc::clone(&entered_tick);
+        let task_release = Arc::clone(&release_tick);
+        let ticker = tokio::spawn(async move {
+            task_entered.notify_waiters();
+            task_release.notified().await;
+        });
+        entered_tick.notified().await;
+
+        let save_started_in_future = Arc::clone(&save_started);
+        let save = async move {
+            save_started_in_future.store(true, Ordering::SeqCst);
+            42
+        };
+        let mut shutdown_save = std::pin::pin!(drain_entity_ticker_then_save(ticker, save));
+        tokio::select! {
+            value = &mut shutdown_save => panic!("final save ran before entity ticker drained: {value}"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert!(
+            !save_started.load(Ordering::SeqCst),
+            "final save must not start while entity ticker is still in-flight"
+        );
+
+        release_tick.notify_waiters();
+        assert_eq!(shutdown_save.await, 42);
+        assert!(save_started.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
