@@ -598,7 +598,8 @@ async fn serve(path: &Path) -> Result<()> {
                         path = %world_dir.display(),
                         chunks = prepared.warmed,
                         baked = prepared.baked,
-                        flushed = prepared.flushed,
+                        flushed = 0usize,
+                        dirty = prepared.dirty,
                         view_distance = cfg.server.view_distance,
                         "existing world spawn window warmed",
                     );
@@ -911,7 +912,7 @@ fn warm_spawn_window(storage: &mut mc_world::WorldStorage, view_distance: i32) -
 struct ExistingSpawnWindowPrep {
     warmed: usize,
     baked: usize,
-    flushed: usize,
+    dirty: usize,
 }
 
 fn prepare_existing_spawn_window(
@@ -923,16 +924,14 @@ fn prepare_existing_spawn_window(
     let warmed = warm_spawn_window(storage, view_distance)?;
     let baked =
         bake_missing_spawn_window_light(storage, block_light, view_distance, worker_threads)?;
-    let flushed = if storage.dirty_count() > 0 {
-        tracing::info!("Preparing world... 95% (saving warmed spawn window)");
-        storage.flush_dirty()?
-    } else {
-        0
-    };
+    let dirty = storage.dirty_count();
+    if dirty > 0 {
+        tracing::info!("Preparing world... 95% (warmed spawn window resident)");
+    }
     Ok(ExistingSpawnWindowPrep {
         warmed,
         baked,
-        flushed,
+        dirty,
     })
 }
 
@@ -2021,7 +2020,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_world_startup_flushes_generated_light_border_when_view_light_is_present() {
+    fn existing_world_startup_defers_generated_light_border_flush_when_view_light_is_present() {
         struct StubGen;
 
         impl mc_world::ChunkGenerator for StubGen {
@@ -2078,13 +2077,13 @@ mod tests {
         assert_eq!(prep.warmed, 25);
         assert_eq!(prep.baked, 0);
         assert_eq!(
-            prep.flushed, 16,
-            "generated light-border chunks must be flushed even when view light was already baked"
+            prep.dirty, 16,
+            "generated light-border chunks should remain dirty and resident before listener"
         );
         assert_eq!(
             reopened.dirty_count(),
-            0,
-            "existing-world startup should not leave dirty warm-cache chunks"
+            16,
+            "existing-world startup should defer dirty warm-cache chunks to save-all"
         );
     }
 

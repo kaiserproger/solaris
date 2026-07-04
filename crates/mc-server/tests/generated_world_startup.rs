@@ -12,6 +12,7 @@ use std::fs::File;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mc_protocol::packets::Packet;
@@ -20,6 +21,7 @@ use mc_protocol::packets::play::{
     ServerboundKeepAlive, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
+use mc_world::ChunkGenerator;
 
 const VIEW_DISTANCE: i32 = 8;
 const EXPECTED_CHUNKS: usize = ((VIEW_DISTANCE * 2 + 1) * (VIEW_DISTANCE * 2 + 1)) as usize;
@@ -50,7 +52,11 @@ async fn disk_backed_generated_world_startup_stream_budget() {
     stop_server(&mut first_client, &mut first, &first_log).await;
     let first_log_text = std::fs::read_to_string(&first_log).expect("read first log");
     assert_deferred_startup_flush(&first_log_text, "fresh startup");
-    assert_save_all_flushed_spawn_window(&first_log_text, "fresh startup stop");
+    assert_save_all_flushed_chunks(
+        &first_log_text,
+        "fresh startup stop",
+        EXPECTED_SPAWN_WINDOW_CHUNKS,
+    );
     assert_chunk_stream_summary(&first_log_text, "fresh startup");
 
     let second_addr = loopback_addr_with_reserved_port();
@@ -88,6 +94,51 @@ async fn disk_backed_generated_world_startup_stream_budget() {
         "fresh generated-world startup-to-listener exceeded budget: startup={first_startup:?} \
          budget={STARTUP_TO_LISTENER_BUDGET:?}; first_stream={first_stream:?} \
          second_startup={second_startup:?} second_stream={second_stream:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "M100 existing-world missing-light startup budget gate; requires local data/vanilla sidecars"]
+async fn disk_backed_existing_world_missing_light_startup_stream_budget() {
+    let vanilla_dir = vanilla_data_dir();
+    assert_required_sidecars(&vanilla_dir);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let world_dir = temp.path().join("world");
+    materialize_unbaked_spawn_window(&world_dir, &vanilla_dir);
+
+    let log = temp.path().join("server.log");
+    let addr = loopback_addr_with_reserved_port();
+    let config = temp.path().join("server.toml");
+    write_server_config(&config, &world_dir, &vanilla_dir, addr.port());
+
+    let started = Instant::now();
+    let mut server = spawn_server(&config, &log);
+    let mut client = connect_when_ready(addr, &mut server, &log).await;
+    let startup = started.elapsed();
+    drive_to_play(&mut client, addr, "M100Unbaked").await;
+    let stream = drain_view_distance_window(&mut client).await;
+    stop_server(&mut client, &mut server, &log).await;
+    let log_text = std::fs::read_to_string(&log).expect("read server log");
+
+    assert_existing_missing_light_deferred_flush(&log_text, "existing missing-light startup");
+    assert_save_all_flushed_chunks(&log_text, "existing missing-light stop", EXPECTED_CHUNKS);
+    assert_chunk_stream_summary(&log_text, "existing missing-light startup");
+
+    eprintln!(
+        "M100 existing-world missing-light startup: startup_ms={} full_ms={} \
+         first_chunk_ms={} ring1_ms={:?} ring2_ms={:?}",
+        startup.as_millis(),
+        stream.full_window_ms,
+        stream.first_chunk_ms,
+        stream.ring1_complete_ms,
+        stream.ring2_complete_ms,
+    );
+
+    assert!(
+        startup <= STARTUP_TO_LISTENER_BUDGET,
+        "existing generated-world missing-light startup-to-listener exceeded budget: \
+         startup={startup:?} budget={STARTUP_TO_LISTENER_BUDGET:?}; stream={stream:?}"
     );
 }
 
@@ -164,6 +215,49 @@ region_cache_size = 9
         vanilla_dir.display()
     );
     std::fs::write(path, toml).expect("write server config");
+}
+
+fn materialize_unbaked_spawn_window(world_dir: &Path, vanilla_dir: &Path) {
+    std::fs::create_dir_all(world_dir.join("region")).expect("create region dir");
+    let blocks_report =
+        mc_data::blocks::load_blocks_report(vanilla_dir.join("reports/blocks.json"))
+            .expect("load blocks report");
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&blocks_report).expect("registry"));
+    let generator = mc_worldgen::TerrainGenerator::try_with_biome_rules(
+        0,
+        Arc::clone(&blocks),
+        mc_worldgen::BiomeRules::vanilla_overworld(),
+    )
+    .expect("terrain generator")
+    .with_structures(mc_worldgen::StructureRules::none());
+    let mut storage = mc_world::WorldStorage::open_with_capacities(
+        world_dir,
+        blocks,
+        EXPECTED_SPAWN_WINDOW_CHUNKS,
+        9,
+    )
+    .expect("open fixture storage");
+    for pos in spawn_window_positions(VIEW_DISTANCE) {
+        storage
+            .insert_generated_chunk(pos, generator.generate(pos))
+            .expect("insert generated unbaked chunk");
+    }
+    assert_eq!(
+        storage.flush_dirty().expect("flush fixture chunks"),
+        EXPECTED_SPAWN_WINDOW_CHUNKS
+    );
+}
+
+fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    let radius = view_distance.max(0) + 1;
+    let width = radius as usize * 2 + 1;
+    let mut positions = Vec::with_capacity(width * width);
+    for z in -radius..=radius {
+        for x in -radius..=radius {
+            positions.push(mc_world::ChunkPos { x, z });
+        }
+    }
+    positions
 }
 
 fn spawn_server(config: &Path, log: &Path) -> Child {
@@ -359,17 +453,35 @@ fn assert_deferred_startup_flush(log: &str, label: &str) {
     }
 }
 
-fn assert_save_all_flushed_spawn_window(log: &str, label: &str) {
+fn assert_existing_missing_light_deferred_flush(log: &str, label: &str) {
+    let summary = log
+        .lines()
+        .find(|line| line.contains("existing world spawn window warmed"))
+        .unwrap_or_else(|| panic!("{label}: missing existing-world warm-cache log:\n{log}"));
+    for expected in [
+        format!("chunks={EXPECTED_SPAWN_WINDOW_CHUNKS}"),
+        format!("baked={EXPECTED_CHUNKS}"),
+        "flushed=0".to_string(),
+        format!("dirty={EXPECTED_CHUNKS}"),
+    ] {
+        assert!(
+            summary.contains(&expected),
+            "{label}: existing-world warm-cache summary missing `{expected}`:\n{summary}"
+        );
+    }
+}
+
+fn assert_save_all_flushed_chunks(log: &str, label: &str, expected_chunks: usize) {
     let summary = log
         .lines()
         .find(|line| {
             line.contains("world storage save pressure")
-                && line.contains(&format!("flushed={EXPECTED_SPAWN_WINDOW_CHUNKS}"))
+                && line.contains(&format!("flushed={expected_chunks}"))
         })
         .unwrap_or_else(|| panic!("{label}: missing save-all flush log:\n{log}"));
     for expected in [
-        format!("planned={EXPECTED_SPAWN_WINDOW_CHUNKS}"),
-        format!("dirty_before={EXPECTED_SPAWN_WINDOW_CHUNKS}"),
+        format!("planned={expected_chunks}"),
+        format!("dirty_before={expected_chunks}"),
         "dirty_after=0".to_string(),
     ] {
         assert!(
