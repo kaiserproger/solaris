@@ -2,19 +2,20 @@
 
 Quality label: `draft`.
 
-M92 adds a bounded, local runtime-control primitive. It exposes three
+M92 added a bounded, local runtime-control primitive. It exposes three
 profiles (`low_end`, `balanced`, `high_end`), deterministic limits, and
-observable decisions for chunk/view throughput. The live server does not yet
-wire these decisions into the chunk-stream hot path, so `enabled = true` is a
-draft no-op and `--check` reports `runtime_mode = "draft_noop_not_wired"`.
-It does not implement or claim transparent shared-world horizontal sharding.
+observable decisions for chunk/view throughput. As of the M100 stabilization
+slices, enabled autoscale is wired into the live chunk-stream hot path for
+chunk send-rate and for a prepare-dispatch cap derived from load/generate
+limits. It does not implement or claim transparent shared-world horizontal
+sharding, health/drain readiness, slow-client shedding, or profile-matrix soak.
 
 ## Operator Surface
 
 `mc-server --check --config example.toml` now renders an
 `effective_autoscale` block. It reports whether autoscale is enabled, the
-draft runtime mode, selected profile, normalized policy bounds, and the
-initial limits the controller would start from if wired.
+runtime mode, selected profile, normalized policy bounds, and the initial
+limits the controller starts from when enabled.
 
 Config shape:
 
@@ -62,8 +63,10 @@ subsequent observations in an observable drain state.
 
 ## Known Draft Gaps
 
-- The primitive is not yet wired into the live chunk-stream hot path;
-  `enabled = true` remains `draft_noop_not_wired`.
+- Live runtime control currently affects chunk send-rate and the prepare
+  dispatch budget derived from load/generate limits. It does not yet provide
+  runtime view-distance replanning or separately metered load-vs-generate
+  queues.
 - No health endpoint or in-game admin command consumes the snapshot yet.
 - Slow-client load shedding and safe config reload are not implemented.
 - No low-end/balanced/high-end performance soak was run in this slice.

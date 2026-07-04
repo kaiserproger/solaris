@@ -64,9 +64,10 @@ region_cache_size = 9
 # compression_level = 1
 
 [autoscale]
-# Draft M92 runtime-control primitive. The live server does not yet consume
-# decisions, so even enabled=true is reported as draft_noop_not_wired by
-# --check; --check still renders normalized effective bounds.
+# Runtime-control primitive. When enabled, live chunk streaming consumes
+# the bounded send-rate limit plus a prepare-dispatch cap derived from
+# load/generate limits. This is still not a full health/drain/load-shedding
+# autoscale gate.
 enabled = false
 profile = "balanced"
 # Optional overrides. Omit to use the profile defaults.

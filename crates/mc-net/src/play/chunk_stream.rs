@@ -73,6 +73,8 @@ pub(super) struct ChunkStreamState {
     pressure_retries: HashMap<(i32, i32), usize>,
     pressure_cooldowns: HashMap<(i32, i32), usize>,
     policy: ChunkPipelinePolicy,
+    configured_prepare_batch_size: usize,
+    prepare_limit_stop_reason: ChunkPipelineStopReason,
     runtime_control: Option<crate::RuntimeControlHandle>,
     result_queue_size: usize,
     center_cx: i32,
@@ -809,6 +811,8 @@ impl ChunkStreamState {
             pressure_retries: HashMap::new(),
             pressure_cooldowns: HashMap::new(),
             policy,
+            configured_prepare_batch_size: policy.chunk_prepare_batch_size.max(1),
+            prepare_limit_stop_reason: ChunkPipelineStopReason::BatchLimit,
             runtime_control: None,
             result_queue_size: policy.chunk_result_queue_size,
             center_cx,
@@ -1054,6 +1058,8 @@ impl ChunkStreamState {
         W: AsyncWriteExt + Unpin,
     {
         let initial_target = initial_window_target(self.view_distance);
+        self.drain_ready();
+        self.observe_runtime_control();
         self.dispatch_available();
         self.drain_ready();
 
@@ -1081,7 +1087,6 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
-        self.observe_runtime_control();
         let limit = self.policy.chunk_send_rate.max(1) as usize;
         let mut processed = 0usize;
         while processed < limit {
@@ -1119,6 +1124,23 @@ impl ChunkStreamState {
 
     fn apply_runtime_control_limits(&mut self, limits: crate::RuntimeControlLimits) {
         self.policy.chunk_send_rate = limits.chunk_send_rate.max(1);
+        self.policy.chunk_load_rate = limits.chunk_load_rate.max(1);
+        self.policy.chunk_generate_rate = limits.chunk_generate_rate.max(1);
+        let load_limit = self.policy.chunk_load_rate as usize;
+        let generate_limit = self.policy.chunk_generate_rate as usize;
+        let runtime_prepare_limit = load_limit.min(generate_limit);
+        self.policy.chunk_prepare_batch_size = self
+            .configured_prepare_batch_size
+            .min(runtime_prepare_limit)
+            .max(1);
+        self.prepare_limit_stop_reason =
+            if self.policy.chunk_prepare_batch_size >= self.configured_prepare_batch_size {
+                ChunkPipelineStopReason::BatchLimit
+            } else if load_limit <= generate_limit {
+                ChunkPipelineStopReason::LoadBudget
+            } else {
+                ChunkPipelineStopReason::GenerateBudget
+            };
     }
 
     fn dispatch_available(&mut self) {
@@ -1132,7 +1154,7 @@ impl ChunkStreamState {
                 break;
             }
             if dispatched_this_turn >= self.policy.chunk_prepare_batch_size {
-                self.last_stop_reason = ChunkPipelineStopReason::BatchLimit;
+                self.last_stop_reason = self.prepare_limit_stop_reason;
                 break;
             }
             if self.policy.chunk_prepare_budget_ms > 0
@@ -3301,6 +3323,7 @@ mod tests {
                 outcome: ChunkPrepareOutcome::Absent,
             });
         }
+        stream.observe_runtime_control();
         let mut writer = tokio::io::sink();
         let mut light_cache = LightCache::new();
 
@@ -3324,6 +3347,193 @@ mod tests {
         assert_eq!(stream.absent, 2);
         assert_eq!(stream.ready.len(), 1);
         assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::SendBudget);
+    }
+
+    #[tokio::test]
+    async fn runtime_limits_reduce_load_dispatch_budget() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 4,
+            chunk_result_queue_size: 8,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            2,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        stream.apply_runtime_control_limits(crate::RuntimeControlLimits {
+            view_distance: 2,
+            chunk_send_rate: 16,
+            chunk_load_rate: 1,
+            chunk_generate_rate: 64,
+        });
+
+        stream.dispatch_available();
+
+        assert_eq!(stream.dispatched, 1);
+        assert_eq!(stream.scheduler.in_flight_len(), 1);
+        assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::LoadBudget);
+    }
+
+    #[tokio::test]
+    async fn runtime_limits_reduce_generate_dispatch_budget() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 4,
+            chunk_result_queue_size: 8,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            2,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        stream.apply_runtime_control_limits(crate::RuntimeControlLimits {
+            view_distance: 2,
+            chunk_send_rate: 16,
+            chunk_load_rate: 64,
+            chunk_generate_rate: 1,
+        });
+
+        stream.dispatch_available();
+
+        assert_eq!(stream.dispatched, 1);
+        assert_eq!(stream.scheduler.in_flight_len(), 1);
+        assert_eq!(
+            stream.last_stop_reason,
+            ChunkPipelineStopReason::GenerateBudget
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_control_step_scales_prepare_dispatch_before_spawning_workers() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 4,
+            chunk_result_queue_size: 8,
+            chunk_send_rate: 16,
+            ..ChunkPipelinePolicy::default()
+        };
+        let control = crate::RuntimeControlHandle::new(crate::RuntimeControlConfig {
+            policy: crate::AutoscalePolicy {
+                min_view_distance: 2,
+                max_view_distance: 2,
+                min_chunk_send_rate: 16,
+                max_chunk_send_rate: 16,
+                min_chunk_load_rate: 1,
+                max_chunk_load_rate: 2,
+                min_chunk_generate_rate: 64,
+                max_chunk_generate_rate: 64,
+                queue_pressure_percent: 1,
+                scale_down_after_ticks: 1,
+                ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+            },
+            initial_limits: crate::RuntimeControlLimits {
+                view_distance: 2,
+                chunk_send_rate: 16,
+                chunk_load_rate: 2,
+                chunk_generate_rate: 64,
+            },
+        });
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            2,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        )
+        .with_runtime_control(Some(control.clone()));
+        for _ in 0..3 {
+            let request = stream.scheduler.poll_next().expect("queued chunk");
+            stream.accept_result(ChunkPrepareResult {
+                request,
+                fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
+                staged: Vec::new(),
+                outcome: ChunkPrepareOutcome::Absent,
+            });
+        }
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        stream.step(&mut writer, &mut light_cache).await.unwrap();
+
+        let snapshot = control.snapshot();
+        assert_eq!(snapshot.limits.chunk_load_rate, 1);
+        assert_eq!(stream.dispatched, 1);
+        assert_eq!(stream.scheduler.in_flight_len(), 1);
+        assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::LoadBudget);
     }
 
     #[tokio::test]
