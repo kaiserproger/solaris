@@ -321,8 +321,10 @@ The same review keeps these blockers canonical for replacement claims:
 - Online-mode/session auth, duplicate-name handling, permissions, chat policy,
   and malformed-action fail-closed behavior need M89. `mc-server --check` now
   emits structured public-bind warnings for offline-mode auth and local-dev
-  operators, but that is check-output evidence only; it is not online-mode auth,
-  a public deployment gate, or a broader security audit.
+  operators, plus a missing-world-dir warning for configs that would start
+  without persistent chunk streaming/storage. That is check-output evidence only;
+  it is not online-mode auth, filesystem/permissions validation, a public
+  deployment gate, or a broader security audit.
 - Boats, minecarts, common survival station gameplay beyond M87 safe rejection,
   and redstone-lite automation need M81/M83/M94/M95 decisions, implementation,
   or evidence-backed deferral.

@@ -104,6 +104,22 @@ fn check_reports_public_bind_security_warnings() {
 }
 
 #[test]
+fn check_reports_missing_world_dir_warning() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("missing_world_dir"));
+}
+
+#[test]
 fn check_missing_config_exits_nonzero_with_clear_error() {
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")

@@ -75,14 +75,21 @@ struct OperatorWarning {
 }
 
 fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
-    let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
-        return Vec::new();
-    };
-    if !is_public_bind_ip(ip) {
-        return Vec::new();
+    let mut warnings = Vec::new();
+    if config.data.world_dir.is_none() {
+        warnings.push(OperatorWarning {
+            code: "missing_world_dir",
+            message: "no [data].world_dir configured; serve will start without persistent chunk streaming",
+        });
     }
 
-    let mut warnings = Vec::new();
+    let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
+        return warnings;
+    };
+    if !is_public_bind_ip(ip) {
+        return warnings;
+    }
+
     if config.admin.allow_local_dev_operators {
         warnings.push(OperatorWarning {
             code: "public_bind_local_dev_operators",
