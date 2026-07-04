@@ -204,6 +204,7 @@ mod tests {
             region_cache_size: 1,
             compression_threshold: 256,
             compression_level: None,
+            runtime_control: None,
         }
     }
 

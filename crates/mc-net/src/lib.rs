@@ -34,7 +34,8 @@ pub use chunk_pipeline::{
 };
 pub use control_plane::{
     AutoscaleAction, AutoscaleDecision, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,
-    RuntimeControlInput, RuntimeControlLimits, RuntimeControlPlane, RuntimeControlSnapshot,
+    RuntimeControlConfig, RuntimeControlHandle, RuntimeControlInput, RuntimeControlLimits,
+    RuntimeControlPlane, RuntimeControlSnapshot,
 };
 pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};

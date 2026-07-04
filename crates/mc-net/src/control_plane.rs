@@ -4,6 +4,8 @@
 //! backpressure decisions observable; it does not coordinate shared-world
 //! horizontal sharding.
 
+use std::sync::{Arc, Mutex};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutoscaleProfile {
     LowEnd,
@@ -201,6 +203,17 @@ pub struct RuntimeControlSnapshot {
     pub pressure_ticks: u32,
     pub healthy_ticks: u32,
     pub draining: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuntimeControlConfig {
+    pub policy: AutoscalePolicy,
+    pub initial_limits: RuntimeControlLimits,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeControlHandle {
+    controller: Arc<Mutex<RuntimeControlPlane>>,
 }
 
 #[derive(Debug, Clone)]
@@ -409,6 +422,39 @@ impl RuntimeControlPlane {
                 self.policy.max_chunk_generate_rate,
             ),
         }
+    }
+}
+
+impl RuntimeControlHandle {
+    #[must_use]
+    pub fn new(config: RuntimeControlConfig) -> Self {
+        Self {
+            controller: Arc::new(Mutex::new(RuntimeControlPlane::new(
+                config.policy,
+                config.initial_limits,
+            ))),
+        }
+    }
+
+    pub fn request_drain(&self) -> AutoscaleDecision {
+        self.with_controller(RuntimeControlPlane::request_drain)
+    }
+
+    pub fn observe(&self, input: RuntimeControlInput) -> AutoscaleDecision {
+        self.with_controller(|controller| controller.observe(input))
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> RuntimeControlSnapshot {
+        self.with_controller(|controller| controller.snapshot())
+    }
+
+    fn with_controller<T>(&self, f: impl FnOnce(&mut RuntimeControlPlane) -> T) -> T {
+        let mut controller = self
+            .controller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        f(&mut controller)
     }
 }
 

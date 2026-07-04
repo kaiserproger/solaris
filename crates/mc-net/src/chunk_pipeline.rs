@@ -11,6 +11,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
 
+use crate::control_plane::RuntimeControlConfig;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChunkPipelinePolicy {
     pub chunk_send_rate: u32,
@@ -25,6 +27,7 @@ pub struct ChunkPipelinePolicy {
     pub region_cache_size: usize,
     pub compression_threshold: i32,
     pub compression_level: Option<u32>,
+    pub runtime_control: Option<RuntimeControlConfig>,
 }
 
 impl Default for ChunkPipelinePolicy {
@@ -42,6 +45,7 @@ impl Default for ChunkPipelinePolicy {
             region_cache_size: 4,
             compression_threshold: crate::login::LOGIN_COMPRESSION_THRESHOLD,
             compression_level: None,
+            runtime_control: None,
         }
     }
 }

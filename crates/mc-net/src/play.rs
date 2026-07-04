@@ -84,6 +84,7 @@ use crate::login::LoggedInProfile;
 use crate::server::{ServerConfig, WorldHandle};
 use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
+    RuntimeControlHandle,
 };
 
 mod block_wire;
@@ -623,6 +624,7 @@ pub(crate) async fn handle<R, W>(
     config: &ServerConfig,
     sessions: Arc<SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
+    runtime_control: Option<RuntimeControlHandle>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -910,31 +912,34 @@ where
     let mut light_cache = LightCache::new();
     let mut chunk_stream = config.world.as_ref().and_then(|world| {
         let biomes = data.registry("worldgen/biome")?;
-        Some(ChunkStreamState::new(
-            Arc::clone(world),
-            Arc::new(biomes.clone()),
-            Arc::clone(&config.blocks),
-            config.block_light.as_ref().map(Arc::clone),
-            Arc::clone(&config.items),
-            Arc::clone(&config.tags),
-            Arc::clone(&config.recipes),
-            Arc::clone(&block_entity_types),
-            passive_herd_surface,
-            Arc::clone(&passive_herd_fallback_surfaces),
-            Arc::clone(&passive_herd_water_states),
-            Arc::clone(&passive_herd_passable),
-            Arc::clone(&config.biome_spawns),
-            Arc::clone(&config.entity_types),
-            compression,
-            Arc::clone(&sessions),
-            session_id,
-            spawn_cx,
-            spawn_cz,
-            initial_pose.yaw,
-            config.view_distance,
-            chunk_pipeline_resources.clone(),
-            config.chunk_pipeline,
-        ))
+        Some(
+            ChunkStreamState::new(
+                Arc::clone(world),
+                Arc::new(biomes.clone()),
+                Arc::clone(&config.blocks),
+                config.block_light.as_ref().map(Arc::clone),
+                Arc::clone(&config.items),
+                Arc::clone(&config.tags),
+                Arc::clone(&config.recipes),
+                Arc::clone(&block_entity_types),
+                passive_herd_surface,
+                Arc::clone(&passive_herd_fallback_surfaces),
+                Arc::clone(&passive_herd_water_states),
+                Arc::clone(&passive_herd_passable),
+                Arc::clone(&config.biome_spawns),
+                Arc::clone(&config.entity_types),
+                compression,
+                Arc::clone(&sessions),
+                session_id,
+                spawn_cx,
+                spawn_cz,
+                initial_pose.yaw,
+                config.view_distance,
+                chunk_pipeline_resources.clone(),
+                config.chunk_pipeline,
+            )
+            .with_runtime_control(runtime_control.clone()),
+        )
     });
     if config.world.is_some() && chunk_stream.is_none() {
         warn!("worldgen/biome registry missing; skipping chunk emission");

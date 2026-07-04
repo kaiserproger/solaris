@@ -365,6 +365,7 @@ impl ChunkPipelineSection {
             region_cache_size: self.region_cache_size.max(1),
             compression_threshold: self.compression_threshold.max(0),
             compression_level: self.compression_level.map(|level| level.min(9)),
+            runtime_control: None,
         }
     }
 }
@@ -470,6 +471,15 @@ impl ServerConfig {
         biome_spawns: Arc<BiomeSpawnRules>,
     ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
         let ip: IpAddr = self.network.bind_address.parse()?;
+        let mut chunk_pipeline = self.chunk_pipeline.to_network();
+        if self.autoscale.enabled {
+            chunk_pipeline.runtime_control = Some(mc_net::RuntimeControlConfig {
+                policy: self.autoscale.to_policy(&self.chunk_pipeline),
+                initial_limits: self
+                    .autoscale
+                    .initial_limits(&self.server, &self.chunk_pipeline),
+            });
+        }
         Ok(mc_net::ServerConfig {
             bind_address: SocketAddr::new(ip, self.network.port),
             motd: self.server.motd.clone(),
@@ -487,7 +497,7 @@ impl ServerConfig {
             block_facts,
             entity_types,
             biome_spawns,
-            chunk_pipeline: self.chunk_pipeline.to_network(),
+            chunk_pipeline,
             random_tick: self.simulation.to_network(self.data.seed),
             command_permissions: mc_net::CommandPermissionConfig::new(
                 self.admin.operators.clone(),
@@ -843,6 +853,29 @@ mod tests {
         assert_eq!(limits.chunk_send_rate, 8);
         assert_eq!(limits.chunk_load_rate, 16);
         assert_eq!(limits.chunk_generate_rate, 16);
+
+        let net = cfg
+            .to_network(
+                Arc::new(mc_data::testing::stub()),
+                stub_blocks(),
+                None,
+                stub_tags(),
+                Arc::new(Vec::new()),
+                Arc::new(LootTables::default()),
+                None,
+                Arc::new(ItemRegistry::default()),
+                Arc::new(ItemFactsTable::default()),
+                Arc::new(BlockFactsTable::default()),
+                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(BiomeSpawnRules::default()),
+            )
+            .unwrap();
+        let runtime = net
+            .chunk_pipeline
+            .runtime_control
+            .expect("enabled autoscale wires runtime control");
+        assert_eq!(runtime.policy, policy);
+        assert_eq!(runtime.initial_limits, limits);
     }
 
     #[test]
@@ -941,6 +974,7 @@ mod tests {
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
         assert_eq!(net.chunk_pipeline.region_cache_size, 4);
+        assert!(net.chunk_pipeline.runtime_control.is_none());
         assert_eq!(cfg.data.world_dir, Some(PathBuf::from("/tmp/world")));
     }
 

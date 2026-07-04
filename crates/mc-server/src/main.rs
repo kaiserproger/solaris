@@ -423,7 +423,11 @@ impl From<&ServerConfig> for EffectiveAutoscale {
     fn from(config: &ServerConfig) -> Self {
         Self {
             enabled: config.autoscale.enabled,
-            runtime_mode: "draft_noop_not_wired",
+            runtime_mode: if config.autoscale.enabled {
+                "live_chunk_send_rate"
+            } else {
+                "disabled"
+            },
             profile: config.autoscale.profile,
             initial_limits: EffectiveAutoscaleLimits::from(
                 config
@@ -2088,7 +2092,7 @@ mod tests {
     }
 
     #[test]
-    fn check_output_marks_autoscale_draft_noop_and_normalized_bounds() {
+    fn check_output_marks_autoscale_live_chunk_send_and_normalized_bounds() {
         let toml_src = r#"
             [server]
             name = "S"
@@ -2117,7 +2121,7 @@ mod tests {
         let policy = &autoscale["policy"];
 
         assert_eq!(autoscale["enabled"], Value::Bool(true));
-        assert_eq!(autoscale["runtime_mode"], "draft_noop_not_wired");
+        assert_eq!(autoscale["runtime_mode"], "live_chunk_send_rate");
         assert_eq!(policy["min_view_distance"], 2);
         assert_eq!(policy["max_view_distance"], 2);
         assert_eq!(policy["min_chunk_send_rate"], 3);

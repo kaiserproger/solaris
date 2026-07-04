@@ -30,10 +30,10 @@ use tokio::net::TcpListener;
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tracing::{debug, info, warn};
 
-use crate::ChunkPipelinePolicy;
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout};
 use crate::error::ConnectionError;
+use crate::{ChunkPipelinePolicy, RuntimeControlHandle, RuntimeControlInput};
 use crate::{configuration, login, play, status};
 
 static SAVE_COORDINATOR: OnceLock<Mutex<()>> = OnceLock::new();
@@ -236,6 +236,7 @@ pub struct BoundServer {
     listener: TcpListener,
     config: Arc<ServerConfig>,
     chunk_pipeline_resources: ChunkPipelineResources,
+    runtime_control: Option<RuntimeControlHandle>,
     sessions: Arc<play::SessionRegistry>,
 }
 
@@ -332,6 +333,11 @@ impl BoundServer {
         }
     }
 
+    #[must_use]
+    pub fn runtime_control_handle(&self) -> Option<RuntimeControlHandle> {
+        self.runtime_control.clone()
+    }
+
     /// Accept connections forever, spawning a per-connection task each
     /// time. An error inside a connection task is logged but does not
     /// stop the listener.
@@ -344,6 +350,7 @@ impl BoundServer {
         );
         let config = self.config;
         let chunk_pipeline_resources = self.chunk_pipeline_resources;
+        let runtime_control = self.runtime_control;
         let sessions = self.sessions;
         let shutdown = config.shutdown.clone();
         let mut connections = tokio::task::JoinSet::new();
@@ -360,6 +367,8 @@ impl BoundServer {
         };
         let entity_sessions = Arc::clone(&sessions);
         let entity_config = Arc::clone(&config);
+        let entity_runtime_control = runtime_control.clone();
+        let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         let entity_cpu_permits =
             Arc::new(Semaphore::new(config.chunk_pipeline.entity_worker_threads));
         tokio::spawn(async move {
@@ -452,6 +461,19 @@ impl BoundServer {
                 let fluid_tick_us = elapsed_us(started);
 
                 let tick_us = elapsed_us(tick_started);
+                if let Some(control) = entity_runtime_control.as_ref() {
+                    let resources = entity_chunk_pipeline_resources.metrics().snapshot();
+                    control.observe(RuntimeControlInput {
+                        tick_ms: tick_us.div_ceil(1_000),
+                        queued_chunks: 0,
+                        queue_capacity: 0,
+                        active_workers: resources.active_cpu,
+                        worker_capacity: entity_config.chunk_pipeline.chunk_worker_threads.max(1),
+                        memory_used_mb: 0,
+                        memory_limit_mb: 0,
+                        first_chunk_ms: None,
+                    });
+                }
                 if should_log_runtime_metrics(tick, tick_us, metrics_policy) {
                     let pressure = entity_sessions.pressure_snapshot();
                     let lock_pressure = crate::lock_metrics::snapshot();
@@ -590,10 +612,11 @@ impl BoundServer {
                     debug!(%peer, "accepted connection");
                     let config = config.clone();
                     let chunk_pipeline_resources = chunk_pipeline_resources.clone();
+                    let runtime_control = runtime_control.clone();
                     let sessions = Arc::clone(&sessions);
                     connections.spawn(async move {
                         if let Err(err) =
-                            handle_connection(socket, &config, sessions, chunk_pipeline_resources).await
+                            handle_connection(socket, &config, sessions, chunk_pipeline_resources, runtime_control).await
                         {
                             match err {
                                 err if is_client_disconnect(&err) => {
@@ -1015,6 +1038,10 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
     validate_public_security_config(config.bind_address, &config.command_permissions)?;
     let listener = TcpListener::bind(config.bind_address).await?;
     let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
+    let runtime_control = config
+        .chunk_pipeline
+        .runtime_control
+        .map(RuntimeControlHandle::new);
     let sessions = Arc::new(play::SessionRegistry::new());
     play::configure_session_arrow_kill_rewards(&sessions, &config);
     if let Some(world) = config.world.as_ref() {
@@ -1064,6 +1091,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
         listener,
         config: Arc::new(config),
         chunk_pipeline_resources,
+        runtime_control,
         sessions,
     })
 }
@@ -1307,6 +1335,7 @@ async fn handle_connection(
     config: &ServerConfig,
     sessions: Arc<play::SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
+    runtime_control: Option<RuntimeControlHandle>,
 ) -> Result<(), ConnectionError> {
     // Disable Nagle for low-latency interactive packets — same setting
     // vanilla uses.
@@ -1367,6 +1396,7 @@ async fn handle_connection(
                 config,
                 sessions,
                 chunk_pipeline_resources,
+                runtime_control,
             )
             .await
         }
