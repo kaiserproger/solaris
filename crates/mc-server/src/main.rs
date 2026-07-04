@@ -40,6 +40,12 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
 
 fn check_config(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
+    let _ip: IpAddr = cfg.network.bind_address.parse().with_context(|| {
+        format!(
+            "validating network.bind_address `{}`",
+            cfg.network.bind_address
+        )
+    })?;
     let effective = EffectiveConfig::from(&cfg);
     let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
     println!("{rendered}");

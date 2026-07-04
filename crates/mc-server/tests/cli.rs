@@ -1265,6 +1265,33 @@ fn check_malformed_config_exits_nonzero_with_clear_error() {
 }
 
 #[test]
+fn check_invalid_bind_address_exits_nonzero_with_clear_error() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(
+        br#"
+            [server]
+            name = "InvalidBind"
+            motd = "Hello"
+
+            [network]
+            bind_address = "not-an-ip"
+            port = 30000
+        "#,
+    )
+    .expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("network.bind_address"))
+        .stderr(contains("not-an-ip"));
+}
+
+#[test]
 fn check_unknown_config_field_exits_nonzero_with_clear_error() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(
