@@ -71,7 +71,7 @@ use mc_world::light::{
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{
     BlockRegistry, BlockStateId, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
-    FurnaceSlot, ScheduledBlockTick, ScheduledFluidTick,
+    FurnaceSlot, SECTION_DIM, ScheduledBlockTick, ScheduledFluidTick,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -5537,6 +5537,12 @@ pub(crate) async fn run_scheduled_block_ticks(
     let mut outcome = BlockEditBatchOutcome::default();
     {
         let mut storage = world.lock().await;
+        backfill_loaded_hopper_ticks(
+            &mut storage,
+            &config.blocks,
+            &loaded_chunks,
+            world_tick.saturating_add(HOPPER_TRANSFER_DELAY_TICKS),
+        );
         for &(cx, cz) in &loaded_chunks {
             if drained >= policy.fluid_tick_budget {
                 break;
@@ -8647,6 +8653,50 @@ async fn schedule_placed_hopper_ticks(state: &InteractionState, outcome: &BlockE
     for tick in ticks {
         if let Err(err) = storage.schedule_block_tick(tick) {
             warn!(error = %err, "placed hopper initial tick scheduling failed");
+        }
+    }
+}
+
+fn backfill_loaded_hopper_ticks(
+    storage: &mut mc_world::WorldStorage,
+    blocks: &BlockRegistry,
+    loaded_chunks: &[(i32, i32)],
+    trigger_tick: u64,
+) {
+    let mut ticks = Vec::new();
+    for &(cx, cz) in loaded_chunks {
+        let cpos = ChunkPos { x: cx, z: cz };
+        let Some(chunk) = storage.cached_chunk(cpos) else {
+            continue;
+        };
+        for pos in chunk.hoppers.keys().copied() {
+            let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            let Some(state_id) = chunk.get_block(local_x, pos.y, local_z) else {
+                continue;
+            };
+            let Some(state) = blocks.by_id(state_id) else {
+                continue;
+            };
+            if state.block.id.path() != "hopper"
+                || chunk
+                    .scheduled_block_ticks()
+                    .iter()
+                    .any(|tick| tick.pos == pos && tick.block == state.block.id)
+            {
+                continue;
+            }
+            ticks.push(ScheduledBlockTick::new(
+                pos,
+                state.block.id.clone(),
+                trigger_tick,
+                0,
+            ));
+        }
+    }
+    for tick in ticks {
+        if let Err(err) = storage.schedule_block_tick(tick) {
+            warn!(error = %err, "loaded hopper tick backfill failed");
         }
     }
 }

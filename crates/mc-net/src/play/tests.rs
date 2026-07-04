@@ -4285,6 +4285,180 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
 }
 
 #[tokio::test]
+async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let source_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    let mut source = mc_world::ChestBlockEntity::default();
+    source.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_chest_block_entity(source_pos, source).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    register_loaded_button_session(&sessions, "BackfillHopper");
+
+    let first = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(first.drained, 0);
+    assert_eq!(first.applied, 0);
+    {
+        let mut storage = world.lock().await;
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert_eq!(source.slots[0].count, 1);
+        assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        let scheduled = storage
+            .scheduled_block_ticks(cpos)
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(
+            scheduled[0].block,
+            Identifier::parse("minecraft:hopper").unwrap()
+        );
+    }
+
+    let second = run_scheduled_block_ticks(&config, &sessions, 28).await;
+
+    assert_eq!(second.drained, 1);
+    assert_eq!(second.applied, 1);
+    let mut storage = world.lock().await;
+    let source = storage
+        .chest_block_entity(source_pos)
+        .unwrap()
+        .expect("source chest");
+    let target = storage
+        .chest_block_entity(target_pos)
+        .unwrap()
+        .expect("target chest");
+    assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+    assert_eq!(
+        target.slots[0],
+        mc_world::FurnaceSlot {
+            count: 1,
+            item_id: 42,
+            damage: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn scheduled_block_pass_does_not_duplicate_existing_hopper_tick() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["down"])]),
+                states: vec![state(1, true, &[("facing", "down")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(1)).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            40,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    register_loaded_button_session(&sessions, "ExistingHopperTick");
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 0);
+    assert_eq!(report.applied, 0);
+    let mut storage = world.lock().await;
+    let scheduled = storage
+        .scheduled_block_ticks(cpos)
+        .unwrap()
+        .expect("chunk scheduled ticks");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].pos, hopper_pos);
+    assert_eq!(scheduled[0].trigger_tick, 40);
+    assert_eq!(
+        scheduled[0].block,
+        Identifier::parse("minecraft:hopper").unwrap()
+    );
+}
+
+#[tokio::test]
 async fn scheduled_button_tick_ignores_ticketed_chunk_until_loaded() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(
