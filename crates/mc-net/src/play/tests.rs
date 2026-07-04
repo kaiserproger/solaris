@@ -210,6 +210,91 @@ async fn play_loop_closes_session_when_outbound_write_stalls() {
     );
 }
 
+#[tokio::test]
+async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write_timeout() {
+    let (_client, mut reader) = tokio::io::duplex(64);
+    let mut writer = tokio::io::sink();
+    let mut buf = BytesMut::new();
+    let sessions = Arc::new(SessionRegistry::new());
+    let start = sessions.pressure_snapshot();
+    let config = play_loop_slow_client_test_config();
+    let (outbound_tx, outbound_rx) = mpsc::channel(16);
+    for entity_id in 1..=16 {
+        outbound_tx
+            .try_send(OutboundCommand::AnimatePlayer { entity_id })
+            .expect("prefill outbound pressure queue");
+    }
+    let producer = tokio::spawn(async move {
+        let mut entity_id = 17;
+        loop {
+            if outbound_tx
+                .send(OutboundCommand::AnimatePlayer { entity_id })
+                .await
+                .is_err()
+            {
+                break;
+            }
+            entity_id += 1;
+        }
+    });
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let respawn = ClientboundRespawn {
+        dimension_type_id: 0,
+        dimension_name: Identifier::parse("minecraft:overworld").unwrap(),
+        hashed_seed: 0,
+        game_mode: GameMode::Survival.id() as u8,
+        previous_game_mode: -1,
+        is_debug: false,
+        is_flat: false,
+        death_location: None,
+        portal_cooldown: 0,
+        sea_level: DEFAULT_SEA_LEVEL,
+        data_to_keep: 0,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        play_loop(
+            &mut reader,
+            &mut writer,
+            &mut buf,
+            Compression::Disabled,
+            None,
+            None,
+            None,
+            Arc::clone(&sessions),
+            &config,
+            1,
+            pose,
+            pose,
+            respawn,
+            CommandPermissions::from_op(false),
+            SurvivalState::FULL,
+            XpState::default(),
+            GameMode::Survival,
+            None,
+            outbound_rx,
+            0,
+        ),
+    )
+    .await
+    .expect("sustained outbound pressure should shed before socket write timeout");
+
+    result.expect("slow outbound pressure shed should close session cleanly");
+    producer
+        .await
+        .expect("producer task should stop when receiver closes");
+    let pressure = sessions.pressure_snapshot();
+    assert_eq!(
+        pressure.slow_client_write_timeouts, start.slow_client_write_timeouts,
+        "pre-timeout pressure shedding should not be reported as a socket write timeout"
+    );
+    assert_eq!(
+        pressure.slow_client_pressure_sheds,
+        start.slow_client_pressure_sheds + 1
+    );
+}
+
 #[test]
 fn container_title_nbt_reports_oversized_text_instead_of_panicking() {
     let oversized = "x".repeat(usize::from(u16::MAX) + 1);

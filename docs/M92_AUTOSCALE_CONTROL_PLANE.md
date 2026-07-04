@@ -71,6 +71,8 @@ subsequent observations in an observable drain state.
   load-balancer readiness/drain contract.
 - Authenticated `/status` and unauthenticated server-list `solaris.health`
   expose bounded runtime snapshots, but they are not a full readiness model.
-- Slow-client load shedding and safe config reload are not implemented.
+- Focused slow-client timeout and pre-timeout queue-pressure shedding paths
+  exist, but broad slow-client recovery/rejoin policy and safe config reload are
+  not implemented.
 - No low-end/balanced/high-end performance soak was run in this slice.
 - High-end throughput claims remain blocked on M91/M93 performance data.

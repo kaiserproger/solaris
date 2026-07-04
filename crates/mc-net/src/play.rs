@@ -157,7 +157,8 @@ use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
     ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration,
     VisibilityDispatch, dispatch_visibility_commands, entity_aabb,
-    record_slow_client_write_timeout, within_block_reach, within_entity_reach,
+    record_slow_client_pressure_shed, record_slow_client_write_timeout, within_block_reach,
+    within_entity_reach,
 };
 #[cfg(test)]
 use spawn::spawn_chunk_pos;
@@ -196,6 +197,9 @@ pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
 const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(test)]
 const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
+const SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS: usize = 4;
+const SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR: usize = 3;
+const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
 const MAX_PENDING_TELEPORT_RESYNCS: u8 = 3;
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
 const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.5;
@@ -9155,6 +9159,25 @@ fn collect_light_update_batch(
     updates
 }
 
+fn outbound_queue_at_shed_pressure(
+    rx: &mpsc::Receiver<OutboundCommand>,
+    pending: &VecDeque<OutboundCommand>,
+) -> Option<(usize, usize, usize)> {
+    let queued = rx.len() + pending.len();
+    let channel_capacity = rx.max_capacity();
+    if channel_capacity == 0 {
+        return None;
+    }
+    let threshold = (channel_capacity * SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR)
+        .div_ceil(SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR)
+        .max(1);
+    if queued >= threshold {
+        Some((queued, channel_capacity, threshold))
+    } else {
+        None
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundWriteOutcome {
     Sent,
@@ -9230,11 +9253,32 @@ where
     let mut client_preferences: Option<ClientPreferences> = None;
     let mut effective_client_view_distance = server_view_distance;
     let mut pending_outbound = VecDeque::new();
+    let mut outbound_pressure_turns = 0usize;
     send_world_time(writer, compression, &sessions).await?;
     write_packet(writer, &survival_state.as_packet(), compression).await?;
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
     loop {
+        if let Some((queued, capacity, threshold)) =
+            outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound)
+        {
+            outbound_pressure_turns += 1;
+            if outbound_pressure_turns >= SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS {
+                record_slow_client_pressure_shed();
+                warn!(
+                    session_id,
+                    queued,
+                    capacity,
+                    threshold,
+                    turns = outbound_pressure_turns,
+                    "slow client outbound queue stayed above pressure threshold; closing play session"
+                );
+                return Ok(());
+            }
+        } else {
+            outbound_pressure_turns = 0;
+        }
+
         sync_player_persistence(
             &player_save_state,
             player_pose,

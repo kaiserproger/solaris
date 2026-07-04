@@ -84,7 +84,8 @@ impl AutoscaleSoakReport {
                     .outbound_pressure
                     .reliable_command_retries_in_flight
                     > 0
-                || snapshot.outbound_pressure.slow_client_write_timeouts > 0);
+                || snapshot.outbound_pressure.slow_client_write_timeouts > 0
+                || snapshot.outbound_pressure.slow_client_pressure_sheds > 0);
         let memory_pressure_shedding_observed = memory_pressure_attempted
             && snapshot.memory_pressure_shed_chunks > 0
             && snapshot
@@ -273,6 +274,7 @@ mod tests {
                 reliable_command_retries_in_flight: 0,
                 max_reliable_command_retries_in_flight: 1,
                 slow_client_write_timeouts: 0,
+                slow_client_pressure_sheds: 0,
             },
             save_all: Some(&save),
             memory_pressure_shed_chunks: 0,
@@ -371,6 +373,35 @@ mod tests {
             chunk_stop_reasons: &[],
             outbound_pressure: OutboundPressureSnapshot {
                 slow_client_write_timeouts: 1,
+                slow_client_pressure_sheds: 0,
+                ..OutboundPressureSnapshot::default()
+            },
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+        });
+
+        assert_eq!(
+            report.slow_client_pressure,
+            AutoscalePrimitiveStatus::Present
+        );
+        assert!(report.slow_client_pressure_observed);
+    }
+
+    #[test]
+    fn bounded_soak_report_counts_slow_client_pressure_shed_as_pressure() {
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::SlowClient],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[],
+            outbound_pressure: OutboundPressureSnapshot {
+                slow_client_pressure_sheds: 1,
                 ..OutboundPressureSnapshot::default()
             },
             save_all: None,
@@ -448,6 +479,7 @@ mod tests {
                 reliable_command_retries_in_flight: 1,
                 max_reliable_command_retries_in_flight: 1,
                 slow_client_write_timeouts: 0,
+                slow_client_pressure_sheds: 0,
             },
             save_all: Some(&save),
             memory_pressure_shed_chunks: 0,

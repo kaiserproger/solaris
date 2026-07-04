@@ -250,6 +250,7 @@ pub struct OutboundPressureSnapshot {
     pub reliable_command_retries_in_flight: u64,
     pub max_reliable_command_retries_in_flight: u64,
     pub slow_client_write_timeouts: u64,
+    pub slow_client_pressure_sheds: u64,
 }
 
 #[derive(Clone)]
@@ -267,6 +268,7 @@ impl OutboundPressureHandle {
             reliable_command_retries_in_flight: pressure.reliable_command_retries_in_flight,
             max_reliable_command_retries_in_flight: pressure.max_reliable_command_retries_in_flight,
             slow_client_write_timeouts: pressure.slow_client_write_timeouts,
+            slow_client_pressure_sheds: pressure.slow_client_pressure_sheds,
         }
     }
 }
