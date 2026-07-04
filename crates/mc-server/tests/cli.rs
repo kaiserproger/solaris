@@ -73,6 +73,37 @@ fn check_prints_effective_thread_minimums() {
 }
 
 #[test]
+fn check_reports_public_bind_security_warnings() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(
+        br#"
+            [server]
+            name = "PublicTest"
+            motd = "Hello"
+
+            [network]
+            bind_address = "8.8.8.8"
+            port = 30000
+
+            [admin]
+            allow_local_dev_operators = true
+        "#,
+    )
+    .expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("public_bind_offline_mode"))
+        .stdout(contains("public_bind_local_dev_operators"));
+}
+
+#[test]
 fn check_missing_config_exits_nonzero_with_clear_error() {
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")

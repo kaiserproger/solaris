@@ -1,6 +1,7 @@
 //! `mc-server` binary entry point.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -51,6 +52,7 @@ struct EffectiveConfig<'a> {
     config: &'a ServerConfig,
     effective_chunk_pipeline: EffectiveChunkPipeline,
     effective_autoscale: EffectiveAutoscale,
+    operator_warnings: Vec<OperatorWarning>,
 }
 
 impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
@@ -61,7 +63,50 @@ impl<'a> From<&'a ServerConfig> for EffectiveConfig<'a> {
                 config.chunk_pipeline.to_network(),
             ),
             effective_autoscale: EffectiveAutoscale::from(config),
+            operator_warnings: operator_warnings(config),
         }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OperatorWarning {
+    code: &'static str,
+    message: &'static str,
+}
+
+fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
+    let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
+        return Vec::new();
+    };
+    if !is_public_bind_ip(ip) {
+        return Vec::new();
+    }
+
+    let mut warnings = Vec::new();
+    if config.admin.allow_local_dev_operators {
+        warnings.push(OperatorWarning {
+            code: "public_bind_local_dev_operators",
+            message: "allow_local_dev_operators cannot be enabled on a public bind address; serve will fail",
+        });
+    }
+    if config.auth.online_mode {
+        warnings.push(OperatorWarning {
+            code: "public_bind_online_mode",
+            message: "online-mode authentication is not implemented on public bind addresses; serve will fail",
+        });
+    } else {
+        warnings.push(OperatorWarning {
+            code: "public_bind_offline_mode",
+            message: "offline-mode Solaris authentication cannot be used on a public bind address; serve will fail",
+        });
+    }
+    warnings
+}
+
+fn is_public_bind_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => !ip.is_loopback() && !ip.is_private() && !ip.is_link_local(),
+        IpAddr::V6(ip) => !ip.is_loopback() && !ip.is_unique_local(),
     }
 }
 

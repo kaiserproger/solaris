@@ -95,7 +95,10 @@ manual notes, protocol metadata, or vanilla captures exist.
   ignored, sidecar-dependent, and insufficient for disk-backed latency,
   hardware-profile, slow-client, broad lock-review, or soak coverage.
 - Public/session safety, common stations, vehicles, autoscale, operator/deps,
-  and data drift rows remain unknown or draft debt.
+  and data drift rows remain unknown or draft debt. O4 now has one focused
+  `--check` warning regression for public-bind offline/local-dev operator
+  blockers, but no backup/restore, dependency audit, data-drift, or real
+  operations evidence.
 - Most gameplay rows are `partial`: they have implementation and focused tests,
   including B1/B3 focused rejected occupied-target placement, occupied-target
   water-bucket fallback/resync, survival out-of-reach `UseItemOn` resync,

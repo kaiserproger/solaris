@@ -45,6 +45,10 @@ cargo run --bin mc-server -- --check --config example.toml
 cargo run --bin mc-server -- --config example.toml
 ```
 
+The `--check` JSON includes `operator_warnings`. Treat non-empty warnings as
+public-use blockers; for example, public binds with offline-mode auth or
+`allow_local_dev_operators` are not production-safe.
+
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
 
 ## Test

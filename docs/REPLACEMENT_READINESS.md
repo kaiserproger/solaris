@@ -312,8 +312,11 @@ The same review keeps these blockers canonical for replacement claims:
 - Water/swim feel and the M40/M41 frozen-world/manual regression route remain
   blocked until rerun green or explicitly reclassified; the `m94-07` artifact
   covers water placement/pickup, not client-local swimming feel.
-- Online-mode/session auth, public-safety defaults, duplicate-name handling,
-  permissions, chat policy, and malformed-action fail-closed behavior need M89.
+- Online-mode/session auth, duplicate-name handling, permissions, chat policy,
+  and malformed-action fail-closed behavior need M89. `mc-server --check` now
+  emits structured public-bind warnings for offline-mode auth and local-dev
+  operators, but that is check-output evidence only; it is not online-mode auth,
+  a public deployment gate, or a broader security audit.
 - Boats, minecarts, common survival station gameplay beyond M87 safe rejection,
   and redstone-lite automation need M81/M83/M94/M95 decisions, implementation,
   or evidence-backed deferral.
