@@ -6,9 +6,11 @@ M92 added a bounded, local runtime-control primitive. It exposes three
 profiles (`low_end`, `balanced`, `high_end`), deterministic limits, and
 observable decisions for chunk/view throughput. As of the M100 stabilization
 slices, enabled autoscale is wired into the live chunk-stream hot path for
-chunk send-rate and for a prepare-dispatch cap derived from load/generate
-limits. It does not implement or claim transparent shared-world horizontal
-sharding, health/drain readiness, slow-client shedding, or profile-matrix soak.
+chunk send-rate, runtime view-distance limits, and separately metered
+prepare-dispatch caps for classified load/generate work. It does not implement
+or claim transparent shared-world horizontal sharding, a production
+load-balancer readiness/drain contract, broad slow-client shedding, or
+profile-matrix soak.
 
 ## Operator Surface
 
@@ -63,13 +65,12 @@ subsequent observations in an observable drain state.
 
 ## Known Draft Gaps
 
-- Live runtime control currently affects chunk send-rate and the prepare
-  dispatch budget derived from load/generate limits. It does not yet provide
-  runtime view-distance replanning or separately metered load-vs-generate
-  queues.
-- There is an authenticated in-game `/status` admin command for the current
-  runtime-control snapshot, but no unauthenticated health endpoint or readiness
-  model.
+- Live runtime control has focused coverage for chunk send-rate, runtime
+  view-distance replanning, and separately metered load-vs-generate prepare
+  dispatch. It does not yet have profile-matrix soak or a production
+  load-balancer readiness/drain contract.
+- Authenticated `/status` and unauthenticated server-list `solaris.health`
+  expose bounded runtime snapshots, but they are not a full readiness model.
 - Slow-client load shedding and safe config reload are not implemented.
 - No low-end/balanced/high-end performance soak was run in this slice.
 - High-end throughput claims remain blocked on M91/M93 performance data.

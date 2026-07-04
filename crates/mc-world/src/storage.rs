@@ -233,16 +233,25 @@ pub enum ChunkSnapshotPlan {
 pub struct ChunkDiskLoadPlan {
     local: (u8, u8),
     region_path: PathBuf,
+    disk_backed: bool,
     cached_region: Option<Arc<DecodedRegion>>,
     registry: Arc<BlockRegistry>,
     item_registry: Option<Arc<ItemRegistry>>,
 }
 
 impl ChunkDiskLoadPlan {
+    #[must_use]
+    pub fn has_load_source(&self) -> bool {
+        self.cached_region
+            .as_ref()
+            .is_some_and(|region| region.contains_key(&self.local))
+            || (self.disk_backed && self.region_path.is_file())
+    }
+
     pub fn load(self) -> Result<Option<Chunk>, WorldError> {
         let payload = if let Some(region) = self.cached_region {
             region.get(&self.local).cloned()
-        } else if self.region_path.is_file() {
+        } else if self.disk_backed && self.region_path.is_file() {
             read_region(&self.region_path)?
                 .into_iter()
                 .find(|payload| (payload.local_x, payload.local_z) == self.local)
@@ -686,6 +695,7 @@ impl WorldStorage {
         ChunkSnapshotPlan::Load(ChunkDiskLoadPlan {
             local: (local_x, local_z),
             region_path: self.region_root.join(format!("r.{rx}.{rz}.mca")),
+            disk_backed: self.world_root.is_some(),
             cached_region: self.regions.get(&(rx, rz)).cloned(),
             registry: Arc::clone(&self.registry),
             item_registry: self.item_registry.clone(),
