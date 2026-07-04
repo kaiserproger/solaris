@@ -463,6 +463,11 @@ impl BoundServer {
                 let random_tick_us = elapsed_us(started);
 
                 let started = Instant::now();
+                let block_tick =
+                    play::run_scheduled_block_ticks(&entity_config, &entity_sessions, tick).await;
+                let block_tick_us = elapsed_us(started);
+
+                let started = Instant::now();
                 let fluid_tick =
                     play::run_scheduled_fluid_ticks(&entity_config, &entity_sessions, tick).await;
                 let fluid_tick_us = elapsed_us(started);
@@ -492,6 +497,7 @@ impl BoundServer {
                             campfire_tick_us,
                             entity_save_us,
                             random_tick_us,
+                            block_tick_us,
                             fluid_tick_us,
                             entity_queries = queries.len(),
                             entity_steps = steps.len(),
@@ -501,6 +507,10 @@ impl BoundServer {
                             random_sampled = random_tick.sampled,
                             random_eligible = random_tick.eligible,
                             random_applied = random_tick.applied,
+                            block_drained = block_tick.drained,
+                            block_applied = block_tick.applied,
+                            block_budget = block_tick.budget,
+                            block_budget_exhausted = block_tick.budget_exhausted,
                             fluid_drained = fluid_tick.drained,
                             fluid_applied = fluid_tick.applied,
                             fluid_budget = fluid_tick.budget,
@@ -552,6 +562,7 @@ impl BoundServer {
                             campfire_tick_us,
                             entity_save_us,
                             random_tick_us,
+                            block_tick_us,
                             fluid_tick_us,
                             entity_queries = queries.len(),
                             entity_steps = steps.len(),
@@ -561,6 +572,10 @@ impl BoundServer {
                             random_sampled = random_tick.sampled,
                             random_eligible = random_tick.eligible,
                             random_applied = random_tick.applied,
+                            block_drained = block_tick.drained,
+                            block_applied = block_tick.applied,
+                            block_budget = block_tick.budget,
+                            block_budget_exhausted = block_tick.budget_exhausted,
                             fluid_drained = fluid_tick.drained,
                             fluid_applied = fluid_tick.applied,
                             fluid_budget = fluid_tick.budget,

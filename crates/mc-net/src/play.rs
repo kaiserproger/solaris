@@ -71,7 +71,7 @@ use mc_world::light::{
 use mc_world::wire::{client_heightmaps, encode_chunk_data, encode_chunk_light};
 use mc_world::{
     BlockRegistry, BlockStateId, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
-    FurnaceSlot, ScheduledFluidTick,
+    FurnaceSlot, ScheduledBlockTick, ScheduledFluidTick,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
@@ -200,6 +200,7 @@ const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 const SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS: usize = 4;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR: usize = 3;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
+const BUTTON_RELEASE_DELAY_TICKS: u64 = 20;
 const MAX_PENDING_TELEPORT_RESYNCS: u8 = 3;
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
 const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.5;
@@ -458,6 +459,14 @@ pub(crate) struct ScheduledFluidTickReport {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ScheduledBlockTickReport {
+    pub(crate) drained: usize,
+    pub(crate) applied: usize,
+    pub(crate) budget: usize,
+    pub(crate) budget_exhausted: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CampfireCookingTickReport {
     pub(crate) persisted: usize,
     pub(crate) completed: usize,
@@ -509,6 +518,11 @@ pub(crate) struct LandedFallingBlock {
 struct BlockEdit {
     pos: mc_world::BlockPos,
     new_state: mc_world::BlockStateId,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ToggleBlockPlan {
+    edits: Vec<BlockEdit>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5496,6 +5510,100 @@ pub(crate) async fn run_scheduled_fluid_ticks(
     }
 }
 
+pub(crate) async fn run_scheduled_block_ticks(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    world_tick: u64,
+) -> ScheduledBlockTickReport {
+    let policy = config.random_tick.normalized();
+    let Some(world) = config.world.as_ref() else {
+        return ScheduledBlockTickReport {
+            budget: policy.fluid_tick_budget,
+            ..ScheduledBlockTickReport::default()
+        };
+    };
+    let loaded_chunks = sessions.loaded_chunks_sorted();
+    if loaded_chunks.is_empty() {
+        return ScheduledBlockTickReport {
+            budget: policy.fluid_tick_budget,
+            ..ScheduledBlockTickReport::default()
+        };
+    }
+
+    let table = config.block_light.as_deref();
+    let mut drained = 0usize;
+    let mut outcome = BlockEditBatchOutcome::default();
+    {
+        let mut storage = world.lock().await;
+        for &(cx, cz) in &loaded_chunks {
+            if drained >= policy.fluid_tick_budget {
+                break;
+            }
+            let cpos = ChunkPos { x: cx, z: cz };
+            let remaining = policy.fluid_tick_budget - drained;
+            let due = storage.drain_due_cached_block_ticks(cpos, world_tick, remaining);
+            drained += due.len();
+            for tick in due {
+                let Some(state_id) = storage.get_cached_block(tick.pos) else {
+                    continue;
+                };
+                let Some(state) = config.blocks.by_id(state_id) else {
+                    continue;
+                };
+                if state.block.id != tick.block {
+                    continue;
+                }
+                let Some(edits) =
+                    scheduled_block_tick_edits(&config.blocks, &mut storage, tick.pos, state_id)
+                else {
+                    continue;
+                };
+                for edit in edits {
+                    apply_block_edit_to_storage(&mut storage, table, &edit, &mut outcome);
+                }
+            }
+        }
+    }
+    let budget_exhausted = drained >= policy.fluid_tick_budget;
+    if budget_exhausted {
+        warn!(
+            world_tick,
+            drained,
+            budget = policy.fluid_tick_budget,
+            "scheduled block tick budget exhausted"
+        );
+    }
+
+    if !outcome.applied.is_empty() {
+        sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+        broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
+        if let Some(table) = table
+            && !outcome.light_edit_chunks.is_empty()
+        {
+            let light_updates = {
+                let mut storage = world.lock().await;
+                collect_incremental_light_updates_for_applied_edits(&mut storage, table, &outcome)
+            };
+            if !light_updates.is_empty() {
+                sessions.invalidate_prepared_chunks(&outcome.light_edit_chunks);
+                broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            }
+        }
+        debug!(
+            world_tick,
+            drained,
+            applied = outcome.applied.len(),
+            "scheduled block ticks applied edits"
+        );
+    }
+    ScheduledBlockTickReport {
+        drained,
+        applied: outcome.applied.len(),
+        budget: policy.fluid_tick_budget,
+        budget_exhausted,
+    }
+}
+
 pub(crate) async fn land_falling_blocks(
     config: &ServerConfig,
     sessions: &SessionRegistry,
@@ -6947,32 +7055,281 @@ where
                     .map(|()| true);
             }
         };
-        plan_toggle_block_edits(&state.blocks, &mut storage, pos, clicked)
+        plan_toggle_block_interaction(
+            &state.blocks,
+            &mut storage,
+            pos,
+            clicked,
+            state.sessions.simulation_tick(),
+        )
     };
-    let Some(edits) = edits else {
+    let Some(plan) = edits else {
         return Ok(false);
     };
-    let _ = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
+    let _ = apply_player_block_edit_batch(state, writer, sequence, &plan.edits).await?;
     Ok(true)
 }
 
-fn plan_toggle_block_edits(
+fn plan_toggle_block_interaction(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state_id: mc_world::BlockStateId,
+    world_tick: u64,
+) -> Option<ToggleBlockPlan> {
+    let state = blocks.by_id(state_id)?;
+    if state.block.id.path().ends_with("_door") && block_state_property(state, "half").is_some() {
+        return plan_door_toggle_edits(blocks, storage, pos, state)
+            .map(|edits| ToggleBlockPlan { edits });
+    }
+    if let Some(open) = toggled_bool_state(blocks, state, "open") {
+        return Some(ToggleBlockPlan {
+            edits: vec![BlockEdit {
+                pos,
+                new_state: open,
+            }],
+        });
+    }
+    let path = state.block.id.path();
+    if path.ends_with("_button") {
+        return plan_power_control_interaction(blocks, storage, pos, state, true, world_tick);
+    }
+    if path == "lever" {
+        return plan_power_control_interaction(blocks, storage, pos, state, false, world_tick);
+    }
+    None
+}
+
+fn plan_power_control_interaction(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+    momentary: bool,
+    world_tick: u64,
+) -> Option<ToggleBlockPlan> {
+    let currently_powered = block_state_property(state, "powered")? == "true";
+    if momentary && currently_powered {
+        return Some(ToggleBlockPlan { edits: Vec::new() });
+    }
+    let next_powered = if momentary { true } else { !currently_powered };
+    let mut edits = vec![BlockEdit {
+        pos,
+        new_state: sibling_state_with_bool_property(blocks, state, "powered", next_powered)?,
+    }];
+    extend_adjacent_power_target_edits(blocks, storage, pos, next_powered, &mut edits);
+    if momentary {
+        let trigger_tick = world_tick.saturating_add(BUTTON_RELEASE_DELAY_TICKS);
+        if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
+            pos,
+            state.block.id.clone(),
+            trigger_tick,
+            0,
+        )) {
+            warn!(error = %err, ?pos, "button release tick scheduling failed");
+        }
+    }
+    Some(ToggleBlockPlan { edits })
+}
+
+fn scheduled_block_tick_edits(
     blocks: &mc_world::BlockRegistry,
     storage: &mut mc_world::WorldStorage,
     pos: mc_world::BlockPos,
     state_id: mc_world::BlockStateId,
 ) -> Option<Vec<BlockEdit>> {
     let state = blocks.by_id(state_id)?;
-    if state.block.id.path().ends_with("_door") && block_state_property(state, "half").is_some() {
-        return plan_door_toggle_edits(blocks, storage, pos, state);
+    if !state.block.id.path().ends_with("_button")
+        || block_state_property(state, "powered")? != "true"
+    {
+        return None;
     }
-    if let Some(open) = toggled_bool_state(blocks, state, "open") {
-        return Some(vec![BlockEdit {
-            pos,
-            new_state: open,
-        }]);
+    let mut edits = vec![BlockEdit {
+        pos,
+        new_state: sibling_state_with_bool_property(blocks, state, "powered", false)?,
+    }];
+    extend_adjacent_power_target_edits(blocks, storage, pos, false, &mut edits);
+    Some(edits)
+}
+
+fn extend_adjacent_power_target_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    source: mc_world::BlockPos,
+    powered: bool,
+    edits: &mut Vec<BlockEdit>,
+) {
+    let mut edited = edits.iter().map(|edit| edit.pos).collect::<HashSet<_>>();
+    for pos in adjacent_block_positions(source) {
+        extend_power_target_edits(blocks, storage, source, pos, powered, edits, &mut edited);
     }
-    toggled_bool_state(blocks, state, "powered").map(|new_state| vec![BlockEdit { pos, new_state }])
+}
+
+fn adjacent_block_positions(pos: mc_world::BlockPos) -> [mc_world::BlockPos; 6] {
+    [
+        mc_world::BlockPos {
+            x: pos.x + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            x: pos.x - 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            y: pos.y + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            y: pos.y - 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z + 1,
+            ..pos
+        },
+        mc_world::BlockPos {
+            z: pos.z - 1,
+            ..pos
+        },
+    ]
+}
+
+fn extend_power_target_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    source: mc_world::BlockPos,
+    pos: mc_world::BlockPos,
+    powered: bool,
+    edits: &mut Vec<BlockEdit>,
+    edited: &mut HashSet<mc_world::BlockPos>,
+) {
+    let Some(state_id) = storage.get_cached_block(pos) else {
+        return;
+    };
+    let Some(state) = blocks.by_id(state_id) else {
+        return;
+    };
+    let path = state.block.id.path();
+    if path.ends_with("_door") && block_state_property(state, "half").is_some() {
+        if !powered && door_has_adjacent_power_control(blocks, storage, pos, state, source) {
+            return;
+        }
+        if let Some(door_edits) = plan_door_power_edits(blocks, storage, pos, state, powered) {
+            for edit in door_edits {
+                if edit.new_state != state_id && edited.insert(edit.pos) {
+                    edits.push(edit);
+                }
+            }
+        }
+    } else if path.ends_with("_trapdoor")
+        && (powered || !has_adjacent_power_control(blocks, storage, pos, source))
+        && let Some(new_state) = powered_open_state(blocks, state, powered)
+        && new_state != state_id
+        && edited.insert(pos)
+    {
+        edits.push(BlockEdit { pos, new_state });
+    }
+}
+
+fn door_has_adjacent_power_control(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+    source: mc_world::BlockPos,
+) -> bool {
+    has_adjacent_power_control(blocks, storage, pos, source)
+        || match block_state_property(state, "half") {
+            Some("lower") => has_adjacent_power_control(
+                blocks,
+                storage,
+                mc_world::BlockPos {
+                    y: pos.y + 1,
+                    ..pos
+                },
+                source,
+            ),
+            Some("upper") => has_adjacent_power_control(
+                blocks,
+                storage,
+                mc_world::BlockPos {
+                    y: pos.y - 1,
+                    ..pos
+                },
+                source,
+            ),
+            _ => false,
+        }
+}
+
+fn has_adjacent_power_control(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    target: mc_world::BlockPos,
+    excluded_source: mc_world::BlockPos,
+) -> bool {
+    adjacent_block_positions(target)
+        .into_iter()
+        .filter(|pos| *pos != excluded_source)
+        .any(|pos| {
+            let Some(state_id) = storage.get_cached_block(pos) else {
+                return false;
+            };
+            let Some(state) = blocks.by_id(state_id) else {
+                return false;
+            };
+            is_power_control_powered(state)
+        })
+}
+
+fn is_power_control_powered(state: &mc_world::BlockState) -> bool {
+    let path = state.block.id.path();
+    (path.ends_with("_button") || path == "lever")
+        && block_state_property(state, "powered") == Some("true")
+}
+
+fn plan_door_power_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+    powered: bool,
+) -> Option<Vec<BlockEdit>> {
+    let mut edits = Vec::with_capacity(2);
+    edits.push(BlockEdit {
+        pos,
+        new_state: powered_open_state(blocks, state, powered)?,
+    });
+    let other_y = match block_state_property(state, "half")? {
+        "lower" => pos.y + 1,
+        "upper" => pos.y - 1,
+        _ => return Some(edits),
+    };
+    let other_pos = mc_world::BlockPos { y: other_y, ..pos };
+    if let Some(other_state_id) = storage.get_cached_block(other_pos)
+        && let Some(other_state) = blocks.by_id(other_state_id)
+        && other_state.block.id == state.block.id
+        && let Some(new_state) = powered_open_state(blocks, other_state, powered)
+    {
+        edits.push(BlockEdit {
+            pos: other_pos,
+            new_state,
+        });
+    }
+    Some(edits)
+}
+
+fn powered_open_state(
+    blocks: &mc_world::BlockRegistry,
+    state: &mc_world::BlockState,
+    powered: bool,
+) -> Option<mc_world::BlockStateId> {
+    let mut props = state.properties.clone();
+    let (_, powered_prop) = props.iter_mut().find(|(key, _)| key == "powered")?;
+    *powered_prop = if powered { "true" } else { "false" }.to_string();
+    let (_, open_prop) = props.iter_mut().find(|(key, _)| key == "open")?;
+    *open_prop = if powered { "true" } else { "false" }.to_string();
+    blocks.by_name_and_props(&state.block.id, &props)
 }
 
 fn plan_door_toggle_edits(

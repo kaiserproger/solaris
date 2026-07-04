@@ -967,6 +967,19 @@ impl WorldStorage {
         Ok(chunk.drain_due_block_ticks(world_tick, max_ticks))
     }
 
+    pub fn drain_due_cached_block_ticks(
+        &mut self,
+        cpos: ChunkPos,
+        world_tick: u64,
+        max_ticks: usize,
+    ) -> Vec<ScheduledBlockTick> {
+        let Some(chunk) = self.cache.get_mut(&cpos) else {
+            return Vec::new();
+        };
+        let chunk = make_cached_chunk_mut(chunk);
+        chunk.drain_due_block_ticks(world_tick, max_ticks)
+    }
+
     pub fn scheduled_fluid_ticks(
         &mut self,
         cpos: ChunkPos,
