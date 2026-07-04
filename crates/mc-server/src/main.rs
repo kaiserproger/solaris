@@ -233,6 +233,13 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         }
     }
 
+    if config.simulation.save_interval_ticks == 0 {
+        warnings.push(OperatorWarning {
+            code: "simulation_save_interval_ticks_zero",
+            message: "simulation.save_interval_ticks is 0; serve will clamp it to 1 tick, causing continuous save pressure",
+        });
+    }
+
     if config.auth.online_mode {
         warnings.push(OperatorWarning {
             code: "online_mode_unsupported",

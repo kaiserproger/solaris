@@ -175,6 +175,42 @@ fn check_prints_effective_thread_minimums() {
 }
 
 #[test]
+fn check_reports_zero_save_interval_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let mut file = NamedTempFile::new().expect("tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "ZeroSaveInterval"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+
+            [simulation]
+            save_interval_ticks = 0
+        "#,
+        world_dir.path().display()
+    );
+    file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("simulation_save_interval_ticks_zero"))
+        .stdout(contains("missing_world_dir").not());
+}
+
+#[test]
 fn check_reports_public_bind_security_warnings() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(
