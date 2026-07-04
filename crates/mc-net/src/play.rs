@@ -442,6 +442,13 @@ pub(crate) struct ScheduledFluidTickReport {
     pub(crate) budget_exhausted: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CampfireCookingTickReport {
+    pub(crate) persisted: usize,
+    pub(crate) completed: usize,
+    pub(crate) dropped: usize,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct HerdSpawn {
     chunk: (i32, i32),
@@ -2625,13 +2632,17 @@ fn dispatch_inventory_drop(state: &InteractionState, player_pose: PlayerPose, st
     ));
 }
 
-fn is_campfire_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
-    state.blocks.by_id(block_state).is_some_and(|block_state| {
+fn is_campfire_block(blocks: &BlockRegistry, block_state: mc_world::BlockStateId) -> bool {
+    blocks.by_id(block_state).is_some_and(|block_state| {
         matches!(
             block_state.block.id.as_str(),
             "minecraft:campfire" | "minecraft:soul_campfire"
         )
     })
+}
+
+fn is_campfire_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
+    is_campfire_block(&state.blocks, block_state)
 }
 
 fn hand_inventory_slot(state: &InteractionState, hand: InteractionHand) -> usize {
@@ -2833,30 +2844,33 @@ fn campfire_block_entity_persistent_nbt(
 }
 
 async fn persist_campfire_block_entity(
-    state: &InteractionState,
+    world: &WorldHandle,
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    sessions: &SessionRegistry,
     position: mc_world::BlockPos,
     cooking: &CampfireCookingState,
 ) -> bool {
-    let mut storage = state.world.lock().await;
-    let block_entity_id = match storage.get_block(position) {
-        Ok(Some(block_state)) => state.blocks.by_id(block_state).and_then(|block_state| {
-            match block_state.block.id.as_str() {
-                "minecraft:campfire" => Some("minecraft:campfire"),
-                "minecraft:soul_campfire" => Some("minecraft:soul_campfire"),
-                _ => None,
+    let mut storage = world.lock().await;
+    let block_entity_id =
+        match storage.get_block(position) {
+            Ok(Some(block_state)) => blocks.by_id(block_state).and_then(|block_state| {
+                match block_state.block.id.as_str() {
+                    "minecraft:campfire" => Some("minecraft:campfire"),
+                    "minecraft:soul_campfire" => Some("minecraft:soul_campfire"),
+                    _ => None,
+                }
+            }),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = %err, ?position, "campfire block entity target read failed");
+                None
             }
-        }),
-        Ok(None) => None,
-        Err(err) => {
-            warn!(error = %err, ?position, "campfire block entity target read failed");
-            None
-        }
-    };
+        };
     let Some(block_entity_id) = block_entity_id else {
         return false;
     };
-    let Some(tag) =
-        campfire_block_entity_persistent_nbt(block_entity_id, position, &state.items, cooking)
+    let Some(tag) = campfire_block_entity_persistent_nbt(block_entity_id, position, items, cooking)
     else {
         warn!(
             ?position,
@@ -2874,7 +2888,7 @@ async fn persist_campfire_block_entity(
         return false;
     }
     drop(storage);
-    state.sessions.invalidate_prepared_chunks(&HashSet::from([(
+    sessions.invalidate_prepared_chunks(&HashSet::from([(
         position.x.div_euclid(16),
         position.z.div_euclid(16),
     )]));
@@ -2917,20 +2931,22 @@ where
 }
 
 fn dispatch_campfire_block_entity_update(
-    state: &InteractionState,
+    items: &ItemRegistry,
+    sessions: &SessionRegistry,
+    except: Option<SessionId>,
     position: mc_world::BlockPos,
     cooking: &CampfireCookingState,
 ) {
-    let Some(nbt) = campfire_block_entity_update_nbt(&state.items, cooking) else {
+    let Some(nbt) = campfire_block_entity_update_nbt(items, cooking) else {
         warn!(
             ?position,
             "campfire block entity update skipped for unknown item id"
         );
         return;
     };
-    dispatch_visibility_commands(state.sessions.block_entity_data_dispatches(
+    dispatch_visibility_commands(sessions.block_entity_data_dispatches(
         position,
-        None,
+        except,
         CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
         nbt,
     ));
@@ -2989,7 +3005,15 @@ where
     else {
         return Ok(false);
     };
-    persist_campfire_block_entity(state, position, &cooking).await;
+    persist_campfire_block_entity(
+        &state.world,
+        &state.blocks,
+        &state.items,
+        &state.sessions,
+        position,
+        &cooking,
+    )
+    .await;
 
     let held = &mut state.inventory.slots[slot];
     held.count = held.count.saturating_sub(1);
@@ -3013,32 +3037,58 @@ where
     Ok(true)
 }
 
-async fn tick_campfire_cooking(state: &mut InteractionState) {
-    let updates = state.sessions.tick_campfire_cooking();
+pub(crate) async fn run_campfire_cooking_ticks(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+) -> CampfireCookingTickReport {
+    let Some(world) = config.world.as_ref() else {
+        return CampfireCookingTickReport::default();
+    };
+    let updates = sessions.tick_campfire_cooking();
+    let mut report = CampfireCookingTickReport {
+        persisted: updates.persisted.len(),
+        completed: updates.completed.len(),
+        dropped: 0,
+    };
     for (position, cooking) in &updates.persisted {
-        persist_campfire_block_entity(state, *position, cooking).await;
+        persist_campfire_block_entity(
+            world,
+            &config.blocks,
+            &config.items,
+            sessions,
+            *position,
+            cooking,
+        )
+        .await;
     }
     for (position, cooking) in updates.changed {
-        let still_campfire = campfire_block_still_present(state, position).await;
+        let still_campfire = campfire_block_still_present(world, &config.blocks, position).await;
         if still_campfire {
-            dispatch_campfire_block_entity_update(state, position, &cooking);
+            dispatch_campfire_block_entity_update(
+                &config.items,
+                sessions,
+                None,
+                position,
+                &cooking,
+            );
         }
     }
-    let Some(entity_type_id) = item_entity_type_id(&state.entity_types) else {
+    let Some(entity_type_id) = item_entity_type_id(&config.entity_types) else {
         if !updates.completed.is_empty() {
             debug!(
                 count = updates.completed.len(),
                 "campfire drops ignored: item entity type unavailable"
             );
         }
-        return;
+        return report;
     };
     for (position, stack) in updates.completed {
-        let still_campfire = campfire_block_still_present(state, position).await;
+        let still_campfire = campfire_block_still_present(world, &config.blocks, position).await;
         if !still_campfire {
             continue;
         }
-        dispatch_visibility_commands(state.sessions.spawn_item_drop(
+        report.dropped += 1;
+        dispatch_visibility_commands(sessions.spawn_item_drop(
             entity_type_id,
             Vec3::new(
                 position.x as f64 + 0.5,
@@ -3048,18 +3098,20 @@ async fn tick_campfire_cooking(state: &mut InteractionState) {
             entity_item_stack(stack),
         ));
     }
+    report
 }
 
 async fn campfire_block_still_present(
-    state: &InteractionState,
+    world: &WorldHandle,
+    blocks: &BlockRegistry,
     position: mc_world::BlockPos,
 ) -> bool {
-    let mut storage = state.world.lock().await;
+    let mut storage = world.lock().await;
     storage
         .get_block(position)
         .ok()
         .flatten()
-        .is_some_and(|block_state| is_campfire_state(state, block_state))
+        .is_some_and(|block_state| is_campfire_block(blocks, block_state))
 }
 
 fn take_death_inventory_drops(
@@ -7002,7 +7054,13 @@ where
         Some(state.session_id),
     );
     for pos in &outcome.cleared_campfires {
-        dispatch_campfire_block_entity_update(state, *pos, &CampfireCookingState::default());
+        dispatch_campfire_block_entity_update(
+            &state.items,
+            &state.sessions,
+            None,
+            *pos,
+            &CampfireCookingState::default(),
+        );
     }
 
     if let Some(table) = table {
@@ -9250,7 +9308,6 @@ where
             _ = furnace_ticker.tick() => {
                 if let Some(state) = interaction.as_deref_mut() {
                     tick_active_container(state, writer).await?;
-                    tick_campfire_cooking(state).await;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
                     tick_hostile_pressure(
                         state,

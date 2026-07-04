@@ -406,6 +406,11 @@ impl BoundServer {
                 }
 
                 let started = Instant::now();
+                let campfire_tick =
+                    play::run_campfire_cooking_ticks(&entity_config, &entity_sessions).await;
+                let campfire_tick_us = elapsed_us(started);
+
+                let started = Instant::now();
                 let mut entity_save_us = 0;
                 if tick.is_multiple_of(simulation_policy.save_interval_ticks)
                     && entity_sessions.active_session_count() > 0
@@ -457,11 +462,15 @@ impl BoundServer {
                             entity_goals_us,
                             entity_physics_us,
                             entity_dispatch_us,
+                            campfire_tick_us,
                             entity_save_us,
                             random_tick_us,
                             fluid_tick_us,
                             entity_queries = queries.len(),
                             entity_steps = steps.len(),
+                            campfire_persisted = campfire_tick.persisted,
+                            campfire_completed = campfire_tick.completed,
+                            campfire_dropped = campfire_tick.dropped,
                             random_sampled = random_tick.sampled,
                             random_eligible = random_tick.eligible,
                             random_applied = random_tick.applied,
@@ -513,11 +522,15 @@ impl BoundServer {
                             entity_goals_us,
                             entity_physics_us,
                             entity_dispatch_us,
+                            campfire_tick_us,
                             entity_save_us,
                             random_tick_us,
                             fluid_tick_us,
                             entity_queries = queries.len(),
                             entity_steps = steps.len(),
+                            campfire_persisted = campfire_tick.persisted,
+                            campfire_completed = campfire_tick.completed,
+                            campfire_dropped = campfire_tick.dropped,
                             random_sampled = random_tick.sampled,
                             random_eligible = random_tick.eligible,
                             random_applied = random_tick.applied,
