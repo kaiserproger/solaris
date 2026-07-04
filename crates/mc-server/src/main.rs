@@ -92,6 +92,11 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                             code: "world_dir_not_directory",
                             message: "[data].world_dir exists but is not a directory; serve will start without usable world storage",
                         });
+                    } else if world_region_root_is_blocked(world_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "world_region_not_directory",
+                            message: "[data].world_dir/region exists but is not a directory, and no modern overworld region directory exists; serve will start without usable world storage",
+                        });
                     }
                 }
                 Err(_) if has_non_directory_ancestor(world_dir) => {
@@ -311,6 +316,19 @@ fn has_non_directory_ancestor(path: &Path) -> bool {
             Err(_) => Some(false),
         })
         .unwrap_or(false)
+}
+
+fn world_region_root_is_blocked(world_dir: &Path) -> bool {
+    let modern = world_dir
+        .join("dimensions")
+        .join("minecraft")
+        .join("overworld")
+        .join("region");
+    let legacy = world_dir.join("region");
+    if modern.is_dir() || legacy.is_dir() {
+        return false;
+    }
+    std::fs::metadata(legacy).is_ok_and(|metadata| !metadata.is_dir())
 }
 
 fn is_public_bind_ip(ip: IpAddr) -> bool {
@@ -1301,6 +1319,23 @@ mod tests {
 
         assert!(modern.is_dir());
         assert!(!tmp.path().join("region").exists());
+    }
+
+    #[test]
+    fn ensure_world_region_root_reports_blocked_legacy_region_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join("region");
+        std::fs::write(&legacy, b"not a directory").unwrap();
+
+        let error = ensure_world_region_root(tmp.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("creating empty world region directory"),
+            "{error:#}"
+        );
+        assert!(legacy.is_file());
     }
 
     #[test]

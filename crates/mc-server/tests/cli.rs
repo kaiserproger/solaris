@@ -321,6 +321,84 @@ fn check_reports_world_dir_parent_file_warning() {
 }
 
 #[test]
+fn check_reports_world_region_file_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    std::fs::write(world_dir.path().join("region"), b"not a directory")
+        .expect("write blocking region file");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "BlockedWorldRegion"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("world_region_not_directory"))
+        .stdout(contains("world_dir_not_directory").not())
+        .stdout(contains("world_dir_missing_on_disk").not());
+}
+
+#[test]
+fn check_accepts_legacy_region_file_when_modern_region_exists() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let modern_region = world_dir
+        .path()
+        .join("dimensions")
+        .join("minecraft")
+        .join("overworld")
+        .join("region");
+    std::fs::create_dir_all(modern_region).expect("create modern region dir");
+    std::fs::write(world_dir.path().join("region"), b"not a directory")
+        .expect("write legacy region file");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "ModernWorldRegion"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("world_region_not_directory").not())
+        .stdout(contains("world_dir_not_directory").not())
+        .stdout(contains("world_dir_missing_on_disk").not());
+}
+
+#[test]
 fn check_reports_vanilla_data_protocol_mismatch_warning() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
