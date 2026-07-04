@@ -3101,6 +3101,34 @@ pub(crate) async fn run_campfire_cooking_ticks(
     report
 }
 
+pub(crate) async fn hydrate_persisted_campfire_cooking(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+) -> usize {
+    let Some(world) = config.world.as_ref() else {
+        return 0;
+    };
+    let storage = world.lock().await;
+    let mut restored = 0usize;
+    match storage.visit_existing_chunks_without_generation(|_, chunk| {
+        for (position, cooking) in
+            campfire_cooking_states_from_chunk(chunk, &config.recipes, &config.items, &config.tags)
+        {
+            if sessions.restore_campfire_cooking(position, cooking) {
+                restored += 1;
+            }
+        }
+    }) {
+        Ok(scanned) => {
+            if restored > 0 {
+                info!(scanned, restored, "hydrated persisted campfire cooking");
+            }
+        }
+        Err(err) => warn!(error = %err, "persisted campfire cooking hydration failed"),
+    }
+    restored
+}
+
 async fn campfire_block_still_present(
     world: &WorldHandle,
     blocks: &BlockRegistry,

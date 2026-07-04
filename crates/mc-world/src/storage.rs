@@ -8,6 +8,7 @@
 //! planning/write/commit paths.
 
 use std::collections::{HashMap, VecDeque};
+use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -626,6 +627,60 @@ impl WorldStorage {
             registry: Arc::clone(&self.registry),
             item_registry: self.item_registry.clone(),
         })
+    }
+
+    /// Visit every chunk already present in region files without invoking the
+    /// fallback generator or mutating the chunk/region caches.
+    pub fn visit_existing_chunks_without_generation<F>(
+        &self,
+        mut visit: F,
+    ) -> Result<usize, WorldError>
+    where
+        F: FnMut(ChunkPos, &Chunk),
+    {
+        let entries = match std::fs::read_dir(&self.region_root) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
+            Err(err) => {
+                return Err(RegionError::Io {
+                    path: self.region_root.clone(),
+                    source: err,
+                }
+                .into());
+            }
+        };
+        let mut regions = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|err| RegionError::Io {
+                path: self.region_root.clone(),
+                source: err,
+            })?;
+            let Some((rx, rz)) = parse_region_file_name(&entry.file_name()) else {
+                continue;
+            };
+            regions.push((rx, rz, entry.path()));
+        }
+        regions.sort_by_key(|(rx, rz, _)| (*rx, *rz));
+
+        let mut visited = 0usize;
+        for (rx, rz, path) in regions {
+            for payload in read_region(&path)? {
+                let cpos = ChunkPos {
+                    x: rx * REGION_AXIS_CHUNKS + i32::from(payload.local_x),
+                    z: rz * REGION_AXIS_CHUNKS + i32::from(payload.local_z),
+                };
+                let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
+                let (_, root) = mc_nbt::read_named(&mut cursor)?;
+                let chunk = chunk_from_nbt_with_items(
+                    &root,
+                    &self.registry,
+                    self.item_registry.as_deref(),
+                )?;
+                visit(cpos, &chunk);
+                visited += 1;
+            }
+        }
+        Ok(visited)
     }
 
     pub fn commit_chunk_snapshot(
@@ -1313,6 +1368,16 @@ fn region_of(cpos: ChunkPos) -> (i32, i32) {
         cpos.x.div_euclid(REGION_AXIS_CHUNKS),
         cpos.z.div_euclid(REGION_AXIS_CHUNKS),
     )
+}
+
+fn parse_region_file_name(name: &OsStr) -> Option<(i32, i32)> {
+    let name = name.to_str()?;
+    let name = name.strip_prefix("r.")?.strip_suffix(".mca")?;
+    let (rx, rz) = name.split_once('.')?;
+    if rz.contains('.') {
+        return None;
+    }
+    Some((rx.parse().ok()?, rz.parse().ok()?))
 }
 
 #[cfg(test)]
@@ -2160,6 +2225,42 @@ mod tests {
         let chunk = reopened.get_chunk(cpos).unwrap().unwrap();
         assert_eq!(chunk.extras, extras);
         assert_eq!(chunk.get_block(1, 0, 1).unwrap(), BlockStateId(1));
+    }
+
+    #[test]
+    fn visit_existing_chunks_without_generation_scans_disk_without_cache_mutation() {
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let registry = air_stone_registry();
+        let cpos = ChunkPos { x: -1, z: 32 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+
+        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
+        chunk.set_block(15, 0, 0, BlockStateId(1));
+        chunk.mark_dirty();
+
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(cpos, chunk).unwrap();
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+        drop(world);
+
+        let reopened =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        assert_eq!(reopened.stats().chunk_cache_len, 0);
+        assert_eq!(reopened.stats().region_cache_len, 0);
+
+        let mut visited = Vec::new();
+        let count = reopened
+            .visit_existing_chunks_without_generation(|pos, chunk| {
+                visited.push((pos, chunk.get_block(15, 0, 0).unwrap()));
+            })
+            .unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(visited, vec![(cpos, BlockStateId(1))]);
+        assert_eq!(reopened.stats().chunk_cache_len, 0);
+        assert_eq!(reopened.stats().region_cache_len, 0);
     }
 
     #[test]

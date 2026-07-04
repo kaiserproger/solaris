@@ -1057,6 +1057,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
             }
         }
     }
+    play::hydrate_persisted_campfire_cooking(&config, &sessions).await;
     Ok(BoundServer {
         listener,
         config: Arc::new(config),
