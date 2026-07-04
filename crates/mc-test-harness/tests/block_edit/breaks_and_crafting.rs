@@ -525,6 +525,168 @@ async fn survival_break_requires_timed_stop_before_mutation() {
     }
 }
 
+#[tokio::test]
+async fn out_of_reach_survival_break_resyncs_target_before_ack() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|b| b.default)
+        .expect("air in registry");
+    let stone_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .map(|b| b.default)
+        .expect("stone in registry");
+    let stone_state_id = stone_state.0 as i32;
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let seeded_y =
+        top_non_air_y(&mut storage, 6, 0, air_state).expect("loaded column has terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 6,
+                y: seeded_y,
+                z: 0,
+            },
+            stone_state,
+        )
+        .expect("seed far stone target")
+        .expect("replace generated far top block");
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 out-of-reach survival break resync".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M100FarBreak").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    let dx = sync.x - 6.5;
+    let dy = sync.y + 1.62 - (f64::from(seeded_y) + 0.5);
+    let dz = sync.z - 0.5;
+    assert!(
+        dx * dx + dy * dy + dz * dz > 25.0,
+        "seeded break target must be outside survival reach"
+    );
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(6, seeded_y, 0),
+            direction: Direction::Up,
+            sequence: 26,
+        })
+        .await
+        .expect("send out-of-reach survival start break");
+    read_rejected_break_resync_before_ack(&mut client, 26, (6, seeded_y, 0), stone_state_id).await;
+}
+
+#[tokio::test]
+async fn far_out_of_reach_survival_break_does_not_load_target_before_ack() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!("skipping: {} missing", blocks_json.display());
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 far survival break no load".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M100NoLoad").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    let target = (96, sync.y.floor() as i32 - 2, 0);
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            sequence: 27,
+        })
+        .await
+        .expect("send far out-of-reach survival start break");
+    read_ack_without_target_update(&mut client, 27, target).await;
+}
+
 async fn read_rejected_break_resync_before_ack(
     client: &mut Client,
     sequence: i32,
