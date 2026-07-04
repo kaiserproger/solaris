@@ -386,18 +386,36 @@ async fn survival_break_requires_timed_stop_before_mutation() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|b| b.default)
+        .expect("air in registry");
+    let air_state_id = air_state.0 as i32;
+    let stone_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .map(|b| b.default)
+        .expect("stone in registry");
+    let stone_state_id = stone_state.0 as i32;
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let seeded_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn column has terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 0,
+                y: seeded_y,
+                z: 0,
+            },
+            stone_state,
+        )
+        .expect("seed stone target")
+        .expect("replace generated top block");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
-    let air_state_id = blocks
-        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
-        .map(|b| b.default.0 as i32)
-        .expect("air in registry");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -431,6 +449,7 @@ async fn survival_break_requires_timed_stop_before_mutation() {
     drain_until_chunk(&mut client, (0, 0)).await;
 
     let target_y = sync.y.floor() as i32 - 2;
+    assert_eq!(target_y, seeded_y, "spawn should expose seeded stone target");
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -452,7 +471,7 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         })
         .await
         .expect("send early survival stop break");
-    read_ack_without_target_update(&mut client, 23, (0, target_y, 0)).await;
+    read_rejected_break_resync_before_ack(&mut client, 23, (0, target_y, 0), stone_state_id).await;
 
     client
         .write_packet(&ServerboundPlayerAction {
@@ -464,7 +483,7 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         .await
         .expect("send timed survival start break");
     read_ack_without_target_update(&mut client, 24, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(1_600)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -501,6 +520,48 @@ async fn survival_break_requires_timed_stop_before_mutation() {
             let pkt = BlockChangedAck::decode(&mut body).expect("decode survival ack");
             if pkt.sequence == 25 {
                 saw_ack = true;
+            }
+        }
+    }
+}
+
+async fn read_rejected_break_resync_before_ack(
+    client: &mut Client,
+    sequence: i32,
+    target: (i32, i32, i32),
+    expected_state_id: i32,
+) {
+    let mut saw_target_resync = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("rejected break resync");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode rejected break BlockUpdate");
+            if unpack_block_pos(pkt.position) == target {
+                assert_eq!(
+                    pkt.state_id, expected_state_id,
+                    "rejected break must resync the authoritative target state"
+                );
+                saw_target_resync = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode rejected break ack");
+            if pkt.sequence == sequence {
+                assert!(
+                    saw_target_resync,
+                    "rejected break ack arrived before target-cell BlockUpdate"
+                );
+                return;
             }
         }
     }

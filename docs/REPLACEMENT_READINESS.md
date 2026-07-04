@@ -102,6 +102,13 @@ The same review keeps these blockers canonical for replacement claims:
   are absent. Broader stale edit/CAS paths, wider bucket/no-op edge cases,
   vanilla oracle evidence, and real-client desync coverage beyond that one
   scenario remain unproven.
+- Early rejected survival block breaks now have focused packet/session coverage:
+  `survival_break_requires_timed_stop_before_mutation` seeds a deterministic
+  stone target, proves an early `STOP_DESTROY_BLOCK` does not mutate it, and
+  requires an authoritative target-cell `BlockUpdate` before the matching ack.
+  The first run failed because the ack arrived before the resync; broader
+  stale-break/CAS behavior, anti-cheat variants, vanilla oracle, and real-client
+  break-resync coverage remain unproven.
 - Water buckets have focused real-client place/pickup evidence and packet
   harness coverage for scheduled spread timing. The scheduler now queues
   interaction-created fluid ticks from the shared simulation tick rather than a
@@ -114,6 +121,12 @@ The same review keeps these blockers canonical for replacement claims:
   `.analysis/real-client-runs/20260622T174026Z-m94-regression-pack` reran the
   focused water place/pickup scenario after random-tick performance fixes and
   validated with no runtime tick budget warnings in the server log.
+- Lava/water interaction now has focused Solaris packet/session coverage through
+  `lava_bucket_next_to_water_solidifies_through_scheduled_fluid_tick`, which
+  places lava with `UseItemOn` beside a water source and observes scheduled
+  solidification to obsidian. This passed on the first run and is not real-client
+  or fresh vanilla-oracle evidence; wider lava-water topology and visual/feel
+  coverage remain open.
 - A later broad `m94-02-blocks-fluids-farming-drops` run validated
   `.analysis/real-client-runs/20260622T180920Z-m94-regression-pack`; it composed
   the real-client solid break/drop/place and water-bucket place/pickup probes in
@@ -147,9 +160,18 @@ The same review keeps these blockers canonical for replacement claims:
   still not claimed.
 - Crafting table, chest, barrel, furnace, smoker, and blast furnace paths have
   partial container/menu support. Barrels use single-container storage;
-  smokers and blast furnaces share the furnace-family runtime. Barrel animation,
-  sounds/events, furnace lit-state, hopper/comparator automation, and exact
-  state-machine parity are not claimed.
+  smokers and blast furnaces share the furnace-family runtime. Focused shared
+  chest and furnace stale-click guards now include storage/packet coverage, and
+  both chest and furnace paths now have two-protocol-client stale-click resync
+  harnesses after live peer slot updates. Focused unsupported/malformed chest
+  and furnace click harnesses also prove Solaris ignores lying client
+  slot/cursor deltas for `QuickCraft`, `Clone`, and `PickupAll`. For one
+  malformed furnace pickup, Solaris rejects a conflicting non-empty post-click
+  carried-item prediction, then resyncs authoritative content without mutating
+  storage. Barrel
+  animation, sounds/events, furnace lit-state, hopper/comparator automation,
+  real-client stale-click or malformed-click coverage, and exact state-machine
+  parity are not claimed.
 - Common survival stations beyond crafting/furnace-family support are safe
   rejected in M87: brewing stand, anvil variants, enchanting table, smithing
   table, grindstone, stonecutter, loom, cartography table, composter,
@@ -256,6 +278,12 @@ The same review keeps these blockers canonical for replacement claims:
   `.analysis/real-client-runs/20260622T174026Z-m94-regression-pack` by keeping
   random neighbor reads resident-only and using background incremental relight
   from saved baked light; that focused run still is not a full O1/O2 profile.
+  A 2026-07-04 ignored protocol harness also keeps the 289-chunk
+  generated-world stream green while proving `chunk_prepare` wait/hold counters
+  advance and the in-memory stream does not enter `save_all_flush` or
+  `player_persistence` lock paths. This is still not a disk-backed
+  generated-world latency gate, slow-client test, hardware profile, broad lock
+  review, or soak run.
 
 ## Blocked Or Unknown For M100
 

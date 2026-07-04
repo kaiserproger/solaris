@@ -45,7 +45,7 @@ use mc_protocol::packets::play::{
     ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
     Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
     EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityPositionSync,
-    EntityVec3, ForgetLevelChunk, GameEvent, GameMode, ITEM_ENTITY_DATA_ITEM_INDEX,
+    EntityVec3, ForgetLevelChunk, GameEvent, GameMode, HashedStack, ITEM_ENTITY_DATA_ITEM_INDEX,
     InteractionHand, ItemStack, LIVING_ENTITY_DATA_FLAGS_INDEX, LIVING_ENTITY_FLAG_OFF_HAND,
     LIVING_ENTITY_FLAG_USING_ITEM, LevelChunkWithLight, LightData, LightUpdate, LoginPlay,
     MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction,
@@ -1169,6 +1169,36 @@ where
     write_packet(writer, &BlockChangedAck { sequence }, compression).await
 }
 
+async fn write_block_resync_then_ack<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    position: i64,
+    sequence: i32,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let (x, y, z) = unpack_block_pos(position);
+    let update = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(mc_world::BlockPos { x, y, z }) {
+            Ok(Some(state_id)) => Some(BlockUpdate {
+                position,
+                state_id: state_id.0 as i32,
+            }),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = %err, x, y, z, "block resync read failed");
+                None
+            }
+        }
+    };
+    if let Some(update) = update {
+        write_packet(writer, &update, state.compression).await?;
+    }
+    write_block_ack(writer, state.compression, sequence).await
+}
+
 fn crafting_player_slot(menu_slot: usize) -> Option<usize> {
     match menu_slot {
         10..=36 => Some(9 + (menu_slot - 10)),
@@ -1708,6 +1738,9 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let before_inventory = state.inventory.clone();
+    let before_carried_item = state.carried_item.clone();
+    let before_window = window.clone();
     let mut dropped = None;
     let changed = match classify_container_click(&packet) {
         ContainerClickAction::Pickup { slot, button } => {
@@ -1733,6 +1766,13 @@ where
         }
         ContainerClickAction::Unsupported => false,
     };
+    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+        state.inventory = before_inventory;
+        state.carried_item = before_carried_item;
+        window = before_window;
+        write_crafting_content(state, writer, &window).await?;
+        return Ok(window);
+    }
     if changed {
         window.state_id = window.state_id.wrapping_add(1);
     }
@@ -2491,6 +2531,21 @@ fn classify_container_click(packet: &ServerboundContainerClick) -> ContainerClic
             button: packet.button_num,
         },
         _ => ContainerClickAction::Unsupported,
+    }
+}
+
+fn client_carried_item_matches(client: &HashedStack, server: &ItemStack) -> bool {
+    match client {
+        // Older protocol harnesses often omit the predicted post-click carried
+        // item. Treat an empty client prediction as non-authoritative and let
+        // the following resync carry Solaris' cursor state back to the client.
+        HashedStack::Empty => true,
+        HashedStack::Actual {
+            item_id,
+            count,
+            components: _,
+        } if !server.is_empty() => *item_id == server.item_id && *count == server.count,
+        HashedStack::Actual { .. } => false,
     }
 }
 
@@ -3414,6 +3469,9 @@ where
             write_chest_content(state, writer, &window, &view).await?;
             return Ok(window);
         }
+        let before_inventory = state.inventory.clone();
+        let before_carried_item = state.carried_item.clone();
+        let before_view = view.clone();
         changed = match classify_container_click(&packet) {
             ContainerClickAction::Pickup { slot, button } => {
                 apply_chest_pickup_click(state, &mut view, slot, button)
@@ -3438,6 +3496,14 @@ where
             }
             ContainerClickAction::Unsupported => false,
         };
+        if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+            state.inventory = before_inventory;
+            state.carried_item = before_carried_item;
+            view = before_view;
+            drop(storage);
+            write_chest_content(state, writer, &window, &view).await?;
+            return Ok(window);
+        }
         if changed {
             window.state_id = window.state_id.wrapping_add(1);
             for (&position, chest) in window.positions.iter().zip(&view.chests) {
@@ -3498,6 +3564,9 @@ where
             write_furnace_content(state, writer, &window, &furnace).await?;
             return Ok(window);
         }
+        let before_inventory = state.inventory.clone();
+        let before_carried_item = state.carried_item.clone();
+        let before_furnace = furnace.clone();
         changed = match classify_container_click(&packet) {
             ContainerClickAction::Pickup { slot, button } => {
                 apply_furnace_pickup_click(state, &mut furnace, window.kind, slot, button)
@@ -3522,6 +3591,14 @@ where
             }
             ContainerClickAction::Unsupported => false,
         };
+        if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+            state.inventory = before_inventory;
+            state.carried_item = before_carried_item;
+            furnace = before_furnace;
+            drop(storage);
+            write_furnace_content(state, writer, &window, &furnace).await?;
+            return Ok(window);
+        }
         if changed {
             window.state_id = window.state_id.wrapping_add(1);
             storage
@@ -3813,6 +3890,8 @@ where
         return Ok(());
     }
 
+    let before_inventory = state.inventory.clone();
+    let before_carried_item = state.carried_item.clone();
     let mut dropped = None;
     let changed = match classify_container_click(&packet) {
         ContainerClickAction::Pickup { slot, button } => apply_pickup_click(state, slot, button),
@@ -3832,6 +3911,13 @@ where
         }
         ContainerClickAction::Unsupported => false,
     };
+    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+        debug!("container click resynced mismatched carried item");
+        state.inventory = before_inventory;
+        state.carried_item = before_carried_item;
+        write_inventory_content(state, writer).await?;
+        return Ok(());
+    }
 
     if !changed {
         debug!(
@@ -4502,7 +4588,8 @@ where
                         sequence = action.sequence,
                         "survival block break rejected before completion"
                     );
-                    write_block_ack(writer, state.compression, action.sequence).await
+                    write_block_resync_then_ack(state, writer, action.position, action.sequence)
+                        .await
                 }
             }
             _ => write_block_ack(writer, state.compression, action.sequence).await,

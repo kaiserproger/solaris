@@ -89,20 +89,39 @@ manual notes, protocol metadata, or vanilla captures exist.
 - Systematic vanilla oracle scenario evidence remains blocked (`Q1`).
 - Performance and concurrency remain blocked (`O1`, `O2`), including the M77
   generated-world join/chunk-stream stall evidence.
+- The ignored generated-world chunk-stream guard now has one focused O2
+  lock-pressure assertion pass: `chunk_prepare` deltas are exercised while
+  in-memory save-all/player-persistence lock paths stay unchanged. It remains
+  ignored, sidecar-dependent, and insufficient for disk-backed latency,
+  hardware-profile, slow-client, broad lock-review, or soak coverage.
 - Public/session safety, common stations, vehicles, autoscale, operator/deps,
   and data drift rows remain unknown or draft debt.
 - Most gameplay rows are `partial`: they have implementation and focused tests,
   including B1/B3 focused rejected occupied-target placement, occupied-target
-  water-bucket fallback/resync, and survival out-of-reach `UseItemOn` resync
-  harness coverage, including a negative held-slot check for the out-of-reach
-  bucket variant. Those regressions are local-sidecar-dependent and degrade when
-  required `data/vanilla/reports` files are absent; they still lack enough
-  row-specific vanilla oracle or real-client evidence to count.
+  water-bucket fallback/resync, survival out-of-reach `UseItemOn` resync,
+  early rejected survival-break target resync, scheduled water spread, and
+  lava-bucket-plus-water scheduled solidification harness coverage. Those
+  regressions are local-sidecar-dependent and degrade when required
+  `data/vanilla/reports` files are absent; they still lack enough row-specific
+  vanilla oracle or real-client evidence to count.
 - I1/I2 now have one focused real-client inventory recipe run
   (`m94-03a-inventory-oak-log-to-planks`), but recipe-book UI, crafting-table
   UI, cursor recovery, containers/stations, malformed clicks, furnace-family
   and campfire client recipes, and broad recipe execution remain outside that
   evidence.
+- K1/S2 stale shared-container coverage now includes storage/packet regressions
+  for chest and furnace plus two-protocol-client chest and furnace stale-click
+  resyncs after live peer slot updates. That is still protocol harness
+  evidence, not real-client concurrent-click, broad shared-container, oracle,
+  contention, performance, or soak evidence.
+- Q3 malformed-action evidence now has focused unsupported/malformed chest and
+  furnace protocol harnesses covering `QuickCraft`, `Clone`, and `PickupAll`
+  with lying client slot/cursor deltas plus one furnace pickup with a
+  conflicting non-empty post-click carried-item prediction; Solaris rolls that
+  pickup back, resyncs authoritative content, and leaves backing storage
+  unchanged. It remains far short of a replay corpus, invalid-wire
+  fuzzer, broad malformed-action matrix, real-client evidence, or vanilla
+  oracle.
 - Farming, plants, campfires, bows, shields, storage/cache/persistence,
   generated exploration, and common stations remain split in the denominator;
   unit-only or Solaris-only subcoverage is excluded from the numerator.

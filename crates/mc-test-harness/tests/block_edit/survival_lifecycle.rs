@@ -284,7 +284,11 @@ async fn survival_armor_slot_reduces_debug_damage() {
             button_num: 0,
             container_input: ContainerInput::Pickup,
             changed_slots: Vec::new(),
-            carried_item: HashedStack::empty(),
+            carried_item: HashedStack::Actual {
+                item_id: chestplate_id,
+                count: 1,
+                components: HashedStackComponentHashes::empty(),
+            },
         })
         .await
         .expect("pick up chestplate");
@@ -300,11 +304,7 @@ async fn survival_armor_slot_reduces_debug_damage() {
             button_num: 0,
             container_input: ContainerInput::Pickup,
             changed_slots: Vec::new(),
-            carried_item: HashedStack::Actual {
-                item_id: chestplate_id,
-                count: 1,
-                components: HashedStackComponentHashes::empty(),
-            },
+            carried_item: HashedStack::empty(),
         })
         .await
         .expect("equip chestplate");

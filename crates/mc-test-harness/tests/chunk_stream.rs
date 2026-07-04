@@ -108,6 +108,7 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         .drive_login(addr, "M3gTester")
         .await
         .expect("drive login");
+    let lock_pressure_before = mc_net::lock_pressure_snapshot();
     client
         .drive_configuration()
         .await
@@ -253,6 +254,9 @@ async fn vanilla_client_receives_spawn_view_distance_window() {
         "no chunk in the ring carried client-usage heightmaps — \
          encode_chunk_data is probably dropping them"
     );
+
+    let lock_pressure_after = mc_net::lock_pressure_snapshot();
+    assert_generated_world_chunk_stream_lock_pressure(lock_pressure_before, lock_pressure_after);
 
     let resource_metrics = chunk_pipeline_metrics.snapshot();
     assert!(
@@ -451,6 +455,38 @@ async fn movement_across_chunk_boundary_replans_view_subscription() {
 
     assert!(saw_new_center, "movement must send SetCenterChunk(3, 0)");
     assert!(saw_unload, "movement must unload a chunk that left view");
+}
+
+fn assert_generated_world_chunk_stream_lock_pressure(
+    before: mc_net::LockMetricsSnapshot,
+    after: mc_net::LockMetricsSnapshot,
+) {
+    eprintln!(
+        "generated-world chunk stream lock pressure: world_storage={:?}->{:?} \
+         session_registry={:?}->{:?} chunk_prepare={:?}->{:?}",
+        before.world_storage,
+        after.world_storage,
+        before.session_registry,
+        after.session_registry,
+        before.chunk_prepare,
+        after.chunk_prepare
+    );
+    assert!(
+        after.chunk_prepare.wait_count > before.chunk_prepare.wait_count,
+        "generated-world full-window stream must exercise ChunkPrepare wait metrics: before={before:?} after={after:?}"
+    );
+    assert!(
+        after.chunk_prepare.hold_count > before.chunk_prepare.hold_count,
+        "generated-world full-window stream must exercise ChunkPrepare hold metrics: before={before:?} after={after:?}"
+    );
+    assert_eq!(
+        after.save_all_flush, before.save_all_flush,
+        "in-memory generated-world stream must not enter SaveAllFlush lock path"
+    );
+    assert_eq!(
+        after.player_persistence, before.player_persistence,
+        "in-memory generated-world stream must not enter PlayerPersistence lock path"
+    );
 }
 
 /// M4.f: every streamed chunk must carry a wire LightData whose
