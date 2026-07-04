@@ -252,6 +252,29 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         });
     }
 
+    if config
+        .auth
+        .whitelist
+        .iter()
+        .any(|entry| entry.trim().is_empty())
+    {
+        warnings.push(OperatorWarning {
+            code: "auth_whitelist_entry_blank",
+            message: "auth.whitelist contains an empty or whitespace-only entry; blank entries never allow login",
+        });
+    }
+    if config
+        .auth
+        .banned_players
+        .iter()
+        .any(|entry| entry.trim().is_empty())
+    {
+        warnings.push(OperatorWarning {
+            code: "auth_banned_player_entry_blank",
+            message: "auth.banned_players contains an empty or whitespace-only entry; blank entries never deny login",
+        });
+    }
+
     if config.auth.online_mode {
         warnings.push(OperatorWarning {
             code: "online_mode_unsupported",
