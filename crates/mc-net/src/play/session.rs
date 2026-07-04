@@ -304,10 +304,21 @@ impl SessionRegistry {
             .then(|| cooking.clone())
     }
 
-    pub(super) fn tick_campfire_cooking(&self) -> CampfireCookingUpdates {
+    pub(super) fn campfire_cooking_positions(&self) -> Vec<mc_world::BlockPos> {
+        let inner = self.lock_inner("list campfire cooking");
+        inner.campfire_cooking.keys().copied().collect()
+    }
+
+    pub(super) fn tick_campfire_cooking(
+        &self,
+        cooking_positions: &HashSet<mc_world::BlockPos>,
+    ) -> CampfireCookingUpdates {
         let mut inner = self.lock_inner("tick campfire cooking");
         let mut updates = CampfireCookingUpdates::default();
         inner.campfire_cooking.retain(|position, cooking| {
+            if !cooking_positions.contains(position) {
+                return true;
+            }
             let tick = cooking.tick();
             updates
                 .completed

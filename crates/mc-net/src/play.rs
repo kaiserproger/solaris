@@ -2645,6 +2645,18 @@ fn is_campfire_block(blocks: &BlockRegistry, block_state: mc_world::BlockStateId
     })
 }
 
+fn is_lit_campfire_block(blocks: &BlockRegistry, block_state: mc_world::BlockStateId) -> bool {
+    blocks.by_id(block_state).is_some_and(|block_state| {
+        matches!(
+            block_state.block.id.as_str(),
+            "minecraft:campfire" | "minecraft:soul_campfire"
+        ) && block_state
+            .properties
+            .iter()
+            .any(|(key, value)| key == "lit" && value == "true")
+    })
+}
+
 fn is_campfire_state(state: &InteractionState, block_state: mc_world::BlockStateId) -> bool {
     is_campfire_block(&state.blocks, block_state)
 }
@@ -3078,7 +3090,13 @@ pub(crate) async fn run_campfire_cooking_ticks(
     let Some(world) = config.world.as_ref() else {
         return CampfireCookingTickReport::default();
     };
-    let updates = sessions.tick_campfire_cooking();
+    let mut cooking_positions = HashSet::new();
+    for position in sessions.campfire_cooking_positions() {
+        if campfire_block_can_cook(world, &config.blocks, position).await {
+            cooking_positions.insert(position);
+        }
+    }
+    let updates = sessions.tick_campfire_cooking(&cooking_positions);
     let mut report = CampfireCookingTickReport {
         persisted: updates.persisted.len(),
         completed: updates.completed.len(),
@@ -3117,8 +3135,7 @@ pub(crate) async fn run_campfire_cooking_ticks(
         return report;
     };
     for (position, stack) in updates.completed {
-        let still_campfire = campfire_block_still_present(world, &config.blocks, position).await;
-        if !still_campfire {
+        if !campfire_block_can_cook(world, &config.blocks, position).await {
             continue;
         }
         report.dropped += 1;
@@ -3174,6 +3191,22 @@ async fn campfire_block_still_present(
         .ok()
         .flatten()
         .is_some_and(|block_state| is_campfire_block(blocks, block_state))
+}
+
+async fn campfire_block_can_cook(
+    world: &WorldHandle,
+    blocks: &BlockRegistry,
+    position: mc_world::BlockPos,
+) -> bool {
+    let mut storage = world.lock().await;
+    match storage.get_block(position) {
+        Ok(Some(block_state)) => is_lit_campfire_block(blocks, block_state),
+        Ok(None) => false,
+        Err(err) => {
+            warn!(error = %err, ?position, "campfire cook-state read failed");
+            false
+        }
+    }
 }
 
 fn take_death_inventory_drops(
