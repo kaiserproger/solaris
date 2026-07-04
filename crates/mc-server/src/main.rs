@@ -76,7 +76,7 @@ struct OperatorWarning {
 
 #[derive(serde::Deserialize)]
 struct VanillaVersionMetadata {
-    protocol_version: Option<i32>,
+    protocol_version: i32,
 }
 
 fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
@@ -119,10 +119,7 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                 match std::fs::read_to_string(version_path) {
                     Ok(raw) => match serde_json::from_str::<VanillaVersionMetadata>(&raw) {
                         Ok(version) => {
-                            if version
-                                .protocol_version
-                                .is_some_and(|protocol| protocol != mc_protocol::PROTOCOL_VERSION)
-                            {
+                            if version.protocol_version != mc_protocol::PROTOCOL_VERSION {
                                 warnings.push(OperatorWarning {
                                     code: "vanilla_data_protocol_mismatch",
                                     message: "data.vanilla_data_dir version.json protocol_version does not match Solaris; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
@@ -131,7 +128,7 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                         }
                         Err(_) => warnings.push(OperatorWarning {
                             code: "vanilla_data_version_invalid",
-                            message: "data.vanilla_data_dir version.json is not valid metadata; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                            message: "data.vanilla_data_dir version.json is not valid metadata or is missing protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                         }),
                     }
                     Err(_) => warnings.push(OperatorWarning {
