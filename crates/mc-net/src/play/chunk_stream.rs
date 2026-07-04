@@ -81,6 +81,8 @@ pub(super) struct ChunkStreamState {
     center_cz: i32,
     direction_yaw: f32,
     view_distance: i32,
+    client_view_distance_cap: i32,
+    runtime_view_distance_limit: i32,
     scheduler: ChunkScheduler,
     staged: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
@@ -818,7 +820,9 @@ impl ChunkStreamState {
             center_cx,
             center_cz,
             direction_yaw,
-            view_distance,
+            view_distance: vd,
+            client_view_distance_cap: vd,
+            runtime_view_distance_limit: vd,
             scheduler,
             staged: HashSet::new(),
             loaded: HashSet::new(),
@@ -940,6 +944,18 @@ impl ChunkStreamState {
         view_distance: i32,
         direction_yaw: f32,
     ) -> Vec<(i32, i32)> {
+        self.client_view_distance_cap = view_distance.max(0);
+        let effective_view_distance = self
+            .runtime_view_distance_limit
+            .min(self.client_view_distance_cap);
+        self.replan_effective_view_distance(effective_view_distance, direction_yaw)
+    }
+
+    fn replan_effective_view_distance(
+        &mut self,
+        view_distance: i32,
+        direction_yaw: f32,
+    ) -> Vec<(i32, i32)> {
         let view_distance = view_distance.max(0);
         if self.view_distance == view_distance {
             return Vec::new();
@@ -1057,13 +1073,25 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let initial_target = initial_window_target(self.view_distance);
         self.drain_ready();
-        self.observe_runtime_control();
+        let unloads = self.observe_runtime_control();
+        for (chunk_x, chunk_z) in unloads {
+            light_cache.remove(ChunkPos {
+                x: chunk_x,
+                z: chunk_z,
+            });
+            write_packet(
+                writer,
+                &ForgetLevelChunk { chunk_x, chunk_z },
+                self.compression,
+            )
+            .await?;
+        }
         self.dispatch_available();
         self.drain_ready();
 
         let made_send_progress = self.emit_ready_batch(writer, light_cache).await?;
+        let initial_target = initial_window_target(self.view_distance);
         if self.emitted + self.absent >= initial_target || self.scheduler.is_complete() {
             self.wait_for_first_chunk = false;
         }
@@ -1101,9 +1129,9 @@ impl ChunkStreamState {
         Ok(processed > 0)
     }
 
-    fn observe_runtime_control(&mut self) {
+    fn observe_runtime_control(&mut self) -> Vec<(i32, i32)> {
         let Some(runtime_control) = self.runtime_control.clone() else {
-            return;
+            return Vec::new();
         };
         let resources = self.resources.metrics().snapshot();
         let decision = runtime_control.observe(crate::RuntimeControlInput {
@@ -1119,10 +1147,13 @@ impl ChunkStreamState {
             memory_limit_mb: 0,
             first_chunk_ms: self.first_chunk_ms,
         });
-        self.apply_runtime_control_limits(decision.limits);
+        self.apply_runtime_control_limits(decision.limits)
     }
 
-    fn apply_runtime_control_limits(&mut self, limits: crate::RuntimeControlLimits) {
+    fn apply_runtime_control_limits(
+        &mut self,
+        limits: crate::RuntimeControlLimits,
+    ) -> Vec<(i32, i32)> {
         self.policy.chunk_send_rate = limits.chunk_send_rate.max(1);
         self.policy.chunk_load_rate = limits.chunk_load_rate.max(1);
         self.policy.chunk_generate_rate = limits.chunk_generate_rate.max(1);
@@ -1141,6 +1172,15 @@ impl ChunkStreamState {
             } else {
                 ChunkPipelineStopReason::GenerateBudget
             };
+        self.runtime_view_distance_limit = limits.view_distance.max(0);
+        let effective_view_distance = self
+            .runtime_view_distance_limit
+            .min(self.client_view_distance_cap);
+        if effective_view_distance != self.view_distance {
+            return self
+                .replan_effective_view_distance(effective_view_distance, self.direction_yaw);
+        }
+        Vec::new()
     }
 
     fn dispatch_available(&mut self) {
@@ -3314,7 +3354,7 @@ mod tests {
             0,
             0,
             0.0,
-            1,
+            2,
             ChunkPipelineResources::with_limits(1, 1),
             policy,
         )
@@ -3353,6 +3393,189 @@ mod tests {
         assert_eq!(stream.absent, 2);
         assert_eq!(stream.ready.len(), 1);
         assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::SendBudget);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_queue_pressure_replans_live_view_distance() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(8);
+        let profile = crate::login::LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "RuntimeViewDistanceAlice".to_string(),
+        };
+        let old_desired = desired_chunk_set(0, 0, 3);
+        let (session_id, _) = sessions.register(
+            &profile,
+            (0, 0),
+            3,
+            old_desired,
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        let control = crate::RuntimeControlHandle::new(crate::RuntimeControlConfig {
+            policy: crate::AutoscalePolicy {
+                min_view_distance: 2,
+                max_view_distance: 3,
+                min_chunk_send_rate: 4,
+                max_chunk_send_rate: 4,
+                min_chunk_load_rate: 64,
+                max_chunk_load_rate: 64,
+                min_chunk_generate_rate: 32,
+                max_chunk_generate_rate: 32,
+                queue_pressure_percent: 1,
+                scale_down_after_ticks: 1,
+                ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+            },
+            initial_limits: crate::RuntimeControlLimits {
+                view_distance: 3,
+                chunk_send_rate: 4,
+                chunk_load_rate: 64,
+                chunk_generate_rate: 32,
+            },
+        });
+        let policy = ChunkPipelinePolicy {
+            chunk_send_rate: 4,
+            chunk_result_queue_size: 4,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            3,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        )
+        .with_runtime_control(Some(control.clone()));
+        let request = stream.scheduler.poll_next().expect("queued chunk");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Absent,
+        });
+        stream.loaded.insert((3, 0));
+        sessions.mark_loaded(session_id, (3, 0));
+
+        let (mut client, mut server) = tokio::io::duplex(256);
+        let mut light_cache = LightCache::new();
+
+        stream.step(&mut server, &mut light_cache).await.unwrap();
+
+        let snapshot = control.snapshot();
+        assert_eq!(
+            snapshot.last_decision.action,
+            crate::AutoscaleAction::ScaleDown
+        );
+        assert_eq!(snapshot.limits.view_distance, 2);
+        assert_eq!(stream.view_distance, 2);
+        assert!(!stream.loaded.contains(&(3, 0)));
+        assert_eq!(sessions.ticketed_chunks_sorted().len(), 25);
+        assert!(!sessions.ticketed_chunks_sorted().contains(&(3, 0)));
+        assert!(stream.ready.is_empty());
+
+        let mut buf = BytesMut::new();
+        let read = tokio::time::timeout(Duration::from_millis(100), client.read_buf(&mut buf))
+            .await
+            .expect("runtime view-distance shrink should emit a forget-level-chunk packet")
+            .unwrap();
+        assert!(read > 0);
+        let frame = mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled)
+            .unwrap()
+            .expect("forget-level-chunk frame");
+        assert_eq!(frame.id, ForgetLevelChunk::ID);
+        let packet = ForgetLevelChunk::decode(&mut frame.body.clone()).unwrap();
+        assert_eq!(
+            packet,
+            ForgetLevelChunk {
+                chunk_x: 3,
+                chunk_z: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn runtime_control_view_distance_does_not_exceed_client_cap() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(8);
+        let profile = crate::login::LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "RuntimeViewDistanceCapAlice".to_string(),
+        };
+        let old_desired = desired_chunk_set(0, 0, 3);
+        let (session_id, _) = sessions.register(
+            &profile,
+            (0, 0),
+            3,
+            old_desired,
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            3,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+
+        stream.replan_view_distance(2, 0.0);
+        stream.apply_runtime_control_limits(crate::RuntimeControlLimits {
+            view_distance: 3,
+            chunk_send_rate: 16,
+            chunk_load_rate: 64,
+            chunk_generate_rate: 32,
+        });
+
+        assert_eq!(stream.view_distance, 2);
+        assert_eq!(sessions.ticketed_chunks_sorted().len(), 25);
+        assert!(!sessions.ticketed_chunks_sorted().contains(&(3, 0)));
     }
 
     #[tokio::test]
