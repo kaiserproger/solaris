@@ -7138,6 +7138,7 @@ enum UseItemOnOutcome {
 enum UseItemOnNoOpReason {
     DeadPlayer,
     UnsupportedGameMode,
+    WorldBorderHit,
     OutOfReach,
     EmptyHeldItem,
     ClickedCellUnavailable,
@@ -7192,7 +7193,10 @@ where
 
     let preflight = classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action);
     if let UseItemOnOutcome::NoOp { reason } = preflight
-        && reason != UseItemOnNoOpReason::OutOfReach
+        && !matches!(
+            reason,
+            UseItemOnNoOpReason::OutOfReach | UseItemOnNoOpReason::WorldBorderHit
+        )
     {
         return ack_use_item_on_noop(writer, state.compression, action.sequence, reason).await;
     }
@@ -7224,6 +7228,26 @@ where
                 z: cz + dz,
             },
             UseItemOnNoOpReason::OutOfReach,
+            UseItemOnResyncOptions::LOADED_ONLY_BLOCKS,
+        )
+        .await;
+    }
+    if let UseItemOnOutcome::NoOp {
+        reason: UseItemOnNoOpReason::WorldBorderHit,
+    } = preflight
+    {
+        let (dx, dy, dz) = action.direction.normal();
+        return reject_use_item_on_with_resync(
+            state,
+            writer,
+            action.sequence,
+            target.clicked_pos,
+            mc_world::BlockPos {
+                x: cx + dx,
+                y: cy + dy,
+                z: cz + dz,
+            },
+            UseItemOnNoOpReason::WorldBorderHit,
             UseItemOnResyncOptions::LOADED_ONLY_BLOCKS,
         )
         .await;
@@ -7282,6 +7306,16 @@ fn classify_use_item_on_preflight(
         );
         return UseItemOnOutcome::NoOp {
             reason: UseItemOnNoOpReason::UnsupportedGameMode,
+        };
+    }
+
+    if action.world_border_hit {
+        debug!(
+            sequence = action.sequence,
+            "block placement ignored: client reported world-border hit"
+        );
+        return UseItemOnOutcome::NoOp {
+            reason: UseItemOnNoOpReason::WorldBorderHit,
         };
     }
 
