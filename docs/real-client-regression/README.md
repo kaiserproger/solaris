@@ -51,8 +51,10 @@ client executes the pack, fill `observations.json` with `client_gate` set to
 bash tools/run-real-client-regression.sh --validate-run .analysis/real-client-runs/<run_id>
 ```
 
-Validation checks the artifact shape and fails while the observations remain
-`not-run`/prepared. The runner rejects protocol bot/mock commands before
+Validation checks the artifact shape, fails while the observations remain
+`not-run`/prepared, and rejects a passed observed scenario when its manifest
+requires screenshots but `observations.json` does not point at an existing file
+under `screenshots/`. The runner rejects protocol bot/mock commands before
 `--run`; `--validate-run` does not re-authenticate a manually edited artifact
 directory.
 
@@ -204,6 +206,10 @@ bridge tests only validate driver plumbing; they do not count as real-client
 evidence. The driver only records a passed scenario when the in-client bridge
 returns an explicit `run_scenario` result of `passed`; bridge connection,
 `wait_play`, and screenshots by themselves are not a gameplay pass.
+Validation also requires passed observed scenarios with
+`screenshots_required: true` to reference at least one existing
+`screenshots/` artifact; this proves artifact shape only, not screenshot
+content quality or gameplay correctness.
 
 The Solaris-owned bridge source lives under
 `client-mod/solaris-client-agent/`. The `bridge-core` module is a pure Java

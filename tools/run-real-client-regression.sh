@@ -303,6 +303,56 @@ validate_run_dir() {
     printf 'error: observations.json is still a prepared/not-run template\n' >&2
     exit 1
   fi
+  python3 - "$run_dir" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+run_dir = Path(sys.argv[1])
+manifest = json.loads((run_dir / "manifest.json").read_text())
+observations = json.loads((run_dir / "observations.json").read_text())
+screenshots_dir = run_dir / "screenshots"
+screenshots_root = screenshots_dir.resolve()
+
+required_screenshots = {
+    scenario.get("id")
+    for scenario in manifest.get("scenarios", [])
+    if scenario.get("screenshots_required") is True
+}
+for scenario in observations.get("scenarios", []):
+    scenario_id = scenario.get("id")
+    if scenario_id not in required_screenshots or scenario.get("result") != "passed":
+        continue
+    screenshots = scenario.get("screenshots")
+    if not isinstance(screenshots, list) or not screenshots:
+        print(
+            f"error: scenario {scenario_id} requires at least one screenshots/ artifact",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    for screenshot in screenshots:
+        if not isinstance(screenshot, str) or not screenshot.startswith("screenshots/"):
+            print(
+                f"error: scenario {scenario_id} screenshot must live under screenshots/: {screenshot!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        screenshot_path = (run_dir / screenshot).resolve()
+        try:
+            screenshot_path.relative_to(screenshots_root)
+        except ValueError:
+            print(
+                f"error: scenario {scenario_id} screenshot escapes screenshots/: {screenshot!r}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        if not screenshot_path.is_file():
+            print(
+                f"error: scenario {scenario_id} screenshot is missing on disk: {screenshot}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+PY
   printf 'validated %s\n' "$run_dir"
 }
 

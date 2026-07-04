@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
+use std::process::Command;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 const M94_MANIFEST: &str =
     include_str!("../../../docs/real-client-regression/manifests/m94-regression-pack.json");
@@ -310,5 +311,58 @@ fn approved_real_client_runner_is_fail_closed() {
             && runner.contains("server_restart_count=")
             && runner.contains("kill -INT"),
         "runner must orchestrate m94-06 as a real restart plus optional two-client bridge phase"
+    );
+}
+
+#[test]
+fn validate_run_rejects_missing_required_scenario_screenshots() {
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    std::fs::write(run_dir.path().join("manifest.json"), M94_MANIFEST).expect("write manifest");
+    for artifact in [
+        "client.log",
+        "server.log",
+        "git.txt",
+        "toolchain.txt",
+        "automation-driver.txt",
+    ] {
+        std::fs::write(run_dir.path().join(artifact), "").expect("write artifact");
+    }
+    std::fs::create_dir(run_dir.path().join("screenshots")).expect("create screenshots dir");
+    std::fs::write(
+        run_dir.path().join("observations.json"),
+        serde_json::to_vec_pretty(&json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-01-join-rejoin-chunks-movement",
+                "result": "passed",
+                "screenshots": []
+            }]
+        }))
+        .expect("serialize observations"),
+    )
+    .expect("write observations");
+
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--validate-run")
+        .arg(run_dir.path())
+        .output()
+        .expect("run real-client validator");
+
+    assert!(
+        !output.status.success(),
+        "validator accepted a passed required-screenshot scenario without screenshots\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("screenshots"),
+        "validator error should name screenshots\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
