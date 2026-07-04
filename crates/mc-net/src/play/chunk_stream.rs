@@ -1584,6 +1584,12 @@ impl ChunkStreamState {
     }
 }
 
+impl Drop for ChunkStreamState {
+    fn drop(&mut self) {
+        self.active_generation.store(0, Ordering::Release);
+    }
+}
+
 /// Iterate chunk positions around `(center_x, center_z)` outwards
 /// to `view_distance` in chebyshev-ring order. The first cell is the
 /// centre; subsequent yields are every cell on ring `r = 1`, then

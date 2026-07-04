@@ -48,6 +48,7 @@ type PhysicsMaterialCache = HashMap<
 
 static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const CHUNK_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -647,6 +648,11 @@ impl BoundServer {
             };
         }
         drain_connections(&mut connections).await;
+        drain_chunk_pipeline(&chunk_pipeline_resources).await;
+        if shutdown.is_requested() && config.world.is_some() {
+            let report = save_all(&config, &sessions).await;
+            log_save_report("listener shutdown final save", &report);
+        }
         Ok(())
     }
 }
@@ -667,6 +673,21 @@ async fn drain_connections(connections: &mut tokio::task::JoinSet<()>) {
                 return;
             }
         }
+    }
+}
+
+async fn drain_chunk_pipeline(resources: &ChunkPipelineResources) {
+    let started = Instant::now();
+    loop {
+        let snapshot = resources.metrics().snapshot();
+        if snapshot.active_io == 0 && snapshot.active_cpu == 0 {
+            return;
+        }
+        if started.elapsed() >= CHUNK_PIPELINE_DRAIN_TIMEOUT {
+            warn!(?snapshot, "chunk pipeline drain timed out");
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 

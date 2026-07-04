@@ -35,6 +35,8 @@ const M96_REPLAY_CLIENTS: usize = 4;
 const M96_PRESSURE_SUMMONS: usize = 128;
 const M96_REPLAY_ELAPSED_BUDGET: Duration = Duration::from_secs(45);
 const M96_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
+const O2_STOP_FLUSH_CLIENTS: usize = 4;
+const O2_STOP_VIEW_DISTANCE: i32 = 8;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local data/vanilla sidecars; degraded when absent"]
@@ -250,6 +252,142 @@ async fn bounded_multiplayer_survival_replay_covers_sequential_contention_and_sl
     );
 
     paused_reader.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires local data/vanilla sidecars; degraded when absent"]
+async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load() {
+    let server = start_load_server_with_options(LoadServerOptions {
+        view_distance: O2_STOP_VIEW_DISTANCE,
+        disk_backed: true,
+        runtime_control: true,
+    })
+    .await;
+    let addr = server.addr;
+    let save_pressure_before = mc_net::lock_pressure_snapshot().save_all_flush;
+
+    let mut client_tasks = Vec::new();
+    for idx in 0..O2_STOP_FLUSH_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let (mut client, _) = connect_to_play(addr, &format!("O2Stop{idx}")).await;
+            let chunks = drain_unique_chunks(&mut client, 9).await;
+            (client, chunks)
+        }));
+    }
+
+    let mut clients = Vec::new();
+    let mut streamed_chunks = std::collections::BTreeSet::new();
+    for task in client_tasks {
+        let (client, chunks) = task.await.expect("O2 stop client task joins");
+        streamed_chunks.extend(chunks);
+        clients.push(client);
+    }
+    let mut stopper = clients.remove(0);
+    let dirty_before = {
+        let world = server.world.lock().await;
+        world.stats().dirty_chunks
+    };
+    assert!(
+        dirty_before > 0,
+        "disk-backed VD8 stream should dirty generated chunks before stop"
+    );
+
+    stopper
+        .write_packet(&ServerboundChatCommand {
+            command: "stop".to_string(),
+        })
+        .await
+        .expect("send stop command");
+    wait_for_shutdown_requested(&server.shutdown).await;
+    for client in clients {
+        drop(client);
+    }
+    drop(stopper);
+
+    assert!(
+        server.shutdown.is_requested(),
+        "player /stop should signal shutdown"
+    );
+    let runtime_control = server
+        .runtime_control
+        .as_ref()
+        .expect("O2 stop gate enables runtime control");
+    assert!(
+        runtime_control.snapshot().draining,
+        "player /stop should request runtime-control drain"
+    );
+
+    let serve_result = tokio::time::timeout(Duration::from_secs(10), server.serve_task)
+        .await
+        .expect("server should exit after player /stop")
+        .expect("server task should join");
+    serve_result.expect("server serve should exit cleanly");
+
+    let chunk_snapshot = server.chunk_pipeline_metrics.snapshot();
+    assert_eq!(
+        chunk_snapshot.active_cpu, 0,
+        "chunk CPU work should be drained after /stop: {:?}",
+        chunk_snapshot
+    );
+    assert_eq!(
+        chunk_snapshot.active_io, 0,
+        "chunk IO work should be drained after /stop: {:?}",
+        chunk_snapshot
+    );
+
+    let dirty_after = {
+        let world = server.world.lock().await;
+        world.stats().dirty_chunks
+    };
+    assert_eq!(
+        dirty_after, 0,
+        "player /stop should flush all disk-backed generated chunks after draining; dirty_before={dirty_before}"
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let quiet_dirty_after = {
+        let world = server.world.lock().await;
+        world.stats().dirty_chunks
+    };
+    assert_eq!(
+        quiet_dirty_after, 0,
+        "detached chunk work should not dirty chunks after the final shutdown save"
+    );
+
+    let save_pressure_after = mc_net::lock_pressure_snapshot().save_all_flush;
+    assert!(
+        save_pressure_after.hold_count > save_pressure_before.hold_count,
+        "player /stop should exercise save_all_flush lock path: before={save_pressure_before:?} after={save_pressure_after:?}"
+    );
+    let world_dir = server
+        .world_dir
+        .as_ref()
+        .expect("O2 stop gate uses a disk-backed temp world");
+    let mut reopened = mc_world::WorldStorage::open_with_capacity(
+        world_dir.path(),
+        Arc::clone(&server.blocks),
+        streamed_chunks.len().max(4),
+    )
+    .expect("reopen disk-backed stop world");
+    for (cx, cz) in &streamed_chunks {
+        let chunk = reopened
+            .get_chunk(mc_world::ChunkPos { x: *cx, z: *cz })
+            .expect("read streamed chunk after stop flush");
+        assert!(
+            chunk.is_some(),
+            "streamed chunk ({cx},{cz}) should exist on disk after stop flush"
+        );
+    }
+
+    eprintln!(
+        "O2 VD8 stop flush clients={} streamed_chunks={} dirty_before={} dirty_after={} chunk_pipeline={:?} save_all_before={:?} save_all_after={:?}",
+        O2_STOP_FLUSH_CLIENTS,
+        streamed_chunks.len(),
+        dirty_before,
+        dirty_after,
+        chunk_snapshot,
+        save_pressure_before,
+        save_pressure_after,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -616,11 +754,16 @@ async fn reports_spawn_exploration_block_entity_and_multi_client_load() {
 
 struct LoadServer {
     addr: std::net::SocketAddr,
+    blocks: Arc<mc_world::BlockRegistry>,
     world: Arc<tokio::sync::Mutex<mc_world::WorldStorage>>,
     chunk_pipeline_metrics: mc_net::ChunkPipelineResourceMetrics,
     outbound_pressure: mc_net::OutboundPressureHandle,
+    shutdown: mc_net::ShutdownHandle,
+    runtime_control: Option<mc_net::RuntimeControlHandle>,
+    serve_task: tokio::task::JoinHandle<std::io::Result<()>>,
     chunk_io_threads: usize,
     chunk_worker_threads: usize,
+    world_dir: Option<tempfile::TempDir>,
 }
 
 impl LoadServer {
@@ -629,7 +772,27 @@ impl LoadServer {
     }
 }
 
+struct LoadServerOptions {
+    view_distance: i32,
+    disk_backed: bool,
+    runtime_control: bool,
+}
+
+impl Default for LoadServerOptions {
+    fn default() -> Self {
+        Self {
+            view_distance: VIEW_DISTANCE,
+            disk_backed: false,
+            runtime_control: false,
+        }
+    }
+}
+
 async fn start_load_server() -> LoadServer {
+    start_load_server_with_options(LoadServerOptions::default()).await
+}
+
+async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServer {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -646,10 +809,20 @@ async fn start_load_server() -> LoadServer {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("registry"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
-        Arc::clone(&blocks),
-        ((2 * VIEW_DISTANCE + 5) as usize).pow(2),
-    )
+    let world_dir = if options.disk_backed {
+        let temp = tempfile::tempdir().expect("create disk-backed load world");
+        std::fs::create_dir_all(temp.path().join("region")).expect("create legacy region dir");
+        Some(temp)
+    } else {
+        None
+    };
+    let chunk_capacity = ((2 * options.view_distance + 5) as usize).pow(2);
+    let storage = if let Some(temp) = world_dir.as_ref() {
+        mc_world::WorldStorage::open_with_capacity(temp.path(), Arc::clone(&blocks), chunk_capacity)
+            .expect("open disk-backed load world")
+    } else {
+        mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), chunk_capacity)
+    }
     .with_generator(generator);
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
@@ -668,13 +841,32 @@ async fn start_load_server() -> LoadServer {
             .map(Arc::new)
             .unwrap_or_default();
 
+    let mut chunk_pipeline = mc_net::ChunkPipelinePolicy {
+        chunk_prepare_batch_size: 2,
+        chunk_io_threads: LOAD_CHUNK_IO_THREADS,
+        chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
+        chunk_result_queue_size: 8,
+        ..mc_net::ChunkPipelinePolicy::default()
+    };
+    if options.runtime_control {
+        chunk_pipeline.runtime_control = Some(mc_net::RuntimeControlConfig {
+            policy: mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced),
+            initial_limits: mc_net::RuntimeControlLimits {
+                view_distance: options.view_distance,
+                chunk_send_rate: 8,
+                chunk_load_rate: 16,
+                chunk_generate_rate: 32,
+            },
+        });
+    }
+
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M37 load scenarios".into(),
         max_players: 8,
-        view_distance: VIEW_DISTANCE,
+        view_distance: options.view_distance,
         data,
-        blocks,
+        blocks: Arc::clone(&blocks),
         world: Some(Arc::clone(&world)),
         tags,
         recipes: Arc::new(Vec::new()),
@@ -685,13 +877,7 @@ async fn start_load_server() -> LoadServer {
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
         entity_types,
         biome_spawns,
-        chunk_pipeline: mc_net::ChunkPipelinePolicy {
-            chunk_prepare_batch_size: 2,
-            chunk_io_threads: LOAD_CHUNK_IO_THREADS,
-            chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
-            chunk_result_queue_size: 8,
-            ..mc_net::ChunkPipelinePolicy::default()
-        },
+        chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy {
             random_tick_speed: 3,
             chunk_budget: 8,
@@ -702,20 +888,25 @@ async fn start_load_server() -> LoadServer {
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         shutdown: mc_net::ShutdownHandle::default(),
     };
+    let shutdown = cfg.shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local addr");
     let chunk_pipeline_metrics = bound.chunk_pipeline_metrics();
     let outbound_pressure = bound.outbound_pressure_handle();
-    tokio::spawn(async move {
-        let _ = bound.serve().await;
-    });
+    let runtime_control = bound.runtime_control_handle();
+    let serve_task = tokio::spawn(async move { bound.serve().await });
     LoadServer {
         addr,
+        blocks,
         world,
         chunk_pipeline_metrics,
         outbound_pressure,
+        shutdown,
+        runtime_control,
+        serve_task,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
+        world_dir,
     }
 }
 
@@ -852,6 +1043,50 @@ async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
                 return;
             }
         }
+    }
+}
+
+async fn drain_unique_chunks(
+    client: &mut Client,
+    expected: usize,
+) -> std::collections::BTreeSet<(i32, i32)> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut seen = std::collections::BTreeSet::new();
+    loop {
+        if seen.len() >= expected {
+            return seen;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {expected} unique chunks; seen={seen:?}"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("drain unique chunks");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let pkt = LevelChunkWithLight::decode(&mut body).expect("decode chunk");
+            seen.insert((pkt.chunk_x, pkt.chunk_z));
+        }
+    }
+}
+
+async fn wait_for_shutdown_requested(shutdown: &mc_net::ShutdownHandle) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if shutdown.is_requested() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for player /stop to request shutdown"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
