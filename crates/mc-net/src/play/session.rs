@@ -312,6 +312,9 @@ impl SessionRegistry {
             updates
                 .completed
                 .extend(tick.completed.into_iter().map(|stack| (*position, stack)));
+            if tick.dirty {
+                updates.persisted.push((*position, cooking.clone()));
+            }
             if tick.changed {
                 updates.changed.push((*position, cooking.clone()));
             }

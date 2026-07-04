@@ -268,18 +268,21 @@ struct CampfireCookingEntry {
     input: ItemStack,
     result: ItemStack,
     ticks_remaining: u32,
+    cooking_time_total: u32,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CampfireCookingTick {
     completed: Vec<ItemStack>,
     changed: bool,
+    dirty: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CampfireCookingUpdates {
     completed: Vec<(mc_world::BlockPos, ItemStack)>,
     changed: Vec<(mc_world::BlockPos, CampfireCookingState)>,
+    persisted: Vec<(mc_world::BlockPos, CampfireCookingState)>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -292,10 +295,12 @@ impl CampfireCookingState {
         let Some(slot) = self.slots.iter_mut().find(|slot| slot.is_none()) else {
             return false;
         };
+        let cooking_time = cooking_time.max(1);
         *slot = Some(CampfireCookingEntry {
             input,
             result,
-            ticks_remaining: cooking_time.max(1),
+            ticks_remaining: cooking_time,
+            cooking_time_total: cooking_time,
         });
         true
     }
@@ -307,6 +312,7 @@ impl CampfireCookingState {
                 continue;
             };
             entry.ticks_remaining = entry.ticks_remaining.saturating_sub(1);
+            tick.dirty = true;
             if entry.ticks_remaining == 0 {
                 let entry = slot.take().expect("entry existed before completion");
                 tick.completed.push(entry.result);
@@ -2673,6 +2679,94 @@ fn campfire_block_entity_update_nbt(
     )]))
 }
 
+fn campfire_block_entity_persistent_nbt(
+    block_entity_id: &str,
+    position: mc_world::BlockPos,
+    items: &ItemRegistry,
+    cooking: &CampfireCookingState,
+) -> Option<Tag> {
+    let Tag::Compound(mut fields) = campfire_block_entity_update_nbt(items, cooking)? else {
+        return None;
+    };
+    fields.push(("id".into(), Tag::String(block_entity_id.to_string())));
+    fields.push(("x".into(), Tag::Int(position.x)));
+    fields.push(("y".into(), Tag::Int(position.y)));
+    fields.push(("z".into(), Tag::Int(position.z)));
+    fields.push((
+        "solaris_cooking_remaining".into(),
+        Tag::IntArray(
+            cooking
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map_or(0, |entry| {
+                        i32::try_from(entry.ticks_remaining).unwrap_or(i32::MAX)
+                    })
+                })
+                .collect(),
+        ),
+    ));
+    fields.push((
+        "solaris_cooking_total".into(),
+        Tag::IntArray(
+            cooking
+                .slots
+                .iter()
+                .map(|slot| {
+                    slot.as_ref().map_or(0, |entry| {
+                        i32::try_from(entry.cooking_time_total).unwrap_or(i32::MAX)
+                    })
+                })
+                .collect(),
+        ),
+    ));
+    Some(Tag::Compound(fields))
+}
+
+async fn persist_campfire_block_entity(
+    state: &InteractionState,
+    position: mc_world::BlockPos,
+    cooking: &CampfireCookingState,
+) -> bool {
+    let mut storage = state.world.lock().await;
+    let block_entity_id = match storage.get_block(position) {
+        Ok(Some(block_state)) => state.blocks.by_id(block_state).and_then(|block_state| {
+            match block_state.block.id.as_str() {
+                "minecraft:campfire" => Some("minecraft:campfire"),
+                "minecraft:soul_campfire" => Some("minecraft:soul_campfire"),
+                _ => None,
+            }
+        }),
+        Ok(None) => None,
+        Err(err) => {
+            warn!(error = %err, ?position, "campfire block entity target read failed");
+            None
+        }
+    };
+    let Some(block_entity_id) = block_entity_id else {
+        return false;
+    };
+    let Some(tag) =
+        campfire_block_entity_persistent_nbt(block_entity_id, position, &state.items, cooking)
+    else {
+        warn!(
+            ?position,
+            "campfire block entity persistence skipped for unknown item id"
+        );
+        return false;
+    };
+    let mut bytes = Vec::new();
+    if let Err(err) = mc_nbt::write_network(&mut bytes, &tag) {
+        warn!(error = %err, ?position, "campfire block entity NBT encode failed");
+        return false;
+    }
+    if let Err(err) = storage.set_opaque_block_entity(position, bytes) {
+        warn!(error = %err, ?position, "campfire block entity save failed");
+        return false;
+    }
+    true
+}
+
 async fn send_campfire_block_entity_update<W>(
     state: &InteractionState,
     writer: &mut W,
@@ -2781,6 +2875,7 @@ where
     else {
         return Ok(false);
     };
+    persist_campfire_block_entity(state, position, &cooking).await;
 
     let held = &mut state.inventory.slots[slot];
     held.count = held.count.saturating_sub(1);
@@ -2806,6 +2901,9 @@ where
 
 async fn tick_campfire_cooking(state: &mut InteractionState) {
     let updates = state.sessions.tick_campfire_cooking();
+    for (position, cooking) in &updates.persisted {
+        persist_campfire_block_entity(state, *position, cooking).await;
+    }
     for (position, cooking) in updates.changed {
         let still_campfire = campfire_block_still_present(state, position).await;
         if still_campfire {

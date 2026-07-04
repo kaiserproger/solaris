@@ -200,6 +200,199 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     }
 }
 
+#[tokio::test]
+async fn survival_campfire_in_flight_state_flushes_to_disk() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("region dir");
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+
+    let storage =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)
+            .expect("disk world opens")
+            .with_generator(generator)
+            .with_item_registry(Arc::clone(&items));
+    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
+    let world = Some(Arc::clone(&world_handle));
+
+    let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
+    let campfire_id = ident("minecraft:campfire");
+    let porkchop = ident("minecraft:porkchop");
+    let cooked_porkchop = ident("minecraft:cooked_porkchop");
+    let campfire_state_id =
+        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
+            .expect("campfire state id fits i32");
+    let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
+    let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
+    let porkchop_name = porkchop.as_str().to_string();
+
+    let recipes = Arc::new(vec![mc_data::recipes::Recipe {
+        id: ident("minecraft:cooked_porkchop_from_campfire_cooking"),
+        kind: mc_data::recipes::RecipeKind::CampfireCooking(mc_data::recipes::SmeltingRecipe {
+            ingredient: mc_data::recipes::Ingredient {
+                alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
+            },
+            cooking_time: 200,
+        }),
+        result: mc_data::recipes::RecipeResult {
+            item: cooked_porkchop,
+            count: 1,
+        },
+    }]);
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 campfire persistence".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks: Arc::clone(&blocks),
+        world,
+        tags,
+        recipes,
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::clone(&items),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M100CampPersist").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:campfire 1 0".into(),
+        })
+        .await
+        .expect("give campfire");
+    wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
+
+    let support_y = sync.y.floor() as i32 - 2;
+    let campfire_y = support_y + 1;
+    let campfire_z = 2;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, support_y, campfire_z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 201,
+        })
+        .await
+        .expect("place campfire");
+    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:porkchop 1 0".into(),
+        })
+        .await
+        .expect("give porkchop");
+    wait_for_slot_stack(&mut client, porkchop_id, 1).await;
+
+    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: campfire_pos,
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 202,
+        })
+        .await
+        .expect("start campfire cooking");
+    wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
+
+    {
+        let mut storage = world_handle.lock().await;
+        let flushed = storage.flush_dirty().expect("flush dirty world");
+        assert!(flushed > 0, "in-flight campfire state should dirty a chunk");
+    }
+
+    let mut reopened =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)
+            .expect("reopen disk world")
+            .with_item_registry(items);
+    let campfire_block_pos = mc_world::BlockPos {
+        x: 0,
+        y: campfire_y,
+        z: campfire_z,
+    };
+    let chunk = reopened
+        .get_chunk(mc_world::ChunkPos { x: 0, z: 0 })
+        .expect("load reopened chunk")
+        .expect("reopened chunk exists");
+    let bytes = chunk
+        .block_entities
+        .get(&campfire_block_pos)
+        .expect("in-flight campfire block entity persisted");
+    let mut cursor = std::io::Cursor::new(bytes.as_slice());
+    let tag = mc_nbt::read_network(&mut cursor).expect("read persisted campfire block entity");
+
+    assert_eq!(
+        compound_string(&tag, "id"),
+        Some("minecraft:campfire"),
+        "persistent campfire block entity should keep its type id"
+    );
+    assert_eq!(compound_int(&tag, "x"), Some(0));
+    assert_eq!(compound_int(&tag, "y"), Some(campfire_y));
+    assert_eq!(compound_int(&tag, "z"), Some(campfire_z));
+    assert!(
+        campfire_items(&tag).is_some_and(|items| items
+            .iter()
+            .any(|item| campfire_item_matches(item, &porkchop_name))),
+        "persistent campfire block entity should retain the cooking input"
+    );
+    assert!(
+        compound_int_array(&tag, "solaris_cooking_remaining")
+            .is_some_and(|remaining| remaining.first().is_some_and(|ticks| *ticks > 0)),
+        "persistent campfire block entity should retain remaining cook time"
+    );
+    assert_eq!(
+        compound_int_array(&tag, "solaris_cooking_total").and_then(|total| total.first().copied()),
+        Some(200)
+    );
+}
+
 async fn wait_for_campfire_input_visual_and_slot(
     client: &mut Client,
     campfire_pos: i64,
@@ -244,6 +437,45 @@ fn campfire_items(nbt: &mc_nbt::Tag) -> Option<&[mc_nbt::Tag]> {
         return None;
     };
     Some(&list.elements)
+}
+
+fn compound_string<'a>(nbt: &'a mc_nbt::Tag, name: &str) -> Option<&'a str> {
+    let mc_nbt::Tag::Compound(fields) = nbt else {
+        return None;
+    };
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .and_then(|value| match value {
+            mc_nbt::Tag::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+}
+
+fn compound_int(nbt: &mc_nbt::Tag, name: &str) -> Option<i32> {
+    let mc_nbt::Tag::Compound(fields) = nbt else {
+        return None;
+    };
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .and_then(|value| match value {
+            mc_nbt::Tag::Int(value) => Some(*value),
+            _ => None,
+        })
+}
+
+fn compound_int_array<'a>(nbt: &'a mc_nbt::Tag, name: &str) -> Option<&'a [i32]> {
+    let mc_nbt::Tag::Compound(fields) = nbt else {
+        return None;
+    };
+    fields
+        .iter()
+        .find_map(|(field, value)| (field == name).then_some(value))
+        .and_then(|value| match value {
+            mc_nbt::Tag::IntArray(values) => Some(values.as_slice()),
+            _ => None,
+        })
 }
 
 fn campfire_item_matches(item: &mc_nbt::Tag, expected_id: &str) -> bool {
