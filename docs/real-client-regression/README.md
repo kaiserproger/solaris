@@ -54,8 +54,9 @@ bash tools/run-real-client-regression.sh --validate-run .analysis/real-client-ru
 Validation checks the artifact shape, fails while the observations remain
 `not-run`/prepared, requires exact
 `"schema": "solaris.real_client_observations.v1"` and
-`"client_gate": "agent-run-real-client"`, rejects observed scenario ids that
-are absent from the manifest, and rejects a passed observed scenario when its
+`"client_gate": "agent-run-real-client"` plus exact
+`"quality_label": "stabilization"`, rejects observed scenario ids that are
+absent from the manifest, and rejects a passed observed scenario when its
 manifest requires screenshots but `observations.json` does not point at an
 existing file under `screenshots/` or points at a file that is not a
 structurally valid PNG. The runner rejects protocol bot/mock commands before

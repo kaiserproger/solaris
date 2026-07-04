@@ -311,6 +311,7 @@ from pathlib import Path
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 EXPECTED_OBSERVATIONS_SCHEMA = "solaris.real_client_observations.v1"
+EXPECTED_QUALITY_LABEL = "stabilization"
 
 
 def png_validation_error(path):
@@ -361,6 +362,12 @@ if not isinstance(observations, dict):
 if observations.get("schema") != EXPECTED_OBSERVATIONS_SCHEMA:
     print(
         f"error: observations.json schema must be {EXPECTED_OBSERVATIONS_SCHEMA}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if observations.get("quality_label") != EXPECTED_QUALITY_LABEL:
+    print(
+        f"error: observations.json quality_label must be {EXPECTED_QUALITY_LABEL}",
         file=sys.stderr,
     )
     sys.exit(1)
