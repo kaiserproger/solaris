@@ -409,6 +409,20 @@ start without persistent world storage and chunk streaming readiness.
 | CLI surface | Passed | `cargo test -p mc-server --test cli -- --nocapture` passed 7/7 after the new warning. |
 | Evidence limit | Partial | This is operator check-output evidence for one missing-world-dir readiness warning. It does not validate filesystem permissions, backup/restore, `/save-all`/`/stop`, existing-world migration, corruption recovery, dependency/security audit, public deployment safety, or data/protocol drift. |
 
+## 2026-07-04 Login Compression Boundary Evidence Slice
+
+This local P2 stabilization slice adds synthetic raw-TCP evidence around the
+login compression boundary. With `compression_threshold = 1`, the harness
+observes `SetCompression` uncompressed, then inspects the next raw frame before
+normal decode and requires a positive compressed-frame `data_length` for
+`LoginSuccess`.
+
+| Gate | Result | Notes |
+|---|---|---|
+| Raw TCP compression boundary | Passed first run | `cargo test -p mc-server --test login login_compresses_post_set_compression_frames_at_configured_threshold -- --nocapture` passed on the first run, proving the current implementation already sends `LoginSuccess` with compressed framing after `SetCompression` at threshold `1`. This is added normal-path evidence, not a bug-fix regression. |
+| Login/config suites | Passed | `cargo test -p mc-server --test login -- --nocapture` passed 8/8, and `cargo test -p mc-server --test configuration -- --nocapture` passed 8/8. |
+| Evidence limit | Draft debt | This is synthetic raw-TCP evidence for one compression threshold and one post-`SetCompression` frame. It is not vanilla oracle evidence, real-client evidence, malformed compressed-frame coverage, compression performance evidence, compression-level coverage, or broad play-state compression proof. |
+
 ## 2026-07-04 Falling-Block Landing/Removal Slice
 
 This local B6 stabilization slice extends falling-block coverage beyond the M47
@@ -428,7 +442,7 @@ start window. A protocol client breaks the support under sand, captures the
 | ID | Row | M100 scope | Status | Current evidence | Known gaps and debt | Target milestones |
 |---|---|---|---|---|---|---|
 | P1 | Login, configuration, known packs, registries, tags, and play start | In scope | `partial` | Early protocol harness, packet IDs from `wire-probe`/`javap`, join-path tests from M1/M36, M79 `spawn-smoke` start/play parity, and an ignored `configuration-phase` parity scenario in `crates/mc-test-harness/tests/parity_oracle.rs` that compares `KnownPacks`, `RegistryData`, `UpdateTags`, and `FinishConfiguration` against a local vanilla server using the extracted sidecar; after refreshing the configuration registry set to match vanilla 26.1.2 (`test_environment`/`test_instance` in, `enchantment_provider`/`trade_set`/`villager_trade` out), the scenario now passes locally. A 2026-06-22 real vanilla-client run of `m94-01-join-rejoin-chunks-movement` reached Play and rejoined Play after an agent-driven disconnect. | Broad real-client coverage is still incomplete, and protocol facts still need to be refreshed before new packet claims beyond the currently exercised configuration/start path. | M79, M94, M95, M100 |
-| P2 | Login compression | In scope | `draft debt` | M8 spawn burst work kept compression as carry-over debt. | Set Compression path and thresholds need oracle/client proof; no broad compression perf boundary evidence. | M79, M90, M91, M100 |
+| P2 | Login compression | In scope | `draft debt` | M8 spawn burst work kept compression as carry-over debt. The 2026-07-04 raw-TCP regression `login_compresses_post_set_compression_frames_at_configured_threshold` proves `SetCompression` is sent uncompressed and the following `LoginSuccess` uses compressed framing at threshold `1`. | Set Compression still needs vanilla oracle/client proof, malformed compressed-frame coverage, compression performance evidence, compression-level coverage, and broad play-state compression proof. | M79, M90, M91, M100 |
 | P3 | Offline/online mode, encryption/session auth, duplicate names, whitelist/banlist/op persistence | In scope | `unknown` | Local offline development path exists through prior session/admission work. The 2026-06-14 stabilization slice adds real TOML-to-TCP login/config coverage for a whitelist-enabled offline server allowing a normalized allow-listed player, alongside existing rejection coverage for online-mode, banlist, and whitelist denial paths. | Online-mode/session auth is undecided; public release readiness is blocked without auth evidence or explicit private/local scope. Whitelist/banlist evidence is focused static-config and TCP integration coverage only; no operator file persistence, real-client, auth-concurrency, or public deployment evidence has been run. | M89, M98, M100 |
 | P4 | Spawn, respawn metadata, `SetDefaultSpawnPosition`, player abilities/gamemode start state | In scope | `partial` | M19/M22/M23 covered command/player state, death guard, and respawn slices. M84 keeps the existing default-spawn packet path and prefers `minecraft:overworld` for play spawn dimension when the registry contains it. | Full vanilla respawn bundle, default spawn packet/client compass behavior, and restart persistence need oracle/client evidence. | M84, M88, M94, M95, M100 |
 | W1 | Sidecar availability, vanilla data drift, registry/data schema, stale/missing-data behavior | In scope | `partial` | Local `data/vanilla/reports` exists; M73 loads embedded fallback loot and optional sidecar simple drops. M80 keeps unsupported loot functions, unsupported rolls/bonus rolls, and non-constant or conditional `set_count` shapes skipped rather than silently green. | Sidecar extraction/version checks and stale/missing-data operator behavior need validation; unsupported datapack feature reporting is still loader-test/doc visible, not yet operator-facing readiness evidence. | M80, M98, M100 |

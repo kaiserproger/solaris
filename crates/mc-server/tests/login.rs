@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 
 use bytes::{Buf, BytesMut};
 use mc_protocol::PROTOCOL_VERSION;
+use mc_protocol::codec::read_varint_partial;
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::ClientboundKnownPacks;
@@ -182,6 +183,23 @@ async fn read_one_frame(
     }
 }
 
+async fn read_complete_raw_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> BytesMut {
+    loop {
+        if let Some((frame_len, prefix_len)) = read_varint_partial(buf.as_ref()).unwrap() {
+            let frame_len = usize::try_from(frame_len).expect("frame length is non-negative");
+            let total = prefix_len + frame_len;
+            if buf.len() >= total {
+                return buf.split_to(total);
+            }
+        }
+        let read = stream.read_buf(buf).await.unwrap();
+        assert!(
+            read > 0,
+            "server closed before sending a complete raw frame"
+        );
+    }
+}
+
 #[tokio::test]
 async fn login_offline_flow_completes() {
     let addr = start_server().await;
@@ -243,6 +261,43 @@ async fn login_offline_flow_completes() {
         "server should advertise Known Packs once Configuration begins"
     );
     let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+}
+
+#[tokio::test]
+async fn login_compresses_post_set_compression_frames_at_configured_threshold() {
+    let addr = start_server_with_policy(mc_net::ChunkPipelinePolicy {
+        compression_threshold: 1,
+        ..mc_net::ChunkPipelinePolicy::default()
+    })
+    .await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "CompressedLogin").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, SetCompression::ID);
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    assert_eq!(set_compression.threshold, 1);
+
+    let raw = read_complete_raw_frame(&mut stream, &mut rbuf).await;
+    let (frame_len, prefix_len) = read_varint_partial(raw.as_ref())
+        .unwrap()
+        .expect("raw frame has length prefix");
+    let compressed_body = &raw[prefix_len..prefix_len + frame_len as usize];
+    let (data_length, _) = read_varint_partial(compressed_body)
+        .unwrap()
+        .expect("compressed frame has data_length prefix");
+    assert!(
+        data_length > 0,
+        "LoginSuccess after SetCompression must use compressed framing at threshold 1",
+    );
+
+    let mut decode_buf = raw.clone();
+    let mut frame = try_decode_frame(&mut decode_buf, Compression::Threshold(1))
+        .unwrap()
+        .expect("compressed LoginSuccess decodes");
+    assert_eq!(frame.id, LoginSuccess::ID);
+    let success = LoginSuccess::decode(&mut frame.body).unwrap();
+    assert_eq!(success.name, "CompressedLogin");
+    assert_eq!(success.uuid, mc_net::offline_uuid("CompressedLogin"));
 }
 
 #[tokio::test]
