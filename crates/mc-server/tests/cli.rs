@@ -186,6 +186,40 @@ fn check_reports_missing_world_dir_path_warning() {
 }
 
 #[test]
+fn check_reports_world_dir_parent_file_warning() {
+    let world_parent_file = NamedTempFile::new().expect("world parent tempfile");
+    let world_dir = world_parent_file.path().join("child-world");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "BlockedWorldParent"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_dir.display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("world_dir_parent_not_directory"))
+        .stdout(contains("world_dir_missing_on_disk").not());
+}
+
+#[test]
 fn check_reports_vanilla_data_protocol_mismatch_warning() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");

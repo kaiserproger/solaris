@@ -94,6 +94,12 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                         });
                     }
                 }
+                Err(_) if has_non_directory_ancestor(world_dir) => {
+                    warnings.push(OperatorWarning {
+                        code: "world_dir_parent_not_directory",
+                        message: "[data].world_dir has a non-directory parent path; serve cannot create usable world storage",
+                    });
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     warnings.push(OperatorWarning {
                         code: "world_dir_missing_on_disk",
@@ -199,6 +205,18 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         });
     }
     warnings
+}
+
+fn has_non_directory_ancestor(path: &Path) -> bool {
+    path.ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+        .find_map(|ancestor| match std::fs::metadata(ancestor) {
+            Ok(metadata) => Some(!metadata.is_dir()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(false),
+        })
+        .unwrap_or(false)
 }
 
 fn is_public_bind_ip(ip: IpAddr) -> bool {
