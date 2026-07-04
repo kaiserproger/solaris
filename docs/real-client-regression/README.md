@@ -55,10 +55,11 @@ Validation checks the artifact shape, fails while the observations remain
 `not-run`/prepared, rejects observed scenario ids that are absent from the
 manifest, and rejects a passed observed scenario when its manifest requires
 screenshots but `observations.json` does not point at an existing file under
-`screenshots/`. The runner rejects protocol bot/mock commands before `--run`;
-`--validate-run` does not re-authenticate a manually edited artifact directory.
-The in-client agent driver also rejects captured screenshot files that are not
-structurally valid PNGs before writing a passed observation.
+`screenshots/` or points at a file that is not a structurally valid PNG. The
+runner rejects protocol bot/mock commands before `--run`; `--validate-run` does
+not re-authenticate a manually edited artifact directory. The in-client agent
+driver also rejects invalid captured PNG artifacts before writing a passed
+observation.
 
 ## In-Client Agent Driver
 
@@ -210,11 +211,11 @@ returns an explicit `run_scenario` result of `passed`; bridge connection,
 `wait_play`, and screenshots by themselves are not a gameplay pass.
 Validation also requires passed observed scenarios with
 `screenshots_required: true` to reference at least one existing
-`screenshots/` artifact, and the driver rejects captured screenshots that are
-not structurally valid PNGs before writing passed observations. These checks
-prove artifact shape only, not screenshot content quality or gameplay
-correctness. Observed scenario ids must exist in the copied manifest, so a
-typo or fabricated id cannot validate as M94 coverage.
+`screenshots/` artifact, and both the runner and driver reject screenshots that
+are not structurally valid PNGs before accepting passed observations. These
+checks prove artifact shape only, not screenshot content quality or gameplay
+correctness. Observed scenario ids must exist in the copied manifest, so a typo
+or fabricated id cannot validate as M94 coverage.
 
 The Solaris-owned bridge source lives under
 `client-mod/solaris-client-agent/`. The `bridge-core` module is a pure Java

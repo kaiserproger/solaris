@@ -304,9 +304,52 @@ validate_run_dir() {
     exit 1
   fi
   python3 - "$run_dir" <<'PY'
+import binascii
 import json
 import sys
 from pathlib import Path
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def png_validation_error(path):
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return f"could not read file: {exc}"
+
+    if not data.startswith(PNG_SIGNATURE):
+        return "missing PNG signature"
+    offset = len(PNG_SIGNATURE)
+    saw_ihdr = False
+    while True:
+        if offset + 12 > len(data):
+            return "truncated PNG chunk header"
+        length = int.from_bytes(data[offset : offset + 4], "big")
+        chunk_type = data[offset + 4 : offset + 8]
+        chunk_start = offset + 8
+        chunk_end = chunk_start + length
+        crc_end = chunk_end + 4
+        if crc_end > len(data):
+            return f"truncated {chunk_type.decode('ascii', errors='replace')} chunk"
+        expected_crc = int.from_bytes(data[chunk_end:crc_end], "big")
+        actual_crc = binascii.crc32(chunk_type + data[chunk_start:chunk_end]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return f"{chunk_type.decode('ascii', errors='replace')} CRC mismatch"
+        if not saw_ihdr:
+            if chunk_type != b"IHDR":
+                return "first PNG chunk is not IHDR"
+            if length != 13:
+                return "IHDR chunk has invalid length"
+            saw_ihdr = True
+        if chunk_type == b"IEND":
+            if length != 0:
+                return "IEND chunk has invalid length"
+            if crc_end != len(data):
+                return "trailing bytes after IEND"
+            return None
+        offset = crc_end
+
 
 run_dir = Path(sys.argv[1])
 manifest = json.loads((run_dir / "manifest.json").read_text())
@@ -360,6 +403,13 @@ for scenario in observations.get("scenarios", []):
         if not screenshot_path.is_file():
             print(
                 f"error: scenario {scenario_id} screenshot is missing on disk: {screenshot}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        png_error = png_validation_error(screenshot_path)
+        if png_error is not None:
+            print(
+                f"error: scenario {scenario_id} screenshot is invalid PNG: {screenshot}: {png_error}",
                 file=sys.stderr,
             )
             sys.exit(1)

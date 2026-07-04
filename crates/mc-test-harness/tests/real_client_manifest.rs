@@ -393,6 +393,92 @@ fn validate_run_rejects_unknown_observed_scenario_id() {
     );
 }
 
+#[test]
+fn validate_run_rejects_invalid_screenshot_png() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-01-join-rejoin-chunks-movement",
+                "result": "passed",
+                "screenshots": ["screenshots/m94-01-join-rejoin-chunks-movement.png"]
+            }]
+        }),
+    );
+    std::fs::write(
+        run_dir
+            .path()
+            .join("screenshots")
+            .join("m94-01-join-rejoin-chunks-movement.png"),
+        b"fake png bytes",
+    )
+    .expect("write invalid screenshot");
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted an invalid screenshot PNG\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("invalid PNG"),
+        "validator error should name invalid PNG bytes\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_run_accepts_valid_required_screenshot_png() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-01-join-rejoin-chunks-movement",
+                "result": "passed",
+                "screenshots": ["screenshots/m94-01-join-rejoin-chunks-movement.png"]
+            }]
+        }),
+    );
+    std::fs::write(
+        run_dir
+            .path()
+            .join("screenshots")
+            .join("m94-01-join-rejoin-chunks-movement.png"),
+        VALID_PNG_1X1,
+    )
+    .expect("write valid screenshot");
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        output.status.success(),
+        "validator rejected a valid screenshot PNG\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("validated"),
+        "validator success should report validated run\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn repo_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -424,3 +510,11 @@ fn validate_run(repo_root: &Path, run_dir: &Path) -> std::process::Output {
         .output()
         .expect("run real-client validator")
 }
+
+const VALID_PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
