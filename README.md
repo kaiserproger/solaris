@@ -33,8 +33,9 @@ to start the server. If `data.vanilla_data_dir` points at a local extracted
 vanilla sidecar, that sidecar is treated as authoritative: registries, tags,
 `reports/block_light.json`, and supported simple loot must be present. Generate
 it with `tools/extract-vanilla-data.sh`; `--check` warns when the sidecar
-`version.json` protocol does not match Solaris. Without `data.vanilla_data_dir`,
-Solaris uses embedded repo-owned fallback data.
+`version.json` is missing, invalid, or targets a protocol that does not match
+Solaris. Without `data.vanilla_data_dir`, Solaris uses embedded repo-owned
+fallback data.
 
 ## Run
 
