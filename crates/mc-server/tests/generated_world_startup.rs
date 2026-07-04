@@ -9,6 +9,7 @@
 
 use std::collections::HashSet;
 use std::fs::File;
+use std::io::Write;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -28,6 +29,8 @@ const EXPECTED_CHUNKS: usize = ((VIEW_DISTANCE * 2 + 1) * (VIEW_DISTANCE * 2 + 1
 const EXPECTED_SPAWN_WINDOW_CHUNKS: usize =
     (((VIEW_DISTANCE + 1) * 2 + 1) * ((VIEW_DISTANCE + 1) * 2 + 1)) as usize;
 const STARTUP_TO_LISTENER_BUDGET: Duration = Duration::from_secs(10);
+const CONSOLE_STOP_CLIENTS: usize = 4;
+const CONSOLE_STOP_STREAM_CHUNKS: usize = 9;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "M100 generated-world startup budget gate; requires local data/vanilla sidecars"]
@@ -142,6 +145,61 @@ async fn disk_backed_existing_world_missing_light_startup_stream_budget() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "M100 console-stop shutdown drain gate; requires local data/vanilla sidecars"]
+async fn disk_backed_generated_world_console_stop_drains_stream_load() {
+    let vanilla_dir = vanilla_data_dir();
+    assert_required_sidecars(&vanilla_dir);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let world_dir = temp.path().join("world");
+    let log = temp.path().join("console-stop-server.log");
+    let addr = loopback_addr_with_reserved_port();
+    let config = temp.path().join("console-stop.toml");
+    write_server_config_with_autoscale(&config, &world_dir, &vanilla_dir, addr.port(), true);
+
+    let mut server = spawn_server_with_stdin(&config, &log);
+    let first_client = connect_when_ready(addr, &mut server, &log).await;
+    let mut client_tasks = Vec::new();
+    client_tasks.push(tokio::spawn(async move {
+        drive_to_play_and_drain_unique(first_client, addr, "M100ConsoleStop0").await
+    }));
+    for idx in 1..CONSOLE_STOP_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let client = Client::connect(addr)
+                .await
+                .expect("connect console-stop client");
+            drive_to_play_and_drain_unique(client, addr, &format!("M100ConsoleStop{idx}")).await
+        }));
+    }
+
+    let mut clients = Vec::new();
+    let mut streamed_chunks = HashSet::new();
+    for task in client_tasks {
+        let (client, chunks) = task.await.expect("console-stop client task joins");
+        streamed_chunks.extend(chunks);
+        clients.push(client);
+    }
+    assert!(
+        !streamed_chunks.is_empty(),
+        "console-stop gate should stream generated chunks before stop"
+    );
+
+    write_console_stop(&mut server);
+    drop(clients);
+    wait_for_server_exit(&mut server, &log, Duration::from_secs(30)).await;
+    let log_text = std::fs::read_to_string(&log).expect("read console-stop log");
+    assert_console_stop_requested_shutdown_before_save(&log_text, "console stop");
+    assert_final_shutdown_save_quiescent(&log_text, "console stop");
+    assert_streamed_chunks_on_disk(&world_dir, &vanilla_dir, &streamed_chunks);
+
+    eprintln!(
+        "M100 console-stop disk-backed stream load: clients={} streamed_chunks={}",
+        CONSOLE_STOP_CLIENTS,
+        streamed_chunks.len(),
+    );
+}
+
 fn vanilla_data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/vanilla")
 }
@@ -168,6 +226,16 @@ fn loopback_addr_with_reserved_port() -> SocketAddr {
 }
 
 fn write_server_config(path: &Path, world_dir: &Path, vanilla_dir: &Path, port: u16) {
+    write_server_config_with_autoscale(path, world_dir, vanilla_dir, port, false);
+}
+
+fn write_server_config_with_autoscale(
+    path: &Path,
+    world_dir: &Path,
+    vanilla_dir: &Path,
+    port: u16,
+    autoscale_enabled: bool,
+) {
     let toml = format!(
         r#"
 [server]
@@ -210,6 +278,10 @@ chunk_worker_threads_percent = 25
 entity_worker_threads_percent = 25
 chunk_result_queue_size = 64
 region_cache_size = 9
+
+[autoscale]
+enabled = {autoscale_enabled}
+profile = "balanced"
 "#,
         world_dir.display(),
         vanilla_dir.display()
@@ -272,6 +344,19 @@ fn spawn_server(config: &Path, log: &Path) -> Child {
         .expect("spawn mc-server")
 }
 
+fn spawn_server_with_stdin(config: &Path, log: &Path) -> Child {
+    let log_file = File::create(log).expect("create server log");
+    let stderr = log_file.try_clone().expect("clone server log");
+    Command::new(assert_cmd::cargo::cargo_bin("mc-server"))
+        .arg("--config")
+        .arg(config)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .expect("spawn mc-server")
+}
+
 async fn connect_when_ready(addr: SocketAddr, child: &mut Child, log: &Path) -> Client {
     let deadline = Instant::now() + Duration::from_secs(90);
     loop {
@@ -298,6 +383,16 @@ async fn connect_when_ready(addr: SocketAddr, child: &mut Child, log: &Path) -> 
 async fn drive_to_play(client: &mut Client, addr: SocketAddr, name: &str) {
     client.drive_login(addr, name).await.expect("login");
     client.drive_configuration().await.expect("configuration");
+}
+
+async fn drive_to_play_and_drain_unique(
+    mut client: Client,
+    addr: SocketAddr,
+    name: &str,
+) -> (Client, HashSet<(i32, i32)>) {
+    drive_to_play(&mut client, addr, name).await;
+    let chunks = drain_unique_chunks(&mut client, CONSOLE_STOP_STREAM_CHUNKS).await;
+    (client, chunks)
 }
 
 #[derive(Debug)]
@@ -386,6 +481,49 @@ async fn drain_view_distance_window(client: &mut Client) -> StreamDrain {
     }
 }
 
+async fn drain_unique_chunks(client: &mut Client, expected: usize) -> HashSet<(i32, i32)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut seen = HashSet::new();
+    while seen.len() < expected {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "timed out waiting for {expected} unique chunks; seen={seen:?}"
+        );
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("read console-stop stream frame");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+            continue;
+        }
+        if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let sync = SynchronizePlayerPosition::decode(&mut body).expect("decode SyncPlayerPos");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: sync.teleport_id,
+                })
+                .await
+                .expect("ack teleport");
+            continue;
+        }
+        if frame.id != LevelChunkWithLight::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let pkt = LevelChunkWithLight::decode(&mut body).expect("decode LevelChunkWithLight");
+        seen.insert((pkt.chunk_x, pkt.chunk_z));
+    }
+    seen
+}
+
 async fn stop_server(client: &mut Client, child: &mut Child, log: &Path) {
     client
         .write_packet(&ServerboundChatCommand {
@@ -414,6 +552,34 @@ async fn stop_server(client: &mut Client, child: &mut Child, log: &Path) {
     }
 }
 
+fn write_console_stop(child: &mut Child) {
+    let stdin = child.stdin.as_mut().expect("console stdin is piped");
+    stdin.write_all(b"stop\n").expect("write console stop");
+    stdin.flush().expect("flush console stop");
+}
+
+async fn wait_for_server_exit(child: &mut Child, log: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait().expect("poll server process") {
+            assert!(
+                status.success(),
+                "server exited non-zero: {status}; log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!(
+                "server did not stop after console command; log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn assert_chunk_stream_summary(log: &str, label: &str) {
     let summary = log
         .lines()
@@ -432,6 +598,44 @@ fn assert_chunk_stream_summary(log: &str, label: &str) {
         assert!(
             summary.contains(expected),
             "{label}: summary missing `{expected}`:\n{summary}"
+        );
+    }
+}
+
+fn assert_console_stop_requested_shutdown_before_save(log: &str, label: &str) {
+    let request_idx = log
+        .lines()
+        .position(|line| line.contains("console stop requested shutdown before save-all"))
+        .unwrap_or_else(|| {
+            panic!("{label}: missing console stop shutdown-before-save log:\n{log}")
+        });
+    let save_idx = log
+        .lines()
+        .position(|line| line.contains("console stop") && line.contains("save-all complete"))
+        .unwrap_or_else(|| panic!("{label}: missing console stop save-all log:\n{log}"));
+    assert!(
+        request_idx < save_idx,
+        "{label}: console save-all started before shutdown request log"
+    );
+}
+
+fn assert_final_shutdown_save_quiescent(log: &str, label: &str) {
+    let lines: Vec<_> = log.lines().collect();
+    let final_save_idx = lines
+        .iter()
+        .position(|line| {
+            line.contains("listener shutdown final save") && line.contains("save-all complete")
+        })
+        .unwrap_or_else(|| panic!("{label}: missing listener final save log:\n{log}"));
+    let pressure = lines[..final_save_idx]
+        .iter()
+        .rev()
+        .find(|line| line.contains("world storage save pressure"))
+        .unwrap_or_else(|| panic!("{label}: missing final save pressure log before final save"));
+    for expected in ["flushed=0", "planned=0", "dirty_before=0", "dirty_after=0"] {
+        assert!(
+            pressure.contains(expected),
+            "{label}: final shutdown save was not quiescent; missing `{expected}`:\n{pressure}"
         );
     }
 }
@@ -487,6 +691,29 @@ fn assert_save_all_flushed_chunks(log: &str, label: &str, expected_chunks: usize
         assert!(
             summary.contains(&expected),
             "{label}: save-all flush summary missing `{expected}`:\n{summary}"
+        );
+    }
+}
+
+fn assert_streamed_chunks_on_disk(
+    world_dir: &Path,
+    vanilla_dir: &Path,
+    streamed_chunks: &HashSet<(i32, i32)>,
+) {
+    let blocks_report =
+        mc_data::blocks::load_blocks_report(vanilla_dir.join("reports/blocks.json"))
+            .expect("load blocks report");
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&blocks_report).expect("registry"));
+    let mut storage =
+        mc_world::WorldStorage::open_with_capacity(world_dir, blocks, streamed_chunks.len().max(4))
+            .expect("reopen console-stop world");
+    for (cx, cz) in streamed_chunks {
+        let chunk = storage
+            .get_chunk(mc_world::ChunkPos { x: *cx, z: *cz })
+            .expect("read streamed chunk after console stop");
+        assert!(
+            chunk.is_some(),
+            "streamed chunk ({cx},{cz}) should exist on disk after console stop"
         );
     }
 }

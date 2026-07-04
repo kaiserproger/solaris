@@ -2,6 +2,7 @@
 //! point.
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -738,13 +739,14 @@ async fn run_console_commands(
                 log_save_report("console save-all", &report);
             }
             Ok(play::commands::AdminCommand::Stop) => {
-                if let Some(runtime_control) = runtime_control.as_ref() {
-                    runtime_control.request_drain();
-                }
-                let report = save_all(&config, &sessions).await;
+                let report = request_console_stop_then_save(
+                    &config.shutdown,
+                    runtime_control.as_ref(),
+                    save_all(&config, &sessions),
+                )
+                .await;
                 log_save_report("console stop", &report);
                 if report.is_ok() {
-                    config.shutdown.request();
                     return;
                 }
                 warn!("console stop aborted because save-all failed");
@@ -767,6 +769,22 @@ async fn run_console_commands(
             }
         }
     }
+}
+
+async fn request_console_stop_then_save<S, SR>(
+    shutdown: &ShutdownHandle,
+    runtime_control: Option<&RuntimeControlHandle>,
+    save: S,
+) -> SR
+where
+    S: Future<Output = SR>,
+{
+    if let Some(runtime_control) = runtime_control {
+        runtime_control.request_drain();
+    }
+    shutdown.request();
+    info!("console stop requested shutdown before save-all");
+    save.await
 }
 
 fn log_save_report(context: &'static str, report: &SaveAllReport) {
@@ -1721,6 +1739,35 @@ mod tests {
         serve_result.expect("serve exits cleanly");
 
         assert!(runtime_control.snapshot().draining);
+    }
+
+    #[tokio::test]
+    async fn console_stop_requests_shutdown_and_drain_before_save() {
+        let shutdown = ShutdownHandle::default();
+        let runtime_control = RuntimeControlHandle::new(crate::RuntimeControlConfig {
+            policy: crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced),
+            initial_limits: crate::RuntimeControlLimits {
+                view_distance: 4,
+                chunk_send_rate: 8,
+                chunk_load_rate: 16,
+                chunk_generate_rate: 16,
+            },
+        });
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let save_shutdown = shutdown.clone();
+        let save_runtime_control = runtime_control.clone();
+        let save_events = Arc::clone(&events);
+        let save = async move {
+            assert!(save_shutdown.is_requested());
+            assert!(save_runtime_control.snapshot().draining);
+            save_events.lock().unwrap().push("save");
+            42
+        };
+
+        let result = request_console_stop_then_save(&shutdown, Some(&runtime_control), save).await;
+
+        assert_eq!(result, 42);
+        assert_eq!(events.lock().unwrap().as_slice(), ["save"]);
     }
 
     fn save_all_test_config(
