@@ -167,6 +167,12 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                 code: "vanilla_data_dir_not_directory",
                 message: "data.vanilla_data_dir exists but is not a directory; rerun tools/extract-vanilla-data.sh or remove data.vanilla_data_dir to use embedded fallback data",
             }),
+            Err(_) if has_non_directory_ancestor(vanilla_data_dir) => {
+                warnings.push(OperatorWarning {
+                    code: "vanilla_data_dir_parent_not_directory",
+                    message: "data.vanilla_data_dir has a non-directory parent path; rerun tools/extract-vanilla-data.sh or remove data.vanilla_data_dir to use embedded fallback data",
+                });
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 warnings.push(OperatorWarning {
                     code: "vanilla_data_dir_missing_on_disk",

@@ -671,6 +671,45 @@ fn check_reports_vanilla_data_dir_file_warning() {
 }
 
 #[test]
+fn check_reports_vanilla_data_dir_parent_file_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_parent_file = NamedTempFile::new().expect("vanilla parent tempfile");
+    let vanilla_dir = vanilla_parent_file.path().join("child-sidecar");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarBlockedParent"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_dir_parent_not_directory"))
+        .stdout(contains("vanilla_data_dir_metadata_unavailable").not())
+        .stdout(contains("vanilla_data_dir_missing_on_disk").not())
+        .stdout(contains("vanilla_data_version_missing").not());
+}
+
+#[test]
 fn check_missing_config_exits_nonzero_with_clear_error() {
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")
