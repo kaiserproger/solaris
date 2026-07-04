@@ -76,7 +76,8 @@ impl AutoscaleSoakReport {
                 || snapshot
                     .outbound_pressure
                     .reliable_command_retries_in_flight
-                    > 0);
+                    > 0
+                || snapshot.outbound_pressure.slow_client_write_timeouts > 0);
         let save_errors_observed = snapshot.save_all.map_or(0, |report| report.errors.len());
 
         let mut gaps = vec![
@@ -243,6 +244,7 @@ mod tests {
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 0,
                 max_reliable_command_retries_in_flight: 1,
+                slow_client_write_timeouts: 0,
             },
             save_all: Some(&save),
         });
@@ -325,6 +327,33 @@ mod tests {
     }
 
     #[test]
+    fn bounded_soak_report_counts_slow_client_write_timeout_as_pressure() {
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::SlowClient],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[],
+            outbound_pressure: OutboundPressureSnapshot {
+                slow_client_write_timeouts: 1,
+                ..OutboundPressureSnapshot::default()
+            },
+            save_all: None,
+        });
+
+        assert_eq!(
+            report.slow_client_pressure,
+            AutoscalePrimitiveStatus::Present
+        );
+        assert!(report.slow_client_pressure_observed);
+    }
+
+    #[test]
     fn bounded_soak_report_does_not_treat_counters_as_unscoped_scenario_evidence() {
         let save = SaveAllReport {
             players_saved: 1,
@@ -350,6 +379,7 @@ mod tests {
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 1,
                 max_reliable_command_retries_in_flight: 1,
+                slow_client_write_timeouts: 0,
             },
             save_all: Some(&save),
         });

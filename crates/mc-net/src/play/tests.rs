@@ -1,10 +1,13 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport};
 use mc_data::items::ItemReport;
+use tokio::io::AsyncWrite;
 
 fn props(entries: &[(&str, &str)]) -> BTreeMap<String, String> {
     entries
@@ -40,6 +43,171 @@ fn text_component_nbt_reports_oversized_text_instead_of_panicking() {
     let err = text_component_nbt(&oversized).expect_err("oversized NBT string should fail");
 
     assert!(matches!(err, mc_protocol::CodecError::Nbt(_)));
+}
+
+struct StalledWriter;
+
+impl AsyncWrite for StalledWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Pending
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+struct AllowThenStallWriter {
+    remaining_ready_writes: usize,
+}
+
+impl AllowThenStallWriter {
+    const fn new(remaining_ready_writes: usize) -> Self {
+        Self {
+            remaining_ready_writes,
+        }
+    }
+}
+
+impl AsyncWrite for AllowThenStallWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        if self.remaining_ready_writes == 0 {
+            return Poll::Pending;
+        }
+        self.remaining_ready_writes -= 1;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
+    crate::server::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "slow-client-test".into(),
+        max_players: 1,
+        view_distance: 0,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: ChunkPipelinePolicy::default(),
+        random_tick: RandomTickPolicy::default(),
+        command_permissions: crate::server::CommandPermissionConfig::new(
+            Vec::<String>::new(),
+            true,
+        ),
+        shutdown: crate::server::ShutdownHandle::default(),
+    }
+}
+
+#[tokio::test]
+async fn outbound_command_write_timeout_sheds_stalled_client() {
+    let mut writer = StalledWriter;
+
+    let outcome = slow_client_outbound_write_timeout(
+        write_packet(
+            &mut writer,
+            &EntityEvent {
+                entity_id: 1,
+                event_id: 2,
+            },
+            Compression::Disabled,
+        ),
+        Duration::from_millis(1),
+    )
+    .await
+    .expect("stalled outbound write timeout should close cleanly");
+
+    assert_eq!(outcome, OutboundWriteOutcome::TimedOut);
+}
+
+#[tokio::test]
+async fn play_loop_closes_session_when_outbound_write_stalls() {
+    let (_client, mut reader) = tokio::io::duplex(64);
+    let mut writer = AllowThenStallWriter::new(3);
+    let mut buf = BytesMut::new();
+    let sessions = Arc::new(SessionRegistry::new());
+    let start_timeouts = sessions.pressure_snapshot().slow_client_write_timeouts;
+    let config = play_loop_slow_client_test_config();
+    let (outbound_tx, outbound_rx) = mpsc::channel(1);
+    outbound_tx
+        .try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        .expect("queue outbound command");
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let respawn = ClientboundRespawn {
+        dimension_type_id: 0,
+        dimension_name: Identifier::parse("minecraft:overworld").unwrap(),
+        hashed_seed: 0,
+        game_mode: GameMode::Survival.id() as u8,
+        previous_game_mode: -1,
+        is_debug: false,
+        is_flat: false,
+        death_location: None,
+        portal_cooldown: 0,
+        sea_level: DEFAULT_SEA_LEVEL,
+        data_to_keep: 0,
+    };
+
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        play_loop(
+            &mut reader,
+            &mut writer,
+            &mut buf,
+            Compression::Disabled,
+            None,
+            None,
+            None,
+            Arc::clone(&sessions),
+            &config,
+            1,
+            pose,
+            pose,
+            respawn,
+            CommandPermissions::from_op(false),
+            SurvivalState::FULL,
+            XpState::default(),
+            GameMode::Survival,
+            None,
+            outbound_rx,
+            0,
+        ),
+    )
+    .await
+    .expect("slow outbound write should be bounded by play-loop timeout");
+
+    result.expect("slow outbound writer should close session cleanly");
+    assert_eq!(
+        sessions.pressure_snapshot().slow_client_write_timeouts,
+        start_timeouts + 1
+    );
 }
 
 #[test]

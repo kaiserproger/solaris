@@ -15,6 +15,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -154,8 +155,8 @@ use recipes::{craft_recipe, ingredient_accepts_item};
 use session::{
     OutboundCommand, OutboundLightUpdate, PlayerEntitySnapshot, ServerEntityMove,
     ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration,
-    VisibilityDispatch, dispatch_visibility_commands, entity_aabb, within_block_reach,
-    within_entity_reach,
+    VisibilityDispatch, dispatch_visibility_commands, entity_aabb,
+    record_slow_client_write_timeout, within_block_reach, within_entity_reach,
 };
 #[cfg(test)]
 use spawn::spawn_chunk_pos;
@@ -190,6 +191,10 @@ thread_local! {
 pub const KEEPALIVE_PERIOD: Duration = Duration::from_secs(15);
 /// How long we wait for the client's echo before disconnecting. Vanilla's value.
 pub const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(not(test))]
+const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 const MAX_PENDING_TELEPORT_RESYNCS: u8 = 3;
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
 const SHIELD_FRONT_ARC_DOT_MIN: f64 = 0.5;
@@ -9149,6 +9154,28 @@ fn collect_light_update_batch(
     updates
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutboundWriteOutcome {
+    Sent,
+    TimedOut,
+}
+
+async fn slow_client_outbound_write_timeout<F>(
+    write: F,
+    timeout: Duration,
+) -> Result<OutboundWriteOutcome, ConnectionError>
+where
+    F: Future<Output = Result<(), ConnectionError>>,
+{
+    match tokio::time::timeout(timeout, write).await {
+        Ok(result) => {
+            result?;
+            Ok(OutboundWriteOutcome::Sent)
+        }
+        Err(_) => Ok(OutboundWriteOutcome::TimedOut),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn play_loop<R, W>(
     reader: &mut R,
@@ -9249,7 +9276,8 @@ where
 
         tokio::select! {
             command = recv_outbound_command(&mut outbound_rx, &mut pending_outbound) => {
-                match command {
+                let outcome = slow_client_outbound_write_timeout(async {
+                    match command {
                     Some(OutboundCommand::BlockDeltas(deltas)) => {
                         let deltas = collect_block_delta_batch(deltas, &mut outbound_rx, &mut pending_outbound);
                         send_block_deltas(writer, compression, &deltas).await?;
@@ -9393,6 +9421,17 @@ where
                         }
                     }
                     None => {}
+                    }
+                    Ok(())
+                }, SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT).await?;
+                if outcome == OutboundWriteOutcome::TimedOut {
+                    record_slow_client_write_timeout();
+                    warn!(
+                        session_id,
+                        timeout_ms = SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT.as_millis() as u64,
+                        "slow client outbound write timed out; closing play session"
+                    );
+                    return Ok(());
                 }
             }
             _ = ticker.tick(), if chunk_stream.as_ref().is_none_or(ChunkStreamState::is_complete) => {

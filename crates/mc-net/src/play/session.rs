@@ -128,12 +128,14 @@ pub(crate) struct SessionPressureSnapshot {
     pub(crate) reliable_command_retries: u64,
     pub(crate) reliable_command_retries_in_flight: u64,
     pub(crate) max_reliable_command_retries_in_flight: u64,
+    pub(crate) slow_client_write_timeouts: u64,
 }
 
 static VISIBILITY_COMMAND_DROPS: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
+static SLOW_CLIENT_WRITE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
 static RELIABLE_RETRY_RECIPIENTS: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
 
 fn reliable_retry_recipients() -> &'static Mutex<HashSet<SessionId>> {
@@ -162,6 +164,10 @@ fn record_reliable_retry_in_flight(current: u64) {
             Err(actual) => observed = actual,
         }
     }
+}
+
+pub(super) fn record_slow_client_write_timeout() {
+    SLOW_CLIENT_WRITE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Clone)]
@@ -569,6 +575,7 @@ impl SessionRegistry {
                 .load(Ordering::Relaxed),
             max_reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT
                 .load(Ordering::Relaxed),
+            slow_client_write_timeouts: SLOW_CLIENT_WRITE_TIMEOUTS.load(Ordering::Relaxed),
         }
     }
 
