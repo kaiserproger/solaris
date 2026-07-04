@@ -124,22 +124,30 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         match std::fs::metadata(vanilla_data_dir) {
             Ok(metadata) if metadata.is_dir() => {
                 let version_path = vanilla_data_dir.join("version.json");
+                let mut current_version = false;
                 match std::fs::read_to_string(version_path) {
                     Ok(raw) => match serde_json::from_str::<VanillaVersionMetadata>(&raw) {
                         Ok(version) => {
-                            if version.id != mc_protocol::TARGET_RELEASE {
+                            let release_matches = version.id == mc_protocol::TARGET_RELEASE;
+                            let world_version_matches =
+                                version.world_version == mc_protocol::WORLD_VERSION;
+                            let protocol_matches =
+                                version.protocol_version == mc_protocol::PROTOCOL_VERSION;
+                            current_version =
+                                release_matches && world_version_matches && protocol_matches;
+                            if !release_matches {
                                 warnings.push(OperatorWarning {
                                     code: "vanilla_data_release_mismatch",
                                     message: "data.vanilla_data_dir version.json id does not match Solaris target release; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                                 });
                             }
-                            if version.world_version != mc_protocol::WORLD_VERSION {
+                            if !world_version_matches {
                                 warnings.push(OperatorWarning {
                                     code: "vanilla_data_world_version_mismatch",
                                     message: "data.vanilla_data_dir version.json world_version does not match Solaris world version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                                 });
                             }
-                            if version.protocol_version != mc_protocol::PROTOCOL_VERSION {
+                            if !protocol_matches {
                                 warnings.push(OperatorWarning {
                                     code: "vanilla_data_protocol_mismatch",
                                     message: "data.vanilla_data_dir version.json protocol_version does not match Solaris; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
@@ -161,6 +169,12 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                         code: "vanilla_data_version_invalid",
                         message: "data.vanilla_data_dir version.json is not readable as UTF-8, is not valid metadata, or is missing id, world_version, or protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                     }),
+                }
+                if current_version && !vanilla_registry_tree_is_complete(vanilla_data_dir) {
+                    warnings.push(OperatorWarning {
+                        code: "vanilla_data_registry_tree_incomplete",
+                        message: "data.vanilla_data_dir is missing required registry JSON under data/minecraft; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                    });
                 }
             }
             Ok(_) => warnings.push(OperatorWarning {
@@ -211,6 +225,37 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         });
     }
     warnings
+}
+
+fn vanilla_registry_tree_is_complete(vanilla_data_dir: &Path) -> bool {
+    let minecraft_root = vanilla_data_dir.join("data").join("minecraft");
+    minecraft_root.is_dir()
+        && mc_data::KNOWN_REGISTRIES
+            .iter()
+            .all(|(_, fs_subpath)| registry_dir_has_json(&minecraft_root.join(fs_subpath)))
+}
+
+fn registry_dir_has_json(path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            return false;
+        };
+        if file_type.is_file()
+            && path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        {
+            return true;
+        }
+        if file_type.is_dir() && registry_dir_has_json(&path) {
+            return true;
+        }
+    }
+    false
 }
 
 fn has_non_directory_ancestor(path: &Path) -> bool {
