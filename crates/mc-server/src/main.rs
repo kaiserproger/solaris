@@ -240,6 +240,18 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         });
     }
 
+    if config
+        .admin
+        .operators
+        .iter()
+        .any(|operator| operator.trim().is_empty())
+    {
+        warnings.push(OperatorWarning {
+            code: "admin_operator_entry_blank",
+            message: "admin.operators contains an empty or whitespace-only name; blank entries never grant operator permissions",
+        });
+    }
+
     if config.auth.online_mode {
         warnings.push(OperatorWarning {
             code: "online_mode_unsupported",
