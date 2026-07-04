@@ -120,6 +120,38 @@ fn check_reports_missing_world_dir_warning() {
 }
 
 #[test]
+fn check_reports_world_dir_file_warning() {
+    let world_file = NamedTempFile::new().expect("world tempfile");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "FileWorld"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_file.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("world_dir_not_directory"));
+}
+
+#[test]
 fn check_missing_config_exits_nonzero_with_clear_error() {
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")

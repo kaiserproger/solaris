@@ -47,8 +47,8 @@ cargo run --bin mc-server -- --config example.toml
 
 The `--check` JSON includes `operator_warnings`. Treat non-empty warnings as
 deployment readiness blockers; for example, public binds with offline-mode auth
-or `allow_local_dev_operators` are not production-safe, and a missing
-`[data].world_dir` means chunk streaming/persistence is not ready.
+or `allow_local_dev_operators` are not production-safe, and a missing or
+unusable `[data].world_dir` means chunk streaming/persistence is not ready.
 
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
 

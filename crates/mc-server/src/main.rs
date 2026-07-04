@@ -76,11 +76,23 @@ struct OperatorWarning {
 
 fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     let mut warnings = Vec::new();
-    if config.data.world_dir.is_none() {
-        warnings.push(OperatorWarning {
-            code: "missing_world_dir",
-            message: "no [data].world_dir configured; serve will start without persistent chunk streaming",
-        });
+    match &config.data.world_dir {
+        Some(world_dir) => {
+            if let Ok(metadata) = std::fs::metadata(world_dir)
+                && !metadata.is_dir()
+            {
+                warnings.push(OperatorWarning {
+                    code: "world_dir_not_directory",
+                    message: "[data].world_dir exists but is not a directory; serve will start without usable world storage",
+                });
+            }
+        }
+        None => {
+            warnings.push(OperatorWarning {
+                code: "missing_world_dir",
+                message: "no [data].world_dir configured; serve will start without persistent chunk streaming",
+            });
+        }
     }
 
     let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
