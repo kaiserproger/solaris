@@ -351,6 +351,37 @@ fn validate_run_rejects_missing_required_scenario_screenshots() {
 }
 
 #[test]
+fn validate_run_rejects_misspelled_client_gate() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-runreal-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": []
+        }),
+    );
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted a misspelled client_gate\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("client_gate"),
+        "validator error should name client_gate\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn validate_run_rejects_unknown_observed_scenario_id() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");

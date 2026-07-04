@@ -295,8 +295,8 @@ validate_run_dir() {
     fi
   done
   observations="$(tr -d '\n[:space:]' < "$run_dir/observations.json")"
-  if [[ "$observations" != *'"client_gate":"agent-runreal-client"'* && "$observations" != *'"client_gate":"agent-run-real-client"'* ]]; then
-    printf 'error: observations.json does not record an agent-run real-client gate\n' >&2
+  if [[ "$observations" != *'"client_gate":"agent-run-real-client"'* ]]; then
+    printf 'error: observations.json client_gate must be agent-run-real-client\n' >&2
     exit 1
   fi
   if [[ "$observations" == *'"result":"not-run"'* || "$observations" == *'"result":"prepared"'* ]]; then
