@@ -37,6 +37,7 @@ pub struct AutoscaleSoakSnapshot<'a> {
     pub chunk_stop_reasons: &'a [ChunkPipelineStopReason],
     pub outbound_pressure: OutboundPressureSnapshot,
     pub save_all: Option<&'a SaveAllReport>,
+    pub memory_pressure_shed_chunks: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,9 +48,12 @@ pub struct AutoscaleSoakReport {
     pub bounded_chunk_queue: AutoscalePrimitiveStatus,
     pub worker_backpressure: AutoscalePrimitiveStatus,
     pub slow_client_pressure: AutoscalePrimitiveStatus,
+    pub memory_pressure_shedding: AutoscalePrimitiveStatus,
     pub save_recovery_visibility: AutoscalePrimitiveStatus,
     pub queue_saturation_observed: bool,
     pub slow_client_pressure_observed: bool,
+    pub memory_pressure_shedding_observed: bool,
+    pub memory_pressure_shed_chunks: usize,
     pub save_errors_observed: usize,
     pub gaps: Vec<&'static str>,
 }
@@ -63,6 +67,9 @@ impl AutoscaleSoakReport {
         let slow_client_attempted = snapshot
             .scenarios
             .contains(&AutoscaleSoakScenario::SlowClient);
+        let memory_pressure_attempted = snapshot
+            .scenarios
+            .contains(&AutoscaleSoakScenario::MemoryPressure);
         let save_during_shutdown_attempted = snapshot
             .scenarios
             .contains(&AutoscaleSoakScenario::SaveDuringShutdown);
@@ -78,13 +85,21 @@ impl AutoscaleSoakReport {
                     .reliable_command_retries_in_flight
                     > 0
                 || snapshot.outbound_pressure.slow_client_write_timeouts > 0);
+        let memory_pressure_shedding_observed = memory_pressure_attempted
+            && snapshot.memory_pressure_shed_chunks > 0
+            && snapshot
+                .chunk_stop_reasons
+                .contains(&ChunkPipelineStopReason::MemoryPressure);
         let save_errors_observed = snapshot.save_all.map_or(0, |report| report.errors.len());
 
         let mut gaps = vec![
             "dynamic runtime scale-up/scale-down controller is absent",
             "profile validation is config-level only, not measured against low-end/balanced/high-end hardware",
-            "memory-pressure shedding, recovery, and soak evidence are absent",
+            "memory-pressure recovery and soak evidence are absent",
         ];
+        if !memory_pressure_shedding_observed {
+            gaps.push("memory-pressure shedding evidence is absent");
+        }
 
         for (scenario, gap) in [
             (
@@ -156,6 +171,13 @@ impl AutoscaleSoakReport {
                     reason: "no slow-client outbound pressure was observed in this bounded slice",
                 }
             },
+            memory_pressure_shedding: if memory_pressure_shedding_observed {
+                AutoscalePrimitiveStatus::Present
+            } else {
+                AutoscalePrimitiveStatus::Degraded {
+                    reason: "no memory-pressure work shedding was observed in this bounded slice",
+                }
+            },
             save_recovery_visibility: if save_during_shutdown_attempted
                 && snapshot.save_all.is_some()
             {
@@ -167,6 +189,8 @@ impl AutoscaleSoakReport {
             },
             queue_saturation_observed,
             slow_client_pressure_observed,
+            memory_pressure_shedding_observed,
+            memory_pressure_shed_chunks: snapshot.memory_pressure_shed_chunks,
             save_errors_observed,
             gaps,
         }
@@ -178,6 +202,10 @@ impl AutoscaleSoakReport {
             || !matches!(self.bounded_chunk_queue, AutoscalePrimitiveStatus::Present)
             || !matches!(self.worker_backpressure, AutoscalePrimitiveStatus::Present)
             || !matches!(self.slow_client_pressure, AutoscalePrimitiveStatus::Present)
+            || !matches!(
+                self.memory_pressure_shedding,
+                AutoscalePrimitiveStatus::Present
+            )
             || !matches!(
                 self.save_recovery_visibility,
                 AutoscalePrimitiveStatus::Present
@@ -247,6 +275,7 @@ mod tests {
                 slow_client_write_timeouts: 0,
             },
             save_all: Some(&save),
+            memory_pressure_shed_chunks: 0,
         });
 
         assert_eq!(
@@ -291,6 +320,7 @@ mod tests {
             chunk_stop_reasons: &[ChunkPipelineStopReason::LoadBudget],
             outbound_pressure: OutboundPressureSnapshot::default(),
             save_all: None,
+            memory_pressure_shed_chunks: 0,
         });
 
         assert_eq!(
@@ -344,6 +374,7 @@ mod tests {
                 ..OutboundPressureSnapshot::default()
             },
             save_all: None,
+            memory_pressure_shed_chunks: 0,
         });
 
         assert_eq!(
@@ -351,6 +382,43 @@ mod tests {
             AutoscalePrimitiveStatus::Present
         );
         assert!(report.slow_client_pressure_observed);
+    }
+
+    #[test]
+    fn bounded_soak_report_counts_memory_pressure_shedding_as_focused_evidence() {
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::MemoryPressure],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[ChunkPipelineStopReason::MemoryPressure],
+            outbound_pressure: OutboundPressureSnapshot::default(),
+            save_all: None,
+            memory_pressure_shed_chunks: 3,
+        });
+
+        assert_eq!(
+            report.memory_pressure_shedding,
+            AutoscalePrimitiveStatus::Present
+        );
+        assert!(report.memory_pressure_shedding_observed);
+        assert_eq!(report.memory_pressure_shed_chunks, 3);
+        assert!(
+            !report
+                .gaps
+                .contains(&"memory-pressure shedding evidence is absent")
+        );
+        assert!(
+            report
+                .gaps
+                .contains(&"memory-pressure recovery and soak evidence are absent")
+        );
+        assert!(report.is_degraded());
     }
 
     #[test]
@@ -382,6 +450,7 @@ mod tests {
                 slow_client_write_timeouts: 0,
             },
             save_all: Some(&save),
+            memory_pressure_shed_chunks: 0,
         });
 
         assert!(!report.queue_saturation_observed);

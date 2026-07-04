@@ -123,6 +123,10 @@ pub(super) struct ChunkStreamState {
     max_pressure_flush_plan_ms: u64,
     max_pressure_flush_write_ms: u64,
     max_pressure_flush_commit_ms: u64,
+    memory_pressure_shed_runs: usize,
+    memory_pressure_shed_ready: usize,
+    memory_pressure_shed_in_flight: usize,
+    memory_pressure_active: bool,
     bytes: usize,
     dispatch_turns: usize,
     yielded_turns: usize,
@@ -863,6 +867,10 @@ impl ChunkStreamState {
             max_pressure_flush_plan_ms: 0,
             max_pressure_flush_write_ms: 0,
             max_pressure_flush_commit_ms: 0,
+            memory_pressure_shed_runs: 0,
+            memory_pressure_shed_ready: 0,
+            memory_pressure_shed_in_flight: 0,
+            memory_pressure_active: false,
             bytes: 0,
             dispatch_turns: 0,
             yielded_turns: 0,
@@ -1087,7 +1095,9 @@ impl ChunkStreamState {
             )
             .await?;
         }
-        self.dispatch_available();
+        if !self.memory_pressure_active {
+            self.dispatch_available();
+        }
         self.drain_ready();
 
         let made_send_progress = self.emit_ready_batch(writer, light_cache).await?;
@@ -1147,7 +1157,18 @@ impl ChunkStreamState {
             memory_limit_mb: 0,
             first_chunk_ms: self.first_chunk_ms,
         });
-        self.apply_runtime_control_limits(decision.limits)
+        let memory_pressure_active = decision.pressure == Some(crate::AutoscalePressure::Memory);
+        let should_shed_memory =
+            memory_pressure_active && decision.action == crate::AutoscaleAction::ScaleDown;
+        if should_shed_memory {
+            self.shed_memory_pressure_work();
+        }
+        let unloads = self.apply_runtime_control_limits(decision.limits);
+        self.memory_pressure_active = memory_pressure_active;
+        if memory_pressure_active {
+            self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
+        }
+        unloads
     }
 
     fn apply_runtime_control_limits(
@@ -1191,6 +1212,10 @@ impl ChunkStreamState {
         loop {
             if self.scheduler.in_flight_len() >= self.result_queue_size {
                 self.last_stop_reason = ChunkPipelineStopReason::QueueFull;
+                break;
+            }
+            if self.memory_pressure_active {
+                self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
                 break;
             }
             if dispatched_this_turn >= self.policy.chunk_prepare_batch_size {
@@ -1239,6 +1264,29 @@ impl ChunkStreamState {
             self.dispatched += 1;
         }
         self.max_in_flight = self.max_in_flight.max(self.scheduler.in_flight_len());
+    }
+
+    fn shed_memory_pressure_work(&mut self) {
+        let ready = self.ready.len();
+        let in_flight = self.scheduler.in_flight_len();
+        self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
+        if ready == 0 && in_flight == 0 {
+            return;
+        }
+
+        self.ready.clear();
+        self.reset_pressure_tracking();
+        self.scheduler.replace_view(prioritized_spiral(
+            self.center_cx,
+            self.center_cz,
+            self.view_distance,
+            self.direction_yaw,
+        ));
+        self.active_generation
+            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.memory_pressure_shed_runs += 1;
+        self.memory_pressure_shed_ready += ready;
+        self.memory_pressure_shed_in_flight += in_flight;
     }
 
     fn spawn_prepare_worker(&self, request: ChunkRequest) {
@@ -1573,6 +1621,9 @@ impl ChunkStreamState {
             max_pressure_flush_plan_ms = self.max_pressure_flush_plan_ms,
             max_pressure_flush_write_ms = self.max_pressure_flush_write_ms,
             max_pressure_flush_commit_ms = self.max_pressure_flush_commit_ms,
+            memory_pressure_shed_runs = self.memory_pressure_shed_runs,
+            memory_pressure_shed_ready = self.memory_pressure_shed_ready,
+            memory_pressure_shed_in_flight = self.memory_pressure_shed_in_flight,
             degraded_delivery = self.pressure_abandoned > 0,
             bytes = self.bytes,
             framed_bytes = self.framed_bytes,
@@ -3419,6 +3470,7 @@ mod tests {
                     max_chunk_load_rate: 64,
                     min_chunk_generate_rate: 1,
                     max_chunk_generate_rate: 32,
+                    queue_pressure_percent: 100,
                     memory_pressure_percent: 50,
                     scale_down_after_ticks: 1,
                     ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
@@ -3471,6 +3523,205 @@ mod tests {
             crate::AutoscaleAction::ScaleDown
         );
         assert_eq!(snapshot.limits.chunk_send_rate, 2);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_memory_pressure_sheds_ready_and_in_flight_work() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            },
+        );
+        let control = crate::RuntimeControlHandle::new_with_memory_pressure(
+            crate::RuntimeControlConfig {
+                policy: crate::AutoscalePolicy {
+                    min_view_distance: 1,
+                    max_view_distance: 1,
+                    min_chunk_send_rate: 1,
+                    max_chunk_send_rate: 4,
+                    min_chunk_load_rate: 1,
+                    max_chunk_load_rate: 64,
+                    min_chunk_generate_rate: 1,
+                    max_chunk_generate_rate: 32,
+                    queue_pressure_percent: 100,
+                    memory_pressure_percent: 50,
+                    scale_down_after_ticks: 1,
+                    ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+                },
+                initial_limits: crate::RuntimeControlLimits {
+                    view_distance: 1,
+                    chunk_send_rate: 4,
+                    chunk_load_rate: 64,
+                    chunk_generate_rate: 32,
+                },
+            },
+            memory_pressure,
+        );
+        let policy = ChunkPipelinePolicy {
+            chunk_send_rate: 4,
+            chunk_result_queue_size: 16,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            1,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        )
+        .with_runtime_control(Some(control.clone()));
+        let mut old_generation = None;
+        for _ in 0..3 {
+            let request = stream.scheduler.poll_next().expect("queued chunk");
+            old_generation.get_or_insert(request.generation);
+            stream.accept_result(ChunkPrepareResult {
+                request,
+                fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
+                staged: Vec::new(),
+                outcome: ChunkPrepareOutcome::Absent,
+            });
+        }
+        assert_eq!(stream.ready.len(), 3);
+        assert_eq!(stream.scheduler.in_flight_len(), 3);
+
+        stream.observe_runtime_control();
+
+        let snapshot = control.snapshot();
+        assert_eq!(
+            snapshot.last_decision.pressure,
+            Some(crate::AutoscalePressure::Memory)
+        );
+        assert_eq!(stream.ready.len(), 0);
+        assert_eq!(stream.scheduler.in_flight_len(), 0);
+        assert!(stream.scheduler.queued_len() >= 3);
+        assert_eq!(stream.memory_pressure_shed_runs, 1);
+        assert_eq!(stream.memory_pressure_shed_ready, 3);
+        assert_eq!(stream.memory_pressure_shed_in_flight, 3);
+        assert_eq!(
+            stream.last_stop_reason,
+            ChunkPipelineStopReason::MemoryPressure
+        );
+
+        let replayed = stream.scheduler.poll_next().expect("replayed request");
+        assert_ne!(Some(replayed.generation), old_generation);
+    }
+
+    #[tokio::test]
+    async fn runtime_control_memory_pressure_pauses_dispatch_until_pressure_clears() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let memory_pressure = crate::memory_pressure::MemoryPressureHandle::with_sample(
+            crate::memory_pressure::MemoryPressureSnapshot {
+                used_mb: 900,
+                limit_mb: 1_000,
+            },
+        );
+        let control = crate::RuntimeControlHandle::new_with_memory_pressure(
+            crate::RuntimeControlConfig {
+                policy: crate::AutoscalePolicy {
+                    min_view_distance: 1,
+                    max_view_distance: 1,
+                    min_chunk_send_rate: 1,
+                    max_chunk_send_rate: 4,
+                    min_chunk_load_rate: 1,
+                    max_chunk_load_rate: 64,
+                    min_chunk_generate_rate: 1,
+                    max_chunk_generate_rate: 32,
+                    memory_pressure_percent: 50,
+                    scale_down_after_ticks: 1,
+                    scale_up_after_ticks: 1,
+                    ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
+                },
+                initial_limits: crate::RuntimeControlLimits {
+                    view_distance: 1,
+                    chunk_send_rate: 4,
+                    chunk_load_rate: 64,
+                    chunk_generate_rate: 32,
+                },
+            },
+            memory_pressure.clone(),
+        );
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 2,
+            chunk_result_queue_size: 4,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::new(SessionRegistry::new()),
+            1,
+            0,
+            0,
+            0.0,
+            1,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        )
+        .with_runtime_control(Some(control));
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        stream.step(&mut writer, &mut light_cache).await.unwrap();
+
+        assert_eq!(stream.scheduler.in_flight_len(), 0);
+        assert_eq!(
+            stream.last_stop_reason,
+            ChunkPipelineStopReason::MemoryPressure
+        );
+
+        memory_pressure.set_sample(crate::memory_pressure::MemoryPressureSnapshot {
+            used_mb: 100,
+            limit_mb: 1_000,
+        });
+        stream.step(&mut writer, &mut light_cache).await.unwrap();
+
+        assert!(stream.scheduler.in_flight_len() > 0);
+        assert_ne!(
+            stream.last_stop_reason,
+            ChunkPipelineStopReason::MemoryPressure
+        );
     }
 
     #[tokio::test]

@@ -183,6 +183,7 @@ pub enum ChunkPipelineStopReason {
     SendBudget,
     LoadBudget,
     GenerateBudget,
+    MemoryPressure,
     QueueFull,
     QueueEmpty,
     Complete,

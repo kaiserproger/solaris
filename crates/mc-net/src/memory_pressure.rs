@@ -40,6 +40,11 @@ impl MemoryPressureHandle {
         handle
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_sample(&self, snapshot: MemoryPressureSnapshot) {
+        self.store(snapshot);
+    }
+
     fn store(&self, snapshot: MemoryPressureSnapshot) {
         self.inner
             .used_mb
