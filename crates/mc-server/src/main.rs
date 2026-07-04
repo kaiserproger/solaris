@@ -113,28 +113,46 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     }
 
     if let Some(vanilla_data_dir) = &config.data.vanilla_data_dir {
-        let version_path = vanilla_data_dir.join("version.json");
-        match std::fs::read_to_string(version_path) {
-            Ok(raw) => match serde_json::from_str::<VanillaVersionMetadata>(&raw) {
-                Ok(version) => {
-                    if version
-                        .protocol_version
-                        .is_some_and(|protocol| protocol != mc_protocol::PROTOCOL_VERSION)
-                    {
-                        warnings.push(OperatorWarning {
-                            code: "vanilla_data_protocol_mismatch",
-                            message: "data.vanilla_data_dir version.json protocol_version does not match Solaris; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
-                        });
+        match std::fs::metadata(vanilla_data_dir) {
+            Ok(metadata) if metadata.is_dir() => {
+                let version_path = vanilla_data_dir.join("version.json");
+                match std::fs::read_to_string(version_path) {
+                    Ok(raw) => match serde_json::from_str::<VanillaVersionMetadata>(&raw) {
+                        Ok(version) => {
+                            if version
+                                .protocol_version
+                                .is_some_and(|protocol| protocol != mc_protocol::PROTOCOL_VERSION)
+                            {
+                                warnings.push(OperatorWarning {
+                                    code: "vanilla_data_protocol_mismatch",
+                                    message: "data.vanilla_data_dir version.json protocol_version does not match Solaris; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                                });
+                            }
+                        }
+                        Err(_) => warnings.push(OperatorWarning {
+                            code: "vanilla_data_version_invalid",
+                            message: "data.vanilla_data_dir version.json is not valid metadata; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        }),
                     }
+                    Err(_) => warnings.push(OperatorWarning {
+                        code: "vanilla_data_version_missing",
+                        message: "data.vanilla_data_dir is missing version.json; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                    }),
                 }
-                Err(_) => warnings.push(OperatorWarning {
-                    code: "vanilla_data_version_invalid",
-                    message: "data.vanilla_data_dir version.json is not valid metadata; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
-                }),
-            },
+            }
+            Ok(_) => warnings.push(OperatorWarning {
+                code: "vanilla_data_dir_not_directory",
+                message: "data.vanilla_data_dir exists but is not a directory; rerun tools/extract-vanilla-data.sh or remove data.vanilla_data_dir to use embedded fallback data",
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                warnings.push(OperatorWarning {
+                    code: "vanilla_data_dir_missing_on_disk",
+                    message: "data.vanilla_data_dir does not exist on disk; rerun tools/extract-vanilla-data.sh or remove data.vanilla_data_dir to use embedded fallback data",
+                });
+            }
             Err(_) => warnings.push(OperatorWarning {
-                code: "vanilla_data_version_missing",
-                message: "data.vanilla_data_dir is missing version.json; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                code: "vanilla_data_dir_metadata_unavailable",
+                message: "data.vanilla_data_dir metadata is unavailable; serve may fail to load authoritative sidecar data or remove data.vanilla_data_dir to use embedded fallback data",
             }),
         }
     }

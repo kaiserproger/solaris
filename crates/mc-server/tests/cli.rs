@@ -7,6 +7,7 @@
 use std::io::Write;
 
 use assert_cmd::Command;
+use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
 use tempfile::NamedTempFile;
 
@@ -294,6 +295,79 @@ fn check_reports_invalid_vanilla_data_version_warning() {
         .success()
         .stdout(contains("\"operator_warnings\""))
         .stdout(contains("vanilla_data_version_invalid"));
+}
+
+#[test]
+fn check_reports_missing_vanilla_data_dir_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_parent = tempfile::tempdir().expect("vanilla parent tempdir");
+    let vanilla_dir = vanilla_parent.path().join("missing-sidecar");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarMissingRoot"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_dir_missing_on_disk"))
+        .stdout(contains("vanilla_data_version_missing").not());
+}
+
+#[test]
+fn check_reports_vanilla_data_dir_file_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_file = NamedTempFile::new().expect("vanilla file");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarFileRoot"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_file.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_dir_not_directory"))
+        .stdout(contains("vanilla_data_version_missing").not());
 }
 
 #[test]
