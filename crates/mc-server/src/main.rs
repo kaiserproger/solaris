@@ -181,6 +181,11 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                             code: "vanilla_data_block_light_report_invalid",
                             message: "data.vanilla_data_dir reports/block_light.json is missing, malformed, or targets a different release; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                         });
+                    } else if !vanilla_tags_are_usable(vanilla_data_dir) {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_tags_unavailable",
+                            message: "data.vanilla_data_dir tags are missing, malformed, or lack required resolved block/item/entity_type entries; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
                     }
                 }
             }
@@ -268,6 +273,14 @@ fn registry_dir_has_json(path: &Path) -> bool {
 fn vanilla_block_light_report_matches_target(vanilla_data_dir: &Path) -> bool {
     let path = vanilla_data_dir.join("reports").join("block_light.json");
     mc_data::block_light::load(path).is_ok_and(|table| table.version == mc_protocol::TARGET_RELEASE)
+}
+
+fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
+    let Ok(protocol_data) = load_effective_protocol_data(Some(vanilla_data_dir)) else {
+        return false;
+    };
+    let items = mc_data::items::solaris_required_items();
+    load_effective_tags(Some(vanilla_data_dir), &protocol_data.data, &items).is_ok()
 }
 
 fn has_non_directory_ancestor(path: &Path) -> bool {
