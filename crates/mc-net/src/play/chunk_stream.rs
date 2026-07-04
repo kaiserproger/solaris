@@ -26,6 +26,16 @@ pub(super) struct ChunkWriteTiming {
     framed_bytes: usize,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+struct PressureFlushTiming {
+    runs: usize,
+    planned_chunks: usize,
+    flushed_chunks: usize,
+    plan_ms: u64,
+    write_ms: u64,
+    commit_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ChunkStreamStep {
     Progress,
@@ -37,7 +47,6 @@ const CHUNK_STAGE_SLOW_MS: u64 = 50;
 const CHUNK_BACKPRESSURE_COOLDOWN_TURNS: usize = 8;
 const CHUNK_BACKPRESSURE_MAX_COOLDOWN_TURNS: usize = 64;
 const CHUNK_BACKPRESSURE_MAX_RETRIES: usize = 16;
-
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     biomes: Arc<Registry>,
@@ -98,6 +107,15 @@ pub(super) struct ChunkStreamState {
     absent: usize,
     pressure_abandoned: usize,
     pressure_staged_by_chunk: HashMap<(i32, i32), HashSet<(i32, i32)>>,
+    pressure_flush_runs: usize,
+    pressure_flush_planned_chunks: usize,
+    pressure_flush_flushed_chunks: usize,
+    pressure_flush_plan_ms: u64,
+    pressure_flush_write_ms: u64,
+    pressure_flush_commit_ms: u64,
+    max_pressure_flush_plan_ms: u64,
+    max_pressure_flush_write_ms: u64,
+    max_pressure_flush_commit_ms: u64,
     bytes: usize,
     dispatch_turns: usize,
     yielded_turns: usize,
@@ -154,6 +172,7 @@ enum EmitReadyResult {
 struct ChunkPrepareResult {
     request: crate::ChunkRequest,
     fetch_ms: u64,
+    pressure_flush: PressureFlushTiming,
     staged: Vec<(i32, i32)>,
     outcome: ChunkPrepareOutcome,
 }
@@ -818,6 +837,15 @@ impl ChunkStreamState {
             absent: 0,
             pressure_abandoned: 0,
             pressure_staged_by_chunk: HashMap::new(),
+            pressure_flush_runs: 0,
+            pressure_flush_planned_chunks: 0,
+            pressure_flush_flushed_chunks: 0,
+            pressure_flush_plan_ms: 0,
+            pressure_flush_write_ms: 0,
+            pressure_flush_commit_ms: 0,
+            max_pressure_flush_plan_ms: 0,
+            max_pressure_flush_write_ms: 0,
+            max_pressure_flush_commit_ms: 0,
             bytes: 0,
             dispatch_turns: 0,
             yielded_turns: 0,
@@ -913,7 +941,7 @@ impl ChunkStreamState {
         dispatch_visibility_commands(visibility);
         self.ready.clear();
         self.reset_pressure_tracking();
-        self.scheduler.replace_view(prioritized_spiral(
+        self.scheduler.replay_view(prioritized_spiral(
             self.center_cx,
             self.center_cz,
             self.view_distance,
@@ -923,6 +951,31 @@ impl ChunkStreamState {
             .store(self.scheduler.current_generation().0, Ordering::Release);
         self.reset_window_metrics();
         unloads
+    }
+
+    pub(super) fn replay_current_view(&mut self, direction_yaw: f32) {
+        let loaded: Vec<_> = self.loaded.drain().collect();
+        dispatch_visibility_commands(self.sessions.mark_unloaded(self.session_id, &loaded));
+
+        let desired = desired_chunk_set(self.center_cx, self.center_cz, self.view_distance);
+        dispatch_visibility_commands(self.sessions.replace_view(
+            self.session_id,
+            (self.center_cx, self.center_cz),
+            self.view_distance,
+            desired,
+        ));
+        self.direction_yaw = direction_yaw;
+        self.ready.clear();
+        self.reset_pressure_tracking();
+        self.scheduler.replay_view(prioritized_spiral(
+            self.center_cx,
+            self.center_cz,
+            self.view_distance,
+            self.direction_yaw,
+        ));
+        self.active_generation
+            .store(self.scheduler.current_generation().0, Ordering::Release);
+        self.reset_window_metrics();
     }
 
     fn reset_window_metrics(&mut self) {
@@ -955,6 +1008,15 @@ impl ChunkStreamState {
         self.absent = 0;
         self.pressure_abandoned = 0;
         self.reset_pressure_tracking();
+        self.pressure_flush_runs = 0;
+        self.pressure_flush_planned_chunks = 0;
+        self.pressure_flush_flushed_chunks = 0;
+        self.pressure_flush_plan_ms = 0;
+        self.pressure_flush_write_ms = 0;
+        self.pressure_flush_commit_ms = 0;
+        self.max_pressure_flush_plan_ms = 0;
+        self.max_pressure_flush_write_ms = 0;
+        self.max_pressure_flush_commit_ms = 0;
         self.bytes = 0;
         self.dispatch_turns = 0;
         self.yielded_turns = 0;
@@ -1051,6 +1113,7 @@ impl ChunkStreamState {
                 self.accept_result(ChunkPrepareResult {
                     request,
                     fetch_ms: 0,
+                    pressure_flush: PressureFlushTiming::default(),
                     staged: Vec::new(),
                     outcome: ChunkPrepareOutcome::Ready(Box::new(prepared.prepared_cache_hit())),
                 });
@@ -1066,48 +1129,54 @@ impl ChunkStreamState {
                 }
                 continue;
             }
-            let world = Arc::clone(&self.world);
-            let biomes = Arc::clone(&self.biomes);
-            let blocks = Arc::clone(&self.blocks);
-            let block_light = self.block_light.as_ref().map(Arc::clone);
-            let items = Arc::clone(&self.items);
-            let block_entity_types = Arc::clone(&self.block_entity_types);
-            let passive_herd_surface = self.passive_herd_surface;
-            let passive_herd_fallback_surfaces = Arc::clone(&self.passive_herd_fallback_surfaces);
-            let passive_herd_water = Arc::clone(&self.passive_herd_water);
-            let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
-            let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
-            let entity_types = Arc::clone(&self.entity_types);
-            let resources = self.resources.clone();
-            let active_generation = Arc::clone(&self.active_generation);
-            let compression = self.compression;
-            let tx = self.result_tx.clone();
-            tokio::spawn(async move {
-                let result = prepare_chunk_request(
-                    request,
-                    world,
-                    biomes,
-                    blocks,
-                    block_light,
-                    items,
-                    block_entity_types,
-                    passive_herd_surface,
-                    passive_herd_fallback_surfaces,
-                    passive_herd_water,
-                    passive_herd_passable,
-                    passive_spawn_rules,
-                    entity_types,
-                    compression,
-                    resources,
-                    active_generation,
-                )
-                .await;
-                let _ = tx.send(result).await;
-            });
+            self.spawn_prepare_worker(request);
             dispatched_this_turn += 1;
             self.dispatched += 1;
         }
         self.max_in_flight = self.max_in_flight.max(self.scheduler.in_flight_len());
+    }
+
+    fn spawn_prepare_worker(&self, request: ChunkRequest) {
+        let world = Arc::clone(&self.world);
+        let biomes = Arc::clone(&self.biomes);
+        let blocks = Arc::clone(&self.blocks);
+        let block_light = self.block_light.as_ref().map(Arc::clone);
+        let items = Arc::clone(&self.items);
+        let block_entity_types = Arc::clone(&self.block_entity_types);
+        let passive_herd_surface = self.passive_herd_surface;
+        let passive_herd_fallback_surfaces = Arc::clone(&self.passive_herd_fallback_surfaces);
+        let passive_herd_water = Arc::clone(&self.passive_herd_water);
+        let passive_herd_passable = Arc::clone(&self.passive_herd_passable);
+        let passive_spawn_rules = Arc::clone(&self.passive_spawn_rules);
+        let entity_types = Arc::clone(&self.entity_types);
+        let resources = self.resources.clone();
+        let active_generation = Arc::clone(&self.active_generation);
+        let compression = self.compression;
+        let current_tick = self.sessions.simulation_tick();
+        let tx = self.result_tx.clone();
+        tokio::spawn(async move {
+            let result = prepare_chunk_request(
+                request,
+                world,
+                biomes,
+                blocks,
+                block_light,
+                items,
+                block_entity_types,
+                passive_herd_surface,
+                passive_herd_fallback_surfaces,
+                passive_herd_water,
+                passive_herd_passable,
+                passive_spawn_rules,
+                entity_types,
+                compression,
+                resources,
+                active_generation,
+                current_tick,
+            )
+            .await;
+            let _ = tx.send(result).await;
+        });
     }
 
     fn drain_ready(&mut self) {
@@ -1126,6 +1195,18 @@ impl ChunkStreamState {
         self.max_ready = self.max_ready.max(self.ready.len());
     }
 
+    fn record_pressure_flush(&mut self, timing: PressureFlushTiming) {
+        self.pressure_flush_runs += timing.runs;
+        self.pressure_flush_planned_chunks += timing.planned_chunks;
+        self.pressure_flush_flushed_chunks += timing.flushed_chunks;
+        self.pressure_flush_plan_ms += timing.plan_ms;
+        self.pressure_flush_write_ms += timing.write_ms;
+        self.pressure_flush_commit_ms += timing.commit_ms;
+        self.max_pressure_flush_plan_ms = self.max_pressure_flush_plan_ms.max(timing.plan_ms);
+        self.max_pressure_flush_write_ms = self.max_pressure_flush_write_ms.max(timing.write_ms);
+        self.max_pressure_flush_commit_ms = self.max_pressure_flush_commit_ms.max(timing.commit_ms);
+    }
+
     async fn emit_next_ready<W>(
         &mut self,
         writer: &mut W,
@@ -1141,6 +1222,7 @@ impl ChunkStreamState {
         let cx = request.chunk_x;
         let cz = request.chunk_z;
         self.fetch_ms += result.fetch_ms;
+        self.record_pressure_flush(result.pressure_flush);
         self.max_fetch_ms = self.max_fetch_ms.max(result.fetch_ms);
         if result.fetch_ms >= CHUNK_STAGE_SLOW_MS {
             self.slow_fetch_chunks += 1;
@@ -1148,15 +1230,15 @@ impl ChunkStreamState {
 
         match result.outcome {
             ChunkPrepareOutcome::Ready(prepared) => {
-                self.pressure_retries.remove(&(cx, cz));
-                self.pressure_cooldowns.remove(&(cx, cz));
-                self.clear_pressure_staged((cx, cz));
+                self.clear_pressure_tracking((cx, cz));
                 self.staged.extend(result.staged);
                 if let Some(light) = prepared.light.clone() {
                     light_cache.insert(ChunkPos { x: cx, z: cz }, light);
                 }
                 let mut write_timing = prepared.write_timing;
-                write_timing.socket_write_ms = write_framed_chunk(writer, &prepared.frame).await?;
+                let socket_write_started = Instant::now();
+                writer.write_all(&prepared.frame).await?;
+                write_timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
                 self.loaded.insert((cx, cz));
                 let mut visibility = self.sessions.mark_loaded(self.session_id, (cx, cz));
                 visibility.extend(
@@ -1171,9 +1253,7 @@ impl ChunkStreamState {
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
             ChunkPrepareOutcome::Absent => {
-                self.pressure_retries.remove(&(cx, cz));
-                self.pressure_cooldowns.remove(&(cx, cz));
-                self.clear_pressure_staged((cx, cz));
+                self.clear_pressure_tracking((cx, cz));
                 self.staged.extend(result.staged);
                 self.absent += 1;
                 info!(cx, cz, "no chunk in storage");
@@ -1185,9 +1265,7 @@ impl ChunkStreamState {
                 let retries = self.pressure_retries.entry((cx, cz)).or_default();
                 *retries += 1;
                 if *retries > CHUNK_BACKPRESSURE_MAX_RETRIES {
-                    self.pressure_retries.remove(&(cx, cz));
-                    self.pressure_cooldowns.remove(&(cx, cz));
-                    self.clear_pressure_staged((cx, cz));
+                    self.clear_pressure_tracking((cx, cz));
                     self.pressure_abandoned += 1;
                     warn!(
                         cx,
@@ -1203,9 +1281,7 @@ impl ChunkStreamState {
                     .min(CHUNK_BACKPRESSURE_MAX_COOLDOWN_TURNS);
                 self.pressure_cooldowns.insert((cx, cz), cooldown);
                 if !self.scheduler.defer(request) {
-                    self.pressure_retries.remove(&(cx, cz));
-                    self.pressure_cooldowns.remove(&(cx, cz));
-                    self.clear_pressure_staged((cx, cz));
+                    self.clear_pressure_tracking((cx, cz));
                     self.pressure_abandoned += 1;
                     warn!(
                         cx,
@@ -1225,9 +1301,7 @@ impl ChunkStreamState {
                 return Ok(EmitReadyResult::Blocked);
             }
             ChunkPrepareOutcome::Failed(err) => {
-                self.pressure_retries.remove(&(cx, cz));
-                self.pressure_cooldowns.remove(&(cx, cz));
-                self.clear_pressure_staged((cx, cz));
+                self.clear_pressure_tracking((cx, cz));
                 warn!(cx, cz, error = %err, "chunk encode failed; skipping");
                 self.scheduler.mark_finished(request);
                 return Ok(EmitReadyResult::DrainedNoPacket);
@@ -1267,6 +1341,12 @@ impl ChunkStreamState {
 
     fn clear_pressure_staged(&mut self, coord: (i32, i32)) {
         self.pressure_staged_by_chunk.remove(&coord);
+    }
+
+    fn clear_pressure_tracking(&mut self, coord: (i32, i32)) {
+        self.pressure_retries.remove(&coord);
+        self.pressure_cooldowns.remove(&coord);
+        self.clear_pressure_staged(coord);
     }
 
     fn reset_pressure_tracking(&mut self) {
@@ -1371,6 +1451,15 @@ impl ChunkStreamState {
             absent = self.absent,
             pressure_abandoned = self.pressure_abandoned,
             pressure_staged = self.pressure_staged_count(),
+            pressure_flush_runs = self.pressure_flush_runs,
+            pressure_flush_planned_chunks = self.pressure_flush_planned_chunks,
+            pressure_flush_flushed_chunks = self.pressure_flush_flushed_chunks,
+            pressure_flush_plan_ms = self.pressure_flush_plan_ms,
+            pressure_flush_write_ms = self.pressure_flush_write_ms,
+            pressure_flush_commit_ms = self.pressure_flush_commit_ms,
+            max_pressure_flush_plan_ms = self.max_pressure_flush_plan_ms,
+            max_pressure_flush_write_ms = self.max_pressure_flush_write_ms,
+            max_pressure_flush_commit_ms = self.max_pressure_flush_commit_ms,
             degraded_delivery = self.pressure_abandoned > 0,
             bytes = self.bytes,
             framed_bytes = self.framed_bytes,
@@ -1530,11 +1619,12 @@ async fn prepare_chunk_request(
     compression: Compression,
     resources: ChunkPipelineResources,
     active_generation: Arc<AtomicU64>,
+    current_tick: u64,
 ) -> ChunkPrepareResult {
     if !is_active_request(request, &active_generation) {
         return stale_chunk_result(request);
     }
-    let (centre, neighbourhood, staged, fetch_ms, backpressured) = match load_chunk_neighbourhood(
+    let loaded = match load_chunk_neighbourhood(
         Arc::clone(&world),
         request.chunk_x,
         request.chunk_z,
@@ -1550,20 +1640,40 @@ async fn prepare_chunk_request(
             return ChunkPrepareResult {
                 request,
                 fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
                 outcome: ChunkPrepareOutcome::Failed(err),
             };
         }
     };
 
+    let LoadedNeighbourhood {
+        centre,
+        neighbourhood,
+        staged,
+        fetch_ms,
+        backpressured,
+    } = loaded;
+
     let Some(centre) = centre else {
         if backpressured {
-            if let Err(err) = flush_dirty_chunks_for_pressure(Arc::clone(&world), request).await {
-                warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
-            }
+            let pressure_flush = match flush_dirty_chunks_for_pressure(
+                Arc::clone(&world),
+                request,
+                current_tick,
+            )
+            .await
+            {
+                Ok(timing) => timing,
+                Err(err) => {
+                    warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
+                    PressureFlushTiming::default()
+                }
+            };
             return ChunkPrepareResult {
                 request,
                 fetch_ms,
+                pressure_flush,
                 staged,
                 outcome: ChunkPrepareOutcome::Backpressured,
             };
@@ -1571,18 +1681,30 @@ async fn prepare_chunk_request(
         return ChunkPrepareResult {
             request,
             fetch_ms,
+            pressure_flush: PressureFlushTiming::default(),
             staged,
             outcome: ChunkPrepareOutcome::Absent,
         };
     };
 
     if backpressured {
-        if let Err(err) = flush_dirty_chunks_for_pressure(Arc::clone(&world), request).await {
-            warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
-        }
+        let pressure_flush = match flush_dirty_chunks_for_pressure(
+            Arc::clone(&world),
+            request,
+            current_tick,
+        )
+        .await
+        {
+            Ok(timing) => timing,
+            Err(err) => {
+                warn!(cx = request.chunk_x, cz = request.chunk_z, error = %err, "dirty pressure flush failed");
+                PressureFlushTiming::default()
+            }
+        };
         return ChunkPrepareResult {
             request,
             fetch_ms,
+            pressure_flush,
             staged,
             outcome: ChunkPrepareOutcome::Backpressured,
         };
@@ -1598,6 +1720,7 @@ async fn prepare_chunk_request(
             return ChunkPrepareResult {
                 request,
                 fetch_ms,
+                pressure_flush: PressureFlushTiming::default(),
                 staged,
                 outcome: ChunkPrepareOutcome::Failed("CPU worker pool closed".into()),
             };
@@ -1664,6 +1787,7 @@ async fn prepare_chunk_request(
     ChunkPrepareResult {
         request,
         fetch_ms,
+        pressure_flush: PressureFlushTiming::default(),
         staged,
         outcome,
     }
@@ -1677,6 +1801,7 @@ fn stale_chunk_result(request: ChunkRequest) -> ChunkPrepareResult {
     ChunkPrepareResult {
         request,
         fetch_ms: 0,
+        pressure_flush: PressureFlushTiming::default(),
         staged: Vec::new(),
         outcome: ChunkPrepareOutcome::Absent,
     }
@@ -1685,7 +1810,9 @@ fn stale_chunk_result(request: ChunkRequest) -> ChunkPrepareResult {
 async fn flush_dirty_chunks_for_pressure(
     world: WorldHandle,
     request: ChunkRequest,
-) -> Result<usize, String> {
+    current_tick: u64,
+) -> Result<PressureFlushTiming, String> {
+    let plan_started = Instant::now();
     let plan = {
         let storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::ChunkPrepare,
@@ -1694,18 +1821,21 @@ async fn flush_dirty_chunks_for_pressure(
             world.lock().await,
         );
         if storage.world_root().is_none() || !storage.dirty_chunk_cache_saturated() {
-            return Ok(0);
+            return Ok(PressureFlushTiming::default());
         }
-        storage.plan_dirty_flush().map_err(|err| err.to_string())?
+        storage
+            .plan_dirty_flush_at_tick(current_tick)
+            .map_err(|err| err.to_string())?
     };
+    let plan_ms = plan_started.elapsed().as_millis() as u64;
     if plan.is_empty() {
-        return Ok(0);
+        return Ok(PressureFlushTiming::default());
     }
     let planned_chunks = plan.chunk_count();
-    let commit = tokio::task::spawn_blocking(move || plan.write())
-        .await
-        .map_err(|err| err.to_string())?
-        .map_err(|err| err.to_string())?;
+    let write_started = Instant::now();
+    let commit = crate::dirty_flush::write_dirty_flush_blocking(plan).await?;
+    let write_ms = write_started.elapsed().as_millis() as u64;
+    let commit_started = Instant::now();
     let flushed = {
         let mut storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::ChunkPrepare,
@@ -1717,23 +1847,34 @@ async fn flush_dirty_chunks_for_pressure(
             .commit_dirty_flush(commit)
             .map_err(|err| err.to_string())?
     };
+    let commit_ms = commit_started.elapsed().as_millis() as u64;
     info!(
         cx = request.chunk_x,
         cz = request.chunk_z,
         planned_chunks,
         flushed,
+        plan_ms,
+        write_ms,
+        commit_ms,
         "dirty pressure flush completed"
     );
-    Ok(flushed)
+    Ok(PressureFlushTiming {
+        runs: 1,
+        planned_chunks,
+        flushed_chunks: flushed,
+        plan_ms,
+        write_ms,
+        commit_ms,
+    })
 }
 
-type LoadedNeighbourhood = (
-    Option<Arc<Chunk>>,
-    [[Option<Arc<Chunk>>; 3]; 3],
-    Vec<(i32, i32)>,
-    u64,
-    bool,
-);
+struct LoadedNeighbourhood {
+    centre: Option<Arc<Chunk>>,
+    neighbourhood: [[Option<Arc<Chunk>>; 3]; 3],
+    staged: Vec<(i32, i32)>,
+    fetch_ms: u64,
+    backpressured: bool,
+}
 
 async fn load_chunk_neighbourhood(
     world: WorldHandle,
@@ -1745,13 +1886,13 @@ async fn load_chunk_neighbourhood(
     need_full_neighbourhood: bool,
 ) -> Result<LoadedNeighbourhood, String> {
     if !is_active_request(request, &active_generation) {
-        return Ok((
-            None,
-            std::array::from_fn(|_| std::array::from_fn(|_| None)),
-            Vec::new(),
-            0,
-            false,
-        ));
+        return Ok(LoadedNeighbourhood {
+            centre: None,
+            neighbourhood: std::array::from_fn(|_| std::array::from_fn(|_| None)),
+            staged: Vec::new(),
+            fetch_ms: 0,
+            backpressured: false,
+        });
     }
     let fetch_started = Instant::now();
     let mut neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
@@ -1769,13 +1910,13 @@ async fn load_chunk_neighbourhood(
             world.lock().await,
         );
         if !is_active_request(request, &active_generation) {
-            return Ok((
-                None,
+            return Ok(LoadedNeighbourhood {
+                centre: None,
                 neighbourhood,
                 staged,
-                fetch_started.elapsed().as_millis() as u64,
-                false,
-            ));
+                fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                backpressured: false,
+            });
         }
         match storage.plan_chunk_snapshot_without_generation(ChunkPos { x: cx, z: cz }) {
             mc_world::ChunkSnapshotPlan::Cached(chunk) => {
@@ -1821,13 +1962,13 @@ async fn load_chunk_neighbourhood(
                         world.lock().await,
                     );
                     if !is_active_request(request, &active_generation) {
-                        return Ok((
-                            None,
+                        return Ok(LoadedNeighbourhood {
+                            centre: None,
                             neighbourhood,
                             staged,
-                            fetch_started.elapsed().as_millis() as u64,
-                            false,
-                        ));
+                            fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                            backpressured: false,
+                        });
                     }
                     storage.try_commit_chunk_snapshot(ChunkPos { x: cx, z: cz }, chunk)
                 };
@@ -1860,13 +2001,13 @@ async fn load_chunk_neighbourhood(
             storage.can_cache_new_chunk(ChunkPos { x: cx, z: cz })
         };
         if !can_cache {
-            return Ok((
-                None,
+            return Ok(LoadedNeighbourhood {
+                centre: None,
                 neighbourhood,
                 staged,
-                fetch_started.elapsed().as_millis() as u64,
-                true,
-            ));
+                fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                backpressured: true,
+            });
         }
         let chunk = match generate_fresh_chunk(
             Arc::clone(generator),
@@ -1879,23 +2020,23 @@ async fn load_chunk_neighbourhood(
         {
             Ok(Some(chunk)) => chunk,
             Ok(None) => {
-                return Ok((
-                    None,
+                return Ok(LoadedNeighbourhood {
+                    centre: None,
                     neighbourhood,
                     staged,
-                    fetch_started.elapsed().as_millis() as u64,
-                    false,
-                ));
+                    fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                    backpressured: false,
+                });
             }
             Err(err) => {
                 warn!(cx, cz, error = %err, "chunk generation failed; skipping");
-                return Ok((
-                    None,
+                return Ok(LoadedNeighbourhood {
+                    centre: None,
                     neighbourhood,
                     staged,
-                    fetch_started.elapsed().as_millis() as u64,
-                    false,
-                ));
+                    fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                    backpressured: false,
+                });
             }
         };
         let chunk = {
@@ -1906,13 +2047,13 @@ async fn load_chunk_neighbourhood(
                 world.lock().await,
             );
             if !is_active_request(request, &active_generation) {
-                return Ok((
-                    None,
+                return Ok(LoadedNeighbourhood {
+                    centre: None,
                     neighbourhood,
                     staged,
-                    fetch_started.elapsed().as_millis() as u64,
-                    false,
-                ));
+                    fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                    backpressured: false,
+                });
             }
             match storage.try_insert_generated_chunk(ChunkPos { x: cx, z: cz }, chunk) {
                 Ok(true) => {}
@@ -1948,13 +2089,13 @@ async fn load_chunk_neighbourhood(
                         world.lock().await,
                     );
                     if !is_active_request(request, &active_generation) {
-                        return Ok((
-                            None,
+                        return Ok(LoadedNeighbourhood {
+                            centre: None,
                             neighbourhood,
                             staged,
-                            fetch_started.elapsed().as_millis() as u64,
-                            false,
-                        ));
+                            fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                            backpressured: false,
+                        });
                     }
                     match storage.plan_chunk_snapshot_without_generation(pos) {
                         mc_world::ChunkSnapshotPlan::Cached(chunk) => {
@@ -1991,13 +2132,13 @@ async fn load_chunk_neighbourhood(
                         storage.can_cache_new_chunk(pos)
                     };
                     if !can_generate {
-                        return Ok((
+                        return Ok(LoadedNeighbourhood {
                             centre,
                             neighbourhood,
                             staged,
-                            fetch_started.elapsed().as_millis() as u64,
-                            true,
-                        ));
+                            fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                            backpressured: true,
+                        });
                     }
                     chunk = match generate_fresh_chunk(
                         Arc::clone(generator),
@@ -2026,13 +2167,13 @@ async fn load_chunk_neighbourhood(
                         world.lock().await,
                     );
                     if !is_active_request(request, &active_generation) {
-                        return Ok((
-                            None,
+                        return Ok(LoadedNeighbourhood {
+                            centre: None,
                             neighbourhood,
                             staged,
-                            fetch_started.elapsed().as_millis() as u64,
-                            false,
-                        ));
+                            fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                            backpressured: false,
+                        });
                     }
                     storage.try_commit_chunk_snapshot(pos, chunk)
                 };
@@ -2042,13 +2183,13 @@ async fn load_chunk_neighbourhood(
                         staged.push((ncx, ncz));
                     }
                     Ok(None) => {
-                        return Ok((
+                        return Ok(LoadedNeighbourhood {
                             centre,
                             neighbourhood,
                             staged,
-                            fetch_started.elapsed().as_millis() as u64,
-                            true,
-                        ));
+                            fetch_ms: fetch_started.elapsed().as_millis() as u64,
+                            backpressured: true,
+                        });
                     }
                     Err(err) => {
                         warn!(cx = ncx, cz = ncz, error = %err, "neighbour chunk commit failed; lighting may be partial")
@@ -2058,13 +2199,13 @@ async fn load_chunk_neighbourhood(
         }
     }
 
-    Ok((
+    Ok(LoadedNeighbourhood {
         centre,
         neighbourhood,
         staged,
-        fetch_started.elapsed().as_millis() as u64,
+        fetch_ms: fetch_started.elapsed().as_millis() as u64,
         backpressured,
-    ))
+    })
 }
 
 async fn load_chunk_from_disk(
@@ -2168,8 +2309,21 @@ fn build_chunk_packet(
     timing.heightmap_ms = heightmap_started.elapsed().as_millis() as u64;
 
     let mut computed_light = None;
-    let light = match (block_light, workspace) {
-        (Some(table), Some(ws)) => {
+    let light = if block_light.is_some() {
+        if let Some(baked) = ChunkLight::from_section_lights(&centre.section_lights) {
+            let light_encode_started = Instant::now();
+            let wire = encode_chunk_light(&baked);
+            timing.light_encode_ms = light_encode_started.elapsed().as_millis() as u64;
+            computed_light = Some(baked);
+            LightData {
+                sky_y_mask: wire.sky_y_mask,
+                block_y_mask: wire.block_y_mask,
+                empty_sky_y_mask: wire.empty_sky_y_mask,
+                empty_block_y_mask: wire.empty_block_y_mask,
+                sky_updates: wire.sky_updates,
+                block_updates: wire.block_updates,
+            }
+        } else if let (Some(table), Some(ws)) = (block_light, workspace) {
             // Centre slot is the chunk we already have a reference to;
             // off-centre slots come from the staged map.
             let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
@@ -2196,8 +2350,11 @@ fn build_chunk_packet(
                 sky_updates: wire.sky_updates,
                 block_updates: wire.block_updates,
             }
+        } else {
+            LightData::empty()
         }
-        _ => LightData::empty(),
+    } else {
+        LightData::empty()
     };
     let block_entities = mc_world::wire::client_block_entities(centre, blocks, items)
         .into_iter()
@@ -2263,15 +2420,6 @@ fn frame_chunk_packet(
         build_timing: built.timing,
         write_timing: timing,
     })
-}
-
-async fn write_framed_chunk<W>(writer: &mut W, framed: &[u8]) -> Result<u64, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let socket_write_started = Instant::now();
-    writer.write_all(framed).await?;
-    Ok(socket_write_started.elapsed().as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -2426,6 +2574,51 @@ mod tests {
         assert_eq!(cached.write_timing.framed_bytes, 17);
     }
 
+    #[test]
+    fn build_chunk_packet_uses_baked_section_light_without_recompute() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let mut centre = Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), plains);
+        centre.set_block(0, 0, 0, BlockStateId(1)).unwrap();
+        let mut sky = vec![0; mc_world::chunk::LIGHT_LAYER_BYTES];
+        let mut block = vec![0; mc_world::chunk::LIGHT_LAYER_BYTES];
+        sky[0] = 0x21;
+        block[0] = 0x43;
+        centre.section_lights[0].sky = Some(sky.clone());
+        centre.section_lights[0].block = Some(block.clone());
+        let neighbourhood: [[Option<Arc<Chunk>>; 3]; 3] =
+            std::array::from_fn(|_| std::array::from_fn(|_| None));
+        let table =
+            BlockLightTable::from_arrays("test", vec![0, 0], vec![0, 15], vec![true, false]);
+        let mut workspace = LightWorkspace::new();
+
+        let built = build_chunk_packet(
+            &centre,
+            &neighbourhood,
+            &test_biome_registry(),
+            &air_block_registry(),
+            &ItemRegistry::from_report(&[]),
+            &mc_data::block_entity_types::BlockEntityTypeRegistry::default(),
+            Some(&table),
+            None,
+            &[],
+            &[],
+            &[],
+            &mc_data::biomes::BiomeSpawnRules::default(),
+            &mc_data::entity_types::EntityTypeRegistry::default(),
+            Some(&mut workspace),
+            0,
+            0,
+        )
+        .expect("chunk packet builds from baked light");
+
+        let light = built
+            .light
+            .expect("baked light should populate the play light cache");
+        assert_eq!(built.timing.light_compute_ms, 0);
+        assert_eq!(light.sky.section(0).unwrap()[0], 0x21);
+        assert_eq!(light.block.section(0).unwrap()[0], 0x43);
+    }
+
     #[tokio::test]
     async fn dirty_pressure_defers_generated_stream_chunk_instead_of_absent() {
         let registry = Arc::new(air_block_registry());
@@ -2452,7 +2645,7 @@ mod tests {
             generation: ChunkPipelineGeneration(1),
         };
 
-        let (centre, _neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+        let loaded = load_chunk_neighbourhood(
             Arc::clone(&world),
             1,
             0,
@@ -2464,9 +2657,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(centre.is_none());
-        assert_eq!(staged, vec![(0, 0)]);
-        assert!(backpressured);
+        assert!(loaded.centre.is_none());
+        assert_eq!(loaded.staged, vec![(0, 0)]);
+        assert!(loaded.backpressured);
         assert_eq!(world.lock().await.cache_len(), 1);
         assert_eq!(calls.load(Ordering::Acquire), 0);
     }
@@ -2493,7 +2686,7 @@ mod tests {
             generation: ChunkPipelineGeneration(1),
         };
 
-        let (centre, _neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+        let loaded = load_chunk_neighbourhood(
             Arc::clone(&world),
             1,
             0,
@@ -2505,9 +2698,9 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(centre.is_none());
-        assert_eq!(staged, vec![(0, 0)]);
-        assert!(!backpressured);
+        assert!(loaded.centre.is_none());
+        assert_eq!(loaded.staged, vec![(0, 0)]);
+        assert!(!loaded.backpressured);
         assert_eq!(world.lock().await.cache_len(), 1);
     }
 
@@ -2537,7 +2730,7 @@ mod tests {
             generation: ChunkPipelineGeneration(1),
         };
 
-        let (centre, neighbourhood, staged, _fetch_ms, backpressured) = load_chunk_neighbourhood(
+        let loaded = load_chunk_neighbourhood(
             Arc::clone(&world),
             0,
             0,
@@ -2549,10 +2742,10 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(centre.is_some());
-        assert!(neighbourhood[1][1].is_some());
-        assert_eq!(staged, vec![(0, 0)]);
-        assert!(backpressured);
+        assert!(loaded.centre.is_some());
+        assert!(loaded.neighbourhood[1][1].is_some());
+        assert_eq!(loaded.staged, vec![(0, 0)]);
+        assert!(loaded.backpressured);
         assert_eq!(calls.load(Ordering::Acquire), 0);
     }
 
@@ -2622,9 +2815,13 @@ mod tests {
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&stream.active_generation),
+            0,
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
+        assert_eq!(result.pressure_flush.runs, 0);
+        assert_eq!(result.pressure_flush.planned_chunks, 0);
+        assert_eq!(result.pressure_flush.flushed_chunks, 0);
         stream.accept_result(result);
         assert_eq!(
             stream
@@ -2678,6 +2875,14 @@ mod tests {
         stream.accept_result(ChunkPrepareResult {
             request,
             fetch_ms: 0,
+            pressure_flush: PressureFlushTiming {
+                runs: 1,
+                planned_chunks: 2,
+                flushed_chunks: 1,
+                plan_ms: 3,
+                write_ms: 5,
+                commit_ms: 7,
+            },
             staged: vec![(0, 0)],
             outcome: ChunkPrepareOutcome::Backpressured,
         });
@@ -2695,6 +2900,15 @@ mod tests {
         assert_eq!(stream.pressure_staged_count(), 1);
         assert!(stream.pressure_staged_contains((0, 0)));
         assert_eq!(stream.pressure_abandoned, 0);
+        assert_eq!(stream.pressure_flush_runs, 1);
+        assert_eq!(stream.pressure_flush_planned_chunks, 2);
+        assert_eq!(stream.pressure_flush_flushed_chunks, 1);
+        assert_eq!(stream.pressure_flush_plan_ms, 3);
+        assert_eq!(stream.pressure_flush_write_ms, 5);
+        assert_eq!(stream.pressure_flush_commit_ms, 7);
+        assert_eq!(stream.max_pressure_flush_plan_ms, 3);
+        assert_eq!(stream.max_pressure_flush_write_ms, 5);
+        assert_eq!(stream.max_pressure_flush_commit_ms, 7);
         assert_eq!(stream.absent, 0);
         assert_eq!(stream.emitted, 0);
         assert!(stream.staged.is_empty());
@@ -2706,6 +2920,7 @@ mod tests {
             stream.accept_result(ChunkPrepareResult {
                 request,
                 fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
                 staged: vec![(0, 0)],
                 outcome: ChunkPrepareOutcome::Backpressured,
             });
@@ -2753,6 +2968,7 @@ mod tests {
         stream.accept_result(ChunkPrepareResult {
             request,
             fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0)],
             outcome: ChunkPrepareOutcome::Backpressured,
         });
@@ -2852,6 +3068,7 @@ mod tests {
         stream.accept_result(ChunkPrepareResult {
             request,
             fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
             staged: Vec::new(),
             outcome: ChunkPrepareOutcome::Absent,
         });
@@ -2903,6 +3120,7 @@ mod tests {
         stream.accept_result(ChunkPrepareResult {
             request,
             fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0), (1, 0)],
             outcome: ChunkPrepareOutcome::Backpressured,
         });
@@ -2923,6 +3141,7 @@ mod tests {
         stream.accept_result(ChunkPrepareResult {
             request,
             fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0)],
             outcome: ChunkPrepareOutcome::Ready(Box::new(PreparedChunkFrame {
                 frame: Bytes::new(),
@@ -3015,9 +3234,13 @@ mod tests {
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&stream.active_generation),
+            0,
         )
         .await;
         assert!(matches!(result.outcome, ChunkPrepareOutcome::Backpressured));
+        assert_eq!(result.pressure_flush.runs, 1);
+        assert_eq!(result.pressure_flush.planned_chunks, 1);
+        assert_eq!(result.pressure_flush.flushed_chunks, 1);
         stream.accept_result(result);
         assert_eq!(
             stream

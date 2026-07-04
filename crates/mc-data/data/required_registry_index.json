@@ -306,6 +306,12 @@
     "minecraft:temperate",
     "minecraft:warm"
   ],
+  "test_environment": [
+    "minecraft:default"
+  ],
+  "test_instance": [
+    "minecraft:always_pass"
+  ],
   "timeline": [
     "minecraft:day",
     "minecraft:early_game",

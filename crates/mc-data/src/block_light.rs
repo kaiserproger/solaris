@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::blocks::BlockReport;
+use crate::{blocks::BlockReport, read_json_file};
 
 #[derive(Debug, Error)]
 pub enum BlockLightError {
@@ -280,15 +280,11 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
     if !path.is_file() {
         return Err(BlockLightError::Missing(path.to_path_buf()));
     }
-    let bytes = std::fs::read(path).map_err(|source| BlockLightError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let raw: RawTable =
-        serde_json::from_slice(&bytes).map_err(|source| BlockLightError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let raw: RawTable = read_json_file(
+        path,
+        &|path, source| BlockLightError::Io { path, source },
+        &|path, source| BlockLightError::Parse { path, source },
+    )?;
 
     let expected = raw.max_state_id as usize + 1;
     if raw.entries.len() != expected {

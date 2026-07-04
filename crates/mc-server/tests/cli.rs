@@ -99,3 +99,33 @@ fn check_malformed_config_exits_nonzero_with_clear_error() {
         .failure()
         .stderr(contains("parsing config file"));
 }
+
+#[test]
+fn check_unknown_config_field_exits_nonzero_with_clear_error() {
+    let mut file = NamedTempFile::new().expect("tempfile");
+    file.write_all(
+        br#"
+            [server]
+            name = "TestServer"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            vanilla_dir = "data/vanilla"
+        "#,
+    )
+    .expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("parsing config file"))
+        .stderr(contains("unknown field `vanilla_dir`"));
+}

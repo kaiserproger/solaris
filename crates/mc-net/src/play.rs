@@ -494,6 +494,8 @@ struct BlockEditBatchOutcome {
     applied: Vec<AppliedBlockEdit>,
     deltas: Vec<BlockDelta>,
     edit_chunks: HashSet<(i32, i32)>,
+    light_edit_chunks: HashSet<(i32, i32)>,
+    previous_light_chunks: HashMap<(i32, i32), ChunkLight>,
     cleared_campfires: Vec<mc_world::BlockPos>,
 }
 
@@ -576,6 +578,15 @@ impl PlayerPose {
             },
         ]
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AcceptedAbsoluteMovement {
+    x: f64,
+    y: f64,
+    z: f64,
+    yaw_pitch: Option<(f32, f32)>,
+    flags: MovePlayerFlags,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -967,7 +978,6 @@ where
             shield_use: None,
             last_hostile_damage_at: None,
             last_entity_attack_at: None,
-            fluid_schedule_tick: 0,
         });
         play_loop(
             reader,
@@ -1068,7 +1078,6 @@ struct InteractionState {
     shield_use: Option<ShieldUseState>,
     last_hostile_damage_at: Option<Instant>,
     last_entity_attack_at: Option<Instant>,
-    fluid_schedule_tick: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1584,11 +1593,7 @@ fn apply_crafting_pickup_click(
         return false;
     };
     let cursor = state.carried_item.clone();
-    let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.item_facts, &state.items, &slot_stack)
-    } else {
-        item_max_stack(&state.item_facts, &state.items, &cursor)
-    };
+    let max_stack = pickup_click_max_stack(state, &slot_stack);
     let can_place_cursor = can_place_in_crafting_menu_slot(state, menu_slot, &cursor);
     let Some(new_slot) = apply_regular_pickup_slot(
         &mut state.carried_item,
@@ -1937,6 +1942,32 @@ where
     Ok(())
 }
 
+async fn write_container_slots<W>(
+    writer: &mut W,
+    compression: Compression,
+    container_id: i32,
+    state_id: i32,
+    slots: impl IntoIterator<Item = ItemStack>,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    for (slot, item_stack) in slots.into_iter().enumerate() {
+        write_packet(
+            writer,
+            &ClientboundContainerSetSlot {
+                container_id,
+                state_id,
+                slot: slot as i16,
+                item_stack,
+            },
+            compression,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn write_furnace_content<W>(
     state: &InteractionState,
     writer: &mut W,
@@ -2037,7 +2068,10 @@ where
 
     store_active_container(state, player_pose);
     let container_id = next_container_id(state);
-    let window = ChestWindow::new(positions, container_id);
+    let mut window = ChestWindow::new(positions, container_id);
+    window.state_id = state
+        .sessions
+        .register_chest_viewer(state.session_id, window.position());
     let view = load_chest_view(state, &window).await?;
     write_packet(
         writer,
@@ -2050,9 +2084,6 @@ where
     )
     .await?;
     write_chest_content(state, writer, &window, &view).await?;
-    state
-        .sessions
-        .register_chest_viewer(state.session_id, window.position());
     state.active_container = Some(ActiveContainer::Chest(window));
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
@@ -2098,7 +2129,10 @@ where
 
     store_active_container(state, player_pose);
     let container_id = next_container_id(state);
-    let window = FurnaceWindow::new(position, container_id, kind);
+    let mut window = FurnaceWindow::new(position, container_id, kind);
+    window.state_id = state
+        .sessions
+        .register_furnace_viewer(state.session_id, window.position);
     let furnace = {
         let mut storage = state.world.lock().await;
         storage.furnace_block_entity(position).map_err(|err| {
@@ -2119,9 +2153,6 @@ where
     .await?;
     write_furnace_content(state, writer, &window, &furnace).await?;
     write_furnace_data(writer, state.compression, &window, &furnace).await?;
-    state
-        .sessions
-        .register_furnace_viewer(state.session_id, window.position);
     state.active_container = Some(ActiveContainer::Furnace(window));
     write_block_ack(writer, state.compression, sequence).await?;
     Ok(true)
@@ -2318,6 +2349,15 @@ fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
         1 => (!slot.is_empty()).then(|| std::mem::take(slot)),
         _ => None,
     }
+}
+
+fn pickup_click_max_stack(state: &InteractionState, slot_stack: &ItemStack) -> i32 {
+    let stack = if state.carried_item.is_empty() {
+        slot_stack
+    } else {
+        &state.carried_item
+    };
+    item_max_stack(&state.item_facts, &state.items, stack)
 }
 
 fn apply_regular_pickup_slot(
@@ -2779,11 +2819,7 @@ fn apply_pickup_click(state: &mut InteractionState, slot: usize, button: i8) -> 
 
     let slot_stack = state.inventory.slots[slot].clone();
     let cursor = state.carried_item.clone();
-    let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.item_facts, &state.items, &slot_stack)
-    } else {
-        item_max_stack(&state.item_facts, &state.items, &cursor)
-    };
+    let max_stack = pickup_click_max_stack(state, &slot_stack);
     let can_place_cursor = can_place_in_player_slot(state, slot, &cursor);
     let Some(new_slot) = apply_regular_pickup_slot(
         &mut state.carried_item,
@@ -3049,11 +3085,7 @@ fn apply_furnace_pickup_click(
         return false;
     };
     let cursor = state.carried_item.clone();
-    let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.item_facts, &state.items, &slot_stack)
-    } else {
-        item_max_stack(&state.item_facts, &state.items, &cursor)
-    };
+    let max_stack = pickup_click_max_stack(state, &slot_stack);
 
     if menu_slot == 2 && !slot_stack.is_empty() {
         if cursor.is_empty() {
@@ -3208,11 +3240,7 @@ fn apply_chest_pickup_click(
         return false;
     };
     let cursor = state.carried_item.clone();
-    let max_stack = if cursor.is_empty() {
-        item_max_stack(&state.item_facts, &state.items, &slot_stack)
-    } else {
-        item_max_stack(&state.item_facts, &state.items, &cursor)
-    };
+    let max_stack = pickup_click_max_stack(state, &slot_stack);
     let can_place_cursor =
         can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, &cursor);
     let Some(new_slot) = apply_regular_pickup_slot(
@@ -3377,6 +3405,10 @@ where
             chests.push(chest);
         }
         view = ChestView { chests };
+        let authoritative_state_id = state.sessions.chest_state_id(window.position());
+        if window.state_id != authoritative_state_id {
+            window.state_id = authoritative_state_id;
+        }
         if packet.state_id != window.state_id {
             drop(storage);
             write_chest_content(state, writer, &window, &view).await?;
@@ -3419,11 +3451,13 @@ where
         }
     }
     if changed {
-        dispatch_visibility_commands(state.sessions.chest_slot_dispatches(
+        let (state_id, dispatches) = state.sessions.chest_slot_dispatches(
             window.position(),
             state.session_id,
             chest_slot_stacks(&view),
-        ));
+        );
+        window.state_id = state_id;
+        dispatch_visibility_commands(dispatches);
     }
     if let Some(stack) = dropped {
         dispatch_inventory_drop(state, player_pose, stack);
@@ -3455,6 +3489,10 @@ where
                 err
             })?
             .unwrap_or_default();
+        let authoritative_state_id = state.sessions.furnace_state_id(window.position);
+        if window.state_id != authoritative_state_id {
+            window.state_id = authoritative_state_id;
+        }
         if packet.state_id != window.state_id {
             drop(storage);
             write_furnace_content(state, writer, &window, &furnace).await?;
@@ -3495,11 +3533,13 @@ where
         }
     }
     if changed {
-        dispatch_visibility_commands(state.sessions.furnace_slot_dispatches(
+        let (state_id, dispatches) = state.sessions.furnace_slot_dispatches(
             window.position,
             state.session_id,
             furnace_slot_stacks(&furnace),
-        ));
+        );
+        window.state_id = state_id;
+        dispatch_visibility_commands(dispatches);
     }
     if let Some(stack) = dropped {
         dispatch_inventory_drop(state, player_pose, stack);
@@ -3635,14 +3675,6 @@ where
             }
             .unwrap_or_default();
             let (slots_changed, data_changed) = tick_furnace(state, &mut furnace, window.kind);
-            if slots_changed {
-                window.state_id = window.state_id.wrapping_add(1);
-                write_furnace_content(state, writer, &window, &furnace).await?;
-            }
-            if !data_changed.is_empty() {
-                write_furnace_data_changes(writer, state.compression, &window, &data_changed)
-                    .await?;
-            }
             if slots_changed || !data_changed.is_empty() {
                 let mut storage = state.world.lock().await;
                 storage
@@ -3653,11 +3685,18 @@ where
                     })?;
             }
             if slots_changed {
-                dispatch_visibility_commands(state.sessions.furnace_slot_dispatches(
+                let (state_id, dispatches) = state.sessions.furnace_slot_dispatches(
                     window.position,
                     state.session_id,
                     furnace_slot_stacks(&furnace),
-                ));
+                );
+                window.state_id = state_id;
+                dispatch_visibility_commands(dispatches);
+                write_furnace_content(state, writer, &window, &furnace).await?;
+            }
+            if !data_changed.is_empty() {
+                write_furnace_data_changes(writer, state.compression, &window, &data_changed)
+                    .await?;
             }
             if !data_changed.is_empty() {
                 dispatch_visibility_commands(state.sessions.furnace_data_dispatches(
@@ -4728,11 +4767,11 @@ pub(crate) async fn run_random_ticks(
     let Some(world) = config.world.as_ref() else {
         return RandomTickReport::default();
     };
-    let ticketed_chunks = sessions.ticketed_chunks_sorted();
-    if ticketed_chunks.is_empty() {
+    let loaded_chunks = sessions.loaded_chunks_sorted();
+    if loaded_chunks.is_empty() {
         return RandomTickReport::default();
     }
-    let samples = sample_random_tick_positions(policy, world_tick, &ticketed_chunks);
+    let samples = sample_random_tick_positions(policy, world_tick, &loaded_chunks);
     if samples.is_empty() {
         return RandomTickReport::default();
     }
@@ -4770,13 +4809,17 @@ pub(crate) async fn run_random_ticks(
     if !outcome.applied.is_empty() {
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
         broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
-        if let Some(table) = table {
+        if let Some(table) = table
+            && !outcome.light_edit_chunks.is_empty()
+        {
             let light_updates = {
                 let mut storage = world.lock().await;
-                collect_full_light_updates_for_chunks(&mut storage, table, &outcome.edit_chunks)
+                collect_incremental_light_updates_for_applied_edits(&mut storage, table, &outcome)
             };
-            sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
-            broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            if !light_updates.is_empty() {
+                sessions.invalidate_prepared_chunks(&outcome.light_edit_chunks);
+                broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            }
         }
     }
 
@@ -4808,8 +4851,8 @@ pub(crate) async fn run_scheduled_fluid_ticks(
             ..ScheduledFluidTickReport::default()
         };
     };
-    let ticketed_chunks = sessions.ticketed_chunks_sorted();
-    if ticketed_chunks.is_empty() {
+    let loaded_chunks = sessions.loaded_chunks_sorted();
+    if loaded_chunks.is_empty() {
         return ScheduledFluidTickReport {
             budget: policy.fluid_tick_budget,
             ..ScheduledFluidTickReport::default()
@@ -4821,7 +4864,7 @@ pub(crate) async fn run_scheduled_fluid_ticks(
     let mut outcome = BlockEditBatchOutcome::default();
     {
         let mut storage = world.lock().await;
-        for &(cx, cz) in &ticketed_chunks {
+        for &(cx, cz) in &loaded_chunks {
             if drained >= policy.fluid_tick_budget {
                 break;
             }
@@ -4872,13 +4915,17 @@ pub(crate) async fn run_scheduled_fluid_ticks(
     if !outcome.applied.is_empty() {
         sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
         broadcast_block_deltas_to_sessions(sessions, &outcome.edit_chunks, &outcome.deltas, None);
-        if let Some(table) = table {
+        if let Some(table) = table
+            && !outcome.light_edit_chunks.is_empty()
+        {
             let light_updates = {
                 let mut storage = world.lock().await;
-                collect_full_light_updates_for_chunks(&mut storage, table, &outcome.edit_chunks)
+                collect_incremental_light_updates_for_applied_edits(&mut storage, table, &outcome)
             };
-            sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
-            broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            if !light_updates.is_empty() {
+                sessions.invalidate_prepared_chunks(&outcome.light_edit_chunks);
+                broadcast_light_updates_to_sessions(sessions, &light_updates, None);
+            }
         }
         debug!(
             world_tick,
@@ -5007,9 +5054,12 @@ fn supported_flow_state(
 
     let next_level = horizontal_fluid_neighbours(pos)
         .into_iter()
-        .filter_map(|neighbour| storage.get_block(neighbour).ok().flatten())
-        .filter_map(|state| facts.fluid(state.0))
-        .filter(|other| other.kind == fluid.kind)
+        .filter_map(|neighbour| {
+            let state = storage.get_block(neighbour).ok().flatten()?;
+            let other = facts.fluid(state.0)?;
+            (other.kind == fluid.kind && fluid_has_source_path(facts, storage, neighbour, other, 0))
+                .then_some(other)
+        })
         .map(|other| other.level.saturating_add(1))
         .min();
 
@@ -5019,6 +5069,69 @@ fn supported_flow_state(
         }
         _ => Some(air_state_id(blocks)),
     }
+}
+
+fn fluid_has_source_path(
+    facts: &mc_data::block_facts::BlockFactsTable,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    fluid: FluidStateFacts,
+    depth: u8,
+) -> bool {
+    if fluid.source {
+        return true;
+    }
+    if depth > max_flow_level(fluid.kind).saturating_add(1) {
+        return false;
+    }
+
+    let above = mc_world::BlockPos {
+        y: pos.y + 1,
+        ..pos
+    };
+    if storage
+        .get_block(above)
+        .ok()
+        .flatten()
+        .and_then(|state| facts.fluid(state.0))
+        .is_some_and(|above_fluid| {
+            above_fluid.kind == fluid.kind
+                && fluid_has_source_path(
+                    facts,
+                    storage,
+                    above,
+                    above_fluid,
+                    depth.saturating_add(1),
+                )
+        })
+    {
+        return true;
+    }
+
+    for neighbour in horizontal_fluid_neighbours(pos) {
+        let support = storage
+            .get_block(neighbour)
+            .ok()
+            .flatten()
+            .and_then(|state| facts.fluid(state.0))
+            .and_then(|other| {
+                (other.kind == fluid.kind && other.level < fluid.level)
+                    .then_some((neighbour, other))
+            });
+        let Some((support_pos, support_fluid)) = support else {
+            continue;
+        };
+        if fluid_has_source_path(
+            facts,
+            storage,
+            support_pos,
+            support_fluid,
+            depth.saturating_add(1),
+        ) {
+            return true;
+        }
+    }
+    false
 }
 
 fn fluid_spread_edits(
@@ -5212,59 +5325,152 @@ fn random_tick_edit(
     }
 }
 
-fn collect_full_light_updates_for_chunks(
+fn collect_incremental_light_updates_for_applied_edits(
     storage: &mut mc_world::WorldStorage,
     table: &BlockLightTable,
-    chunks: &HashSet<(i32, i32)>,
+    outcome: &BlockEditBatchOutcome,
 ) -> Vec<OutboundLightUpdate> {
+    let mut cache = LightCache::new();
     let mut updates = Vec::new();
-    for &(cx, cz) in chunks {
-        let mut neighbourhood: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
+
+    for edit in &outcome.applied {
+        if !block_edit_changes_light(table, edit.previous, edit.new_state) {
+            continue;
+        }
+        let centre_pos = ChunkPos {
+            x: edit.pos.x.div_euclid(16),
+            z: edit.pos.z.div_euclid(16),
+        };
+        seed_background_light_cache(
+            &mut cache,
+            storage,
+            centre_pos,
+            &outcome.previous_light_chunks,
+        );
+        if !cache.contains(centre_pos) {
+            warn!(
+                x = edit.pos.x,
+                y = edit.pos.y,
+                z = edit.pos.z,
+                "background relight skipped; missing baked light seed"
+            );
+            continue;
+        }
+
+        let mut chunks: HashMap<(i32, i32), Arc<Chunk>> = HashMap::new();
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
                 let pos = ChunkPos {
-                    x: cx + dx,
-                    z: cz + dz,
+                    x: centre_pos.x + dx,
+                    z: centre_pos.z + dz,
                 };
-                match storage.get_chunk(pos) {
-                    Ok(Some(chunk)) => {
-                        neighbourhood.insert((cx + dx, cz + dz), Arc::new(chunk.clone()));
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        warn!(error = %err, cx = pos.x, cz = pos.z, "random-tick relight chunk read failed");
-                    }
+                if let Some(chunk) = storage.cached_chunk_snapshot(pos) {
+                    chunks.insert((pos.x, pos.z), chunk);
                 }
             }
         }
+        if !chunks.contains_key(&(centre_pos.x, centre_pos.z)) {
+            continue;
+        }
+
         let mut refs: [[Option<&Chunk>; 3]; 3] = [[None; 3]; 3];
         for dz in -1i32..=1 {
             for dx in -1i32..=1 {
-                refs[(dz + 1) as usize][(dx + 1) as usize] = neighbourhood
-                    .get(&(cx + dx, cz + dz))
+                refs[(dz + 1) as usize][(dx + 1) as usize] = chunks
+                    .get(&(centre_pos.x + dx, centre_pos.z + dz))
                     .map(|chunk| chunk.as_ref());
             }
         }
-        if refs[1][1].is_none() {
-            continue;
+
+        let touched = apply_block_change_to_light(
+            &mut cache,
+            &refs,
+            table,
+            centre_pos,
+            edit.pos.x.rem_euclid(16) as u8,
+            edit.pos.y,
+            edit.pos.z.rem_euclid(16) as u8,
+            edit.previous,
+            edit.new_state,
+        );
+        let mut edit_updates = Vec::new();
+        for pos in touched {
+            let Some(light) = cache.get(pos) else {
+                continue;
+            };
+            let wire = encode_chunk_light(light);
+            edit_updates.push(OutboundLightUpdate {
+                pos,
+                light: light.clone(),
+                wire: LightData {
+                    sky_y_mask: wire.sky_y_mask,
+                    block_y_mask: wire.block_y_mask,
+                    empty_sky_y_mask: wire.empty_sky_y_mask,
+                    empty_block_y_mask: wire.empty_block_y_mask,
+                    sky_updates: wire.sky_updates,
+                    block_updates: wire.block_updates,
+                },
+            });
         }
-        let light = CHUNK_LIGHT_WORKSPACE
-            .with(|cell| compute_chunk_light_in(&mut cell.borrow_mut(), refs, table));
-        let wire = encode_chunk_light(&light);
-        updates.push(OutboundLightUpdate {
-            pos: ChunkPos { x: cx, z: cz },
-            light,
-            wire: LightData {
-                sky_y_mask: wire.sky_y_mask,
-                block_y_mask: wire.block_y_mask,
-                empty_sky_y_mask: wire.empty_sky_y_mask,
-                empty_block_y_mask: wire.empty_block_y_mask,
-                sky_updates: wire.sky_updates,
-                block_updates: wire.block_updates,
-            },
-        });
+        merge_light_updates(&mut updates, edit_updates);
     }
+
+    persist_baked_light_updates(storage, &updates);
     updates
+}
+
+fn seed_background_light_cache(
+    cache: &mut LightCache,
+    storage: &mc_world::WorldStorage,
+    centre_pos: ChunkPos,
+    previous_lights: &HashMap<(i32, i32), ChunkLight>,
+) {
+    for dz in -1i32..=1 {
+        for dx in -1i32..=1 {
+            let pos = ChunkPos {
+                x: centre_pos.x + dx,
+                z: centre_pos.z + dz,
+            };
+            if cache.contains(pos) {
+                continue;
+            }
+            if let Some(light) = previous_lights.get(&(pos.x, pos.z)) {
+                cache.insert(pos, light.clone());
+                continue;
+            }
+            if let Some(chunk) = storage.cached_chunk_snapshot(pos)
+                && let Some(light) = ChunkLight::from_section_lights(&chunk.section_lights)
+            {
+                cache.insert(pos, light);
+            }
+        }
+    }
+}
+
+fn persist_baked_light_update(
+    storage: &mut mc_world::WorldStorage,
+    pos: ChunkPos,
+    light: &ChunkLight,
+) {
+    if storage.cached_chunk_snapshot(pos).is_none() {
+        return;
+    }
+    match storage.get_chunk_mut(pos) {
+        Ok(Some(chunk)) => chunk.set_baked_light(light),
+        Ok(None) => {}
+        Err(err) => {
+            warn!(error = %err, cx = pos.x, cz = pos.z, "baked light update write failed");
+        }
+    }
+}
+
+fn persist_baked_light_updates(
+    storage: &mut mc_world::WorldStorage,
+    updates: &[OutboundLightUpdate],
+) {
+    for update in updates {
+        persist_baked_light_update(storage, update.pos, &update.light);
+    }
 }
 
 fn next_leaf_decay_state(
@@ -5353,13 +5559,11 @@ fn block_above_allows_grass(
     pos: mc_world::BlockPos,
 ) -> bool {
     storage
-        .get_block(mc_world::BlockPos {
+        .get_cached_block(mc_world::BlockPos {
             x: pos.x,
             y: pos.y + 1,
             z: pos.z,
         })
-        .ok()
-        .flatten()
         .and_then(|state| blocks.by_id(state))
         .is_none_or(|state| {
             matches!(
@@ -5379,9 +5583,7 @@ fn block_is(
     name: &str,
 ) -> bool {
     storage
-        .get_block(pos)
-        .ok()
-        .flatten()
+        .get_cached_block(pos)
         .and_then(|state| blocks.by_id(state))
         .is_some_and(|state| state.block.id.as_str() == name)
 }
@@ -5484,13 +5686,11 @@ fn farmland_has_crop_above(
     pos: mc_world::BlockPos,
 ) -> bool {
     storage
-        .get_block(mc_world::BlockPos {
+        .get_cached_block(mc_world::BlockPos {
             x: pos.x,
             y: pos.y + 1,
             z: pos.z,
         })
-        .ok()
-        .flatten()
         .and_then(|state| facts.random_tick_family(state.0))
         == Some(mc_data::block_facts::RandomTickFamily::Crop)
 }
@@ -5503,7 +5703,7 @@ fn farmland_has_nearby_water(
     for x in (pos.x - 4)..=(pos.x + 4) {
         for z in (pos.z - 4)..=(pos.z + 4) {
             for y in pos.y..=(pos.y + 1) {
-                let Ok(Some(state)) = storage.get_block(mc_world::BlockPos { x, y, z }) else {
+                let Some(state) = storage.get_cached_block(mc_world::BlockPos { x, y, z }) else {
                     continue;
                 };
                 if blocks
@@ -6266,6 +6466,22 @@ fn apply_block_edit_to_storage(
     outcome: &mut BlockEditBatchOutcome,
 ) {
     let pos = edit.pos;
+    let chunk_pos = ChunkPos {
+        x: pos.x.div_euclid(16),
+        z: pos.z.div_euclid(16),
+    };
+    let previous_light = if table.is_some() {
+        match storage.get_chunk(chunk_pos) {
+            Ok(Some(chunk)) => ChunkLight::from_section_lights(&chunk.section_lights),
+            Ok(None) => None,
+            Err(err) => {
+                warn!(error = %err, cx = chunk_pos.x, cz = chunk_pos.z, "pre-edit baked light read failed");
+                None
+            }
+        }
+    } else {
+        None
+    };
     match storage.set_block_at(pos, edit.new_state) {
         Ok(Some(previous)) if previous != edit.new_state => {
             if let Some(table) = table
@@ -6284,15 +6500,41 @@ fn apply_block_edit_to_storage(
                 z: pos.z,
                 state_id: edit.new_state,
             });
-            outcome
-                .edit_chunks
-                .insert((pos.x.div_euclid(16), pos.z.div_euclid(16)));
+            let chunk = (pos.x.div_euclid(16), pos.z.div_euclid(16));
+            outcome.edit_chunks.insert(chunk);
+            let changes_light = table
+                .is_some_and(|table| block_edit_changes_light(table, previous, edit.new_state));
+            if changes_light {
+                outcome.light_edit_chunks.insert(chunk);
+                if let Some(light) = previous_light {
+                    outcome.previous_light_chunks.entry(chunk).or_insert(light);
+                }
+            } else if let Some(light) = previous_light {
+                match storage.get_chunk_mut(chunk_pos) {
+                    Ok(Some(chunk)) => chunk.set_baked_light(&light),
+                    Ok(None) => {}
+                    Err(err) => {
+                        warn!(error = %err, cx = chunk_pos.x, cz = chunk_pos.z, "light-inert edit baked light restore failed");
+                    }
+                }
+            }
         }
         Ok(Some(_)) | Ok(None) => {}
         Err(err) => {
             warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "set_block_at failed; skipping edit");
         }
     }
+}
+
+fn block_edit_changes_light(
+    table: &BlockLightTable,
+    previous: mc_world::BlockStateId,
+    new_state: mc_world::BlockStateId,
+) -> bool {
+    table.emission(previous.0).unwrap_or(0) != table.emission(new_state.0).unwrap_or(0)
+        || table.opacity(previous.0).unwrap_or(0) != table.opacity(new_state.0).unwrap_or(0)
+        || table.propagates_sky(previous.0).unwrap_or(true)
+            != table.propagates_sky(new_state.0).unwrap_or(true)
 }
 
 async fn apply_visible_block_edit_batch<W>(
@@ -6331,6 +6573,10 @@ where
                 &mut light_updates,
                 collect_incremental_relight(state, &table, edit).await?,
             );
+        }
+        {
+            let mut storage = state.world.lock().await;
+            persist_baked_light_updates(&mut storage, &light_updates);
         }
         let light_chunks: HashSet<_> = light_updates
             .iter()
@@ -6699,12 +6945,8 @@ async fn schedule_fluid_ticks_for_interaction(
     applied: &[AppliedBlockEdit],
 ) {
     let mut storage = state.world.lock().await;
-    schedule_fluid_ticks_near_applied(
-        &mut storage,
-        &state.block_facts,
-        state.fluid_schedule_tick,
-        applied,
-    );
+    let current_tick = state.sessions.simulation_tick();
+    schedule_fluid_ticks_near_applied(&mut storage, &state.block_facts, current_tick, applied);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6731,6 +6973,30 @@ struct UseItemOnTarget {
     coords: (i32, i32, i32),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UseItemOnResyncLookup {
+    AuthoritativeLookup,
+    LoadedOnly,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UseItemOnResyncOptions {
+    lookup: UseItemOnResyncLookup,
+    resync_held_bucket: bool,
+}
+
+impl UseItemOnResyncOptions {
+    const AUTHORITATIVE_WITH_BUCKET: Self = Self {
+        lookup: UseItemOnResyncLookup::AuthoritativeLookup,
+        resync_held_bucket: true,
+    };
+
+    const LOADED_ONLY_BLOCKS: Self = Self {
+        lookup: UseItemOnResyncLookup::LoadedOnly,
+        resync_held_bucket: false,
+    };
+}
+
 async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -6746,8 +7012,9 @@ where
     state.pending_use = None;
     clear_shield_use(state);
 
-    if let UseItemOnOutcome::NoOp { reason } =
-        classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action)
+    let preflight = classify_use_item_on_preflight(game_mode, survival_state, player_pose, &action);
+    if let UseItemOnOutcome::NoOp { reason } = preflight
+        && reason != UseItemOnNoOpReason::OutOfReach
     {
         return ack_use_item_on_noop(writer, state.compression, action.sequence, reason).await;
     }
@@ -6762,6 +7029,27 @@ where
         clicked_pos,
         coords: (cx, cy, cz),
     };
+
+    if let UseItemOnOutcome::NoOp {
+        reason: UseItemOnNoOpReason::OutOfReach,
+    } = preflight
+    {
+        let (dx, dy, dz) = action.direction.normal();
+        return reject_use_item_on_with_resync(
+            state,
+            writer,
+            action.sequence,
+            target.clicked_pos,
+            mc_world::BlockPos {
+                x: cx + dx,
+                y: cy + dy,
+                z: cz + dz,
+            },
+            UseItemOnNoOpReason::OutOfReach,
+            UseItemOnResyncOptions::LOADED_ONLY_BLOCKS,
+        )
+        .await;
+    }
 
     match handle_use_item_on_interactions(
         state,
@@ -6956,11 +7244,18 @@ where
             held_count = held.count,
             "UseItemOn: held item is empty or not placeable; skipping"
         );
-        return ack_use_item_on_noop(
+        return reject_use_item_on_with_resync(
+            state,
             writer,
-            state.compression,
             sequence,
+            clicked_pos,
+            mc_world::BlockPos {
+                x: tx,
+                y: ty,
+                z: tz,
+            },
             UseItemOnNoOpReason::EmptyHeldItem,
+            UseItemOnResyncOptions::AUTHORITATIVE_WITH_BUCKET,
         )
         .await;
     };
@@ -6981,7 +7276,7 @@ where
     // Validate: target cell must currently be air. Crop items also
     // inspect the clicked block because seeds place the crop above
     // their supporting soil instead of mapping item name to block name.
-    let placed_state = {
+    let placement_result = 'placement: {
         let mut storage = state.world.lock().await;
         let clicked = match storage.get_block(mc_world::BlockPos {
             x: cx,
@@ -6996,23 +7291,11 @@ where
                     z = cz,
                     "UseItemOn clicked cell absent; skipping placement"
                 );
-                return ack_use_item_on_noop(
-                    writer,
-                    state.compression,
-                    sequence,
-                    UseItemOnNoOpReason::ClickedCellUnavailable,
-                )
-                .await;
+                break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
             }
             Err(err) => {
                 warn!(error = %err, x = cx, y = cy, z = cz, "UseItemOn clicked read failed");
-                return ack_use_item_on_noop(
-                    writer,
-                    state.compression,
-                    sequence,
-                    UseItemOnNoOpReason::ClickedCellUnavailable,
-                )
-                .await;
+                break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
             }
         };
         let target_is_air = match storage.get_block(mc_world::BlockPos {
@@ -7028,32 +7311,58 @@ where
             }
         };
         if !target_is_air {
-            None
+            Ok(None)
         } else {
-            state.item_to_block.resolve_for_use_on(
+            Ok(state.item_to_block.resolve_for_use_on(
                 &state.items,
                 held.item_id,
                 clicked,
                 action.direction,
                 &state.blocks,
-            )
+            ))
         }
     };
-    let Some(placed_state) = placed_state else {
-        debug!(
-            x = tx,
-            y = ty,
-            z = tz,
-            held_item = held.item_id,
-            "UseItemOn target invalid or held item not placeable; skipping placement"
-        );
-        return ack_use_item_on_noop(
-            writer,
-            state.compression,
-            sequence,
-            UseItemOnNoOpReason::TargetBlockedOrUnplaceable,
-        )
-        .await;
+    let placed_state = match placement_result {
+        Ok(Some(placed_state)) => placed_state,
+        Ok(None) => {
+            debug!(
+                x = tx,
+                y = ty,
+                z = tz,
+                held_item = held.item_id,
+                "UseItemOn target invalid or held item not placeable; skipping placement"
+            );
+            return reject_use_item_on_with_resync(
+                state,
+                writer,
+                sequence,
+                clicked_pos,
+                mc_world::BlockPos {
+                    x: tx,
+                    y: ty,
+                    z: tz,
+                },
+                UseItemOnNoOpReason::TargetBlockedOrUnplaceable,
+                UseItemOnResyncOptions::AUTHORITATIVE_WITH_BUCKET,
+            )
+            .await;
+        }
+        Err(reason) => {
+            return reject_use_item_on_with_resync(
+                state,
+                writer,
+                sequence,
+                clicked_pos,
+                mc_world::BlockPos {
+                    x: tx,
+                    y: ty,
+                    z: tz,
+                },
+                reason,
+                UseItemOnResyncOptions::AUTHORITATIVE_WITH_BUCKET,
+            )
+            .await;
+        }
     };
 
     let Some(edits) = plan_place_block_edits(
@@ -7069,11 +7378,18 @@ where
     )
     .await
     else {
-        return ack_use_item_on_noop(
+        return reject_use_item_on_with_resync(
+            state,
             writer,
-            state.compression,
             sequence,
+            clicked_pos,
+            mc_world::BlockPos {
+                x: tx,
+                y: ty,
+                z: tz,
+            },
             UseItemOnNoOpReason::PlacementPlanRejected,
+            UseItemOnResyncOptions::AUTHORITATIVE_WITH_BUCKET,
         )
         .await;
     };
@@ -7118,6 +7434,85 @@ where
         .await?;
     }
     Ok(())
+}
+
+async fn reject_use_item_on_with_resync<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    target_pos: mc_world::BlockPos,
+    reason: UseItemOnNoOpReason,
+    options: UseItemOnResyncOptions,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let held_slot_resync = if options.resync_held_bucket {
+        bucket_held_slot_resync(state)
+    } else {
+        None
+    };
+    let updates = {
+        let mut storage = state.world.lock().await;
+        [clicked_pos, target_pos]
+            .into_iter()
+            .filter_map(|pos| {
+                let state_id = match options.lookup {
+                    UseItemOnResyncLookup::AuthoritativeLookup => match storage.get_block(pos) {
+                        Ok(Some(state_id)) => Some(state_id),
+                        Ok(None) => None,
+                        Err(err) => {
+                            warn!(error = %err, x = pos.x, y = pos.y, z = pos.z, "UseItemOn resync read failed");
+                            None
+                        }
+                    },
+                    UseItemOnResyncLookup::LoadedOnly => storage.get_cached_block(pos),
+                }?;
+                Some(BlockUpdate {
+                    position: pack_block_pos(pos.x, pos.y, pos.z),
+                    state_id: state_id.0 as i32,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    for update in updates {
+        write_packet(writer, &update, state.compression).await?;
+    }
+    if let Some((slot, item_stack)) = held_slot_resync {
+        state.inventory_state_id = state.inventory_state_id.wrapping_add(1);
+        write_packet(
+            writer,
+            &ClientboundContainerSetSlot {
+                container_id: 0,
+                state_id: state.inventory_state_id,
+                slot,
+                item_stack,
+            },
+            state.compression,
+        )
+        .await?;
+    }
+    ack_use_item_on_noop(writer, state.compression, sequence, reason).await
+}
+
+fn bucket_held_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)> {
+    let held_slot = state.selected_hotbar_slot;
+    let held = state.inventory.held(held_slot);
+    if held.is_empty() {
+        return None;
+    }
+    let is_bucket = state
+        .item_to_block
+        .bucket_fluid_kind(held.item_id)
+        .is_some()
+        || Some(held.item_id) == state.item_to_block.empty_bucket_item();
+    is_bucket.then(|| {
+        (
+            (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
+            held.clone(),
+        )
+    })
 }
 
 async fn ack_use_item_on_noop<W>(
@@ -7934,6 +8329,86 @@ where
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn handle_accepted_absolute_movement<W>(
+    writer: &mut W,
+    compression: Compression,
+    interaction: &mut Option<&mut InteractionState>,
+    chunk_stream: &mut Option<ChunkStreamState>,
+    sessions: &SessionRegistry,
+    session_id: SessionId,
+    survival_state: &mut SurvivalState,
+    xp_state: &mut XpState,
+    game_mode: GameMode,
+    player_pose: &mut PlayerPose,
+    movement: AcceptedAbsoluteMovement,
+    next_teleport_id: &mut i32,
+    pending_teleport: &mut Option<PendingTeleport>,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let old_center = player_pose.chunk_pos();
+    let old_pose = *player_pose;
+    let mut new_pose = *player_pose;
+    new_pose.x = movement.x;
+    new_pose.y = movement.y;
+    new_pose.z = movement.z;
+    if let Some((yaw, pitch)) = movement.yaw_pitch {
+        new_pose.yaw = yaw;
+        new_pose.pitch = pitch;
+    }
+    new_pose.flags = movement.flags;
+    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
+    refresh_player_fall_state(old_pose, &mut new_pose);
+    if correct_player_collision(
+        interaction.as_deref(),
+        writer,
+        compression,
+        old_pose,
+        new_pose,
+        next_teleport_id,
+        pending_teleport,
+    )
+    .await?
+    {
+        *player_pose = old_pose;
+        return Ok(());
+    }
+
+    *player_pose = new_pose;
+    if game_mode == GameMode::Survival
+        && let Some(state) = interaction.as_deref_mut()
+    {
+        maybe_trample_farmland(state, writer, old_pose, *player_pose).await?;
+    }
+    if game_mode == GameMode::Survival {
+        apply_fall_damage(
+            interaction.as_deref_mut(),
+            writer,
+            compression,
+            survival_state,
+            xp_state,
+            old_pose,
+            *player_pose,
+        )
+        .await?;
+    }
+    let new_center = player_pose.chunk_pos();
+    dispatch_visibility_commands(sessions.update_pose(session_id, *player_pose));
+    replan_after_movement(
+        writer,
+        compression,
+        chunk_stream,
+        interaction.as_deref_mut(),
+        old_center,
+        new_center,
+        player_pose.yaw,
+    )
+    .await?;
+    Ok(())
+}
+
 fn sync_player_persistence(
     player_save_state: &Option<Arc<Mutex<PlayerPersistedState>>>,
     pose: PlayerPose,
@@ -8196,25 +8671,24 @@ where
                         )
                         .await?;
                     }
-                    Some(OutboundCommand::FurnaceSlots { position, slots }) => {
+                    Some(OutboundCommand::FurnaceSlots {
+                        position,
+                        state_id,
+                        slots,
+                    }) => {
                         if let Some(state) = interaction.as_deref_mut()
                             && let Some(ActiveContainer::Furnace(mut window)) = state.active_container.take()
                         {
                             if window.position == position {
-                                window.state_id = window.state_id.wrapping_add(1);
-                                for (slot, item_stack) in slots.iter().cloned().enumerate() {
-                                    write_packet(
-                                        writer,
-                                        &ClientboundContainerSetSlot {
-                                            container_id: window.container_id,
-                                            state_id: window.state_id,
-                                            slot: slot as i16,
-                                            item_stack,
-                                        },
-                                        compression,
-                                    )
-                                    .await?;
-                                }
+                                window.state_id = state_id;
+                                write_container_slots(
+                                    writer,
+                                    compression,
+                                    window.container_id,
+                                    window.state_id,
+                                    slots.iter().cloned(),
+                                )
+                                .await?;
                             }
                             state.active_container = Some(ActiveContainer::Furnace(window));
                         }
@@ -8227,25 +8701,24 @@ where
                             write_furnace_data_changes(writer, compression, window, &changed).await?;
                         }
                     }
-                    Some(OutboundCommand::ChestSlots { position, slots }) => {
+                    Some(OutboundCommand::ChestSlots {
+                        position,
+                        state_id,
+                        slots,
+                    }) => {
                         if let Some(state) = interaction.as_deref_mut()
                             && let Some(ActiveContainer::Chest(mut window)) = state.active_container.take()
                         {
                             if window.position() == position {
-                                window.state_id = window.state_id.wrapping_add(1);
-                                for (slot, item_stack) in slots.iter().cloned().enumerate() {
-                                    write_packet(
-                                        writer,
-                                        &ClientboundContainerSetSlot {
-                                            container_id: window.container_id,
-                                            state_id: window.state_id,
-                                            slot: slot as i16,
-                                            item_stack,
-                                        },
-                                        compression,
-                                    )
-                                    .await?;
-                                }
+                                window.state_id = state_id;
+                                write_container_slots(
+                                    writer,
+                                    compression,
+                                    window.container_id,
+                                    window.state_id,
+                                    slots.iter().cloned(),
+                                )
+                                .await?;
                             }
                             state.active_container = Some(ActiveContainer::Chest(window));
                         }
@@ -8303,7 +8776,6 @@ where
             }
             _ = furnace_ticker.tick() => {
                 if let Some(state) = interaction.as_deref_mut() {
-                    state.fluid_schedule_tick = state.fluid_schedule_tick.wrapping_add(1);
                     tick_active_container(state, writer).await?;
                     tick_campfire_cooking(state).await;
                     tick_pending_use(state, writer, game_mode, &mut survival_state).await?;
@@ -8374,59 +8846,28 @@ where
                     }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPos::decode(&mut body)?;
-                    let old_center = player_pose.chunk_pos();
-                    let old_pose = player_pose;
-                    let mut new_pose = player_pose;
-                    new_pose.x = movement.x;
-                    new_pose.y = movement.y;
-                    new_pose.z = movement.z;
-                    new_pose.flags = movement.flags;
-                    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
-                    refresh_player_fall_state(old_pose, &mut new_pose);
-                    if correct_player_collision(
-                        interaction.as_deref(),
+                    handle_accepted_absolute_movement(
                         writer,
                         compression,
-                        old_pose,
-                        new_pose,
+                        &mut interaction,
+                        &mut chunk_stream,
+                        sessions.as_ref(),
+                        session_id,
+                        &mut survival_state,
+                        &mut xp_state,
+                        game_mode,
+                        &mut player_pose,
+                        AcceptedAbsoluteMovement {
+                            x: movement.x,
+                            y: movement.y,
+                            z: movement.z,
+                            yaw_pitch: None,
+                            flags: movement.flags,
+                        },
                         &mut next_teleport_id,
                         &mut pending_teleport,
                     )
-                    .await?
-                    {
-                        player_pose = old_pose;
-                    } else {
-                        player_pose = new_pose;
-                        if game_mode == GameMode::Survival
-                            && let Some(state) = interaction.as_deref_mut()
-                        {
-                            maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
-                        }
-                        if game_mode == GameMode::Survival {
-                            apply_fall_damage(
-                                interaction.as_deref_mut(),
-                                writer,
-                                compression,
-                                &mut survival_state,
-                                &mut xp_state,
-                                old_pose,
-                                player_pose,
-                            )
-                            .await?;
-                        }
-                        let new_center = player_pose.chunk_pos();
-                        dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                        replan_after_movement(
-                            writer,
-                            compression,
-                            &mut chunk_stream,
-                            interaction.as_deref_mut(),
-                            old_center,
-                            new_center,
-                            player_pose.yaw,
-                        )
-                        .await?;
-                    }
+                    .await?;
                 } else if frame.id == ServerboundMovePlayerPosRot::ID {
                     if guard_pending_teleport_movement(
                         &mut pending_teleport,
@@ -8440,61 +8881,28 @@ where
                     }
                     let mut body = frame.body;
                     let movement = ServerboundMovePlayerPosRot::decode(&mut body)?;
-                    let old_center = player_pose.chunk_pos();
-                    let old_pose = player_pose;
-                    let mut new_pose = player_pose;
-                    new_pose.x = movement.x;
-                    new_pose.y = movement.y;
-                    new_pose.z = movement.z;
-                    new_pose.yaw = movement.yaw;
-                    new_pose.pitch = movement.pitch;
-                    new_pose.flags = movement.flags;
-                    refresh_player_water_state(interaction.as_deref(), &mut new_pose).await;
-                    refresh_player_fall_state(old_pose, &mut new_pose);
-                    if correct_player_collision(
-                        interaction.as_deref(),
+                    handle_accepted_absolute_movement(
                         writer,
                         compression,
-                        old_pose,
-                        new_pose,
+                        &mut interaction,
+                        &mut chunk_stream,
+                        sessions.as_ref(),
+                        session_id,
+                        &mut survival_state,
+                        &mut xp_state,
+                        game_mode,
+                        &mut player_pose,
+                        AcceptedAbsoluteMovement {
+                            x: movement.x,
+                            y: movement.y,
+                            z: movement.z,
+                            yaw_pitch: Some((movement.yaw, movement.pitch)),
+                            flags: movement.flags,
+                        },
                         &mut next_teleport_id,
                         &mut pending_teleport,
                     )
-                    .await?
-                    {
-                        player_pose = old_pose;
-                    } else {
-                        player_pose = new_pose;
-                        if game_mode == GameMode::Survival
-                            && let Some(state) = interaction.as_deref_mut()
-                        {
-                            maybe_trample_farmland(state, writer, old_pose, player_pose).await?;
-                        }
-                        if game_mode == GameMode::Survival {
-                            apply_fall_damage(
-                                interaction.as_deref_mut(),
-                                writer,
-                                compression,
-                                &mut survival_state,
-                                &mut xp_state,
-                                old_pose,
-                                player_pose,
-                            )
-                            .await?;
-                        }
-                        let new_center = player_pose.chunk_pos();
-                        dispatch_visibility_commands(sessions.update_pose(session_id, player_pose));
-                        replan_after_movement(
-                            writer,
-                            compression,
-                            &mut chunk_stream,
-                            interaction.as_deref_mut(),
-                            old_center,
-                            new_center,
-                            player_pose.yaw,
-                        )
-                        .await?;
-                    }
+                    .await?;
                 } else if frame.id == ServerboundMovePlayerRot::ID {
                     if guard_pending_teleport_movement(
                         &mut pending_teleport,
@@ -8733,6 +9141,7 @@ where
                         writer,
                         compression,
                         interaction.as_deref_mut(),
+                        &mut chunk_stream,
                         &mut player_pose,
                         respawn_pose,
                         &mut survival_state,
@@ -9215,13 +9624,13 @@ where
                 debug!(%item, "debug give ignored — no interaction state");
                 return Ok(());
             };
-            let Some(item_id) = state.items.id_of(&item) else {
-                debug!(%item, "debug give ignored — item not in registry");
-                return Ok(());
-            };
             let stack = if count <= 0 {
                 ItemStack::EMPTY
             } else {
+                let Some(item_id) = state.items.id_of(&item) else {
+                    debug!(%item, "debug give ignored — item not in registry");
+                    return Ok(());
+                };
                 ItemStack::new(item_id, count.min(i32::from(u8::MAX)))
             };
             state.inventory.set_hotbar(hotbar_slot, stack.clone());
@@ -9334,6 +9743,7 @@ async fn handle_client_command<W>(
     writer: &mut W,
     compression: Compression,
     interaction: Option<&mut InteractionState>,
+    chunk_stream: &mut Option<ChunkStreamState>,
     player_pose: &mut PlayerPose,
     respawn_pose: PlayerPose,
     survival_state: &mut SurvivalState,
@@ -9356,6 +9766,27 @@ where
             }
             *player_pose = respawn_pose;
             write_packet(writer, respawn, compression).await?;
+            write_packet(
+                writer,
+                &GameEvent {
+                    event: GameEvent::EVENT_START_WAITING_FOR_CHUNKS,
+                    value: 0.0,
+                },
+                compression,
+            )
+            .await?;
+            write_packet(
+                writer,
+                &SetCenterChunk {
+                    chunk_x: respawn_pose.chunk_pos().0,
+                    chunk_z: respawn_pose.chunk_pos().1,
+                },
+                compression,
+            )
+            .await?;
+            if let Some(stream) = chunk_stream.as_mut() {
+                stream.replay_current_view(respawn_pose.yaw);
+            }
             let teleport_id = next_player_teleport_id(next_teleport_id);
             send_player_position_sync(writer, compression, teleport_id, *player_pose).await?;
             *pending_teleport = Some(PendingTeleport::new(teleport_id, *player_pose));

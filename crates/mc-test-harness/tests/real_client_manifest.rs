@@ -87,6 +87,56 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
         Some("agent-run real-client"),
         "runner must distinguish completed real-client evidence from prepared scaffolding"
     );
+    assert_eq!(
+        runner["agent_driver"].as_str(),
+        Some("tools/real-client-agent-driver.py"),
+        "runner must name the approved in-client bridge driver"
+    );
+    assert_eq!(
+        runner["agent_bridge_url_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL"),
+        "runner must expose the loopback bridge URL env hook"
+    );
+    assert_eq!(
+        runner["agent_secret_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_AGENT_SECRET"),
+        "runner must expose the per-run bridge secret env hook"
+    );
+    assert_eq!(
+        runner["agent_jar_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_AGENT_JAR"),
+        "runner must expose the Java agent jar env hook"
+    );
+    assert_eq!(
+        runner["agent_port_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_AGENT_PORT"),
+        "runner must expose the Java agent port env hook"
+    );
+    assert_eq!(
+        runner["agent_scenario_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_AGENT_SCENARIO"),
+        "runner must expose the agent scenario override hook"
+    );
+    assert_eq!(
+        runner["agent_server_addr_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_SERVER_ADDR"),
+        "runner must expose the server address passed to the client agent"
+    );
+    assert_eq!(
+        runner["second_command_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_SECOND_COMMAND"),
+        "runner must expose the second real-client command hook for two-client gates"
+    );
+    assert_eq!(
+        runner["second_agent_secret_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET"),
+        "runner must expose a separate second-client bridge secret"
+    );
+    assert_eq!(
+        runner["second_agent_port_env"].as_str(),
+        Some("SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT"),
+        "runner must expose a separate second-client bridge port"
+    );
     let allowed_client_kinds = runner["allowed_client_kinds"]
         .as_array()
         .expect("allowed client kinds are present");
@@ -146,6 +196,26 @@ fn m94_real_client_manifest_covers_required_regression_rows() {
             covered_rows.insert(row.as_str().expect("ledger row is a string"));
         }
     }
+    assert!(
+        scenario_ids.contains("m94-02c-water-bucket-place-pickup"),
+        "M94 manifest must keep the focused accepted water-bucket real-client scenario"
+    );
+    assert!(
+        scenario_ids.contains("m94-04a-regular-sign-place-text"),
+        "M94 manifest must keep the focused regular sign real-client scenario"
+    );
+    assert!(
+        scenario_ids.contains("m94-03a-inventory-oak-log-to-planks"),
+        "M94 manifest must keep the focused inventory recipe real-client scenario"
+    );
+    assert!(
+        scenario_ids.contains("m94-03b-two-client-shared-chest"),
+        "M94 manifest must keep the focused two-client shared chest scenario"
+    );
+    assert!(
+        scenario_ids.contains("m94-03c-two-client-shared-chest-live-update"),
+        "M94 manifest must keep the focused two-client shared chest live-update scenario"
+    );
 
     let mut manual_pending_rows = BTreeSet::new();
     for row in manifest["scoped_rows_manual_pending"]
@@ -205,5 +275,40 @@ fn approved_real_client_runner_is_fail_closed() {
             && runner.contains("example.toml")
             && runner.contains("cargo run --bin mc-server -- --config"),
         "runner must default to the manifest server command while allowing explicit config overrides"
+    );
+    assert!(
+        runner.contains("SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL")
+            && runner.contains("SOLARIS_REAL_CLIENT_AGENT_SECRET")
+            && runner.contains("SOLARIS_REAL_CLIENT_AGENT_JAR")
+            && runner.contains("JDK_JAVA_OPTIONS")
+            && runner.contains("--add-modules jdk.httpserver")
+            && runner.contains("-javaagent:")
+            && runner.contains("tools/real-client-agent-driver.py")
+            && runner.contains("driver_timeout_seconds=$((CLIENT_TIMEOUT_SECONDS + 15))")
+            && runner.contains("--bridge-url")
+            && runner.contains("--server-addr"),
+        "runner must expose and invoke the in-client bridge driver hooks"
+    );
+    assert!(
+        runner.contains("m94-06-save-restart-two-client-visibility")
+            && runner.contains("m94-06-save-restart-before")
+            && runner.contains("m94-06-save-restart-after")
+            && runner.contains("m94-06-two-client-live-visibility")
+            && runner.contains("m94-06-two-client-shared-drop")
+            && runner.contains("m94-06-two-client-shared-pickup")
+            && runner.contains("m94-03b-two-client-shared-chest")
+            && runner.contains("m94-03c-two-client-shared-chest-live-update")
+            && runner.contains("client_agent_two_client_shared_chest_phase_exit_status=")
+            && runner
+                .contains("client_agent_two_client_shared_chest_live_update_phase_exit_status=")
+            && runner.contains("--append-observations")
+            && runner.contains("SOLARIS_REAL_CLIENT_SECOND_COMMAND")
+            && runner.contains("SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET")
+            && runner.contains("SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT")
+            && runner.contains("--secondary-bridge-url")
+            && runner.contains("--secondary-secret")
+            && runner.contains("server_restart_count=")
+            && runner.contains("kill -INT"),
+        "runner must orchestrate m94-06 as a real restart plus optional two-client bridge phase"
     );
 }

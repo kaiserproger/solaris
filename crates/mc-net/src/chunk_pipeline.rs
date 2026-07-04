@@ -232,6 +232,14 @@ impl ChunkScheduler {
         self.finished.retain(|coord| self.desired.contains(coord));
     }
 
+    pub fn replay_view<I>(&mut self, desired: I)
+    where
+        I: IntoIterator<Item = (i32, i32, ChunkPriority)>,
+    {
+        self.finished.clear();
+        self.replace_view(desired);
+    }
+
     #[must_use]
     pub fn current_generation(&self) -> ChunkPipelineGeneration {
         ChunkPipelineGeneration(self.generation)
@@ -337,6 +345,21 @@ mod tests {
 
         assert_eq!(scheduler.desired_len(), 2);
         assert_eq!(scheduler.queued_len(), 2);
+    }
+
+    #[test]
+    fn scheduler_replay_view_requeues_finished_chunks() {
+        let mut scheduler = ChunkScheduler::new([(0, 0, priority(0)), (1, 0, priority(1))]);
+        let first = scheduler.poll_next().expect("first request");
+        assert!(scheduler.mark_finished(first));
+        let second = scheduler.poll_next().expect("second request");
+        assert!(scheduler.mark_finished(second));
+        assert!(scheduler.is_complete());
+
+        scheduler.replay_view([(0, 0, priority(0)), (1, 0, priority(1))]);
+
+        assert_eq!(scheduler.queued_len(), 2);
+        assert_eq!(scheduler.finished_len(), 0);
     }
 
     #[test]

@@ -44,6 +44,39 @@ Solaris-only, wire-probe-only, protocol-metadata-only, negated, partial,
 blocked, unknown, draft-debt, accepted-divergence, and non-goal rows do not
 count toward the 80% target.
 
+## 2026-06-13 Static Review Summary
+
+A static documentation/code review on 2026-06-13 classified Solaris as a strong
+stabilization-alpha/private vanilla-near base, not a release-ready vanilla
+replacement. That review did not run cargo, a real vanilla client, or profiler
+workloads; it adds no executable validation evidence by itself.
+
+Positive readiness signals remain real: the docs are unusually honest about
+claim boundaries, crates are modular, vanilla data sidecar discipline and
+protocol-oracle discipline are explicit, several vertical slices exist end to
+end, dense entity storage is the right direction, lock metrics are already
+visible, and extension/script contracts are bounded boundary primitives rather
+than a promised plugin API.
+
+The same review keeps these blockers canonical for replacement claims:
+
+- Real-client and vanilla-oracle evidence are still the largest gating gaps.
+- Generated-world chunk/light streaming is functional but non-green: the M77
+  view-distance-8 path emitted 289 chunks, yet the full window took 17.3s with
+  `light_compute_ms=50489` plus tick, `chunk_prepare`, and `save_all_flush`
+  warnings.
+- The global `WorldStorage` mutex and `SessionRegistry` lock responsibilities
+  still need narrowing, ownership review, and runtime evidence.
+- Entity AI/pathfinding is draft, not broad vanilla behavior.
+- Player water/swim feel, movement polish, and frozen-world/manual regressions
+  remain open.
+- Stale block edits and CAS-style transaction safety are not proven.
+- Public auth/offline-mode defaults and session safety block public deployment.
+- Persistence, crash recovery, soak, autoscale, and generated-world performance
+  need real validation.
+- Plugin API parity is a non-goal for M100; only bounded extension/script
+  boundary primitives should be claimed.
+
 ## Evidence-Backed Partial Scope
 
 - Login/config/play, chunk streaming, lighting, block edits, persistence,
@@ -51,15 +84,67 @@ count toward the 80% target.
   focused implementation and test coverage from earlier milestones, but still
   require current oracle/client and soak evidence before they count as broad
   M100 coverage.
+- Rejected occupied-target block placement now has focused Solaris harness
+  coverage requiring authoritative clicked-cell and target-cell block updates
+  before the matching acknowledgement. A second focused occupied-target
+  water-bucket fallback/resync harness also requires the authoritative held
+  water-bucket slot with a fresh inventory state id before ack. A third focused
+  harness covers survival out-of-reach `UseItemOn` against loaded clicked/target
+  dirt cells and requires both cached loaded-cell block updates before ack. The
+  out-of-reach water-bucket variant also guards that no held-slot correction is
+  emitted before ack. A 2026-06-22 Java-agent run drove a real vanilla 26.1.2
+  client through `m94-02b-rejected-block-resync` and validated the local
+  artifact `.analysis/real-client-runs/20260622T135534Z-m94-regression-pack`;
+  that run passed the occupied solid, out-of-reach solid, and occupied
+  water-bucket fallback/resync observations and wrote
+  `screenshots/m94-02b-rejected-block-resync.png`. These harnesses are
+  local-sidecar-dependent and degrade/skip when required `data/vanilla` reports
+  are absent. Broader stale edit/CAS paths, wider bucket/no-op edge cases,
+  vanilla oracle evidence, and real-client desync coverage beyond that one
+  scenario remain unproven.
+- Water buckets have focused real-client place/pickup evidence and packet
+  harness coverage for scheduled spread timing. The scheduler now queues
+  interaction-created fluid ticks from the shared simulation tick rather than a
+  connection-local counter; `water_bucket_spread_waits_for_scheduled_fluid_delay`
+  drives the normal `UseItemOn` packet path and guards against immediate
+  post-placement water spread after the server has already ticked. This is not
+  broad fluid parity: lava, full spread topology, water-lava interaction,
+  bucket no-op variants, swim feel, and broad real-client/oracle coverage remain
+  incomplete. A follow-up PrismLauncher run
+  `.analysis/real-client-runs/20260622T174026Z-m94-regression-pack` reran the
+  focused water place/pickup scenario after random-tick performance fixes and
+  validated with no runtime tick budget warnings in the server log.
+- A later broad `m94-02-blocks-fluids-farming-drops` run validated
+  `.analysis/real-client-runs/20260622T180920Z-m94-regression-pack`; it composed
+  the real-client solid break/drop/place and water-bucket place/pickup probes in
+  one broad-row run. That row remains blocked because door/trapdoor,
+  crop/bonemeal, sugar cane support/cascade/drop, broad fluid spread,
+  water-lava interaction, and swim feel still lack in-client primitives and
+  server evidence.
+- A 2026-06-22 Java-agent run drove a real vanilla 26.1.2 client through
+  `m94-01-join-rejoin-chunks-movement` and validated the local artifact
+  `.analysis/real-client-runs/20260622T142127Z-m94-regression-pack`. The run
+  reached Play, moved forward for `750` ms with `horizontal_delta=3.673`,
+  observed the Solaris server-side session release marker, rejoined Play in
+  `minecraft:overworld`, and wrote after-move plus after-rejoin screenshots.
+  This is narrow evidence for one join/rejoin/movement path; it is not broad
+  movement, water/swim, slow-client, two-client, or performance evidence.
 - Beds set respawn points. A bounded draft sleep path skips a lone player from
   Solaris-defined night to the next morning through the existing `SetTime` path,
   but client-visible clock-map/time-sync behavior and sleep skip save/restart
   persistence are not proven. Multiplayer sleep quorum, weather, and
   client-visible bed animation parity are not claimed. Weather is currently
   disabled: Solaris does not start rain/thunder or send weather transitions.
-- Signs support regular plain-text editing through Solaris harness coverage;
-  hanging signs, styled/filtered/clickable text, waxed semantics,
-  sounds/statistics/game events, and visual/manual parity are not claimed.
+- Signs support regular plain-text editing through Solaris harness coverage. A
+  focused packet-path harness now flushes and reopens a disk-backed world after
+  regular sign text edit and checks the persisted sign NBT plus client
+  block-entity wire record. A broad `m94-04-signs-beds-campfires-and-block-entities`
+  run validated `.analysis/real-client-runs/20260622T182159Z-m94-regression-pack`;
+  it placed an oak sign, opened `SignEditScreen`, sent plain text, closed the
+  editor, and rechecked the same text after close. Hanging signs,
+  styled/filtered/clickable text, waxed semantics, sounds/statistics/game events,
+  broad restart/client evidence, beds, campfires, and visual/manual parity are
+  still not claimed.
 - Crafting table, chest, barrel, furnace, smoker, and blast furnace paths have
   partial container/menu support. Barrels use single-container storage;
   smokers and blast furnaces share the furnace-family runtime. Barrel animation,
@@ -72,8 +157,21 @@ count toward the 80% target.
   are acknowledged without opening unimplemented menus or placing a held block
   through the station interaction. Their actual gameplay remains deferred.
 - Recipe loading and runtime support are partial for furnace, blasting, smoking,
-  and campfire variants. Recipe-book/window sync and broader recipe execution
-  need M80/M87 validation.
+  and campfire variants. A 2026-06-22 Java-agent run drove a real vanilla
+  26.1.2 client through `m94-03a-inventory-oak-log-to-planks` and validated
+  `.analysis/real-client-runs/20260622T161221Z-m94-regression-pack`; that run
+  loaded the configured vanilla sidecar recipe registry, sent the vanilla
+  place-recipe packet for inventory container `0` with sidecar recipe display id
+  `697`, consumed one oak log, and observed four added oak planks. Recipe-book/
+  window sync, crafting-table UI, cursor recovery, containers/stations,
+  malformed clicks, and broader recipe execution still need M80/M87 validation.
+  A later broad `m94-03-inventory-crafting-containers-stations` run validated
+  `.analysis/real-client-runs/20260622T180005Z-m94-regression-pack`; it again
+  proved the oak-log recipe path, placed a chest, opened the vanilla
+  `ContainerScreen`, and closed back to no screen. That broad row remains
+  blocked because cursor transfer, chest/barrel clicks, furnace-family UI,
+  common stations, malformed clicks, and recovery paths still lack in-client
+  primitives and server evidence.
 - Campfire cooking has usable partial support for held-input cooking, visible
   `Items` block-entity updates, cooked item drops, and pickup. In-flight
   persistence, automation, smoke/sound/particles, and exact ejection behavior are
@@ -92,22 +190,100 @@ count toward the 80% target.
 - Bows/arrows and shields have partial local combat behavior. Exact projectile
   physics/metadata, durability, axe-disable, shield pose/timing/angle,
   attribution, effects, and broader damage-source parity are not claimed.
+- Entities/combat/death now have one broad-row real-client partial:
+  `.analysis/real-client-runs/20260622T190401Z-m94-regression-pack` observed a
+  visible `minecraft:cow`, showed the real `DeathScreen`, performed vanilla
+  respawn, and returned to Play with `current_screen=none`. That artifact also
+  forced a server-side respawn recovery fix: Solaris now replays the completed
+  chunk view and emits the vanilla-pinned level-chunks-load-start game event
+  after `ClientboundRespawn`. Hostile combat, melee damage/knockback, mob drops,
+  XP pickup, projectiles, shield timing, vehicles, and broad AI/pathing remain
+  unclaimed.
+- The named M40/M41 route now has one broad-row real-client partial:
+  `.analysis/real-client-runs/20260622T191650Z-m94-regression-pack` placed and
+  picked up water, broke a visible-drop target, picked up the dirt, placed dirt
+  back into loaded air, observed a visible `minecraft:cow`, and captured a
+  server log with no runtime tick-budget or background-relight warnings. Swim
+  feel, sugar cane support/cascade/drop, the owner frozen-world route, and full
+  TPS/lock performance evidence remain unclaimed.
+- Save/restart now has one broad-row real-client partial:
+  `.analysis/real-client-runs/20260622T210703Z-m94-regression-pack` placed a
+  dirt marker through the real client, sent `save-all`, stopped Solaris with
+  `kill -INT`, restarted, reconnected the same real client, and observed the
+  marker persisted. The same artifact also launched `SolarisObserver` from a
+  separate PrismLauncher root and passed one two-client live block-visibility
+  check where the observer saw a primary-client dirt marker plus one
+  two-client shared-drop visibility check where the observer saw a dirt item
+  entity produced by the primary client, and one two-client shared-pickup
+  removal check where the primary collected that dirt through the real client
+  and the observer saw the item disappear. This is not full persistence or
+  multiplayer evidence: block entities, containers, time/weather, crash
+  recovery, shared-container state, contention, broad two-client join/move/edit
+  coverage, and soak remain unclaimed.
 - M37/M42 provide earlier metrics and lock-pressure evidence, but the M100
   low-end/balanced/high-end performance, concurrency, and autoscale gates remain
   non-green. M77 generated-world validation proved functional spawn-window
   generation/streaming, but also exposed a performance blocker: the
   view-distance-8 live stream emitted all 289 chunks only after 17.3s and logged
-  repeated tick-budget plus `chunk_prepare` lock warnings.
+  repeated tick-budget plus `chunk_prepare` lock warnings. Later 2026-06-22
+  debug `wire-probe` slices pre-generated the one-chunk light border, baked
+  view-square light into generated chunks, reused persisted section light arrays,
+  and warmed existing-world spawn chunks before listening. Those slices reduced
+  the fresh generated-world stream to `327` ms and the warmed restart stream to
+  `338` ms with `light_compute_ms=0`, `slow_light_compute_chunks=0`, and
+  `slow_fetch_chunks=0`. A later existing-world diagnostic
+  `.analysis/perf-runs/20260622T163447Z-generated-world-full-window` captured
+  the remaining missing-light path at `light_compute_ms=47773`; the follow-up
+  backfill and persistence probes moved that same stream to `light_compute_ms=0`
+  and `323` ms, then proved an immediate restart stayed at `baked=0`/`flushed=0`
+  after a client run. The work remains non-green: fresh startup paid `17273` ms
+  total pregen-plus-bake cost, first existing-world missing-light backfill paid
+  startup light cost for 289 chunks, earlier warmed streams logged lock waits,
+  and broad performance profiles are unrun. A follow-up focused slice moved
+  random block ticks and scheduled fluid ticks from desired/ticketed chunks to
+  already-loaded chunks, skipped full relight for light-inert random/fluid edits,
+  preserved baked light for those light-inert edits, and persisted recomputed
+  relight, with `mc-net` regressions for those cases. The bounded before/after
+  protocol probes
+  `.analysis/perf-runs/20260622T162551Z-loaded-simulation-boundary` and
+  `.analysis/perf-runs/20260622T162829Z-loaded-simulation-light-inert` moved the
+  short-run runtime tick evidence from repeated random-tick-dominated budget
+  warnings to no slow-tick warnings and `random_tick_us` below about `0.6` ms,
+  but this is not a full generated-world performance gate. A real-client
+  follow-up then reproduced the remaining PrismLauncher random-tick stall in
+  `.analysis/real-client-runs/20260622T173420Z-m94-regression-pack`
+  (`random_tick_us` up to `525492`) and cleared it in
+  `.analysis/real-client-runs/20260622T174026Z-m94-regression-pack` by keeping
+  random neighbor reads resident-only and using background incremental relight
+  from saved baked light; that focused run still is not a full O1/O2 profile.
 
 ## Blocked Or Unknown For M100
 
-- Real-client automation/manual evidence is blocked until M78/M94 produce an
-  approved real vanilla 26.1.2 client gate.
+- Real-client automation/manual evidence is blocked at the full-pack level.
+  M94 now has approved real vanilla 26.1.2 client gates for
+  `m94-02b-rejected-block-resync` and
+  `m94-01-join-rejoin-chunks-movement`,
+  `m94-02a-solid-place-break-drop`,
+  `m94-02c-water-bucket-place-pickup`,
+  `m94-04a-regular-sign-place-text`, and
+  `m94-03a-inventory-oak-log-to-planks`. Broad `m94-02` has blocked partial
+  evidence for solid break/drop/place plus water place/pickup, broad `m94-03`
+  has blocked partial evidence for recipe plus simple chest open/close, and
+  broad `m94-04` has blocked partial evidence for regular sign text plus
+  after-close visibility. Broad `m94-05` has blocked partial evidence for
+  visible passive entity sync plus death/respawn. Broad `m94-07` has blocked
+  partial evidence for the water/drop/entity parts of the named M40/M41 route,
+  and broad `m94-06` has blocked partial evidence for same-client save/restart
+  marker persistence, one two-client live block-visibility check, one
+  two-client shared-drop visibility check, and one two-client shared-pickup
+  removal check. No M94 manifest scenario remains unrun/manual-pending, but the
+  broad pack is not green.
 - Systematic vanilla oracle scenarios are blocked until M79 inventories and
   promotes usable captures. Protocol bots remain harness evidence, not client
   evidence.
 - Water/swim feel and the M40/M41 frozen-world/manual regression route remain
-  blocked until rerun green or explicitly reclassified.
+  blocked until rerun green or explicitly reclassified; the `m94-07` artifact
+  covers water placement/pickup, not client-local swimming feel.
 - Online-mode/session auth, public-safety defaults, duplicate-name handling,
   permissions, chat policy, and malformed-action fail-closed behavior need M89.
 - Boats, minecarts, common survival station gameplay beyond M87 safe rejection,
@@ -117,7 +293,8 @@ count toward the 80% target.
   lifecycle, long multiplayer soak, and autoscale behavior need M88-M96 evidence.
 - Generated-world join/chunk streaming must be fixed or explicitly carried as
   non-release-ready debt before M100: no unexplained 150ms+ runtime ticks,
-  `chunk_prepare`/`save_all_flush` warnings, or full-window latency misses.
+  `chunk_prepare`/`save_all_flush` warnings, unbudgeted startup prep, shutdown
+  hangs, first-join generated-border work, or broad profile/slow-client gaps.
 
 ## Accepted Non-Goals And Divergences
 

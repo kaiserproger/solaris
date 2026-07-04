@@ -926,8 +926,18 @@ impl EntityStore {
     }
 
     fn allocate_id(&mut self) -> EntityId {
-        self.next_id = self.next_id.wrapping_add(1).max(1);
-        EntityId(self.next_id)
+        let mut next_id = self.next_id.max(0);
+        loop {
+            next_id = next_id
+                .checked_add(1)
+                .expect("entity runtime id space exhausted");
+
+            let id = EntityId(next_id);
+            if !self.slots_by_id.contains_key(&id) {
+                self.next_id = next_id;
+                return id;
+            }
+        }
     }
 
     fn snapshot_slot(&self, slot: usize) -> EntitySnapshot {
@@ -1268,6 +1278,21 @@ mod tests {
             store.snapshot(b).unwrap().position,
             Vec3::new(2.0, 64.0, 2.0)
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "entity runtime id space exhausted")]
+    fn allocate_id_panics_on_runtime_id_overflow() {
+        let mut store = EntityStore::with_next_id(i32::MAX);
+        let _ = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+    }
+
+    #[test]
+    fn allocate_id_normalizes_negative_seed() {
+        let mut store = EntityStore::with_next_id(-5);
+        let id = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+
+        assert_eq!(id, EntityId(1));
     }
 
     #[test]

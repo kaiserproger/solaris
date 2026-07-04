@@ -62,6 +62,9 @@ run_scenario() {
   local id="$2"
 
   case "$kind:$id" in
+    cargo-ignored-test:configuration-phase)
+      (cd "$ROOT" && cargo test -p mc-test-harness --test parity_oracle vanilla_and_solaris_configuration_phase_can_be_diffed -- --ignored --exact --nocapture)
+      ;;
     cargo-ignored-test:spawn-smoke)
       (cd "$ROOT" && cargo test -p mc-test-harness --test parity_oracle vanilla_and_solaris_spawn_smoke_can_be_diffed -- --ignored --exact --nocapture)
       ;;

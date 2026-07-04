@@ -4,6 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use mc_protocol::packets::Packet;
+use mc_protocol::packets::configuration::{
+    AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
+    ServerboundKnownPacks, UpdateTags,
+};
 use mc_protocol::packets::play::{
     AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
@@ -30,6 +34,18 @@ impl ParityScenario for SpawnSmokeScenario {
 
     fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
         Box::pin(async move { observe_spawn_smoke(ctx).await })
+    }
+}
+
+struct ConfigurationPhaseScenario;
+
+impl ParityScenario for ConfigurationPhaseScenario {
+    fn name(&self) -> &'static str {
+        "configuration-phase"
+    }
+
+    fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a> {
+        Box::pin(async move { observe_configuration_phase(ctx).await })
     }
 }
 
@@ -108,8 +124,96 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
     Ok(observations.normalized())
 }
 
+async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<ObservationSet> {
+    let subject = match ctx.kind {
+        ServerKind::Solaris => "solaris",
+        ServerKind::Vanilla => "vanilla",
+    };
+    let mut client = Client::connect(ctx.addr).await?;
+    let _login = client.drive_login(ctx.addr, subject).await?;
+
+    let mut observations = ObservationSet::new(subject, "configuration-phase");
+    let known = loop {
+        let frame = client.read_frame().await?;
+        if frame.id == ClientboundKnownPacks::ID {
+            break ClientboundKnownPacks::decode(&mut frame.body.clone())?;
+        }
+    };
+    observations.push(ObservationFact::PacketSeen {
+        id: ClientboundKnownPacks::ID,
+    });
+    observations.push(ObservationFact::Note {
+        key: "known_packs.count".into(),
+        value: known.packs.len().to_string(),
+    });
+    for (index, pack) in known.packs.iter().enumerate() {
+        observations.push(ObservationFact::Note {
+            key: format!("known_packs.{index}"),
+            value: format!("{}:{}:{}", pack.namespace, pack.id, pack.version),
+        });
+    }
+    client
+        .write_packet(&ServerboundKnownPacks {
+            packs: known.packs.clone(),
+        })
+        .await?;
+
+    let mut registry_packets = 0usize;
+    loop {
+        let frame = client.read_frame().await?;
+        if frame.id == RegistryData::ID {
+            let registry = RegistryData::decode(&mut frame.body.clone())?;
+            registry_packets += 1;
+            observations.push(ObservationFact::PacketSeen {
+                id: RegistryData::ID,
+            });
+            observations.push(ObservationFact::Note {
+                key: format!("registry_data.{}.entries", registry.registry_id),
+                value: registry.entries.len().to_string(),
+            });
+            continue;
+        }
+        if frame.id == UpdateTags::ID {
+            let tags = UpdateTags::decode(&mut frame.body.clone())?;
+            observations.push(ObservationFact::PacketSeen { id: UpdateTags::ID });
+            observations.push(ObservationFact::Note {
+                key: "update_tags.registries.count".into(),
+                value: tags.registries.len().to_string(),
+            });
+            for registry in tags.registries {
+                observations.push(ObservationFact::Note {
+                    key: format!("update_tags.{}.tags", registry.registry),
+                    value: registry.tags.len().to_string(),
+                });
+            }
+            continue;
+        }
+        if frame.id == FinishConfiguration::ID {
+            let _finish = FinishConfiguration::decode(&mut frame.body.clone())?;
+            observations.push(ObservationFact::PacketSeen {
+                id: FinishConfiguration::ID,
+            });
+            observations.push(ObservationFact::Note {
+                key: "registry_data.packet_count".into(),
+                value: registry_packets.to_string(),
+            });
+            client.write_packet(&AcknowledgeFinishConfiguration).await?;
+            return Ok(observations.normalized());
+        }
+        anyhow::bail!(
+            "unexpected configuration frame id=0x{:02X} body_len={}",
+            frame.id,
+            frame.body.len()
+        );
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn local_vanilla_dir() -> PathBuf {
+    repo_root().join("data/vanilla")
 }
 
 async fn read_spawn_position(client: &mut Client) -> Result<SynchronizePlayerPosition> {
@@ -146,6 +250,75 @@ async fn spawn_solaris() -> Result<(mc_net::BoundServer, std::net::SocketAddr)> 
         )),
         entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy {
+            chunk_send_rate: 8,
+            chunk_load_rate: 8,
+            chunk_generate_rate: 8,
+            chunk_prepare_budget_ms: 5,
+            chunk_prepare_batch_size: 8,
+            chunk_io_threads: 1,
+            chunk_worker_threads: 2,
+            entity_worker_threads: 1,
+            chunk_result_queue_size: 64,
+            region_cache_size: 4,
+            compression_threshold: 256,
+            compression_level: None,
+        },
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await?;
+    let addr = bound.local_addr()?;
+    Ok((bound, addr))
+}
+
+async fn spawn_solaris_with_local_vanilla_data()
+-> Result<(mc_net::BoundServer, std::net::SocketAddr)> {
+    let vanilla_dir = local_vanilla_dir();
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    let data = Arc::new(mc_data::load(&vanilla_dir)?);
+    let blocks_report = mc_data::blocks::load_blocks_report(&blocks_json)?;
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&blocks_report)?);
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 128)
+        .with_generator(generator);
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data)?);
+    let items_report = mc_data::items::load_items_report(&registries_json)?;
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let entity_report = mc_data::entity_types::load_entity_types_report(&registries_json)?;
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse()?,
+        motd: "M79 configuration parity".into(),
+        max_players: 8,
+        view_distance: 2,
+        data,
+        blocks: Arc::clone(&blocks),
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: mc_data::block_light::load(vanilla_dir.join("reports/block_light.json"))
+            .ok()
+            .map(Arc::new),
+        items,
+        item_facts: Arc::new(mc_data::item_components::load_item_facts(
+            vanilla_dir.join("reports/item_components"),
+        )?),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &blocks_report,
+        )),
+        entity_types,
+        biome_spawns: mc_data::biomes::load_biome_spawn_rules(
+            vanilla_dir.join("data/minecraft/worldgen/biome"),
+        )
+        .map(Arc::new)
+        .unwrap_or_default(),
         chunk_pipeline: mc_net::ChunkPipelinePolicy {
             chunk_send_rate: 8,
             chunk_load_rate: 8,
@@ -207,6 +380,79 @@ async fn solaris_spawn_smoke_scenario_produces_normalized_observations() {
     )));
 
     task.abort();
+}
+
+#[tokio::test]
+async fn solaris_configuration_phase_scenario_produces_normalized_observations() {
+    let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
+    let task = tokio::spawn(async move { bound.serve().await });
+
+    let scenario = ConfigurationPhaseScenario;
+    let observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr,
+        })
+        .await
+        .expect("configuration scenario runs");
+
+    assert_eq!(scenario.name(), "configuration-phase");
+    assert!(observations.facts().contains(&ObservationFact::PacketSeen {
+        id: ClientboundKnownPacks::ID,
+    }));
+    assert!(
+        observations
+            .facts()
+            .contains(&ObservationFact::PacketSeen { id: UpdateTags::ID })
+    );
+    assert!(observations.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "registry_data.packet_count" && value != "0"
+    )));
+
+    task.abort();
+}
+
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_configuration_phase_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris_with_local_vanilla_data()
+        .await
+        .expect("spawn Solaris with local vanilla sidecar");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let scenario = ConfigurationPhaseScenario;
+    let vanilla_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        })
+        .await
+        .expect("vanilla configuration scenario runs");
+    let solaris_observations = scenario
+        .run(ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        })
+        .await
+        .expect("Solaris configuration scenario runs");
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+    println!("M79_ORACLE_COMPARISON_OK configuration-phase");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
 }
 
 #[tokio::test]
@@ -776,25 +1022,43 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         sync.y,
         sync.z,
         false,
+        None,
     )
     .await?;
+    let summon_x = sync.x.floor() as i32 + 2;
+    let summon_y = sync.y.floor() as i32;
+    let summon_z = sync.z.floor() as i32;
     client
         .write_packet(&ServerboundChatCommand {
-            command: format!(
-                "summon minecraft:zombie {} {} {}",
-                sync.x.floor() as i32 + 2,
-                sync.y.floor() as i32,
-                sync.z.floor() as i32
-            ),
+            command: format!("summon minecraft:zombie {summon_x} {summon_y} {summon_z}"),
         })
         .await?;
-    let entity_count =
-        drain_entity_lifecycle_frames(&mut client, &mut observations, sync.x, sync.y, sync.z, true)
-            .await?;
+    let zombie_type_id = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:zombie")?)
+        .and_then(|id| i32::try_from(id).ok())
+        .context("zombie entity type id")?;
+    let entity_count = drain_entity_lifecycle_frames(
+        &mut client,
+        &mut observations,
+        sync.x,
+        sync.y,
+        sync.z,
+        true,
+        Some((
+            zombie_type_id,
+            f64::from(summon_x),
+            f64::from(summon_y),
+            f64::from(summon_z),
+        )),
+    )
+    .await?;
+    if entity_count == 0 {
+        anyhow::bail!("expected command-spawned zombie AddEntity was not observed");
+    }
 
     observations.push(ObservationFact::Note {
         key: "explicit_entity_spawn_observed".into(),
-        value: (entity_count > 0).to_string(),
+        value: "true".into(),
     });
     observations.push(ObservationFact::Note {
         key: "post_action_liveness".into(),
@@ -811,10 +1075,12 @@ async fn drain_entity_lifecycle_frames(
     y: f64,
     z: f64,
     record_entities: bool,
+    expected_entity: Option<(i32, f64, f64, f64)>,
 ) -> Result<u32> {
     let flags = MovePlayerFlags::new(false, false);
     let mut entity_count = 0u32;
-    for _cycle in 0..8 {
+    let cycles = if record_entities { 40 } else { 8 };
+    for _cycle in 0..cycles {
         client
             .write_packet(&ServerboundMovePlayerStatusOnly { flags })
             .await?;
@@ -836,13 +1102,21 @@ async fn drain_entity_lifecycle_frames(
                 }
                 id if id == AddEntity::ID => {
                     let mut body = frame.body.clone();
-                    let _add = AddEntity::decode(&mut body)?;
-                    if record_entities {
+                    let add = AddEntity::decode(&mut body)?;
+                    if record_entities
+                        && expected_entity.is_none_or(|(entity_type_id, ex, ey, ez)| {
+                            add.entity_type_id == entity_type_id
+                                && (add.x - ex).abs() <= 1.5
+                                && (add.y - ey).abs() <= 2.0
+                                && (add.z - ez).abs() <= 1.5
+                        })
+                    {
                         observations.push(ObservationFact::Note {
                             key: "entity_spawn_packet_seen".into(),
                             value: "true".into(),
                         });
                         entity_count += 1;
+                        return Ok(entity_count);
                     }
                 }
                 id if id == RemoveEntities::ID => {

@@ -23,7 +23,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use tracing::{debug, warn};
 
-use crate::{Identifier, VanillaData, items::ItemRegistry};
+use crate::{Identifier, VanillaData, items::ItemRegistry, read_json_file, visit_json_files};
 
 const REQUIRED_ITEM_TAGS: &str = include_str!("../data/required_item_tags.json");
 
@@ -38,12 +38,13 @@ const REQUIRED_ITEM_TAGS: &str = include_str!("../data/required_item_tags.json")
 /// Configuration → Play transition, even if the tag entry list is
 /// empty — see the M3.i log for the wire repro.
 ///
-/// Registries excluded on purpose: `dialog`, `timeline`,
+/// Registries excluded on purpose: `enchantment_provider`,
+/// `test_environment`, `test_instance`, `trade_set`,
 /// `villager_trade`, `worldgen/configured_feature`,
 /// `worldgen/flat_level_generator_preset`, `worldgen/structure`,
-/// `worldgen/world_preset`. We do not ship their entries via
-/// `RegistryData` (they are data-driven but not in
-/// [`KNOWN_REGISTRIES`]) and the client doesn't have them built in.
+/// `worldgen/world_preset`. Solaris does not currently advertise them
+/// through `RegistryData`, and shipping tags for a registry the client
+/// never learned about trips the Configuration → Play transition.
 const TAG_ROOTS: &[(&str, &str)] = &[
     ("banner_pattern", "minecraft:banner_pattern"),
     ("block", "minecraft:block"),
@@ -204,15 +205,11 @@ fn load_vanilla_id_index(
     if !path.is_file() {
         return Err(TagError::RegistriesMissing(path));
     }
-    let raw = std::fs::read_to_string(&path).map_err(|source| TagError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let report: BTreeMap<String, RegistryReport> =
-        serde_json::from_str(&raw).map_err(|source| TagError::RegistriesMalformed {
-            path: path.clone(),
-            source,
-        })?;
+    let report: BTreeMap<String, RegistryReport> = read_json_file(
+        &path,
+        &|path, source| TagError::Io { path, source },
+        &|path, source| TagError::RegistriesMalformed { path, source },
+    )?;
     Ok(report
         .into_iter()
         .map(|(reg, body)| {
@@ -228,27 +225,12 @@ fn load_vanilla_id_index(
 
 fn collect_tag_files(
     root: &Path,
-    dir: &Path,
     registry_id: &str,
     raw: &mut BTreeMap<(String, String), (PathBuf, RawTag)>,
 ) -> Result<(), TagError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| TagError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| TagError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry.file_type().map_err(|source| TagError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if ty.is_dir() {
-            collect_tag_files(root, &path, registry_id, raw)?;
-        } else if ty.is_file() && path.extension().is_some_and(|e| e == "json") {
+    visit_json_files(
+        root,
+        &mut |path| {
             let rel = path
                 .strip_prefix(root)
                 .expect("walk yields paths under root")
@@ -260,19 +242,16 @@ fn collect_tag_files(
                 }
                 joined.push_str(component.as_os_str().to_string_lossy().as_ref());
             }
-            let body = std::fs::read_to_string(&path).map_err(|source| TagError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let parsed: RawTag =
-                serde_json::from_str(&body).map_err(|source| TagError::TagMalformed {
-                    path: path.clone(),
-                    source,
-                })?;
+            let parsed: RawTag = read_json_file(
+                &path,
+                &|path, source| TagError::Io { path, source },
+                &|path, source| TagError::TagMalformed { path, source },
+            )?;
             raw.insert((registry_id.to_string(), joined), (path, parsed));
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+        &|path, source| TagError::Io { path, source },
+    )
 }
 
 fn resolve(
@@ -339,7 +318,7 @@ pub fn load(vanilla_dir: &Path, ours: &VanillaData) -> Result<TagsData, TagError
         if !root.is_dir() {
             continue;
         }
-        collect_tag_files(&root, &root, registry_id, &mut raw)?;
+        collect_tag_files(&root, registry_id, &mut raw)?;
     }
 
     let mut registries: BTreeMap<Identifier, BTreeMap<Identifier, Vec<i32>>> = BTreeMap::new();

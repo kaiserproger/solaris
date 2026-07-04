@@ -1,6 +1,8 @@
 # Validation Coverage Audit
 
-**Status:** M95 snapshot. Quality label: `stabilization`.
+**Status:** M95 snapshot plus 2026-06-13 static-review note and 2026-06-18
+live-audit alignment. Quality label:
+`stabilization`.
 
 This report is a committed M95 snapshot derived from the frozen denominator
 table in [`VALIDATION_LEDGER.md`](VALIDATION_LEDGER.md). Reproduce the raw
@@ -37,14 +39,36 @@ non-goal classification do not count.
 | Rows needed for 80% | 37 |
 | Gap to 80% | 37 rows |
 
+## 2026-06-13 Static Review Note
+
+The 2026-06-13 static review preserves this accounting: 46 frozen denominator
+rows, 0 countable `ready` rows, and 0.00% conservative coverage. It did not run
+`cargo`, a real vanilla/PrismLauncher client, or profiler/load workloads, so it
+does not change the numerator.
+
+The review describes Solaris as a strong stabilization-alpha/private vanilla-near
+base, not as a release-ready vanilla replacement. The most important evidence
+gaps remain real-client/oracle proof, generated-world chunk/light performance,
+global `WorldStorage` and `SessionRegistry` lock ownership, entity AI/pathing,
+water/swim and movement, stale block-edit/CAS safety, public auth/offline-mode,
+persistence/crash/soak/autoscale, and plugin API non-goal clarity.
+
+## 2026-06-18 Live Audit Alignment
+
+A fresh `coverage-audit` rerun still reports 46 denominator rows, 0 conservative
+`ready` rows, and 0.00% coverage. The status breakdown below reflects the
+current ledger row classifications after later post-M95 row reclassifications:
+29 `partial`, 5 `blocked`, 3 `unknown`, 7 `draft debt`, 2
+`accepted divergence`, and 0 `ready`.
+
 ## Status Breakdown
 
 | Status | Rows | Counts |
 |---|---:|---|
-| `partial` | 28 | no |
+| `partial` | 29 | no |
 | `blocked` | 5 | no |
-| `unknown` | 7 | no |
-| `draft debt` | 4 | no |
+| `unknown` | 3 | no |
+| `draft debt` | 7 | no |
 | `accepted divergence` | 2 | no |
 | `ready` | 0 | yes, if evidence also passes the conservative rule |
 
@@ -57,13 +81,28 @@ manual notes, protocol metadata, or vanilla captures exist.
 ## Immediate Coverage Gaps
 
 - Real-client evidence remains blocked for broad M100 accounting (`Q2`).
+  The 2026-06-22 M94 pack now includes focused m94-06 same-client restart,
+  two-client block-visibility, shared-drop visibility, and shared-pickup
+  removal evidence, but Q2 remains blocked because broad two-client contention,
+  shared container behavior, vanilla oracle, performance, and soak evidence are
+  still missing.
 - Systematic vanilla oracle scenario evidence remains blocked (`Q1`).
 - Performance and concurrency remain blocked (`O1`, `O2`), including the M77
   generated-world join/chunk-stream stall evidence.
 - Public/session safety, common stations, vehicles, autoscale, operator/deps,
   and data drift rows remain unknown or draft debt.
 - Most gameplay rows are `partial`: they have implementation and focused tests,
-  but not enough row-specific vanilla oracle or real-client evidence to count.
+  including B1/B3 focused rejected occupied-target placement, occupied-target
+  water-bucket fallback/resync, and survival out-of-reach `UseItemOn` resync
+  harness coverage, including a negative held-slot check for the out-of-reach
+  bucket variant. Those regressions are local-sidecar-dependent and degrade when
+  required `data/vanilla/reports` files are absent; they still lack enough
+  row-specific vanilla oracle or real-client evidence to count.
+- I1/I2 now have one focused real-client inventory recipe run
+  (`m94-03a-inventory-oak-log-to-planks`), but recipe-book UI, crafting-table
+  UI, cursor recovery, containers/stations, malformed clicks, furnace-family
+  and campfire client recipes, and broad recipe execution remain outside that
+  evidence.
 - Farming, plants, campfires, bows, shields, storage/cache/persistence,
   generated exploration, and common stations remain split in the denominator;
   unit-only or Solaris-only subcoverage is excluded from the numerator.

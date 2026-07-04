@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, sorted_json_files};
 
 #[derive(Debug, Error)]
 pub enum FeatureDataError {
@@ -103,21 +103,10 @@ pub fn load_feature_facts(
         ));
     }
 
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(&placed_dir).map_err(|source| FeatureDataError::Io {
-        path: placed_dir.clone(),
+    let paths = sorted_json_files(&placed_dir, &|path, source| FeatureDataError::Io {
+        path,
         source,
-    })? {
-        let entry = entry.map_err(|source| FeatureDataError::Io {
-            path: placed_dir.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
+    })?;
 
     paths
         .into_iter()
@@ -130,7 +119,9 @@ fn load_one_feature_fact(
     configured_dir: &Path,
 ) -> Result<WorldgenFeatureFacts, FeatureDataError> {
     let placed_feature = id_from_file(placed_path)?;
-    let placed: RawPlacedFeature = read_json(placed_path)?;
+    let io_error = |path, source| FeatureDataError::Io { path, source };
+    let parse_error = |path, source| FeatureDataError::Parse { path, source };
+    let placed: RawPlacedFeature = read_json_file(placed_path, &io_error, &parse_error)?;
     let configured_feature = parse_id(placed_path, placed.feature)?;
     if configured_feature.namespace() != "minecraft" {
         return Err(FeatureDataError::UnsupportedNamespace {
@@ -147,7 +138,7 @@ fn load_one_feature_fact(
             path: configured_path,
         });
     }
-    let configured_value: Value = read_json(&configured_path)?;
+    let configured_value: Value = read_json_file(&configured_path, &io_error, &parse_error)?;
     let configured_type = configured_value
         .get("type")
         .and_then(Value::as_str)
@@ -344,17 +335,6 @@ fn parse_id(path: &Path, value: String) -> Result<Identifier, FeatureDataError> 
     Identifier::parse(value.clone()).map_err(|_| FeatureDataError::InvalidIdentifier {
         path: path.to_path_buf(),
         value,
-    })
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, FeatureDataError> {
-    let bytes = std::fs::read(path).map_err(|source| FeatureDataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_slice(&bytes).map_err(|source| FeatureDataError::Parse {
-        path: path.to_path_buf(),
-        source,
     })
 }
 

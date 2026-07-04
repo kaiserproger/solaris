@@ -1,7 +1,7 @@
 //! M17 - server-owned vanilla entity visibility baseline.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use mc_protocol::packets::Packet;
@@ -16,6 +16,11 @@ use mc_protocol::packets::play::{
 use mc_test_harness::client::Client;
 
 const VIEW_DISTANCE: i32 = 2;
+// These scenarios drive independent debug servers, but their timed survival
+// combat loops contend for Tokio scheduling in the same test process.
+static SURVIVAL_MOB_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -182,6 +187,7 @@ async fn survival_attack_passive_mob_uses_configured_drop() {
         return;
     }
 
+    let _survival_mob_guard = SURVIVAL_MOB_TEST_LOCK.lock().await;
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
@@ -327,6 +333,7 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         return;
     }
 
+    let _survival_mob_guard = SURVIVAL_MOB_TEST_LOCK.lock().await;
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
@@ -414,6 +421,13 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         .await
         .expect("move to zombie");
     wait_for_health_below(&mut client, 20.0).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival heal 20".into(),
+        })
+        .await
+        .expect("heal after hostile damage check");
+    wait_for_health_near(&mut client, 20.0, f32::EPSILON).await;
 
     client
         .write_packet(&ServerboundAttack {
@@ -485,6 +499,7 @@ async fn survival_shield_blocks_frontal_zombie_damage() {
         return;
     }
 
+    let _survival_mob_guard = SURVIVAL_MOB_TEST_LOCK.lock().await;
     let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =

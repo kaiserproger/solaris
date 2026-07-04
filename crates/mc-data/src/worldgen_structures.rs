@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, sorted_json_files};
 
 #[derive(Debug, Error)]
 pub enum StructureDataError {
@@ -49,28 +49,21 @@ pub fn load_structure_set_facts(
         return Err(StructureDataError::MissingStructureSetDir(set_dir));
     }
 
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(&set_dir).map_err(|source| StructureDataError::Io {
-        path: set_dir.clone(),
+    let paths = sorted_json_files(&set_dir, &|path, source| StructureDataError::Io {
+        path,
         source,
-    })? {
-        let entry = entry.map_err(|source| StructureDataError::Io {
-            path: set_dir.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
-            paths.push(path);
-        }
-    }
-    paths.sort();
+    })?;
 
     paths.into_iter().map(load_one_structure_set_fact).collect()
 }
 
 fn load_one_structure_set_fact(path: PathBuf) -> Result<StructureSetFacts, StructureDataError> {
     let id = id_from_file(&path)?;
-    let raw: RawStructureSet = read_json(&path)?;
+    let raw: RawStructureSet = read_json_file(
+        &path,
+        &|path, source| StructureDataError::Io { path, source },
+        &|path, source| StructureDataError::Parse { path, source },
+    )?;
     let structures = raw
         .structures
         .into_iter()
@@ -139,17 +132,6 @@ fn parse_id(path: &Path, value: String) -> Result<Identifier, StructureDataError
     Identifier::parse(&value).map_err(|_| StructureDataError::InvalidIdentifier {
         path: path.to_path_buf(),
         value,
-    })
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, StructureDataError> {
-    let bytes = std::fs::read(path).map_err(|source| StructureDataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_slice(&bytes).map_err(|source| StructureDataError::Parse {
-        path: path.to_path_buf(),
-        source,
     })
 }
 

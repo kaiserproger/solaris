@@ -13,6 +13,16 @@
     "kind_env": "SOLARIS_REAL_CLIENT_KIND",
     "allowed_client_kinds": ["prism-launcher", "vanilla-launcher", "vanilla-client"],
     "modes": ["--check", "--prepare", "--run", "--validate-run"],
+    "agent_driver": "tools/real-client-agent-driver.py",
+    "agent_bridge_url_env": "SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_jar_env": "SOLARIS_REAL_CLIENT_AGENT_JAR",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
+    "second_command_env": "SOLARIS_REAL_CLIENT_SECOND_COMMAND",
+    "second_agent_secret_env": "SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET",
+    "second_agent_port_env": "SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT",
     "prepared_status": "prepared-owner-run",
     "passing_gate": "agent-run real-client"
   },
@@ -87,6 +97,70 @@
       ]
     },
     {
+      "id": "m94-02a-solid-place-break-drop",
+      "title": "Focused solid block placement, break, drop, and pickup",
+      "ledger_rows": ["B1", "B2", "L2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Find a loaded dirt-like solid block face with adjacent loaded air within survival reach.",
+        "Use the real client destroy path to break that dirt-like block and record visible air state, item-entity visibility if observed, and held-stack pickup convergence.",
+        "Use the real client item-use path to place the picked-up dirt into a loaded adjacent air target and record visible target state plus held-stack decrement.",
+        "Keep door/trapdoor, crop/bonemeal, sugar cane, and broad fluid paths explicitly degraded rather than counting this focused run as full m94-02 coverage."
+      ],
+      "expected_observations": [
+        "Breaking the dirt-like block returns it to air and restores the selected dirt stack after pickup.",
+        "Accepted placement makes the target visible as dirt and decrements the selected dirt stack.",
+        "If the visible item-entity window is too short to observe before pickup, the run records that substep as degraded."
+      ]
+    },
+    {
+      "id": "m94-02b-rejected-block-resync",
+      "title": "Rejected block, out-of-reach, and water-bucket fallback resync",
+      "ledger_rows": ["B1", "B3", "Q2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Prepare two adjacent solid blocks and first hold a matching placeable block item.",
+        "Attempt to place into the already-occupied adjacent target face and record the visible correction.",
+        "Attempt the same clicked/target face interaction from outside survival reach and record the visible correction.",
+        "Repeat the occupied-target face interaction while holding a water bucket in the selected hotbar slot.",
+        "Record whether the client immediately snaps both the clicked and target cells back to their authoritative solid states.",
+        "Record whether the held water-bucket stack remains visible and unchanged after the rejected occupied-target fallback.",
+        "Record any persistent ghost block, fluid ghost, delayed correction, disconnect, or inventory count mismatch."
+      ],
+      "expected_observations": [
+        "The rejected solid placement does not leave a persistent client-visible ghost block.",
+        "The rejected out-of-reach interaction does not leave a persistent client-visible ghost block.",
+        "The rejected occupied-target water-bucket fallback does not leave a persistent client-visible ghost block or fluid ghost.",
+        "The held block and bucket stacks remain unchanged after their rejection paths.",
+        "Any visual correction delay or missing resync is recorded as blocked for B1/B3/Q2."
+      ]
+    },
+    {
+      "id": "m94-02c-water-bucket-place-pickup",
+      "title": "Focused accepted water-bucket placement and pickup",
+      "ledger_rows": ["B1", "B3"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Find a loaded solid block face with adjacent loaded air within survival reach.",
+        "Use the real client item-use path with a held water bucket to place water into that adjacent air target.",
+        "Record that the target is visible as water and the selected held item becomes an empty bucket.",
+        "Use the real client item-use path with the empty bucket on the visible water source.",
+        "Record that the source cell is no longer fluid and the selected held item becomes a water bucket again.",
+        "Keep lava, broad fluid spread, water-lava interaction, and swim feel explicitly degraded rather than counting this focused run as full B3 coverage."
+      ],
+      "expected_observations": [
+        "Accepted water placement makes the target visible as water and changes the held stack to an empty bucket.",
+        "Accepted water pickup clears the source fluid and changes the held stack back to a water bucket.",
+        "Fluid spread beyond the source cell is noted as not covered by this scenario."
+      ]
+    },
+    {
       "id": "m94-03-inventory-crafting-containers-stations",
       "title": "Inventory, crafting, containers, and common stations",
       "ledger_rows": ["I1", "I2", "K1", "K2", "A1"],
@@ -106,6 +180,65 @@
       ]
     },
     {
+      "id": "m94-03a-inventory-oak-log-to-planks",
+      "title": "Focused inventory recipe execution from oak log to planks",
+      "ledger_rows": ["I1", "I2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Give the real vanilla client one oak log in the selected hotbar slot through the approved local debug command.",
+        "Send the vanilla client ServerboundPlaceRecipePacket for the inventory menu and the current configured vanilla sidecar oak_planks recipe display id.",
+        "Record that the client inventory consumes one oak log and creates four oak planks, allowing for pre-existing items from a reused player save.",
+        "Keep crafting-table UI, cursor recovery, recipe-book discovery UI, containers, stations, malformed clicks, and broad recipe execution explicitly degraded rather than counting this focused run as full M94-03 coverage."
+      ],
+      "expected_observations": [
+        "The inventory recipe consumes one oak log and creates four oak planks relative to the starting inventory counts.",
+        "The run names the local recipe display id and records that this is tied to the current configured vanilla sidecar recipe layout.",
+        "No container, station, recipe-book UI, or malformed click parity is claimed."
+      ]
+    },
+    {
+      "id": "m94-03b-two-client-shared-chest",
+      "title": "Focused two-client shared chest deposit and observation",
+      "ledger_rows": ["I1", "K1", "S2", "Q2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "steps": [
+        "Launch two real vanilla clients through the approved Java-agent bridge runner.",
+        "Have the primary client place a chest through the real item-use path, open it, and move a held dirt stack into chest slot 0 through vanilla menu-click handling.",
+        "Have the secondary client open the same marked chest and observe chest slot 0 containing the dirt stack.",
+        "Capture screenshots from both clients and keep broad cursor recovery, malformed clicks, barrels, furnace-family UIs, and common stations explicitly degraded."
+      ],
+      "expected_observations": [
+        "The primary client records accepted chest placement, container screen open, slot transfer, slot convergence, and clean screen close.",
+        "The secondary client records the same chest block, container screen open, and slot 0 containing the dirt stack.",
+        "The run does not claim broad container, station, malformed-click, or contention parity."
+      ]
+    },
+    {
+      "id": "m94-03c-two-client-shared-chest-live-update",
+      "title": "Focused two-client shared chest live slot update",
+      "ledger_rows": ["I1", "K1", "S2", "Q2"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "steps": [
+        "Launch two real vanilla clients through the approved Java-agent bridge runner.",
+        "Have the primary client place a chest, open it, move a held dirt stack into chest slot 0 through vanilla menu-click handling, and keep that container screen open.",
+        "Have the secondary client open the same marked chest, observe dirt in slot 0, quick-move that slot into its inventory, and close the screen.",
+        "Have the primary client observe the same still-open chest screen update so slot 0 becomes empty, then close the screen.",
+        "Capture screenshots from both clients and keep broad cursor recovery, malformed clicks, barrels, furnace-family UIs, common stations, and deliberate stale-click injection explicitly degraded."
+      ],
+      "expected_observations": [
+        "The primary client records accepted chest placement, container screen open, slot transfer, slot convergence, and that the screen stayed open for the peer mutation.",
+        "The secondary client records the same chest block, container screen open, slot 0 containing dirt, quick-move withdrawal, empty slot convergence, and clean screen close.",
+        "The primary client records the peer mutation arriving on the still-open container screen before it closes.",
+        "The run does not claim broad container, station, malformed-click, furnace, barrel, cursor-recovery, or deliberate stale-click parity."
+      ]
+    },
+    {
       "id": "m94-04-signs-beds-campfires-and-block-entities",
       "title": "Signs, beds, campfires, and block-entity visuals",
       "ledger_rows": ["E1", "E2", "E3", "S1"],
@@ -122,6 +255,28 @@
         "Plain sign text remains visible to the client after edit.",
         "Bed and campfire behavior is classified with explicit unsupported or degraded notes.",
         "Any restart persistence claim names the before/after artifacts."
+      ]
+    },
+    {
+      "id": "m94-04a-regular-sign-place-text",
+      "title": "Focused regular sign placement and plain text update",
+      "ledger_rows": ["E1"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "steps": [
+        "Find a loaded dry solid block face with adjacent loaded air within survival reach.",
+        "Use the real client item-use path with a held oak sign to place a regular floor or wall sign into that adjacent air target.",
+        "Record that the target is visible as a regular sign and the selected held item is decremented.",
+        "Wait for the real sign editor to open for the placed sign.",
+        "Send a plain four-line sign update from the real client and verify the client-side sign block entity contains those exact lines.",
+        "Keep hanging signs, waxed signs, styled/filtered/clickable text, beds, campfires, restart persistence, and after-close visual assertions explicitly degraded rather than counting this focused run as full M94-04 coverage."
+      ],
+      "expected_observations": [
+        "Accepted sign placement makes the target visible as a regular sign and consumes the held oak sign.",
+        "The real sign editor opens for the placed sign.",
+        "The client-side sign block entity converges to the plain four-line text sent by the real client.",
+        "The run does not claim broad sign, bed, campfire, or persistence parity."
       ]
     },
     {
@@ -158,6 +313,7 @@
       ],
       "expected_observations": [
         "Two-client observations are made from both clients, not only server logs.",
+        "A secondary real client observes at least one primary-client block edit, one primary-client item drop, and one primary-client item pickup removal when the second-client runner environment is configured.",
         "Restart evidence names exact state that persisted and exact state not tested.",
         "Visibility or contention failures are marked blocked with artifacts."
       ]

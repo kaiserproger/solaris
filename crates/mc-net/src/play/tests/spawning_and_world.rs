@@ -1054,6 +1054,157 @@ fn session_registry_reports_ticketed_chunks_sorted() {
     assert!(registry.ticketed_chunks_sorted().is_empty());
 }
 
+fn random_tick_test_config(
+    blocks: Arc<BlockRegistry>,
+    world: mc_world::WorldStorage,
+    random_tick: RandomTickPolicy,
+) -> crate::server::ServerConfig {
+    simulation_tick_test_config(
+        blocks,
+        world,
+        random_tick,
+        Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+    )
+}
+
+fn simulation_tick_test_config(
+    blocks: Arc<BlockRegistry>,
+    world: mc_world::WorldStorage,
+    random_tick: RandomTickPolicy,
+    block_facts: Arc<mc_data::block_facts::BlockFactsTable>,
+) -> crate::server::ServerConfig {
+    crate::server::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "random-tick-test".into(),
+        max_players: 1,
+        view_distance: 0,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts,
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: ChunkPipelinePolicy::default(),
+        random_tick,
+        command_permissions: crate::server::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: crate::server::ShutdownHandle::default(),
+    }
+}
+
+#[tokio::test]
+async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "tester".to_string(),
+    };
+    let (id, _) = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let blocks = Arc::new(BlockRegistry::from_report(&[simple_block(0, "minecraft:air")]).unwrap());
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    world.commit_chunk_snapshot(
+        ChunkPos { x: 0, z: 0 },
+        Chunk::empty(
+            ChunkPos { x: 0, z: 0 },
+            mc_world::BlockStateId(0),
+            mc_data::Identifier::parse("minecraft:plains").unwrap(),
+        ),
+    )
+    .unwrap();
+    let config = random_tick_test_config(blocks, world, RandomTickPolicy {
+        random_tick_speed: 1,
+        chunk_budget: 1,
+        fluid_tick_budget: 1,
+        save_interval_ticks: 20,
+        seed: 0,
+    });
+
+    let unloaded = run_random_ticks(&config, &registry, 0).await;
+    assert_eq!(unloaded.sampled, 0);
+
+    let _ = registry.mark_loaded(id, (0, 0));
+    let loaded = run_random_ticks(&config, &registry, 0).await;
+    assert_eq!(loaded.sampled, 1);
+}
+
+#[tokio::test]
+async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
+    let registry = SessionRegistry::new();
+    let (tx, _rx) = mpsc::channel(8);
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::nil(),
+        name: "tester".to_string(),
+    };
+    let (id, _) = registry.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+    );
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: mc_data::Identifier::parse("minecraft:water").unwrap(),
+            properties: prop_schema(&[("level", &["0"])]),
+            states: vec![state(1, true, &[("level", "0")])],
+        },
+    ];
+    let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+    let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+        &reports,
+    ));
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let pos = mc_world::BlockPos {
+        x: 0,
+        y: DEFAULT_SEA_LEVEL,
+        z: 0,
+    };
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(0),
+        mc_data::Identifier::parse("minecraft:plains").unwrap(),
+    );
+    let _ = chunk.set_block(0, DEFAULT_SEA_LEVEL, 0, mc_world::BlockStateId(1));
+    world.commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk).unwrap();
+    world
+        .schedule_fluid_tick(mc_world::ScheduledFluidTick::new(
+            pos,
+            mc_data::Identifier::parse("minecraft:water").unwrap(),
+            0,
+            0,
+        ))
+        .unwrap();
+    let config = simulation_tick_test_config(blocks, world, RandomTickPolicy {
+        random_tick_speed: 0,
+        chunk_budget: 1,
+        fluid_tick_budget: 1,
+        save_interval_ticks: 20,
+        seed: 0,
+    }, block_facts);
+
+    let unloaded = run_scheduled_fluid_ticks(&config, &registry, 0).await;
+    assert_eq!(unloaded.drained, 0);
+
+    let _ = registry.mark_loaded(id, (0, 0));
+    let loaded = run_scheduled_fluid_ticks(&config, &registry, 0).await;
+    assert_eq!(loaded.drained, 1);
+}
+
 #[test]
 fn random_tick_sampling_is_deterministic_for_seed_tick_and_chunks() {
     let policy = RandomTickPolicy {
@@ -1125,6 +1276,92 @@ fn simulation_tick_policy_normalizes_deferred_work_budgets() {
     assert_eq!(policy.chunk_budget, 1);
     assert_eq!(policy.fluid_tick_budget, 1);
     assert_eq!(policy.save_interval_ticks, 1);
+}
+
+#[test]
+fn light_inert_block_edits_do_not_request_full_relight() {
+    let blocks = Arc::new(
+        BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:age_zero"),
+            simple_block(2, "minecraft:age_one"),
+            simple_block(3, "minecraft:stone"),
+        ])
+        .unwrap(),
+    );
+    let table = mc_data::block_light::BlockLightTable::from_arrays(
+        "test",
+        vec![0, 0, 0, 0],
+        vec![0, 0, 0, 15],
+        vec![true, true, true, false],
+    );
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let baked = mc_world::light::ChunkLight::filled(15, 0);
+    let mut chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(1),
+        mc_data::Identifier::parse("minecraft:plains").unwrap(),
+    );
+    chunk.set_baked_light(&baked);
+    chunk.dirty = false;
+    world
+        .commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk)
+        .unwrap();
+    let pos = mc_world::BlockPos {
+        x: 1,
+        y: DEFAULT_SEA_LEVEL,
+        z: 1,
+    };
+    let mut outcome = BlockEditBatchOutcome::default();
+
+    apply_block_edit_to_storage(
+        &mut world,
+        Some(&table),
+        &BlockEdit {
+            pos,
+            new_state: mc_world::BlockStateId(2),
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(outcome.edit_chunks, HashSet::from([(0, 0)]));
+    assert!(outcome.light_edit_chunks.is_empty());
+    assert_eq!(
+        mc_world::light::ChunkLight::from_section_lights(
+            &world
+                .cached_chunk_snapshot(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .section_lights
+        ),
+        Some(baked)
+    );
+
+    apply_block_edit_to_storage(
+        &mut world,
+        Some(&table),
+        &BlockEdit {
+            pos,
+            new_state: mc_world::BlockStateId(3),
+        },
+        &mut outcome,
+    );
+
+    assert_eq!(outcome.light_edit_chunks, HashSet::from([(0, 0)]));
+    let updates = collect_incremental_light_updates_for_applied_edits(
+        &mut world,
+        &table,
+        &outcome,
+    );
+    assert_eq!(updates.len(), 1);
+    assert!(
+        mc_world::light::ChunkLight::from_section_lights(
+            &world
+                .cached_chunk_snapshot(ChunkPos { x: 0, z: 0 })
+                .unwrap()
+                .section_lights
+        )
+        .is_some()
+    );
 }
 
 #[test]

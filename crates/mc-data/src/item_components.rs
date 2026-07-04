@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
 use crate::food::FoodEntry;
+use crate::{Identifier, read_json_file, visit_json_files};
 
 const REQUIRED_ITEM_COMPONENTS: &str = include_str!("../data/required_item_components.json");
 const DEFAULT_CONSUME_SECONDS: f32 = 1.6;
@@ -104,7 +104,14 @@ pub fn load_item_facts(
     }
 
     let mut paths = Vec::new();
-    collect_json_files(report_dir, &mut paths)?;
+    visit_json_files(
+        report_dir,
+        &mut |path| {
+            paths.push(path);
+            Ok(())
+        },
+        &|path, source| ItemComponentsError::Io { path, source },
+    )?;
     paths.sort();
 
     let mut items = BTreeMap::new();
@@ -129,32 +136,6 @@ pub fn solaris_required_item_facts() -> ItemFactsTable {
     }))
 }
 
-fn collect_json_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), ItemComponentsError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| ItemComponentsError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| ItemComponentsError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry
-            .file_type()
-            .map_err(|source| ItemComponentsError::Io {
-                path: path.clone(),
-                source,
-            })?;
-        if ty.is_dir() {
-            collect_json_files(&path, paths)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            paths.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn id_from_path(root: &Path, path: &Path) -> Result<Identifier, ItemComponentsError> {
     let rel = path
         .strip_prefix(root)
@@ -176,15 +157,11 @@ fn id_from_path(root: &Path, path: &Path) -> Result<Identifier, ItemComponentsEr
 }
 
 fn load_one(path: &Path) -> Result<ItemFacts, ItemComponentsError> {
-    let bytes = std::fs::read_to_string(path).map_err(|source| ItemComponentsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    let raw: RawItemComponents =
-        serde_json::from_str(&bytes).map_err(|source| ItemComponentsError::Parse {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let raw: RawItemComponents = read_json_file(
+        path,
+        &|path, source| ItemComponentsError::Io { path, source },
+        &|path, source| ItemComponentsError::Parse { path, source },
+    )?;
     Ok(raw.into_facts())
 }
 

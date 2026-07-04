@@ -47,6 +47,8 @@ include!("block_edit/breaks_and_crafting.rs");
 include!("block_edit/campfire.rs");
 include!("block_edit/crop_bonemeal.rs");
 include!("block_edit/crop_harvest.rs");
+include!("block_edit/fluid_scheduling.rs");
+include!("block_edit/placement_rejection.rs");
 include!("block_edit/plant_harvest.rs");
 include!("block_edit/plant_lifecycle.rs");
 include!("block_edit/furnace_and_chests.rs");

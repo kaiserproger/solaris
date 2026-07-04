@@ -97,18 +97,17 @@ REGISTRIES=(
   dialog
   dimension_type
   enchantment
-  enchantment_provider
   frog_variant
   instrument
   jukebox_song
   painting_variant
   pig_sound_variant
   pig_variant
+  test_environment
+  test_instance
   timeline
-  trade_set
   trim_material
   trim_pattern
-  villager_trade
   wolf_sound_variant
   wolf_variant
   world_clock

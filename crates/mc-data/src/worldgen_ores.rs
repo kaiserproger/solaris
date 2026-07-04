@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, sorted_json_files};
 
 #[derive(Debug, Error)]
 pub enum OreDataError {
@@ -102,25 +102,17 @@ pub fn load_ore_features(worldgen_dir: impl AsRef<Path>) -> Result<Vec<OreFeatur
         return Err(OreDataError::MissingConfiguredFeatureDir(configured_dir));
     }
 
-    let mut paths = Vec::new();
-    for entry in std::fs::read_dir(&placed_dir).map_err(|source| OreDataError::Io {
-        path: placed_dir.clone(),
+    let paths = sorted_json_files(&placed_dir, &|path, source| OreDataError::Io {
+        path,
         source,
-    })? {
-        let entry = entry.map_err(|source| OreDataError::Io {
-            path: placed_dir.clone(),
-            source,
-        })?;
-        let path = entry.path();
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-            continue;
-        };
-        if path.extension().and_then(|ext| ext.to_str()) == Some("json") && stem.starts_with("ore_")
-        {
-            paths.push(path);
-        }
-    }
-    paths.sort();
+    })?
+    .into_iter()
+    .filter(|path| {
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .is_some_and(|stem| stem.starts_with("ore_"))
+    })
+    .collect::<Vec<_>>();
 
     paths
         .into_iter()
@@ -133,7 +125,9 @@ fn load_one_ore_feature(
     configured_dir: &Path,
 ) -> Result<OreFeature, OreDataError> {
     let placed_feature = id_from_file(placed_path)?;
-    let placed: RawPlacedFeature = read_json(placed_path)?;
+    let io_error = |path, source| OreDataError::Io { path, source };
+    let parse_error = |path, source| OreDataError::Parse { path, source };
+    let placed: RawPlacedFeature = read_json_file(placed_path, &io_error, &parse_error)?;
     let configured_feature = parse_id(placed_path, placed.feature)?;
     if configured_feature.namespace() != "minecraft" {
         return Err(OreDataError::UnsupportedNamespace {
@@ -149,7 +143,8 @@ fn load_one_ore_feature(
             path: configured_path,
         });
     }
-    let configured: RawConfiguredFeature = read_json(&configured_path)?;
+    let configured: RawConfiguredFeature =
+        read_json_file(&configured_path, &io_error, &parse_error)?;
 
     let placement = parse_placement(placed_path, placed.placement)?;
     let targets = configured
@@ -251,17 +246,6 @@ fn parse_id(path: &Path, value: String) -> Result<Identifier, OreDataError> {
     Identifier::parse(value.clone()).map_err(|_| OreDataError::InvalidIdentifier {
         path: path.to_path_buf(),
         value,
-    })
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, OreDataError> {
-    let bytes = std::fs::read(path).map_err(|source| OreDataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_slice(&bytes).map_err(|source| OreDataError::Parse {
-        path: path.to_path_buf(),
-        source,
     })
 }
 

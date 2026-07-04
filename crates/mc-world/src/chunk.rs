@@ -21,6 +21,7 @@ use mc_data::block_light::BlockLightTable;
 use mc_nbt::Tag;
 
 use crate::block::BlockStateId;
+use crate::light::ChunkLight;
 use crate::section::{ChunkSection, PackedBitArray, SECTION_DIM};
 
 /// Lowest world Y coordinate (inclusive).
@@ -454,6 +455,17 @@ impl Chunk {
         self.dirty_generation = self.dirty_generation.wrapping_add(1).max(1);
     }
 
+    pub fn set_baked_light(&mut self, light: &ChunkLight) {
+        light.write_section_lights(&mut self.section_lights);
+        self.mark_dirty();
+    }
+
+    fn clear_baked_light(&mut self) {
+        for section in &mut self.section_lights {
+            *section = SectionLight::default();
+        }
+    }
+
     /// Look up a block by chunk-local (x, z) and absolute world y.
     /// `None` when `y` is outside `MIN_Y..MAX_Y`.
     #[must_use]
@@ -495,6 +507,7 @@ impl Chunk {
             return Some(prev);
         }
         self.mark_dirty();
+        self.clear_baked_light();
         // Heightmap entries store `height + 1`-style values (the Y of
         // the first air cell above the column), matching vanilla's
         // on-disk packing. Recompute the column for every present
@@ -861,6 +874,24 @@ mod tests {
         assert_eq!(prev, air());
         assert_eq!(c.get_block(0, 0, 0), Some(stone()));
         assert!(c.heightmaps.is_empty());
+    }
+
+    #[test]
+    fn set_block_and_update_clears_stale_baked_light_layers() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
+        c.section_lights[3].sky = Some(vec![0x22; LIGHT_LAYER_BYTES]);
+
+        let prev = c.set_block_and_update(0, 0, 0, stone(), air()).unwrap();
+
+        assert_eq!(prev, air());
+        assert!(
+            c.section_lights
+                .iter()
+                .all(|section| section.sky.is_none() && section.block.is_none()),
+            "block mutation must invalidate baked light arrays before they can be reused"
+        );
     }
 
     #[test]

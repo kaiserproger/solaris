@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, visit_json_files};
 
 const REQUIRED_RECIPES: &str = include_str!("../data/required_recipes.json");
 
@@ -103,7 +103,14 @@ pub fn load_recipes(recipe_dir: impl AsRef<Path>) -> Result<Vec<Recipe>, RecipeD
     }
 
     let mut paths = Vec::new();
-    collect_recipe_files(recipe_dir, &mut paths)?;
+    visit_json_files(
+        recipe_dir,
+        &mut |path| {
+            paths.push(path);
+            Ok(())
+        },
+        &|path, source| RecipeDataError::Io { path, source },
+    )?;
     paths.sort();
 
     let mut recipes = Vec::new();
@@ -131,33 +138,13 @@ pub fn solaris_required_recipes() -> Vec<Recipe> {
         .collect()
 }
 
-fn collect_recipe_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), RecipeDataError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| RecipeDataError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| RecipeDataError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry.file_type().map_err(|source| RecipeDataError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if ty.is_dir() {
-            collect_recipe_files(&path, paths)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            paths.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn load_one_recipe(root: &Path, path: &Path) -> Result<Option<Recipe>, RecipeDataError> {
     let id = id_from_file(root, path)?;
-    let value: serde_json::Value = read_json(path)?;
+    let value: serde_json::Value = read_json_file(
+        path,
+        &|path, source| RecipeDataError::Io { path, source },
+        &|path, source| RecipeDataError::Parse { path, source },
+    )?;
     parse_recipe_value(path, id, value)
 }
 
@@ -362,17 +349,6 @@ fn parse_id(path: &Path, value: String) -> Result<Identifier, RecipeDataError> {
     Identifier::parse(value.clone()).map_err(|_| RecipeDataError::InvalidIdentifier {
         path: path.to_path_buf(),
         value,
-    })
-}
-
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T, RecipeDataError> {
-    let bytes = std::fs::read(path).map_err(|source| RecipeDataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_slice(&bytes).map_err(|source| RecipeDataError::Parse {
-        path: path.to_path_buf(),
-        source,
     })
 }
 

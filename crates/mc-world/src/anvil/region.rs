@@ -406,6 +406,7 @@ fn decompress_lz4_block_stream(payload: &[u8]) -> Result<Vec<u8>, std::io::Error
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::GzEncoder;
     use std::path::{Path, PathBuf};
 
     fn workspace_path(rel: &str) -> PathBuf {
@@ -439,6 +440,46 @@ mod tests {
         None
     }
 
+    fn synthetic_region(compression: u8, payload: &[u8]) -> tempfile::NamedTempFile {
+        let body_len = 5 + payload.len();
+        let sectors = body_len.div_ceil(SECTOR_SIZE).max(1);
+        let mut bytes = vec![0u8; (HEADER_SECTORS + sectors) * SECTOR_SIZE];
+        let location = ((HEADER_SECTORS as u32) << 8) | sectors as u32;
+        bytes[0..4].copy_from_slice(&location.to_be_bytes());
+        bytes[SECTOR_SIZE..SECTOR_SIZE + 4].copy_from_slice(&1_700_000_000u32.to_be_bytes());
+        let chunk_start = HEADER_SECTORS * SECTOR_SIZE;
+        let declared_len = (payload.len() + 1) as u32;
+        bytes[chunk_start..chunk_start + 4].copy_from_slice(&declared_len.to_be_bytes());
+        bytes[chunk_start + 4] = compression;
+        bytes[chunk_start + 5..chunk_start + 5 + payload.len()].copy_from_slice(payload);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+        tmp
+    }
+
+    fn gzip_payload(raw: &[u8]) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(raw).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn raw_lz4_block_payload(raw: &[u8]) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(LZ4_BLOCK_MAGIC);
+        payload.push(LZ4_BLOCK_METHOD_RAW);
+        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(raw);
+        payload.extend_from_slice(LZ4_BLOCK_MAGIC);
+        payload.push(LZ4_BLOCK_METHOD_RAW);
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload.extend_from_slice(&0u32.to_le_bytes());
+        payload
+    }
+
     #[test]
     fn round_trip_synthetic_region() {
         let payloads = vec![
@@ -467,6 +508,41 @@ mod tests {
             let got = by_slot[&(orig.local_x, orig.local_z)];
             assert_eq!(got.timestamp, orig.timestamp);
             assert_eq!(got.uncompressed_nbt, orig.uncompressed_nbt);
+        }
+    }
+
+    #[test]
+    fn reads_synthetic_gzip_uncompressed_and_lz4_regions() {
+        let raw = b"synthetic chunk payload bytes";
+        for (compression, payload) in [
+            (CompressionType::Gzip as u8, gzip_payload(raw)),
+            (CompressionType::Uncompressed as u8, raw.to_vec()),
+            (CompressionType::Lz4 as u8, raw_lz4_block_payload(raw)),
+        ] {
+            let region = synthetic_region(compression, &payload);
+
+            let chunks = read_region(region.path()).unwrap();
+
+            assert_eq!(chunks.len(), 1);
+            assert_eq!(chunks[0].local_x, 0);
+            assert_eq!(chunks[0].local_z, 0);
+            assert_eq!(chunks[0].timestamp, 1_700_000_000);
+            assert_eq!(chunks[0].uncompressed_nbt, raw);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_and_oversized_compression_flags() {
+        let unknown = synthetic_region(0x7F, b"payload");
+        match read_region(unknown.path()) {
+            Err(RegionError::UnknownCompression(0x7F)) => {}
+            other => panic!("expected unknown compression, got {other:?}"),
+        }
+
+        let oversized = synthetic_region(0x80 | CompressionType::Zlib as u8, b"payload");
+        match read_region(oversized.path()) {
+            Err(RegionError::Oversized) => {}
+            other => panic!("expected oversized rejection, got {other:?}"),
         }
     }
 

@@ -55,7 +55,7 @@ Closeouts must include this matrix, even for drafts:
 
 | Gate | Required wording |
 |---|---|
-| Cargo baseline | Exact `fmt`, `clippy`, and `test` commands run after the last code change, or why not. |
+| Cargo baseline | Exact `fmt`, `xtask code-health`, `clippy`, and `test` commands run after the last code change, or why not. |
 | Focused tests | Which behavior they prove, and why they are not pass-by-construction. |
 | Vanilla oracle | `wire-probe`, `javap`, decompiled source, vanilla server capture, or explicit `not run`. |
 | Client/manual gate | PrismLauncher or approved real-client automation status: owner-run, agent-run, prepared only, or not run. |

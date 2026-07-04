@@ -904,8 +904,12 @@ fn cached_material_ids(config: &ServerConfig) -> Arc<BlockMaterialIds> {
         Arc::as_ptr(&config.blocks) as usize,
         Arc::as_ptr(&config.block_facts) as usize,
     );
-    let cache = PHYSICS_MATERIAL_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let mut cache = cache.lock().expect("physics material cache poisoned");
+    let cache_lock = PHYSICS_MATERIAL_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache_lock.lock().unwrap_or_else(|poisoned| {
+        warn!("physics material cache mutex was poisoned; recovering state");
+        cache_lock.clear_poison();
+        poisoned.into_inner()
+    });
     if let Some((blocks, facts, materials)) = cache.get(&key)
         && blocks
             .upgrade()
@@ -1112,7 +1116,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
         world.lock().await,
     );
     let storage_before = storage.stats();
-    let flush_plan = match storage.plan_dirty_flush() {
+    let flush_plan = match storage.plan_dirty_flush_at_tick(sessions.simulation_tick()) {
         Ok(plan) => Some(plan),
         Err(err) => {
             report
@@ -1142,7 +1146,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
             );
         } else {
             let started = Instant::now();
-            match write_dirty_flush_blocking(flush_plan).await {
+            match crate::dirty_flush::write_dirty_flush_blocking(flush_plan).await {
                 Ok(commit) => {
                     report.timings.flush_write_us = elapsed_us(started);
 
@@ -1251,40 +1255,20 @@ async fn save_entities_blocking(
     items: Arc<ItemRegistry>,
     entities: Vec<play::persistence::PersistedEntityRecord>,
 ) -> Result<(), String> {
-    match tokio::task::spawn_blocking(move || {
+    crate::blocking::spawn_result_blocking(move || {
         play::persistence::save_persisted_entity_records(&root, &items, &entities)
     })
     .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(err) => Err(err.to_string()),
-    }
 }
 
 async fn save_world_metadata_blocking(
     root: std::path::PathBuf,
     metadata: play::persistence::WorldPersistedMetadata,
 ) -> Result<(), String> {
-    match tokio::task::spawn_blocking(move || {
+    crate::blocking::spawn_result_blocking(move || {
         play::persistence::save_world_metadata(&root, &metadata)
     })
     .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-async fn write_dirty_flush_blocking(
-    flush_plan: mc_world::storage::DirtyFlushPlan,
-) -> Result<mc_world::storage::DirtyFlushCommit, String> {
-    match tokio::task::spawn_blocking(move || flush_plan.write()).await {
-        Ok(Ok(commit)) => Ok(commit),
-        Ok(Err(err)) => Err(err.to_string()),
-        Err(err) => Err(err.to_string()),
-    }
 }
 
 /// Convenience for the binary: `bind` followed by `serve`.
@@ -1556,6 +1540,82 @@ mod tests {
         assert!(step.velocity.y < 0.0);
     }
 
+    #[test]
+    fn cached_material_ids_recovers_poisoned_mutex_state() {
+        let cache = PHYSICS_MATERIAL_CACHE.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = cache.lock().unwrap();
+            panic!("inject material cache poison");
+        });
+        assert!(poisoned.is_err());
+
+        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+        let config = ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: "poisoned-material-cache-test".into(),
+            max_players: 0,
+            view_distance: 0,
+            data: Arc::new(mc_data::testing::stub()),
+            blocks,
+            world: None,
+            tags: Arc::new(TagsData::default()),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: ChunkPipelinePolicy::default(),
+            random_tick: play::RandomTickPolicy::default(),
+            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
+            shutdown: ShutdownHandle::default(),
+        };
+
+        let first = cached_material_ids(&config);
+        let second = cached_material_ids(&config);
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(cache.lock().is_ok());
+    }
+
+    fn save_all_test_config(
+        tmp: &std::path::Path,
+        blocks: Arc<BlockRegistry>,
+        items: Arc<mc_data::items::ItemRegistry>,
+        entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
+    ) -> ServerConfig {
+        let world = Arc::new(Mutex::new(
+            WorldStorage::open(tmp, Arc::clone(&blocks))
+                .unwrap()
+                .with_item_registry(Arc::clone(&items)),
+        ));
+        ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: "test".into(),
+            max_players: 1,
+            view_distance: 2,
+            data: Arc::new(mc_data::testing::stub()),
+            blocks,
+            world: Some(world),
+            tags: Arc::new(mc_data::tags::TagsData::default()),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items,
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            entity_types,
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: ChunkPipelinePolicy::default(),
+            random_tick: play::RandomTickPolicy::default(),
+            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), true),
+            shutdown: ShutdownHandle::default(),
+        }
+    }
+
     #[tokio::test]
     async fn save_all_writes_entities_and_world_metadata_to_real_storage() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1573,53 +1633,36 @@ mod tests {
                 protocol_id: 1,
             },
         ]));
-        let world = Arc::new(Mutex::new(
-            WorldStorage::open(tmp.path(), Arc::clone(&blocks))
-                .unwrap()
-                .with_item_registry(Arc::clone(&items)),
-        ));
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(42);
-        sessions.restore_persisted_entities([mc_entity::EntitySnapshot {
-            id: mc_entity::EntityId(1_000_001),
-            uuid: uuid::Uuid::from_u128(1),
-            type_id: 1,
-            type_name: "minecraft:item".into(),
-            position: mc_entity::Vec3::new(1.0, 2.0, 3.0),
-            rotation: mc_entity::Rotation::ZERO,
-            velocity: mc_entity::Vec3::ZERO,
-            on_ground: true,
-            item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
-            experience_value: None,
-            block_state: None,
-            lifecycle: mc_entity::EntityLifecycle::Alive,
-            health: 20.0,
-            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-            goal: mc_entity::GoalState::Idle,
-            vehicle: None,
+        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
+            snapshot: mc_entity::EntitySnapshot {
+                id: mc_entity::EntityId(1_000_001),
+                uuid: uuid::Uuid::from_u128(1),
+                type_id: 1,
+                type_name: "minecraft:item".into(),
+                position: mc_entity::Vec3::new(1.0, 2.0, 3.0),
+                rotation: mc_entity::Rotation::ZERO,
+                velocity: mc_entity::Vec3::ZERO,
+                on_ground: true,
+                item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
+                experience_value: None,
+                block_state: None,
+                lifecycle: mc_entity::EntityLifecycle::Alive,
+                health: 20.0,
+                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                goal: mc_entity::GoalState::Idle,
+                vehicle: None,
+            },
+            age: 12,
+            pickup_delay: 3,
         }]);
-        let config = ServerConfig {
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: "test".into(),
-            max_players: 1,
-            view_distance: 2,
-            data: Arc::new(mc_data::testing::stub()),
+        let config = save_all_test_config(
+            tmp.path(),
             blocks,
-            world: Some(world),
-            tags: Arc::new(mc_data::tags::TagsData::default()),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::clone(&items),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::clone(&entity_types),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: ChunkPipelinePolicy::default(),
-            random_tick: play::RandomTickPolicy::default(),
-            command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), true),
-            shutdown: ShutdownHandle::default(),
-        };
+            Arc::clone(&items),
+            Arc::clone(&entity_types),
+        );
 
         let report = save_all(&config, &sessions).await;
 
@@ -1633,10 +1676,155 @@ mod tests {
             entities[0].item_stack,
             Some(mc_entity::EntityItemStack::new(1, 2))
         );
+        assert_eq!(entities[0].age, 12);
+        assert_eq!(entities[0].pickup_delay, 3);
         let metadata = play::persistence::load_world_metadata(tmp.path())
             .unwrap()
             .unwrap();
         assert_eq!(metadata.world_time, 42);
+    }
+
+    #[tokio::test]
+    async fn save_all_then_bind_restores_world_time_and_item_entities() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+            mc_data::items::ItemReport {
+                id: Identifier::parse("minecraft:stone").unwrap(),
+                protocol_id: 1,
+            },
+        ]));
+        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
+            mc_data::entity_types::EntityTypeReport {
+                id: Identifier::parse("minecraft:item").unwrap(),
+                protocol_id: 1,
+            },
+        ]));
+        let sessions = play::SessionRegistry::new();
+        sessions.set_world_time(99);
+        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
+            snapshot: mc_entity::EntitySnapshot {
+                id: mc_entity::EntityId(1_000_002),
+                uuid: uuid::Uuid::from_u128(2),
+                type_id: 1,
+                type_name: "minecraft:item".into(),
+                position: mc_entity::Vec3::new(4.0, 5.0, 6.0),
+                rotation: mc_entity::Rotation::ZERO,
+                velocity: mc_entity::Vec3::ZERO,
+                on_ground: true,
+                item_stack: Some(mc_entity::EntityItemStack::new(1, 5)),
+                experience_value: None,
+                block_state: None,
+                lifecycle: mc_entity::EntityLifecycle::Alive,
+                health: 20.0,
+                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                goal: mc_entity::GoalState::Idle,
+                vehicle: None,
+            },
+            age: 8,
+            pickup_delay: 4,
+        }]);
+        let save_config = save_all_test_config(
+            tmp.path(),
+            Arc::clone(&blocks),
+            Arc::clone(&items),
+            Arc::clone(&entity_types),
+        );
+
+        let report = save_all(&save_config, &sessions).await;
+        assert!(report.is_ok(), "save-all errors: {:?}", report.errors);
+
+        let bound = bind(save_all_test_config(
+            tmp.path(),
+            blocks,
+            items,
+            entity_types,
+        ))
+        .await
+        .unwrap();
+        assert_eq!(bound.sessions.world_time(), 99);
+        let records = bound.sessions.persisted_entity_records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, mc_entity::EntityId(1_000_002));
+        assert_eq!(
+            records[0].item_stack,
+            Some(mc_entity::EntityItemStack::new(1, 5))
+        );
+        assert_eq!(records[0].age, 8);
+        assert_eq!(records[0].pickup_delay, 4);
+    }
+
+    #[tokio::test]
+    async fn save_all_persists_scheduled_fluid_ticks_as_remaining_restart_delay() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(
+            BlockRegistry::from_report(&[
+                report("minecraft:air", &[], &[(0, true, &[])]),
+                report(
+                    "minecraft:water",
+                    &[("level", &["0", "1"])],
+                    &[(1, true, &[("level", "0")]), (2, false, &[("level", "1")])],
+                ),
+            ])
+            .unwrap(),
+        );
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
+        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let sessions = play::SessionRegistry::new();
+        sessions.advance_world_time(100);
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::clone(&blocks),
+            items,
+            Arc::clone(&entity_types),
+        );
+        let cpos = mc_world::ChunkPos { x: 0, z: 0 };
+        let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+        let water = Identifier::parse("minecraft:water").unwrap();
+        {
+            let world = config.world.as_ref().unwrap();
+            let mut storage = world.lock().await;
+            storage
+                .insert_generated_chunk(
+                    cpos,
+                    mc_world::Chunk::empty(
+                        cpos,
+                        mc_world::BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            storage
+                .set_block_at(pos, mc_world::BlockStateId(1))
+                .unwrap();
+            assert!(
+                storage
+                    .schedule_fluid_tick(mc_world::ScheduledFluidTick::new(
+                        pos,
+                        water.clone(),
+                        112,
+                        0,
+                    ))
+                    .unwrap()
+            );
+        }
+
+        let report = save_all(&config, &sessions).await;
+
+        assert!(report.is_ok(), "save-all errors: {:?}", report.errors);
+        drop(config);
+
+        let mut reopened = WorldStorage::open(tmp.path(), blocks).unwrap();
+        let ticks = reopened.scheduled_fluid_ticks(cpos).unwrap().unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].pos, pos);
+        assert_eq!(ticks[0].fluid, water);
+        assert_eq!(
+            ticks[0].trigger_tick, 12,
+            "fresh runtimes must reload persisted fluid ticks as remaining delay"
+        );
     }
 
     #[test]

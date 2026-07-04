@@ -42,10 +42,12 @@ pub(super) enum OutboundCommand {
     },
     FurnaceSlots {
         position: mc_world::BlockPos,
+        state_id: i32,
         slots: [ItemStack; 3],
     },
     ChestSlots {
         position: mc_world::BlockPos,
+        state_id: i32,
         slots: Vec<ItemStack>,
     },
     FurnaceData {
@@ -226,7 +228,9 @@ struct SessionRegistryInner {
     arrow_owner_sessions: HashMap<EntityId, SessionId>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
+    furnace_state_ids: HashMap<mc_world::BlockPos, i32>,
     chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
+    chest_state_ids: HashMap<mc_world::BlockPos, i32>,
     campfire_cooking: HashMap<mc_world::BlockPos, CampfireCookingState>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
     entity_dispatches: EntityDispatchCounters,
@@ -262,7 +266,9 @@ impl Default for SessionRegistryInner {
             arrow_owner_sessions: HashMap::new(),
             spawned_entity_chunks: HashSet::new(),
             furnace_viewers: HashMap::new(),
+            furnace_state_ids: HashMap::new(),
             chest_viewers: HashMap::new(),
+            chest_state_ids: HashMap::new(),
             campfire_cooking: HashMap::new(),
             player_persistence: HashMap::new(),
             entity_dispatches: EntityDispatchCounters::default(),
@@ -352,6 +358,11 @@ impl SessionRegistry {
     pub(crate) fn world_time(&self) -> u64 {
         let inner = self.lock_inner("read world time");
         inner.world_time
+    }
+
+    pub(crate) fn simulation_tick(&self) -> u64 {
+        let inner = self.lock_inner("read simulation tick");
+        inner.entity_lifecycle_tick
     }
 
     pub(super) fn register_player_persistence(
@@ -497,63 +508,82 @@ impl SessionRegistry {
     }
 
     pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("unregister play session");
-        let Some(session) = inner.sessions.remove(&id) else {
-            return Vec::new();
-        };
-        for viewers in inner.furnace_viewers.values_mut() {
-            viewers.remove(&id);
-        }
-        for viewers in inner.chest_viewers.values_mut() {
-            viewers.remove(&id);
-        }
-        inner.player_persistence.remove(&id);
-        inner
-            .furnace_viewers
-            .retain(|_, viewers| !viewers.is_empty());
-        inner.chest_viewers.retain(|_, viewers| !viewers.is_empty());
-        let snapshot = session_snapshot(id, &session);
-        let mut dispatches = Vec::new();
-        for (&observer_id, observer) in &mut inner.sessions {
-            if observer.visible_players.remove(&id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
+        let (snapshot, recipients) = {
+            let mut inner = self.lock_inner("unregister play session");
+            let Some(session) = inner.sessions.remove(&id) else {
+                return Vec::new();
+            };
+            for viewers in inner.furnace_viewers.values_mut() {
+                viewers.remove(&id);
+            }
+            for viewers in inner.chest_viewers.values_mut() {
+                viewers.remove(&id);
+            }
+            inner.player_persistence.remove(&id);
+            inner
+                .furnace_viewers
+                .retain(|_, viewers| !viewers.is_empty());
+            let active_furnace_positions = inner
+                .furnace_viewers
+                .keys()
+                .copied()
+                .collect::<HashSet<_>>();
+            inner
+                .furnace_state_ids
+                .retain(|position, _| active_furnace_positions.contains(position));
+            inner.chest_viewers.retain(|_, viewers| !viewers.is_empty());
+            let active_chest_positions =
+                inner.chest_viewers.keys().copied().collect::<HashSet<_>>();
+            inner
+                .chest_state_ids
+                .retain(|position, _| active_chest_positions.contains(position));
+            let snapshot = session_snapshot(id, &session);
+            let mut recipients = Vec::new();
+            for (&observer_id, observer) in &mut inner.sessions {
+                if observer.visible_players.remove(&id) {
+                    recipients.push(SessionRecipient {
                         id: observer_id,
                         tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnPlayer(snapshot.clone()),
-                });
+                    });
+                }
             }
-        }
-        let desired_len = session.desired.len();
-        let loaded_len = session.loaded.len();
-        for chunk in session.desired {
-            if remove_ticket(&mut inner.tickets, chunk, id) {
-                inner.prepared.remove(&chunk);
+            let desired_len = session.desired.len();
+            let loaded_len = session.loaded.len();
+            for chunk in session.desired {
+                if remove_ticket(&mut inner.tickets, chunk, id) {
+                    inner.prepared.remove(&chunk);
+                }
             }
-        }
-        debug!(
-            session_id = id,
-            player = %session.name,
-            desired = desired_len,
-            loaded = loaded_len,
-            sessions = inner.sessions.len(),
-            tickets = inner.tickets.len(),
-            "play session unregistered"
-        );
-        dispatches
+            debug!(
+                session_id = id,
+                player = %session.name,
+                desired = desired_len,
+                loaded = loaded_len,
+                sessions = inner.sessions.len(),
+                tickets = inner.tickets.len(),
+                "play session unregistered"
+            );
+            (snapshot, recipients)
+        };
+        visibility_dispatches(recipients, OutboundCommand::DespawnPlayer(snapshot))
     }
 
-    pub(super) fn register_furnace_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+    pub(super) fn register_furnace_viewer(
+        &self,
+        id: SessionId,
+        position: mc_world::BlockPos,
+    ) -> i32 {
         let mut inner = self.lock_inner("register furnace viewer");
+        let state_id = *inner.furnace_state_ids.entry(position).or_insert(1);
         let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
-            return;
+            return state_id;
         };
         inner
             .furnace_viewers
             .entry(position)
             .or_default()
             .insert(id, FurnaceViewer { tx });
+        state_id
     }
 
     pub(super) fn unregister_furnace_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
@@ -562,20 +592,28 @@ impl SessionRegistry {
             viewers.remove(&id);
             if viewers.is_empty() {
                 inner.furnace_viewers.remove(&position);
+                inner.furnace_state_ids.remove(&position);
             }
         }
     }
 
-    pub(super) fn register_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
+    pub(super) fn furnace_state_id(&self, position: mc_world::BlockPos) -> i32 {
+        let inner = self.lock_inner("furnace state id");
+        inner.furnace_state_ids.get(&position).copied().unwrap_or(1)
+    }
+
+    pub(super) fn register_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) -> i32 {
         let mut inner = self.lock_inner("register chest viewer");
+        let state_id = *inner.chest_state_ids.entry(position).or_insert(1);
         let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
-            return;
+            return state_id;
         };
         inner
             .chest_viewers
             .entry(position)
             .or_default()
             .insert(id, FurnaceViewer { tx });
+        state_id
     }
 
     pub(super) fn unregister_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
@@ -584,8 +622,14 @@ impl SessionRegistry {
             viewers.remove(&id);
             if viewers.is_empty() {
                 inner.chest_viewers.remove(&position);
+                inner.chest_state_ids.remove(&position);
             }
         }
+    }
+
+    pub(super) fn chest_state_id(&self, position: mc_world::BlockPos) -> i32 {
+        let inner = self.lock_inner("chest state id");
+        inner.chest_state_ids.get(&position).copied().unwrap_or(1)
     }
 
     pub(super) fn chest_slot_dispatches(
@@ -593,25 +637,39 @@ impl SessionRegistry {
         position: mc_world::BlockPos,
         except: SessionId,
         slots: Vec<ItemStack>,
-    ) -> Vec<VisibilityDispatch> {
-        let inner = self.lock_inner("chest slot dispatches");
-        inner
-            .chest_viewers
-            .get(&position)
-            .into_iter()
-            .flat_map(|viewers| viewers.iter())
-            .filter(|&(&id, _)| id != except)
-            .map(|(&id, viewer)| VisibilityDispatch {
-                recipient: SessionRecipient {
+    ) -> (i32, Vec<VisibilityDispatch>) {
+        let (state_id, recipients) = {
+            let mut inner = self.lock_inner("chest slot dispatches");
+            let state_id = inner
+                .chest_state_ids
+                .entry(position)
+                .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
+                .or_insert(2);
+            let state_id = *state_id;
+            let recipients = inner
+                .chest_viewers
+                .get(&position)
+                .into_iter()
+                .flat_map(|viewers| viewers.iter())
+                .filter(|&(&id, _)| id != except)
+                .map(|(&id, viewer)| SessionRecipient {
                     id,
                     tx: viewer.tx.clone(),
-                },
-                command: OutboundCommand::ChestSlots {
+                })
+                .collect::<Vec<_>>();
+            (state_id, recipients)
+        };
+        (
+            state_id,
+            visibility_dispatches(
+                recipients,
+                OutboundCommand::ChestSlots {
                     position,
-                    slots: slots.clone(),
+                    state_id,
+                    slots,
                 },
-            })
-            .collect()
+            ),
+        )
     }
 
     pub(super) fn block_entity_data_dispatches(
@@ -622,23 +680,26 @@ impl SessionRegistry {
         nbt: Tag,
     ) -> Vec<VisibilityDispatch> {
         let chunk = (position.x.div_euclid(16), position.z.div_euclid(16));
-        let inner = self.lock_inner("block entity data dispatches");
-        inner
-            .sessions
-            .iter()
-            .filter(|&(&id, session)| except != Some(id) && session.loaded.contains(&chunk))
-            .map(|(&id, session)| VisibilityDispatch {
-                recipient: SessionRecipient {
+        let recipients = {
+            let inner = self.lock_inner("block entity data dispatches");
+            inner
+                .sessions
+                .iter()
+                .filter(|&(&id, session)| except != Some(id) && session.loaded.contains(&chunk))
+                .map(|(&id, session)| SessionRecipient {
                     id,
                     tx: session.tx.clone(),
-                },
-                command: OutboundCommand::BlockEntityData {
-                    position,
-                    block_entity_type,
-                    nbt: nbt.clone(),
-                },
-            })
-            .collect()
+                })
+                .collect::<Vec<_>>()
+        };
+        visibility_dispatches(
+            recipients,
+            OutboundCommand::BlockEntityData {
+                position,
+                block_entity_type,
+                nbt,
+            },
+        )
     }
 
     pub(super) fn furnace_slot_dispatches(
@@ -646,11 +707,28 @@ impl SessionRegistry {
         position: mc_world::BlockPos,
         except: SessionId,
         slots: [ItemStack; 3],
-    ) -> Vec<VisibilityDispatch> {
-        self.furnace_dispatches(
-            position,
-            except,
-            OutboundCommand::FurnaceSlots { position, slots },
+    ) -> (i32, Vec<VisibilityDispatch>) {
+        let (state_id, recipients) = {
+            let mut inner = self.lock_inner("furnace slot dispatches");
+            let state_id = inner
+                .furnace_state_ids
+                .entry(position)
+                .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
+                .or_insert(2);
+            let state_id = *state_id;
+            let recipients = furnace_recipients_except(&inner, position, except);
+            (state_id, recipients)
+        };
+        (
+            state_id,
+            visibility_dispatches(
+                recipients,
+                OutboundCommand::FurnaceSlots {
+                    position,
+                    state_id,
+                    slots,
+                },
+            ),
         )
     }
 
@@ -660,34 +738,14 @@ impl SessionRegistry {
         except: SessionId,
         changed: Vec<(i16, i16)>,
     ) -> Vec<VisibilityDispatch> {
-        self.furnace_dispatches(
-            position,
-            except,
+        let recipients = {
+            let inner = self.lock_inner("furnace dispatches");
+            furnace_recipients_except(&inner, position, except)
+        };
+        visibility_dispatches(
+            recipients,
             OutboundCommand::FurnaceData { position, changed },
         )
-    }
-
-    fn furnace_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        except: SessionId,
-        command: OutboundCommand,
-    ) -> Vec<VisibilityDispatch> {
-        let inner = self.lock_inner("furnace dispatches");
-        inner
-            .furnace_viewers
-            .get(&position)
-            .into_iter()
-            .flat_map(|viewers| viewers.iter())
-            .filter(|&(&id, _)| id != except)
-            .map(|(&id, viewer)| VisibilityDispatch {
-                recipient: SessionRecipient {
-                    id,
-                    tx: viewer.tx.clone(),
-                },
-                command: command.clone(),
-            })
-            .collect()
     }
 
     pub(super) fn is_furnace_tick_owner(
@@ -792,73 +850,64 @@ impl SessionRegistry {
     }
 
     pub(super) fn update_pose(&self, id: SessionId, pose: PlayerPose) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("update player pose");
-        let old_observers = visible_observers_locked(&inner, id);
-        let old_chunk = inner
-            .sessions
-            .get(&id)
-            .map(|session| session.pose.chunk_pos());
-        let Some(session) = inner.sessions.get_mut(&id) else {
-            return Vec::new();
+        let (mut dispatches, snapshot, move_recipients) = {
+            let mut inner = self.lock_inner("update player pose");
+            let old_observers = visible_observers_locked(&inner, id);
+            let old_chunk = inner
+                .sessions
+                .get(&id)
+                .map(|session| session.pose.chunk_pos());
+            let Some(session) = inner.sessions.get_mut(&id) else {
+                return Vec::new();
+            };
+            session.pose = pose;
+            push_entities_from_player_locked(&mut inner, pose);
+            let crossed_chunk = old_chunk.is_some_and(|chunk| chunk != pose.chunk_pos());
+            let dispatches = if crossed_chunk {
+                refresh_player_target_visibility_locked(
+                    &mut inner,
+                    id,
+                    old_chunk.expect("old chunk recorded for existing session"),
+                    pose.chunk_pos(),
+                )
+            } else {
+                Vec::new()
+            };
+            let new_observers = if crossed_chunk {
+                visible_observers_locked(&inner, id)
+            } else {
+                old_observers.clone()
+            };
+            let Some(snapshot) = inner
+                .sessions
+                .get(&id)
+                .map(|session| session_snapshot(id, session))
+            else {
+                return dispatches;
+            };
+            let move_recipients =
+                session_recipients(&inner, old_observers.intersection(&new_observers).copied());
+            (dispatches, snapshot, move_recipients)
         };
-        session.pose = pose;
-        push_entities_from_player_locked(&mut inner, pose);
-        let crossed_chunk = old_chunk.is_some_and(|chunk| chunk != pose.chunk_pos());
-        let mut dispatches = if crossed_chunk {
-            refresh_player_target_visibility_locked(
-                &mut inner,
-                id,
-                old_chunk.expect("old chunk recorded for existing session"),
-                pose.chunk_pos(),
-            )
-        } else {
-            Vec::new()
-        };
-        let new_observers = if crossed_chunk {
-            visible_observers_locked(&inner, id)
-        } else {
-            old_observers.clone()
-        };
-        let Some(snapshot) = inner
-            .sessions
-            .get(&id)
-            .map(|session| session_snapshot(id, session))
-        else {
-            return dispatches;
-        };
-        for observer_id in old_observers.intersection(&new_observers) {
-            if let Some(observer) = inner.sessions.get(observer_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: *observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::MovePlayer(snapshot.clone()),
-                });
-            }
-        }
+
+        dispatches.extend(visibility_dispatches(
+            move_recipients,
+            OutboundCommand::MovePlayer(snapshot),
+        ));
         dispatches
     }
 
     pub(super) fn broadcast_player_animation(&self, id: SessionId) -> Vec<VisibilityDispatch> {
-        let inner = self.lock_inner("broadcast player animation");
-        let Some(session) = inner.sessions.get(&id) else {
-            return Vec::new();
+        let (entity_id, recipients) = {
+            let inner = self.lock_inner("broadcast player animation");
+            let Some(session) = inner.sessions.get(&id) else {
+                return Vec::new();
+            };
+            let entity_id = session.entity_id;
+            let recipients = session_recipients(&inner, visible_observers_locked(&inner, id));
+            (entity_id, recipients)
         };
-        let entity_id = session.entity_id;
-        visible_observers_locked(&inner, id)
-            .into_iter()
-            .filter_map(|observer_id| {
-                let observer = inner.sessions.get(&observer_id)?;
-                Some(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::AnimatePlayer { entity_id },
-                })
-            })
-            .collect()
+        visibility_dispatches(recipients, OutboundCommand::AnimatePlayer { entity_id })
     }
 
     pub(super) fn broadcast_player_entity_data(
@@ -866,27 +915,19 @@ impl SessionRegistry {
         id: SessionId,
         values: Vec<EntityDataValue>,
     ) -> Vec<VisibilityDispatch> {
-        let inner = self.lock_inner("broadcast player entity data");
-        let Some(session) = inner.sessions.get(&id) else {
-            return Vec::new();
+        let (entity_id, recipients) = {
+            let inner = self.lock_inner("broadcast player entity data");
+            let Some(session) = inner.sessions.get(&id) else {
+                return Vec::new();
+            };
+            let entity_id = session.entity_id;
+            let recipients = session_recipients(&inner, visible_observers_locked(&inner, id));
+            (entity_id, recipients)
         };
-        let entity_id = session.entity_id;
-        visible_observers_locked(&inner, id)
-            .into_iter()
-            .filter_map(|observer_id| {
-                let observer = inner.sessions.get(&observer_id)?;
-                Some(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::PlayerEntityData {
-                        entity_id,
-                        values: values.clone(),
-                    },
-                })
-            })
-            .collect()
+        visibility_dispatches(
+            recipients,
+            OutboundCommand::PlayerEntityData { entity_id, values },
+        )
     }
 
     pub(super) fn ensure_chunk_herd(
@@ -1086,17 +1127,10 @@ impl SessionRegistry {
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let radius_sq = radius * radius;
         let inner = self.lock_inner("nearby item entities");
-        inner
-            .entities
-            .views()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .filter(|entity| entity.item_stack.is_some())
-            .filter(|entity| item_pickup_ready_locked(&inner, entity.id))
-            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
-            .map(server_entity_snapshot_from_view)
-            .collect()
+        nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
+            entity.item_stack.is_some() && item_pickup_ready_locked(&inner, entity.id)
+        })
     }
 
     pub(super) fn nearby_grounded_arrows(
@@ -1104,17 +1138,12 @@ impl SessionRegistry {
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let radius_sq = radius * radius;
         let inner = self.lock_inner("nearby grounded arrows");
-        inner
-            .entities
-            .views()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .filter(|entity| entity.type_name == "minecraft:arrow")
-            .filter(|entity| entity.on_ground && entity.velocity == Vec3::ZERO)
-            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
-            .map(server_entity_snapshot_from_view)
-            .collect()
+        nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
+            entity.type_name == "minecraft:arrow"
+                && entity.on_ground
+                && entity.velocity == Vec3::ZERO
+        })
     }
 
     pub(super) fn nearby_experience_entities(
@@ -1122,16 +1151,10 @@ impl SessionRegistry {
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let radius_sq = radius * radius;
         let inner = self.lock_inner("nearby experience entities");
-        inner
-            .entities
-            .views()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .filter(|entity| entity.experience_value.is_some())
-            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
-            .map(server_entity_snapshot_from_view)
-            .collect()
+        nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
+            entity.experience_value.is_some()
+        })
     }
 
     pub(super) fn nearby_hostile_entities(
@@ -1139,17 +1162,10 @@ impl SessionRegistry {
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let radius_sq = radius * radius;
         let inner = self.lock_inner("nearby hostile entities");
-        inner
-            .entities
-            .views()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .filter(|entity| entity.item_stack.is_none())
-            .filter(|entity| is_hostile_entity(entity.type_name))
-            .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
-            .map(server_entity_snapshot_from_view)
-            .collect()
+        nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
+            entity.item_stack.is_none() && is_hostile_entity(entity.type_name)
+        })
     }
 
     pub(super) fn server_entity_snapshot(
@@ -1181,77 +1197,65 @@ impl SessionRegistry {
         if max_count <= 0 {
             return None;
         }
-        let mut inner = self.lock_inner("remove dead entity");
-        let snapshot = inner.entities.snapshot(entity_id)?;
-        if snapshot.lifecycle != EntityLifecycle::Alive {
-            return None;
-        }
-        if !item_pickup_ready_locked(&inner, entity_id) {
-            return None;
-        }
-        let mut stack = snapshot.item_stack?;
-        if stack.count <= 0 {
-            return None;
-        }
-        let picked_count = stack.count.min(max_count);
-        let picked = EntityItemStack {
-            item_id: stack.item_id,
-            count: picked_count,
-            damage: stack.damage,
-        };
-        stack.count -= picked_count;
-
-        if stack.count <= 0 {
-            let snapshot = inner
-                .entities
-                .remove(entity_id)
-                .map(server_entity_snapshot_from)?;
-            inner.last_sent_entity_positions.remove(&entity_id);
-            inner.last_entity_damage_ticks.remove(&entity_id);
-            inner.item_pickup_ready_ticks.remove(&entity_id);
-            inner.entity_spawn_ticks.remove(&entity_id);
-            inner.arrow_spawn_ticks.remove(&entity_id);
-            inner.arrow_owner_sessions.remove(&entity_id);
-            untrack_entity_chunk_locked(&mut inner, entity_id);
-            let dispatches = picked_entity_dispatches_locked(
-                &mut inner,
-                entity_id,
-                collector_session,
-                picked_count,
-                snapshot,
-            );
-            Some(ClaimedPickup {
-                stack: picked,
-                dispatches,
-            })
-        } else {
-            if !inner.entities.set_item_stack(entity_id, Some(stack)) {
+        let (picked, update_entity, collector_entity_id, snapshot, recipients) = {
+            let mut inner = self.lock_inner("remove dead entity");
+            let snapshot = inner.entities.snapshot(entity_id)?;
+            if snapshot.lifecycle != EntityLifecycle::Alive {
                 return None;
             }
-            let snapshot = inner
-                .entities
-                .snapshot(entity_id)
-                .map(server_entity_snapshot_from)?;
-            let dispatches: Vec<VisibilityDispatch> =
-                visible_entity_observers_locked(&inner, entity_id)
-                    .into_iter()
-                    .filter_map(|observer_id| {
-                        let observer = inner.sessions.get(&observer_id)?;
-                        Some(VisibilityDispatch {
-                            recipient: SessionRecipient {
-                                id: observer_id,
-                                tx: observer.tx.clone(),
-                            },
-                            command: OutboundCommand::UpdateEntityData(snapshot.clone()),
-                        })
-                    })
-                    .collect();
-            record_entity_dispatches_locked(&mut inner, &dispatches);
-            Some(ClaimedPickup {
-                stack: picked,
-                dispatches,
-            })
-        }
+            if !item_pickup_ready_locked(&inner, entity_id) {
+                return None;
+            }
+            let mut stack = snapshot.item_stack?;
+            if stack.count <= 0 {
+                return None;
+            }
+            let picked_count = stack.count.min(max_count);
+            let picked = EntityItemStack {
+                item_id: stack.item_id,
+                count: picked_count,
+                damage: stack.damage,
+            };
+            stack.count -= picked_count;
+
+            if stack.count <= 0 {
+                let snapshot = inner
+                    .entities
+                    .remove(entity_id)
+                    .map(server_entity_snapshot_from)?;
+                clear_removed_entity_tracking_locked(&mut inner, entity_id);
+                let (collector_entity_id, recipients) =
+                    picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
+                (picked, false, collector_entity_id, snapshot, recipients)
+            } else {
+                if !inner.entities.set_item_stack(entity_id, Some(stack)) {
+                    return None;
+                }
+                let snapshot = inner
+                    .entities
+                    .snapshot(entity_id)
+                    .map(server_entity_snapshot_from)?;
+                let recipients =
+                    session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
+                inner.entity_dispatches.data += recipients.len() as u64;
+                (picked, true, 0, snapshot, recipients)
+            }
+        };
+        let dispatches = if update_entity {
+            visibility_dispatches(recipients, OutboundCommand::UpdateEntityData(snapshot))
+        } else {
+            picked_entity_dispatches(
+                entity_id,
+                collector_entity_id,
+                picked.count,
+                snapshot,
+                recipients,
+            )
+        };
+        Some(ClaimedPickup {
+            stack: picked,
+            dispatches,
+        })
     }
 
     pub(super) fn claim_arrow_pickup(
@@ -1259,32 +1263,31 @@ impl SessionRegistry {
         entity_id: EntityId,
         collector_session: SessionId,
     ) -> Option<Vec<VisibilityDispatch>> {
-        let mut inner = self.lock_inner("claim arrow pickup");
-        let snapshot = inner.entities.snapshot(entity_id)?;
-        if snapshot.lifecycle != EntityLifecycle::Alive
-            || snapshot.type_name != "minecraft:arrow"
-            || !snapshot.on_ground
-            || snapshot.velocity != Vec3::ZERO
-        {
-            return None;
-        }
-        let snapshot = inner
-            .entities
-            .remove(entity_id)
-            .map(server_entity_snapshot_from)?;
-        inner.last_sent_entity_positions.remove(&entity_id);
-        inner.last_entity_damage_ticks.remove(&entity_id);
-        inner.item_pickup_ready_ticks.remove(&entity_id);
-        inner.entity_spawn_ticks.remove(&entity_id);
-        inner.arrow_spawn_ticks.remove(&entity_id);
-        inner.arrow_owner_sessions.remove(&entity_id);
-        untrack_entity_chunk_locked(&mut inner, entity_id);
-        Some(picked_entity_dispatches_locked(
-            &mut inner,
+        let (snapshot, collector_entity_id, recipients) = {
+            let mut inner = self.lock_inner("claim arrow pickup");
+            let snapshot = inner.entities.snapshot(entity_id)?;
+            if snapshot.lifecycle != EntityLifecycle::Alive
+                || snapshot.type_name != "minecraft:arrow"
+                || !snapshot.on_ground
+                || snapshot.velocity != Vec3::ZERO
+            {
+                return None;
+            }
+            let snapshot = inner
+                .entities
+                .remove(entity_id)
+                .map(server_entity_snapshot_from)?;
+            clear_removed_entity_tracking_locked(&mut inner, entity_id);
+            let (collector_entity_id, recipients) =
+                picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
+            (snapshot, collector_entity_id, recipients)
+        };
+        Some(picked_entity_dispatches(
             entity_id,
-            collector_session,
+            collector_entity_id,
             1,
             snapshot,
+            recipients,
         ))
     }
 
@@ -1302,24 +1305,23 @@ impl SessionRegistry {
         collector_session: SessionId,
         amount: i32,
     ) -> Option<Vec<VisibilityDispatch>> {
-        let mut inner = self.lock_inner("remove picked item entity");
-        let snapshot = inner
-            .entities
-            .remove(entity_id)
-            .map(server_entity_snapshot_from)?;
-        inner.last_sent_entity_positions.remove(&entity_id);
-        inner.last_entity_damage_ticks.remove(&entity_id);
-        inner.item_pickup_ready_ticks.remove(&entity_id);
-        inner.entity_spawn_ticks.remove(&entity_id);
-        inner.arrow_spawn_ticks.remove(&entity_id);
-        inner.arrow_owner_sessions.remove(&entity_id);
-        untrack_entity_chunk_locked(&mut inner, entity_id);
-        Some(picked_entity_dispatches_locked(
-            &mut inner,
+        let (snapshot, collector_entity_id, recipients) = {
+            let mut inner = self.lock_inner("remove picked item entity");
+            let snapshot = inner
+                .entities
+                .remove(entity_id)
+                .map(server_entity_snapshot_from)?;
+            clear_removed_entity_tracking_locked(&mut inner, entity_id);
+            let (collector_entity_id, recipients) =
+                picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
+            (snapshot, collector_entity_id, recipients)
+        };
+        Some(picked_entity_dispatches(
             entity_id,
-            collector_session,
+            collector_entity_id,
             amount,
             snapshot,
+            recipients,
         ))
     }
 
@@ -1675,9 +1677,23 @@ impl SessionRegistry {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn ticketed_chunks_sorted(&self) -> Vec<(i32, i32)> {
         let inner = self.lock_inner("ticketed chunks sorted");
         let mut chunks: Vec<_> = inner.tickets.keys().copied().collect();
+        chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
+        chunks
+    }
+
+    pub(crate) fn loaded_chunks_sorted(&self) -> Vec<(i32, i32)> {
+        let inner = self.lock_inner("loaded chunks sorted");
+        let mut chunks: Vec<_> = inner
+            .sessions
+            .values()
+            .flat_map(|session| session.loaded.iter().copied())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
         chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
         chunks
     }
@@ -1754,6 +1770,23 @@ fn server_entity_snapshot_from_view(entity: EntityView<'_>) -> ServerEntitySnaps
         block_state: entity.block_state,
         attack_damage: entity.attributes.base(&AttributeKind::AttackDamage),
     }
+}
+
+fn nearby_entity_snapshots_locked(
+    inner: &SessionRegistryInner,
+    position: Vec3,
+    radius: f64,
+    predicate: impl Fn(EntityView<'_>) -> bool,
+) -> Vec<ServerEntitySnapshot> {
+    let radius_sq = radius * radius;
+    inner
+        .entities
+        .views()
+        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
+        .filter(|entity| predicate(*entity))
+        .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
+        .map(server_entity_snapshot_from_view)
+        .collect()
 }
 
 fn apply_entity_facts(entity: &mut SpawnEntity) {
@@ -2012,6 +2045,51 @@ fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> 
         .collect()
 }
 
+fn session_recipients<I>(inner: &SessionRegistryInner, ids: I) -> Vec<SessionRecipient>
+where
+    I: IntoIterator<Item = SessionId>,
+{
+    ids.into_iter()
+        .filter_map(|id| {
+            inner.sessions.get(&id).map(|session| SessionRecipient {
+                id,
+                tx: session.tx.clone(),
+            })
+        })
+        .collect()
+}
+
+fn furnace_recipients_except(
+    inner: &SessionRegistryInner,
+    position: mc_world::BlockPos,
+    except: SessionId,
+) -> Vec<SessionRecipient> {
+    inner
+        .furnace_viewers
+        .get(&position)
+        .into_iter()
+        .flat_map(|viewers| viewers.iter())
+        .filter(|&(&id, _)| id != except)
+        .map(|(&id, viewer)| SessionRecipient {
+            id,
+            tx: viewer.tx.clone(),
+        })
+        .collect()
+}
+
+fn visibility_dispatches(
+    recipients: Vec<SessionRecipient>,
+    command: OutboundCommand,
+) -> Vec<VisibilityDispatch> {
+    recipients
+        .into_iter()
+        .map(|recipient| VisibilityDispatch {
+            recipient,
+            command: command.clone(),
+        })
+        .collect()
+}
+
 fn refresh_loaded_chunk_for_session_locked(
     inner: &mut SessionRegistryInner,
     observer_id: SessionId,
@@ -2161,10 +2239,8 @@ fn refresh_player_target_visibility_locked(
             continue;
         };
         let desired = observer.loaded.contains(&new_chunk);
-        let visible = observer.visible_players.contains(&target_id);
-        match (desired, visible) {
-            (true, false) => {
-                observer.visible_players.insert(target_id);
+        match update_visibility_set(&mut observer.visible_players, target_id, desired) {
+            Some(VisibilityTransition::Spawn) => {
                 dispatches.push(VisibilityDispatch {
                     recipient: SessionRecipient {
                         id: observer_id,
@@ -2173,8 +2249,7 @@ fn refresh_player_target_visibility_locked(
                     command: OutboundCommand::SpawnPlayer(snapshot.clone()),
                 });
             }
-            (false, true) => {
-                observer.visible_players.remove(&target_id);
+            Some(VisibilityTransition::Despawn) => {
                 dispatches.push(VisibilityDispatch {
                     recipient: SessionRecipient {
                         id: observer_id,
@@ -2183,10 +2258,35 @@ fn refresh_player_target_visibility_locked(
                     command: OutboundCommand::DespawnPlayer(snapshot.clone()),
                 });
             }
-            _ => {}
+            None => {}
         }
     }
     dispatches
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisibilityTransition {
+    Spawn,
+    Despawn,
+}
+
+fn update_visibility_set<T>(
+    visible: &mut std::collections::HashSet<T>,
+    target: T,
+    desired: bool,
+) -> Option<VisibilityTransition>
+where
+    T: Copy + Eq + std::hash::Hash,
+{
+    if desired {
+        visible
+            .insert(target)
+            .then_some(VisibilityTransition::Spawn)
+    } else {
+        visible
+            .remove(&target)
+            .then_some(VisibilityTransition::Despawn)
+    }
 }
 
 fn spawn_entity_visibility_locked(
@@ -2247,10 +2347,8 @@ fn refresh_entity_target_visibility_locked(
             continue;
         };
         let desired = observer.loaded.contains(&new_chunk);
-        let visible = observer.visible_entities.contains(&entity_id);
-        match (desired, visible) {
-            (true, false) => {
-                observer.visible_entities.insert(entity_id);
+        match update_visibility_set(&mut observer.visible_entities, entity_id, desired) {
+            Some(VisibilityTransition::Spawn) => {
                 dispatches.push(VisibilityDispatch {
                     recipient: SessionRecipient {
                         id: observer_id,
@@ -2259,8 +2357,7 @@ fn refresh_entity_target_visibility_locked(
                     command: OutboundCommand::SpawnEntity(snapshot.clone()),
                 });
             }
-            (false, true) => {
-                observer.visible_entities.remove(&entity_id);
+            Some(VisibilityTransition::Despawn) => {
                 dispatches.push(VisibilityDispatch {
                     recipient: SessionRecipient {
                         id: observer_id,
@@ -2269,7 +2366,7 @@ fn refresh_entity_target_visibility_locked(
                     command: OutboundCommand::DespawnEntity(snapshot.clone()),
                 });
             }
-            _ => {}
+            None => {}
         }
     }
     record_entity_dispatches_locked(inner, &dispatches);
@@ -2816,6 +2913,16 @@ fn entity_event_dispatches_locked(
         .collect()
 }
 
+fn clear_removed_entity_tracking_locked(inner: &mut SessionRegistryInner, entity_id: EntityId) {
+    inner.last_sent_entity_positions.remove(&entity_id);
+    inner.last_entity_damage_ticks.remove(&entity_id);
+    inner.item_pickup_ready_ticks.remove(&entity_id);
+    inner.entity_spawn_ticks.remove(&entity_id);
+    inner.arrow_spawn_ticks.remove(&entity_id);
+    inner.arrow_owner_sessions.remove(&entity_id);
+    untrack_entity_chunk_locked(inner, entity_id);
+}
+
 fn remove_server_entity_locked(
     inner: &mut SessionRegistryInner,
     entity_id: EntityId,
@@ -2824,13 +2931,7 @@ fn remove_server_entity_locked(
         .entities
         .remove(entity_id)
         .map(server_entity_snapshot_from)?;
-    inner.last_sent_entity_positions.remove(&entity_id);
-    inner.last_entity_damage_ticks.remove(&entity_id);
-    inner.item_pickup_ready_ticks.remove(&entity_id);
-    inner.entity_spawn_ticks.remove(&entity_id);
-    inner.arrow_spawn_ticks.remove(&entity_id);
-    inner.arrow_owner_sessions.remove(&entity_id);
-    untrack_entity_chunk_locked(inner, entity_id);
+    clear_removed_entity_tracking_locked(inner, entity_id);
 
     let mut dispatches = Vec::new();
     for (&observer_id, observer) in &mut inner.sessions {
@@ -2919,40 +3020,52 @@ fn retry_reliable_command(
     });
 }
 
-fn picked_entity_dispatches_locked(
+fn picked_entity_recipients_locked(
     inner: &mut SessionRegistryInner,
     entity_id: EntityId,
     collector_session: SessionId,
-    amount: i32,
-    snapshot: ServerEntitySnapshot,
-) -> Vec<VisibilityDispatch> {
+) -> (i32, Vec<SessionRecipient>) {
     let collector_entity_id = inner
         .sessions
         .get(&collector_session)
         .map(|session| session.entity_id)
         .unwrap_or_default();
-    let mut dispatches = Vec::new();
+    let mut recipients = Vec::new();
     for (&observer_id, observer) in &mut inner.sessions {
         if observer.visible_entities.remove(&entity_id) {
-            let recipient = SessionRecipient {
+            recipients.push(SessionRecipient {
                 id: observer_id,
                 tx: observer.tx.clone(),
-            };
-            dispatches.push(VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::TakeItemEntity {
-                    item_entity_id: entity_id.0,
-                    player_entity_id: collector_entity_id,
-                    amount,
-                },
-            });
-            dispatches.push(VisibilityDispatch {
-                recipient,
-                command: OutboundCommand::DespawnEntity(snapshot.clone()),
             });
         }
     }
-    record_entity_dispatches_locked(inner, &dispatches);
+    inner.entity_dispatches.take += recipients.len() as u64;
+    inner.entity_dispatches.remove += recipients.len() as u64;
+    (collector_entity_id, recipients)
+}
+
+fn picked_entity_dispatches(
+    entity_id: EntityId,
+    collector_entity_id: i32,
+    amount: i32,
+    snapshot: ServerEntitySnapshot,
+    recipients: Vec<SessionRecipient>,
+) -> Vec<VisibilityDispatch> {
+    let mut dispatches = Vec::with_capacity(recipients.len() * 2);
+    for recipient in recipients {
+        dispatches.push(VisibilityDispatch {
+            recipient: recipient.clone(),
+            command: OutboundCommand::TakeItemEntity {
+                item_entity_id: entity_id.0,
+                player_entity_id: collector_entity_id,
+                amount,
+            },
+        });
+        dispatches.push(VisibilityDispatch {
+            recipient,
+            command: OutboundCommand::DespawnEntity(snapshot.clone()),
+        });
+    }
     dispatches
 }
 
@@ -3039,6 +3152,84 @@ mod tests {
             PlayerPose::new(0.5, 64.0, 0.5),
         );
         id
+    }
+
+    #[test]
+    fn chest_slot_dispatches_advance_and_carry_shared_state_id() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "ChestStateAlice");
+        let bob = register_test_session(&registry, "ChestStateBob");
+        let position = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+        let stack = ItemStack::new(10, 1);
+
+        assert_eq!(registry.register_chest_viewer(alice, position), 1);
+        assert_eq!(registry.register_chest_viewer(bob, position), 1);
+
+        let (state_id, dispatches) =
+            registry.chest_slot_dispatches(position, alice, vec![stack.clone()]);
+
+        assert_eq!(state_id, 2);
+        assert_eq!(registry.chest_state_id(position), 2);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].recipient.id, bob);
+        match &dispatches[0].command {
+            OutboundCommand::ChestSlots {
+                position: command_position,
+                state_id: command_state_id,
+                slots,
+            } => {
+                assert_eq!(*command_position, position);
+                assert_eq!(*command_state_id, 2);
+                assert_eq!(slots.as_slice(), &[stack]);
+            }
+            other => panic!("expected chest slots dispatch, got {other:?}"),
+        }
+
+        let charlie = register_test_session(&registry, "ChestStateCharlie");
+        assert_eq!(registry.register_chest_viewer(charlie, position), 2);
+        registry.unregister_chest_viewer(alice, position);
+        registry.unregister_chest_viewer(bob, position);
+        registry.unregister_chest_viewer(charlie, position);
+        assert_eq!(registry.chest_state_id(position), 1);
+    }
+
+    #[test]
+    fn furnace_slot_dispatches_advance_and_carry_shared_state_id() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "FurnaceStateAlice");
+        let bob = register_test_session(&registry, "FurnaceStateBob");
+        let position = mc_world::BlockPos { x: 5, y: 64, z: 5 };
+        let slots = [ItemStack::new(10, 1), ItemStack::EMPTY, ItemStack::EMPTY];
+
+        assert_eq!(registry.register_furnace_viewer(alice, position), 1);
+        assert_eq!(registry.register_furnace_viewer(bob, position), 1);
+
+        let (state_id, dispatches) =
+            registry.furnace_slot_dispatches(position, alice, slots.clone());
+
+        assert_eq!(state_id, 2);
+        assert_eq!(registry.furnace_state_id(position), 2);
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].recipient.id, bob);
+        match &dispatches[0].command {
+            OutboundCommand::FurnaceSlots {
+                position: command_position,
+                state_id: command_state_id,
+                slots: command_slots,
+            } => {
+                assert_eq!(*command_position, position);
+                assert_eq!(*command_state_id, 2);
+                assert_eq!(command_slots, &slots);
+            }
+            other => panic!("expected furnace slots dispatch, got {other:?}"),
+        }
+
+        let charlie = register_test_session(&registry, "FurnaceStateCharlie");
+        assert_eq!(registry.register_furnace_viewer(charlie, position), 2);
+        registry.unregister_furnace_viewer(alice, position);
+        registry.unregister_furnace_viewer(bob, position);
+        registry.unregister_furnace_viewer(charlie, position);
+        assert_eq!(registry.furnace_state_id(position), 1);
     }
 
     #[test]
@@ -3849,6 +4040,7 @@ mod tests {
     fn item_pickup_preserves_damage_on_partial_claim() {
         let registry = SessionRegistry::new();
         let alice = register_test_session(&registry, "DamagePickupAlice");
+        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
         registry.spawn_item_drop(
             1,
             Vec3::new(0.5, 64.0, 0.5),
@@ -3856,14 +4048,46 @@ mod tests {
         );
         registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
         let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
+        let before_pickup = registry.pressure_snapshot().entity_dispatches;
 
         let claimed = registry.claim_item_pickup(entity_id, alice, 1).unwrap();
         let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0]
             .item_stack
             .unwrap();
+        let after_pickup = registry.pressure_snapshot().entity_dispatches;
 
         assert_eq!(claimed.stack, EntityItemStack::new(42, 1).with_damage(17));
+        assert!(matches!(
+            claimed.dispatches.as_slice(),
+            [VisibilityDispatch {
+                command: OutboundCommand::UpdateEntityData(_),
+                ..
+            }]
+        ));
         assert_eq!(remaining, EntityItemStack::new(42, 2).with_damage(17));
+        assert_eq!(after_pickup.data, before_pickup.data + 1);
+        assert_eq!(after_pickup.take, before_pickup.take);
+        assert_eq!(after_pickup.remove, before_pickup.remove);
+    }
+
+    #[test]
+    fn item_pickup_counts_take_and_remove_per_observer() {
+        let registry = SessionRegistry::new();
+        let alice = register_test_session(&registry, "PickupCounterAlice");
+        let bob = register_test_session(&registry, "PickupCounterBob");
+        let _ = registry.mark_loaded(alice, (0, 0));
+        let _ = registry.mark_loaded(bob, (0, 0));
+        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
+        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
+        let before_pickup = registry.pressure_snapshot().entity_dispatches;
+
+        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
+        let after_pickup = registry.pressure_snapshot().entity_dispatches;
+
+        assert_eq!(claimed.dispatches.len(), 4);
+        assert_eq!(after_pickup.take, before_pickup.take + 2);
+        assert_eq!(after_pickup.remove, before_pickup.remove + 2);
     }
 
     #[test]
@@ -4282,5 +4506,58 @@ mod tests {
                 .nearby_experience_entities(Vec3::new(10.0, 64.0, 10.0), 2.25)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn hostile_entities_are_filtered_by_kind_and_radius() {
+        let registry = SessionRegistry::new();
+        let observer = register_test_session(&registry, "HostileQueryAlice");
+        assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+        let spawn_dispatches = registry.spawn_command_entity(
+            1,
+            "minecraft:zombie".to_owned(),
+            Vec3::new(1.0, 64.0, 1.0),
+        );
+        let zombie = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected zombie spawn dispatch, got {other:?}"),
+        };
+        registry.spawn_command_entity(2, "minecraft:cow".to_owned(), Vec3::new(1.5, 64.0, 1.0));
+        registry.spawn_command_entity(
+            1,
+            "minecraft:zombie".to_owned(),
+            Vec3::new(20.0, 64.0, 20.0),
+        );
+        assert_eq!(
+            registry.restore_persisted_entities([PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(777),
+                    uuid: uuid::Uuid::nil(),
+                    type_id: 1,
+                    type_name: "minecraft:zombie".into(),
+                    position: Vec3::new(1.25, 64.0, 1.0),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(EntityItemStack::new(42, 1)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::new(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                },
+                age: 0,
+                pickup_delay: 0,
+            }]),
+            1
+        );
+
+        let nearby = registry.nearby_hostile_entities(Vec3::new(1.0, 64.0, 1.0), 2.25);
+
+        assert_eq!(nearby.len(), 1);
+        assert_eq!(nearby[0].id, zombie);
+        assert_eq!(nearby[0].type_name, "minecraft:zombie");
     }
 }

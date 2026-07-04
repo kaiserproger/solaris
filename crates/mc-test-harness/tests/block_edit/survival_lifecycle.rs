@@ -979,7 +979,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     });
 
     let (mut client, _) = connect_to_play(addr, "M23Respawn").await;
-    drain_until_chunk(&mut client, (0, 0)).await;
+    drain_complete_spawn_view(&mut client).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:apple 1 0".into(),
@@ -1002,15 +1002,23 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         .await
         .expect("request respawn");
     let mut saw_respawn = false;
+    let mut saw_center_chunk = false;
+    let mut saw_respawn_chunk = false;
+    let mut saw_load_start = false;
     let mut saw_full_health = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(saw_respawn && saw_full_health) {
+    while !(saw_respawn && saw_center_chunk && saw_respawn_chunk && saw_load_start && saw_full_health)
+    {
         let frame = client
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("respawn response");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "respawn response timed out: respawn={saw_respawn} center={saw_center_chunk} chunk={saw_respawn_chunk} load_start={saw_load_start} health={saw_full_health}: {error}"
+                )
+            });
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
             continue;
         }
@@ -1024,6 +1032,22 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
             if (pkt.health - 20.0).abs() < f32::EPSILON && pkt.food == 20 {
                 saw_full_health = true;
+            }
+        } else if frame.id == SetCenterChunk::ID {
+            let mut body = frame.body;
+            let pkt = SetCenterChunk::decode(&mut body).expect("decode SetCenterChunk");
+            if pkt.chunk_x == 0 && pkt.chunk_z == 0 {
+                saw_center_chunk = true;
+            }
+        } else if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let _ = LevelChunkWithLight::decode(&mut body).expect("decode respawn chunk");
+            saw_respawn_chunk = true;
+        } else if frame.id == GameEvent::ID {
+            let mut body = frame.body;
+            let pkt = GameEvent::decode(&mut body).expect("decode respawn GameEvent");
+            if pkt.event == GameEvent::EVENT_START_WAITING_FOR_CHUNKS {
+                saw_load_start = true;
             }
         }
     }
@@ -1077,6 +1101,37 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
             if pkt.food == 20 {
                 saw_food = true;
+            }
+        }
+    }
+}
+
+async fn drain_complete_spawn_view(client: &mut Client) {
+    let expected_count = (2 * VIEW_DISTANCE + 1).pow(2) as usize;
+    let mut seen = HashSet::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while seen.len() < expected_count {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "initial view did not complete before respawn probe: saw {} of {expected_count}: {error}",
+                    seen.len()
+                )
+            });
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let pkt = LevelChunkWithLight::decode(&mut body).expect("decode initial chunk");
+            if (-VIEW_DISTANCE..=VIEW_DISTANCE).contains(&pkt.chunk_x)
+                && (-VIEW_DISTANCE..=VIEW_DISTANCE).contains(&pkt.chunk_z)
+            {
+                seen.insert((pkt.chunk_x, pkt.chunk_z));
             }
         }
     }

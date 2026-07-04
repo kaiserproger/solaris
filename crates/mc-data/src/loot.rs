@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, visit_json_files};
 
 const BUILTIN_SURVIVAL_LOOT: &str = include_str!("../data/survival_loot.json");
 
@@ -147,50 +147,29 @@ fn load_vanilla_kind(dir: &Path) -> Result<BTreeMap<Identifier, LootDrop>, LootE
     }
 
     let mut paths = Vec::new();
-    collect_json_files(dir, &mut paths)?;
+    visit_json_files(
+        dir,
+        &mut |path| {
+            paths.push(path);
+            Ok(())
+        },
+        &|path, source| LootError::Io { path, source },
+    )?;
     paths.sort();
 
     let mut drops = BTreeMap::new();
     for path in paths {
         let source = id_from_file(dir, &path)?;
-        let bytes = std::fs::read_to_string(&path).map_err(|source| LootError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        let value: serde_json::Value =
-            serde_json::from_str(&bytes).map_err(|source| LootError::Malformed {
-                path: path.clone(),
-                source,
-            })?;
+        let value: serde_json::Value = read_json_file(
+            &path,
+            &|path, source| LootError::Io { path, source },
+            &|path, source| LootError::Malformed { path, source },
+        )?;
         if let Some(drop) = simple_drop_from_table(&path, &value)? {
             drops.insert(source, drop);
         }
     }
     Ok(drops)
-}
-
-fn collect_json_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), LootError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| LootError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| LootError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry.file_type().map_err(|source| LootError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if ty.is_dir() {
-            collect_json_files(&path, paths)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            paths.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn id_from_file(root: &Path, path: &Path) -> Result<Identifier, LootError> {

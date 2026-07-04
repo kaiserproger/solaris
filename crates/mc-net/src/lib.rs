@@ -10,10 +10,12 @@
 //! Login → Configuration → Play path arrives in M1.d / M1.e / M1.g.
 
 mod autoscale_soak;
+mod blocking;
 mod chunk_pipeline;
 mod configuration;
 mod connection;
 mod control_plane;
+mod dirty_flush;
 mod error;
 mod lock_metrics;
 mod login;

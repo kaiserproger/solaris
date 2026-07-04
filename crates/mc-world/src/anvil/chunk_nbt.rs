@@ -1,22 +1,25 @@
 //! Anvil chunk schema ↔ [`Chunk`] translation.
 //!
 //! Decodes the chunk NBT compound vanilla 26.1 writes into a `Chunk`,
-//! and emits the same shape back. The translation is **lossy**: fields
-//! we don't model (structures, block/fluid ticks, PostProcessing,
-//! InhabitedTime, LastUpdate, DataVersion) are dropped on decode and
-//! not re-emitted. The modelled subset round-trips losslessly:
+//! and emits the supported normalized Anvil shape back. Typed fields are
+//! modelled where runtime code consumes them. Root-level fields outside
+//! the modelled set are kept in `Chunk::extras` and re-emitted on save
+//! when possible. The modelled subset round-trips losslessly:
 //!
 //! - block states (palette + packed indices)
 //! - biomes (palette + packed indices)
 //! - heightmaps (long-array view preserved)
-//! - block entities (re-encoded as opaque network NBT and stored in
-//!   the chunk's `block_entities` map, byte-identical on round-trip)
+//! - opaque block entities (stored in `Chunk::block_entities` and
+//!   byte-identical on round-trip); typed furnace/chest entities are
+//!   normalized through runtime models
+//! - scheduled block and fluid ticks
 //! - Status string, xPos / zPos
 //! - per-section `BlockLight` / `SkyLight` nibble arrays (decoded
-//!   into `Chunk::section_lights`; **not** re-emitted by
-//!   `chunk_to_nbt` — the on-disk light is informative for the wire
-//!   path, not load-bearing, so the encoder stays light-less to keep
-//!   the existing round-trip oracle scoped to block/biome data)
+//!   into `Chunk::section_lights` and re-emitted when present)
+//!
+//! Additionally, unmodelled root-level extras such as structures,
+//! PostProcessing, InhabitedTime, LastUpdate, and DataVersion are
+//! best-effort preserved verbatim.
 
 use std::io::Cursor;
 
@@ -57,7 +60,17 @@ pub fn chunk_to_payload_with_items(
     items: Option<&ItemRegistry>,
     timestamp: u32,
 ) -> Result<ChunkPayload, ChunkNbtError> {
-    let nbt = chunk_to_nbt_with_items(chunk, registry, items)?;
+    chunk_to_payload_with_items_at_tick(chunk, registry, items, timestamp, 0)
+}
+
+pub fn chunk_to_payload_with_items_at_tick(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+    timestamp: u32,
+    current_tick: u64,
+) -> Result<ChunkPayload, ChunkNbtError> {
+    let nbt = chunk_to_nbt_with_items_at_tick(chunk, registry, items, current_tick)?;
     let mut buf: Vec<u8> = Vec::with_capacity(8 * 1024);
     mc_nbt::write_named(&mut buf, "", &nbt)?;
     let local_x = chunk.pos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -491,6 +504,15 @@ pub fn chunk_to_nbt_with_items(
     registry: &BlockRegistry,
     items: Option<&ItemRegistry>,
 ) -> Result<Tag, ChunkNbtError> {
+    chunk_to_nbt_with_items_at_tick(chunk, registry, items, 0)
+}
+
+pub fn chunk_to_nbt_with_items_at_tick(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    items: Option<&ItemRegistry>,
+    current_tick: u64,
+) -> Result<Tag, ChunkNbtError> {
     let mut root: Vec<(String, Tag)> = Vec::with_capacity(8);
     root.push(("xPos".into(), Tag::Int(chunk.pos.x)));
     root.push(("zPos".into(), Tag::Int(chunk.pos.z)));
@@ -501,11 +523,17 @@ pub fn chunk_to_nbt_with_items(
     let mut sections = Vec::with_capacity(SECTION_COUNT);
     for (i, sec) in chunk.sections.iter().enumerate() {
         let y = (i as i32 + MIN_SECTION_Y) as i8;
-        let s_cmp = vec![
+        let mut s_cmp = vec![
             ("Y".into(), Tag::Byte(y)),
             ("block_states".into(), encode_block_section(sec, registry)?),
             ("biomes".into(), encode_biome_section(&chunk.biomes[i])),
         ];
+        if let Some(tag) = encode_light_layer("BlockLight", &chunk.section_lights[i].block)? {
+            s_cmp.push(("BlockLight".into(), tag));
+        }
+        if let Some(tag) = encode_light_layer("SkyLight", &chunk.section_lights[i].sky)? {
+            s_cmp.push(("SkyLight".into(), tag));
+        }
         sections.push(Tag::Compound(s_cmp));
     }
     root.push((
@@ -575,11 +603,11 @@ pub fn chunk_to_nbt_with_items(
 
     root.push((
         "block_ticks".into(),
-        encode_scheduled_block_ticks(&chunk.scheduled_block_ticks, 0)?,
+        encode_scheduled_block_ticks(&chunk.scheduled_block_ticks, current_tick)?,
     ));
     root.push((
         "fluid_ticks".into(),
-        encode_scheduled_fluid_ticks(&chunk.scheduled_fluid_ticks, 0)?,
+        encode_scheduled_fluid_ticks(&chunk.scheduled_fluid_ticks, current_tick)?,
     ));
 
     // M5.c.2: re-emit every root-level field decode kept in
@@ -594,6 +622,25 @@ pub fn chunk_to_nbt_with_items(
     }
 
     Ok(Tag::Compound(root))
+}
+
+fn encode_light_layer(
+    field: &'static str,
+    layer: &Option<Vec<u8>>,
+) -> Result<Option<Tag>, ChunkNbtError> {
+    let Some(layer) = layer else {
+        return Ok(None);
+    };
+    if layer.len() != LIGHT_LAYER_BYTES {
+        return Err(ChunkNbtError::LightLengthMismatch {
+            field,
+            expected: LIGHT_LAYER_BYTES,
+            got: layer.len(),
+        });
+    }
+    Ok(Some(Tag::ByteArray(
+        layer.iter().copied().map(|byte| byte as i8).collect(),
+    )))
 }
 
 fn encode_scheduled_block_ticks(
@@ -1916,6 +1963,72 @@ mod tests {
         assert_eq!(sky[0x7F], 0x7F);
         assert_eq!(sky[0x80], 0x80);
         assert_eq!(sky[0xFF], 0xFF);
+    }
+
+    #[test]
+    fn encodes_per_section_light_arrays_when_present() {
+        let registry = tiny_registry();
+        let pattern = nibble_pattern();
+        let expected: Vec<u8> = pattern.iter().map(|&byte| byte as u8).collect();
+        let mut chunk = Chunk::empty(
+            ChunkPos { x: 0, z: 0 },
+            BlockStateId(0),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        chunk.section_lights[0].block = Some(expected.clone());
+        chunk.section_lights[0].sky = Some(expected.clone());
+        chunk.section_lights[4].sky = Some(expected.clone());
+
+        let root = chunk_to_nbt(&chunk, &registry).expect("encode");
+        let sections = get_optional_list(expect_compound(&root, "root").unwrap(), "sections")
+            .unwrap()
+            .unwrap();
+
+        let first = expect_compound(&sections.elements[0], "sections[0]").unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .find(|(key, _)| key == "BlockLight")
+                .map(|(_, tag)| tag),
+            Some(&Tag::ByteArray(pattern.clone()))
+        );
+        assert_eq!(
+            first
+                .iter()
+                .find(|(key, _)| key == "SkyLight")
+                .map(|(_, tag)| tag),
+            Some(&Tag::ByteArray(pattern.clone()))
+        );
+        let second = expect_compound(&sections.elements[1], "sections[1]").unwrap();
+        assert!(
+            second
+                .iter()
+                .all(|(key, _)| key != "BlockLight" && key != "SkyLight")
+        );
+        let y_zero = expect_compound(&sections.elements[4], "sections[4]").unwrap();
+        assert!(y_zero.iter().all(|(key, _)| key != "BlockLight"));
+        assert_eq!(
+            y_zero
+                .iter()
+                .find(|(key, _)| key == "SkyLight")
+                .map(|(_, tag)| tag),
+            Some(&Tag::ByteArray(pattern))
+        );
+
+        let decoded = chunk_from_nbt(&root, &registry).expect("decode encoded light");
+        assert_eq!(
+            decoded.section_lights[0].block.as_deref(),
+            Some(&expected[..])
+        );
+        assert_eq!(
+            decoded.section_lights[0].sky.as_deref(),
+            Some(&expected[..])
+        );
+        assert_eq!(decoded.section_lights[4].block, None);
+        assert_eq!(
+            decoded.section_lights[4].sky.as_deref(),
+            Some(&expected[..])
+        );
     }
 
     #[test]

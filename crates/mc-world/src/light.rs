@@ -39,7 +39,8 @@ use mc_data::block_light::BlockLightTable;
 
 use crate::block::BlockStateId;
 use crate::chunk::{
-    Chunk, ChunkPos, MAX_Y, MIN_Y, SECTION_COUNT, heightmap_value_to_world_y, top_opaque_column,
+    Chunk, ChunkPos, LIGHT_LAYER_BYTES, MAX_Y, MIN_Y, SECTION_COUNT, SectionLight,
+    heightmap_value_to_world_y, top_opaque_column,
 };
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
@@ -129,6 +130,27 @@ impl LightLayer {
         debug_assert!(section_idx < SECTION_COUNT);
         self.sections[section_idx].as_deref()
     }
+
+    fn set_section_from_slice(&mut self, section_idx: usize, bytes: &[u8]) -> bool {
+        if section_idx >= SECTION_COUNT || bytes.len() != LIGHT_LAYER_BYTES {
+            return false;
+        }
+        let nonzero_nibbles = bytes
+            .iter()
+            .map(|byte| u16::from(byte & 0x0F != 0) + u16::from(byte >> 4 != 0))
+            .sum();
+        if nonzero_nibbles == 0 {
+            self.sections[section_idx] = None;
+            self.nonzero_nibbles[section_idx] = 0;
+            return true;
+        }
+        let Ok(layer) = <[u8; LIGHT_LAYER_BYTES]>::try_from(bytes) else {
+            return false;
+        };
+        self.sections[section_idx] = Some(Box::new(layer));
+        self.nonzero_nibbles[section_idx] = nonzero_nibbles;
+        true
+    }
 }
 
 /// One chunk's worth of computed light.
@@ -154,6 +176,34 @@ impl ChunkLight {
         Self {
             sky: LightLayer::filled(sky),
             block: LightLayer::filled(block),
+        }
+    }
+
+    #[must_use]
+    pub fn from_section_lights(section_lights: &[SectionLight]) -> Option<Self> {
+        let mut out = Self::zeroed();
+        let mut any = false;
+        for (section_idx, section) in section_lights.iter().enumerate().take(SECTION_COUNT) {
+            if let Some(sky) = &section.sky {
+                if !out.sky.set_section_from_slice(section_idx, sky) {
+                    return None;
+                }
+                any = true;
+            }
+            if let Some(block) = &section.block {
+                if !out.block.set_section_from_slice(section_idx, block) {
+                    return None;
+                }
+                any = true;
+            }
+        }
+        any.then_some(out)
+    }
+
+    pub(crate) fn write_section_lights(&self, section_lights: &mut [SectionLight]) {
+        for (section_idx, section) in section_lights.iter_mut().enumerate().take(SECTION_COUNT) {
+            section.sky = self.sky.section(section_idx).map(|layer| layer.to_vec());
+            section.block = self.block.section(section_idx).map(|layer| layer.to_vec());
         }
     }
 
@@ -1356,6 +1406,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn chunk_light_can_be_rebuilt_from_baked_section_layers() {
+        let mut chunk = air_chunk();
+        let mut sky = vec![0; crate::chunk::LIGHT_LAYER_BYTES];
+        let mut block = vec![0; crate::chunk::LIGHT_LAYER_BYTES];
+        sky[0] = 0x21;
+        block[7] = 0xF0;
+        chunk.section_lights[0].sky = Some(sky.clone());
+        chunk.section_lights[2].block = Some(block.clone());
+
+        let light = ChunkLight::from_section_lights(&chunk.section_lights)
+            .expect("present baked layers should rebuild chunk light");
+
+        assert_eq!(light.sky.section(0).unwrap()[0], 0x21);
+        assert_eq!(light.block.section(2).unwrap()[7], 0xF0);
+        assert_eq!(light.sky.get(0, 0, 0), 1);
+        assert_eq!(light.sky.get(1, 0, 0), 2);
+        assert_eq!(light.block.section(0), None);
     }
 
     #[test]

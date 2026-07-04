@@ -7,6 +7,13 @@ is intentionally stricter than the earlier breadth-first milestone docs.
 M77-M99 are preparation, hardening, and evidence milestones. M100 is the
 full validation milestone. M100 must not become another feature bucket.
 
+After the 2026-06-13 static review, the operating direction is a breadth freeze:
+do not add new survival stations, mobs, or gameplay surface as the default next
+step. Prioritize the M90/M91/M94/M95/M99 class of blockers instead: ownership,
+performance, real-client evidence, vanilla oracles, soak, security, and
+persistence. New breadth is justified only when the frozen ledger marks it as a
+replacement blocker or the owner explicitly reopens scope.
+
 The per-milestone prompts live in `docs/milestones/M77.md` through
 `docs/milestones/M100.md`. This file is the high-level map; the
 per-milestone docs are the files future agents should open for concrete
@@ -896,6 +903,7 @@ Required evidence:
 - Preflight: full autonomous preflight plus port, `.analysis/test-world`,
   `.analysis/server.jar`, vanilla sidecar, branch, and dirty status.
 - Cargo baseline: `cargo fmt --all -- --check`,
+  `cargo run -p xtask -- code-health`,
   `cargo clippy --workspace --all-targets -- -D warnings`,
   `cargo test --workspace` after final change.
 - Focused harness: protocol/session, chunk streaming, block edits,

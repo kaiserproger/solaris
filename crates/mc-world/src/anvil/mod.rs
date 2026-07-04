@@ -17,7 +17,7 @@ pub mod region;
 
 pub use chunk_nbt::{
     ChunkNbtError, chunk_from_nbt, chunk_from_nbt_with_items, chunk_to_nbt, chunk_to_payload,
-    chunk_to_payload_with_items,
+    chunk_to_payload_with_items, chunk_to_payload_with_items_at_tick,
 };
 pub use region::{
     CHUNKS_PER_REGION_AXIS, ChunkPayload, CompressionType, RegionError, read_region, write_region,

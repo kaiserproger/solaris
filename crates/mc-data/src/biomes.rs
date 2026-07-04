@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, sorted_json_files, visit_json_files};
 
 const REQUIRED_BIOME_SPAWNS: &str = include_str!("../data/required_biome_spawns.json");
 
@@ -157,33 +157,18 @@ pub fn load_biome_spawn_rules(path: impl AsRef<Path>) -> Result<BiomeSpawnRules,
         return Err(BiomeDataError::Missing(path.to_path_buf()));
     }
     let mut entries = BTreeMap::new();
-    for dir_entry in std::fs::read_dir(path).map_err(|source| BiomeDataError::Io {
-        path: path.to_path_buf(),
-        source,
-    })? {
-        let dir_entry = dir_entry.map_err(|source| BiomeDataError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
-        let file_path = dir_entry.path();
-        if file_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
+    for file_path in sorted_json_files(path, &|path, source| BiomeDataError::Io { path, source })? {
         let stem = file_path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .ok_or_else(|| BiomeDataError::InvalidIdentifier(file_path.display().to_string()))?;
         let biome = Identifier::parse(format!("minecraft:{stem}"))
             .map_err(|_| BiomeDataError::InvalidIdentifier(stem.to_string()))?;
-        let bytes = std::fs::read(&file_path).map_err(|source| BiomeDataError::Io {
-            path: file_path.clone(),
-            source,
-        })?;
-        let raw: RawBiome =
-            serde_json::from_slice(&bytes).map_err(|source| BiomeDataError::Parse {
-                path: file_path.clone(),
-                source,
-            })?;
+        let raw: RawBiome = read_json_file(
+            &file_path,
+            &|path, source| BiomeDataError::Io { path, source },
+            &|path, source| BiomeDataError::Parse { path, source },
+        )?;
         let groups = raw
             .spawners
             .into_iter()
@@ -221,28 +206,16 @@ pub fn load_biome_worldgen_data(
     }
 
     let mut features_by_biome = BTreeMap::new();
-    for dir_entry in std::fs::read_dir(biome_dir).map_err(|source| BiomeDataError::Io {
-        path: biome_dir.to_path_buf(),
+    for file_path in sorted_json_files(biome_dir, &|path, source| BiomeDataError::Io {
+        path,
         source,
     })? {
-        let dir_entry = dir_entry.map_err(|source| BiomeDataError::Io {
-            path: biome_dir.to_path_buf(),
-            source,
-        })?;
-        let file_path = dir_entry.path();
-        if file_path.extension().and_then(|ext| ext.to_str()) != Some("json") {
-            continue;
-        }
         let biome = id_from_file(&file_path)?;
-        let bytes = std::fs::read(&file_path).map_err(|source| BiomeDataError::Io {
-            path: file_path.clone(),
-            source,
-        })?;
-        let raw: RawBiome =
-            serde_json::from_slice(&bytes).map_err(|source| BiomeDataError::Parse {
-                path: file_path.clone(),
-                source,
-            })?;
+        let raw: RawBiome = read_json_file(
+            &file_path,
+            &|path, source| BiomeDataError::Io { path, source },
+            &|path, source| BiomeDataError::Parse { path, source },
+        )?;
         let features = raw
             .features
             .into_iter()
@@ -305,7 +278,7 @@ fn load_biome_tags(path: &Path) -> Result<BTreeMap<Identifier, Vec<Identifier>>,
         return Ok(BTreeMap::new());
     }
     let mut raw = BTreeMap::new();
-    collect_tag_files(path, path, &mut raw)?;
+    collect_tag_files(path, &mut raw)?;
 
     let mut resolved = BTreeMap::new();
     for tag_path in raw.keys() {
@@ -321,25 +294,11 @@ fn load_biome_tags(path: &Path) -> Result<BTreeMap<Identifier, Vec<Identifier>>,
 
 fn collect_tag_files(
     root: &Path,
-    dir: &Path,
     raw: &mut BTreeMap<String, (PathBuf, RawBiomeTag)>,
 ) -> Result<(), BiomeDataError> {
-    for entry in std::fs::read_dir(dir).map_err(|source| BiomeDataError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })? {
-        let entry = entry.map_err(|source| BiomeDataError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry.file_type().map_err(|source| BiomeDataError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if ty.is_dir() {
-            collect_tag_files(root, &path, raw)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+    visit_json_files(
+        root,
+        &mut |path| {
             let rel = path
                 .strip_prefix(root)
                 .expect("walk yields paths under root")
@@ -349,19 +308,16 @@ fn collect_tag_files(
                 .map(|component| component.as_os_str().to_string_lossy())
                 .collect::<Vec<_>>()
                 .join("/");
-            let body = std::fs::read_to_string(&path).map_err(|source| BiomeDataError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            let parsed: RawBiomeTag =
-                serde_json::from_str(&body).map_err(|source| BiomeDataError::TagParse {
-                    path: path.clone(),
-                    source,
-                })?;
+            let parsed: RawBiomeTag = read_json_file(
+                &path,
+                &|path, source| BiomeDataError::Io { path, source },
+                &|path, source| BiomeDataError::TagParse { path, source },
+            )?;
             raw.insert(joined, (path, parsed));
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+        &|path, source| BiomeDataError::Io { path, source },
+    )
 }
 
 fn resolve_tag(

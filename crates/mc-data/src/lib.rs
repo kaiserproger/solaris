@@ -73,18 +73,17 @@ pub const KNOWN_REGISTRIES: &[(&str, &str)] = &[
     ("dialog", "dialog"),
     ("dimension_type", "dimension_type"),
     ("enchantment", "enchantment"),
-    ("enchantment_provider", "enchantment_provider"),
     ("frog_variant", "frog_variant"),
     ("instrument", "instrument"),
     ("jukebox_song", "jukebox_song"),
     ("painting_variant", "painting_variant"),
     ("pig_sound_variant", "pig_sound_variant"),
     ("pig_variant", "pig_variant"),
+    ("test_environment", "test_environment"),
+    ("test_instance", "test_instance"),
     ("timeline", "timeline"),
-    ("trade_set", "trade_set"),
     ("trim_material", "trim_material"),
     ("trim_pattern", "trim_pattern"),
-    ("villager_trade", "villager_trade"),
     ("wolf_sound_variant", "wolf_sound_variant"),
     ("wolf_variant", "wolf_variant"),
     ("world_clock", "world_clock"),
@@ -275,7 +274,7 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
             });
         }
         let mut entries = Vec::new();
-        collect_entries(&dir, &dir, &mut entries)?;
+        collect_entries(&dir, &mut entries)?;
         if entries.is_empty() {
             return Err(DataError::EmptyRegistry {
                 registry: (*registry_path).to_string(),
@@ -318,24 +317,59 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
     })
 }
 
-fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(), DataError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| DataError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
+pub(crate) fn visit_json_files<E>(
+    dir: &Path,
+    visitor: &mut impl FnMut(PathBuf) -> Result<(), E>,
+    io_error: &impl Fn(PathBuf, std::io::Error) -> E,
+) -> Result<(), E> {
+    let entries = std::fs::read_dir(dir).map_err(|source| io_error(dir.to_path_buf(), source))?;
     for entry in entries {
-        let entry = entry.map_err(|source| DataError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
+        let entry = entry.map_err(|source| io_error(dir.to_path_buf(), source))?;
         let path = entry.path();
-        let ty = entry.file_type().map_err(|source| DataError::Io {
-            path: path.clone(),
-            source,
-        })?;
+        let ty = entry
+            .file_type()
+            .map_err(|source| io_error(path.clone(), source))?;
         if ty.is_dir() {
-            collect_entries(root, &path, out)?;
-        } else if ty.is_file() && path.extension().is_some_and(|e| e == "json") {
+            visit_json_files(&path, visitor, io_error)?;
+        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
+            visitor(path)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sorted_json_files<E>(
+    dir: &Path,
+    io_error: &impl Fn(PathBuf, std::io::Error) -> E,
+) -> Result<Vec<PathBuf>, E> {
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(|source| io_error(dir.to_path_buf(), source))? {
+        let entry = entry.map_err(|source| io_error(dir.to_path_buf(), source))?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("json") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    Ok(paths)
+}
+
+pub(crate) fn read_json_file<T, E>(
+    path: &Path,
+    io_error: &impl Fn(PathBuf, std::io::Error) -> E,
+    parse_error: &impl Fn(PathBuf, serde_json::Error) -> E,
+) -> Result<T, E>
+where
+    T: for<'de> serde::Deserialize<'de>,
+{
+    let bytes = std::fs::read(path).map_err(|source| io_error(path.to_path_buf(), source))?;
+    serde_json::from_slice(&bytes).map_err(|source| parse_error(path.to_path_buf(), source))
+}
+
+fn collect_entries(root: &Path, out: &mut Vec<String>) -> Result<(), DataError> {
+    visit_json_files(
+        root,
+        &mut |path| {
             let rel = path
                 .strip_prefix(root)
                 .expect("recursive walk yields paths under root");
@@ -357,9 +391,10 @@ fn collect_entries(root: &Path, dir: &Path, out: &mut Vec<String>) -> Result<(),
             }
             trace!(file = %path.display(), entry = %joined, "indexed");
             out.push(joined);
-        }
-    }
-    Ok(())
+            Ok(())
+        },
+        &|path, source| DataError::Io { path, source },
+    )
 }
 
 #[cfg(test)]
@@ -414,7 +449,7 @@ mod tests {
 
         assert!(data.sidecar_root().is_none());
         assert_eq!(data.registry_count(), KNOWN_REGISTRIES.len());
-        assert!(data.entry_count() > 800);
+        assert!(data.entry_count() > 300);
         assert!(
             data.registry("minecraft:worldgen/biome")
                 .unwrap()
@@ -429,6 +464,27 @@ mod tests {
                 .iter()
                 .any(|entry| entry.as_str() == "minecraft:overworld")
         );
+        assert_eq!(
+            data.registry("minecraft:test_environment")
+                .unwrap()
+                .entries
+                .iter()
+                .map(Identifier::as_str)
+                .collect::<Vec<_>>(),
+            vec!["minecraft:default"]
+        );
+        assert_eq!(
+            data.registry("minecraft:test_instance")
+                .unwrap()
+                .entries
+                .iter()
+                .map(Identifier::as_str)
+                .collect::<Vec<_>>(),
+            vec!["minecraft:always_pass"]
+        );
+        assert!(data.registry("minecraft:enchantment_provider").is_none());
+        assert!(data.registry("minecraft:trade_set").is_none());
+        assert!(data.registry("minecraft:villager_trade").is_none());
     }
 
     #[test]
@@ -504,5 +560,10 @@ mod tests {
         );
         let biomes = data.registry("worldgen/biome").unwrap();
         assert!(biomes.entries.len() >= 30, "expected ≥ 30 vanilla biomes");
+        assert!(data.registry("test_environment").is_some());
+        assert!(data.registry("test_instance").is_some());
+        assert!(data.registry("enchantment_provider").is_none());
+        assert!(data.registry("trade_set").is_none());
+        assert!(data.registry("villager_trade").is_none());
     }
 }

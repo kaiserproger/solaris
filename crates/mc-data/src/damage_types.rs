@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::Identifier;
+use crate::{Identifier, read_json_file, visit_json_files};
 
 const REQUIRED_DAMAGE_TYPES: &str = include_str!("../data/required_damage_types.json");
 
@@ -110,7 +110,14 @@ pub fn load_damage_type_facts(
     }
 
     let mut paths = Vec::new();
-    collect_json_files(damage_type_dir, &mut paths)?;
+    visit_json_files(
+        damage_type_dir,
+        &mut |path| {
+            paths.push(path);
+            Ok(())
+        },
+        &|path, source| DamageTypesError::Io { path, source },
+    )?;
     paths.sort();
 
     let mut entries = Vec::new();
@@ -120,30 +127,6 @@ pub fn load_damage_type_facts(
         entries.push(raw.into_facts(id));
     }
     Ok(DamageTypeTable::from_entries(entries))
-}
-
-fn collect_json_files(dir: &Path, paths: &mut Vec<PathBuf>) -> Result<(), DamageTypesError> {
-    let entries = std::fs::read_dir(dir).map_err(|source| DamageTypesError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|source| DamageTypesError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let path = entry.path();
-        let ty = entry.file_type().map_err(|source| DamageTypesError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if ty.is_dir() {
-            collect_json_files(&path, paths)?;
-        } else if ty.is_file() && path.extension().is_some_and(|ext| ext == "json") {
-            paths.push(path);
-        }
-    }
-    Ok(())
 }
 
 fn id_from_path(root: &Path, path: &Path) -> Result<Identifier, DamageTypesError> {
@@ -168,14 +151,11 @@ fn id_from_path(root: &Path, path: &Path) -> Result<Identifier, DamageTypesError
 }
 
 fn load_one(path: &Path) -> Result<RawDamageType, DamageTypesError> {
-    let bytes = std::fs::read_to_string(path).map_err(|source| DamageTypesError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_str(&bytes).map_err(|source| DamageTypesError::Parse {
-        path: path.to_path_buf(),
-        source,
-    })
+    read_json_file(
+        path,
+        &|path, source| DamageTypesError::Io { path, source },
+        &|path, source| DamageTypesError::Parse { path, source },
+    )
 }
 
 #[derive(Deserialize)]

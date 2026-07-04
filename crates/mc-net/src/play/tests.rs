@@ -1,5 +1,6 @@
 use super::*;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
 use mc_data::blocks::{BlockReport, BlockStateReport};
@@ -1081,7 +1082,6 @@ fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> Interac
         shield_use: None,
         last_hostile_damage_at: None,
         last_entity_attack_at: None,
-        fluid_schedule_tick: 0,
     }
 }
 
@@ -1317,6 +1317,76 @@ fn debug_commands_parse_survival_mutations_and_give() {
     );
     assert_eq!(parse_debug_command("damage 7.5"), None);
     assert_eq!(parse_debug_command("debug survival damage bad"), None);
+}
+
+#[tokio::test]
+async fn debug_give_zero_count_clears_hotbar_slot_before_item_lookup() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(10, 1);
+    let mut writer = Vec::new();
+    let mut survival_state = SurvivalState::FULL;
+    let mut xp_state = XpState::default();
+
+    apply_debug_command(
+        &mut writer,
+        Compression::Disabled,
+        &mut survival_state,
+        &mut xp_state,
+        Some(&mut state),
+        PlayerPose::new(0.0, 64.0, 0.0),
+        DebugCommand::Give {
+            item: Identifier::parse("minecraft:air").unwrap(),
+            count: 0,
+            hotbar_slot: 0,
+        },
+        CommandPermissions { op: true },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::EMPTY
+    );
+    let packets = decode_container_set_slot_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].item_stack, ItemStack::EMPTY);
+}
+
+#[test]
+fn chest_quick_move_places_player_stack_in_first_empty_storage_slot() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: dirt,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(dirt_id, 1);
+    let mut view = ChestView {
+        chests: vec![ChestBlockEntity::default()],
+    };
+
+    assert!(apply_chest_quick_move_click(
+        &mut state,
+        &mut view,
+        SINGLE_CHEST_STORAGE_SLOTS + 27,
+    ));
+    assert_eq!(
+        furnace_slot_to_stack(&view.chests[0].slots[0]),
+        ItemStack::new(dirt_id, 1)
+    );
+    assert_eq!(
+        state.inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::EMPTY
+    );
 }
 
 #[test]
@@ -1771,6 +1841,100 @@ fn unsupported_flow_decays_to_air() {
 }
 
 #[test]
+fn removed_bucket_source_drains_own_spread_from_source_cell() {
+    let facts = fluid_test_facts();
+    let registry = Arc::new(fluid_test_registry());
+    let blocks = registry.as_ref();
+    let mut world = mc_world::WorldStorage::in_memory(Arc::clone(&registry));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let source = mc_world::BlockPos { x: 8, y: 64, z: 8 };
+    seed_fluid_test_floor(&mut world, 1..=15, source.y - 1, 1..=15);
+    world.set_block_at(source, BlockStateId(2)).unwrap();
+
+    for _ in 0..6 {
+        run_fluid_test_step(blocks, &facts, &mut world, 1..=15, source.y, 1..=15);
+    }
+
+    world.set_block_at(source, BlockStateId(0)).unwrap();
+    let mut source_refilled = false;
+    for _ in 0..16 {
+        run_fluid_test_step(blocks, &facts, &mut world, 1..=15, source.y, 1..=15);
+        let state = world.get_block(source).unwrap().unwrap();
+        if facts.fluid(state.0).is_some() {
+            source_refilled = true;
+            break;
+        }
+    }
+
+    assert!(
+        !source_refilled,
+        "removed bucket source cell must not be repopulated by its own stale flowing water"
+    );
+}
+
+fn seed_fluid_test_floor(
+    world: &mut mc_world::WorldStorage,
+    xs: std::ops::RangeInclusive<i32>,
+    y: i32,
+    zs: std::ops::RangeInclusive<i32>,
+) {
+    for x in xs {
+        for z in zs.clone() {
+            world
+                .set_block_at(mc_world::BlockPos { x, y, z }, BlockStateId(1))
+                .unwrap();
+        }
+    }
+}
+
+fn run_fluid_test_step(
+    blocks: &mc_world::BlockRegistry,
+    facts: &mc_data::block_facts::BlockFactsTable,
+    world: &mut mc_world::WorldStorage,
+    xs: std::ops::RangeInclusive<i32>,
+    y: i32,
+    zs: std::ops::RangeInclusive<i32>,
+) {
+    let mut positions = Vec::new();
+    for x in xs {
+        for z in zs.clone() {
+            let pos = mc_world::BlockPos { x, y, z };
+            if world
+                .get_block(pos)
+                .ok()
+                .flatten()
+                .is_some_and(|state| facts.fluid(state.0).is_some())
+            {
+                positions.push(pos);
+            }
+        }
+    }
+
+    let mut outcome = BlockEditBatchOutcome::default();
+    for pos in positions {
+        let Some(state) = world.get_cached_block(pos) else {
+            continue;
+        };
+        let Some(fluid) = facts.fluid(state.0) else {
+            continue;
+        };
+        for edit in fluid_tick_edits(blocks, facts, world, pos, state, fluid) {
+            apply_block_edit_to_storage(world, None, &edit, &mut outcome);
+        }
+    }
+}
+
+#[test]
 fn scheduling_fluid_edits_uses_current_tick_delay() {
     let facts = fluid_test_facts();
     let registry = Arc::new(fluid_test_registry());
@@ -1801,6 +1965,42 @@ fn scheduling_fluid_edits_uses_current_tick_delay() {
     );
 
     let ticks = world.scheduled_fluid_ticks(cpos).unwrap().unwrap();
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].pos, pos);
+    assert_eq!(ticks[0].trigger_tick, 100 + WATER_FLOW_DELAY_TICKS);
+}
+
+#[tokio::test]
+async fn interaction_fluid_scheduling_uses_shared_simulation_tick() {
+    let mut state = interaction_state_for_blocks(Arc::new(fluid_test_registry()));
+    state.block_facts = Arc::new(fluid_test_facts());
+    insert_fluid_test_chunk(&state).await;
+    state.sessions.advance_world_time(100);
+
+    let pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    {
+        let mut world = state.world.lock().await;
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+    }
+
+    schedule_fluid_ticks_for_interaction(
+        &state,
+        &[AppliedBlockEdit {
+            pos,
+            previous: BlockStateId(0),
+            new_state: BlockStateId(2),
+        }],
+    )
+    .await;
+
+    let ticks = {
+        let mut world = state.world.lock().await;
+        world
+            .scheduled_fluid_ticks(ChunkPos { x: 0, z: 0 })
+            .unwrap()
+            .unwrap()
+            .to_vec()
+    };
     assert_eq!(ticks.len(), 1);
     assert_eq!(ticks[0].pos, pos);
     assert_eq!(ticks[0].trigger_tick, 100 + WATER_FLOW_DELAY_TICKS);
@@ -2578,6 +2778,81 @@ fn crop_random_tick_advances_supported_age_crops_until_mature() {
         next_crop_growth_state(&blocks, mc_world::BlockStateId(0)),
         None
     );
+}
+
+#[test]
+fn farmland_random_tick_does_not_materialize_neighbour_chunks() {
+    struct CountingAirGenerator {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl mc_world::ChunkGenerator for CountingAirGenerator {
+        fn generate(&self, pos: ChunkPos) -> Chunk {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            let mut chunk = Chunk::empty(
+                pos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            );
+            chunk.status = "minecraft:full".into();
+            chunk.dirty = true;
+            chunk
+        }
+    }
+
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:farmland").unwrap(),
+            properties: prop_schema(&[("moisture", &["0", "1"])]),
+            states: vec![
+                state(1, true, &[("moisture", "0")]),
+                state(2, false, &[("moisture", "1")]),
+            ],
+        },
+        simple_block(3, "minecraft:water"),
+    ];
+    let registry = Arc::new(mc_world::BlockRegistry::from_report(&reports).unwrap());
+    let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
+    let generated_chunks = Arc::new(AtomicUsize::new(0));
+    let mut world = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 16)
+        .with_generator(Arc::new(CountingAirGenerator {
+            calls: Arc::clone(&generated_chunks),
+        }));
+    let cpos = ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    let edge_farmland = mc_world::BlockPos {
+        x: 15,
+        y: 64,
+        z: 15,
+    };
+    world.set_block_at(edge_farmland, BlockStateId(2)).unwrap();
+
+    assert_eq!(
+        random_tick_edit(
+            registry.as_ref(),
+            &facts,
+            &mut world,
+            edge_farmland,
+            BlockStateId(2),
+            mc_data::block_facts::RandomTickFamily::Farmland,
+        ),
+        Some(vec![BlockEdit {
+            pos: edge_farmland,
+            new_state: BlockStateId(1),
+        }])
+    );
+    assert_eq!(generated_chunks.load(Ordering::Relaxed), 0);
+    assert_eq!(world.cache_len(), 1);
 }
 
 #[test]
@@ -3576,7 +3851,6 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         shield_use: None,
         last_hostile_damage_at: None,
         last_entity_attack_at: None,
-        fluid_schedule_tick: 0,
     }
 }
 
@@ -3597,6 +3871,20 @@ fn decode_container_set_slot_packets(bytes: &[u8]) -> Vec<ClientboundContainerSe
     {
         if frame.id == ClientboundContainerSetSlot::ID {
             packets.push(ClientboundContainerSetSlot::decode(&mut frame.body).unwrap());
+        }
+    }
+    assert!(buf.is_empty());
+    packets
+}
+
+fn decode_container_set_content_packets(bytes: &[u8]) -> Vec<ClientboundContainerSetContent> {
+    let mut buf = bytes::BytesMut::from(bytes);
+    let mut packets = Vec::new();
+    while let Some(mut frame) =
+        mc_protocol::frame::try_decode_frame(&mut buf, Compression::Disabled).unwrap()
+    {
+        if frame.id == ClientboundContainerSetContent::ID {
+            packets.push(ClientboundContainerSetContent::decode(&mut frame.body).unwrap());
         }
     }
     assert!(buf.is_empty());
@@ -3652,6 +3940,101 @@ fn furnace_window_swap_and_throw_mutate_menu_slots() {
     );
 }
 
+#[tokio::test]
+async fn stale_furnace_click_after_peer_mutation_resyncs_without_mutating_storage() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let stone = Identifier::parse("minecraft:stone").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: dirt,
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: stone,
+            protocol_id: 11,
+        },
+    ]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let stone_id = items
+        .id_of(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap();
+    let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    {
+        let mut storage = state.world.lock().await;
+        let cpos = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mut furnace = FurnaceBlockEntity::default();
+        furnace.slots[0] = stack_to_furnace_slot(&ItemStack::new(dirt_id, 5));
+        storage.set_furnace_block_entity(position, furnace).unwrap();
+    }
+
+    let window = FurnaceWindow::new(position, 7, FurnaceKind::Furnace);
+    {
+        let mut storage = state.world.lock().await;
+        let mut furnace = storage
+            .furnace_block_entity(position)
+            .unwrap()
+            .expect("test furnace exists");
+        furnace.slots[0] = stack_to_furnace_slot(&ItemStack::new(stone_id, 2));
+        storage
+            .set_furnace_block_entity(position, furnace.clone())
+            .unwrap();
+        let _ = state
+            .sessions
+            .furnace_slot_dispatches(position, 99, furnace_slot_stacks(&furnace));
+    }
+
+    let mut writer = Vec::new();
+    let returned = handle_furnace_container_click(
+        &mut state,
+        &mut writer,
+        window,
+        PlayerPose::new(0.5, 65.0, 0.5),
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(returned.state_id, 2);
+    assert!(state.carried_item.is_empty());
+    {
+        let mut storage = state.world.lock().await;
+        let furnace = storage
+            .furnace_block_entity(position)
+            .unwrap()
+            .expect("test furnace exists");
+        assert_eq!(
+            furnace_slot_to_stack(&furnace.slots[0]),
+            ItemStack::new(stone_id, 2)
+        );
+    }
+    let packets = decode_container_set_content_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].state_id, 2);
+    assert_eq!(packets[0].items[0], ItemStack::new(stone_id, 2));
+    assert!(packets[0].carried_item.is_empty());
+}
+
 #[test]
 fn chest_window_swap_and_throw_mutate_storage_slots() {
     let dirt = Identifier::parse("minecraft:dirt").unwrap();
@@ -3695,6 +4078,99 @@ fn chest_window_swap_and_throw_mutate_storage_slots() {
         furnace_slot_to_stack(&view.chests[0].slots[0]),
         ItemStack::new(stone_id, 1)
     );
+}
+
+#[tokio::test]
+async fn stale_chest_click_after_peer_mutation_resyncs_without_mutating_storage() {
+    let dirt = Identifier::parse("minecraft:dirt").unwrap();
+    let stone = Identifier::parse("minecraft:stone").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: dirt,
+            protocol_id: 10,
+        },
+        ItemReport {
+            id: stone,
+            protocol_id: 11,
+        },
+    ]));
+    let mut state = interaction_state_for_items(Arc::clone(&items));
+    let dirt_id = items
+        .id_of(&Identifier::parse("minecraft:dirt").unwrap())
+        .unwrap();
+    let stone_id = items
+        .id_of(&Identifier::parse("minecraft:stone").unwrap())
+        .unwrap();
+    let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    {
+        let mut storage = state.world.lock().await;
+        let cpos = ChunkPos { x: 0, z: 0 };
+        storage
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = stack_to_furnace_slot(&ItemStack::new(dirt_id, 5));
+        storage.set_chest_block_entity(position, chest).unwrap();
+    }
+
+    let window = ChestWindow::new(vec![position], 7);
+    {
+        let mut storage = state.world.lock().await;
+        let mut chest = storage
+            .chest_block_entity(position)
+            .unwrap()
+            .expect("test chest exists");
+        chest.slots[0] = stack_to_furnace_slot(&ItemStack::new(stone_id, 2));
+        storage.set_chest_block_entity(position, chest).unwrap();
+    }
+    let _ = state
+        .sessions
+        .chest_slot_dispatches(position, 99, vec![ItemStack::new(stone_id, 2)]);
+
+    let mut writer = Vec::new();
+    let returned = handle_chest_container_click(
+        &mut state,
+        &mut writer,
+        window,
+        PlayerPose::new(0.5, 65.0, 0.5),
+        ServerboundContainerClick {
+            container_id: 7,
+            state_id: 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(returned.state_id, 2);
+    assert!(state.carried_item.is_empty());
+    {
+        let mut storage = state.world.lock().await;
+        let chest = storage
+            .chest_block_entity(position)
+            .unwrap()
+            .expect("test chest exists");
+        assert_eq!(
+            furnace_slot_to_stack(&chest.slots[0]),
+            ItemStack::new(stone_id, 2)
+        );
+    }
+    let packets = decode_container_set_content_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].state_id, 2);
+    assert_eq!(packets[0].items[0], ItemStack::new(stone_id, 2));
+    assert!(packets[0].carried_item.is_empty());
 }
 
 #[test]

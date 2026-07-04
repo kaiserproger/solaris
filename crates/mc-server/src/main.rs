@@ -1,5 +1,6 @@
 //! `mc-server` binary entry point.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -191,6 +192,15 @@ async fn serve(path: &Path) -> Result<()> {
         states = block_states,
         "embedded block registry loaded",
     );
+    let block_light_source =
+        load_effective_block_light(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
+    let block_light = Arc::new(block_light_source.table);
+    tracing::info!(
+        version = %block_light.version,
+        states = block_light.len(),
+        source = block_light_source.source,
+        "block-light table loaded",
+    );
     let structure_rules = mc_worldgen::StructureRules::none();
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let terrain_generator = build_terrain_generator(
@@ -235,6 +245,7 @@ async fn serve(path: &Path) -> Result<()> {
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
                         cfg.server.view_distance,
                         chunk_pipeline.chunk_worker_threads,
+                        Some(block_light.as_ref()),
                     )?;
                     tracing::info!("Preparing world... 95% (saving generated chunks)");
                     let flushed = storage.flush_dirty()?;
@@ -246,6 +257,28 @@ async fn serve(path: &Path) -> Result<()> {
                         flushed,
                         region_files = region_count,
                         "empty world pre-generated around spawn",
+                    );
+                } else {
+                    let warmed = warm_spawn_window(&mut storage, cfg.server.view_distance)?;
+                    let baked = bake_missing_spawn_window_light(
+                        &mut storage,
+                        block_light.as_ref(),
+                        cfg.server.view_distance,
+                        chunk_pipeline.chunk_worker_threads,
+                    )?;
+                    let flushed = if baked > 0 {
+                        tracing::info!("Preparing world... 95% (saving baked spawn light)");
+                        storage.flush_dirty()?
+                    } else {
+                        0
+                    };
+                    tracing::info!(
+                        path = %world_dir.display(),
+                        chunks = warmed,
+                        baked,
+                        flushed,
+                        view_distance = cfg.server.view_distance,
+                        "existing world spawn window warmed",
                     );
                 }
                 tracing::info!(
@@ -282,24 +315,19 @@ async fn serve(path: &Path) -> Result<()> {
         source = tag_source.source,
         "tags loaded"
     );
-    let recipes = Arc::new(mc_data::recipes::solaris_required_recipes());
-    tracing::info!(entries = recipes.len(), "embedded recipe registry loaded");
+    let recipe_source = load_effective_recipes(cfg.data.vanilla_data_dir.as_deref())?;
+    let recipes = Arc::new(recipe_source.recipes);
+    tracing::info!(
+        entries = recipes.len(),
+        source = recipe_source.source,
+        "recipe registry loaded"
+    );
     let loot_source = load_effective_loot(cfg.data.vanilla_data_dir.as_deref())?;
     let loot = Arc::new(loot_source.tables);
     tracing::info!(
         drops = loot.total_drops(),
         source = loot_source.source,
         "survival loot tables loaded"
-    );
-
-    let block_light_source =
-        load_effective_block_light(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
-    let block_light = Arc::new(block_light_source.table);
-    tracing::info!(
-        version = %block_light.version,
-        states = block_light.len(),
-        source = block_light_source.source,
-        "block-light table loaded",
     );
 
     let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
@@ -435,6 +463,7 @@ fn generate_spawn_window(
     generator: Arc<dyn mc_world::ChunkGenerator>,
     view_distance: i32,
     worker_threads: usize,
+    block_light: Option<&mc_data::block_light::BlockLightTable>,
 ) -> Result<usize> {
     let view_distance = view_distance.max(0);
     let positions = spawn_window_positions(view_distance);
@@ -524,15 +553,196 @@ fn generate_spawn_window(
         chunks_per_second,
         "empty world pre-generation finished",
     );
+    if let Some(block_light) = block_light {
+        let baked = bake_spawn_window_light(storage, block_light, view_distance, worker_threads)?;
+        tracing::info!(
+            baked,
+            elapsed_ms = started.elapsed().as_millis(),
+            "empty world startup light bake finished",
+        );
+    }
     Ok(generated)
 }
 
-fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
-    let view_distance = view_distance.max(0);
-    let width = view_distance as usize * 2 + 1;
+fn warm_spawn_window(storage: &mut mc_world::WorldStorage, view_distance: i32) -> Result<usize> {
+    let mut warmed = 0usize;
+    for pos in spawn_window_positions(view_distance) {
+        if storage
+            .get_chunk(pos)
+            .with_context(|| format!("warming spawn chunk ({}, {})", pos.x, pos.z))?
+            .is_some()
+        {
+            warmed += 1;
+        }
+    }
+    Ok(warmed)
+}
+
+fn bake_spawn_window_light(
+    storage: &mut mc_world::WorldStorage,
+    block_light: &mc_data::block_light::BlockLightTable,
+    view_distance: i32,
+    worker_threads: usize,
+) -> Result<usize> {
+    let positions = spawn_view_positions(view_distance);
+    bake_spawn_window_light_for_positions(
+        storage,
+        block_light,
+        view_distance,
+        worker_threads,
+        positions,
+    )
+}
+
+fn bake_missing_spawn_window_light(
+    storage: &mut mc_world::WorldStorage,
+    block_light: &mc_data::block_light::BlockLightTable,
+    view_distance: i32,
+    worker_threads: usize,
+) -> Result<usize> {
+    let mut missing = Vec::new();
+    for pos in spawn_view_positions(view_distance) {
+        let Some(chunk) = storage.cached_chunk_snapshot(pos) else {
+            bail!(
+                "missing warmed spawn chunk ({}, {}) while checking baked light",
+                pos.x,
+                pos.z
+            );
+        };
+        if mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights).is_none() {
+            missing.push(pos);
+        }
+    }
+    bake_spawn_window_light_for_positions(
+        storage,
+        block_light,
+        view_distance,
+        worker_threads,
+        missing,
+    )
+}
+
+fn bake_spawn_window_light_for_positions(
+    storage: &mut mc_world::WorldStorage,
+    block_light: &mc_data::block_light::BlockLightTable,
+    view_distance: i32,
+    worker_threads: usize,
+    positions: Vec<mc_world::ChunkPos>,
+) -> Result<usize> {
+    let total = positions.len();
+    if total == 0 {
+        return Ok(0);
+    }
+    let mut snapshots: HashMap<mc_world::ChunkPos, Arc<mc_world::Chunk>> = HashMap::new();
+    for pos in spawn_window_positions(view_distance) {
+        let Some(chunk) = storage.cached_chunk_snapshot(pos) else {
+            bail!(
+                "missing generated chunk ({}, {}) while baking spawn light",
+                pos.x,
+                pos.z
+            );
+        };
+        snapshots.insert(pos, chunk);
+    }
+
+    let workers = worker_threads.max(1).min(total);
+    tracing::info!(
+        chunks = total,
+        workers,
+        view_distance,
+        "spawn-window light bake started",
+    );
+
+    let positions = Arc::new(positions);
+    let snapshots = Arc::new(snapshots);
+    let next = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = std::sync::mpsc::channel::<
+        Result<Vec<(mc_world::ChunkPos, mc_world::light::ChunkLight)>>,
+    >();
+    let batch_size = 8usize.min(total);
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let positions = Arc::clone(&positions);
+            let snapshots = Arc::clone(&snapshots);
+            let next = Arc::clone(&next);
+            let tx = tx.clone();
+            scope.spawn(move || {
+                let mut workspace = mc_world::light::LightWorkspace::new();
+                let mut batch = Vec::with_capacity(batch_size);
+                loop {
+                    let idx = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&pos) = positions.get(idx) else {
+                        break;
+                    };
+                    let mut refs: [[Option<&mc_world::Chunk>; 3]; 3] = [[None; 3]; 3];
+                    for dz in -1i32..=1 {
+                        for dx in -1i32..=1 {
+                            let neighbour = mc_world::ChunkPos {
+                                x: pos.x + dx,
+                                z: pos.z + dz,
+                            };
+                            refs[(dz + 1) as usize][(dx + 1) as usize] =
+                                snapshots.get(&neighbour).map(|chunk| chunk.as_ref());
+                        }
+                    }
+                    if refs[1][1].is_none() {
+                        let _ = tx.send(Err(anyhow::anyhow!(
+                            "missing centre chunk ({}, {}) while baking spawn light",
+                            pos.x,
+                            pos.z
+                        )));
+                        return;
+                    }
+                    let light =
+                        mc_world::light::compute_chunk_light_in(&mut workspace, refs, block_light);
+                    batch.push((pos, light));
+                    if batch.len() >= batch_size && tx.send(Ok(std::mem::take(&mut batch))).is_err()
+                    {
+                        break;
+                    }
+                }
+                if !batch.is_empty() {
+                    let _ = tx.send(Ok(batch));
+                }
+            });
+        }
+        drop(tx);
+        for batch in rx {
+            for (pos, light) in batch? {
+                let Some(chunk) = storage.get_chunk_mut(pos)? else {
+                    bail!(
+                        "missing generated chunk ({}, {}) while storing baked spawn light",
+                        pos.x,
+                        pos.z
+                    );
+                };
+                chunk.set_baked_light(&light);
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    })?;
+
+    Ok(total)
+}
+
+fn spawn_view_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    let radius = view_distance.max(0);
+    let width = radius as usize * 2 + 1;
     let mut positions = Vec::with_capacity(width * width);
-    for z in -view_distance..=view_distance {
-        for x in -view_distance..=view_distance {
+    for z in -radius..=radius {
+        for x in -radius..=radius {
+            positions.push(mc_world::ChunkPos { x, z });
+        }
+    }
+    positions
+}
+
+fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    let radius = view_distance.max(0) + 1;
+    let width = radius as usize * 2 + 1;
+    let mut positions = Vec::with_capacity(width * width);
+    for z in -radius..=radius {
+        for x in -radius..=radius {
             positions.push(mc_world::ChunkPos { x, z });
         }
     }
@@ -655,6 +865,37 @@ fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootT
 
     Ok(EffectiveLootTables {
         tables: mc_data::loot::builtin().clone(),
+        source: "embedded_solaris_fallback",
+    })
+}
+
+struct EffectiveRecipes {
+    recipes: Vec<mc_data::recipes::Recipe>,
+    source: &'static str,
+}
+
+fn load_effective_recipes(vanilla_data_dir: Option<&Path>) -> Result<EffectiveRecipes> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let root = vanilla_data_dir
+            .join("data")
+            .join("minecraft")
+            .join("recipe");
+        let recipes = mc_data::recipes::load_recipes(&root)
+            .with_context(|| format!("loading vanilla recipes from {}", root.display()))?;
+        if !recipes.is_empty() {
+            return Ok(EffectiveRecipes {
+                recipes,
+                source: "vanilla_sidecar",
+            });
+        }
+        bail!(
+            "vanilla recipes from {} had no supported recipes; run tools/extract-vanilla-data.sh with recipe data",
+            root.display()
+        );
+    }
+
+    Ok(EffectiveRecipes {
+        recipes: mc_data::recipes::solaris_required_recipes(),
         source: "embedded_solaris_fallback",
     })
 }
@@ -1111,6 +1352,59 @@ mod tests {
         assert!(err.to_string().contains("no supported simple drops"));
     }
 
+    #[test]
+    fn effective_recipes_use_vanilla_sidecar_when_present() {
+        let tmp = tempfile::tempdir().unwrap();
+        let recipes = tmp.path().join("data").join("minecraft").join("recipe");
+        std::fs::create_dir_all(&recipes).unwrap();
+        std::fs::write(
+            recipes.join("oak_planks.json"),
+            r#"{
+              "type": "minecraft:crafting_shapeless",
+              "category": "building",
+              "ingredients": [{ "tag": "minecraft:oak_logs" }],
+              "result": {
+                "id": "minecraft:oak_planks",
+                "count": 4
+              }
+            }"#,
+        )
+        .unwrap();
+
+        let recipes = load_effective_recipes(Some(tmp.path())).unwrap();
+
+        assert_eq!(recipes.source, "vanilla_sidecar");
+        assert_eq!(recipes.recipes.len(), 1);
+        assert_eq!(recipes.recipes[0].id.as_str(), "minecraft:oak_planks");
+        assert_eq!(recipes.recipes[0].result.count, 4);
+    }
+
+    #[test]
+    fn effective_recipes_reject_configured_sidecar_without_supported_recipes() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let err = match load_effective_recipes(Some(tmp.path())) {
+            Ok(_) => panic!("configured vanilla recipe sidecar without recipes must fail"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("vanilla recipes"));
+        assert!(err.to_string().contains("no supported recipes"));
+    }
+
+    #[test]
+    fn effective_recipes_use_embedded_fallback_without_sidecar() {
+        let recipes = load_effective_recipes(None).unwrap();
+
+        assert_eq!(recipes.source, "embedded_solaris_fallback");
+        assert!(
+            recipes
+                .recipes
+                .iter()
+                .any(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
+        );
+    }
+
     #[tokio::test]
     async fn shutdown_sequence_requests_and_drains_before_save() {
         let shutdown = mc_net::ShutdownHandle::default();
@@ -1140,7 +1434,7 @@ mod tests {
     }
 
     #[test]
-    fn generate_spawn_window_materializes_view_square() {
+    fn generate_spawn_window_materializes_view_square_plus_light_border() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct StubGen {
@@ -1173,7 +1467,7 @@ mod tests {
             }],
         }];
         let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
-        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 16);
+        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 32);
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let generator = Arc::new(StubGen {
@@ -1182,15 +1476,163 @@ mod tests {
         });
 
         assert_eq!(
-            generate_spawn_window(&mut storage, generator, 1, 4).unwrap(),
-            9
+            generate_spawn_window(&mut storage, generator, 1, 4, None).unwrap(),
+            25
         );
-        assert_eq!(storage.cache_len(), 9);
-        assert_eq!(storage.dirty_count(), 9);
+        assert_eq!(storage.cache_len(), 25);
+        assert_eq!(storage.dirty_count(), 25);
         assert!(
             max_active.load(Ordering::SeqCst) > 1,
             "startup pre-generation should use worker threads"
         );
+    }
+
+    #[test]
+    fn generate_spawn_window_bakes_view_square_light() {
+        struct StubGen;
+
+        impl mc_world::ChunkGenerator for StubGen {
+            fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+                let air = mc_world::BlockStateId(0);
+                let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = mc_world::Chunk::empty(pos, air, biome);
+                chunk.status = "minecraft:full".into();
+                chunk.mark_dirty();
+                chunk
+            }
+        }
+
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 32);
+        let table = mc_data::block_light::BlockLightTable::from_arrays(
+            "test",
+            vec![0],
+            vec![0],
+            vec![true],
+        );
+
+        assert_eq!(
+            generate_spawn_window(&mut storage, Arc::new(StubGen), 1, 4, Some(&table)).unwrap(),
+            25
+        );
+
+        for z in -1..=1 {
+            for x in -1..=1 {
+                let chunk = storage
+                    .cached_chunk_snapshot(mc_world::ChunkPos { x, z })
+                    .expect("view-square chunk should be resident");
+                assert!(
+                    mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights)
+                        .is_some(),
+                    "view-square chunk ({x}, {z}) should carry baked startup light"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn warm_spawn_window_loads_existing_chunks_without_dirtying_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        {
+            let mut storage =
+                mc_world::WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 32)
+                    .unwrap();
+            for pos in spawn_window_positions(1) {
+                let mut chunk = mc_world::Chunk::empty(
+                    pos,
+                    mc_world::BlockStateId(0),
+                    mc_data::Identifier::parse("minecraft:plains").unwrap(),
+                );
+                chunk.mark_dirty();
+                storage.insert_generated_chunk(pos, chunk).unwrap();
+            }
+            assert_eq!(storage.flush_dirty().unwrap(), 25);
+        }
+        let mut reopened =
+            mc_world::WorldStorage::open_with_capacity(tmp.path(), registry, 32).unwrap();
+
+        assert_eq!(warm_spawn_window(&mut reopened, 1).unwrap(), 25);
+
+        assert_eq!(reopened.cache_len(), 25);
+        assert_eq!(reopened.dirty_count(), 0);
+    }
+
+    #[test]
+    fn existing_world_startup_bakes_missing_view_square_light() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        {
+            let mut storage =
+                mc_world::WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 32)
+                    .unwrap();
+            for pos in spawn_window_positions(1) {
+                let mut chunk = mc_world::Chunk::empty(
+                    pos,
+                    mc_world::BlockStateId(0),
+                    mc_data::Identifier::parse("minecraft:plains").unwrap(),
+                );
+                chunk.mark_dirty();
+                storage.insert_generated_chunk(pos, chunk).unwrap();
+            }
+            assert_eq!(storage.flush_dirty().unwrap(), 25);
+        }
+        let mut reopened =
+            mc_world::WorldStorage::open_with_capacity(tmp.path(), registry, 32).unwrap();
+        let table = mc_data::block_light::BlockLightTable::from_arrays(
+            "test",
+            vec![0],
+            vec![0],
+            vec![true],
+        );
+
+        assert_eq!(warm_spawn_window(&mut reopened, 1).unwrap(), 25);
+        assert_eq!(
+            bake_missing_spawn_window_light(&mut reopened, &table, 1, 4).unwrap(),
+            9
+        );
+
+        for pos in spawn_view_positions(1) {
+            let chunk = reopened
+                .cached_chunk_snapshot(pos)
+                .expect("view-square chunk should remain cached");
+            assert!(
+                mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights).is_some(),
+                "view-square chunk ({}, {}) should be backfilled with baked light",
+                pos.x,
+                pos.z
+            );
+        }
+        assert_eq!(reopened.dirty_count(), 9);
     }
 
     #[test]

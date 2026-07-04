@@ -336,6 +336,43 @@ async fn login_toml_ban_rejects_before_compression() {
 }
 
 #[tokio::test]
+async fn login_toml_whitelist_allows_normalized_offline_profile() {
+    let addr = start_server_from_toml(
+        r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 0
+
+            [auth]
+            online_mode = false
+            whitelist_enabled = true
+            whitelist = [" notch "]
+        "#,
+    )
+    .await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "Notch").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, SetCompression::ID);
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    let compression = Compression::Threshold(set_compression.threshold as usize);
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, LoginSuccess::ID);
+    let success = LoginSuccess::decode(&mut frame.body).unwrap();
+    assert_eq!(success.name, "Notch");
+    assert_eq!(success.uuid, mc_net::offline_uuid("Notch"));
+
+    write_frame(&mut stream, &LoginAcknowledged, compression).await;
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+}
+
+#[tokio::test]
 async fn login_does_not_break_concurrent_status() {
     let addr = start_server().await;
 

@@ -1,4 +1,7 @@
 /target/
+/.gradle/
+**/.gradle/
+**/build/
 **/*.rs.bk
 *.pdb
 

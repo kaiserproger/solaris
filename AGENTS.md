@@ -48,6 +48,7 @@ local git identity, do not change it.
   extracted test-world, protocol-dump.txt. Gitignored.
 - `data/vanilla/` — extracted vanilla data sidecar (reports +
   registries). Gitignored.
+- `x-ui-pro/` — ignored accidental nested checkout; not part of Solaris.
 - `example.toml` — the dev config; points at
   `.analysis/test-world` and the vanilla data dir.
 
@@ -56,6 +57,7 @@ local git identity, do not change it.
 Every commit must keep the following green:
 
 ```sh
+cargo run -p xtask -- code-health
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
@@ -69,6 +71,10 @@ also say which higher-level gates were run: vanilla oracle, harness,
 manual/client, performance, and concurrency. Use the labels in
 `docs/DEFINITION_OF_DONE.md`; never collapse skipped/manual-pending
 coverage into "green".
+
+`xtask code-health` is a fail-only architecture tripwire. It is part of
+the normal post-change gate, but it is not gameplay, oracle, client,
+performance, or soak evidence by itself.
 
 **Always use debug builds for dev.** Release has hung at the
 `mc-server` binary linking step in past sessions; debug is
@@ -111,14 +117,49 @@ state as `draft`, `stabilization`, or `release-ready` in the milestone
 doc and final response. Do not let a draft closeout sound like vanilla
 parity or production readiness.
 
+## Development workflow
+
+Default development mode during core readiness work is negative-code
+stabilization: reduce duplication, lock scope, fake abstraction, noisy
+tests, and unsupported claims before adding gameplay breadth.
+
+Use a bounded pipeline for non-trivial code work:
+
+1. Scout the candidate and name the exact files/symbols.
+2. Plan one independently revertible slice.
+3. Identify focused real-path tests before editing.
+4. Implement the smallest behavior-preserving diff.
+5. Run focused tests plus `cargo fmt --all -- --check` and
+   `cargo run -p xtask -- code-health`.
+6. Run a negative-code review.
+7. Run workspace `test`/`clippy` after the final slice.
+
+Do not chase an arbitrary chunk count. If the remaining candidates are
+only churn or behavior-risky without strong tests, stop and report that
+frontier. A smaller kept diff is better than sixteen forced rewrites.
+
+For risky cleanup, use one slice at a time. Keep packet-specific guards,
+protocol labels, ordering, lock boundaries, and accounting local unless
+the tests prove the extraction preserves them. If review says `REWORK`,
+fix the small issue or revert your own slice; do not stack more changes
+on top of a questionable risky diff.
+
+Subagents are useful for scouting, planning, implementation, and review,
+but the main agent remains responsible for checking their diff, rerunning
+the required gates, and reporting exact evidence. Empty subagent output is
+not a verdict.
+
 ## Fast pipeline mode
 
 If a user prompt contains the exact token `quaka-whaka-zaka-du`, switch
 to the fast parallel pipeline mode used in the June 2026 stabilization
-session: split independent domains across multiple `task()` agents, and
-have each agent run its own scout -> plan -> test -> implement -> review
--> verify loop. Parallelize implementation, validation, and review where
-file ownership can be kept separate.
+session: split independent domains across multiple `task()` agents. This
+means launching independent agents in parallel; each agent must run its
+own complete scout -> plan -> test -> review -> implement -> review ->
+verify loop inside that agent session. Do not replace this with one
+main-thread plan plus helper searches. Fast-pipeline agents must run on
+`gpt-5.5` with high reasoning. Parallelize implementation, validation,
+and review where file ownership can be kept separate.
 
 This mode increases throughput only; it does not relax repository rules.
 Still avoid protocol guesses, fake validation, hidden parity claims,
