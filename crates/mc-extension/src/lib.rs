@@ -14,15 +14,74 @@ use bytes::Bytes;
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Semantic version of the stable extension boundary contract.
+pub const EXTENSION_API_VERSION: ExtensionApiVersion = ExtensionApiVersion::new(0, 1, 0);
+
 /// Default maximum custom payload body accepted for extension forwarding.
 pub const DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES: usize = 32 * 1024;
 
+/// Version requested by an extension host or supported by the server boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtensionApiVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+
+impl ExtensionApiVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub const fn major(&self) -> u16 {
+        self.major
+    }
+
+    pub const fn minor(&self) -> u16 {
+        self.minor
+    }
+
+    pub const fn patch(&self) -> u16 {
+        self.patch
+    }
+
+    pub const fn is_supported_by(&self, host: Self) -> bool {
+        if self.major != host.major {
+            return false;
+        }
+        if self.minor < host.minor {
+            return true;
+        }
+        self.minor == host.minor && self.patch <= host.patch
+    }
+}
+
+pub const fn supports_extension_api_version(requested: ExtensionApiVersion) -> bool {
+    requested.is_supported_by(EXTENSION_API_VERSION)
+}
+
 /// Stable player/session identifier snapshot for extension DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PlayerId(pub u64);
+#[non_exhaustive]
+pub struct PlayerId(u64);
+
+impl PlayerId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 /// Protocol phase that produced a custom payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum ProtocolPhase {
     Configuration,
     Play,
@@ -30,6 +89,7 @@ pub enum ProtocolPhase {
 
 /// Immutable inbound event snapshots visible to extension code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum InboundEvent {
     PlayerJoined {
         player_id: PlayerId,
@@ -48,6 +108,7 @@ pub enum InboundEvent {
 
 /// Bounded custom payload snapshot allowed through the extension boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CustomPayloadEvent {
     pub player_id: PlayerId,
     pub phase: ProtocolPhase,
@@ -57,6 +118,7 @@ pub struct CustomPayloadEvent {
 
 /// Outbound command requests emitted by extension code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum OutboundCommand {
     SendCustomPayload {
         player_id: PlayerId,
@@ -145,6 +207,7 @@ impl Default for CustomPayloadPolicy {
 
 /// Reason a custom payload was not forwarded to the extension boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CustomPayloadRejection {
     UnknownChannel { channel: String },
     PayloadTooLarge { len: usize, max: usize },
@@ -152,6 +215,7 @@ pub enum CustomPayloadRejection {
 
 /// Error returned when a bounded extension queue cannot accept an item.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueueError<T> {
     Full(T),
     Closed(T),
@@ -159,6 +223,7 @@ pub enum QueueError<T> {
 
 /// Error returned when a bounded extension queue has no item to receive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum QueueRecvError {
     Empty,
     Closed,
@@ -253,7 +318,7 @@ mod tests {
 
     fn joined(name: &str) -> InboundEvent {
         InboundEvent::PlayerJoined {
-            player_id: PlayerId(7),
+            player_id: PlayerId::new(7),
             username: name.to_owned(),
         }
     }
@@ -277,11 +342,11 @@ mod tests {
     fn outbound_command_queue_reports_full_without_dropping_existing_command() {
         let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
         let first = OutboundCommand::DisconnectPlayer {
-            player_id: PlayerId(9),
+            player_id: PlayerId::new(9),
             reason: "first".to_owned(),
         };
         let second = OutboundCommand::DisconnectPlayer {
-            player_id: PlayerId(9),
+            player_id: PlayerId::new(9),
             reason: "second".to_owned(),
         };
 
@@ -327,7 +392,12 @@ mod tests {
         let policy = CustomPayloadPolicy::new(16, ["solaris:allowed".to_owned()]);
 
         assert_eq!(
-            policy.build_event(PlayerId(1), ProtocolPhase::Play, "other:channel", b"small",),
+            policy.build_event(
+                PlayerId::new(1),
+                ProtocolPhase::Play,
+                "other:channel",
+                b"small",
+            ),
             Err(CustomPayloadRejection::UnknownChannel {
                 channel: "other:channel".to_owned()
             })
@@ -340,7 +410,7 @@ mod tests {
 
         assert_eq!(
             policy.build_event(
-                PlayerId(1),
+                PlayerId::new(1),
                 ProtocolPhase::Configuration,
                 "solaris:allowed",
                 b"12345",
@@ -354,12 +424,36 @@ mod tests {
         let policy = CustomPayloadPolicy::new(4, ["solaris:allowed".to_owned()]);
 
         let event = policy
-            .build_event(PlayerId(2), ProtocolPhase::Play, "solaris:allowed", b"1234")
+            .build_event(
+                PlayerId::new(2),
+                ProtocolPhase::Play,
+                "solaris:allowed",
+                b"1234",
+            )
             .unwrap();
 
-        assert_eq!(event.player_id, PlayerId(2));
+        assert_eq!(event.player_id, PlayerId::new(2));
+        assert_eq!(event.player_id.value(), 2);
         assert_eq!(event.phase, ProtocolPhase::Play);
         assert_eq!(event.channel, "solaris:allowed");
         assert_eq!(event.payload, Bytes::from_static(b"1234"));
+    }
+
+    #[test]
+    fn extension_api_version_accepts_current_and_older_minor_only() {
+        assert_eq!(EXTENSION_API_VERSION, ExtensionApiVersion::new(0, 1, 0));
+        assert!(supports_extension_api_version(EXTENSION_API_VERSION));
+        assert!(supports_extension_api_version(ExtensionApiVersion::new(
+            0, 0, 0
+        )));
+        assert!(!supports_extension_api_version(ExtensionApiVersion::new(
+            0, 1, 1
+        )));
+        assert!(!supports_extension_api_version(ExtensionApiVersion::new(
+            0, 2, 0
+        )));
+        assert!(!supports_extension_api_version(ExtensionApiVersion::new(
+            1, 0, 0
+        )));
     }
 }

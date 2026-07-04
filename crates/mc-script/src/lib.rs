@@ -14,13 +14,82 @@ use std::time::Duration;
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Semantic version of the stable script API contract.
+pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 1, 0);
+
+/// Version requested by a script runtime or supported by the server host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ScriptApiVersion {
+    major: u16,
+    minor: u16,
+    patch: u16,
+}
+
+impl ScriptApiVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+
+    pub const fn major(&self) -> u16 {
+        self.major
+    }
+
+    pub const fn minor(&self) -> u16 {
+        self.minor
+    }
+
+    pub const fn patch(&self) -> u16 {
+        self.patch
+    }
+
+    pub const fn is_supported_by(&self, host: Self) -> bool {
+        if self.major != host.major {
+            return false;
+        }
+        if self.minor < host.minor {
+            return true;
+        }
+        self.minor == host.minor && self.patch <= host.patch
+    }
+}
+
+pub const fn supports_script_api_version(requested: ScriptApiVersion) -> bool {
+    requested.is_supported_by(SCRIPT_API_VERSION)
+}
+
 /// Stable player identifier snapshot for script-visible DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScriptPlayerId(pub u64);
+#[non_exhaustive]
+pub struct ScriptPlayerId(u64);
+
+impl ScriptPlayerId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 /// Stable entity identifier snapshot for script-visible DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ScriptEntityId(pub u64);
+#[non_exhaustive]
+pub struct ScriptEntityId(u64);
+
+impl ScriptEntityId {
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+}
 
 /// Immutable inbound event snapshots visible to script runtimes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +159,7 @@ impl ScriptEvent {
 
 /// Script-visible event variants.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScriptEventKind {
     ServerStarted,
     ServerStopping {
@@ -114,6 +184,7 @@ pub enum ScriptEventKind {
 
 /// Outbound command requests emitted by script code.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ScriptCommand {
     SendChatMessage {
         player_id: ScriptPlayerId,
@@ -133,6 +204,7 @@ pub enum ScriptCommand {
 
 /// Error returned when a command batch cannot accept another command.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CommandBatchError {
     Full { limit: NonZeroUsize },
 }
@@ -269,6 +341,7 @@ impl<'a> RuntimeContext<'a> {
 
 /// Error returned by a script runtime implementation.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeError {
     Trap { message: String },
     ShutdownRequested,
@@ -301,15 +374,17 @@ mod tests {
 
     #[test]
     fn event_dtos_are_stable_snapshots_without_host_handles() {
-        let event = ScriptEvent::player_joined(ScriptPlayerId(42), "kaiser");
+        let event = ScriptEvent::player_joined(ScriptPlayerId::new(42), "kaiser");
 
         assert_eq!(
             event.kind(),
             &ScriptEventKind::PlayerJoined {
-                player_id: ScriptPlayerId(42),
+                player_id: ScriptPlayerId::new(42),
                 username: "kaiser".to_owned(),
             }
         );
+        assert_eq!(ScriptPlayerId::new(42).value(), 42);
+        assert_eq!(ScriptEntityId::new(99).value(), 99);
 
         let source = include_str!("lib.rs");
         let forbidden = [
@@ -383,7 +458,7 @@ mod tests {
 
         let controls = RuntimeControls::unrestricted();
         let context = RuntimeContext::new(&controls, nonzero(1));
-        let event = ScriptEvent::player_chat(ScriptPlayerId(7), "hello");
+        let event = ScriptEvent::player_chat(ScriptPlayerId::new(7), "hello");
 
         let commands = EchoRuntime
             .handle_event(&event, context)
@@ -393,16 +468,26 @@ mod tests {
         assert_eq!(
             commands,
             vec![ScriptCommand::SendChatMessage {
-                player_id: ScriptPlayerId(7),
+                player_id: ScriptPlayerId::new(7),
                 message: "echo: hello".to_owned(),
             }]
         );
         assert_eq!(
             event.kind(),
             &ScriptEventKind::PlayerChat {
-                player_id: ScriptPlayerId(7),
+                player_id: ScriptPlayerId::new(7),
                 message: "hello".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn script_api_version_accepts_current_and_older_minor_only() {
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 1, 0));
+        assert!(supports_script_api_version(SCRIPT_API_VERSION));
+        assert!(supports_script_api_version(ScriptApiVersion::new(0, 0, 0)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 1, 1)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 2, 0)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(1, 0, 0)));
     }
 }

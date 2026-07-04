@@ -165,6 +165,8 @@ fn scan_api_leaks(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
         return;
     }
 
+    scan_api_evolution_guards(path, lines, findings);
+
     let aliases = forbidden_api_aliases(lines);
     for (index, line) in lines.iter().enumerate() {
         let trimmed = line.trim_start();
@@ -190,6 +192,92 @@ fn scan_api_leaks(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
             });
         }
     }
+}
+
+fn scan_api_evolution_guards(path: &Path, lines: &[&str], findings: &mut Vec<Finding>) {
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("pub enum ") && !has_non_exhaustive_attr(lines, index) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: index + 1,
+                message: "plugin/script API public enum missing #[non_exhaustive]".into(),
+            });
+        }
+        if public_struct_exposes_fields(lines, index) && !has_non_exhaustive_attr(lines, index) {
+            findings.push(Finding {
+                path: path.to_path_buf(),
+                line: index + 1,
+                message: "plugin/script API public field struct missing #[non_exhaustive]".into(),
+            });
+        }
+    }
+}
+
+fn has_non_exhaustive_attr(lines: &[&str], index: usize) -> bool {
+    let mut cursor = index;
+    while cursor > 0 {
+        cursor -= 1;
+        let trimmed = lines[cursor].trim();
+        if trimmed.is_empty() || trimmed.starts_with("///") || trimmed.starts_with("//!") {
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            if trimmed == "#[non_exhaustive]" {
+                return true;
+            }
+            continue;
+        }
+        break;
+    }
+    false
+}
+
+fn public_struct_exposes_fields(lines: &[&str], index: usize) -> bool {
+    let trimmed = lines[index].trim_start();
+    if !trimmed.starts_with("pub struct ") {
+        return false;
+    }
+
+    if let Some((_, tuple_tail)) = trimmed.split_once('(') {
+        if tuple_tail.trim_start().starts_with("pub ") {
+            return true;
+        }
+        if tuple_tail.contains(");") || tuple_tail.trim_end().ends_with(';') {
+            return false;
+        }
+        for line in lines.iter().skip(index + 1) {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("pub ") || trimmed.starts_with("pub(") {
+                return true;
+            }
+            if trimmed.contains(");") || trimmed.ends_with(';') {
+                break;
+            }
+        }
+        return false;
+    }
+
+    let mut saw_brace = false;
+    for (offset, line) in lines[index..].iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.contains('{') {
+            saw_brace = true;
+            if trimmed.contains("{ pub ") || trimmed.contains("{pub ") {
+                return true;
+            }
+        }
+        if saw_brace && offset > 0 && (trimmed.starts_with("pub ") || trimmed.starts_with("pub(")) {
+            return true;
+        }
+        if saw_brace && trimmed.contains('}') {
+            break;
+        }
+        if !saw_brace && trimmed.ends_with(';') {
+            break;
+        }
+    }
+    false
 }
 
 fn scan_api_manifests(root: &Path, findings: &mut Vec<Finding>) {
@@ -313,7 +401,12 @@ mod tests {
         let mut findings = Vec::new();
         scan_api_leaks(
             Path::new("crates/mc-extension/src/lib.rs"),
-            &["pub struct Api {", "pub world: WorldHandle,", "}"],
+            &[
+                "#[non_exhaustive]",
+                "pub struct Api {",
+                "pub world: WorldHandle,",
+                "}",
+            ],
             &mut findings,
         );
         scan_api_leaks(
@@ -323,7 +416,7 @@ mod tests {
         );
 
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].line, 2);
+        assert_eq!(findings[0].line, 3);
     }
 
     #[test]
@@ -391,6 +484,79 @@ mod tests {
         scan_api_manifest(
             Path::new("crates/mc-extension/Cargo.toml"),
             "[dependencies]\nbytes = { workspace = true }\n",
+            &mut findings,
+        );
+
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn api_guard_rejects_public_enums_without_non_exhaustive() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-script/src/lib.rs"),
+            &[
+                "#[derive(Debug, Clone, PartialEq, Eq)]",
+                "pub enum ScriptCommand {",
+                "    BroadcastChatMessage { message: String },",
+                "}",
+            ],
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].line, 2);
+        assert_eq!(
+            findings[0].message,
+            "plugin/script API public enum missing #[non_exhaustive]"
+        );
+    }
+
+    #[test]
+    fn api_guard_rejects_public_field_structs_without_non_exhaustive() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-extension/src/lib.rs"),
+            &[
+                "#[derive(Debug, Clone, PartialEq, Eq)]",
+                "pub struct CustomPayloadEvent {",
+                "    pub channel: String,",
+                "}",
+                "pub struct PlayerId(pub u64);",
+                "pub struct MultilineId(",
+                "    pub u64,",
+                ");",
+            ],
+            &mut findings,
+        );
+
+        assert_eq!(findings.len(), 3);
+        assert_eq!(findings[0].line, 2);
+        assert_eq!(
+            findings[0].message,
+            "plugin/script API public field struct missing #[non_exhaustive]"
+        );
+        assert_eq!(findings[1].line, 5);
+        assert_eq!(findings[2].line, 6);
+    }
+
+    #[test]
+    fn api_guard_allows_non_exhaustive_api_items() {
+        let mut findings = Vec::new();
+        scan_api_leaks(
+            Path::new("crates/mc-extension/src/lib.rs"),
+            &[
+                "#[derive(Debug, Clone, PartialEq, Eq)]",
+                "#[non_exhaustive]",
+                "pub enum InboundEvent {",
+                "    PlayerJoined,",
+                "}",
+                "#[derive(Debug, Clone, PartialEq, Eq)]",
+                "#[non_exhaustive]",
+                "pub struct CustomPayloadEvent {",
+                "    pub channel: String,",
+                "}",
+            ],
             &mut findings,
         );
 
