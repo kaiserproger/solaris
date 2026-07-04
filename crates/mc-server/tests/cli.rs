@@ -191,7 +191,11 @@ fn check_reports_vanilla_data_protocol_mismatch_warning() {
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
         vanilla_dir.path().join("version.json"),
-        r#"{"id":"26.0-test","protocol_version":999999}"#,
+        format!(
+            r#"{{"id":"{}","world_version":{},"protocol_version":999999}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::WORLD_VERSION
+        ),
     )
     .expect("write version.json");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
@@ -223,6 +227,98 @@ fn check_reports_vanilla_data_protocol_mismatch_warning() {
         .success()
         .stdout(contains("\"operator_warnings\""))
         .stdout(contains("vanilla_data_protocol_mismatch"));
+}
+
+#[test]
+fn check_reports_vanilla_data_release_mismatch_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("version.json"),
+        format!(
+            r#"{{"id":"26.0-test","world_version":{},"protocol_version":{}}}"#,
+            mc_protocol::WORLD_VERSION,
+            mc_protocol::PROTOCOL_VERSION
+        ),
+    )
+    .expect("write version.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarReleaseDrift"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_release_mismatch"))
+        .stdout(contains("vanilla_data_world_version_mismatch").not())
+        .stdout(contains("vanilla_data_protocol_mismatch").not());
+}
+
+#[test]
+fn check_reports_vanilla_data_world_version_mismatch_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("version.json"),
+        format!(
+            r#"{{"id":"{}","world_version":999999,"protocol_version":{}}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::PROTOCOL_VERSION
+        ),
+    )
+    .expect("write version.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarWorldDrift"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_world_version_mismatch"))
+        .stdout(contains("vanilla_data_release_mismatch").not())
+        .stdout(contains("vanilla_data_protocol_mismatch").not());
 }
 
 #[test]
@@ -298,12 +394,54 @@ fn check_reports_invalid_vanilla_data_version_warning() {
 }
 
 #[test]
+fn check_reports_unreadable_vanilla_data_version_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(vanilla_dir.path().join("version.json"), [0xff, 0xfe, 0xfd])
+        .expect("write version.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarUnreadableVersion"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_version_invalid"))
+        .stdout(contains("vanilla_data_version_missing").not());
+}
+
+#[test]
 fn check_reports_vanilla_data_version_without_protocol_warning() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
         vanilla_dir.path().join("version.json"),
-        r#"{"id":"26.1.2"}"#,
+        format!(
+            r#"{{"id":"{}","world_version":{}}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::WORLD_VERSION
+        ),
     )
     .expect("write version.json");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
@@ -311,6 +449,94 @@ fn check_reports_vanilla_data_version_without_protocol_warning() {
         r#"
             [server]
             name = "SidecarNoProtocol"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_version_invalid"));
+}
+
+#[test]
+fn check_reports_vanilla_data_version_without_id_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("version.json"),
+        format!(
+            r#"{{"world_version":{},"protocol_version":{}}}"#,
+            mc_protocol::WORLD_VERSION,
+            mc_protocol::PROTOCOL_VERSION
+        ),
+    )
+    .expect("write version.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarNoId"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+            vanilla_data_dir = "{}"
+        "#,
+        world_dir.path().display(),
+        vanilla_dir.path().display()
+    );
+    config_file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(config_file.path())
+        .assert()
+        .success()
+        .stdout(contains("\"operator_warnings\""))
+        .stdout(contains("vanilla_data_version_invalid"));
+}
+
+#[test]
+fn check_reports_vanilla_data_version_without_world_version_warning() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    std::fs::write(
+        vanilla_dir.path().join("version.json"),
+        format!(
+            r#"{{"id":"{}","protocol_version":{}}}"#,
+            mc_protocol::TARGET_RELEASE,
+            mc_protocol::PROTOCOL_VERSION
+        ),
+    )
+    .expect("write version.json");
+    let mut config_file = NamedTempFile::new().expect("config tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "SidecarNoWorldVersion"
             motd = "Hello"
 
             [network]

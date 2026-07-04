@@ -76,6 +76,8 @@ struct OperatorWarning {
 
 #[derive(serde::Deserialize)]
 struct VanillaVersionMetadata {
+    id: String,
+    world_version: u32,
     protocol_version: i32,
 }
 
@@ -119,6 +121,18 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                 match std::fs::read_to_string(version_path) {
                     Ok(raw) => match serde_json::from_str::<VanillaVersionMetadata>(&raw) {
                         Ok(version) => {
+                            if version.id != mc_protocol::TARGET_RELEASE {
+                                warnings.push(OperatorWarning {
+                                    code: "vanilla_data_release_mismatch",
+                                    message: "data.vanilla_data_dir version.json id does not match Solaris target release; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                                });
+                            }
+                            if version.world_version != mc_protocol::WORLD_VERSION {
+                                warnings.push(OperatorWarning {
+                                    code: "vanilla_data_world_version_mismatch",
+                                    message: "data.vanilla_data_dir version.json world_version does not match Solaris world version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                                });
+                            }
                             if version.protocol_version != mc_protocol::PROTOCOL_VERSION {
                                 warnings.push(OperatorWarning {
                                     code: "vanilla_data_protocol_mismatch",
@@ -128,12 +142,18 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                         }
                         Err(_) => warnings.push(OperatorWarning {
                             code: "vanilla_data_version_invalid",
-                            message: "data.vanilla_data_dir version.json is not valid metadata or is missing protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                            message: "data.vanilla_data_dir version.json is not readable as UTF-8, is not valid metadata, or is missing id, world_version, or protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                         }),
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        warnings.push(OperatorWarning {
+                            code: "vanilla_data_version_missing",
+                            message: "data.vanilla_data_dir is missing version.json; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        });
+                    }
                     Err(_) => warnings.push(OperatorWarning {
-                        code: "vanilla_data_version_missing",
-                        message: "data.vanilla_data_dir is missing version.json; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
+                        code: "vanilla_data_version_invalid",
+                        message: "data.vanilla_data_dir version.json is not readable as UTF-8, is not valid metadata, or is missing id, world_version, or protocol_version; rerun tools/extract-vanilla-data.sh for the target vanilla jar",
                     }),
                 }
             }
