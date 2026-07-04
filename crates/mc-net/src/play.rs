@@ -80,6 +80,7 @@ use tracing::{debug, info, warn};
 
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection::{read_frame, write_packet};
+use crate::control_plane::{autoscale_action_label, autoscale_pressure_label};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
 use crate::server::{ServerConfig, WorldHandle};
@@ -10223,25 +10224,6 @@ fn runtime_control_status_message(runtime_control: Option<&RuntimeControlHandle>
         snapshot.healthy_ticks,
         snapshot.last_decision.reason
     )
-}
-
-fn autoscale_action_label(action: crate::AutoscaleAction) -> &'static str {
-    match action {
-        crate::AutoscaleAction::Hold => "hold",
-        crate::AutoscaleAction::ScaleDown => "scale_down",
-        crate::AutoscaleAction::ScaleUp => "scale_up",
-    }
-}
-
-fn autoscale_pressure_label(pressure: Option<crate::AutoscalePressure>) -> &'static str {
-    match pressure {
-        None => "none",
-        Some(crate::AutoscalePressure::TickTime) => "tick_time",
-        Some(crate::AutoscalePressure::ChunkQueue) => "chunk_queue",
-        Some(crate::AutoscalePressure::WorkerSaturation) => "worker_saturation",
-        Some(crate::AutoscalePressure::Memory) => "memory",
-        Some(crate::AutoscalePressure::FirstChunkSla) => "first_chunk_sla",
-    }
 }
 
 async fn apply_give_command<W>(

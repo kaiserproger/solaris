@@ -104,6 +104,12 @@ async fn handshake_status_ping_round_trip() {
     assert_eq!(json["version"]["name"], TARGET_RELEASE);
     assert_eq!(json["description"]["text"], "Hello from Solaris");
     assert_eq!(json["players"]["max"], 17);
+    assert_eq!(json["solaris"]["health"]["ready"], true);
+    assert_eq!(json["solaris"]["health"]["state"], "ready");
+    assert_eq!(
+        json["solaris"]["health"]["runtime_control"]["enabled"],
+        false
+    );
 
     // 4. Ping → Pong.
     write_frame(

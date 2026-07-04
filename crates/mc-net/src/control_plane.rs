@@ -458,6 +458,25 @@ impl RuntimeControlHandle {
     }
 }
 
+pub(crate) fn autoscale_action_label(action: AutoscaleAction) -> &'static str {
+    match action {
+        AutoscaleAction::Hold => "hold",
+        AutoscaleAction::ScaleDown => "scale_down",
+        AutoscaleAction::ScaleUp => "scale_up",
+    }
+}
+
+pub(crate) fn autoscale_pressure_label(pressure: Option<AutoscalePressure>) -> &'static str {
+    match pressure {
+        None => "none",
+        Some(AutoscalePressure::TickTime) => "tick_time",
+        Some(AutoscalePressure::ChunkQueue) => "chunk_queue",
+        Some(AutoscalePressure::WorkerSaturation) => "worker_saturation",
+        Some(AutoscalePressure::Memory) => "memory",
+        Some(AutoscalePressure::FirstChunkSla) => "first_chunk_sla",
+    }
+}
+
 fn halve_floor(value: u32, floor: u32) -> u32 {
     value.saturating_sub(value / 2).max(floor)
 }

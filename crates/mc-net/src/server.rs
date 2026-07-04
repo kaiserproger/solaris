@@ -1437,7 +1437,16 @@ async fn handle_connection(
     );
 
     match handshake.next_state {
-        NextState::Status => status::handle(&mut reader, &mut writer, &mut buf, config).await,
+        NextState::Status => {
+            status::handle(
+                &mut reader,
+                &mut writer,
+                &mut buf,
+                config,
+                runtime_control.as_ref(),
+            )
+            .await
+        }
         NextState::Login | NextState::Transfer => {
             let profile = login::handle(
                 &mut reader,
