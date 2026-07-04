@@ -310,6 +310,7 @@ import sys
 from pathlib import Path
 
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+EXPECTED_OBSERVATIONS_SCHEMA = "solaris.real_client_observations.v1"
 
 
 def png_validation_error(path):
@@ -354,6 +355,15 @@ def png_validation_error(path):
 run_dir = Path(sys.argv[1])
 manifest = json.loads((run_dir / "manifest.json").read_text())
 observations = json.loads((run_dir / "observations.json").read_text())
+if not isinstance(observations, dict):
+    print("error: observations.json must be a JSON object", file=sys.stderr)
+    sys.exit(1)
+if observations.get("schema") != EXPECTED_OBSERVATIONS_SCHEMA:
+    print(
+        f"error: observations.json schema must be {EXPECTED_OBSERVATIONS_SCHEMA}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
 screenshots_dir = run_dir / "screenshots"
 screenshots_root = screenshots_dir.resolve()
 

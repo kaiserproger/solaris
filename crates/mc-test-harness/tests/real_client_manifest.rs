@@ -382,6 +382,37 @@ fn validate_run_rejects_misspelled_client_gate() {
 }
 
 #[test]
+fn validate_run_rejects_wrong_observations_schema() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v0",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": []
+        }),
+    );
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted a wrong observations schema\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("schema"),
+        "validator error should name schema\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn validate_run_rejects_unknown_observed_scenario_id() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");

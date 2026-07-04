@@ -45,22 +45,23 @@ for example a copy of `example.toml` with `data.vanilla_data_dir` enabled.
 `--run` starts Solaris, executes the configured real-client command, and writes
 the local artifact directory. It does not mark scenarios passed. After a real
 client executes the pack, fill `observations.json` with `client_gate` set to
-`agent-run real-client`, attach screenshots/logs, and run:
+`agent-run-real-client`, attach screenshots/logs, and run:
 
 ```sh
 bash tools/run-real-client-regression.sh --validate-run .analysis/real-client-runs/<run_id>
 ```
 
 Validation checks the artifact shape, fails while the observations remain
-`not-run`/prepared, requires exact `"client_gate": "agent-run-real-client"`,
-rejects observed scenario ids that are absent from the manifest, and rejects a
-passed observed scenario when its manifest requires screenshots but
-`observations.json` does not point at an existing file under `screenshots/` or
-points at a file that is not a structurally valid PNG. The runner rejects
-protocol bot/mock commands before `--run`; `--validate-run` does not
-re-authenticate a manually edited artifact directory. The in-client agent driver
-also rejects invalid captured PNG artifacts before writing a passed
-observation.
+`not-run`/prepared, requires exact
+`"schema": "solaris.real_client_observations.v1"` and
+`"client_gate": "agent-run-real-client"`, rejects observed scenario ids that
+are absent from the manifest, and rejects a passed observed scenario when its
+manifest requires screenshots but `observations.json` does not point at an
+existing file under `screenshots/` or points at a file that is not a
+structurally valid PNG. The runner rejects protocol bot/mock commands before
+`--run`; `--validate-run` does not re-authenticate a manually edited artifact
+directory. The in-client agent driver also rejects invalid captured PNG
+artifacts before writing a passed observation.
 
 ## In-Client Agent Driver
 
