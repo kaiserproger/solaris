@@ -8583,6 +8583,7 @@ where
     if outcome.applied.is_empty() {
         return Ok(());
     }
+    schedule_placed_hopper_ticks(state, &outcome).await;
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
 
     // M6.f: decrement the held stack's count + tell the client the
@@ -8620,6 +8621,34 @@ where
         .await?;
     }
     Ok(())
+}
+
+async fn schedule_placed_hopper_ticks(state: &InteractionState, outcome: &BlockEditBatchOutcome) {
+    let world_tick = state.sessions.simulation_tick();
+    let ticks = outcome
+        .applied
+        .iter()
+        .filter_map(|edit| {
+            let block_state = state.blocks.by_id(edit.new_state)?;
+            (block_state.block.id.path() == "hopper").then(|| {
+                ScheduledBlockTick::new(
+                    edit.pos,
+                    block_state.block.id.clone(),
+                    world_tick.saturating_add(HOPPER_TRANSFER_DELAY_TICKS),
+                    0,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    if ticks.is_empty() {
+        return;
+    }
+    let mut storage = state.world.lock().await;
+    for tick in ticks {
+        if let Err(err) = storage.schedule_block_tick(tick) {
+            warn!(error = %err, "placed hopper initial tick scheduling failed");
+        }
+    }
 }
 
 async fn reject_use_item_on_with_resync<W>(

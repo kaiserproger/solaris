@@ -4185,6 +4185,106 @@ async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_w
 }
 
 #[tokio::test]
+async fn placing_hopper_schedules_initial_transfer_tick() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:dirt"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["down"])]),
+                states: vec![state(2, true, &[("facing", "down")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:hopper").unwrap(),
+        protocol_id: 42,
+    }]));
+    let world = Arc::new(tokio::sync::Mutex::new(mc_world::WorldStorage::in_memory(
+        Arc::clone(&blocks),
+    )));
+    let item_to_block = ItemToBlockTable::build(&items, &blocks);
+    let mut state = InteractionState {
+        world: Arc::clone(&world),
+        blocks,
+        block_light: None,
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        water: None,
+        sessions: Arc::new(SessionRegistry::new()),
+        session_id: 1,
+        workspace: LightWorkspace::new(),
+        light_cache: LightCache::new(),
+        compression: Compression::Disabled,
+        selected_hotbar_slot: 0,
+        inventory: PlayerInventory::empty(),
+        carried_item: ItemStack::EMPTY,
+        inventory_state_id: 1,
+        items,
+        item_facts: Arc::new(ItemFactsTable::default()),
+        entity_types: Arc::new(EntityTypeRegistry::default()),
+        item_to_block,
+        tags: Arc::new(TagsData::default()),
+        recipes: Vec::new(),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        next_container_id: FURNACE_CONTAINER_ID_MIN,
+        active_container: None,
+        pending_break: None,
+        pending_use: None,
+        pending_sign_edit: None,
+        shield_use: None,
+        last_hostile_damage_at: None,
+        last_entity_attack_at: None,
+    };
+    *state.inventory.held_mut(0) = ItemStack::new(42, 1);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let clicked_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    {
+        let mut storage = world.lock().await;
+        storage
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        storage.set_block_at(clicked_pos, BlockStateId(1)).unwrap();
+    }
+    let action = test_use_item_on(pack_block_pos(clicked_pos.x, clicked_pos.y, clicked_pos.z));
+    let mut writer = tokio::io::sink();
+
+    handle_block_item_placement(
+        &mut state,
+        &mut writer,
+        PlayerPose::new(1.5, 64.0, 1.5),
+        clicked_pos,
+        &action,
+        (clicked_pos.x, clicked_pos.y, clicked_pos.z),
+    )
+    .await
+    .unwrap();
+
+    let mut storage = world.lock().await;
+    assert_eq!(storage.get_cached_block(target_pos), Some(BlockStateId(2)));
+    let scheduled = storage
+        .scheduled_block_ticks(cpos)
+        .unwrap()
+        .expect("chunk scheduled ticks");
+    assert_eq!(scheduled.len(), 1);
+    assert_eq!(scheduled[0].pos, target_pos);
+    assert_eq!(scheduled[0].trigger_tick, HOPPER_TRANSFER_DELAY_TICKS);
+    assert_eq!(
+        scheduled[0].block,
+        Identifier::parse("minecraft:hopper").unwrap()
+    );
+}
+
+#[tokio::test]
 async fn scheduled_button_tick_ignores_ticketed_chunk_until_loaded() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(
