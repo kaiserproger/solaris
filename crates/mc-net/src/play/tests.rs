@@ -5024,6 +5024,306 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
 }
 
 #[tokio::test]
+async fn scheduled_hopper_tick_does_not_extract_empty_furnace_output() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+            simple_block(3, "minecraft:furnace"),
+        ])
+        .unwrap(),
+    );
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    storage
+        .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
+        .unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        items: Arc::new(ItemRegistry::from_report(&[])),
+        tags: Arc::new(TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(50),
+        name: "EmptyFurnaceOutputLoadedViewer".to_string(),
+    };
+    let (tx, _rx) = mpsc::channel(16);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let _ = sessions.mark_loaded(session_id, (0, 0));
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 0);
+    {
+        let mut storage = world.lock().await;
+        let furnace = storage
+            .furnace_block_entity(furnace_pos)
+            .unwrap()
+            .expect("furnace");
+        let hopper = storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .expect("hopper");
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert!(furnace.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(
+            storage
+                .scheduled_block_ticks(cpos)
+                .unwrap()
+                .unwrap_or_default()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+            simple_block(3, "minecraft:furnace"),
+        ])
+        .unwrap(),
+    );
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:iron_ingot").unwrap(),
+        protocol_id: 43,
+    }]);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    let mut furnace = mc_world::FurnaceBlockEntity::default();
+    furnace.slots[2] = mc_world::FurnaceSlot {
+        count: 2,
+        item_id: 43,
+        damage: None,
+    };
+    let mut target = mc_world::ChestBlockEntity::default();
+    target.slots[0] = mc_world::FurnaceSlot {
+        count: 63,
+        item_id: 43,
+        damage: None,
+    };
+    storage
+        .set_furnace_block_entity(furnace_pos, furnace)
+        .unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage.set_chest_block_entity(target_pos, target).unwrap();
+
+    let updates = scheduled_hopper_transfer(
+        &blocks,
+        &items,
+        &TagsData::default(),
+        &[],
+        &mut storage,
+        hopper_pos,
+        BlockStateId(2),
+    )
+    .expect("transfer should apply");
+
+    assert_eq!(updates.len(), 2);
+    let furnace = storage
+        .furnace_block_entity(furnace_pos)
+        .unwrap()
+        .expect("furnace");
+    let target = storage
+        .chest_block_entity(target_pos)
+        .unwrap()
+        .expect("target chest");
+    assert_eq!(
+        furnace.slots[2],
+        mc_world::FurnaceSlot {
+            count: 1,
+            item_id: 43,
+            damage: None,
+        }
+    );
+    assert_eq!(
+        target.slots[0],
+        mc_world::FurnaceSlot {
+            count: 64,
+            item_id: 43,
+            damage: None,
+        }
+    );
+}
+
+#[test]
+fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+            simple_block(3, "minecraft:furnace"),
+        ])
+        .unwrap(),
+    );
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:iron_ingot").unwrap(),
+        protocol_id: 43,
+    }]);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    let mut furnace = mc_world::FurnaceBlockEntity::default();
+    furnace.slots[2] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 43,
+        damage: None,
+    };
+    let mut target = mc_world::ChestBlockEntity::default();
+    for slot in &mut target.slots {
+        *slot = mc_world::FurnaceSlot {
+            count: 64,
+            item_id: 43,
+            damage: None,
+        };
+    }
+    storage
+        .set_furnace_block_entity(furnace_pos, furnace)
+        .unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage.set_chest_block_entity(target_pos, target).unwrap();
+
+    assert!(
+        scheduled_hopper_transfer(
+            &blocks,
+            &items,
+            &TagsData::default(),
+            &[],
+            &mut storage,
+            hopper_pos,
+            BlockStateId(2),
+        )
+        .is_none()
+    );
+
+    let furnace = storage
+        .furnace_block_entity(furnace_pos)
+        .unwrap()
+        .expect("furnace");
+    let target = storage
+        .chest_block_entity(target_pos)
+        .unwrap()
+        .expect("target chest");
+    assert_eq!(
+        furnace.slots[2],
+        mc_world::FurnaceSlot {
+            count: 1,
+            item_id: 43,
+            damage: None,
+        }
+    );
+    assert!(target.slots.iter().all(|slot| {
+        *slot
+            == mc_world::FurnaceSlot {
+                count: 64,
+                item_id: 43,
+                damage: None,
+            }
+    }));
+}
+
+#[tokio::test]
 async fn scheduled_button_tick_ignores_ticketed_chunk_until_loaded() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(

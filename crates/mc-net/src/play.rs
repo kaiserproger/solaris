@@ -7326,14 +7326,14 @@ fn scheduled_hopper_transfer(
         };
         let source_before = source.clone();
         let target_before = target.clone();
+        if source.slots[2].is_empty() {
+            return None;
+        }
         let moving = FurnaceSlot {
             count: 1,
             item_id: source.slots[2].item_id,
             damage: source.slots[2].damage,
         };
-        if moving.is_empty() {
-            return None;
-        }
         let target_slot = target_hopper_insert_slot(&target, &moving)?;
         decrement_furnace_slot(&mut source.slots[2]);
         if target.slots[target_slot].is_empty() {
