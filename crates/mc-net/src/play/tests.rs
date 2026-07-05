@@ -4842,6 +4842,188 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
 }
 
 #[tokio::test]
+async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
+    let iron_ingot = Identifier::parse("minecraft:iron_ingot").unwrap();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+            simple_block(3, "minecraft:furnace"),
+        ])
+        .unwrap(),
+    );
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: iron_ingot,
+        protocol_id: 43,
+    }]));
+    let recipes: Arc<Vec<mc_data::recipes::Recipe>> = Arc::new(Vec::new());
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    let mut furnace = mc_world::FurnaceBlockEntity::default();
+    furnace.slots[2] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 43,
+        damage: None,
+    };
+    storage
+        .set_furnace_block_entity(furnace_pos, furnace)
+        .unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        items,
+        tags: Arc::new(TagsData::default()),
+        recipes,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let furnace_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(48),
+        name: "HopperOutputFurnaceViewer".to_string(),
+    };
+    let target_profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(49),
+        name: "HopperOutputTargetViewer".to_string(),
+    };
+    let (furnace_tx, mut furnace_rx) = mpsc::channel(16);
+    let (furnace_session_id, _) = sessions.register(
+        &furnace_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        furnace_tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let (target_tx, mut target_rx) = mpsc::channel(16);
+    let (target_session_id, _) = sessions.register(
+        &target_profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        target_tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let _ = sessions.mark_loaded(furnace_session_id, (0, 0));
+    let _ = sessions.mark_loaded(target_session_id, (0, 0));
+    assert_eq!(
+        sessions.register_furnace_viewer(furnace_session_id, furnace_pos),
+        1
+    );
+    assert_eq!(
+        sessions.register_chest_viewer(target_session_id, target_pos),
+        1
+    );
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        let furnace = storage
+            .furnace_block_entity(furnace_pos)
+            .unwrap()
+            .expect("furnace");
+        let hopper = storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .expect("hopper");
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert!(furnace.slots[0].is_empty());
+        assert!(furnace.slots[1].is_empty());
+        assert!(furnace.slots[2].is_empty());
+        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert_eq!(
+            target.slots[0],
+            mc_world::FurnaceSlot {
+                count: 1,
+                item_id: 43,
+                damage: None,
+            }
+        );
+        let scheduled = storage
+            .scheduled_block_ticks(cpos)
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 28);
+    }
+    match furnace_rx
+        .try_recv()
+        .expect("furnace viewer receives furnace slots")
+    {
+        OutboundCommand::FurnaceSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, furnace_pos);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots[0], ItemStack::EMPTY);
+            assert_eq!(slots[1], ItemStack::EMPTY);
+            assert_eq!(slots[2], ItemStack::EMPTY);
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+    match target_rx
+        .try_recv()
+        .expect("target viewer receives chest slots")
+    {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, target_pos);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots[0], ItemStack::new(43, 1));
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn scheduled_button_tick_ignores_ticketed_chunk_until_loaded() {
     let blocks = Arc::new(button_test_registry());
     let world = Arc::new(tokio::sync::Mutex::new(in_memory_button_world(Arc::clone(

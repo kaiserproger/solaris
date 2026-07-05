@@ -7213,43 +7213,129 @@ fn scheduled_hopper_transfer(
         ..pos
     };
     let target_pos = hopper_facing_target(pos, facing)?;
+    let source_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, source_pos);
+    let source_is_furnace = cached_furnace_kind(blocks, storage, source_pos).is_some();
     let target_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, target_pos);
     let target_furnace_kind = cached_furnace_kind(blocks, storage, target_pos);
-    if !cached_storage_block_is_chest_like(blocks, storage, source_pos)
+    if (!source_is_chest_like && !source_is_furnace)
         || (!target_is_chest_like && target_furnace_kind.is_none())
     {
         return None;
     }
-    let Ok(Some(mut source)) = storage.chest_block_entity(source_pos) else {
-        return None;
-    };
     let Ok(Some(hopper)) = storage.hopper_block_entity(pos) else {
         return None;
     };
     if hopper.slots.iter().any(|slot| !slot.is_empty()) {
         return None;
     }
-    let source_before = source.clone();
-
-    let source_slot = source.slots.iter().position(|slot| !slot.is_empty())?;
-    let moving = FurnaceSlot {
-        count: 1,
-        item_id: source.slots[source_slot].item_id,
-        damage: source.slots[source_slot].damage,
-    };
     let mut updates = Vec::new();
 
-    if target_is_chest_like {
+    if source_is_chest_like {
+        let Ok(Some(mut source)) = storage.chest_block_entity(source_pos) else {
+            return None;
+        };
+        let source_before = source.clone();
+        let source_slot = source.slots.iter().position(|slot| !slot.is_empty())?;
+        let moving = FurnaceSlot {
+            count: 1,
+            item_id: source.slots[source_slot].item_id,
+            damage: source.slots[source_slot].damage,
+        };
+
+        if target_is_chest_like {
+            let Ok(Some(mut target)) = storage.chest_block_entity(target_pos) else {
+                return None;
+            };
+            let target_before = target.clone();
+            let target_slot = target_hopper_insert_slot(&target, &moving)?;
+
+            decrement_furnace_slot(&mut source.slots[source_slot]);
+            if target.slots[target_slot].is_empty() {
+                target.slots[target_slot] = moving;
+            } else {
+                target.slots[target_slot].count += 1;
+            }
+
+            if !storage
+                .set_chest_block_entity(source_pos, source.clone())
+                .unwrap_or(false)
+                || !storage
+                    .set_chest_block_entity(target_pos, target.clone())
+                    .unwrap_or(false)
+            {
+                return None;
+            }
+
+            if target != target_before {
+                updates.push(HopperTransferUpdate::Chest {
+                    position: target_pos,
+                    slots: chest_slots_from_block_entity(&target),
+                });
+            }
+        } else {
+            let furnace_kind = target_furnace_kind?;
+            let Ok(Some(mut target)) = storage.furnace_block_entity(target_pos) else {
+                return None;
+            };
+            let target_before = target.clone();
+            insert_hopper_stack_into_furnace(
+                items,
+                tags,
+                recipes,
+                facing,
+                furnace_kind,
+                &mut target,
+                &moving,
+            )?;
+
+            decrement_furnace_slot(&mut source.slots[source_slot]);
+
+            if !storage
+                .set_chest_block_entity(source_pos, source.clone())
+                .unwrap_or(false)
+                || !storage
+                    .set_furnace_block_entity(target_pos, target.clone())
+                    .unwrap_or(false)
+            {
+                return None;
+            }
+
+            if target != target_before {
+                updates.push(HopperTransferUpdate::Furnace {
+                    position: target_pos,
+                    slots: furnace_slot_stacks(&target),
+                });
+            }
+        }
+
+        if source != source_before {
+            updates.push(HopperTransferUpdate::Chest {
+                position: source_pos,
+                slots: chest_slots_from_block_entity(&source),
+            });
+        }
+    } else {
+        if !target_is_chest_like {
+            return None;
+        }
+        let Ok(Some(mut source)) = storage.furnace_block_entity(source_pos) else {
+            return None;
+        };
         let Ok(Some(mut target)) = storage.chest_block_entity(target_pos) else {
             return None;
         };
+        let source_before = source.clone();
         let target_before = target.clone();
-        let target_slot = target_hopper_insert_slot(&target, &moving)?;
-
-        source.slots[source_slot].count -= 1;
-        if source.slots[source_slot].count <= 0 {
-            source.slots[source_slot] = FurnaceSlot::EMPTY;
+        let moving = FurnaceSlot {
+            count: 1,
+            item_id: source.slots[2].item_id,
+            damage: source.slots[2].damage,
+        };
+        if moving.is_empty() {
+            return None;
         }
+        let target_slot = target_hopper_insert_slot(&target, &moving)?;
+        decrement_furnace_slot(&mut source.slots[2]);
         if target.slots[target_slot].is_empty() {
             target.slots[target_slot] = moving;
         } else {
@@ -7257,7 +7343,7 @@ fn scheduled_hopper_transfer(
         }
 
         if !storage
-            .set_chest_block_entity(source_pos, source.clone())
+            .set_furnace_block_entity(source_pos, source.clone())
             .unwrap_or(false)
             || !storage
                 .set_chest_block_entity(target_pos, target.clone())
@@ -7272,50 +7358,12 @@ fn scheduled_hopper_transfer(
                 slots: chest_slots_from_block_entity(&target),
             });
         }
-    } else {
-        let furnace_kind = target_furnace_kind?;
-        let Ok(Some(mut target)) = storage.furnace_block_entity(target_pos) else {
-            return None;
-        };
-        let target_before = target.clone();
-        insert_hopper_stack_into_furnace(
-            items,
-            tags,
-            recipes,
-            facing,
-            furnace_kind,
-            &mut target,
-            &moving,
-        )?;
-
-        source.slots[source_slot].count -= 1;
-        if source.slots[source_slot].count <= 0 {
-            source.slots[source_slot] = FurnaceSlot::EMPTY;
-        }
-
-        if !storage
-            .set_chest_block_entity(source_pos, source.clone())
-            .unwrap_or(false)
-            || !storage
-                .set_furnace_block_entity(target_pos, target.clone())
-                .unwrap_or(false)
-        {
-            return None;
-        }
-
-        if target != target_before {
+        if source != source_before {
             updates.push(HopperTransferUpdate::Furnace {
-                position: target_pos,
-                slots: furnace_slot_stacks(&target),
+                position: source_pos,
+                slots: furnace_slot_stacks(&source),
             });
         }
-    }
-
-    if source != source_before {
-        updates.push(HopperTransferUpdate::Chest {
-            position: source_pos,
-            slots: chest_slots_from_block_entity(&source),
-        });
     }
     Some(updates)
 }
