@@ -3790,6 +3790,185 @@ fn interactive_toggle_helpers_preserve_other_properties() {
 }
 
 #[test]
+fn hand_toggle_respects_door_and_trapdoor_material() {
+    let blocks = Arc::new(hand_toggle_test_registry());
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let oak_lower = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let oak_upper = mc_world::BlockPos { y: 65, ..oak_lower };
+    let iron_lower = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let iron_upper = mc_world::BlockPos {
+        y: 65,
+        ..iron_lower
+    };
+    let copper_lower = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    let copper_upper = mc_world::BlockPos {
+        y: 65,
+        ..copper_lower
+    };
+    let oak_trapdoor = mc_world::BlockPos { x: 4, y: 64, z: 1 };
+    let iron_trapdoor = mc_world::BlockPos { x: 5, y: 64, z: 1 };
+    let copper_trapdoor = mc_world::BlockPos { x: 6, y: 64, z: 1 };
+
+    for (pos, state_id) in [
+        (oak_lower, 1),
+        (oak_upper, 2),
+        (iron_lower, 5),
+        (iron_upper, 6),
+        (copper_lower, 9),
+        (copper_upper, 10),
+        (oak_trapdoor, 13),
+        (iron_trapdoor, 15),
+        (copper_trapdoor, 17),
+    ] {
+        world
+            .set_block_at(pos, mc_world::BlockStateId(state_id))
+            .expect("place toggle test block");
+    }
+
+    let oak_plan =
+        plan_toggle_block_interaction(&blocks, &mut world, oak_lower, mc_world::BlockStateId(1), 0)
+            .expect("oak door should open by hand");
+    assert_eq!(
+        oak_plan.edits,
+        vec![
+            BlockEdit {
+                pos: oak_lower,
+                new_state: mc_world::BlockStateId(3),
+            },
+            BlockEdit {
+                pos: oak_upper,
+                new_state: mc_world::BlockStateId(4),
+            },
+        ]
+    );
+
+    let copper_plan = plan_toggle_block_interaction(
+        &blocks,
+        &mut world,
+        copper_lower,
+        mc_world::BlockStateId(9),
+        0,
+    )
+    .expect("copper door should open by hand");
+    assert_eq!(
+        copper_plan.edits,
+        vec![
+            BlockEdit {
+                pos: copper_lower,
+                new_state: mc_world::BlockStateId(11),
+            },
+            BlockEdit {
+                pos: copper_upper,
+                new_state: mc_world::BlockStateId(12),
+            },
+        ]
+    );
+
+    assert!(
+        plan_toggle_block_interaction(
+            &blocks,
+            &mut world,
+            iron_lower,
+            mc_world::BlockStateId(5),
+            0,
+        )
+        .is_none(),
+        "iron door must not open by hand"
+    );
+
+    let oak_trapdoor_plan = plan_toggle_block_interaction(
+        &blocks,
+        &mut world,
+        oak_trapdoor,
+        mc_world::BlockStateId(13),
+        0,
+    )
+    .expect("oak trapdoor should open by hand");
+    assert_eq!(
+        oak_trapdoor_plan.edits,
+        vec![BlockEdit {
+            pos: oak_trapdoor,
+            new_state: mc_world::BlockStateId(14),
+        }]
+    );
+
+    let copper_trapdoor_plan = plan_toggle_block_interaction(
+        &blocks,
+        &mut world,
+        copper_trapdoor,
+        mc_world::BlockStateId(17),
+        0,
+    )
+    .expect("copper trapdoor should open by hand");
+    assert_eq!(
+        copper_trapdoor_plan.edits,
+        vec![BlockEdit {
+            pos: copper_trapdoor,
+            new_state: mc_world::BlockStateId(18),
+        }]
+    );
+
+    assert!(
+        plan_toggle_block_interaction(
+            &blocks,
+            &mut world,
+            iron_trapdoor,
+            mc_world::BlockStateId(15),
+            0,
+        )
+        .is_none(),
+        "iron trapdoor must not open by hand"
+    );
+}
+
+#[test]
+fn real_door_states_plan_hand_toggle_when_sidecar_is_present() {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let blocks_json = manifest.join("../../data/vanilla/reports/blocks.json");
+    if !blocks_json.exists() {
+        eprintln!(
+            "skipping real door toggle planner test; missing {}",
+            blocks_json.display()
+        );
+        return;
+    }
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&report).expect("registry builds"));
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let lower = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let upper = mc_world::BlockPos { y: 65, ..lower };
+    let oak_lower = real_door_state(&blocks, "minecraft:oak_door", "lower", false);
+    let oak_upper = real_door_state(&blocks, "minecraft:oak_door", "upper", false);
+    let oak_open = real_door_state(&blocks, "minecraft:oak_door", "lower", true);
+    let oak_upper_open = real_door_state(&blocks, "minecraft:oak_door", "upper", true);
+    world
+        .set_block_at(lower, oak_lower)
+        .expect("set lower")
+        .expect("chunk exists");
+    world
+        .set_block_at(upper, oak_upper)
+        .expect("set upper")
+        .expect("chunk exists");
+
+    let plan = plan_toggle_block_interaction(&blocks, &mut world, lower, oak_lower, 0)
+        .expect("real oak door should hand-toggle");
+
+    assert_eq!(
+        plan.edits,
+        vec![
+            BlockEdit {
+                pos: lower,
+                new_state: oak_open,
+            },
+            BlockEdit {
+                pos: upper,
+                new_state: oak_upper_open,
+            },
+        ]
+    );
+}
+
+#[test]
 fn button_press_schedules_release_tick_without_global_scan() {
     let blocks = Arc::new(button_test_registry());
     let mut world = in_memory_button_world(Arc::clone(&blocks));
@@ -6151,6 +6330,134 @@ fn button_test_registry() -> mc_world::BlockRegistry {
         },
     ])
     .unwrap()
+}
+
+fn hand_toggle_test_registry() -> mc_world::BlockRegistry {
+    mc_world::BlockRegistry::from_report(&[
+        simple_block(0, "minecraft:air"),
+        simple_door_block(1, "minecraft:oak_door"),
+        simple_door_block(5, "minecraft:iron_door"),
+        simple_door_block(9, "minecraft:copper_door"),
+        simple_trapdoor_block(13, "minecraft:oak_trapdoor"),
+        simple_trapdoor_block(15, "minecraft:iron_trapdoor"),
+        simple_trapdoor_block(17, "minecraft:copper_trapdoor"),
+    ])
+    .unwrap()
+}
+
+fn simple_door_block(first_id: u32, name: &str) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: prop_schema(&[
+            ("facing", &["north"]),
+            ("half", &["lower", "upper"]),
+            ("open", &["false", "true"]),
+            ("powered", &["false"]),
+        ]),
+        states: vec![
+            state(
+                first_id,
+                true,
+                &[
+                    ("facing", "north"),
+                    ("half", "lower"),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            ),
+            state(
+                first_id + 1,
+                false,
+                &[
+                    ("facing", "north"),
+                    ("half", "upper"),
+                    ("open", "false"),
+                    ("powered", "false"),
+                ],
+            ),
+            state(
+                first_id + 2,
+                false,
+                &[
+                    ("facing", "north"),
+                    ("half", "lower"),
+                    ("open", "true"),
+                    ("powered", "false"),
+                ],
+            ),
+            state(
+                first_id + 3,
+                false,
+                &[
+                    ("facing", "north"),
+                    ("half", "upper"),
+                    ("open", "true"),
+                    ("powered", "false"),
+                ],
+            ),
+        ],
+    }
+}
+
+fn simple_trapdoor_block(first_id: u32, name: &str) -> BlockReport {
+    BlockReport {
+        id: Identifier::parse(name).unwrap(),
+        properties: prop_schema(&[
+            ("facing", &["north"]),
+            ("half", &["bottom"]),
+            ("open", &["false", "true"]),
+            ("powered", &["false"]),
+            ("waterlogged", &["false"]),
+        ]),
+        states: vec![
+            state(
+                first_id,
+                true,
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("open", "false"),
+                    ("powered", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+            state(
+                first_id + 1,
+                false,
+                &[
+                    ("facing", "north"),
+                    ("half", "bottom"),
+                    ("open", "true"),
+                    ("powered", "false"),
+                    ("waterlogged", "false"),
+                ],
+            ),
+        ],
+    }
+}
+
+fn real_door_state(
+    blocks: &mc_world::BlockRegistry,
+    id: &str,
+    half: &str,
+    open: bool,
+) -> mc_world::BlockStateId {
+    let id = Identifier::parse(id).expect("static door identifier");
+    blocks
+        .by_name_and_props(
+            &id,
+            &[
+                ("facing".to_string(), "north".to_string()),
+                ("half".to_string(), half.to_string()),
+                ("hinge".to_string(), "left".to_string()),
+                (
+                    "open".to_string(),
+                    if open { "true" } else { "false" }.to_string(),
+                ),
+                ("powered".to_string(), "false".to_string()),
+            ],
+        )
+        .expect("real door state")
 }
 
 fn in_memory_button_world(registry: Arc<mc_world::BlockRegistry>) -> mc_world::WorldStorage {

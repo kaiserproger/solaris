@@ -7191,11 +7191,14 @@ fn plan_toggle_block_interaction(
     world_tick: u64,
 ) -> Option<ToggleBlockPlan> {
     let state = blocks.by_id(state_id)?;
-    if state.block.id.path().ends_with("_door") && block_state_property(state, "half").is_some() {
+    let path = state.block.id.path();
+    if is_hand_openable_door(path) && block_state_property(state, "half").is_some() {
         return plan_door_toggle_edits(blocks, storage, pos, state)
             .map(|edits| ToggleBlockPlan { edits });
     }
-    if let Some(open) = toggled_bool_state(blocks, state, "open") {
+    if is_hand_openable_single_block(path)
+        && let Some(open) = toggled_bool_state(blocks, state, "open")
+    {
         return Some(ToggleBlockPlan {
             edits: vec![BlockEdit {
                 pos,
@@ -7203,7 +7206,6 @@ fn plan_toggle_block_interaction(
             }],
         });
     }
-    let path = state.block.id.path();
     if path.ends_with("_button") {
         return plan_power_control_interaction(blocks, storage, pos, state, true, world_tick);
     }
@@ -7243,6 +7245,14 @@ fn plan_power_control_interaction(
         }
     }
     Some(ToggleBlockPlan { edits })
+}
+
+fn is_hand_openable_door(path: &str) -> bool {
+    path.ends_with("_door") && path != "iron_door"
+}
+
+fn is_hand_openable_single_block(path: &str) -> bool {
+    (path.ends_with("_trapdoor") && path != "iron_trapdoor") || path.ends_with("_fence_gate")
 }
 
 fn scheduled_block_tick_edits(
