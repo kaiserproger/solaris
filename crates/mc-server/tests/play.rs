@@ -16,10 +16,13 @@
 //! check, not a vanilla-client compatibility test.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_extension::{
+    DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, PlayerId, ProtocolPhase, QueueRecvError,
+};
 use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::codec::Identifier;
@@ -44,6 +47,7 @@ use tokio::net::TcpStream;
 use uuid::Uuid;
 
 const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
+const EXTENSION_CHANNEL: &str = "solaris:test";
 
 async fn start_server() -> SocketAddr {
     start_server_with_max(8).await
@@ -82,11 +86,66 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
     addr
 }
 
+async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEndpoint) {
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 extension".into(),
+        max_players: 8,
+        view_distance: 10,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
+        blocks: std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
+        recipes: std::sync::Arc::new(Vec::new()),
+        loot: std::sync::Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let (boundary, endpoint) =
+        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(1).unwrap());
+    let policy = mc_extension::CustomPayloadPolicy::new(16, [EXTENSION_CHANNEL.to_owned()]);
+    let bound = mc_net::bind_with_extension(cfg, boundary, policy)
+        .await
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    (addr, endpoint)
+}
+
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
     let framed = encode_frame(P::ID, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
+}
+
+async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match endpoint.try_recv_event() {
+                Ok(event) => return event,
+                Err(QueueRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(QueueRecvError::Closed) => panic!("extension event queue closed"),
+                Err(error) => panic!("unexpected extension queue error: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("extension event was not delivered within 2s")
 }
 
 async fn read_one_frame(
@@ -548,6 +607,76 @@ async fn play_state_ignores_oversized_custom_payload() {
 
     assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
     drop(stream);
+}
+
+#[tokio::test]
+async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
+    let (addr, endpoint) = start_server_with_extension().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPlayer").await;
+
+    let joined = recv_extension_event(&endpoint).await;
+    let InboundEvent::PlayerJoined {
+        player_id,
+        username,
+    } = joined
+    else {
+        panic!("expected PlayerJoined event, got {joined:?}");
+    };
+    assert_eq!(player_id, PlayerId::new(1));
+    assert_eq!(username, "ExtPlayer");
+
+    for _ in 0..15 {
+        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    }
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                payload: b"ok".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+    let payload = recv_extension_event(&endpoint).await;
+    let InboundEvent::CustomPayload(payload) = payload else {
+        panic!("expected CustomPayload event, got {payload:?}");
+    };
+    assert_eq!(payload.player_id, player_id);
+    assert_eq!(payload.phase, ProtocolPhase::Play);
+    assert_eq!(payload.channel, EXTENSION_CHANNEL);
+    assert_eq!(payload.payload.as_ref(), b"ok");
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Brand("solar-client".to_owned()),
+        },
+        compression,
+    )
+    .await;
+    let brand = recv_extension_event(&endpoint).await;
+    assert_eq!(
+        brand,
+        InboundEvent::ClientBrand {
+            player_id,
+            brand: "solar-client".to_owned(),
+        }
+    );
+
+    drop(stream);
+    let left = recv_extension_event(&endpoint).await;
+    assert_eq!(
+        left,
+        InboundEvent::PlayerLeft {
+            player_id,
+            reason: "disconnected".to_owned(),
+        }
+    );
 }
 
 #[tokio::test]

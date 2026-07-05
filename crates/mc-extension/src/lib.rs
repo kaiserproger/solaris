@@ -8,6 +8,7 @@
 
 use std::num::NonZeroUsize;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -248,10 +249,10 @@ impl From<TryRecvError> for QueueRecvError {
 }
 
 /// Server-owned side of the extension boundary.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ExtensionBoundary {
     event_tx: SyncSender<InboundEvent>,
-    command_rx: Receiver<OutboundCommand>,
+    command_rx: Arc<Mutex<Receiver<OutboundCommand>>>,
 }
 
 impl ExtensionBoundary {
@@ -262,7 +263,11 @@ impl ExtensionBoundary {
 
     /// Try to receive one outbound command emitted by the extension side.
     pub fn try_recv_command(&self) -> Result<OutboundCommand, QueueRecvError> {
-        self.command_rx.try_recv().map_err(QueueRecvError::from)
+        let command_rx = self
+            .command_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        command_rx.try_recv().map_err(QueueRecvError::from)
     }
 }
 
@@ -299,7 +304,7 @@ pub fn boundary_pair(
     (
         ExtensionBoundary {
             event_tx,
-            command_rx,
+            command_rx: Arc::new(Mutex::new(command_rx)),
         },
         ExtensionEndpoint {
             event_rx,
@@ -335,6 +340,19 @@ mod tests {
             Err(QueueError::Full(rejected))
         );
         assert_eq!(endpoint.try_recv_event().unwrap(), joined("first"));
+        assert_eq!(endpoint.try_recv_event(), Err(QueueRecvError::Empty));
+    }
+
+    #[test]
+    fn cloned_boundary_handles_share_the_same_event_queue() {
+        let (boundary, endpoint) = boundary_pair(nonzero(2), nonzero(1));
+        let cloned = boundary.clone();
+
+        boundary.try_enqueue_event(joined("first")).unwrap();
+        cloned.try_enqueue_event(joined("second")).unwrap();
+
+        assert_eq!(endpoint.try_recv_event().unwrap(), joined("first"));
+        assert_eq!(endpoint.try_recv_event().unwrap(), joined("second"));
         assert_eq!(endpoint.try_recv_event(), Err(QueueRecvError::Empty));
     }
 

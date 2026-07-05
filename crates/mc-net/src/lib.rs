@@ -44,7 +44,8 @@ pub use login::{LoginAccessConfig, offline_uuid};
 pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
 pub use server::{
     BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,
-    SaveAllReport, SaveAllTimings, ServerConfig, ShutdownHandle, WorldHandle, bind, run,
+    SaveAllReport, SaveAllTimings, ServerConfig, ShutdownHandle, WorldHandle, bind,
+    bind_with_extension, run,
 };
 
 /// Crate version, exposed so other crates and the binary can report it.

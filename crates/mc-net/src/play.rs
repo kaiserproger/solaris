@@ -32,7 +32,7 @@ use mc_entity::{
     EntityView, GoalState, PathingBudget, PathingProbe, PathingProbeResult, Rotation, SpawnEntity,
     Vec3,
 };
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, PlayerId, ProtocolPhase};
 use mc_nbt::{ListTag, Tag};
 use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, Identifier, ReadMc};
 use mc_protocol::frame::{Compression, encode_frame};
@@ -83,7 +83,7 @@ use crate::connection::{read_frame, write_packet};
 use crate::control_plane::{autoscale_action_label, autoscale_pressure_label};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
-use crate::server::{ServerConfig, WorldHandle};
+use crate::server::{ExtensionEventSink, ServerConfig, WorldHandle};
 use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
     RuntimeControlHandle,
@@ -347,29 +347,48 @@ impl CampfireCookingState {
 struct RegisteredSessionCleanup {
     sessions: Arc<SessionRegistry>,
     session_id: SessionId,
+    extension: Option<ExtensionEventSink>,
+    extension_player_id: PlayerId,
     active: bool,
 }
 
 impl RegisteredSessionCleanup {
-    fn new(sessions: Arc<SessionRegistry>, session_id: SessionId) -> Self {
+    fn new(
+        sessions: Arc<SessionRegistry>,
+        session_id: SessionId,
+        extension: Option<ExtensionEventSink>,
+    ) -> Self {
         Self {
             sessions,
             session_id,
+            extension,
+            extension_player_id: PlayerId::new(session_id),
             active: true,
         }
     }
 
     fn unregister(mut self) {
+        self.unregister_active();
+    }
+
+    fn unregister_active(&mut self) {
+        if !self.active {
+            return;
+        }
         self.active = false;
         dispatch_visibility_commands(self.sessions.unregister(self.session_id));
+        if let Some(extension) = self.extension.as_ref() {
+            extension.enqueue_event(InboundEvent::PlayerLeft {
+                player_id: self.extension_player_id,
+                reason: "disconnected".to_owned(),
+            });
+        }
     }
 }
 
 impl Drop for RegisteredSessionCleanup {
     fn drop(&mut self) {
-        if self.active {
-            dispatch_visibility_commands(self.sessions.unregister(self.session_id));
-        }
+        self.unregister_active();
     }
 }
 const FURNACE_MENU_TYPE_ID: i32 = 14;
@@ -650,6 +669,7 @@ pub(crate) async fn handle<R, W>(
     sessions: Arc<SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
     runtime_control: Option<RuntimeControlHandle>,
+    extension: Option<ExtensionEventSink>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -754,7 +774,15 @@ where
             return Ok(());
         }
     };
-    let session_cleanup = RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id);
+    let extension_player_id = PlayerId::new(session_id);
+    let session_cleanup =
+        RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id, extension.clone());
+    if let Some(extension) = extension.as_ref() {
+        extension.enqueue_event(InboundEvent::PlayerJoined {
+            player_id: extension_player_id,
+            username: profile.name.clone(),
+        });
+    }
 
     let permissions = config.command_permissions.permissions_for(profile);
 
@@ -1056,6 +1084,8 @@ where
             Some(Arc::clone(&player_save_state)),
             outbound_rx,
             config.view_distance,
+            extension,
+            extension_player_id,
         )
         .await
     }
@@ -1188,7 +1218,7 @@ impl ClientPreferences {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PlayCustomPayloadAction {
     Brand(String),
-    Ignored { channel: String, payload_len: usize },
+    Unknown { channel: String, payload: Bytes },
     Oversized { len: usize },
 }
 
@@ -1205,9 +1235,10 @@ fn classify_play_custom_payload(
         return Ok(PlayCustomPayloadAction::Brand(brand));
     }
 
-    Ok(PlayCustomPayloadAction::Ignored {
+    let payload = body.copy_to_bytes(body.remaining());
+    Ok(PlayCustomPayloadAction::Unknown {
         channel: channel.as_str().to_string(),
-        payload_len: body.remaining(),
+        payload,
     })
 }
 
@@ -10441,6 +10472,8 @@ async fn play_loop<R, W>(
     player_save_state: Option<Arc<Mutex<PlayerPersistedState>>>,
     mut outbound_rx: mpsc::Receiver<OutboundCommand>,
     server_view_distance: i32,
+    extension: Option<ExtensionEventSink>,
+    extension_player_id: PlayerId,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -11170,13 +11203,30 @@ where
                             if let Some(preferences) = client_preferences.as_mut() {
                                 preferences.brand = Some(brand.clone());
                             }
+                            let brand_for_event = brand.clone();
                             client_brand = Some(brand);
+                            if let Some(extension) = extension.as_ref() {
+                                extension.enqueue_event(InboundEvent::ClientBrand {
+                                    player_id: extension_player_id,
+                                    brand: brand_for_event,
+                                });
+                            }
                         }
-                        PlayCustomPayloadAction::Ignored {
-                            channel,
-                            payload_len,
-                        } => {
-                            debug!(channel = %channel, len = payload_len, "custom payload ignored");
+                        PlayCustomPayloadAction::Unknown { channel, payload } => {
+                            if let Some(extension) = extension.as_ref() {
+                                extension.enqueue_custom_payload(
+                                    extension_player_id,
+                                    ProtocolPhase::Play,
+                                    &channel,
+                                    payload.as_ref(),
+                                );
+                            } else {
+                                debug!(
+                                    channel = %channel,
+                                    len = payload.len(),
+                                    "custom payload ignored"
+                                );
+                            }
                         }
                         PlayCustomPayloadAction::Oversized { len } => {
                             warn!(

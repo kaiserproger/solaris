@@ -21,6 +21,10 @@ use mc_data::items::ItemRegistry;
 use mc_data::loot::LootTables;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
+use mc_extension::{
+    CustomPayloadPolicy, CustomPayloadRejection, ExtensionBoundary, InboundEvent, PlayerId,
+    ProtocolPhase, QueueError,
+};
 use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
@@ -241,6 +245,73 @@ pub struct BoundServer {
     chunk_pipeline_resources: ChunkPipelineResources,
     runtime_control: Option<RuntimeControlHandle>,
     sessions: Arc<play::SessionRegistry>,
+    extension: Option<ExtensionEventSink>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExtensionEventSink {
+    boundary: ExtensionBoundary,
+    custom_payload_policy: CustomPayloadPolicy,
+}
+
+impl ExtensionEventSink {
+    fn new(boundary: ExtensionBoundary, custom_payload_policy: CustomPayloadPolicy) -> Self {
+        Self {
+            boundary,
+            custom_payload_policy,
+        }
+    }
+
+    pub(crate) fn enqueue_event(&self, event: InboundEvent) {
+        match self.boundary.try_enqueue_event(event) {
+            Ok(()) => {}
+            Err(QueueError::Full(_)) => {
+                warn!("extension event queue full; dropping event");
+            }
+            Err(QueueError::Closed(_)) => {
+                warn!("extension event queue closed; dropping event");
+            }
+            Err(_) => {
+                warn!("extension event queue rejected event");
+            }
+        }
+    }
+
+    pub(crate) fn enqueue_custom_payload(
+        &self,
+        player_id: PlayerId,
+        phase: ProtocolPhase,
+        channel: &str,
+        payload: &[u8],
+    ) {
+        match self
+            .custom_payload_policy
+            .build_event(player_id, phase, channel, payload)
+        {
+            Ok(event) => self.enqueue_event(InboundEvent::CustomPayload(event)),
+            Err(CustomPayloadRejection::UnknownChannel { channel }) => {
+                debug!(channel = %channel, phase = ?phase, "extension custom payload denied by policy");
+            }
+            Err(CustomPayloadRejection::PayloadTooLarge { len, max }) => {
+                warn!(
+                    channel,
+                    phase = ?phase,
+                    len,
+                    max,
+                    "extension custom payload denied by size policy"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    channel,
+                    phase = ?phase,
+                    payload_len = payload.len(),
+                    ?error,
+                    "extension custom payload denied by policy"
+                );
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -359,6 +430,7 @@ impl BoundServer {
         let chunk_pipeline_resources = self.chunk_pipeline_resources;
         let runtime_control = self.runtime_control;
         let sessions = self.sessions;
+        let extension = self.extension;
         let shutdown = config.shutdown.clone();
         let mut connections = tokio::task::JoinSet::new();
         let entity_world_root = if let Some(world) = config.world.as_ref() {
@@ -633,9 +705,18 @@ impl BoundServer {
                     let chunk_pipeline_resources = chunk_pipeline_resources.clone();
                     let runtime_control = runtime_control.clone();
                     let sessions = Arc::clone(&sessions);
+                    let extension = extension.clone();
                     connections.spawn(async move {
                         if let Err(err) =
-                            handle_connection(socket, &config, sessions, chunk_pipeline_resources, runtime_control).await
+                            handle_connection(
+                                socket,
+                                &config,
+                                sessions,
+                                chunk_pipeline_resources,
+                                runtime_control,
+                                extension,
+                            )
+                            .await
                         {
                             match err {
                                 err if is_client_disconnect(&err) => {
@@ -1140,6 +1221,27 @@ fn is_client_disconnect(err: &ConnectionError) -> bool {
 /// Bind to `config.bind_address` and return a [`BoundServer`] ready to
 /// `.serve()`.
 pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
+    bind_internal(config, None).await
+}
+
+/// Bind with an explicit extension boundary. The default [`bind`] path keeps
+/// extension dispatch disabled.
+pub async fn bind_with_extension(
+    config: ServerConfig,
+    boundary: ExtensionBoundary,
+    custom_payload_policy: CustomPayloadPolicy,
+) -> std::io::Result<BoundServer> {
+    bind_internal(
+        config,
+        Some(ExtensionEventSink::new(boundary, custom_payload_policy)),
+    )
+    .await
+}
+
+async fn bind_internal(
+    config: ServerConfig,
+    extension: Option<ExtensionEventSink>,
+) -> std::io::Result<BoundServer> {
     validate_public_security_config(config.bind_address, &config.command_permissions)?;
     let listener = TcpListener::bind(config.bind_address).await?;
     let chunk_pipeline_resources = ChunkPipelineResources::new(config.chunk_pipeline);
@@ -1198,6 +1300,7 @@ pub async fn bind(config: ServerConfig) -> std::io::Result<BoundServer> {
         chunk_pipeline_resources,
         runtime_control,
         sessions,
+        extension,
     })
 }
 
@@ -1441,6 +1544,7 @@ async fn handle_connection(
     sessions: Arc<play::SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
     runtime_control: Option<RuntimeControlHandle>,
+    extension: Option<ExtensionEventSink>,
 ) -> Result<(), ConnectionError> {
     // Disable Nagle for low-latency interactive packets — same setting
     // vanilla uses.
@@ -1511,6 +1615,7 @@ async fn handle_connection(
                 sessions,
                 chunk_pipeline_resources,
                 runtime_control,
+                extension,
             )
             .await
         }

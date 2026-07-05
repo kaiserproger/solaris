@@ -198,6 +198,8 @@ async fn play_loop_closes_session_when_outbound_write_stalls() {
             None,
             outbound_rx,
             0,
+            None,
+            PlayerId::new(0),
         ),
     )
     .await
@@ -275,6 +277,8 @@ async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write
             None,
             outbound_rx,
             0,
+            None,
+            PlayerId::new(0),
         ),
     )
     .await
