@@ -8694,12 +8694,13 @@ async fn handle_bucket_use_on<W>(
     sequence: i32,
     clicked_pos: mc_world::BlockPos,
     direction: Direction,
+    hand: InteractionHand,
 ) -> Result<bool, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot).clone();
+    let held_slot = hand_inventory_slot(state, hand);
+    let held = state.inventory.slots[held_slot].clone();
     if held.is_empty() {
         return Ok(false);
     }
@@ -8799,26 +8800,152 @@ where
     Ok(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CauldronBucketPlan {
+    new_state: mc_world::BlockStateId,
+    replacement_item: u32,
+    replacement_max_stack: i32,
+}
+
+async fn handle_cauldron_bucket_use_on<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    game_mode: GameMode,
+    sequence: i32,
+    clicked_pos: mc_world::BlockPos,
+    hand: InteractionHand,
+) -> Result<bool, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if game_mode != GameMode::Survival {
+        return Ok(false);
+    }
+
+    let held_slot = hand_inventory_slot(state, hand);
+    let held = state.inventory.slots[held_slot].clone();
+    if held.is_empty() {
+        return Ok(false);
+    }
+
+    let clicked_state = {
+        let mut storage = state.world.lock().await;
+        match storage.get_block(clicked_pos) {
+            Ok(Some(state_id)) => state_id,
+            Ok(None) => return Ok(false),
+            Err(err) => {
+                warn!(error = %err, x = clicked_pos.x, y = clicked_pos.y, z = clicked_pos.z, "cauldron bucket target read failed");
+                return write_block_ack(writer, state.compression, sequence)
+                    .await
+                    .map(|()| true);
+            }
+        }
+    };
+    let Some(plan) = plan_cauldron_bucket_use(state, clicked_state, held.item_id) else {
+        return Ok(false);
+    };
+    let Some((inventory, changed)) = plan_bucket_replacement(
+        &state.inventory,
+        held_slot,
+        plan.replacement_item,
+        plan.replacement_max_stack,
+    ) else {
+        return Ok(false);
+    };
+
+    let edit = BlockEdit {
+        pos: clicked_pos,
+        new_state: plan.new_state,
+    };
+    let outcome = apply_player_block_edit_batch(state, writer, sequence, &[edit]).await?;
+    if outcome.applied.is_empty() {
+        return Ok(true);
+    }
+
+    state.inventory = inventory;
+    write_inventory_slot_updates(state, writer, changed).await?;
+    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
+    Ok(true)
+}
+
+fn plan_cauldron_bucket_use(
+    state: &InteractionState,
+    clicked_state: mc_world::BlockStateId,
+    held_item: u32,
+) -> Option<CauldronBucketPlan> {
+    let clicked = state.blocks.by_id(clicked_state)?;
+    match clicked.block.id.as_str() {
+        "minecraft:cauldron" => {
+            if state.item_to_block.bucket_fluid_kind(held_item) != Some(FluidKind::Water) {
+                return None;
+            }
+            Some(CauldronBucketPlan {
+                new_state: full_water_cauldron_state(&state.blocks)?,
+                replacement_item: state.item_to_block.empty_bucket_item()?,
+                replacement_max_stack: 16,
+            })
+        }
+        "minecraft:water_cauldron" => {
+            if block_state_property(clicked, "level") != Some("3")
+                || Some(held_item) != state.item_to_block.empty_bucket_item()
+            {
+                return None;
+            }
+            Some(CauldronBucketPlan {
+                new_state: empty_cauldron_state(&state.blocks)?,
+                replacement_item: state.item_to_block.filled_bucket_item(FluidKind::Water)?,
+                replacement_max_stack: 1,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn empty_cauldron_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::BlockStateId> {
+    let cauldron = Identifier::parse("minecraft:cauldron").expect("static identifier");
+    blocks.block(&cauldron).map(|block| block.default)
+}
+
+fn full_water_cauldron_state(blocks: &mc_world::BlockRegistry) -> Option<mc_world::BlockStateId> {
+    let water_cauldron = Identifier::parse("minecraft:water_cauldron").expect("static identifier");
+    blocks.by_name_and_props(&water_cauldron, &[("level".to_string(), "3".to_string())])
+}
+
 fn plan_bucket_replacement(
     inventory: &PlayerInventory,
-    held_slot: u8,
+    held_slot: usize,
     replacement_item: u32,
-    _replacement_max_stack: i32,
+    replacement_max_stack: i32,
 ) -> Option<(PlayerInventory, Vec<(usize, ItemStack)>)> {
-    let mut inventory = inventory.clone();
-    let wire_slot = PlayerInventory::HOTBAR_BASE + held_slot as usize;
-    let mut changed = Vec::new();
-    let held = inventory.held_mut(held_slot);
-    if held.count > 1 {
+    if held_slot >= inventory.slots.len() || replacement_max_stack <= 0 {
         return None;
     }
 
-    *held = ItemStack {
+    let mut inventory = inventory.clone();
+    let mut changed = Vec::new();
+    let held = &mut inventory.slots[held_slot];
+    if held.is_empty() {
+        return None;
+    }
+
+    let replacement = ItemStack {
         item_id: replacement_item,
         count: 1,
         damage: None,
     };
-    changed.push((wire_slot, held.clone()));
+    if held.count <= 1 {
+        *held = replacement;
+        changed.push((held_slot, held.clone()));
+        return Some((inventory, changed));
+    }
+
+    held.count -= 1;
+    changed.push((held_slot, held.clone()));
+    let (leftover, mut merged) = inventory.merge_stack(replacement, replacement_max_stack);
+    if !leftover.is_empty() {
+        return None;
+    }
+    changed.append(&mut merged);
     Some((inventory, changed))
 }
 
@@ -9063,6 +9190,18 @@ where
         if open_chest_container(state, writer, player_pose, action.sequence, cx, cy, cz).await? {
             return Ok(UseItemOnOutcome::Handled);
         }
+        if handle_cauldron_bucket_use_on(
+            state,
+            writer,
+            game_mode,
+            action.sequence,
+            target.clicked_pos,
+            action.hand,
+        )
+        .await?
+        {
+            return Ok(UseItemOnOutcome::Handled);
+        }
         if reject_unsupported_survival_station_use(state, writer, action.sequence, cx, cy, cz)
             .await?
         {
@@ -9088,6 +9227,19 @@ where
         }
     }
 
+    if player_pose.shifting
+        && handle_cauldron_bucket_use_on(
+            state,
+            writer,
+            game_mode,
+            action.sequence,
+            target.clicked_pos,
+            action.hand,
+        )
+        .await?
+    {
+        return Ok(UseItemOnOutcome::Handled);
+    }
     if handle_campfire_use_on(
         state,
         writer,
@@ -9107,6 +9259,7 @@ where
         action.sequence,
         target.clicked_pos,
         action.direction,
+        action.hand,
     )
     .await?
     {

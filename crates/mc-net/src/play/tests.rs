@@ -2068,7 +2068,8 @@ fn bucket_replacement_updates_single_held_stack_only() {
         },
     );
 
-    let (next, changed) = plan_bucket_replacement(&inventory, 0, 60, 16).unwrap();
+    let (next, changed) =
+        plan_bucket_replacement(&inventory, PlayerInventory::HOTBAR_BASE, 60, 16).unwrap();
 
     assert_eq!(next.held(0).item_id, 60);
     assert_eq!(next.held(0).count, 1);
@@ -2085,7 +2086,39 @@ fn bucket_replacement_updates_single_held_stack_only() {
             damage: None,
         },
     );
-    assert!(plan_bucket_replacement(&inventory, 0, 61, 1).is_none());
+    let (next, changed) =
+        plan_bucket_replacement(&inventory, PlayerInventory::HOTBAR_BASE, 61, 1).unwrap();
+    assert_eq!(next.held(0).item_id, 60);
+    assert_eq!(next.held(0).count, 1);
+    assert_eq!(next.slots[9].item_id, 61);
+    assert_eq!(next.slots[9].count, 1);
+    assert_eq!(
+        changed,
+        vec![
+            (PlayerInventory::HOTBAR_BASE, next.held(0).clone()),
+            (9, next.slots[9].clone())
+        ]
+    );
+
+    let mut full_inventory = inventory.clone();
+    for slot in 9..=44 {
+        if slot != PlayerInventory::HOTBAR_BASE {
+            full_inventory.slots[slot] = ItemStack::new(99, 64);
+        }
+    }
+    assert!(
+        plan_bucket_replacement(&full_inventory, PlayerInventory::HOTBAR_BASE, 61, 1).is_none()
+    );
+
+    inventory.slots[45] = ItemStack {
+        item_id: 60,
+        count: 1,
+        damage: None,
+    };
+    let (next, changed) = plan_bucket_replacement(&inventory, 45, 61, 1).unwrap();
+    assert_eq!(next.slots[45].item_id, 61);
+    assert_eq!(next.slots[45].count, 1);
+    assert_eq!(changed, vec![(45, next.slots[45].clone())]);
 }
 
 #[test]
