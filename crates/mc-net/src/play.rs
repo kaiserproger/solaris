@@ -133,7 +133,7 @@ use containers::{
     find_campfire_recipe_in, find_cooking_recipe_for_item, find_smelting_recipe_for_item,
     furnace_kind_for_block_id, furnace_kind_for_state, furnace_menu_title_for_state,
     furnace_menu_title_nbt, is_barrel_state, is_chest_state, is_crafting_table_state, is_fuel_item,
-    is_furnace_state, next_container_id, store_active_container,
+    is_fuel_item_id, is_furnace_state, next_container_id, store_active_container,
     unsupported_survival_station_for_state,
 };
 #[cfg(test)]
@@ -7214,11 +7214,7 @@ fn scheduled_hopper_transfer(
     };
     let target_pos = hopper_facing_target(pos, facing)?;
     let target_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, target_pos);
-    let target_furnace_kind = if facing == "down" {
-        cached_furnace_kind(blocks, storage, target_pos)
-    } else {
-        None
-    };
+    let target_furnace_kind = cached_furnace_kind(blocks, storage, target_pos);
     if !cached_storage_block_is_chest_like(blocks, storage, source_pos)
         || (!target_is_chest_like && target_furnace_kind.is_none())
     {
@@ -7282,7 +7278,15 @@ fn scheduled_hopper_transfer(
             return None;
         };
         let target_before = target.clone();
-        insert_hopper_input_into_furnace(items, tags, recipes, furnace_kind, &mut target, &moving)?;
+        insert_hopper_stack_into_furnace(
+            items,
+            tags,
+            recipes,
+            facing,
+            furnace_kind,
+            &mut target,
+            &moving,
+        )?;
 
         source.slots[source_slot].count -= 1;
         if source.slots[source_slot].count <= 0 {
@@ -7399,6 +7403,55 @@ fn insert_hopper_input_into_furnace(
         return None;
     }
     let target = &mut furnace.slots[0];
+    if target.is_empty() {
+        *target = FurnaceSlot {
+            count: 1,
+            item_id: moving.item_id,
+            damage: moving.damage,
+        };
+        Some(())
+    } else if target.item_id == moving.item_id
+        && target.damage == moving.damage
+        && target.count < HOPPER_TRANSFER_MAX_STACK
+    {
+        target.count += 1;
+        Some(())
+    } else {
+        None
+    }
+}
+
+fn insert_hopper_stack_into_furnace(
+    items: &ItemRegistry,
+    tags: &TagsData,
+    recipes: &[mc_data::recipes::Recipe],
+    facing: &str,
+    furnace_kind: FurnaceKind,
+    furnace: &mut FurnaceBlockEntity,
+    moving: &FurnaceSlot,
+) -> Option<()> {
+    if facing == "down" {
+        return insert_hopper_input_into_furnace(
+            items,
+            tags,
+            recipes,
+            furnace_kind,
+            furnace,
+            moving,
+        );
+    }
+    insert_hopper_fuel_into_furnace(items, furnace, moving)
+}
+
+fn insert_hopper_fuel_into_furnace(
+    items: &ItemRegistry,
+    furnace: &mut FurnaceBlockEntity,
+    moving: &FurnaceSlot,
+) -> Option<()> {
+    if moving.is_empty() || !is_fuel_item_id(items, moving.item_id) {
+        return None;
+    }
+    let target = &mut furnace.slots[1];
     if target.is_empty() {
         *target = FurnaceSlot {
             count: 1,

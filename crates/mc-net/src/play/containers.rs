@@ -277,12 +277,13 @@ pub(super) fn find_cooking_recipe_for_item(
 }
 
 pub(super) fn is_fuel_item(state: &InteractionState, item_id: u32) -> bool {
-    let coal = state
-        .items
-        .id_of(&Identifier::parse("minecraft:coal").expect("static identifier"));
-    let charcoal = state
-        .items
-        .id_of(&Identifier::parse("minecraft:charcoal").expect("static identifier"));
+    is_fuel_item_id(&state.items, item_id)
+}
+
+pub(super) fn is_fuel_item_id(items: &ItemRegistry, item_id: u32) -> bool {
+    let coal = items.id_of(&Identifier::parse("minecraft:coal").expect("static identifier"));
+    let charcoal =
+        items.id_of(&Identifier::parse("minecraft:charcoal").expect("static identifier"));
     Some(item_id) == coal || Some(item_id) == charcoal
 }
 
