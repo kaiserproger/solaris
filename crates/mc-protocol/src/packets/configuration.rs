@@ -96,6 +96,28 @@ impl Packet for ClientboundKnownPacks {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundCustomPayload {
+    pub payload: CustomPayload,
+}
+
+impl Packet for ClientboundCustomPayload {
+    // `.analysis/protocol-dump.txt`: configuration CLIENTBOUND_CUSTOM_PAYLOAD
+    // is clientbound registration index 1, wire id 0x01. Body is the common
+    // custom-payload codec from local decompiled sources.
+    const ID: i32 = 0x01;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.payload.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            payload: CustomPayload::decode(buf)?,
+        })
+    }
+}
+
 /// Serverbound 0x07 — client tells the server which of the advertised
 /// known packs it also has bundled.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -448,6 +470,32 @@ mod tests {
             packs: vec![sample_pack()],
         });
         round_trip(ClientboundKnownPacks { packs: vec![] });
+    }
+
+    #[test]
+    fn clientbound_custom_payload_id_and_layout_match_local_decompiled_sources() {
+        assert_eq!(ClientboundCustomPayload::ID, 0x01);
+        let packet = ClientboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("solaris:test").unwrap(),
+                payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            },
+        };
+        let mut buf = Vec::new();
+        packet.encode(&mut buf).unwrap();
+        assert_eq!(
+            buf,
+            vec![
+                0x0c, b's', b'o', b'l', b'a', b'r', b'i', b's', b':', b't', b'e', b's', b't', 0xDE,
+                0xAD, 0xBE, 0xEF,
+            ]
+        );
+        let mut cursor: &[u8] = &buf;
+        assert_eq!(
+            ClientboundCustomPayload::decode(&mut cursor).unwrap(),
+            packet
+        );
+        assert!(cursor.is_empty());
     }
 
     #[test]

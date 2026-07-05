@@ -54,6 +54,10 @@ pub(super) enum OutboundCommand {
         position: mc_world::BlockPos,
         changed: Vec<(i16, i16)>,
     },
+    CustomPayload {
+        channel: Identifier,
+        payload: Vec<u8>,
+    },
     DisconnectPlayer {
         reason: String,
     },
@@ -86,6 +90,7 @@ impl OutboundCommand {
             | Self::FurnaceSlots { .. }
             | Self::ChestSlots { .. }
             | Self::FurnaceData { .. }
+            | Self::CustomPayload { .. }
             | Self::DisconnectPlayer { .. } => OutboundLane::Reliable,
         }
     }
@@ -602,6 +607,32 @@ impl SessionRegistry {
                         tx: session.tx.clone(),
                     },
                     command: OutboundCommand::DisconnectPlayer { reason },
+                })
+        };
+        let Some(dispatch) = dispatch else {
+            return false;
+        };
+        dispatch_visibility_commands(vec![dispatch]);
+        true
+    }
+
+    pub(crate) fn send_custom_payload(
+        &self,
+        player_id: u64,
+        channel: Identifier,
+        payload: Vec<u8>,
+    ) -> bool {
+        let dispatch = {
+            let inner = self.lock_inner("extension custom payload");
+            inner
+                .sessions
+                .get(&player_id)
+                .map(|session| VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: player_id,
+                        tx: session.tx.clone(),
+                    },
+                    command: OutboundCommand::CustomPayload { channel, payload },
                 })
         };
         let Some(dispatch) = dispatch else {
@@ -4880,6 +4911,78 @@ mod tests {
             rx.recv().await,
             Some(OutboundCommand::DisconnectPlayer { reason })
                 if reason == "duplicate disconnect 0"
+        ));
+        for _ in 0..8 {
+            if registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight
+                == start.reliable_command_retries_in_flight
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_payload_retries_are_bounded_per_slow_recipient() {
+        let _guard = pressure_counter_test_lock().await;
+        let registry = SessionRegistry::new();
+        let start = registry.pressure_snapshot();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+            .expect("fill recipient queue");
+        let (session_id, _) = registry.register(
+            &profile("SlowPayloadAlice"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+        let channel = Identifier::parse("solaris:test").unwrap();
+
+        for idx in 0..16 {
+            assert!(registry.send_custom_payload(session_id, channel.clone(), vec![idx]));
+        }
+
+        let pressure = registry.pressure_snapshot();
+        assert_eq!(
+            pressure.reliable_command_retries,
+            start.reliable_command_retries + 1,
+            "duplicate custom payloads for one slow recipient should schedule one reliable retry"
+        );
+        assert_eq!(
+            pressure.reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight + 1,
+            "duplicate custom payloads for one slow recipient should not accumulate retry tasks"
+        );
+        assert!(
+            pressure.max_reliable_command_retries_in_flight
+                <= start.max_reliable_command_retries_in_flight + 1,
+            "duplicate custom payloads for one slow recipient should not raise max pending retries by more than one"
+        );
+        assert!(
+            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
+            "extra custom payloads for an already-backpressured recipient should be counted as pressure drops"
+        );
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::CustomPayload {
+                channel,
+                payload,
+            }) if channel.as_str() == "solaris:test" && payload == vec![0]
         ));
         for _ in 0..8 {
             if registry

@@ -71,6 +71,32 @@ fn login_play_round_trip_with_death_location() {
 }
 
 #[test]
+fn clientbound_custom_payload_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ClientboundCustomPayload::ID, 0x18);
+    let packet = ClientboundCustomPayload {
+        payload: CustomPayload::Unknown {
+            channel: Identifier::parse("solaris:test").unwrap(),
+            payload: vec![0xDE, 0xAD, 0xBE, 0xEF],
+        },
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            0x0c, b's', b'o', b'l', b'a', b'r', b'i', b's', b':', b't', b'e', b's', b't', 0xDE,
+            0xAD, 0xBE, 0xEF,
+        ]
+    );
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundCustomPayload::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn clientbound_respawn_id_and_layout_match_javap() {
     assert_eq!(ClientboundRespawn::ID, 0x52);
     let packet = ClientboundRespawn {

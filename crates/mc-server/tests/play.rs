@@ -36,11 +36,11 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
     ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundPlayerAbilities,
-    ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime, ConfirmTeleportation,
-    EntityEvent, GameEvent, LoginPlay, PlayDisconnect, ServerboundChatCommand,
-    ServerboundCustomPayload, ServerboundKeepAlive, SetCenterChunk, SetDefaultSpawnPosition,
-    SynchronizePlayerPosition, unpack_block_pos,
+    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
+    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, PlayDisconnect,
+    ServerboundChatCommand, ServerboundCustomPayload, ServerboundKeepAlive, SetCenterChunk,
+    SetDefaultSpawnPosition, SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -113,7 +113,7 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         shutdown: mc_net::ShutdownHandle::default(),
     };
     let (boundary, endpoint) =
-        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(1).unwrap());
+        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(8).unwrap());
     let policy = mc_extension::CustomPayloadPolicy::new(16, [EXTENSION_CHANNEL.to_owned()]);
     let bound = mc_net::bind_with_extension(cfg, boundary, policy)
         .await
@@ -171,6 +171,44 @@ async fn read_play_disconnect(
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == PlayDisconnect::ID {
+                return PlayDisconnect::decode(&mut frame.body).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("play disconnect was not delivered within 2s")
+}
+
+async fn read_play_custom_payload(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> ClientboundCustomPayload {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == ClientboundCustomPayload::ID {
+                return ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("play custom payload was not delivered within 2s")
+}
+
+async fn read_play_disconnect_rejecting_custom_payload(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> PlayDisconnect {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == ClientboundCustomPayload::ID {
+                let payload = ClientboundCustomPayload::decode(&mut frame.body).unwrap();
+                panic!("unexpected custom payload before disconnect: {payload:?}");
+            }
             if frame.id == PlayDisconnect::ID {
                 return PlayDisconnect::decode(&mut frame.body).unwrap();
             }
@@ -730,6 +768,71 @@ async fn play_extension_disconnect_command_disconnects_player() {
             reason: "disconnected".to_owned(),
         }
     );
+}
+
+#[tokio::test]
+async fn play_extension_custom_payload_command_reaches_player() {
+    let (addr, endpoint) = start_server_with_extension().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPayloadOut").await;
+
+    let joined = recv_extension_event(&endpoint).await;
+    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
+        panic!("expected PlayerJoined event, got {joined:?}");
+    };
+
+    endpoint
+        .try_submit_command(OutboundCommand::SendCustomPayload {
+            player_id,
+            channel: EXTENSION_CHANNEL.to_owned(),
+            payload: bytes::Bytes::from_static(b"server-payload"),
+        })
+        .unwrap();
+
+    let payload = read_play_custom_payload(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        payload,
+        ClientboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                payload: b"server-payload".to_vec(),
+            },
+        }
+    );
+
+    drop(stream);
+}
+
+#[tokio::test]
+async fn play_extension_oversized_custom_payload_command_is_rejected() {
+    let (addr, endpoint) = start_server_with_extension().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtPayloadBig").await;
+
+    let joined = recv_extension_event(&endpoint).await;
+    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
+        panic!("expected PlayerJoined event, got {joined:?}");
+    };
+
+    endpoint
+        .try_submit_command(OutboundCommand::SendCustomPayload {
+            player_id,
+            channel: EXTENSION_CHANNEL.to_owned(),
+            payload: bytes::Bytes::from(vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES]),
+        })
+        .unwrap();
+    endpoint
+        .try_submit_command(OutboundCommand::DisconnectPlayer {
+            player_id,
+            reason: "after rejected payload".to_owned(),
+        })
+        .unwrap();
+
+    let disconnect =
+        read_play_disconnect_rejecting_custom_payload(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(disconnect_text(&disconnect), "after rejected payload");
 }
 
 #[tokio::test]

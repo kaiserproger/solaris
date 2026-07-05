@@ -14,14 +14,14 @@
 //! ```
 //!
 //! Inbound configuration packets that aren't `Serverbound Known Packs`
-//! or `Acknowledge Finish Configuration` are read, logged at debug
-//! level, and discarded — robust to optional `Client Information` and
+//! or `Acknowledge Finish Configuration` are read and handled without
+//! blocking the handshake — robust to optional `Client Information` and
 //! `Plugin Message` traffic the client may emit at any point.
 
 use bytes::{Buf, Bytes, BytesMut};
 use mc_data::VanillaData;
 use mc_data::tags::TagsData;
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_extension::{CustomPayloadPolicy, DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES};
 use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, ReadMc};
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::CustomPayload;
@@ -42,6 +42,18 @@ use crate::login::LoggedInProfile;
 
 const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigurationCustomPayload {
+    pub(crate) channel: String,
+    pub(crate) payload: Bytes,
+}
+
+pub(crate) struct ConfigurationContext<'a> {
+    pub(crate) data: &'a VanillaData,
+    pub(crate) tags: &'a TagsData,
+    pub(crate) custom_payload_policy: Option<&'a CustomPayloadPolicy>,
+}
+
 /// The Known Packs entry we advertise as the data pack the running
 /// game version corresponds to. Built from [`TARGET_RELEASE`] so a
 /// version bump only touches one place.
@@ -59,9 +71,8 @@ pub(crate) async fn handle<R, W>(
     buf: &mut BytesMut,
     compression: Compression,
     profile: &LoggedInProfile,
-    data: &VanillaData,
-    tags: &TagsData,
-) -> Result<(), ConnectionError>
+    context: ConfigurationContext<'_>,
+) -> Result<Vec<ConfigurationCustomPayload>, ConnectionError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
@@ -77,6 +88,8 @@ where
         compression,
     )
     .await?;
+
+    let mut custom_payloads = Vec::new();
 
     // Step 2: read frames until we see the client's KnownPacks response.
     let mut ignored_packets = 0usize;
@@ -119,7 +132,12 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            handle_configuration_custom_payload(frame.body, "before_known_packs")?;
+            handle_configuration_custom_payload(
+                frame.body,
+                "before_known_packs",
+                context.custom_payload_policy,
+                &mut custom_payloads,
+            )?;
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
@@ -164,7 +182,7 @@ where
 
     // Step 3: send a Registry Data packet for every built-in registry,
     // with every entry having `has_data = false` (== use built-in).
-    for registry in data.registries() {
+    for registry in context.data.registries() {
         let entries = registry
             .entries
             .iter()
@@ -184,8 +202,8 @@ where
         .await?;
     }
     debug!(
-        registries = data.registry_count(),
-        entries = data.entry_count(),
+        registries = context.data.registry_count(),
+        entries = context.data.entry_count(),
         "sent Registry Data"
     );
 
@@ -195,7 +213,8 @@ where
     // this packet the client kicks itself on `FinishConfiguration`
     // with "Unbound tags" because nothing populated those references.
     let tag_packet = UpdateTags {
-        registries: tags
+        registries: context
+            .tags
             .registries
             .iter()
             .map(|(registry, tag_map)| UpdateTagsRegistry {
@@ -210,8 +229,8 @@ where
             })
             .collect(),
     };
-    let tag_count = tags.total_tags();
-    let tag_entries = tags.total_entries();
+    let tag_count = context.tags.total_tags();
+    let tag_entries = context.tags.total_entries();
     write_packet(writer, &tag_packet, compression).await?;
     debug!(
         registries = tag_packet.registries.len(),
@@ -256,7 +275,12 @@ where
             continue;
         }
         if frame.id == ServerboundCustomPayload::ID {
-            handle_configuration_custom_payload(frame.body, "before_finish_ack")?;
+            handle_configuration_custom_payload(
+                frame.body,
+                "before_finish_ack",
+                context.custom_payload_policy,
+                &mut custom_payloads,
+            )?;
             continue;
         }
         if frame.id == ServerboundResourcePack::ID {
@@ -282,12 +306,14 @@ where
         "configuration complete; entering Play state"
     );
 
-    Ok(())
+    Ok(custom_payloads)
 }
 
 fn handle_configuration_custom_payload(
     mut body: Bytes,
     context: &'static str,
+    custom_payload_policy: Option<&CustomPayloadPolicy>,
+    custom_payloads: &mut Vec<ConfigurationCustomPayload>,
 ) -> Result<(), ConnectionError> {
     if body.len() > DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES {
         warn!(
@@ -307,6 +333,39 @@ fn handle_configuration_custom_payload(
     }
 
     let payload_len = body.remaining();
+    if let Some(policy) = custom_payload_policy {
+        if !policy.allows_channel(channel.as_str()) {
+            debug!(
+                channel = %channel.as_str(),
+                len = payload_len,
+                context,
+                "Configuration custom payload denied by extension policy"
+            );
+            return Ok(());
+        }
+        if payload_len > policy.max_payload_bytes() {
+            warn!(
+                channel = %channel.as_str(),
+                len = payload_len,
+                max = policy.max_payload_bytes(),
+                context,
+                "Configuration custom payload denied by extension size policy"
+            );
+            return Ok(());
+        }
+        custom_payloads.push(ConfigurationCustomPayload {
+            channel: channel.as_str().to_string(),
+            payload: body.copy_to_bytes(payload_len),
+        });
+        debug!(
+            channel = %channel.as_str(),
+            len = payload_len,
+            context,
+            "Configuration custom payload retained for extension"
+        );
+        return Ok(());
+    }
+
     debug!(
         channel = %channel.as_str(),
         len = payload_len,

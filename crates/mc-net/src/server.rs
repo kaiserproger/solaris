@@ -315,6 +315,10 @@ impl ExtensionEventSink {
         }
     }
 
+    pub(crate) fn custom_payload_policy(&self) -> &CustomPayloadPolicy {
+        &self.custom_payload_policy
+    }
+
     pub(crate) fn try_recv_command(&self) -> Result<ExtensionOutboundCommand, QueueRecvError> {
         self.boundary.try_recv_command()
     }
@@ -804,11 +808,38 @@ fn drain_extension_commands(
                     );
                 }
             }
-            Ok(ExtensionOutboundCommand::SendCustomPayload { player_id, .. }) => {
-                debug!(
-                    player_id = player_id.value(),
-                    "extension custom payload command ignored; outbound payloads are not implemented"
-                );
+            Ok(ExtensionOutboundCommand::SendCustomPayload {
+                player_id,
+                channel,
+                payload,
+            }) => {
+                let max_payload_bytes = extension.custom_payload_policy().max_payload_bytes();
+                if payload.len() > max_payload_bytes {
+                    warn!(
+                        player_id = player_id.value(),
+                        len = payload.len(),
+                        max = max_payload_bytes,
+                        "extension custom payload command rejected by size policy"
+                    );
+                    continue;
+                }
+                let channel = match mc_protocol::codec::Identifier::parse(&channel) {
+                    Ok(channel) => channel,
+                    Err(error) => {
+                        debug!(
+                            player_id = player_id.value(),
+                            ?error,
+                            "extension custom payload command rejected invalid channel"
+                        );
+                        continue;
+                    }
+                };
+                if !sessions.send_custom_payload(player_id.value(), channel, payload.to_vec()) {
+                    debug!(
+                        player_id = player_id.value(),
+                        "extension custom payload command targeted unknown player"
+                    );
+                }
             }
             Ok(_) => {
                 debug!("unknown extension command ignored");
@@ -1660,14 +1691,19 @@ async fn handle_connection(
             let Some(profile) = profile else {
                 return Ok(());
             };
-            configuration::handle(
+            let configuration_custom_payloads = configuration::handle(
                 &mut reader,
                 &mut writer,
                 &mut buf,
                 compression,
                 &profile,
-                &config.data,
-                &config.tags,
+                configuration::ConfigurationContext {
+                    data: config.data.as_ref(),
+                    tags: config.tags.as_ref(),
+                    custom_payload_policy: extension
+                        .as_ref()
+                        .map(ExtensionEventSink::custom_payload_policy),
+                },
             )
             .await?;
             play::handle(
@@ -1680,6 +1716,7 @@ async fn handle_connection(
                 sessions,
                 chunk_pipeline_resources,
                 runtime_control,
+                configuration_custom_payloads,
                 extension,
             )
             .await

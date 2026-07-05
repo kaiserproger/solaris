@@ -6,10 +6,11 @@
 //! acknowledges the advertised built-in pack.
 
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use mc_extension::DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES;
+use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, ProtocolPhase, QueueRecvError};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::codec::Identifier;
@@ -29,6 +30,7 @@ use tokio::net::TcpStream;
 use uuid::Uuid;
 
 const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES + 1;
+const EXTENSION_CHANNEL: &str = "solaris:test";
 
 async fn start_server() -> SocketAddr {
     let cfg = mc_net::ServerConfig {
@@ -63,11 +65,66 @@ async fn start_server() -> SocketAddr {
     addr
 }
 
+async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEndpoint) {
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 configuration extension".into(),
+        max_players: 8,
+        view_distance: 10,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
+        blocks: std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
+        recipes: std::sync::Arc::new(Vec::new()),
+        loot: std::sync::Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let (boundary, endpoint) =
+        mc_extension::boundary_pair(NonZeroUsize::new(8).unwrap(), NonZeroUsize::new(1).unwrap());
+    let policy = mc_extension::CustomPayloadPolicy::new(16, [EXTENSION_CHANNEL.to_owned()]);
+    let bound = mc_net::bind_with_extension(cfg, boundary, policy)
+        .await
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    (addr, endpoint)
+}
+
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
     let framed = encode_frame(P::ID, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
+}
+
+async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match endpoint.try_recv_event() {
+                Ok(event) => return event,
+                Err(QueueRecvError::Empty) => {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(QueueRecvError::Closed) => panic!("extension event queue closed"),
+                Err(error) => panic!("unexpected extension queue error: {error:?}"),
+            }
+        }
+    })
+    .await
+    .expect("extension event was not delivered within 2s")
 }
 
 async fn read_one_frame(
@@ -377,6 +434,98 @@ async fn configuration_ignores_unknown_custom_payload_before_known_packs() {
     .await;
 
     read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+}
+
+#[tokio::test]
+async fn configuration_extension_boundary_receives_allowed_payloads() {
+    let (addr, endpoint) = start_server_with_extension().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "ConfigExtension").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("other:channel").unwrap(),
+                payload: b"drop".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                payload: b"before".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: known.packs },
+        compression,
+    )
+    .await;
+    read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
+
+    write_frame(
+        &mut stream,
+        &ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse(EXTENSION_CHANNEL).unwrap(),
+                payload: b"before_ack".to_vec(),
+            },
+        },
+        compression,
+    )
+    .await;
+
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+    let frame = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_one_frame(&mut stream, &mut rbuf, compression),
+    )
+    .await
+    .expect("server did not advance to Play after Configuration extension payloads");
+    assert_eq!(frame.id, LoginPlay::ID);
+
+    let joined = recv_extension_event(&endpoint).await;
+    let InboundEvent::PlayerJoined {
+        player_id,
+        username,
+    } = joined
+    else {
+        panic!("expected PlayerJoined event, got {joined:?}");
+    };
+    assert_eq!(username, "ConfigExtension");
+
+    let payload = recv_extension_event(&endpoint).await;
+    let InboundEvent::CustomPayload(payload) = payload else {
+        panic!("expected CustomPayload event, got {payload:?}");
+    };
+    assert_eq!(payload.player_id, player_id);
+    assert_eq!(payload.phase, ProtocolPhase::Configuration);
+    assert_eq!(payload.channel, EXTENSION_CHANNEL);
+    assert_eq!(payload.payload.as_ref(), b"before");
+
+    let payload = recv_extension_event(&endpoint).await;
+    let InboundEvent::CustomPayload(payload) = payload else {
+        panic!("expected CustomPayload event, got {payload:?}");
+    };
+    assert_eq!(payload.player_id, player_id);
+    assert_eq!(payload.phase, ProtocolPhase::Configuration);
+    assert_eq!(payload.channel, EXTENSION_CHANNEL);
+    assert_eq!(payload.payload.as_ref(), b"before_ack");
 }
 
 #[tokio::test]

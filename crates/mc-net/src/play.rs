@@ -40,8 +40,8 @@ use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate, ChunkHeightmap, ClientCommandAction,
     ClientboundBlockEntityData, ClientboundChangeDifficulty, ClientboundCommandSuggestions,
     ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
-    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
-    ClientboundOpenSignEditor, ClientboundRespawn, ClientboundSetEntityData,
+    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
+    ClientboundOpenScreen, ClientboundOpenSignEditor, ClientboundRespawn, ClientboundSetEntityData,
     ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
     ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput,
     Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation,
@@ -79,6 +79,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{debug, info, warn};
 
 use crate::chunk_pipeline::ChunkPipelineResources;
+use crate::configuration::ConfigurationCustomPayload;
 use crate::connection::{read_frame, write_packet};
 use crate::control_plane::{autoscale_action_label, autoscale_pressure_label};
 use crate::error::ConnectionError;
@@ -669,6 +670,7 @@ pub(crate) async fn handle<R, W>(
     sessions: Arc<SessionRegistry>,
     chunk_pipeline_resources: ChunkPipelineResources,
     runtime_control: Option<RuntimeControlHandle>,
+    configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
     extension: Option<ExtensionEventSink>,
 ) -> Result<(), ConnectionError>
 where
@@ -782,6 +784,14 @@ where
             player_id: extension_player_id,
             username: profile.name.clone(),
         });
+        for payload in &configuration_custom_payloads {
+            extension.enqueue_custom_payload(
+                extension_player_id,
+                ProtocolPhase::Configuration,
+                &payload.channel,
+                payload.payload.as_ref(),
+            );
+        }
     }
 
     let permissions = config.command_permissions.permissions_for(profile);
@@ -10768,6 +10778,16 @@ where
                             }
                             state.active_container = Some(ActiveContainer::Chest(window));
                         }
+                    }
+                    Some(OutboundCommand::CustomPayload { channel, payload }) => {
+                        write_packet(
+                            writer,
+                            &ClientboundCustomPayload {
+                                payload: CustomPayload::Unknown { channel, payload },
+                            },
+                            compression,
+                        )
+                        .await?;
                     }
                     Some(OutboundCommand::DisconnectPlayer { reason }) => {
                         write_packet(

@@ -195,6 +195,28 @@ fn unpack_lp_component(v: u64) -> f64 {
 // Clientbound
 // -----------------------------------------------------------------------
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundCustomPayload {
+    pub payload: CustomPayload,
+}
+
+impl Packet for ClientboundCustomPayload {
+    // `.analysis/protocol-dump.txt`: game CLIENTBOUND_CUSTOM_PAYLOAD is
+    // clientbound registration index 24, wire id 0x18. Body is the common
+    // custom-payload codec from local decompiled sources.
+    const ID: i32 = 0x18;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.payload.encode(buf)
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            payload: CustomPayload::decode(buf)?,
+        })
+    }
+}
+
 /// `Login (Play)` (CB). The server's "welcome to the world" packet that
 /// transitions the client into Play state proper.
 ///
