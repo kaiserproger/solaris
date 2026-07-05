@@ -63,6 +63,7 @@ const CHUNK_STAGE_SLOW_MS: u64 = 50;
 const CHUNK_BACKPRESSURE_COOLDOWN_TURNS: usize = 8;
 const CHUNK_BACKPRESSURE_MAX_COOLDOWN_TURNS: usize = 64;
 const CHUNK_BACKPRESSURE_MAX_RETRIES: usize = 16;
+const PREPARED_IN_FLIGHT_DEFERRAL_LIMIT: usize = 2;
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     biomes: Arc<Registry>,
@@ -1287,7 +1288,9 @@ impl ChunkStreamState {
                         break;
                     }
                     claim_deferrals += 1;
-                    if claim_deferrals >= self.scheduler.queued_len().max(1) {
+                    if claim_deferrals >= PREPARED_IN_FLIGHT_DEFERRAL_LIMIT
+                        || claim_deferrals >= self.scheduler.queued_len().max(1)
+                    {
                         self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
                         break;
                     }
@@ -2973,6 +2976,93 @@ mod tests {
         assert_eq!(stream.dispatched, 1);
         assert_eq!(stream.ready.len(), 1);
         assert_eq!(stream.scheduler.in_flight_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_spawn_waiters_do_not_rescan_full_inflight_window() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let view_distance = 8;
+        let waiter_count = 20usize;
+        let desired = desired_chunk_set(0, 0, view_distance);
+        assert_eq!(desired.len(), 289);
+
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: desired.len(),
+            chunk_result_queue_size: 1,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut streams = Vec::with_capacity(waiter_count);
+        for waiter in 0..waiter_count {
+            let (tx, _rx) = mpsc::channel(1);
+            let profile = LoggedInProfile {
+                uuid: uuid::Uuid::from_u128(waiter as u128 + 1),
+                name: format!("claim-waiter-{waiter}"),
+            };
+            let (session_id, _) = sessions.register(
+                &profile,
+                (0, 0),
+                view_distance,
+                desired.clone(),
+                tx,
+                PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+            );
+            streams.push(ChunkStreamState::new(
+                Arc::clone(&world),
+                Arc::new(test_biome_registry()),
+                Arc::clone(&registry),
+                None,
+                Arc::new(ItemRegistry::from_report(&[])),
+                Arc::new(TagsData::default()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+                None,
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(Vec::new()),
+                Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+                Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+                Compression::Disabled,
+                Arc::clone(&sessions),
+                session_id,
+                0,
+                0,
+                0.0,
+                view_distance,
+                ChunkPipelineResources::with_limits(1, 1),
+                policy,
+            ));
+        }
+
+        for &chunk in &desired {
+            match sessions.prepared_chunk_or_claim(chunk) {
+                PreparedChunkClaimResult::Claimed(_) => {}
+                other => panic!("expected manual prepared claim for {chunk:?}, got {other:?}"),
+            }
+        }
+
+        let before = sessions.prepared_chunk_claim_call_count();
+        for stream in &mut streams {
+            stream.dispatch_available().await;
+            assert_eq!(stream.dispatched, 0);
+            assert_eq!(stream.ready.len(), 0);
+            assert_eq!(stream.scheduler.in_flight_len(), 0);
+            assert_eq!(stream.scheduler.queued_len(), desired.len());
+        }
+        let after = sessions.prepared_chunk_claim_call_count();
+        let delta = after.saturating_sub(before);
+        let full_rescan_probes = waiter_count as u64 * desired.len() as u64;
+
+        assert!(
+            delta <= waiter_count as u64 * 2,
+            "same-spawn waiters should stop after bounded in-flight probes; \
+             claim_probe_count delta={delta}, bounded={} full_rescan={full_rescan_probes}",
+            waiter_count * 2
+        );
     }
 
     #[tokio::test]

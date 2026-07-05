@@ -15,7 +15,7 @@ use std::time::Duration;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Semantic version of the stable script API contract.
-pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 1, 0);
+pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 2, 0);
 
 /// Version requested by a script runtime or supported by the server host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -202,11 +202,101 @@ pub enum ScriptCommand {
     },
 }
 
+impl ScriptCommand {
+    /// Return the host capability required before admitting this command.
+    pub fn required_capability(&self) -> Option<ScriptCommandCapability> {
+        match self {
+            Self::SendChatMessage { .. }
+            | Self::BroadcastChatMessage { .. }
+            | Self::DisconnectPlayer { .. } => None,
+            Self::RunConsoleCommand { command } => {
+                Some(ScriptCommandCapability::RunConsoleCommandRoot {
+                    root: console_command_root(command),
+                })
+            }
+        }
+    }
+}
+
+/// Host capability required by privileged outbound script commands.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptCommandCapability {
+    RunConsoleCommandRoot { root: String },
+}
+
+/// Allow-list of privileged outbound command capabilities granted by the host.
+///
+/// Default builds expose empty capabilities for script-facing callers. Trusted
+/// host-side crates can enable the `host-api` Cargo feature to construct
+/// non-empty allow-lists.
+#[cfg_attr(
+    not(feature = "host-api"),
+    doc = r#"
+The root-granting builder is absent from the default public API:
+
+```compile_fail
+use mc_script::CommandCapabilities;
+
+let _forged = CommandCapabilities::none().allow_console_command_root("stop");
+```
+"#
+)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct CommandCapabilities {
+    console_command_roots: Vec<String>,
+}
+
+impl CommandCapabilities {
+    /// Return capabilities with no privileged console command roots allowed.
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Trusted host-side builder for allowing console commands with a root token.
+    ///
+    /// Available to unit tests and to crates that opt into the `host-api`
+    /// feature.
+    ///
+    /// ```
+    /// use mc_script::{CommandCapabilities, ScriptCommandCapability};
+    ///
+    /// let capabilities = CommandCapabilities::none().allow_console_command_root("time");
+    /// assert!(capabilities.allows(&ScriptCommandCapability::RunConsoleCommandRoot {
+    ///     root: "time".to_owned(),
+    /// }));
+    /// ```
+    #[cfg(any(test, feature = "host-api"))]
+    pub fn allow_console_command_root(mut self, root: impl AsRef<str>) -> Self {
+        let root = console_command_root(root.as_ref());
+        if !self
+            .console_command_roots
+            .iter()
+            .any(|allowed| allowed == &root)
+        {
+            self.console_command_roots.push(root);
+        }
+        self
+    }
+
+    /// Return whether this allow-list grants the requested command capability.
+    pub fn allows(&self, capability: &ScriptCommandCapability) -> bool {
+        match capability {
+            ScriptCommandCapability::RunConsoleCommandRoot { root } => self
+                .console_command_roots
+                .iter()
+                .any(|allowed| allowed == root),
+        }
+    }
+}
+
 /// Error returned when a command batch cannot accept another command.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandBatchError {
     Full { limit: NonZeroUsize },
+    PermissionDenied { capability: ScriptCommandCapability },
 }
 
 /// Bounded list of commands produced by one script event invocation.
@@ -242,6 +332,14 @@ impl CommandBatch {
 
     /// Try to append one command without exceeding the batch limit.
     pub fn try_push(&mut self, command: ScriptCommand) -> Result<(), CommandBatchError> {
+        if let Some(capability) = command.required_capability() {
+            return Err(CommandBatchError::PermissionDenied { capability });
+        }
+
+        self.try_push_unchecked(command)
+    }
+
+    fn try_push_unchecked(&mut self, command: ScriptCommand) -> Result<(), CommandBatchError> {
         if self.commands.len() >= self.limit.get() {
             return Err(CommandBatchError::Full { limit: self.limit });
         }
@@ -249,6 +347,31 @@ impl CommandBatch {
         self.commands.push(command);
         Ok(())
     }
+
+    /// Try to append one command if granted by the host capability allow-list.
+    pub fn try_push_authorized(
+        &mut self,
+        command: ScriptCommand,
+        capabilities: &CommandCapabilities,
+    ) -> Result<(), CommandBatchError> {
+        if let Some(capability) = command.required_capability()
+            && !capabilities.allows(&capability)
+        {
+            return Err(CommandBatchError::PermissionDenied { capability });
+        }
+
+        self.try_push_unchecked(command)
+    }
+}
+
+fn console_command_root(command: &str) -> String {
+    command
+        .trim()
+        .trim_start_matches('/')
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned()
 }
 
 /// Future VM resource and lifecycle controls reserved in the host contract.
@@ -420,6 +543,62 @@ mod tests {
     }
 
     #[test]
+    fn command_capabilities_deny_unlisted_console_commands_without_mutating_batch() {
+        let mut batch = CommandBatch::new(nonzero(1));
+        let denied = ScriptCommand::RunConsoleCommand {
+            command: "stop".to_owned(),
+        };
+
+        assert_eq!(
+            batch.try_push_authorized(denied, &CommandCapabilities::default()),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapability::RunConsoleCommandRoot {
+                    root: "stop".to_owned(),
+                },
+            })
+        );
+        assert!(batch.commands().is_empty());
+
+        let raw_denied = ScriptCommand::RunConsoleCommand {
+            command: "/stop".to_owned(),
+        };
+        assert_eq!(
+            batch.try_push(raw_denied),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapability::RunConsoleCommandRoot {
+                    root: "stop".to_owned(),
+                },
+            })
+        );
+        assert!(batch.commands().is_empty());
+
+        let capabilities = CommandCapabilities::default().allow_console_command_root("time");
+        let allowed = ScriptCommand::RunConsoleCommand {
+            command: "/time set day".to_owned(),
+        };
+
+        assert_eq!(
+            allowed.required_capability(),
+            Some(ScriptCommandCapability::RunConsoleCommandRoot {
+                root: "time".to_owned(),
+            })
+        );
+        batch
+            .try_push_authorized(allowed.clone(), &capabilities)
+            .unwrap();
+        assert_eq!(batch.commands(), std::slice::from_ref(&allowed));
+
+        let extra = ScriptCommand::RunConsoleCommand {
+            command: "/time set noon".to_owned(),
+        };
+        assert_eq!(
+            batch.try_push_authorized(extra, &capabilities),
+            Err(CommandBatchError::Full { limit: nonzero(1) })
+        );
+        assert_eq!(batch.commands(), std::slice::from_ref(&allowed));
+    }
+
+    #[test]
     fn runtime_controls_reserve_fuel_memory_timeout_and_shutdown() {
         let controls = RuntimeControls::unrestricted()
             .with_fuel(nonzero_u64(100))
@@ -483,11 +662,12 @@ mod tests {
 
     #[test]
     fn script_api_version_accepts_current_and_older_minor_only() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 1, 0));
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 2, 0));
         assert!(supports_script_api_version(SCRIPT_API_VERSION));
+        assert!(supports_script_api_version(ScriptApiVersion::new(0, 1, 0)));
         assert!(supports_script_api_version(ScriptApiVersion::new(0, 0, 0)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 1, 1)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 2, 0)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 2, 1)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 3, 0)));
         assert!(!supports_script_api_version(ScriptApiVersion::new(1, 0, 0)));
     }
 }

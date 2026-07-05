@@ -81,6 +81,7 @@ pub(super) struct ChestWindow {
     pub(super) container_id: i32,
     pub(super) positions: Vec<mc_world::BlockPos>,
     pub(super) state_id: i32,
+    pub(super) quickcraft: QuickCraftState,
 }
 
 impl ChestWindow {
@@ -93,6 +94,7 @@ impl ChestWindow {
             container_id,
             positions,
             state_id: 1,
+            quickcraft: QuickCraftState::default(),
         }
     }
 
@@ -106,6 +108,55 @@ impl ChestWindow {
         } else {
             CHEST_MENU_TYPE_ID
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct QuickCraftState {
+    status: i8,
+    kind: i8,
+    slots: Vec<usize>,
+}
+
+impl Default for QuickCraftState {
+    fn default() -> Self {
+        Self {
+            status: 0,
+            kind: -1,
+            slots: Vec::new(),
+        }
+    }
+}
+
+impl QuickCraftState {
+    pub(super) fn status(&self) -> i8 {
+        self.status
+    }
+
+    pub(super) fn kind(&self) -> i8 {
+        self.kind
+    }
+
+    pub(super) fn slots(&self) -> &[usize] {
+        &self.slots
+    }
+
+    pub(super) fn start(&mut self, kind: i8) {
+        self.status = 1;
+        self.kind = kind;
+        self.slots.clear();
+    }
+
+    pub(super) fn add_slot(&mut self, slot: usize) {
+        if !self.slots.contains(&slot) {
+            self.slots.push(slot);
+        }
+    }
+
+    pub(super) fn reset(&mut self) {
+        self.status = 0;
+        self.kind = -1;
+        self.slots.clear();
     }
 }
 

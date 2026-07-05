@@ -11,4 +11,8 @@ repository.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+host-api = []
+
 [dependencies]

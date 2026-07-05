@@ -348,6 +348,8 @@ pub(super) enum PreparedChunkClaimResult {
 #[derive(Debug, Default)]
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
+    #[cfg(test)]
+    prepared_claim_calls: AtomicU64,
 }
 
 impl SessionRegistry {
@@ -1912,6 +1914,9 @@ impl SessionRegistry {
     }
 
     pub(super) fn prepared_chunk_or_claim(&self, chunk: (i32, i32)) -> PreparedChunkClaimResult {
+        #[cfg(test)]
+        self.prepared_claim_calls.fetch_add(1, Ordering::Relaxed);
+
         let mut inner = self.lock_inner("prepared chunk claim");
         if let Some(prepared) = inner.prepared.get(&chunk).cloned() {
             return PreparedChunkClaimResult::Cached(prepared);
@@ -1924,6 +1929,11 @@ impl SessionRegistry {
         let claim = PreparedChunkClaim(inner.next_prepared_claim);
         inner.prepared_in_flight.insert(chunk, claim);
         PreparedChunkClaimResult::Claimed(claim)
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_chunk_claim_call_count(&self) -> u64 {
+        self.prepared_claim_calls.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]

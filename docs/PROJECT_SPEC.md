@@ -42,7 +42,7 @@ Reasons in order of importance:
 Listed explicitly so scope doesn't creep:
 
 - **NOT bit-perfect vanilla parity.** Not in worldgen, not in redstone tick order, not in RNG. Goal is "mechanics behave as expected", not byte-for-byte vanilla matching. For release-quality scoped overworld survival, however, Solaris must prove at least 80% vanilla-observable mechanic coverage; the rest must be explicit non-goals or documented divergences.
-- **NOT compatibility with Forge/Fabric/NeoForge server-side mods.** No JNI bridge for running NeoForge mods on this server.
+- **NOT binary compatibility with Forge/Fabric/NeoForge server-side mods.** No JNI bridge for running NeoForge mods on this server. The plugin/mod migration goal is still low-friction ergonomics: familiar event phases, permissions, command/config conventions, data-driven registries, and migration adapters/docs where they fit Solaris' authoritative Rust core.
 - **NOT cross-platform below the minimum.** Server: Linux x86_64 as primary, Windows x86_64 best-effort, others on demand. Client mod: whatever 26.1 vanilla supports.
 - **NOT Bedrock Edition.** Java Edition only.
 - **NOT a full 1:1 modpack at M12.** Realistic goal for M12-M24 is a playable demo with a subset of each mod's mechanics.
@@ -401,11 +401,11 @@ High-level plan; details go in separate milestone docs as we approach each one. 
 - **M8: Multiplayer** (80-120h) — multiple players, view distance, chunk streaming
 - **M9: Data pack loader** (60-100h) — vanilla data pack format: blocks/items/recipes/loot tables from JSON
 - **M10: Custom protocol extension v1** (80-150h) — handshake, registry sync, basic custom blocks/items
-- **M11: Plugin API (Lua)** (80-130h) — event bus, scriptable behaviors
+- **M11: Plugin API (Lua)** (80-130h) — event bus, scriptable behaviors, server-side loader boundary
 
 ### Phase 4: Modpack replica part 1 (M12-M16, ~400-700 hours = 5-9 months)
 
-- **M12: Client mod scaffolding** (100-150h) — Fabric/NeoForge mod, mixins infrastructure, version handshake
+- **M12: Client mod scaffolding** (100-150h) — Fabric/NeoForge mod, mixins infrastructure, version handshake, client-side loader bridge and server sync
 - **M13: Macaw's replica** (80-120h) — simplest mod, exercises the whole extension pipeline
 - **M14: Farmer's Delight replica** (100-150h) — custom blocks, items, cooking
 - **M15: Epic Knights replica** (120-180h) — custom armor models via equippable component, weapons

@@ -1887,6 +1887,7 @@ where
                 false
             }
         }
+        ContainerClickAction::QuickCraft(_) => false,
         ContainerClickAction::Unsupported => false,
     };
     if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
@@ -2643,10 +2644,30 @@ enum ContainerClickAction {
     QuickMove { slot: usize },
     Swap { slot: usize, button: i8 },
     Throw { slot: usize, button: i8 },
+    QuickCraft(QuickCraftClick),
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QuickCraftClick {
+    header: i8,
+    kind: i8,
+    slot: Option<usize>,
+}
+
+const QUICKCRAFT_TYPE_CHARITABLE: i8 = 0;
+const QUICKCRAFT_HEADER_START: i8 = 0;
+const QUICKCRAFT_HEADER_CONTINUE: i8 = 1;
+const QUICKCRAFT_HEADER_END: i8 = 2;
+
 fn classify_container_click(packet: &ServerboundContainerClick) -> ContainerClickAction {
+    if packet.container_input == ContainerInput::QuickCraft {
+        return ContainerClickAction::QuickCraft(QuickCraftClick {
+            header: (i32::from(packet.button_num) & 3) as i8,
+            kind: ((i32::from(packet.button_num) >> 2) & 3) as i8,
+            slot: usize::try_from(packet.slot_num).ok(),
+        });
+    }
     if packet.slot_num < 0 {
         return match packet.container_input {
             ContainerInput::Pickup => ContainerClickAction::OutsidePickup {
@@ -3808,6 +3829,127 @@ fn apply_chest_pickup_click(
     set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_slot)
 }
 
+fn can_chest_quickcraft_replace(
+    state: &InteractionState,
+    view: &ChestView,
+    menu_slot: usize,
+    stack: &ItemStack,
+) -> bool {
+    let menu_slot_count = view.storage_slots() + PLAYER_CONTAINER_STORAGE_SLOTS;
+    if menu_slot >= menu_slot_count
+        || !can_place_in_chest_menu_slot(state, view.storage_slots(), menu_slot, stack)
+    {
+        return false;
+    }
+    let Some(slot_stack) = chest_menu_stack(view, &state.inventory, menu_slot) else {
+        return false;
+    };
+    slot_stack.is_empty()
+        || can_stack(&slot_stack, stack)
+            && slot_stack.count <= item_max_stack(&state.item_facts, &state.items, stack)
+}
+
+fn apply_chest_quickcraft_click(
+    state: &mut InteractionState,
+    view: &mut ChestView,
+    window: &mut ChestWindow,
+    click: QuickCraftClick,
+) -> bool {
+    let expected_status = window.quickcraft.status();
+    if (expected_status != QUICKCRAFT_HEADER_CONTINUE || click.header != QUICKCRAFT_HEADER_END)
+        && expected_status != click.header
+    {
+        window.quickcraft.reset();
+        return false;
+    }
+    if state.carried_item.is_empty() {
+        window.quickcraft.reset();
+        return false;
+    }
+
+    match click.header {
+        QUICKCRAFT_HEADER_START => {
+            if click.kind == QUICKCRAFT_TYPE_CHARITABLE {
+                window.quickcraft.start(click.kind);
+            } else {
+                window.quickcraft.reset();
+            }
+            false
+        }
+        QUICKCRAFT_HEADER_CONTINUE => {
+            let Some(menu_slot) = click.slot else {
+                window.quickcraft.reset();
+                return false;
+            };
+            if window.quickcraft.kind() == QUICKCRAFT_TYPE_CHARITABLE
+                && can_chest_quickcraft_replace(state, view, menu_slot, &state.carried_item)
+                && state.carried_item.count > window.quickcraft.slots().len() as i32
+            {
+                window.quickcraft.add_slot(menu_slot);
+            }
+            false
+        }
+        QUICKCRAFT_HEADER_END => {
+            let quickcraft_kind = window.quickcraft.kind();
+            let quickcraft_slots = window.quickcraft.slots().to_vec();
+            window.quickcraft.reset();
+            if quickcraft_slots.is_empty() || quickcraft_kind != QUICKCRAFT_TYPE_CHARITABLE {
+                return false;
+            }
+            if quickcraft_slots.len() == 1 {
+                return apply_chest_pickup_click(state, view, quickcraft_slots[0], quickcraft_kind);
+            }
+            let source = state.carried_item.clone();
+            if source.is_empty() || source.count < quickcraft_slots.len() as i32 {
+                return false;
+            }
+            let place_count = source.count / quickcraft_slots.len() as i32;
+            if place_count <= 0 {
+                return false;
+            }
+            let max_stack = item_max_stack(&state.item_facts, &state.items, &source);
+            let mut remaining = source.count;
+            let mut changed = false;
+            for menu_slot in quickcraft_slots {
+                if !can_chest_quickcraft_replace(state, view, menu_slot, &source) {
+                    continue;
+                }
+                let Some(slot_stack) = chest_menu_stack(view, &state.inventory, menu_slot) else {
+                    continue;
+                };
+                let carry = if slot_stack.is_empty() {
+                    0
+                } else {
+                    slot_stack.count
+                };
+                let new_count = (place_count + carry).min(max_stack);
+                let moved = new_count - carry;
+                if moved <= 0 {
+                    continue;
+                }
+                let mut new_stack = source.clone();
+                new_stack.count = new_count;
+                if set_chest_menu_stack(view, &mut state.inventory, menu_slot, new_stack) {
+                    remaining -= moved;
+                    changed = true;
+                }
+            }
+            let mut cursor = source;
+            cursor.count = remaining;
+            state.carried_item = if cursor.count <= 0 {
+                ItemStack::EMPTY
+            } else {
+                cursor
+            };
+            changed
+        }
+        _ => {
+            window.quickcraft.reset();
+            false
+        }
+    }
+}
+
 fn merge_stack_into_chest(
     view: &mut ChestView,
     state: &InteractionState,
@@ -3963,6 +4105,7 @@ where
             window.state_id = authoritative_state_id;
         }
         if packet.state_id != window.state_id {
+            window.quickcraft.reset();
             drop(storage);
             write_chest_content(state, writer, &window, &view).await?;
             return Ok(window);
@@ -3970,7 +4113,11 @@ where
         let before_inventory = state.inventory.clone();
         let before_carried_item = state.carried_item.clone();
         let before_view = view.clone();
-        changed = match classify_container_click(&packet) {
+        let action = classify_container_click(&packet);
+        if !matches!(action, ContainerClickAction::QuickCraft(_)) {
+            window.quickcraft.reset();
+        }
+        changed = match action {
             ContainerClickAction::Pickup { slot, button } => {
                 apply_chest_pickup_click(state, &mut view, slot, button)
             }
@@ -3992,12 +4139,16 @@ where
                     false
                 }
             }
+            ContainerClickAction::QuickCraft(click) => {
+                apply_chest_quickcraft_click(state, &mut view, &mut window, click)
+            }
             ContainerClickAction::Unsupported => false,
         };
         if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
             state.inventory = before_inventory;
             state.carried_item = before_carried_item;
             view = before_view;
+            window.quickcraft.reset();
             drop(storage);
             write_chest_content(state, writer, &window, &view).await?;
             return Ok(window);
@@ -4087,6 +4238,7 @@ where
                     false
                 }
             }
+            ContainerClickAction::QuickCraft(_) => false,
             ContainerClickAction::Unsupported => false,
         };
         if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
@@ -4407,6 +4559,7 @@ where
                 false
             }
         }
+        ContainerClickAction::QuickCraft(_) => false,
         ContainerClickAction::Unsupported => false,
     };
     if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
