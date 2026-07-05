@@ -14,6 +14,7 @@ use clap::Parser;
 use mc_server::ServerConfig;
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
+const STARTUP_LIGHT_BAKE_WORKER_CAP: usize = 16;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -569,6 +570,7 @@ async fn serve(path: &Path) -> Result<()> {
                     Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>;
                 let startup_workers =
                     startup_chunk_worker_threads(chunk_pipeline.chunk_worker_threads);
+                let startup_light_workers = startup_light_bake_worker_threads(startup_workers);
                 let mut storage = storage
                     .with_generator(generator)
                     .with_item_registry(Arc::clone(&items));
@@ -579,6 +581,7 @@ async fn serve(path: &Path) -> Result<()> {
                         Arc::clone(&terrain_generator) as Arc<dyn mc_world::ChunkGenerator>,
                         cfg.server.view_distance,
                         startup_workers,
+                        startup_light_workers,
                         Some(block_light.as_ref()),
                     )?;
                     tracing::info!("Preparing world... 95% (spawn window resident)");
@@ -589,14 +592,14 @@ async fn serve(path: &Path) -> Result<()> {
                         chunks = generated,
                         dirty = storage.dirty_count(),
                         region_files = region_count,
-                        "empty world pre-generated around spawn; disk flush deferred to save-all",
+                        "empty world pre-generated around spawn; disk flush queued for startup dirty checkpoint",
                     );
                 } else {
                     let prepared = prepare_existing_spawn_window(
                         &mut storage,
                         block_light.as_ref(),
                         cfg.server.view_distance,
-                        startup_workers,
+                        startup_light_workers,
                     )?;
                     tracing::info!(
                         path = %world_dir.display(),
@@ -798,11 +801,18 @@ fn startup_chunk_worker_threads(configured_workers: usize) -> usize {
     configured_workers.max(available).max(1)
 }
 
+fn startup_light_bake_worker_threads(chunk_workers: usize) -> usize {
+    chunk_workers
+        .saturating_mul(2)
+        .clamp(1, STARTUP_LIGHT_BAKE_WORKER_CAP)
+}
+
 fn generate_spawn_window(
     storage: &mut mc_world::WorldStorage,
     generator: Arc<dyn mc_world::ChunkGenerator>,
     view_distance: i32,
     worker_threads: usize,
+    light_bake_worker_threads: usize,
     block_light: Option<&mc_data::block_light::BlockLightTable>,
 ) -> Result<usize> {
     let view_distance = view_distance.max(0);
@@ -894,7 +904,12 @@ fn generate_spawn_window(
         "empty world pre-generation finished",
     );
     if let Some(block_light) = block_light {
-        let baked = bake_spawn_window_light(storage, block_light, view_distance, worker_threads)?;
+        let baked = bake_spawn_window_light(
+            storage,
+            block_light,
+            view_distance,
+            light_bake_worker_threads,
+        )?;
         tracing::info!(
             baked,
             elapsed_ms = started.elapsed().as_millis(),
@@ -1447,6 +1462,15 @@ mod tests {
 
         assert_eq!(startup_chunk_worker_threads(0), available.max(1));
         assert_eq!(startup_chunk_worker_threads(available + 3), available + 3);
+        assert_eq!(startup_light_bake_worker_threads(0), 1);
+        assert_eq!(
+            startup_light_bake_worker_threads(available + 3),
+            ((available + 3) * 2).min(STARTUP_LIGHT_BAKE_WORKER_CAP)
+        );
+        assert_eq!(
+            startup_light_bake_worker_threads(100),
+            STARTUP_LIGHT_BAKE_WORKER_CAP
+        );
     }
 
     #[test]
@@ -1898,7 +1922,7 @@ mod tests {
         });
 
         assert_eq!(
-            generate_spawn_window(&mut storage, generator, 1, 4, None).unwrap(),
+            generate_spawn_window(&mut storage, generator, 1, 4, 4, None).unwrap(),
             25
         );
         assert_eq!(storage.cache_len(), 25);
@@ -1943,7 +1967,7 @@ mod tests {
         );
 
         assert_eq!(
-            generate_spawn_window(&mut storage, Arc::new(StubGen), 1, 4, Some(&table)).unwrap(),
+            generate_spawn_window(&mut storage, Arc::new(StubGen), 1, 4, 8, Some(&table)).unwrap(),
             25
         );
 
@@ -2121,7 +2145,7 @@ mod tests {
         assert_eq!(
             reopened.dirty_count(),
             16,
-            "existing-world startup should defer dirty warm-cache chunks to save-all"
+            "existing-world startup should defer dirty warm-cache chunks to startup dirty checkpoint"
         );
     }
 

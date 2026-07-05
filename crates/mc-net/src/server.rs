@@ -57,6 +57,8 @@ const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const EXTENSION_COMMAND_DRAIN_PERIOD: Duration = Duration::from_millis(10);
+const STARTUP_DIRTY_CHECKPOINT_MAX_ATTEMPTS: usize = 4;
+const STARTUP_DIRTY_CHECKPOINT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -442,6 +444,8 @@ impl BoundServer {
         let sessions = self.sessions;
         let extension = self.extension;
         let shutdown = config.shutdown.clone();
+        let startup_dirty_checkpoint =
+            spawn_startup_dirty_checkpoint(Arc::clone(&config), Arc::clone(&sessions));
         let mut connections = tokio::task::JoinSet::new();
         let entity_world_root = if let Some(world) = config.world.as_ref() {
             let storage = crate::lock_metrics::timed_guard(
@@ -765,13 +769,103 @@ impl BoundServer {
         drain_connections(&mut connections).await;
         drain_chunk_pipeline(&chunk_pipeline_resources).await;
         if shutdown.is_requested() && config.world.is_some() {
-            let report =
-                drain_entity_ticker_then_save(entity_ticker, save_all(&config, &sessions)).await;
+            let report = drain_entity_ticker_then_save(entity_ticker, async {
+                drain_startup_dirty_checkpoint(startup_dirty_checkpoint).await;
+                save_all(&config, &sessions).await
+            })
+            .await;
             log_save_report("listener shutdown final save", &report);
         } else {
             drain_entity_ticker(entity_ticker).await;
+            drain_startup_dirty_checkpoint(startup_dirty_checkpoint).await;
         }
         Ok(())
+    }
+}
+
+fn spawn_startup_dirty_checkpoint(
+    config: Arc<ServerConfig>,
+    sessions: Arc<play::SessionRegistry>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    config.world.as_ref()?;
+    Some(tokio::spawn(async move {
+        let Some(mut dirty_chunks) = startup_dirty_checkpoint_dirty_count(&config).await else {
+            return;
+        };
+        info!(dirty = dirty_chunks, "startup dirty checkpoint scheduled");
+        if config.shutdown.is_requested() {
+            return;
+        }
+        for attempt in 1..=STARTUP_DIRTY_CHECKPOINT_MAX_ATTEMPTS {
+            info!(
+                attempt,
+                dirty = dirty_chunks,
+                "startup dirty checkpoint running"
+            );
+            let report =
+                save_all_with_context("startup dirty checkpoint", &config, &sessions).await;
+            log_save_report("startup dirty checkpoint", &report);
+            if !report.is_ok() {
+                return;
+            }
+            let Some(remaining) = startup_dirty_checkpoint_remaining_dirty_count(&config).await
+            else {
+                return;
+            };
+            if remaining == 0 {
+                return;
+            }
+            if attempt == STARTUP_DIRTY_CHECKPOINT_MAX_ATTEMPTS {
+                warn!(
+                    attempts = attempt,
+                    dirty = remaining,
+                    "startup dirty checkpoint left dirty chunks for the next save-all"
+                );
+                return;
+            }
+            info!(
+                attempt,
+                dirty = remaining,
+                "startup dirty checkpoint retry scheduled"
+            );
+            dirty_chunks = remaining;
+            tokio::time::sleep(STARTUP_DIRTY_CHECKPOINT_RETRY_DELAY).await;
+        }
+    }))
+}
+
+async fn startup_dirty_checkpoint_dirty_count(config: &ServerConfig) -> Option<usize> {
+    if config.shutdown.is_requested() {
+        return None;
+    }
+    startup_dirty_checkpoint_remaining_dirty_count(config).await
+}
+
+async fn startup_dirty_checkpoint_remaining_dirty_count(config: &ServerConfig) -> Option<usize> {
+    let world = config.world.as_ref()?;
+    let storage = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::WorldStorage,
+        "startup dirty checkpoint dirty count",
+        Instant::now(),
+        world.lock().await,
+    );
+    storage.world_root()?;
+    let dirty_chunks = storage.stats().dirty_chunks;
+    (dirty_chunks > 0).then_some(dirty_chunks)
+}
+
+async fn drain_startup_dirty_checkpoint(handle: Option<tokio::task::JoinHandle<()>>) {
+    let Some(handle) = handle else {
+        return;
+    };
+    match handle.await {
+        Ok(()) => {}
+        Err(err) if err.is_cancelled() => {
+            debug!("startup dirty checkpoint task cancelled");
+        }
+        Err(err) => {
+            warn!(error = %err, "startup dirty checkpoint task failed");
+        }
     }
 }
 
@@ -1434,6 +1528,14 @@ fn is_public_bind(addr: SocketAddr) -> bool {
 }
 
 pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -> SaveAllReport {
+    save_all_with_context("save-all", config, sessions).await
+}
+
+async fn save_all_with_context(
+    context: &'static str,
+    config: &ServerConfig,
+    sessions: &play::SessionRegistry,
+) -> SaveAllReport {
     let total_started = Instant::now();
     let queue_started = Instant::now();
     let _save_guard = SAVE_COORDINATOR.get_or_init(|| Mutex::new(())).lock().await;
@@ -1500,6 +1602,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
                 region_cache_capacity = storage_before.region_cache_capacity,
                 dirty_before = storage_before.dirty_chunks,
                 dirty_after = storage_before.dirty_chunks,
+                %context,
                 "world storage save pressure"
             );
         } else {
@@ -1529,6 +1632,7 @@ pub async fn save_all(config: &ServerConfig, sessions: &play::SessionRegistry) -
                                 region_cache_capacity = storage_after.region_cache_capacity,
                                 dirty_before = storage_before.dirty_chunks,
                                 dirty_after = storage_after.dirty_chunks,
+                                %context,
                                 "world storage save pressure"
                             );
                         }
@@ -2147,6 +2251,51 @@ mod tests {
 
         assert_eq!(result, 42);
         assert_eq!(events.lock().unwrap().as_slice(), ["save"]);
+    }
+
+    #[tokio::test]
+    async fn startup_dirty_checkpoint_detects_dirty_disk_world_and_skips_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(
+            BlockRegistry::from_report(&[
+                report("minecraft:air", &[], &[(0, true, &[])]),
+                report("minecraft:stone", &[], &[(1, true, &[])]),
+            ])
+            .unwrap(),
+        );
+        let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
+        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let config = save_all_test_config(tmp.path(), Arc::clone(&blocks), items, entity_types);
+
+        assert_eq!(startup_dirty_checkpoint_dirty_count(&config).await, None);
+
+        {
+            let world = config.world.as_ref().unwrap();
+            let mut storage = world.lock().await;
+            let cpos = mc_world::ChunkPos { x: 0, z: 0 };
+            storage
+                .insert_generated_chunk(
+                    cpos,
+                    mc_world::Chunk::empty(
+                        cpos,
+                        mc_world::BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            storage
+                .set_block_at(
+                    mc_world::BlockPos { x: 1, y: 64, z: 1 },
+                    mc_world::BlockStateId(1),
+                )
+                .unwrap();
+        }
+
+        assert_eq!(startup_dirty_checkpoint_dirty_count(&config).await, Some(1));
+
+        config.shutdown.request();
+        assert_eq!(startup_dirty_checkpoint_dirty_count(&config).await, None);
     }
 
     fn save_all_test_config(

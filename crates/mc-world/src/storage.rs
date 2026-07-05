@@ -1003,6 +1003,14 @@ impl WorldStorage {
         let Some(chunk) = self.cache.get_mut(&cpos) else {
             return Vec::new();
         };
+        if max_ticks == 0
+            || chunk
+                .scheduled_block_ticks()
+                .first()
+                .is_none_or(|tick| tick.trigger_tick > world_tick)
+        {
+            return Vec::new();
+        }
         let chunk = make_cached_chunk_mut(chunk);
         chunk.drain_due_block_ticks(world_tick, max_ticks)
     }
@@ -1055,6 +1063,14 @@ impl WorldStorage {
         let Some(chunk) = self.cache.get_mut(&cpos) else {
             return Vec::new();
         };
+        if max_ticks == 0
+            || chunk
+                .scheduled_fluid_ticks()
+                .first()
+                .is_none_or(|tick| tick.trigger_tick > world_tick)
+        {
+            return Vec::new();
+        }
         let chunk = make_cached_chunk_mut(chunk);
         chunk.drain_due_fluid_ticks(world_tick, max_ticks)
     }
@@ -1960,6 +1976,45 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn cached_due_tick_drain_does_not_invalidate_dirty_shared_chunk_without_due_ticks() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let block = mc_data::Identifier::parse("minecraft:wheat").unwrap();
+        let fluid = mc_data::Identifier::parse("minecraft:water").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        assert!(
+            world
+                .schedule_block_tick(ScheduledBlockTick::new(pos, block, 20, 0))
+                .unwrap()
+        );
+        assert!(
+            world
+                .schedule_fluid_tick(ScheduledFluidTick::new(pos, fluid, 20, 0))
+                .unwrap()
+        );
+        let _shared = world.cached_chunk_snapshot(cpos).unwrap();
+        let before = world.cache.get(&cpos).unwrap().dirty_generation;
+
+        assert!(
+            world
+                .drain_due_cached_block_ticks(cpos, 19, usize::MAX)
+                .is_empty()
+        );
+        assert!(
+            world
+                .drain_due_cached_fluid_ticks(cpos, 19, usize::MAX)
+                .is_empty()
+        );
+
+        assert_eq!(world.cache.get(&cpos).unwrap().dirty_generation, before);
     }
 
     #[test]

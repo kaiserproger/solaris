@@ -52,14 +52,22 @@ async fn disk_backed_generated_world_startup_stream_budget() {
     let first_startup = first_started.elapsed();
     drive_to_play(&mut first_client, first_addr, "M100DiskA").await;
     let first_stream = drain_view_distance_window(&mut first_client).await;
+    wait_for_startup_dirty_checkpoint(
+        &mut first,
+        &first_log,
+        Duration::from_secs(30),
+        EXPECTED_SPAWN_WINDOW_CHUNKS,
+    )
+    .await;
     stop_server(&mut first_client, &mut first, &first_log).await;
     let first_log_text = std::fs::read_to_string(&first_log).expect("read first log");
-    assert_deferred_startup_flush(&first_log_text, "fresh startup");
-    assert_save_all_flushed_chunks(
+    assert_startup_checkpoint_queued(&first_log_text, "fresh startup");
+    assert_startup_dirty_checkpoint_drained(
         &first_log_text,
-        "fresh startup stop",
+        "fresh startup checkpoint",
         EXPECTED_SPAWN_WINDOW_CHUNKS,
     );
+    assert_shutdown_saves_quiescent_after_startup_checkpoint(&first_log_text, "fresh startup stop");
     assert_chunk_stream_summary(&first_log_text, "fresh startup");
 
     let second_addr = loopback_addr_with_reserved_port();
@@ -101,6 +109,32 @@ async fn disk_backed_generated_world_startup_stream_budget() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "M100 startup dirty checkpoint regression gate; requires local data/vanilla sidecars"]
+async fn disk_backed_generated_world_startup_checkpoint_survives_kill() {
+    let vanilla_dir = vanilla_data_dir();
+    assert_required_sidecars(&vanilla_dir);
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let world_dir = temp.path().join("world");
+    let log = temp.path().join("server.log");
+    let addr = loopback_addr_with_reserved_port();
+    let config = temp.path().join("server.toml");
+    write_server_config(&config, &world_dir, &vanilla_dir, addr.port());
+
+    let mut server = spawn_server(&config, &log);
+    let _client = connect_when_ready(addr, &mut server, &log).await;
+    wait_for_startup_dirty_checkpoint(
+        &mut server,
+        &log,
+        Duration::from_secs(30),
+        EXPECTED_SPAWN_WINDOW_CHUNKS,
+    )
+    .await;
+    kill_server_without_stop_and_assert_exit(&mut server, &log).await;
+    assert_spawn_window_chunks_on_disk(&world_dir, &vanilla_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "M100 existing-world missing-light startup budget gate; requires local data/vanilla sidecars"]
 async fn disk_backed_existing_world_missing_light_startup_stream_budget() {
     let vanilla_dir = vanilla_data_dir();
@@ -121,11 +155,21 @@ async fn disk_backed_existing_world_missing_light_startup_stream_budget() {
     let startup = started.elapsed();
     drive_to_play(&mut client, addr, "M100Unbaked").await;
     let stream = drain_view_distance_window(&mut client).await;
+    wait_for_startup_dirty_checkpoint(&mut server, &log, Duration::from_secs(30), EXPECTED_CHUNKS)
+        .await;
     stop_server(&mut client, &mut server, &log).await;
     let log_text = std::fs::read_to_string(&log).expect("read server log");
 
     assert_existing_missing_light_deferred_flush(&log_text, "existing missing-light startup");
-    assert_save_all_flushed_chunks(&log_text, "existing missing-light stop", EXPECTED_CHUNKS);
+    assert_startup_dirty_checkpoint_drained(
+        &log_text,
+        "existing missing-light startup checkpoint",
+        EXPECTED_CHUNKS,
+    );
+    assert_shutdown_saves_quiescent_after_startup_checkpoint(
+        &log_text,
+        "existing missing-light stop",
+    );
     assert_chunk_stream_summary(&log_text, "existing missing-light startup");
 
     eprintln!(
@@ -322,6 +366,18 @@ fn materialize_unbaked_spawn_window(world_dir: &Path, vanilla_dir: &Path) {
 
 fn spawn_window_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
     let radius = view_distance.max(0) + 1;
+    let width = radius as usize * 2 + 1;
+    let mut positions = Vec::with_capacity(width * width);
+    for z in -radius..=radius {
+        for x in -radius..=radius {
+            positions.push(mc_world::ChunkPos { x, z });
+        }
+    }
+    positions
+}
+
+fn spawn_view_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
+    let radius = view_distance.max(0);
     let width = radius as usize * 2 + 1;
     let mut positions = Vec::with_capacity(width * width);
     for z in -radius..=radius {
@@ -580,6 +636,88 @@ async fn wait_for_server_exit(child: &mut Child, log: &Path, timeout: Duration) 
     }
 }
 
+async fn wait_for_log_state<F>(
+    child: &mut Child,
+    log: &Path,
+    timeout: Duration,
+    label: &str,
+    matches: F,
+) -> String
+where
+    F: Fn(&str) -> bool,
+{
+    let deadline = Instant::now() + timeout;
+    loop {
+        let log_text = std::fs::read_to_string(log).unwrap_or_default();
+        if matches(&log_text) {
+            return log_text;
+        }
+        if let Some(status) = child.try_wait().expect("poll server process") {
+            panic!(
+                "{label}: server exited before expected log line: status={status}; log:\n{log_text}"
+            );
+        }
+        if Instant::now() >= deadline {
+            let _ = kill_server_without_stop_and_wait(child, log, label).await;
+            panic!("{label}: timed out waiting for expected log line; log:\n{log_text}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_startup_dirty_checkpoint(
+    child: &mut Child,
+    log: &Path,
+    timeout: Duration,
+    expected_chunks: usize,
+) {
+    let log_text = wait_for_log_state(
+        child,
+        log,
+        timeout,
+        "startup dirty checkpoint",
+        |log_text| startup_dirty_checkpoint_drained(log_text, expected_chunks).is_some(),
+    )
+    .await;
+    assert_startup_dirty_checkpoint_drained(&log_text, "startup dirty checkpoint", expected_chunks);
+}
+
+async fn kill_server_without_stop_and_assert_exit(child: &mut Child, log: &Path) {
+    let status = kill_server_without_stop_and_wait(child, log, "kill-without-stop").await;
+    assert!(
+        !status.success(),
+        "kill-without-stop should not look like a graceful successful stop; status={status}"
+    );
+}
+
+async fn kill_server_without_stop_and_wait(
+    child: &mut Child,
+    log: &Path,
+    label: &str,
+) -> std::process::ExitStatus {
+    assert!(
+        child.try_wait().expect("poll server before kill").is_none(),
+        "{label}: server exited before kill; log:\n{}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+    child
+        .kill()
+        .unwrap_or_else(|err| panic!("{label}: kill server without stop: {err}"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("poll killed server process") {
+            return status;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "{label}: server did not exit after kill; log:\n{}",
+                std::fs::read_to_string(log).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 fn assert_chunk_stream_summary(log: &str, label: &str) {
     let summary = log
         .lines()
@@ -640,11 +778,11 @@ fn assert_final_shutdown_save_quiescent(log: &str, label: &str) {
     }
 }
 
-fn assert_deferred_startup_flush(log: &str, label: &str) {
+fn assert_startup_checkpoint_queued(log: &str, label: &str) {
     let summary = log
         .lines()
-        .find(|line| line.contains("disk flush deferred to save-all"))
-        .unwrap_or_else(|| panic!("{label}: missing deferred startup flush log:\n{log}"));
+        .find(|line| line.contains("disk flush queued for startup dirty checkpoint"))
+        .unwrap_or_else(|| panic!("{label}: missing startup checkpoint queue log:\n{log}"));
     for expected in [
         format!("chunks={EXPECTED_SPAWN_WINDOW_CHUNKS}"),
         format!("dirty={EXPECTED_SPAWN_WINDOW_CHUNKS}"),
@@ -652,7 +790,7 @@ fn assert_deferred_startup_flush(log: &str, label: &str) {
     ] {
         assert!(
             summary.contains(&expected),
-            "{label}: deferred flush summary missing `{expected}`:\n{summary}"
+            "{label}: startup checkpoint queue summary missing `{expected}`:\n{summary}"
         );
     }
 }
@@ -675,23 +813,93 @@ fn assert_existing_missing_light_deferred_flush(log: &str, label: &str) {
     }
 }
 
-fn assert_save_all_flushed_chunks(log: &str, label: &str, expected_chunks: usize) {
-    let summary = log
+fn is_startup_dirty_checkpoint_pressure(line: &str) -> bool {
+    line.contains("startup dirty checkpoint") && line.contains("world storage save pressure")
+}
+
+fn assert_startup_dirty_checkpoint_drained(log: &str, label: &str, expected_chunks: usize) {
+    let summary = startup_dirty_checkpoint_drained(log, expected_chunks)
+        .unwrap_or_else(|| panic!("{label}: missing drained startup dirty checkpoint:\n{log}"));
+    assert_startup_dirty_checkpoint_summary(summary, label, expected_chunks);
+}
+
+#[derive(Debug)]
+struct StartupDirtyCheckpointSummary<'a> {
+    lines: Vec<&'a str>,
+    flushed: usize,
+    last: &'a str,
+}
+
+fn startup_dirty_checkpoint_drained(
+    log: &str,
+    expected_chunks: usize,
+) -> Option<StartupDirtyCheckpointSummary<'_>> {
+    let lines = log
         .lines()
-        .find(|line| {
-            line.contains("world storage save pressure")
-                && line.contains(&format!("flushed={expected_chunks}"))
-        })
-        .unwrap_or_else(|| panic!("{label}: missing save-all flush log:\n{log}"));
-    for expected in [
-        format!("planned={expected_chunks}"),
-        format!("dirty_before={expected_chunks}"),
-        "dirty_after=0".to_string(),
-    ] {
-        assert!(
-            summary.contains(&expected),
-            "{label}: save-all flush summary missing `{expected}`:\n{summary}"
-        );
+        .filter(|line| is_startup_dirty_checkpoint_pressure(line))
+        .collect::<Vec<_>>();
+    let last = *lines.last()?;
+    let flushed = lines
+        .iter()
+        .filter_map(|line| pressure_field_usize(line, "flushed"))
+        .sum();
+    (flushed == expected_chunks && pressure_field_usize(last, "dirty_after") == Some(0)).then_some(
+        StartupDirtyCheckpointSummary {
+            lines,
+            flushed,
+            last,
+        },
+    )
+}
+
+fn assert_startup_dirty_checkpoint_summary(
+    summary: StartupDirtyCheckpointSummary<'_>,
+    label: &str,
+    expected_chunks: usize,
+) {
+    assert_eq!(
+        summary.flushed,
+        expected_chunks,
+        "{label}: startup dirty checkpoint flushed unexpected total:\n{}",
+        summary.lines.join("\n")
+    );
+    assert!(
+        summary.last.contains("dirty_after=0"),
+        "{label}: startup dirty checkpoint final pressure missing `dirty_after=0`:\n{}",
+        summary.last
+    );
+}
+
+fn pressure_field_usize(line: &str, field: &str) -> Option<usize> {
+    let prefix = format!("{field}=");
+    line.split_whitespace()
+        .find_map(|part| part.strip_prefix(&prefix)?.parse().ok())
+}
+
+fn assert_shutdown_saves_quiescent_after_startup_checkpoint(log: &str, label: &str) {
+    let lines: Vec<_> = log.lines().collect();
+    let checkpoint_idx = lines
+        .iter()
+        .rposition(|line| is_startup_dirty_checkpoint_pressure(line))
+        .unwrap_or_else(|| {
+            panic!("{label}: missing startup dirty checkpoint pressure log:\n{log}")
+        });
+    let pressure_lines: Vec<_> = lines[checkpoint_idx + 1..]
+        .iter()
+        .filter(|line| line.contains("world storage save pressure"))
+        .copied()
+        .collect();
+    assert!(
+        !pressure_lines.is_empty(),
+        "{label}: missing shutdown save pressure after startup dirty checkpoint:\n{log}"
+    );
+    for pressure in pressure_lines {
+        for expected in ["flushed=0", "planned=0", "dirty_before=0", "dirty_after=0"] {
+            assert!(
+                pressure.contains(expected),
+                "{label}: shutdown save was not quiescent; missing `{expected}`:\n{pressure}"
+            );
+        }
     }
 }
 
@@ -716,4 +924,184 @@ fn assert_streamed_chunks_on_disk(
             "streamed chunk ({cx},{cz}) should exist on disk after console stop"
         );
     }
+}
+
+fn assert_spawn_window_chunks_on_disk(world_dir: &Path, vanilla_dir: &Path) {
+    let blocks_report =
+        mc_data::blocks::load_blocks_report(vanilla_dir.join("reports/blocks.json"))
+            .expect("load blocks report");
+    let block_light = mc_data::block_light::load(vanilla_dir.join("reports/block_light.json"))
+        .expect("load block light report");
+    let blocks = Arc::new(mc_world::BlockRegistry::from_report(&blocks_report).expect("registry"));
+    let mut storage = mc_world::WorldStorage::open_with_capacities(
+        world_dir,
+        blocks,
+        EXPECTED_SPAWN_WINDOW_CHUNKS,
+        9,
+    )
+    .expect("reopen generated startup checkpoint world");
+    for pos in spawn_window_positions(VIEW_DISTANCE) {
+        let chunk = storage
+            .get_chunk(pos)
+            .expect("read spawn window chunk after kill-without-stop");
+        assert!(
+            chunk.is_some(),
+            "spawn window chunk ({}, {}) should exist on disk after startup dirty checkpoint",
+            pos.x,
+            pos.z
+        );
+    }
+    for pos in spawn_view_positions(VIEW_DISTANCE) {
+        let chunk = storage
+            .get_chunk(pos)
+            .expect("read baked spawn view chunk after kill-without-stop")
+            .unwrap_or_else(|| {
+                panic!(
+                    "spawn view chunk ({}, {}) should exist on disk after startup dirty checkpoint",
+                    pos.x, pos.z
+                )
+            });
+        let baked = mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights)
+            .unwrap_or_else(|| {
+                panic!(
+                    "spawn view chunk ({}, {}) should retain baked light arrays after startup dirty checkpoint",
+                    pos.x, pos.z
+                )
+            });
+        assert_spawn_view_chunk_light_sections_survived(chunk, &block_light, pos);
+        assert_eq!(
+            baked.sky_at(8, mc_world::MAX_Y - 1, 8),
+            15,
+            "spawn view chunk ({}, {}) should retain top skylight after startup dirty checkpoint",
+            pos.x,
+            pos.z
+        );
+    }
+}
+
+fn assert_spawn_view_chunk_light_sections_survived(
+    chunk: &mc_world::Chunk,
+    block_light: &mc_data::block_light::BlockLightTable,
+    pos: mc_world::ChunkPos,
+) {
+    assert_eq!(
+        chunk.section_lights.len(),
+        mc_world::SECTION_COUNT,
+        "spawn view chunk ({}, {}) should retain one light slot per section",
+        pos.x,
+        pos.z
+    );
+    for (idx, section) in chunk.section_lights.iter().enumerate() {
+        if let Some(sky) = &section.sky {
+            assert_eq!(
+                sky.len(),
+                mc_world::LIGHT_LAYER_BYTES,
+                "spawn view chunk ({}, {}) sky light section {idx} should retain a full light array",
+                pos.x,
+                pos.z
+            );
+        }
+        if let Some(block) = &section.block {
+            assert_eq!(
+                block.len(),
+                mc_world::LIGHT_LAYER_BYTES,
+                "spawn view chunk ({}, {}) block light section {idx} should retain a full light array",
+                pos.x,
+                pos.z
+            );
+        }
+    }
+
+    let expected_sky_sections = expected_direct_sky_sections(chunk, block_light);
+    let stored_sky_sections = chunk
+        .section_lights
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, section)| section.sky.as_ref().map(|_| idx))
+        .collect::<HashSet<_>>();
+    for section_idx in &expected_sky_sections {
+        assert!(
+            stored_sky_sections.contains(section_idx),
+            "spawn view chunk ({}, {}) missing persisted sky light section {section_idx}; expected={expected_sky_sections:?} stored={stored_sky_sections:?}",
+            pos.x,
+            pos.z
+        );
+    }
+    assert_full_direct_sky_sections_survived(chunk, block_light, pos);
+}
+
+fn expected_direct_sky_sections(
+    chunk: &mc_world::Chunk,
+    block_light: &mc_data::block_light::BlockLightTable,
+) -> HashSet<usize> {
+    let mut sections = HashSet::new();
+    for z in 0..16 {
+        for x in 0..16 {
+            for y in (mc_world::MIN_Y..mc_world::MAX_Y).rev() {
+                let Some(state) = chunk.get_block(x, y, z) else {
+                    break;
+                };
+                if !block_light.propagates_sky(state.0).unwrap_or(true) {
+                    break;
+                }
+                sections.insert((y - mc_world::MIN_Y) as usize / mc_world::SECTION_DIM);
+            }
+        }
+    }
+    sections
+}
+
+fn assert_full_direct_sky_sections_survived(
+    chunk: &mc_world::Chunk,
+    block_light: &mc_data::block_light::BlockLightTable,
+    pos: mc_world::ChunkPos,
+) {
+    let first_full_sky_section = first_full_direct_sky_section(chunk, block_light);
+    assert!(
+        first_full_sky_section < mc_world::SECTION_COUNT,
+        "spawn view chunk ({}, {}) should have at least one full direct-sky section",
+        pos.x,
+        pos.z
+    );
+    for section_idx in first_full_sky_section..mc_world::SECTION_COUNT {
+        let sky = chunk.section_lights[section_idx]
+            .sky
+            .as_deref()
+            .unwrap_or_else(|| {
+                panic!(
+                    "spawn view chunk ({}, {}) should retain full SkyLight section {section_idx} above sky blockers",
+                    pos.x, pos.z
+                )
+            });
+        assert!(
+            sky.iter().all(|byte| *byte == 0xFF),
+            "spawn view chunk ({}, {}) full SkyLight section {section_idx} should persist as skylight 15",
+            pos.x,
+            pos.z
+        );
+    }
+}
+
+fn first_full_direct_sky_section(
+    chunk: &mc_world::Chunk,
+    block_light: &mc_data::block_light::BlockLightTable,
+) -> usize {
+    let first_sky_y = (0..16)
+        .flat_map(|z| {
+            (0..16).filter_map(move |x| {
+                (mc_world::MIN_Y..mc_world::MAX_Y)
+                    .rev()
+                    .find(|y| {
+                        let Some(state) = chunk.get_block(x, *y, z) else {
+                            return false;
+                        };
+                        !block_light.propagates_sky(state.0).unwrap_or(true)
+                    })
+                    .map(|y| y + 1)
+            })
+        })
+        .max()
+        .unwrap_or(mc_world::MIN_Y);
+    let offset = (first_sky_y - mc_world::MIN_Y).max(0) as usize;
+    offset / mc_world::SECTION_DIM + usize::from(!offset.is_multiple_of(mc_world::SECTION_DIM))
 }

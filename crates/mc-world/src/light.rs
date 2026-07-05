@@ -261,6 +261,7 @@ pub struct LightWorkspace {
     opacity: Vec<u8>,
     propagates_sky: Vec<bool>,
     queue: VecDeque<u32>,
+    emitters: Vec<u32>,
 }
 
 impl LightWorkspace {
@@ -272,6 +273,7 @@ impl LightWorkspace {
             opacity: vec![0; N_VOL],
             propagates_sky: vec![true; N_VOL],
             queue: VecDeque::new(),
+            emitters: Vec::new(),
         }
     }
 
@@ -281,6 +283,7 @@ impl LightWorkspace {
         self.opacity.fill(0);
         self.propagates_sky.fill(true);
         self.queue.clear();
+        self.emitters.clear();
     }
 }
 
@@ -1008,13 +1011,16 @@ fn compute_chunk_light_slow_in(
         &mut ws.opacity,
         &mut ws.propagates_sky,
         &mut ws.block,
+        &mut ws.emitters,
     );
 
     seed_sky_from_open_columns(&ws.propagates_sky, &mut ws.sky, &mut ws.queue);
     bfs(&ws.opacity, &mut ws.sky, &mut ws.queue);
 
-    seed_block_from_emission(&ws.block, &mut ws.queue);
-    bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
+    if !ws.emitters.is_empty() {
+        ws.queue.extend(ws.emitters.iter().copied());
+        bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
+    }
 
     extract_centre(&ws.sky, &ws.block)
 }
@@ -1163,8 +1169,8 @@ fn populate_grids(
     opacity: &mut [u8],
     propagates_sky: &mut [bool],
     block_seed: &mut [u8],
+    emitters: &mut Vec<u32>,
 ) {
-    let air = BlockStateId(0);
     for (cz, row) in neighbourhood.iter().enumerate() {
         for (cx, slot) in row.iter().enumerate() {
             let Some(chunk) = *slot else {
@@ -1172,21 +1178,104 @@ fn populate_grids(
                 // defaults (opacity=0, propagates_sky=true, emission=0).
                 continue;
             };
-            for ly in 0..WORLD_HEIGHT {
-                let world_y = MIN_Y + ly as i32;
-                for lz in 0..SECTION_DIM {
-                    for lx in 0..SECTION_DIM {
-                        let gx = cx * SECTION_DIM + lx;
-                        let gz = cz * SECTION_DIM + lz;
-                        let idx = grid_idx(gx, ly, gz);
-                        let state = chunk.get_block(lx as u8, world_y, lz as u8).unwrap_or(air);
-                        opacity[idx] = table.opacity(state.0).unwrap_or(0);
-                        propagates_sky[idx] = table.propagates_sky(state.0).unwrap_or(true);
-                        let emit = table.emission(state.0).unwrap_or(0);
-                        if emit > 0 {
-                            block_seed[idx] = emit;
-                        }
+            for (section_idx, section) in chunk.sections.iter().enumerate().take(SECTION_COUNT) {
+                let base_ly = section_idx * SECTION_DIM;
+                if section.palette().is_none() {
+                    let state = section.get(0, 0, 0);
+                    let op = table.opacity(state.0).unwrap_or(0);
+                    let sky_pass = table.propagates_sky(state.0).unwrap_or(true);
+                    let emit = table.emission(state.0).unwrap_or(0);
+                    if op == 0 && sky_pass && emit == 0 {
+                        continue;
                     }
+                    populate_uniform_section(
+                        cx,
+                        cz,
+                        base_ly,
+                        op,
+                        sky_pass,
+                        emit,
+                        opacity,
+                        propagates_sky,
+                        block_seed,
+                        emitters,
+                    );
+                    continue;
+                }
+
+                populate_indirect_section(
+                    cx,
+                    cz,
+                    base_ly,
+                    section,
+                    table,
+                    opacity,
+                    propagates_sky,
+                    block_seed,
+                    emitters,
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn populate_uniform_section(
+    cx: usize,
+    cz: usize,
+    base_ly: usize,
+    op: u8,
+    sky_pass: bool,
+    emit: u8,
+    opacity: &mut [u8],
+    propagates_sky: &mut [bool],
+    block_seed: &mut [u8],
+    emitters: &mut Vec<u32>,
+) {
+    for sy in 0..SECTION_DIM {
+        let ly = base_ly + sy;
+        for lz in 0..SECTION_DIM {
+            let gz = cz * SECTION_DIM + lz;
+            for lx in 0..SECTION_DIM {
+                let gx = cx * SECTION_DIM + lx;
+                let idx = grid_idx(gx, ly, gz);
+                opacity[idx] = op;
+                propagates_sky[idx] = sky_pass;
+                if emit > 0 {
+                    block_seed[idx] = emit;
+                    emitters.push(idx as u32);
+                }
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn populate_indirect_section(
+    cx: usize,
+    cz: usize,
+    base_ly: usize,
+    section: &crate::section::ChunkSection,
+    table: &BlockLightTable,
+    opacity: &mut [u8],
+    propagates_sky: &mut [bool],
+    block_seed: &mut [u8],
+    emitters: &mut Vec<u32>,
+) {
+    for sy in 0..SECTION_DIM {
+        let ly = base_ly + sy;
+        for lz in 0..SECTION_DIM {
+            let gz = cz * SECTION_DIM + lz;
+            for lx in 0..SECTION_DIM {
+                let gx = cx * SECTION_DIM + lx;
+                let idx = grid_idx(gx, ly, gz);
+                let state = section.get(lx as u8, sy as u8, lz as u8);
+                opacity[idx] = table.opacity(state.0).unwrap_or(0);
+                propagates_sky[idx] = table.propagates_sky(state.0).unwrap_or(true);
+                let emit = table.emission(state.0).unwrap_or(0);
+                if emit > 0 {
+                    block_seed[idx] = emit;
+                    emitters.push(idx as u32);
                 }
             }
         }
@@ -1258,14 +1347,6 @@ fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize) -> bool {
         }
     }
     false
-}
-
-fn seed_block_from_emission(block: &[u8], queue: &mut VecDeque<u32>) {
-    for (idx, &v) in block.iter().enumerate() {
-        if v > 0 {
-            queue.push_back(idx as u32);
-        }
-    }
 }
 
 /// Generic 6-neighbour BFS used by both passes.
