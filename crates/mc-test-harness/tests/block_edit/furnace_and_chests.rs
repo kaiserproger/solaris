@@ -1013,7 +1013,7 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs() {
 }
 
 #[tokio::test]
-async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
+async fn server_origin_hopper_tick_updates_open_chests_and_comparator_over_tcp() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -1044,6 +1044,7 @@ async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let chest_id = mc_data::Identifier::parse("minecraft:chest").unwrap();
     let hopper_id = mc_data::Identifier::parse("minecraft:hopper").unwrap();
+    let comparator_id = mc_data::Identifier::parse("minecraft:comparator").unwrap();
     let dirt_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item");
@@ -1057,11 +1058,31 @@ async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
             ],
         )
         .expect("enabled down-facing hopper state");
+    let comparator_off_state_id = blocks
+        .by_name_and_props(
+            &comparator_id,
+            &[
+                ("facing".to_string(), "west".to_string()),
+                ("mode".to_string(), "compare".to_string()),
+                ("powered".to_string(), "false".to_string()),
+            ],
+        )
+        .expect("unpowered west-facing comparator state");
+    let comparator_on_state_id = blocks
+        .by_name_and_props(
+            &comparator_id,
+            &[
+                ("facing".to_string(), "west".to_string()),
+                ("mode".to_string(), "compare".to_string()),
+                ("powered".to_string(), "true".to_string()),
+            ],
+        )
+        .expect("powered west-facing comparator state");
     let chest_menu_id = 2;
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
-        motd: "M100 hopper TCP chest updates".into(),
+        motd: "M100 hopper TCP chest and comparator updates".into(),
         max_players: 8,
         view_distance: VIEW_DISTANCE,
         data,
@@ -1102,6 +1123,10 @@ async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
         y: hopper_pos.y - 1,
         ..hopper_pos
     };
+    let comparator_pos = mc_world::BlockPos {
+        x: target_pos.x + 1,
+        ..target_pos
+    };
     {
         let mut world = world_handle.lock().await;
         world
@@ -1116,6 +1141,10 @@ async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
             .set_block_at(target_pos, chest_state_id)
             .expect("set target chest block")
             .expect("target chunk exists");
+        world
+            .set_block_at(comparator_pos, comparator_off_state_id)
+            .expect("set comparator block")
+            .expect("comparator chunk exists");
 
         let mut source_chest = mc_world::ChestBlockEntity::default();
         source_chest.slots[0] = mc_world::FurnaceSlot {
@@ -1218,6 +1247,12 @@ async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
         target_dirt.state_id > target_initial.state_id,
         "cooldown-delayed hopper eject should advance the target chest state"
     );
+    wait_for_block_update(
+        &mut target_client,
+        (comparator_pos.x, comparator_pos.y, comparator_pos.z),
+        comparator_on_state_id.0 as i32,
+    )
+    .await;
 }
 
 #[tokio::test]
