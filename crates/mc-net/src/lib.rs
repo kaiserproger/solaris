@@ -30,8 +30,8 @@ pub use autoscale_soak::{
 };
 pub use chunk_pipeline::{
     ChunkLoadSource, ChunkPipelineGeneration, ChunkPipelinePolicy, ChunkPipelineResourceMetrics,
-    ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPriority, ChunkRequest,
-    ChunkScheduler, PreparedChunk,
+    ChunkPipelineResourceSnapshot, ChunkPipelineStopReason, ChunkPipelineStopReasonCounts,
+    ChunkPriority, ChunkRequest, ChunkScheduler, PreparedChunk,
 };
 pub use control_plane::{
     AutoscaleAction, AutoscaleDecision, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,

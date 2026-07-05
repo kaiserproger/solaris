@@ -515,9 +515,54 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
     let pressure_after = wait_for_outbound_pressure_increase(&server, pressure_before).await;
     assert_slow_reader_retry_bounded(pressure_before, pressure_after);
 
+    let chunk_snapshot = server.chunk_pipeline_metrics.snapshot();
+    let stop_reasons = server.chunk_pipeline_metrics.observed_stop_reasons();
+    assert!(
+        !stop_reasons.is_empty(),
+        "slow-reader gate should feed live chunk-stream stop reasons into autoscale accounting"
+    );
+    let scenarios = [mc_net::AutoscaleSoakScenario::SlowClient];
+    let autoscale_report =
+        mc_net::AutoscaleSoakReport::from_snapshot(mc_net::AutoscaleSoakSnapshot {
+            profile: mc_net::AutoscaleSoakProfile::Balanced,
+            scenarios: &scenarios,
+            chunk_policy: server.chunk_policy,
+            chunk_resources: chunk_snapshot,
+            chunk_stop_reasons: &stop_reasons,
+            outbound_pressure: pressure_after,
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+        });
+    assert!(
+        matches!(
+            autoscale_report.worker_backpressure,
+            mc_net::AutoscalePrimitiveStatus::Present
+        ),
+        "slow-reader live resource metrics should stay within configured permits: {autoscale_report:?}"
+    );
+    assert!(
+        autoscale_report.slow_client_pressure_observed
+            && matches!(
+                autoscale_report.slow_client_pressure,
+                mc_net::AutoscalePrimitiveStatus::Present
+            ),
+        "slow-reader pressure should count as explicitly scoped slow-client evidence: {autoscale_report:?}"
+    );
+    assert!(
+        !autoscale_report.queue_saturation_observed
+            && autoscale_report
+                .gaps
+                .contains(&"queue-saturation scenario not run"),
+        "slow-reader report must not promote unattempted queue-saturation evidence: {autoscale_report:?}"
+    );
+    assert!(
+        autoscale_report.is_degraded(),
+        "slow-reader bounded report must remain degraded without full O3 soak/recovery evidence"
+    );
+
     let pressure = mc_net::lock_pressure_snapshot();
     eprintln!(
-        "M52 slow_reader active_spawns={} summons={} paused_start=({:.1},{:.1},{:.1}) outbound_before={:?} outbound_after={:?} session_lock_max_hold_us={} session_lock_wait_us={}",
+        "M52 slow_reader active_spawns={} summons={} paused_start=({:.1},{:.1},{:.1}) outbound_before={:?} outbound_after={:?} chunk_pipeline={:?} stop_reasons={:?} autoscale_report={:?} session_lock_max_hold_us={} session_lock_wait_us={}",
         spawns,
         M52_SLOW_READER_SUMMONS,
         paused_reader.sync.x,
@@ -525,6 +570,9 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
         paused_reader.sync.z,
         pressure_before,
         pressure_after,
+        chunk_snapshot,
+        stop_reasons,
+        autoscale_report,
         pressure.session_registry.max_hold_us,
         pressure.session_registry.wait_us,
     );
@@ -761,6 +809,7 @@ struct LoadServer {
     shutdown: mc_net::ShutdownHandle,
     runtime_control: Option<mc_net::RuntimeControlHandle>,
     serve_task: tokio::task::JoinHandle<std::io::Result<()>>,
+    chunk_policy: mc_net::ChunkPipelinePolicy,
     chunk_io_threads: usize,
     chunk_worker_threads: usize,
     world_dir: Option<tempfile::TempDir>,
@@ -904,6 +953,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         shutdown,
         runtime_control,
         serve_task,
+        chunk_policy: chunk_pipeline,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
         world_dir,
@@ -967,6 +1017,8 @@ async fn wait_for_outbound_pressure_increase(
         let after = server.outbound_pressure_snapshot();
         if after.reliable_command_retries > before.reliable_command_retries
             || after.visibility_command_drops > before.visibility_command_drops
+            || after.slow_client_write_timeouts > before.slow_client_write_timeouts
+            || after.slow_client_pressure_sheds > before.slow_client_pressure_sheds
         {
             return after;
         }

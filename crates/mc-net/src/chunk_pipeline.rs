@@ -63,6 +63,7 @@ pub struct ChunkPipelineResourceMetrics {
     max_io_active: Arc<AtomicUsize>,
     active_cpu: Arc<AtomicUsize>,
     max_cpu_active: Arc<AtomicUsize>,
+    stop_reasons: Arc<ChunkPipelineStopReasonMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +72,32 @@ pub struct ChunkPipelineResourceSnapshot {
     pub max_io_active: usize,
     pub active_cpu: usize,
     pub max_cpu_active: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkPipelineStopReasonCounts {
+    pub batch_limit: usize,
+    pub time_budget: usize,
+    pub send_budget: usize,
+    pub load_budget: usize,
+    pub generate_budget: usize,
+    pub memory_pressure: usize,
+    pub queue_full: usize,
+    pub queue_empty: usize,
+    pub complete: usize,
+}
+
+#[derive(Debug, Default)]
+struct ChunkPipelineStopReasonMetrics {
+    batch_limit: AtomicUsize,
+    time_budget: AtomicUsize,
+    send_budget: AtomicUsize,
+    load_budget: AtomicUsize,
+    generate_budget: AtomicUsize,
+    memory_pressure: AtomicUsize,
+    queue_full: AtomicUsize,
+    queue_empty: AtomicUsize,
+    complete: AtomicUsize,
 }
 
 pub(crate) struct ChunkPipelinePermit {
@@ -94,6 +121,87 @@ impl ChunkPipelineResourceMetrics {
             max_cpu_active: self.max_cpu_active.load(Ordering::Acquire),
         }
     }
+
+    #[must_use]
+    pub fn stop_reason_counts(&self) -> ChunkPipelineStopReasonCounts {
+        self.stop_reasons.snapshot()
+    }
+
+    #[must_use]
+    pub fn observed_stop_reasons(&self) -> Vec<ChunkPipelineStopReason> {
+        self.stop_reason_counts().observed_reasons()
+    }
+
+    pub(crate) fn record_stop_reason(&self, reason: ChunkPipelineStopReason) {
+        self.stop_reasons
+            .counter(reason)
+            .fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl ChunkPipelineStopReasonCounts {
+    #[must_use]
+    pub fn count(self, reason: ChunkPipelineStopReason) -> usize {
+        match reason {
+            ChunkPipelineStopReason::BatchLimit => self.batch_limit,
+            ChunkPipelineStopReason::TimeBudget => self.time_budget,
+            ChunkPipelineStopReason::SendBudget => self.send_budget,
+            ChunkPipelineStopReason::LoadBudget => self.load_budget,
+            ChunkPipelineStopReason::GenerateBudget => self.generate_budget,
+            ChunkPipelineStopReason::MemoryPressure => self.memory_pressure,
+            ChunkPipelineStopReason::QueueFull => self.queue_full,
+            ChunkPipelineStopReason::QueueEmpty => self.queue_empty,
+            ChunkPipelineStopReason::Complete => self.complete,
+        }
+    }
+
+    #[must_use]
+    pub fn observed_reasons(self) -> Vec<ChunkPipelineStopReason> {
+        [
+            ChunkPipelineStopReason::BatchLimit,
+            ChunkPipelineStopReason::TimeBudget,
+            ChunkPipelineStopReason::SendBudget,
+            ChunkPipelineStopReason::LoadBudget,
+            ChunkPipelineStopReason::GenerateBudget,
+            ChunkPipelineStopReason::MemoryPressure,
+            ChunkPipelineStopReason::QueueFull,
+            ChunkPipelineStopReason::QueueEmpty,
+            ChunkPipelineStopReason::Complete,
+        ]
+        .into_iter()
+        .filter(|reason| self.count(*reason) > 0)
+        .collect()
+    }
+}
+
+impl ChunkPipelineStopReasonMetrics {
+    fn snapshot(&self) -> ChunkPipelineStopReasonCounts {
+        ChunkPipelineStopReasonCounts {
+            batch_limit: self.batch_limit.load(Ordering::Acquire),
+            time_budget: self.time_budget.load(Ordering::Acquire),
+            send_budget: self.send_budget.load(Ordering::Acquire),
+            load_budget: self.load_budget.load(Ordering::Acquire),
+            generate_budget: self.generate_budget.load(Ordering::Acquire),
+            memory_pressure: self.memory_pressure.load(Ordering::Acquire),
+            queue_full: self.queue_full.load(Ordering::Acquire),
+            queue_empty: self.queue_empty.load(Ordering::Acquire),
+            complete: self.complete.load(Ordering::Acquire),
+        }
+    }
+
+    fn counter(&self, reason: ChunkPipelineStopReason) -> &AtomicUsize {
+        match reason {
+            ChunkPipelineStopReason::BatchLimit => &self.batch_limit,
+            ChunkPipelineStopReason::TimeBudget => &self.time_budget,
+            ChunkPipelineStopReason::SendBudget => &self.send_budget,
+            ChunkPipelineStopReason::LoadBudget => &self.load_budget,
+            ChunkPipelineStopReason::GenerateBudget => &self.generate_budget,
+            ChunkPipelineStopReason::MemoryPressure => &self.memory_pressure,
+            ChunkPipelineStopReason::QueueFull => &self.queue_full,
+            ChunkPipelineStopReason::QueueEmpty => &self.queue_empty,
+            ChunkPipelineStopReason::Complete => &self.complete,
+        }
+    }
 }
 
 impl ChunkPipelineResources {
@@ -114,6 +222,10 @@ impl ChunkPipelineResources {
     #[must_use]
     pub(crate) fn metrics(&self) -> ChunkPipelineResourceMetrics {
         self.metrics.clone()
+    }
+
+    pub(crate) fn record_stop_reason(&self, reason: ChunkPipelineStopReason) {
+        self.metrics.record_stop_reason(reason);
     }
 
     pub(crate) async fn acquire_io(&self) -> Result<ChunkPipelinePermit, AcquireError> {
@@ -338,6 +450,30 @@ mod tests {
 
     fn priority(sequence: u32) -> ChunkPriority {
         ChunkPriority { ring: 0, sequence }
+    }
+
+    #[test]
+    fn resource_metrics_record_stop_reasons_without_touching_active_permits() {
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let metrics = resources.metrics();
+
+        resources.record_stop_reason(ChunkPipelineStopReason::QueueFull);
+        resources.record_stop_reason(ChunkPipelineStopReason::QueueFull);
+        resources.record_stop_reason(ChunkPipelineStopReason::SendBudget);
+
+        let active = metrics.snapshot();
+        assert_eq!(active.active_io, 0);
+        assert_eq!(active.active_cpu, 0);
+        let counts = metrics.stop_reason_counts();
+        assert_eq!(counts.queue_full, 2);
+        assert_eq!(counts.send_budget, 1);
+        assert_eq!(
+            metrics.observed_stop_reasons(),
+            vec![
+                ChunkPipelineStopReason::SendBudget,
+                ChunkPipelineStopReason::QueueFull,
+            ]
+        );
     }
 
     #[test]

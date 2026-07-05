@@ -1090,6 +1090,11 @@ impl ChunkStreamState {
         self.summary_logged = false;
     }
 
+    fn set_stop_reason(&mut self, reason: ChunkPipelineStopReason) {
+        self.last_stop_reason = reason;
+        self.resources.record_stop_reason(reason);
+    }
+
     pub(super) async fn step<W>(
         &mut self,
         writer: &mut W,
@@ -1124,7 +1129,7 @@ impl ChunkStreamState {
         }
 
         if self.scheduler.is_complete() {
-            self.last_stop_reason = ChunkPipelineStopReason::Complete;
+            self.set_stop_reason(ChunkPipelineStopReason::Complete);
             return Ok(ChunkStreamStep::Complete);
         }
         if !made_send_progress {
@@ -1151,7 +1156,7 @@ impl ChunkStreamState {
             }
         }
         if processed == limit && !self.ready.is_empty() {
-            self.last_stop_reason = ChunkPipelineStopReason::SendBudget;
+            self.set_stop_reason(ChunkPipelineStopReason::SendBudget);
         }
         Ok(processed > 0)
     }
@@ -1183,7 +1188,7 @@ impl ChunkStreamState {
         let unloads = self.apply_runtime_control_limits(decision.limits);
         self.memory_pressure_active = memory_pressure_active;
         if memory_pressure_active {
-            self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
+            self.set_stop_reason(ChunkPipelineStopReason::MemoryPressure);
         }
         unloads
     }
@@ -1218,29 +1223,30 @@ impl ChunkStreamState {
         let mut budget_deferrals = 0usize;
         loop {
             if self.scheduler.in_flight_len() >= self.result_queue_size {
-                self.last_stop_reason = ChunkPipelineStopReason::QueueFull;
+                self.set_stop_reason(ChunkPipelineStopReason::QueueFull);
                 break;
             }
             if self.memory_pressure_active {
-                self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
+                self.set_stop_reason(ChunkPipelineStopReason::MemoryPressure);
                 break;
             }
             if dispatched_this_turn >= self.policy.chunk_prepare_batch_size {
-                self.last_stop_reason = self.prepare_limit_stop_reason;
+                self.set_stop_reason(self.prepare_limit_stop_reason);
                 break;
             }
             if self.policy.chunk_prepare_budget_ms > 0
                 && started.elapsed().as_millis() as u64 >= self.policy.chunk_prepare_budget_ms
             {
-                self.last_stop_reason = ChunkPipelineStopReason::TimeBudget;
+                self.set_stop_reason(ChunkPipelineStopReason::TimeBudget);
                 break;
             }
             let Some(request) = self.scheduler.poll_next() else {
-                self.last_stop_reason = if self.scheduler.in_flight_len() == 0 {
+                let stop_reason = if self.scheduler.in_flight_len() == 0 {
                     ChunkPipelineStopReason::Complete
                 } else {
                     ChunkPipelineStopReason::QueueEmpty
                 };
+                self.set_stop_reason(stop_reason);
                 break;
             };
             let prepared = self
@@ -1263,12 +1269,12 @@ impl ChunkStreamState {
             if budget_exhausted {
                 let stop_reason = budget_class.stop_reason();
                 if !self.scheduler.defer(request) {
-                    self.last_stop_reason = stop_reason;
+                    self.set_stop_reason(stop_reason);
                     break;
                 }
                 budget_deferrals += 1;
                 if budget_deferrals >= self.scheduler.queued_len().max(1) {
-                    self.last_stop_reason = stop_reason;
+                    self.set_stop_reason(stop_reason);
                     break;
                 }
                 continue;
@@ -1290,7 +1296,7 @@ impl ChunkStreamState {
             if self.defer_for_pressure_cooldown(request) {
                 cooldown_deferrals += 1;
                 if cooldown_deferrals >= self.scheduler.queued_len().max(1) {
-                    self.last_stop_reason = ChunkPipelineStopReason::QueueEmpty;
+                    self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
                     break;
                 }
                 continue;
@@ -1334,7 +1340,7 @@ impl ChunkStreamState {
     fn shed_memory_pressure_work(&mut self) {
         let ready = self.ready.len();
         let in_flight = self.scheduler.in_flight_len();
-        self.last_stop_reason = ChunkPipelineStopReason::MemoryPressure;
+        self.set_stop_reason(ChunkPipelineStopReason::MemoryPressure);
         if ready == 0 && in_flight == 0 {
             return;
         }
@@ -3360,6 +3366,8 @@ mod tests {
             chunk_result_queue_size: 4,
             ..ChunkPipelinePolicy::default()
         };
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let metrics = resources.metrics();
         let mut stream = ChunkStreamState::new(
             Arc::clone(&world),
             Arc::new(test_biome_registry()),
@@ -3382,7 +3390,7 @@ mod tests {
             0,
             0.0,
             1,
-            ChunkPipelineResources::with_limits(1, 1),
+            resources,
             policy,
         );
         for _ in 0..3 {
@@ -3414,6 +3422,12 @@ mod tests {
         assert_eq!(stream.absent, 1);
         assert_eq!(stream.ready.len(), 2);
         assert_eq!(stream.last_stop_reason, ChunkPipelineStopReason::SendBudget);
+        assert_eq!(metrics.stop_reason_counts().send_budget, 1);
+        assert!(
+            metrics
+                .observed_stop_reasons()
+                .contains(&ChunkPipelineStopReason::SendBudget)
+        );
     }
 
     #[tokio::test]
