@@ -5210,6 +5210,269 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
 }
 
 #[tokio::test]
+async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let source_left_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let source_right_pos = mc_world::BlockPos { x: 2, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage
+        .set_block_at(source_left_pos, BlockStateId(1))
+        .unwrap();
+    storage
+        .set_block_at(source_right_pos, BlockStateId(1))
+        .unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    storage
+        .set_chest_block_entity(source_left_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    let mut source_right = mc_world::ChestBlockEntity::default();
+    source_right.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage
+        .set_chest_block_entity(source_right_pos, source_right)
+        .unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    register_loaded_button_session(&sessions, "DoubleChestSourceHopper");
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    let mut storage = world.lock().await;
+    let source_left = storage
+        .chest_block_entity(source_left_pos)
+        .unwrap()
+        .expect("source left chest");
+    let source_right = storage
+        .chest_block_entity(source_right_pos)
+        .unwrap()
+        .expect("source right chest");
+    let target = storage
+        .chest_block_entity(target_pos)
+        .unwrap()
+        .expect("target chest");
+    assert!(
+        source_left
+            .slots
+            .iter()
+            .all(mc_world::FurnaceSlot::is_empty)
+    );
+    assert!(
+        source_right
+            .slots
+            .iter()
+            .all(mc_world::FurnaceSlot::is_empty)
+    );
+    assert_eq!(
+        target.slots[0],
+        mc_world::FurnaceSlot {
+            count: 1,
+            item_id: 42,
+            damage: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let source_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let target_left_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
+    let target_right_pos = mc_world::BlockPos { x: 3, y: 65, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage
+        .set_block_at(target_left_pos, BlockStateId(1))
+        .unwrap();
+    storage
+        .set_block_at(target_right_pos, BlockStateId(1))
+        .unwrap();
+    let mut source = mc_world::ChestBlockEntity::default();
+    source.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_chest_block_entity(source_pos, source).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    let mut target_left = mc_world::ChestBlockEntity::default();
+    for slot in &mut target_left.slots {
+        *slot = mc_world::FurnaceSlot {
+            count: 64,
+            item_id: 42,
+            damage: None,
+        };
+    }
+    storage
+        .set_chest_block_entity(target_left_pos, target_left)
+        .unwrap();
+    storage
+        .set_chest_block_entity(target_right_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(52),
+        name: "DoubleChestTargetViewer".to_string(),
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let _ = sessions.mark_loaded(session_id, (0, 0));
+    assert_eq!(
+        sessions.register_chest_viewer(session_id, target_left_pos),
+        1
+    );
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let target_left = storage
+            .chest_block_entity(target_left_pos)
+            .unwrap()
+            .expect("target left chest");
+        let target_right = storage
+            .chest_block_entity(target_right_pos)
+            .unwrap()
+            .expect("target right chest");
+        assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(target_left.slots.iter().all(|slot| {
+            *slot
+                == mc_world::FurnaceSlot {
+                    count: 64,
+                    item_id: 42,
+                    damage: None,
+                }
+        }));
+        assert_eq!(
+            target_right.slots[0],
+            mc_world::FurnaceSlot {
+                count: 1,
+                item_id: 42,
+                damage: None,
+            }
+        );
+    }
+
+    match rx.try_recv().expect("double chest target receives slots") {
+        OutboundCommand::ChestSlots {
+            position,
+            state_id,
+            slots,
+        } => {
+            assert_eq!(position, target_left_pos);
+            assert_eq!(state_id, 2);
+            assert_eq!(slots.len(), 54);
+            assert_eq!(slots[0], ItemStack::new(42, 64));
+            assert_eq!(slots[27], ItemStack::new(42, 1));
+        }
+        other => panic!("unexpected outbound command: {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn scheduled_hopper_tick_does_not_extract_empty_furnace_output() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
