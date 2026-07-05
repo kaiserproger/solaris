@@ -10624,6 +10624,7 @@ where
 
         tokio::select! {
             command = recv_outbound_command(&mut outbound_rx, &mut pending_outbound) => {
+                let mut close_session = false;
                 let outcome = slow_client_outbound_write_timeout(async {
                     match command {
                     Some(OutboundCommand::BlockDeltas(deltas)) => {
@@ -10768,6 +10769,17 @@ where
                             state.active_container = Some(ActiveContainer::Chest(window));
                         }
                     }
+                    Some(OutboundCommand::DisconnectPlayer { reason }) => {
+                        write_packet(
+                            writer,
+                            &PlayDisconnect {
+                                reason_nbt: text_component_nbt(&reason)?,
+                            },
+                            compression,
+                        )
+                        .await?;
+                        close_session = true;
+                    }
                     None => {}
                     }
                     Ok(())
@@ -10779,6 +10791,9 @@ where
                         timeout_ms = SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT.as_millis() as u64,
                         "slow client outbound write timed out; closing play session"
                     );
+                    return Ok(());
+                }
+                if close_session {
                     return Ok(());
                 }
             }

@@ -532,6 +532,7 @@ async fn paused_reader_does_not_stall_active_entity_broadcasts() {
             outbound_pressure: pressure_after,
             save_all: None,
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
     assert!(
         matches!(

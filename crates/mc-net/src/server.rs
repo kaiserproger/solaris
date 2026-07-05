@@ -22,8 +22,9 @@ use mc_data::loot::LootTables;
 use mc_data::recipes::Recipe;
 use mc_data::tags::TagsData;
 use mc_extension::{
-    CustomPayloadPolicy, CustomPayloadRejection, ExtensionBoundary, InboundEvent, PlayerId,
-    ProtocolPhase, QueueError,
+    CustomPayloadPolicy, CustomPayloadRejection, ExtensionBoundary, InboundEvent,
+    OutboundCommand as ExtensionOutboundCommand, PlayerId, ProtocolPhase, QueueError,
+    QueueRecvError,
 };
 use mc_physics::{BlockMaterial, BlockMaterialIds, BlockSampler, EntityBody, PhysicsConfig};
 use mc_protocol::State;
@@ -55,6 +56,7 @@ static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> 
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const CHUNK_PIPELINE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const EXTENSION_COMMAND_DRAIN_PERIOD: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandPermissionConfig {
@@ -311,6 +313,10 @@ impl ExtensionEventSink {
                 );
             }
         }
+    }
+
+    pub(crate) fn try_recv_command(&self) -> Result<ExtensionOutboundCommand, QueueRecvError> {
+        self.boundary.try_recv_command()
     }
 }
 
@@ -691,6 +697,13 @@ impl BoundServer {
                 }
             }
         });
+        if let Some(extension_commands) = extension.clone() {
+            tokio::spawn(run_extension_commands(
+                extension_commands,
+                Arc::clone(&sessions),
+                shutdown.clone(),
+            ));
+        }
         tokio::spawn(run_console_commands(
             Arc::clone(&config),
             Arc::clone(&sessions),
@@ -755,6 +768,58 @@ impl BoundServer {
             drain_entity_ticker(entity_ticker).await;
         }
         Ok(())
+    }
+}
+
+async fn run_extension_commands(
+    extension: ExtensionEventSink,
+    sessions: Arc<play::SessionRegistry>,
+    shutdown: ShutdownHandle,
+) {
+    loop {
+        if !drain_extension_commands(&extension, &sessions) {
+            return;
+        }
+        tokio::select! {
+            () = tokio::time::sleep(EXTENSION_COMMAND_DRAIN_PERIOD) => {}
+            () = shutdown.notified() => {
+                let _ = drain_extension_commands(&extension, &sessions);
+                return;
+            }
+        }
+    }
+}
+
+fn drain_extension_commands(
+    extension: &ExtensionEventSink,
+    sessions: &play::SessionRegistry,
+) -> bool {
+    loop {
+        match extension.try_recv_command() {
+            Ok(ExtensionOutboundCommand::DisconnectPlayer { player_id, reason }) => {
+                if !sessions.disconnect_player(player_id.value(), reason) {
+                    debug!(
+                        player_id = player_id.value(),
+                        "extension disconnect command targeted unknown player"
+                    );
+                }
+            }
+            Ok(ExtensionOutboundCommand::SendCustomPayload { player_id, .. }) => {
+                debug!(
+                    player_id = player_id.value(),
+                    "extension custom payload command ignored; outbound payloads are not implemented"
+                );
+            }
+            Ok(_) => {
+                debug!("unknown extension command ignored");
+            }
+            Err(QueueRecvError::Empty) => return true,
+            Err(QueueRecvError::Closed) => {
+                debug!("extension command queue closed; stopping command drain");
+                return false;
+            }
+            Err(_) => return true,
+        }
     }
 }
 

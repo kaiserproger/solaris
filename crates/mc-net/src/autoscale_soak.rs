@@ -1,6 +1,6 @@
 use crate::{
-    ChunkPipelinePolicy, ChunkPipelineResourceSnapshot, ChunkPipelineStopReason,
-    OutboundPressureSnapshot, SaveAllReport,
+    AutoscaleAction, ChunkPipelinePolicy, ChunkPipelineResourceSnapshot, ChunkPipelineStopReason,
+    OutboundPressureSnapshot, RuntimeControlSnapshot, SaveAllReport,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +38,7 @@ pub struct AutoscaleSoakSnapshot<'a> {
     pub outbound_pressure: OutboundPressureSnapshot,
     pub save_all: Option<&'a SaveAllReport>,
     pub memory_pressure_shed_chunks: usize,
+    pub runtime_control: Option<&'a RuntimeControlSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,13 +92,20 @@ impl AutoscaleSoakReport {
             && snapshot
                 .chunk_stop_reasons
                 .contains(&ChunkPipelineStopReason::MemoryPressure);
+        let dynamic_autoscale_observed = snapshot.runtime_control.is_some_and(|runtime| {
+            !runtime.draining
+                && (runtime.last_decision.pressure.is_some()
+                    || !matches!(runtime.last_decision.action, AutoscaleAction::Hold))
+        });
         let save_errors_observed = snapshot.save_all.map_or(0, |report| report.errors.len());
 
         let mut gaps = vec![
-            "dynamic runtime scale-up/scale-down controller is absent",
             "profile validation is config-level only, not measured against low-end/balanced/high-end hardware",
             "memory-pressure recovery and soak evidence are absent",
         ];
+        if !dynamic_autoscale_observed {
+            gaps.push("dynamic runtime-control pressure/action decision was not observed");
+        }
         if !memory_pressure_shedding_observed {
             gaps.push("memory-pressure shedding evidence is absent");
         }
@@ -144,8 +152,12 @@ impl AutoscaleSoakReport {
         Self {
             profile: snapshot.profile,
             scenarios_attempted: snapshot.scenarios.to_vec(),
-            dynamic_autoscale: AutoscalePrimitiveStatus::Degraded {
-                reason: "no runtime autoscale controller is implemented",
+            dynamic_autoscale: if dynamic_autoscale_observed {
+                AutoscalePrimitiveStatus::Present
+            } else {
+                AutoscalePrimitiveStatus::Degraded {
+                    reason: "no runtime-control pressure/action decision was observed in this bounded slice",
+                }
             },
             bounded_chunk_queue: if snapshot.chunk_policy.chunk_result_queue_size > 0 {
                 AutoscalePrimitiveStatus::Present
@@ -218,7 +230,10 @@ impl AutoscaleSoakReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{SaveAllTimings, server::SaveAllReport};
+    use crate::{
+        AutoscaleAction, AutoscalePolicy, AutoscalePressure, AutoscaleProfile, RuntimeControlInput,
+        RuntimeControlLimits, RuntimeControlPlane, SaveAllTimings, server::SaveAllReport,
+    };
 
     fn policy() -> ChunkPipelinePolicy {
         ChunkPipelinePolicy {
@@ -278,12 +293,13 @@ mod tests {
             },
             save_all: Some(&save),
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
 
         assert_eq!(
             report.dynamic_autoscale,
             AutoscalePrimitiveStatus::Degraded {
-                reason: "no runtime autoscale controller is implemented"
+                reason: "no runtime-control pressure/action decision was observed in this bounded slice"
             }
         );
         assert_eq!(
@@ -304,7 +320,160 @@ mod tests {
         );
         assert!(report.queue_saturation_observed);
         assert!(report.slow_client_pressure_observed);
+        assert!(
+            report
+                .gaps
+                .contains(&"dynamic runtime-control pressure/action decision was not observed")
+        );
         assert!(report.is_degraded());
+    }
+
+    #[test]
+    fn bounded_soak_report_marks_observed_runtime_control_pressure_decision_as_present() {
+        let mut controller = RuntimeControlPlane::new(
+            AutoscalePolicy {
+                scale_down_after_ticks: 1,
+                ..AutoscalePolicy::for_profile(AutoscaleProfile::Balanced)
+            },
+            RuntimeControlLimits {
+                view_distance: 8,
+                chunk_send_rate: 16,
+                chunk_load_rate: 32,
+                chunk_generate_rate: 16,
+            },
+        );
+        let decision = controller.observe(RuntimeControlInput {
+            tick_ms: 35,
+            queued_chunks: 64,
+            queue_capacity: 64,
+            active_workers: 1,
+            worker_capacity: 4,
+            memory_used_mb: 512,
+            memory_limit_mb: 4096,
+            first_chunk_ms: Some(500),
+        });
+        assert_eq!(decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(decision.pressure, Some(AutoscalePressure::ChunkQueue));
+        let runtime_control = controller.snapshot();
+
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::QueueSaturation],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
+            outbound_pressure: OutboundPressureSnapshot::default(),
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+            runtime_control: Some(&runtime_control),
+        });
+
+        assert_eq!(report.dynamic_autoscale, AutoscalePrimitiveStatus::Present);
+        assert!(report.queue_saturation_observed);
+        assert!(report.is_degraded());
+        assert!(
+            !report
+                .gaps
+                .contains(&"dynamic runtime-control pressure/action decision was not observed")
+        );
+    }
+
+    #[test]
+    fn bounded_soak_report_keeps_idle_runtime_control_snapshot_degraded() {
+        let controller = RuntimeControlPlane::new(
+            AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
+            RuntimeControlLimits {
+                view_distance: 8,
+                chunk_send_rate: 16,
+                chunk_load_rate: 32,
+                chunk_generate_rate: 16,
+            },
+        );
+        let runtime_control = controller.snapshot();
+
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::QueueSaturation],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
+            outbound_pressure: OutboundPressureSnapshot::default(),
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+            runtime_control: Some(&runtime_control),
+        });
+
+        assert_eq!(
+            report.dynamic_autoscale,
+            AutoscalePrimitiveStatus::Degraded {
+                reason: "no runtime-control pressure/action decision was observed in this bounded slice"
+            }
+        );
+        assert!(
+            report
+                .gaps
+                .contains(&"dynamic runtime-control pressure/action decision was not observed")
+        );
+    }
+
+    #[test]
+    fn bounded_soak_report_keeps_drain_runtime_control_snapshot_degraded() {
+        let mut controller = RuntimeControlPlane::new(
+            AutoscalePolicy::for_profile(AutoscaleProfile::Balanced),
+            RuntimeControlLimits {
+                view_distance: 8,
+                chunk_send_rate: 16,
+                chunk_load_rate: 32,
+                chunk_generate_rate: 16,
+            },
+        );
+        let drain_decision = controller.request_drain();
+        assert_eq!(drain_decision.action, AutoscaleAction::ScaleDown);
+        assert_eq!(drain_decision.pressure, None);
+        let runtime_control = controller.snapshot();
+        assert!(runtime_control.draining);
+
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[
+                AutoscaleSoakScenario::DrainRestart,
+                AutoscaleSoakScenario::QueueSaturation,
+            ],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 1,
+                active_cpu: 0,
+                max_cpu_active: 1,
+            },
+            chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
+            outbound_pressure: OutboundPressureSnapshot::default(),
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+            runtime_control: Some(&runtime_control),
+        });
+
+        assert_eq!(
+            report.dynamic_autoscale,
+            AutoscalePrimitiveStatus::Degraded {
+                reason: "no runtime-control pressure/action decision was observed in this bounded slice"
+            }
+        );
+        assert!(
+            report
+                .gaps
+                .contains(&"dynamic runtime-control pressure/action decision was not observed")
+        );
     }
 
     #[test]
@@ -323,6 +492,7 @@ mod tests {
             outbound_pressure: OutboundPressureSnapshot::default(),
             save_all: None,
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
 
         assert_eq!(
@@ -378,6 +548,7 @@ mod tests {
             },
             save_all: None,
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
 
         assert_eq!(
@@ -406,6 +577,7 @@ mod tests {
             },
             save_all: None,
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
 
         assert_eq!(
@@ -431,6 +603,7 @@ mod tests {
             outbound_pressure: OutboundPressureSnapshot::default(),
             save_all: None,
             memory_pressure_shed_chunks: 3,
+            runtime_control: None,
         });
 
         assert_eq!(
@@ -483,6 +656,7 @@ mod tests {
             },
             save_all: Some(&save),
             memory_pressure_shed_chunks: 0,
+            runtime_control: None,
         });
 
         assert!(!report.queue_saturation_observed);

@@ -21,7 +21,8 @@ use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
 use mc_extension::{
-    DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, PlayerId, ProtocolPhase, QueueRecvError,
+    DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, OutboundCommand, PlayerId, ProtocolPhase,
+    QueueRecvError,
 };
 use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
@@ -160,6 +161,23 @@ async fn read_one_frame(
         let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
     }
+}
+
+async fn read_play_disconnect(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> PlayDisconnect {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == PlayDisconnect::ID {
+                return PlayDisconnect::decode(&mut frame.body).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("play disconnect was not delivered within 2s")
 }
 
 async fn assert_damage_command_still_processed(
@@ -669,6 +687,41 @@ async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
     );
 
     drop(stream);
+    let left = recv_extension_event(&endpoint).await;
+    assert_eq!(
+        left,
+        InboundEvent::PlayerLeft {
+            player_id,
+            reason: "disconnected".to_owned(),
+        }
+    );
+}
+
+#[tokio::test]
+async fn play_extension_disconnect_command_disconnects_player() {
+    let (addr, endpoint) = start_server_with_extension().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ExtKick").await;
+
+    let joined = recv_extension_event(&endpoint).await;
+    let InboundEvent::PlayerJoined { player_id, .. } = joined else {
+        panic!("expected PlayerJoined event, got {joined:?}");
+    };
+
+    endpoint
+        .try_submit_command(OutboundCommand::DisconnectPlayer {
+            player_id,
+            reason: "extension requested disconnect".to_owned(),
+        })
+        .unwrap();
+
+    let disconnect = read_play_disconnect(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        disconnect_text(&disconnect),
+        "extension requested disconnect"
+    );
+
     let left = recv_extension_event(&endpoint).await;
     assert_eq!(
         left,

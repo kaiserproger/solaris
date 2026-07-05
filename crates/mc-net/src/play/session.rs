@@ -54,6 +54,9 @@ pub(super) enum OutboundCommand {
         position: mc_world::BlockPos,
         changed: Vec<(i16, i16)>,
     },
+    DisconnectPlayer {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -82,7 +85,8 @@ impl OutboundCommand {
             | Self::BlockEntityData { .. }
             | Self::FurnaceSlots { .. }
             | Self::ChestSlots { .. }
-            | Self::FurnaceData { .. } => OutboundLane::Reliable,
+            | Self::FurnaceData { .. }
+            | Self::DisconnectPlayer { .. } => OutboundLane::Reliable,
         }
     }
 }
@@ -584,6 +588,27 @@ impl SessionRegistry {
             slow_client_write_timeouts: SLOW_CLIENT_WRITE_TIMEOUTS.load(Ordering::Relaxed),
             slow_client_pressure_sheds: SLOW_CLIENT_PRESSURE_SHEDS.load(Ordering::Relaxed),
         }
+    }
+
+    pub(crate) fn disconnect_player(&self, player_id: u64, reason: String) -> bool {
+        let dispatch = {
+            let inner = self.lock_inner("extension disconnect player");
+            inner
+                .sessions
+                .get(&player_id)
+                .map(|session| VisibilityDispatch {
+                    recipient: SessionRecipient {
+                        id: player_id,
+                        tx: session.tx.clone(),
+                    },
+                    command: OutboundCommand::DisconnectPlayer { reason },
+                })
+        };
+        let Some(dispatch) = dispatch else {
+            return false;
+        };
+        dispatch_visibility_commands(vec![dispatch]);
+        true
     }
 
     pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
@@ -4786,6 +4811,75 @@ mod tests {
                 session_id: 9_700,
                 ..
             }))
+        ));
+        for _ in 0..8 {
+            if registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight
+                == start.reliable_command_retries_in_flight
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            registry
+                .pressure_snapshot()
+                .reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_player_retries_are_bounded_per_slow_recipient() {
+        let _guard = pressure_counter_test_lock().await;
+        let registry = SessionRegistry::new();
+        let start = registry.pressure_snapshot();
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
+            .expect("fill recipient queue");
+        let (session_id, _) = registry.register(
+            &profile("SlowDisconnectAlice"),
+            (0, 0),
+            2,
+            HashSet::new(),
+            tx,
+            PlayerPose::new(0.5, 64.0, 0.5),
+        );
+
+        for idx in 0..16 {
+            assert!(registry.disconnect_player(session_id, format!("duplicate disconnect {idx}")));
+        }
+
+        let pressure = registry.pressure_snapshot();
+        assert_eq!(
+            pressure.reliable_command_retries,
+            start.reliable_command_retries + 1,
+            "duplicate disconnects for one slow recipient should schedule one reliable retry"
+        );
+        assert_eq!(
+            pressure.reliable_command_retries_in_flight,
+            start.reliable_command_retries_in_flight + 1,
+            "duplicate disconnects for one slow recipient should not accumulate retry tasks"
+        );
+        assert!(
+            pressure.max_reliable_command_retries_in_flight
+                <= start.max_reliable_command_retries_in_flight + 1,
+            "duplicate disconnects for one slow recipient should not raise max pending retries by more than one"
+        );
+        assert!(
+            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
+            "extra disconnects for an already-backpressured recipient should be counted as pressure drops"
+        );
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
+        ));
+        assert!(matches!(
+            rx.recv().await,
+            Some(OutboundCommand::DisconnectPlayer { reason })
+                if reason == "duplicate disconnect 0"
         ));
         for _ in 0..8 {
             if registry
