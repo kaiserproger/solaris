@@ -202,6 +202,7 @@ const SLOW_CLIENT_OUTBOUND_WRITE_TIMEOUT: Duration = Duration::from_millis(10);
 const SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS: usize = 4;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_NUMERATOR: usize = 3;
 const SLOW_CLIENT_OUTBOUND_PRESSURE_DENOMINATOR: usize = 4;
+const OUTBOUND_COMMANDS_PER_PLAYER_BURST: usize = 16;
 const BUTTON_RELEASE_DELAY_TICKS: u64 = 20;
 const MAX_PENDING_TELEPORT_RESYNCS: u8 = 3;
 const SHIELD_ACTIVATION_DELAY_TICKS: u64 = 5;
@@ -727,8 +728,7 @@ where
     };
 
     let (spawn_cx, spawn_cz) = player_state.pose.chunk_pos();
-    let (outbound_tx, outbound_rx) =
-        mpsc::channel(config.chunk_pipeline.chunk_result_queue_size.max(16));
+    let (outbound_tx, outbound_rx) = mpsc::channel(outbound_command_queue_capacity(config));
     let initial_desired = if config.world.is_some() {
         desired_chunk_set(spawn_cx, spawn_cz, config.view_distance)
     } else {
@@ -10489,6 +10489,14 @@ fn outbound_queue_at_shed_pressure(
     }
 }
 
+fn outbound_command_queue_capacity(config: &ServerConfig) -> usize {
+    config
+        .chunk_pipeline
+        .chunk_result_queue_size
+        .max(16)
+        .max((config.max_players as usize).saturating_mul(OUTBOUND_COMMANDS_PER_PLAYER_BURST))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutboundWriteOutcome {
     Sent,
@@ -10572,26 +10580,6 @@ where
     write_packet(writer, &xp_state.as_packet(), compression).await?;
 
     loop {
-        if let Some((queued, capacity, threshold)) =
-            outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound)
-        {
-            outbound_pressure_turns += 1;
-            if outbound_pressure_turns >= SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS {
-                record_slow_client_pressure_shed();
-                warn!(
-                    session_id,
-                    queued,
-                    capacity,
-                    threshold,
-                    turns = outbound_pressure_turns,
-                    "slow client outbound queue stayed above pressure threshold; closing play session"
-                );
-                return Ok(());
-            }
-        } else {
-            outbound_pressure_turns = 0;
-        }
-
         sync_player_persistence(
             &player_save_state,
             player_pose,
@@ -10602,6 +10590,9 @@ where
             game_mode,
         );
         let mut stream_finished = false;
+        let chunk_stream_active = chunk_stream
+            .as_ref()
+            .is_some_and(|stream| !stream.is_complete());
         if let (Some(stream), Some(state)) = (chunk_stream.as_mut(), interaction.as_deref_mut())
             && !stream.is_complete()
         {
@@ -10630,6 +10621,29 @@ where
             }
             last_response_at = Instant::now();
             pending_id = None;
+        }
+        if let Some((queued, capacity, threshold)) =
+            outbound_queue_at_shed_pressure(&outbound_rx, &pending_outbound)
+        {
+            if chunk_stream_active || permissions.op {
+                outbound_pressure_turns = 0;
+            } else {
+                outbound_pressure_turns += 1;
+                if outbound_pressure_turns >= SLOW_CLIENT_OUTBOUND_PRESSURE_TURNS {
+                    record_slow_client_pressure_shed();
+                    warn!(
+                        session_id,
+                        queued,
+                        capacity,
+                        threshold,
+                        turns = outbound_pressure_turns,
+                        "slow client outbound queue stayed above pressure threshold; closing play session"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            outbound_pressure_turns = 0;
         }
 
         tokio::select! {

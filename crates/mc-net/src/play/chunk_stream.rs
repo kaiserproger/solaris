@@ -1,3 +1,4 @@
+use super::session::{PreparedChunkClaim, PreparedChunkClaimResult};
 use super::*;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,7 +45,6 @@ pub(super) enum ChunkStreamStep {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChunkPrepareBudgetClass {
-    Cached,
     Load,
     Generate,
 }
@@ -52,7 +52,6 @@ enum ChunkPrepareBudgetClass {
 impl ChunkPrepareBudgetClass {
     fn stop_reason(self) -> ChunkPipelineStopReason {
         match self {
-            Self::Cached => ChunkPipelineStopReason::BatchLimit,
             Self::Load => ChunkPipelineStopReason::LoadBudget,
             Self::Generate => ChunkPipelineStopReason::GenerateBudget,
         }
@@ -200,6 +199,7 @@ enum EmitReadyResult {
 
 struct ChunkPrepareResult {
     request: crate::ChunkRequest,
+    prepare_claim: Option<PreparedChunkClaim>,
     fetch_ms: u64,
     pressure_flush: PressureFlushTiming,
     staged: Vec<(i32, i32)>,
@@ -920,7 +920,7 @@ impl ChunkStreamState {
     ) -> Vec<(i32, i32)> {
         if (self.center_cx, self.center_cz) == (center_cx, center_cz) {
             if (self.direction_yaw - direction_yaw).abs() >= 22.5 && !self.scheduler.is_complete() {
-                self.ready.clear();
+                self.clear_ready();
                 self.reset_pressure_tracking();
                 self.scheduler.replace_view(prioritized_spiral(
                     center_cx,
@@ -950,7 +950,7 @@ impl ChunkStreamState {
         self.center_cx = center_cx;
         self.center_cz = center_cz;
         self.direction_yaw = direction_yaw;
-        self.ready.clear();
+        self.clear_ready();
         self.reset_pressure_tracking();
         self.scheduler.replace_view(prioritized_spiral(
             center_cx,
@@ -1001,7 +1001,7 @@ impl ChunkStreamState {
         );
         visibility.extend(self.sessions.mark_unloaded(self.session_id, &unloads));
         dispatch_visibility_commands(visibility);
-        self.ready.clear();
+        self.clear_ready();
         self.reset_pressure_tracking();
         self.scheduler.replay_view(prioritized_spiral(
             self.center_cx,
@@ -1027,7 +1027,7 @@ impl ChunkStreamState {
             desired,
         ));
         self.direction_yaw = direction_yaw;
-        self.ready.clear();
+        self.clear_ready();
         self.reset_pressure_tracking();
         self.scheduler.replay_view(prioritized_spiral(
             self.center_cx,
@@ -1221,6 +1221,7 @@ impl ChunkStreamState {
         let mut generate_dispatched_this_turn = 0usize;
         let mut cooldown_deferrals = 0usize;
         let mut budget_deferrals = 0usize;
+        let mut claim_deferrals = 0usize;
         loop {
             if self.scheduler.in_flight_len() >= self.result_queue_size {
                 self.set_stop_reason(ChunkPipelineStopReason::QueueFull);
@@ -1249,16 +1250,52 @@ impl ChunkStreamState {
                 self.set_stop_reason(stop_reason);
                 break;
             };
-            let prepared = self
+            if self.defer_for_pressure_cooldown(request) {
+                cooldown_deferrals += 1;
+                if cooldown_deferrals >= self.scheduler.queued_len().max(1) {
+                    self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
+                    break;
+                }
+                continue;
+            }
+            let prepare_claim = match self
                 .sessions
-                .prepared_chunk((request.chunk_x, request.chunk_z));
-            let budget_class = if prepared.is_some() {
-                ChunkPrepareBudgetClass::Cached
-            } else {
-                self.classify_prepare_budget(request).await
+                .prepared_chunk_or_claim((request.chunk_x, request.chunk_z))
+            {
+                PreparedChunkClaimResult::Cached(prepared) => {
+                    self.accept_result(ChunkPrepareResult {
+                        request,
+                        prepare_claim: None,
+                        fetch_ms: 0,
+                        pressure_flush: PressureFlushTiming::default(),
+                        staged: Vec::new(),
+                        outcome: ChunkPrepareOutcome::Ready(Box::new(
+                            prepared.prepared_cache_hit(),
+                        )),
+                    });
+                    dispatched_this_turn += 1;
+                    self.dispatched += 1;
+                    budget_deferrals = 0;
+                    cooldown_deferrals = 0;
+                    claim_deferrals = 0;
+                    continue;
+                }
+                PreparedChunkClaimResult::Claimed(claim) => claim,
+                PreparedChunkClaimResult::InFlight => {
+                    if !self.scheduler.defer(request) {
+                        self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
+                        break;
+                    }
+                    claim_deferrals += 1;
+                    if claim_deferrals >= self.scheduler.queued_len().max(1) {
+                        self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
+                        break;
+                    }
+                    continue;
+                }
             };
+            let budget_class = self.classify_prepare_budget(request).await;
             let budget_exhausted = match budget_class {
-                ChunkPrepareBudgetClass::Cached => false,
                 ChunkPrepareBudgetClass::Load => {
                     load_dispatched_this_turn >= self.policy.chunk_load_rate as usize
                 }
@@ -1267,6 +1304,7 @@ impl ChunkStreamState {
                 }
             };
             if budget_exhausted {
+                self.release_prepare_claim((request.chunk_x, request.chunk_z), Some(prepare_claim));
                 let stop_reason = budget_class.stop_reason();
                 if !self.scheduler.defer(request) {
                     self.set_stop_reason(stop_reason);
@@ -1279,38 +1317,16 @@ impl ChunkStreamState {
                 }
                 continue;
             }
-            if let Some(prepared) = prepared {
-                self.accept_result(ChunkPrepareResult {
-                    request,
-                    fetch_ms: 0,
-                    pressure_flush: PressureFlushTiming::default(),
-                    staged: Vec::new(),
-                    outcome: ChunkPrepareOutcome::Ready(Box::new(prepared.prepared_cache_hit())),
-                });
-                dispatched_this_turn += 1;
-                self.dispatched += 1;
-                budget_deferrals = 0;
-                cooldown_deferrals = 0;
-                continue;
-            }
-            if self.defer_for_pressure_cooldown(request) {
-                cooldown_deferrals += 1;
-                if cooldown_deferrals >= self.scheduler.queued_len().max(1) {
-                    self.set_stop_reason(ChunkPipelineStopReason::QueueEmpty);
-                    break;
-                }
-                continue;
-            }
             match budget_class {
-                ChunkPrepareBudgetClass::Cached => {}
                 ChunkPrepareBudgetClass::Load => load_dispatched_this_turn += 1,
                 ChunkPrepareBudgetClass::Generate => generate_dispatched_this_turn += 1,
             }
-            self.spawn_prepare_worker(request);
+            self.spawn_prepare_worker(request, prepare_claim);
             dispatched_this_turn += 1;
             self.dispatched += 1;
             budget_deferrals = 0;
             cooldown_deferrals = 0;
+            claim_deferrals = 0;
         }
         self.max_in_flight = self.max_in_flight.max(self.scheduler.in_flight_len());
     }
@@ -1345,7 +1361,7 @@ impl ChunkStreamState {
             return;
         }
 
-        self.ready.clear();
+        self.clear_ready();
         self.reset_pressure_tracking();
         self.scheduler.replace_view(prioritized_spiral(
             self.center_cx,
@@ -1360,7 +1376,7 @@ impl ChunkStreamState {
         self.memory_pressure_shed_in_flight += in_flight;
     }
 
-    fn spawn_prepare_worker(&self, request: ChunkRequest) {
+    fn spawn_prepare_worker(&self, request: ChunkRequest, prepare_claim: PreparedChunkClaim) {
         let world = Arc::clone(&self.world);
         let biomes = Arc::clone(&self.biomes);
         let blocks = Arc::clone(&self.blocks);
@@ -1379,9 +1395,10 @@ impl ChunkStreamState {
         let active_generation = Arc::clone(&self.active_generation);
         let compression = self.compression;
         let current_tick = self.sessions.simulation_tick();
+        let sessions = Arc::clone(&self.sessions);
         let tx = self.result_tx.clone();
         tokio::spawn(async move {
-            let result = prepare_chunk_request(
+            let mut result = prepare_chunk_request(
                 request,
                 world,
                 biomes,
@@ -1403,7 +1420,13 @@ impl ChunkStreamState {
                 current_tick,
             )
             .await;
-            let _ = tx.send(result).await;
+            result.prepare_claim = Some(prepare_claim);
+            if tx.send(result).await.is_err() {
+                sessions.release_prepared_chunk_claim(
+                    (request.chunk_x, request.chunk_z),
+                    prepare_claim,
+                );
+            }
         });
     }
 
@@ -1415,12 +1438,35 @@ impl ChunkStreamState {
 
     fn accept_result(&mut self, result: ChunkPrepareResult) {
         if !self.scheduler.is_current(result.request) {
+            self.release_prepare_claim_for_result(&result);
             return;
         }
-        self.ready
-            .entry(result.request.priority.sequence)
-            .or_insert(result);
+        if self.ready.contains_key(&result.request.priority.sequence) {
+            self.release_prepare_claim_for_result(&result);
+            return;
+        }
+        self.ready.insert(result.request.priority.sequence, result);
         self.max_ready = self.max_ready.max(self.ready.len());
+    }
+
+    fn clear_ready(&mut self) {
+        let ready = std::mem::take(&mut self.ready);
+        for result in ready.into_values() {
+            self.release_prepare_claim_for_result(&result);
+        }
+    }
+
+    fn release_prepare_claim_for_result(&self, result: &ChunkPrepareResult) {
+        self.release_prepare_claim(
+            (result.request.chunk_x, result.request.chunk_z),
+            result.prepare_claim,
+        );
+    }
+
+    fn release_prepare_claim(&self, chunk: (i32, i32), claim: Option<PreparedChunkClaim>) {
+        if let Some(claim) = claim {
+            self.sessions.release_prepared_chunk_claim(chunk, claim);
+        }
     }
 
     fn record_pressure_flush(&mut self, timing: PressureFlushTiming) {
@@ -1449,6 +1495,7 @@ impl ChunkStreamState {
         let request = result.request;
         let cx = request.chunk_x;
         let cz = request.chunk_z;
+        let prepare_claim = result.prepare_claim;
         self.fetch_ms += result.fetch_ms;
         self.record_pressure_flush(result.pressure_flush);
         self.max_fetch_ms = self.max_fetch_ms.max(result.fetch_ms);
@@ -1465,7 +1512,10 @@ impl ChunkStreamState {
                 }
                 let mut write_timing = prepared.write_timing;
                 let socket_write_started = Instant::now();
-                writer.write_all(&prepared.frame).await?;
+                if let Err(err) = writer.write_all(&prepared.frame).await {
+                    self.release_prepare_claim((cx, cz), prepare_claim);
+                    return Err(err.into());
+                }
                 write_timing.socket_write_ms = socket_write_started.elapsed().as_millis() as u64;
                 for (position, cooking) in &prepared.hydrated_campfires {
                     self.sessions
@@ -1480,11 +1530,13 @@ impl ChunkStreamState {
                 dispatch_visibility_commands(visibility);
                 self.sessions
                     .cache_prepared_chunk((cx, cz), Arc::new((*prepared).clone()));
+                self.release_prepare_claim((cx, cz), prepare_claim);
                 self.record_stage_maxima(prepared.build_timing, write_timing);
                 self.build_timing.add(prepared.build_timing);
                 self.record_emitted(cx, cz, prepared.packet_data_len, write_timing);
             }
             ChunkPrepareOutcome::Absent => {
+                self.release_prepare_claim((cx, cz), prepare_claim);
                 self.clear_pressure_tracking((cx, cz));
                 self.staged.extend(result.staged);
                 self.absent += 1;
@@ -1493,6 +1545,7 @@ impl ChunkStreamState {
                 return Ok(EmitReadyResult::DrainedNoPacket);
             }
             ChunkPrepareOutcome::Backpressured => {
+                self.release_prepare_claim((cx, cz), prepare_claim);
                 self.set_pressure_staged((cx, cz), &result.staged);
                 let retries = self.pressure_retries.entry((cx, cz)).or_default();
                 *retries += 1;
@@ -1533,6 +1586,7 @@ impl ChunkStreamState {
                 return Ok(EmitReadyResult::Blocked);
             }
             ChunkPrepareOutcome::Failed(err) => {
+                self.release_prepare_claim((cx, cz), prepare_claim);
                 self.clear_pressure_tracking((cx, cz));
                 warn!(cx, cz, error = %err, "chunk encode failed; skipping");
                 self.scheduler.mark_finished(request);
@@ -1748,6 +1802,7 @@ impl ChunkStreamState {
 
 impl Drop for ChunkStreamState {
     fn drop(&mut self) {
+        self.clear_ready();
         self.active_generation.store(0, Ordering::Release);
     }
 }
@@ -1882,6 +1937,7 @@ async fn prepare_chunk_request(
         Err(err) => {
             return ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
@@ -1915,6 +1971,7 @@ async fn prepare_chunk_request(
             };
             return ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms,
                 pressure_flush,
                 staged,
@@ -1923,6 +1980,7 @@ async fn prepare_chunk_request(
         }
         return ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms,
             pressure_flush: PressureFlushTiming::default(),
             staged,
@@ -1946,6 +2004,7 @@ async fn prepare_chunk_request(
         };
         return ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms,
             pressure_flush,
             staged,
@@ -1962,6 +2021,7 @@ async fn prepare_chunk_request(
         Err(_) => {
             return ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms,
                 pressure_flush: PressureFlushTiming::default(),
                 staged,
@@ -2033,6 +2093,7 @@ async fn prepare_chunk_request(
 
     ChunkPrepareResult {
         request,
+        prepare_claim: None,
         fetch_ms,
         pressure_flush: PressureFlushTiming::default(),
         staged,
@@ -2047,6 +2108,7 @@ fn is_active_request(request: ChunkRequest, active_generation: &AtomicU64) -> bo
 fn stale_chunk_result(request: ChunkRequest) -> ChunkPrepareResult {
     ChunkPrepareResult {
         request,
+        prepare_claim: None,
         fetch_ms: 0,
         pressure_flush: PressureFlushTiming::default(),
         staged: Vec::new(),
@@ -2828,6 +2890,214 @@ mod tests {
         assert_eq!(cached.write_timing.framed_bytes, 17);
     }
 
+    #[tokio::test]
+    async fn dispatch_defers_globally_in_flight_chunk_until_cache_lands() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(1);
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "claim-waiter".to_string(),
+        };
+        let desired = desired_chunk_set(0, 0, 0);
+        let (session_id, _) = sessions.register(
+            &profile,
+            (0, 0),
+            0,
+            desired,
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 1,
+            chunk_result_queue_size: 1,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        let claim = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected manual claim, got {other:?}"),
+        };
+
+        stream.dispatch_available().await;
+
+        assert_eq!(stream.dispatched, 0);
+        assert_eq!(stream.ready.len(), 0);
+        assert_eq!(stream.scheduler.in_flight_len(), 0);
+        assert_eq!(stream.scheduler.queued_len(), 1);
+
+        sessions.cache_prepared_chunk(
+            (0, 0),
+            Arc::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"chunk-frame"),
+                light: None,
+                herd_spawns: Vec::new(),
+                hydrated_campfires: Vec::new(),
+                packet_data_len: 0,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            }),
+        );
+        assert!(sessions.release_prepared_chunk_claim((0, 0), claim));
+
+        stream.dispatch_available().await;
+
+        assert_eq!(stream.dispatched, 1);
+        assert_eq!(stream.ready.len(), 1);
+        assert_eq!(stream.scheduler.in_flight_len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stale_prepare_result_releases_global_claim() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let claim = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected manual claim, got {other:?}"),
+        };
+        let stale_request = ChunkRequest {
+            chunk_x: 0,
+            chunk_z: 0,
+            priority: ChunkPriority {
+                ring: 0,
+                sequence: 0,
+            },
+            generation: ChunkPipelineGeneration(stream.scheduler.current_generation().0 + 1),
+        };
+
+        stream.accept_result(ChunkPrepareResult {
+            request: stale_request,
+            prepare_claim: Some(claim),
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Absent,
+        });
+
+        let replacement = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected released stale claim, got {other:?}"),
+        };
+        assert!(sessions.release_prepared_chunk_claim((0, 0), replacement));
+    }
+
+    #[tokio::test]
+    async fn dropping_stream_releases_ready_prepare_claim() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            1,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        );
+        let request = stream.scheduler.poll_next().expect("chunk request");
+        let claim = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected manual claim, got {other:?}"),
+        };
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            prepare_claim: Some(claim),
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Absent,
+        });
+        assert!(matches!(
+            sessions.prepared_chunk_or_claim((0, 0)),
+            PreparedChunkClaimResult::InFlight
+        ));
+
+        drop(stream);
+
+        let replacement = match sessions.prepared_chunk_or_claim((0, 0)) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected released ready claim, got {other:?}"),
+        };
+        assert!(sessions.release_prepared_chunk_claim((0, 0), replacement));
+    }
+
     #[test]
     fn build_chunk_packet_uses_baked_section_light_without_recompute() {
         let plains = Identifier::parse("minecraft:plains").unwrap();
@@ -3136,6 +3406,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("request");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming {
                 runs: 1,
@@ -3181,6 +3452,7 @@ mod tests {
             let request = stream.scheduler.poll_next().expect("deferred request");
             stream.accept_result(ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: vec![(0, 0)],
@@ -3231,6 +3503,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("request");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0)],
@@ -3335,6 +3608,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("request");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming::default(),
             staged: Vec::new(),
@@ -3397,6 +3671,7 @@ mod tests {
             let request = stream.scheduler.poll_next().expect("queued chunk");
             stream.accept_result(ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
@@ -3493,6 +3768,7 @@ mod tests {
             let request = stream.scheduler.poll_next().expect("queued chunk");
             stream.accept_result(ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
@@ -3679,6 +3955,7 @@ mod tests {
             old_generation.get_or_insert(request.generation);
             stream.accept_result(ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
@@ -3880,6 +4157,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("queued chunk");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming::default(),
             staged: Vec::new(),
@@ -4356,6 +4634,7 @@ mod tests {
             let request = stream.scheduler.poll_next().expect("queued chunk");
             stream.accept_result(ChunkPrepareResult {
                 request,
+                prepare_claim: None,
                 fetch_ms: 0,
                 pressure_flush: PressureFlushTiming::default(),
                 staged: Vec::new(),
@@ -4409,6 +4688,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("request");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0), (1, 0)],
@@ -4430,6 +4710,7 @@ mod tests {
         let request = stream.scheduler.poll_next().expect("deferred request");
         stream.accept_result(ChunkPrepareResult {
             request,
+            prepare_claim: None,
             fetch_ms: 0,
             pressure_flush: PressureFlushTiming::default(),
             staged: vec![(0, 0)],

@@ -127,6 +127,27 @@ fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
     }
 }
 
+#[test]
+fn outbound_command_queue_capacity_scales_with_player_burst() {
+    let mut config = play_loop_slow_client_test_config();
+    config.max_players = 20;
+    config.chunk_pipeline.chunk_result_queue_size = 8;
+
+    assert_eq!(
+        outbound_command_queue_capacity(&config),
+        20 * OUTBOUND_COMMANDS_PER_PLAYER_BURST
+    );
+}
+
+#[test]
+fn outbound_command_queue_capacity_preserves_larger_configured_queue() {
+    let mut config = play_loop_slow_client_test_config();
+    config.max_players = 2;
+    config.chunk_pipeline.chunk_result_queue_size = 512;
+
+    assert_eq!(outbound_command_queue_capacity(&config), 512);
+}
+
 #[tokio::test]
 async fn outbound_command_write_timeout_sheds_stalled_client() {
     let mut writer = StalledWriter;

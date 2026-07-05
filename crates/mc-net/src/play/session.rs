@@ -268,6 +268,8 @@ struct SessionRegistryInner {
     sessions: HashMap<SessionId, PlaySession>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
     prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
+    prepared_in_flight: HashMap<(i32, i32), PreparedChunkClaim>,
+    next_prepared_claim: u64,
     entities: EntityStore,
     entities_by_chunk: HashMap<(i32, i32), HashSet<EntityId>>,
     entity_chunks: HashMap<EntityId, (i32, i32)>,
@@ -306,6 +308,8 @@ impl Default for SessionRegistryInner {
             sessions: HashMap::new(),
             tickets: HashMap::new(),
             prepared: HashMap::new(),
+            prepared_in_flight: HashMap::new(),
+            next_prepared_claim: 0,
             entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
             entities_by_chunk: HashMap::new(),
             entity_chunks: HashMap::new(),
@@ -329,6 +333,16 @@ impl Default for SessionRegistryInner {
             arrow_kill_rewards: ArrowKillRewards::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct PreparedChunkClaim(pub(super) u64);
+
+#[derive(Debug, Clone)]
+pub(super) enum PreparedChunkClaimResult {
+    Cached(Arc<PreparedChunkFrame>),
+    Claimed(PreparedChunkClaim),
+    InFlight,
 }
 
 #[derive(Debug, Default)]
@@ -1897,9 +1911,38 @@ impl SessionRegistry {
             .collect()
     }
 
+    pub(super) fn prepared_chunk_or_claim(&self, chunk: (i32, i32)) -> PreparedChunkClaimResult {
+        let mut inner = self.lock_inner("prepared chunk claim");
+        if let Some(prepared) = inner.prepared.get(&chunk).cloned() {
+            return PreparedChunkClaimResult::Cached(prepared);
+        }
+        if inner.prepared_in_flight.contains_key(&chunk) {
+            return PreparedChunkClaimResult::InFlight;
+        }
+
+        inner.next_prepared_claim = inner.next_prepared_claim.wrapping_add(1).max(1);
+        let claim = PreparedChunkClaim(inner.next_prepared_claim);
+        inner.prepared_in_flight.insert(chunk, claim);
+        PreparedChunkClaimResult::Claimed(claim)
+    }
+
+    #[cfg(test)]
     pub(super) fn prepared_chunk(&self, chunk: (i32, i32)) -> Option<Arc<PreparedChunkFrame>> {
         let inner = self.lock_inner("prepared chunk lookup");
         inner.prepared.get(&chunk).cloned()
+    }
+
+    pub(super) fn release_prepared_chunk_claim(
+        &self,
+        chunk: (i32, i32),
+        claim: PreparedChunkClaim,
+    ) -> bool {
+        let mut inner = self.lock_inner("release prepared chunk claim");
+        if inner.prepared_in_flight.get(&chunk).copied() != Some(claim) {
+            return false;
+        }
+        inner.prepared_in_flight.remove(&chunk);
+        true
     }
 
     pub(super) fn cache_prepared_chunk(
@@ -3451,6 +3494,37 @@ mod tests {
             PlayerPose::new(0.5, 64.0, 0.5),
         );
         id
+    }
+
+    #[test]
+    fn prepared_chunk_claim_blocks_duplicate_until_released() {
+        let registry = SessionRegistry::new();
+        let chunk = (2, -3);
+
+        let first_claim = match registry.prepared_chunk_or_claim(chunk) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected first claim, got {other:?}"),
+        };
+
+        assert!(matches!(
+            registry.prepared_chunk_or_claim(chunk),
+            PreparedChunkClaimResult::InFlight
+        ));
+
+        assert!(!registry.release_prepared_chunk_claim(
+            chunk,
+            PreparedChunkClaim(first_claim.0.wrapping_add(1))
+        ));
+        assert!(matches!(
+            registry.prepared_chunk_or_claim(chunk),
+            PreparedChunkClaimResult::InFlight
+        ));
+
+        assert!(registry.release_prepared_chunk_claim(chunk, first_claim));
+        assert!(matches!(
+            registry.prepared_chunk_or_claim(chunk),
+            PreparedChunkClaimResult::Claimed(_)
+        ));
     }
 
     #[test]

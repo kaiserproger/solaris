@@ -37,6 +37,13 @@ const M96_REPLAY_ELAPSED_BUDGET: Duration = Duration::from_secs(45);
 const M96_LOCK_MAX_HOLD_BUDGET_US: u64 = 250_000;
 const O2_STOP_FLUSH_CLIENTS: usize = 4;
 const O2_STOP_VIEW_DISTANCE: i32 = 8;
+const O2_VD8_CONCURRENT_CLIENTS: usize = 20;
+const O2_VD8_WINDOW_EDGE: usize = (O2_STOP_VIEW_DISTANCE as usize * 2) + 1;
+const O2_VD8_WINDOW_CHUNKS: usize = O2_VD8_WINDOW_EDGE * O2_VD8_WINDOW_EDGE;
+const O2_VD8_JOIN_ELAPSED_BUDGET: Duration = Duration::from_secs(120);
+const O2_VD8_LOCK_MAX_HOLD_BUDGET_US: u64 = 1_000_000;
+const O2_VD8_CHUNK_PREPARE_HOLD_COUNT_BUDGET: u64 = (O2_VD8_WINDOW_CHUNKS as u64) * 16;
+const O2_VD8_CHUNK_RESULT_QUEUE_SIZE: usize = 64;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires local data/vanilla sidecars; degraded when absent"]
@@ -261,6 +268,9 @@ async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load()
         view_distance: O2_STOP_VIEW_DISTANCE,
         disk_backed: true,
         runtime_control: true,
+        max_players: 8,
+        fixed_runtime_view_distance: false,
+        chunk_result_queue_size: 8,
     })
     .await;
     let addr = server.addr;
@@ -387,6 +397,270 @@ async fn vd8_multi_client_stop_drains_and_flushes_disk_world_under_stream_load()
         chunk_snapshot,
         save_pressure_before,
         save_pressure_after,
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "requires local data/vanilla sidecars; O1/O2 concurrent VD8 gate"]
+async fn vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplicate_pressure() {
+    let pressure_before = mc_net::lock_pressure_snapshot();
+    let server = start_load_server_with_options(LoadServerOptions {
+        view_distance: O2_STOP_VIEW_DISTANCE,
+        disk_backed: true,
+        runtime_control: true,
+        max_players: O2_VD8_CONCURRENT_CLIENTS,
+        fixed_runtime_view_distance: true,
+        chunk_result_queue_size: O2_VD8_CHUNK_RESULT_QUEUE_SIZE,
+    })
+    .await;
+    let addr = server.addr;
+    let started = Instant::now();
+
+    let mut client_tasks = Vec::new();
+    for idx in 0..O2_VD8_CONCURRENT_CLIENTS {
+        client_tasks.push(tokio::spawn(async move {
+            let name = format!("O2Vd8Load{idx}");
+            let (mut client, _) = connect_to_play(addr, &name).await;
+            let chunks = try_drain_unique_chunks_with_timeout(
+                &mut client,
+                O2_VD8_WINDOW_CHUNKS,
+                Duration::from_secs(90),
+                &name,
+            )
+            .await;
+            (idx, client, chunks)
+        }));
+    }
+
+    let mut clients = Vec::new();
+    let mut per_client_chunks = Vec::new();
+    let mut streamed_chunks = std::collections::BTreeSet::new();
+    let mut client_failures = Vec::new();
+    for task in client_tasks {
+        let (idx, client, chunks) = task.await.expect("O2 VD8 client task joins");
+        match chunks {
+            Ok(chunks) => {
+                assert_eq!(
+                    chunks.len(),
+                    O2_VD8_WINDOW_CHUNKS,
+                    "client {idx} should drain the full VD8 window"
+                );
+                streamed_chunks.extend(chunks.iter().copied());
+                per_client_chunks.push((idx, chunks.len()));
+            }
+            Err(err) => client_failures.push(format!("client {idx}: {err}")),
+        }
+        clients.push(client);
+    }
+    if !client_failures.is_empty() {
+        let chunk_snapshot = server.chunk_pipeline_metrics.snapshot();
+        let stop_reason_counts = server.chunk_pipeline_metrics.stop_reason_counts();
+        let outbound_pressure = server.outbound_pressure_snapshot();
+        let runtime_snapshot = server
+            .runtime_control
+            .as_ref()
+            .map(mc_net::RuntimeControlHandle::snapshot);
+        for client in clients {
+            drop(client);
+        }
+        server.shutdown.request();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server.serve_task).await;
+        panic!(
+            "O2 VD8 clients failed before full window: failures={client_failures:?} partial_chunks={per_client_chunks:?} shared_chunks={} chunk_pipeline={chunk_snapshot:?} stop_reason_counts={stop_reason_counts:?} outbound_pressure={outbound_pressure:?} runtime_snapshot={runtime_snapshot:?}",
+            streamed_chunks.len()
+        );
+    }
+    assert_eq!(
+        clients.len(),
+        O2_VD8_CONCURRENT_CLIENTS,
+        "all O2 VD8 clients should reach Play"
+    );
+    assert_eq!(
+        streamed_chunks.len(),
+        O2_VD8_WINDOW_CHUNKS,
+        "same-spawn VD8 clients should share one chunk window"
+    );
+
+    let loaded_snapshot = server.chunk_pipeline_metrics.snapshot();
+    assert!(
+        loaded_snapshot.max_cpu_active <= server.chunk_worker_threads,
+        "chunk CPU permits exceeded during 20-client VD8 load: {:?}",
+        loaded_snapshot
+    );
+    assert!(
+        loaded_snapshot.max_io_active <= server.chunk_io_threads,
+        "chunk IO permits exceeded during 20-client VD8 load: {:?}",
+        loaded_snapshot
+    );
+
+    let mut stopper = clients.remove(0);
+    let mut drain_tasks = Vec::new();
+    for client in clients {
+        let shutdown = server.shutdown.clone();
+        drain_tasks.push(tokio::spawn(async move {
+            drain_client_until_shutdown(client, shutdown).await;
+        }));
+    }
+    stopper
+        .write_packet(&ServerboundChatCommand {
+            command: "stop".to_string(),
+        })
+        .await
+        .expect("send O2 VD8 stop command");
+    let stopper_shutdown = server.shutdown.clone();
+    let stopper_drain = tokio::spawn(async move {
+        drain_client_until_shutdown(stopper, stopper_shutdown).await;
+    });
+    wait_for_shutdown_requested(&server.shutdown).await;
+
+    let runtime_control = server
+        .runtime_control
+        .as_ref()
+        .expect("O2 VD8 gate enables runtime control");
+    let runtime_snapshot = runtime_control.snapshot();
+    assert!(
+        runtime_snapshot.draining,
+        "player /stop should request runtime-control drain"
+    );
+    let outbound_pressure = server.outbound_pressure_snapshot();
+    for task in drain_tasks {
+        let _ = task.await;
+    }
+    let _ = stopper_drain.await;
+
+    let serve_result = tokio::time::timeout(Duration::from_secs(15), server.serve_task)
+        .await
+        .expect("server should exit after O2 VD8 player /stop")
+        .expect("server task should join");
+    serve_result.expect("server serve should exit cleanly");
+
+    let drained_snapshot = server.chunk_pipeline_metrics.snapshot();
+    assert_eq!(
+        drained_snapshot.active_cpu, 0,
+        "chunk CPU work should be drained after O2 VD8 stop: {:?}",
+        drained_snapshot
+    );
+    assert_eq!(
+        drained_snapshot.active_io, 0,
+        "chunk IO work should be drained after O2 VD8 stop: {:?}",
+        drained_snapshot
+    );
+    assert!(
+        drained_snapshot.max_cpu_active <= server.chunk_worker_threads,
+        "chunk CPU permits exceeded during O2 VD8 load/stop: {:?}",
+        drained_snapshot
+    );
+    assert!(
+        drained_snapshot.max_io_active <= server.chunk_io_threads,
+        "chunk IO permits exceeded during O2 VD8 load/stop: {:?}",
+        drained_snapshot
+    );
+
+    let stop_reason_counts = server.chunk_pipeline_metrics.stop_reason_counts();
+    let stop_reasons = stop_reason_counts.observed_reasons();
+    assert!(
+        !stop_reasons.is_empty(),
+        "O2 VD8 gate should report chunk stop reasons"
+    );
+
+    let pressure_after = mc_net::lock_pressure_snapshot();
+    let world_storage_delta =
+        lock_metric_delta(pressure_before.world_storage, pressure_after.world_storage);
+    let session_registry_delta = lock_metric_delta(
+        pressure_before.session_registry,
+        pressure_after.session_registry,
+    );
+    let save_all_flush_delta = lock_metric_delta(
+        pressure_before.save_all_flush,
+        pressure_after.save_all_flush,
+    );
+    let chunk_prepare_delta =
+        lock_metric_delta(pressure_before.chunk_prepare, pressure_after.chunk_prepare);
+    assert_lock_metric_observed_within_budget(
+        "world_storage",
+        world_storage_delta,
+        pressure_after.world_storage,
+        O2_VD8_LOCK_MAX_HOLD_BUDGET_US,
+    );
+    assert_lock_metric_observed_within_budget(
+        "session_registry",
+        session_registry_delta,
+        pressure_after.session_registry,
+        O2_VD8_LOCK_MAX_HOLD_BUDGET_US,
+    );
+    assert_lock_metric_observed_within_budget(
+        "save_all_flush",
+        save_all_flush_delta,
+        pressure_after.save_all_flush,
+        O2_VD8_LOCK_MAX_HOLD_BUDGET_US,
+    );
+    assert_lock_metric_observed_within_budget(
+        "chunk_prepare",
+        chunk_prepare_delta,
+        pressure_after.chunk_prepare,
+        O2_VD8_LOCK_MAX_HOLD_BUDGET_US,
+    );
+    assert!(
+        chunk_prepare_delta.hold_count <= O2_VD8_CHUNK_PREPARE_HOLD_COUNT_BUDGET,
+        "same-spawn VD8 chunk preparation should stay near the shared window, not per-client duplication: delta={chunk_prepare_delta:?} budget={O2_VD8_CHUNK_PREPARE_HOLD_COUNT_BUDGET}"
+    );
+
+    let scenarios = [
+        mc_net::AutoscaleSoakScenario::ChunkGenerationStorm,
+        mc_net::AutoscaleSoakScenario::SaveDuringShutdown,
+        mc_net::AutoscaleSoakScenario::DrainRestart,
+    ];
+    let autoscale_report =
+        mc_net::AutoscaleSoakReport::from_snapshot(mc_net::AutoscaleSoakSnapshot {
+            profile: mc_net::AutoscaleSoakProfile::Balanced,
+            scenarios: &scenarios,
+            chunk_policy: server.chunk_policy,
+            chunk_resources: drained_snapshot,
+            chunk_stop_reasons: &stop_reasons,
+            outbound_pressure,
+            save_all: None,
+            memory_pressure_shed_chunks: 0,
+            runtime_control: Some(&runtime_snapshot),
+        });
+    assert!(
+        matches!(
+            autoscale_report.worker_backpressure,
+            mc_net::AutoscalePrimitiveStatus::Present
+        ),
+        "O2 VD8 worker metrics should stay within configured permits: {autoscale_report:?}"
+    );
+    assert!(
+        matches!(
+            autoscale_report.dynamic_autoscale,
+            mc_net::AutoscalePrimitiveStatus::Degraded { .. }
+        ) && autoscale_report
+            .gaps
+            .contains(&"dynamic runtime-control pressure/action decision was not observed"),
+        "runtime-control drain snapshots must not be counted as autoscale pressure: runtime={runtime_snapshot:?} report={autoscale_report:?}"
+    );
+
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed <= O2_VD8_JOIN_ELAPSED_BUDGET,
+        "O2 VD8 20-client gate exceeded debug elapsed budget: elapsed={elapsed:?} budget={O2_VD8_JOIN_ELAPSED_BUDGET:?}"
+    );
+
+    eprintln!(
+        "O2 VD8 20-client same_spawn clients={} per_client_chunks={:?} shared_chunks={} elapsed_ms={} chunk_loaded={:?} chunk_drained={:?} stop_reason_counts={:?} stop_reasons={:?} runtime_snapshot={:?} autoscale_report={:?} locks(world={:?} session={:?} save_all={:?} chunk_prepare={:?})",
+        O2_VD8_CONCURRENT_CLIENTS,
+        per_client_chunks,
+        streamed_chunks.len(),
+        elapsed.as_millis(),
+        loaded_snapshot,
+        drained_snapshot,
+        stop_reason_counts,
+        stop_reasons,
+        runtime_snapshot,
+        autoscale_report,
+        world_storage_delta,
+        session_registry_delta,
+        save_all_flush_delta,
+        chunk_prepare_delta,
     );
 }
 
@@ -826,6 +1100,9 @@ struct LoadServerOptions {
     view_distance: i32,
     disk_backed: bool,
     runtime_control: bool,
+    max_players: usize,
+    fixed_runtime_view_distance: bool,
+    chunk_result_queue_size: usize,
 }
 
 impl Default for LoadServerOptions {
@@ -834,6 +1111,9 @@ impl Default for LoadServerOptions {
             view_distance: VIEW_DISTANCE,
             disk_backed: false,
             runtime_control: false,
+            max_players: 8,
+            fixed_runtime_view_distance: false,
+            chunk_result_queue_size: 8,
         }
     }
 }
@@ -895,25 +1175,37 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         chunk_prepare_batch_size: 2,
         chunk_io_threads: LOAD_CHUNK_IO_THREADS,
         chunk_worker_threads: LOAD_CHUNK_WORKER_THREADS,
-        chunk_result_queue_size: 8,
+        chunk_result_queue_size: options.chunk_result_queue_size,
         ..mc_net::ChunkPipelinePolicy::default()
     };
     if options.runtime_control {
+        let initial_limits = mc_net::RuntimeControlLimits {
+            view_distance: options.view_distance,
+            chunk_send_rate: 8,
+            chunk_load_rate: 16,
+            chunk_generate_rate: 32,
+        };
+        let mut policy = mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced);
+        if options.fixed_runtime_view_distance {
+            policy.min_view_distance = options.view_distance;
+            policy.max_view_distance = options.view_distance;
+            policy.min_chunk_send_rate = initial_limits.chunk_send_rate;
+            policy.max_chunk_send_rate = initial_limits.chunk_send_rate;
+            policy.min_chunk_load_rate = initial_limits.chunk_load_rate;
+            policy.max_chunk_load_rate = initial_limits.chunk_load_rate;
+            policy.min_chunk_generate_rate = initial_limits.chunk_generate_rate;
+            policy.max_chunk_generate_rate = initial_limits.chunk_generate_rate;
+        }
         chunk_pipeline.runtime_control = Some(mc_net::RuntimeControlConfig {
-            policy: mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced),
-            initial_limits: mc_net::RuntimeControlLimits {
-                view_distance: options.view_distance,
-                chunk_send_rate: 8,
-                chunk_load_rate: 16,
-                chunk_generate_rate: 32,
-            },
+            policy,
+            initial_limits,
         });
     }
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M37 load scenarios".into(),
-        max_players: 8,
+        max_players: u32::try_from(options.max_players).expect("load max_players fits u32"),
         view_distance: options.view_distance,
         data,
         blocks: Arc::clone(&blocks),
@@ -1046,6 +1338,36 @@ fn assert_slow_reader_retry_bounded(
     );
 }
 
+fn lock_metric_delta(
+    before: mc_net::LockMetricSnapshot,
+    after: mc_net::LockMetricSnapshot,
+) -> mc_net::LockMetricSnapshot {
+    mc_net::LockMetricSnapshot {
+        wait_count: after.wait_count.saturating_sub(before.wait_count),
+        wait_us: after.wait_us.saturating_sub(before.wait_us),
+        max_wait_us: after.max_wait_us,
+        hold_count: after.hold_count.saturating_sub(before.hold_count),
+        hold_us: after.hold_us.saturating_sub(before.hold_us),
+        max_hold_us: after.max_hold_us,
+    }
+}
+
+fn assert_lock_metric_observed_within_budget(
+    name: &str,
+    delta: mc_net::LockMetricSnapshot,
+    after: mc_net::LockMetricSnapshot,
+    max_hold_budget_us: u64,
+) {
+    assert!(
+        delta.hold_count > 0,
+        "{name} lock path should be exercised: delta={delta:?} after={after:?}"
+    );
+    assert!(
+        after.max_hold_us <= max_hold_budget_us,
+        "{name} lock hold exceeded O2 VD8 budget: after={after:?} budget_us={max_hold_budget_us}"
+    );
+}
+
 async fn connect_to_play(
     addr: std::net::SocketAddr,
     name: &str,
@@ -1103,21 +1425,48 @@ async fn drain_unique_chunks(
     client: &mut Client,
     expected: usize,
 ) -> std::collections::BTreeSet<(i32, i32)> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    drain_unique_chunks_with_timeout(client, expected, Duration::from_secs(30), "client").await
+}
+
+async fn drain_unique_chunks_with_timeout(
+    client: &mut Client,
+    expected: usize,
+    timeout: Duration,
+    label: &str,
+) -> std::collections::BTreeSet<(i32, i32)> {
+    try_drain_unique_chunks_with_timeout(client, expected, timeout, label)
+        .await
+        .unwrap_or_else(|err| panic!("{err}"))
+}
+
+async fn try_drain_unique_chunks_with_timeout(
+    client: &mut Client,
+    expected: usize,
+    timeout: Duration,
+    label: &str,
+) -> Result<std::collections::BTreeSet<(i32, i32)>, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     let mut seen = std::collections::BTreeSet::new();
     loop {
         if seen.len() >= expected {
-            return seen;
+            return Ok(seen);
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for {expected} unique chunks; seen={seen:?}"
-        );
-        let frame = client
-            .read_frame_with_timeout(remaining)
-            .await
-            .expect("drain unique chunks");
+        if remaining.is_zero() {
+            return Err(format!(
+                "timed out waiting for {expected} unique chunks for {label}; seen_count={} seen={seen:?}",
+                seen.len()
+            ));
+        }
+        let frame = match client.read_frame_with_timeout(remaining).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                return Err(format!(
+                    "failed waiting for {expected} unique chunks for {label}; seen_count={} seen={seen:?}: {err}",
+                    seen.len()
+                ));
+            }
+        };
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -1129,8 +1478,22 @@ async fn drain_unique_chunks(
     }
 }
 
+async fn drain_client_until_shutdown(mut client: Client, shutdown: mc_net::ShutdownHandle) {
+    while !shutdown.is_requested() {
+        match client
+            .read_frame_with_timeout(Duration::from_millis(100))
+            .await
+        {
+            Ok(frame) => {
+                let _ = handle_keepalive(&mut client, frame.id, &frame.body).await;
+            }
+            Err(_) => tokio::task::yield_now().await,
+        }
+    }
+}
+
 async fn wait_for_shutdown_requested(shutdown: &mc_net::ShutdownHandle) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if shutdown.is_requested() {
             return;
