@@ -4132,6 +4132,188 @@ async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_withou
 }
 
 #[tokio::test]
+async fn scheduled_hopper_ejection_schedules_comparator_tick_for_target_chest() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["east"])]),
+                states: vec![state(2, true, &[("facing", "east")])],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:comparator").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["west"]),
+                    ("mode", &["compare"]),
+                    ("powered", &["false", "true"]),
+                ]),
+                states: vec![
+                    state(
+                        3,
+                        true,
+                        &[
+                            ("facing", "west"),
+                            ("mode", "compare"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                    state(
+                        4,
+                        false,
+                        &[("facing", "west"), ("mode", "compare"), ("powered", "true")],
+                    ),
+                ],
+            },
+        ])
+        .unwrap(),
+    );
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            ChunkPos { x: 0, z: 0 },
+            Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+        )
+        .unwrap();
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let target_pos = mc_world::BlockPos { x: 2, y: 64, z: 1 };
+    let comparator_pos = mc_world::BlockPos { x: 3, y: 64, z: 1 };
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
+    storage
+        .set_block_at(comparator_pos, BlockStateId(3))
+        .unwrap();
+    let mut hopper = mc_world::HopperBlockEntity::default();
+    hopper.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
+    storage
+        .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    register_loaded_button_session(&sessions, "HopperComparator");
+
+    let first = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(first.drained, 1);
+    assert_eq!(first.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        let target = storage
+            .chest_block_entity(target_pos)
+            .unwrap()
+            .expect("target chest");
+        assert_eq!(
+            target.slots[0],
+            mc_world::FurnaceSlot {
+                count: 1,
+                item_id: 42,
+                damage: None,
+            }
+        );
+        assert_eq!(
+            storage.get_cached_block(comparator_pos),
+            Some(BlockStateId(3))
+        );
+        let scheduled = storage
+            .scheduled_block_ticks(ChunkPos { x: 0, z: 0 })
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert!(
+            scheduled.iter().any(|tick| {
+                tick.pos == comparator_pos
+                    && tick.block == Identifier::parse("minecraft:comparator").unwrap()
+                    && tick.trigger_tick == 22
+            }),
+            "hopper target mutation should schedule a delayed comparator refresh"
+        );
+    }
+
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 22).await;
+
+    assert_eq!(final_report.applied, 1);
+    let storage = world.lock().await;
+    assert_eq!(
+        storage.get_cached_block(comparator_pos),
+        Some(BlockStateId(4))
+    );
+}
+
+#[test]
+fn comparator_container_signal_uses_vanilla_discrete_fullness_formula() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+        ])
+        .unwrap(),
+    );
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            ChunkPos { x: 0, z: 0 },
+            Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+        )
+        .unwrap();
+    let chest_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    storage.set_block_at(chest_pos, BlockStateId(1)).unwrap();
+    storage
+        .set_chest_block_entity(chest_pos, mc_world::ChestBlockEntity::default())
+        .unwrap();
+    assert_eq!(
+        container_redstone_signal_at(&blocks, &mut storage, chest_pos),
+        0
+    );
+
+    let mut chest = mc_world::ChestBlockEntity::default();
+    chest.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_chest_block_entity(chest_pos, chest).unwrap();
+    assert_eq!(
+        container_redstone_signal_at(&blocks, &mut storage, chest_pos),
+        1
+    );
+
+    let mut chest = mc_world::ChestBlockEntity::default();
+    for slot in &mut chest.slots {
+        *slot = mc_world::FurnaceSlot {
+            count: HOPPER_TRANSFER_MAX_STACK,
+            item_id: 42,
+            damage: None,
+        };
+    }
+    storage.set_chest_block_entity(chest_pos, chest).unwrap();
+    assert_eq!(
+        container_redstone_signal_at(&blocks, &mut storage, chest_pos),
+        15
+    );
+}
+
+#[tokio::test]
 async fn placing_hopper_schedules_initial_transfer_tick() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
@@ -5302,6 +5484,30 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                 properties: prop_schema(&[("facing", &["east"])]),
                 states: vec![state(2, true, &[("facing", "east")])],
             },
+            BlockReport {
+                id: Identifier::parse("minecraft:comparator").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["west"]),
+                    ("mode", &["compare"]),
+                    ("powered", &["false", "true"]),
+                ]),
+                states: vec![
+                    state(
+                        3,
+                        true,
+                        &[
+                            ("facing", "west"),
+                            ("mode", "compare"),
+                            ("powered", "false"),
+                        ],
+                    ),
+                    state(
+                        4,
+                        false,
+                        &[("facing", "west"), ("mode", "compare"), ("powered", "true")],
+                    ),
+                ],
+            },
         ])
         .unwrap(),
     );
@@ -5310,6 +5516,7 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
     let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
     let target_left_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
     let target_right_pos = mc_world::BlockPos { x: 3, y: 65, z: 1 };
+    let comparator_pos = mc_world::BlockPos { x: 4, y: 65, z: 1 };
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     storage
         .insert_generated_chunk(
@@ -5328,6 +5535,9 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
         .unwrap();
     storage
         .set_block_at(target_right_pos, BlockStateId(1))
+        .unwrap();
+    storage
+        .set_block_at(comparator_pos, BlockStateId(3))
         .unwrap();
     let mut source = mc_world::ChestBlockEntity::default();
     source.slots[0] = mc_world::FurnaceSlot {
@@ -5395,6 +5605,8 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
     let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
     assert_eq!(final_report.drained, 1);
     assert_eq!(final_report.applied, 1);
+    let comparator_report = run_scheduled_block_ticks_for_range(&config, &sessions, 29, 30).await;
+    assert_eq!(comparator_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let source = storage
@@ -5425,6 +5637,10 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
                 item_id: 42,
                 damage: None,
             }
+        );
+        assert_eq!(
+            storage.get_cached_block(comparator_pos),
+            Some(BlockStateId(4))
         );
     }
 

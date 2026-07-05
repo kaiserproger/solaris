@@ -5589,6 +5589,14 @@ pub(crate) async fn run_scheduled_block_ticks(
                     if result.moved {
                         applied_mutations += 1;
                     }
+                    for update in &result.updates {
+                        schedule_comparator_ticks_for_hopper_update(
+                            &config.blocks,
+                            &mut storage,
+                            update,
+                            world_tick.saturating_add(COMPARATOR_TICK_DELAY_TICKS),
+                        );
+                    }
                     hopper_updates.extend(result.updates);
                     if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
                         tick.pos,
@@ -7213,6 +7221,9 @@ fn scheduled_block_tick_edits(
     state_id: mc_world::BlockStateId,
 ) -> Option<Vec<BlockEdit>> {
     let state = blocks.by_id(state_id)?;
+    if state.block.id.path() == "comparator" {
+        return scheduled_comparator_tick_edits(blocks, storage, pos, state);
+    }
     if !state.block.id.path().ends_with("_button")
         || block_state_property(state, "powered")? != "true"
     {
@@ -7224,6 +7235,88 @@ fn scheduled_block_tick_edits(
     }];
     extend_adjacent_power_target_edits(blocks, storage, pos, false, &mut edits);
     Some(edits)
+}
+
+fn scheduled_comparator_tick_edits(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+) -> Option<Vec<BlockEdit>> {
+    let input_signal = comparator_input_signal(blocks, storage, pos, state);
+    let new_state = sibling_state_with_bool_property(blocks, state, "powered", input_signal > 0)?;
+    if new_state == state.id {
+        return Some(Vec::new());
+    }
+    Some(vec![BlockEdit { pos, new_state }])
+}
+
+fn comparator_input_signal(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+    state: &mc_world::BlockState,
+) -> i32 {
+    let Some(facing) = block_state_property(state, "facing") else {
+        return 0;
+    };
+    let Some(target_pos) = hopper_facing_target(pos, facing) else {
+        return 0;
+    };
+    container_redstone_signal_at(blocks, storage, target_pos)
+}
+
+fn container_redstone_signal_at(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> i32 {
+    if let Some(positions) = cached_storage_chest_like_positions(blocks, storage, pos)
+        && let Some(view) = load_hopper_chest_view(storage, &positions)
+    {
+        let slot_count = view.chests.iter().map(|chest| chest.slots.len()).sum();
+        return container_redstone_signal_from_slots(
+            view.chests.iter().flat_map(|chest| chest.slots.iter()),
+            slot_count,
+        );
+    }
+
+    if cached_furnace_kind(blocks, storage, pos).is_some()
+        && let Ok(Some(furnace)) = storage.furnace_block_entity(pos)
+    {
+        return container_redstone_signal_from_slots(furnace.slots.iter(), furnace.slots.len());
+    }
+
+    let is_hopper = storage
+        .get_cached_block(pos)
+        .and_then(|state_id| blocks.by_id(state_id))
+        .is_some_and(|state| state.block.id.path() == "hopper");
+    if is_hopper && let Ok(Some(hopper)) = storage.hopper_block_entity(pos) {
+        return container_redstone_signal_from_slots(hopper.slots.iter(), hopper.slots.len());
+    }
+
+    0
+}
+
+fn container_redstone_signal_from_slots<'a>(
+    slots: impl IntoIterator<Item = &'a FurnaceSlot>,
+    slot_count: usize,
+) -> i32 {
+    if slot_count == 0 {
+        return 0;
+    }
+    let total_percent = slots.into_iter().fold(0.0f32, |acc, slot| {
+        if slot.is_empty() {
+            acc
+        } else {
+            acc + slot.count as f32 / HOPPER_TRANSFER_MAX_STACK as f32
+        }
+    }) / slot_count as f32;
+    if total_percent <= 0.0 {
+        0
+    } else {
+        (total_percent * 14.0).floor() as i32 + 1
+    }
 }
 
 struct HopperTransferContext<'a> {
@@ -7524,6 +7617,68 @@ enum HopperTransferUpdate {
     },
 }
 
+fn schedule_comparator_ticks_for_hopper_update(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    update: &HopperTransferUpdate,
+    trigger_tick: u64,
+) {
+    match update {
+        HopperTransferUpdate::Chest { position, .. } => {
+            if let Some(positions) = cached_storage_chest_like_positions(blocks, storage, *position)
+            {
+                for position in positions {
+                    schedule_comparator_ticks_for_container(
+                        blocks,
+                        storage,
+                        position,
+                        trigger_tick,
+                    );
+                }
+            } else {
+                schedule_comparator_ticks_for_container(blocks, storage, *position, trigger_tick);
+            }
+        }
+        HopperTransferUpdate::Furnace { position, .. } => {
+            schedule_comparator_ticks_for_container(blocks, storage, *position, trigger_tick);
+        }
+        HopperTransferUpdate::Campfire { .. } => {}
+    }
+}
+
+fn schedule_comparator_ticks_for_container(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mut mc_world::WorldStorage,
+    target: mc_world::BlockPos,
+    trigger_tick: u64,
+) {
+    for pos in adjacent_block_positions(target) {
+        let Some(state_id) = storage.get_cached_block(pos) else {
+            continue;
+        };
+        let Some(state) = blocks.by_id(state_id) else {
+            continue;
+        };
+        if state.block.id.path() != "comparator" {
+            continue;
+        }
+        let Some(facing) = block_state_property(state, "facing") else {
+            continue;
+        };
+        if hopper_facing_target(pos, facing) != Some(target) {
+            continue;
+        }
+        if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
+            pos,
+            state.block.id.clone(),
+            trigger_tick,
+            0,
+        )) {
+            warn!(error = %err, ?pos, ?target, "comparator refresh tick scheduling failed");
+        }
+    }
+}
+
 fn hopper_facing_target(pos: mc_world::BlockPos, facing: &str) -> Option<mc_world::BlockPos> {
     Some(match facing {
         "down" => mc_world::BlockPos {
@@ -7783,6 +7938,8 @@ const HOPPER_TRANSFER_MAX_STACK: i32 = 64;
 // remain outside this foundation.
 const HOPPER_TRANSFER_DELAY_TICKS: u64 = 8;
 const HOPPER_TICK_DELAY_TICKS: u64 = 1;
+// 26.1.2 ComparatorBlock#getDelay.
+const COMPARATOR_TICK_DELAY_TICKS: u64 = 2;
 
 fn extend_adjacent_power_target_edits(
     blocks: &mc_world::BlockRegistry,
