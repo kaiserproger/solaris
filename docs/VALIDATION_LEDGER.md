@@ -208,6 +208,21 @@ container parity.
 | Vanilla oracle | Partial | Local decompiled 26.1.2 `AbstractContainerMenu.java` supplied the QuickCraft constants, state fields, mask helpers, order checks, and type-0 distribution semantics. No vanilla server capture, wire-probe side-by-side comparison, or real client QuickCraft run was performed. |
 | Evidence limit | Partial | This covers chest-window type-0 left-drag only. Right-drag, creative clone-drag, one-slot edge breadth, non-empty/near-full slot breadth, inventory/crafting/furnace/other-container QuickCraft, broad malformed-order corpus, performance, concurrency, persistence, soak, and manual/client behavior remain unproven. |
 
+## 2026-07-05 Chest QuickCraft Right-Drag Slice
+
+This local Q2 slice adds the bounded survival chest QuickCraft type-1
+right-drag path. The quality label remains `stabilization`: this is protocol
+harness evidence plus local decompiled-source oracle semantics, not full
+container parity or real-client proof.
+
+| Gate | Result | Notes |
+|---|---|---|
+| Red valid right-drag harness | Failed before fix | `cargo test -p mc-test-harness --test block_edit chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack -- --nocapture` first timed out waiting for final chest content because GREEDY/type-1 QuickCraft was rejected. |
+| Chest QuickCraft harness pair | Passed | `cargo test -p mc-test-harness --test block_edit chest_quickcraft -- --nocapture` passed the left-drag and right-drag harnesses. The right-drag harness picks up `minecraft:dirt x5`, drags over a compatible slot at `x63` plus an empty slot, and requires final authoritative slots `x64`/`x1` with carried `x3`. |
+| Malformed/unsupported click regressions | Passed | `cargo test -p mc-test-harness --test block_edit unsupported_chest_click_modes_resync_without_trusting_client_slots -- --exact --nocapture` and `cargo test -p mc-test-harness --test block_edit malformed_furnace_clicks_resync_without_trusting_client_slots -- --exact --nocapture` passed after the change. |
+| Vanilla oracle | Partial | Local decompiled 26.1.2 `AbstractContainerMenu.java` confirms QuickCraft type `1` is valid and `getQuickCraftPlaceCount` returns `1` per selected slot before max-stack capping. No vanilla capture, wire-probe side-by-side comparison, or real-client run was performed. |
+| Evidence limit | Partial | This covers chest-window type-1 right-drag for one compatible partial stack plus one empty slot. Creative clone-drag, non-chest containers, duplicate slot breadth, inventory/crafting/furnace QuickCraft, broad malformed-order corpus, manual/client behavior, performance, concurrency, persistence, and soak remain unproven. |
+
 ## 2026-07-05 Script Command Capability Boundary Slice
 
 This local plugin API slice adds a fail-closed outbound command capability
@@ -223,6 +238,21 @@ runtime, sandbox, lifecycle, ABI, or security audit.
 | Diff hygiene | Passed | `git diff --check -- crates/mc-script/src/lib.rs` passed after the boundary fix. |
 | Evidence limit | Partial | Default public callers can no longer forge non-empty `CommandCapabilities`, and external host crates can opt into `host-api` for trusted construction. This Cargo feature split is not a sandbox for arbitrary Rust linked with the same enabled feature. The eventual plugin stack must optimize migration ergonomics from Java plugin/mod ecosystems and split loader work between server-core APIs and a client mod bridge that syncs capabilities/schema with the server; this slice does not design or prove that loader architecture. Broader plugin runtime permissions, lifecycle hooks, sandboxing, policy persistence, ABI compatibility, command execution integration, and security review remain unproven. |
 
+## 2026-07-05 Script Plugin Manifest Contract Slice
+
+This local plugin API slice adds manifest DTO and validation primitives for a
+future server-side script loader. The quality label remains `stabilization`:
+this is API/unit evidence only, not plugin runtime, loader policy, sandbox, Java
+binary compatibility, or client bridge sync.
+
+| Gate | Result | Notes |
+|---|---|---|
+| Red manifest API tests | Failed before fix | New unit tests first failed with unresolved `ScriptPluginManifest` / `ScriptPluginManifestError`, proving the loader-contract API did not exist. |
+| Default mc-script suite | Passed | `cargo test -p mc-script -- --nocapture` passed 9 unit tests plus the default compile-fail doctest after adding manifest validation for plugin ids, requested API versions, duplicate normalized command roots, blank roots, and wildcard roots. |
+| Host-api suite | Passed | `cargo test -p mc-script --features host-api --lib -- --nocapture` passed 10 unit tests, including trusted host derivation of `CommandCapabilities` from a validated manifest that allows `/time set day` and denies `/stop`. `cargo test -p mc-script --features host-api --doc -- --nocapture` passed the host builder doctest. |
+| Review | Passed | Read-only review found no Critical or Important issues. The review explicitly noted that `to_command_capabilities()` is declaration-to-grant wiring for trusted host code, not policy approval evidence, and that command roots are normalized root tokens rather than exact command-pattern validation. |
+| Evidence limit | Partial | This slice does not parse TOML/JSON manifests, load plugin files, execute scripts, approve permissions, sandbox code, persist policy, bridge to a client mod, or provide Java binary compatibility. |
+
 ## 2026-07-05 Same-Spawn In-Flight Rescan Cap
 
 This local O1/O2 slice bounds one coalesced chunk-stream waiter hot path where
@@ -237,6 +267,20 @@ sidecar gate, not low/balanced/high profile performance or soak evidence.
 | Ignored 20-client VD8 gate | Passed | `cargo test -p mc-test-harness --test load_scenarios vd8_twenty_same_spawn_clients_drain_full_window_and_stop_without_duplicate_pressure -- --ignored --exact --nocapture` passed in 30.70s with all 20 clients receiving `289/289` chunks, `shared_chunks=289`, `elapsed_ms=30277`, stop reasons including `BatchLimit`, `QueueFull`, `QueueEmpty`, and `Complete`, `chunk_prepare.hold_count=4158`, and `session_registry.wait_count=1756169`. |
 | Review caveat | Partial | Read-only review found no Critical or Important issues. The unit now uses a test-local prepared-claim call counter instead of the process-global lock-pressure counter, but it still directly covers only the all-in-flight queue shape. |
 | Evidence limit | Partial | The cap reduces one same-spawn waiter churn path but can delay cached/claimable work behind in-flight entries by extra dispatch turns. Existing chunk-stream tests and the ignored gate passed, but mixed-queue fairness, broad profile budgets, TPS/p95/p99, real-client load, slow-client recovery, memory behavior, and soak remain unproven. |
+
+## 2026-07-05 Mixed In-Flight Queue Fairness Guard
+
+This local O1/O2 slice adds explicit unit evidence that the prepared-in-flight
+deferral cap still rotates deferred requests and reaches later cached work.
+The quality label remains `stabilization`: this is focused scheduler evidence,
+not a broad load profile.
+
+| Gate | Result | Notes |
+|---|---|---|
+| Red mutation check | Failed before final | The new test passed against current production code, so the worker temporarily removed the in-flight `scheduler.defer(request)` path; with that mutation, `mixed_inflight_prefix_rotates_to_later_cached_chunk` failed with `left: []`, `right: [(-1, 1)]`. The mutation was reverted before final verification. |
+| Mixed queue unit | Passed | `cargo test -p mc-net --lib mixed_inflight_prefix_rotates_to_later_cached_chunk -- --nocapture` passed. The test holds claims for the first two queued chunks, caches a later chunk, and proves bounded dispatch turns rotate to that cached chunk. |
+| Focused chunk-stream suite | Passed | `cargo test -p mc-net --lib chunk_stream -- --nocapture` passed 34 chunk-stream tests after adding the fairness guard. |
+| Evidence limit | Partial | This covers one mixed in-flight prefix plus later cached chunk shape. It does not prove broad fairness under sustained generated/load budgets, slow clients, memory pressure, multi-client real load, low/balanced/high profiles, TPS, or soak. |
 
 ## 2026-06-22 Real-Client Agent Run
 

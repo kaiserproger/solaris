@@ -3066,6 +3066,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mixed_inflight_prefix_rotates_to_later_cached_chunk() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(1);
+        let profile = LoggedInProfile {
+            uuid: uuid::Uuid::nil(),
+            name: "mixed-claim-waiter".to_string(),
+        };
+        let view_distance = 1;
+        let desired = desired_chunk_set(0, 0, view_distance);
+        let (session_id, _) = sessions.register(
+            &profile,
+            (0, 0),
+            view_distance,
+            desired,
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let policy = ChunkPipelinePolicy {
+            chunk_prepare_batch_size: 1,
+            chunk_result_queue_size: 1,
+            ..ChunkPipelinePolicy::default()
+        };
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            view_distance,
+            ChunkPipelineResources::with_limits(1, 1),
+            policy,
+        );
+        let queued: Vec<_> = prioritized_spiral(0, 0, view_distance, 0.0)
+            .take(3)
+            .map(|(cx, cz, _)| (cx, cz))
+            .collect();
+        let first_inflight = queued[0];
+        let second_inflight = queued[1];
+        let cached_later = queued[2];
+        let first_claim = match sessions.prepared_chunk_or_claim(first_inflight) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected first manual claim, got {other:?}"),
+        };
+        let second_claim = match sessions.prepared_chunk_or_claim(second_inflight) {
+            PreparedChunkClaimResult::Claimed(claim) => claim,
+            other => panic!("expected second manual claim, got {other:?}"),
+        };
+        sessions.cache_prepared_chunk(
+            cached_later,
+            Arc::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"chunk-frame"),
+                light: None,
+                herd_spawns: Vec::new(),
+                hydrated_campfires: Vec::new(),
+                packet_data_len: 0,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            }),
+        );
+
+        for _ in 0..=PREPARED_IN_FLIGHT_DEFERRAL_LIMIT {
+            stream.dispatch_available().await;
+            if stream
+                .ready
+                .values()
+                .any(|result| (result.request.chunk_x, result.request.chunk_z) == cached_later)
+            {
+                break;
+            }
+        }
+
+        let ready_chunks: Vec<_> = stream
+            .ready
+            .values()
+            .map(|result| (result.request.chunk_x, result.request.chunk_z))
+            .collect();
+        assert_eq!(ready_chunks, vec![cached_later]);
+        assert_eq!(stream.dispatched, 1);
+        assert_eq!(stream.scheduler.in_flight_len(), 1);
+        assert!(sessions.release_prepared_chunk_claim(first_inflight, first_claim));
+        assert!(sessions.release_prepared_chunk_claim(second_inflight, second_claim));
+    }
+
+    #[tokio::test]
     async fn stale_prepare_result_releases_global_claim() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(

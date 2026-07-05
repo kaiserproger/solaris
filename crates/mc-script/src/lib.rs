@@ -225,6 +225,189 @@ pub enum ScriptCommandCapability {
     RunConsoleCommandRoot { root: String },
 }
 
+/// Plugin manifest contract consumed by a future server-side script loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptPluginManifest {
+    plugin_id: String,
+    display_name: String,
+    version: String,
+    requested_api_version: ScriptApiVersion,
+    declared_command_capabilities: Vec<ScriptCommandCapability>,
+    declared_permissions: Vec<String>,
+}
+
+impl ScriptPluginManifest {
+    /// Build a script plugin manifest DTO.
+    pub fn new(
+        plugin_id: impl Into<String>,
+        display_name: impl Into<String>,
+        version: impl Into<String>,
+        requested_api_version: ScriptApiVersion,
+    ) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            display_name: display_name.into(),
+            version: version.into(),
+            requested_api_version,
+            declared_command_capabilities: Vec::new(),
+            declared_permissions: Vec::new(),
+        }
+    }
+
+    /// Declare that this plugin requests access to a console command root.
+    pub fn declare_console_command_root(mut self, root: impl Into<String>) -> Self {
+        self.declared_command_capabilities
+            .push(ScriptCommandCapability::RunConsoleCommandRoot { root: root.into() });
+        self
+    }
+
+    /// Declare an opaque plugin permission string for a future loader.
+    pub fn declare_permission(mut self, permission: impl Into<String>) -> Self {
+        self.declared_permissions.push(permission.into());
+        self
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn requested_api_version(&self) -> ScriptApiVersion {
+        self.requested_api_version
+    }
+
+    pub fn declared_command_capabilities(&self) -> &[ScriptCommandCapability] {
+        &self.declared_command_capabilities
+    }
+
+    pub fn declared_permissions(&self) -> &[String] {
+        &self.declared_permissions
+    }
+
+    /// Validate and normalize this manifest for trusted host-side use.
+    pub fn validate(&self) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
+        if !is_valid_plugin_id(&self.plugin_id) {
+            return Err(ScriptPluginManifestError::InvalidPluginId {
+                plugin_id: self.plugin_id.clone(),
+            });
+        }
+
+        if !supports_script_api_version(self.requested_api_version) {
+            return Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
+                requested: self.requested_api_version,
+                supported: SCRIPT_API_VERSION,
+            });
+        }
+
+        let mut normalized_capabilities =
+            Vec::with_capacity(self.declared_command_capabilities.len());
+        for capability in &self.declared_command_capabilities {
+            match capability {
+                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
+                    let root = validate_command_root(root)?;
+                    if normalized_capabilities.iter().any(
+                        |capability| matches!(capability, ScriptCommandCapability::RunConsoleCommandRoot { root: existing } if existing == &root),
+                    ) {
+                        return Err(ScriptPluginManifestError::DuplicateCommandRoot { root });
+                    }
+                    normalized_capabilities
+                        .push(ScriptCommandCapability::RunConsoleCommandRoot { root });
+                }
+            }
+        }
+
+        Ok(ValidatedScriptPluginManifest {
+            plugin_id: self.plugin_id.clone(),
+            display_name: self.display_name.clone(),
+            version: self.version.clone(),
+            requested_api_version: self.requested_api_version,
+            declared_command_capabilities: normalized_capabilities,
+            declared_permissions: self.declared_permissions.clone(),
+        })
+    }
+}
+
+/// Validated and normalized script plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidatedScriptPluginManifest {
+    plugin_id: String,
+    display_name: String,
+    version: String,
+    requested_api_version: ScriptApiVersion,
+    declared_command_capabilities: Vec<ScriptCommandCapability>,
+    declared_permissions: Vec<String>,
+}
+
+impl ValidatedScriptPluginManifest {
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn requested_api_version(&self) -> ScriptApiVersion {
+        self.requested_api_version
+    }
+
+    pub fn declared_command_capabilities(&self) -> &[ScriptCommandCapability] {
+        &self.declared_command_capabilities
+    }
+
+    pub fn declared_permissions(&self) -> &[String] {
+        &self.declared_permissions
+    }
+
+    /// Trusted host-side conversion from validated manifest declarations to
+    /// executable command capabilities.
+    #[cfg(feature = "host-api")]
+    pub fn to_command_capabilities(&self) -> CommandCapabilities {
+        let mut capabilities = CommandCapabilities::none();
+        for capability in &self.declared_command_capabilities {
+            match capability {
+                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
+                    capabilities = capabilities.allow_console_command_root(root);
+                }
+            }
+        }
+        capabilities
+    }
+}
+
+/// Error returned when validating a script plugin manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptPluginManifestError {
+    InvalidPluginId {
+        plugin_id: String,
+    },
+    UnsupportedScriptApiVersion {
+        requested: ScriptApiVersion,
+        supported: ScriptApiVersion,
+    },
+    BlankCommandRoot,
+    UnboundedCommandRoot {
+        root: String,
+    },
+    DuplicateCommandRoot {
+        root: String,
+    },
+}
+
 /// Allow-list of privileged outbound command capabilities granted by the host.
 ///
 /// Default builds expose empty capabilities for script-facing callers. Trusted
@@ -372,6 +555,29 @@ fn console_command_root(command: &str) -> String {
         .next()
         .unwrap_or_default()
         .to_owned()
+}
+
+fn is_valid_plugin_id(plugin_id: &str) -> bool {
+    let mut chars = plugin_id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+
+    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+}
+
+fn validate_command_root(root: &str) -> Result<String, ScriptPluginManifestError> {
+    let root = console_command_root(root);
+    if root.is_empty() {
+        return Err(ScriptPluginManifestError::BlankCommandRoot);
+    }
+    if root.contains('*') {
+        return Err(ScriptPluginManifestError::UnboundedCommandRoot { root });
+    }
+    Ok(root)
 }
 
 /// Future VM resource and lifecycle controls reserved in the host contract.
@@ -596,6 +802,89 @@ mod tests {
             Err(CommandBatchError::Full { limit: nonzero(1) })
         );
         assert_eq!(batch.commands(), std::slice::from_ref(&allowed));
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unsupported_requested_api_version() {
+        let requested = ScriptApiVersion::new(0, 3, 0);
+        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested)
+            .declare_console_command_root("time");
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
+                requested,
+                supported: SCRIPT_API_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_duplicate_command_roots_after_normalization() {
+        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .declare_console_command_root("time")
+            .declare_console_command_root("/time set day");
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ScriptPluginManifestError::DuplicateCommandRoot {
+                root: "time".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_invalid_ids_and_unbounded_command_roots() {
+        let invalid_id =
+            ScriptPluginManifest::new("Day Time", "Daytime", "0.1.0", SCRIPT_API_VERSION);
+        assert_eq!(
+            invalid_id.validate(),
+            Err(ScriptPluginManifestError::InvalidPluginId {
+                plugin_id: "Day Time".to_owned(),
+            })
+        );
+
+        let unbounded =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+                .declare_console_command_root("*");
+        assert_eq!(
+            unbounded.validate(),
+            Err(ScriptPluginManifestError::UnboundedCommandRoot {
+                root: "*".to_owned(),
+            })
+        );
+
+        let blank = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .declare_console_command_root(" / ");
+        assert_eq!(
+            blank.validate(),
+            Err(ScriptPluginManifestError::BlankCommandRoot)
+        );
+    }
+
+    #[cfg(feature = "host-api")]
+    #[test]
+    fn trusted_host_derives_command_capabilities_from_validated_manifest() {
+        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .declare_console_command_root("time");
+        let validated = manifest.validate().unwrap();
+        let capabilities = validated.to_command_capabilities();
+
+        let time = ScriptCommand::RunConsoleCommand {
+            command: "/time set day".to_owned(),
+        }
+        .required_capability()
+        .unwrap();
+        assert!(capabilities.allows(&time));
+        assert!(
+            !capabilities.allows(
+                &ScriptCommand::RunConsoleCommand {
+                    command: "/stop".to_owned(),
+                }
+                .required_capability()
+                .unwrap()
+            )
+        );
     }
 
     #[test]

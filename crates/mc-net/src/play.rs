@@ -2656,6 +2656,7 @@ struct QuickCraftClick {
 }
 
 const QUICKCRAFT_TYPE_CHARITABLE: i8 = 0;
+const QUICKCRAFT_TYPE_GREEDY: i8 = 1;
 const QUICKCRAFT_HEADER_START: i8 = 0;
 const QUICKCRAFT_HEADER_CONTINUE: i8 = 1;
 const QUICKCRAFT_HEADER_END: i8 = 2;
@@ -3849,6 +3850,18 @@ fn can_chest_quickcraft_replace(
             && slot_stack.count <= item_max_stack(&state.item_facts, &state.items, stack)
 }
 
+fn chest_quickcraft_place_count(
+    source_count: i32,
+    selected_slots: usize,
+    quickcraft_kind: i8,
+) -> i32 {
+    match quickcraft_kind {
+        QUICKCRAFT_TYPE_CHARITABLE => source_count / selected_slots as i32,
+        QUICKCRAFT_TYPE_GREEDY => 1,
+        _ => 0,
+    }
+}
+
 fn apply_chest_quickcraft_click(
     state: &mut InteractionState,
     view: &mut ChestView,
@@ -3869,7 +3882,10 @@ fn apply_chest_quickcraft_click(
 
     match click.header {
         QUICKCRAFT_HEADER_START => {
-            if click.kind == QUICKCRAFT_TYPE_CHARITABLE {
+            if matches!(
+                click.kind,
+                QUICKCRAFT_TYPE_CHARITABLE | QUICKCRAFT_TYPE_GREEDY
+            ) {
                 window.quickcraft.start(click.kind);
             } else {
                 window.quickcraft.reset();
@@ -3881,8 +3897,10 @@ fn apply_chest_quickcraft_click(
                 window.quickcraft.reset();
                 return false;
             };
-            if window.quickcraft.kind() == QUICKCRAFT_TYPE_CHARITABLE
-                && can_chest_quickcraft_replace(state, view, menu_slot, &state.carried_item)
+            if matches!(
+                window.quickcraft.kind(),
+                QUICKCRAFT_TYPE_CHARITABLE | QUICKCRAFT_TYPE_GREEDY
+            ) && can_chest_quickcraft_replace(state, view, menu_slot, &state.carried_item)
                 && state.carried_item.count > window.quickcraft.slots().len() as i32
             {
                 window.quickcraft.add_slot(menu_slot);
@@ -3893,7 +3911,12 @@ fn apply_chest_quickcraft_click(
             let quickcraft_kind = window.quickcraft.kind();
             let quickcraft_slots = window.quickcraft.slots().to_vec();
             window.quickcraft.reset();
-            if quickcraft_slots.is_empty() || quickcraft_kind != QUICKCRAFT_TYPE_CHARITABLE {
+            if quickcraft_slots.is_empty()
+                || !matches!(
+                    quickcraft_kind,
+                    QUICKCRAFT_TYPE_CHARITABLE | QUICKCRAFT_TYPE_GREEDY
+                )
+            {
                 return false;
             }
             if quickcraft_slots.len() == 1 {
@@ -3903,7 +3926,8 @@ fn apply_chest_quickcraft_click(
             if source.is_empty() || source.count < quickcraft_slots.len() as i32 {
                 return false;
             }
-            let place_count = source.count / quickcraft_slots.len() as i32;
+            let place_count =
+                chest_quickcraft_place_count(source.count, quickcraft_slots.len(), quickcraft_kind);
             if place_count <= 0 {
                 return false;
             }

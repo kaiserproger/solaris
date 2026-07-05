@@ -1515,6 +1515,274 @@ async fn chest_quickcraft_left_drag_splits_carried_stack_across_empty_slots() {
 }
 
 #[tokio::test]
+async fn chest_quickcraft_right_drag_places_one_per_selected_slot_and_merges_partial_stack() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let chest_id = mc_data::Identifier::parse("minecraft:chest").unwrap();
+    let chest_state_id = i32::try_from(blocks.block(&chest_id).expect("chest block").default.0)
+        .expect("chest state id fits i32");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
+    let world = Some(Arc::clone(&world_handle));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let chest_item_id = items.id_of(&chest_id).expect("chest item");
+    let dirt_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+    let chest_menu_id = 2;
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 chest right quickcraft".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "M100RightQC").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:chest 1 0".into(),
+        })
+        .await
+        .expect("give chest");
+    wait_for_slot_stack(&mut client, chest_item_id, 1).await;
+
+    let support_y = sync.y.floor() as i32 - 2;
+    let chest_y = support_y + 1;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, support_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 203,
+        })
+        .await
+        .expect("place chest");
+    wait_for_block_update(&mut client, (0, chest_y, 0), chest_state_id).await;
+
+    let chest_pos = mc_world::BlockPos {
+        x: 0,
+        y: chest_y,
+        z: 0,
+    };
+    {
+        let mut world = world_handle.lock().await;
+        let mut chest = mc_world::ChestBlockEntity::default();
+        chest.slots[0] = mc_world::FurnaceSlot {
+            item_id: dirt_id,
+            count: 5,
+            damage: None,
+        };
+        chest.slots[1] = mc_world::FurnaceSlot {
+            item_id: dirt_id,
+            count: 63,
+            damage: None,
+        };
+        world
+            .set_chest_block_entity(chest_pos, chest)
+            .expect("seed chest entity");
+    }
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(chest_pos.x, chest_pos.y, chest_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 204,
+        })
+        .await
+        .expect("open chest");
+    let opened = wait_for_open_screen(&mut client, chest_menu_id).await;
+    let initial = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.items[0].item_id == dirt_id
+            && pkt.items[0].count == 5
+            && pkt.items[1].item_id == dirt_id
+            && pkt.items[1].count == 63
+            && pkt.items[2].is_empty()
+            && pkt.carried_item.is_empty()
+    })
+    .await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: opened.container_id,
+            state_id: initial.state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(0, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: dirt_id,
+                count: 5,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("pick up dirt stack");
+    let carrying = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.state_id > initial.state_id
+            && pkt.items[0].is_empty()
+            && pkt.items[1].item_id == dirt_id
+            && pkt.items[1].count == 63
+            && pkt.items[2].is_empty()
+            && pkt.carried_item.item_id == dirt_id
+            && pkt.carried_item.count == 5
+    })
+    .await;
+
+    for (slot_num, button_num, carried_count, changed_slots) in [
+        (-999, 4, 5, Vec::new()),
+        (
+            1,
+            5,
+            5,
+            vec![(
+                1,
+                HashedStack::Actual {
+                    item_id: dirt_id,
+                    count: 64,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            )],
+        ),
+        (
+            2,
+            5,
+            5,
+            vec![(
+                2,
+                HashedStack::Actual {
+                    item_id: dirt_id,
+                    count: 1,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            )],
+        ),
+        (
+            -999,
+            6,
+            3,
+            vec![
+                (
+                    1,
+                    HashedStack::Actual {
+                        item_id: dirt_id,
+                        count: 64,
+                        components: HashedStackComponentHashes::empty(),
+                    },
+                ),
+                (
+                    2,
+                    HashedStack::Actual {
+                        item_id: dirt_id,
+                        count: 1,
+                        components: HashedStackComponentHashes::empty(),
+                    },
+                ),
+            ],
+        ),
+    ] {
+        client
+            .write_packet(&ServerboundContainerClick {
+                container_id: opened.container_id,
+                state_id: carrying.state_id,
+                slot_num,
+                button_num,
+                container_input: ContainerInput::QuickCraft,
+                changed_slots,
+                carried_item: HashedStack::Actual {
+                    item_id: dirt_id,
+                    count: carried_count,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            })
+            .await
+            .expect("send chest right quickcraft stage");
+    }
+
+    let final_content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
+        pkt.state_id > carrying.state_id
+            && pkt.items[0].is_empty()
+            && pkt.items[1].item_id == dirt_id
+            && pkt.items[1].count == 64
+            && pkt.items[2].item_id == dirt_id
+            && pkt.items[2].count == 1
+            && pkt.carried_item.item_id == dirt_id
+            && pkt.carried_item.count == 3
+    })
+    .await;
+    assert!(
+        final_content.state_id > carrying.state_id,
+        "right QuickCraft end should advance the chest state id after storage mutation"
+    );
+
+    let mut world = world_handle.lock().await;
+    let chest = world
+        .chest_block_entity(chest_pos)
+        .expect("read chest entity")
+        .expect("chest entity present");
+    assert!(chest.slots[0].is_empty());
+    assert_eq!(chest.slots[1].item_id, dirt_id);
+    assert_eq!(chest.slots[1].count, 64);
+    assert_eq!(chest.slots[2].item_id, dirt_id);
+    assert_eq!(chest.slots[2].count, 1);
+}
+
+#[tokio::test]
 async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
