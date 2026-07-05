@@ -202,6 +202,7 @@ pub struct ChestBlockEntity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HopperBlockEntity {
     pub slots: [FurnaceSlot; 5],
+    pub transfer_cooldown: i32,
 }
 
 impl Default for ChestBlockEntity {
@@ -216,6 +217,7 @@ impl Default for HopperBlockEntity {
     fn default() -> Self {
         Self {
             slots: std::array::from_fn(|_| FurnaceSlot::EMPTY),
+            transfer_cooldown: -1,
         }
     }
 }

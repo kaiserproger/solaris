@@ -3935,8 +3935,21 @@ async fn scheduled_button_tick_releases_powered_button() {
     );
 }
 
+async fn run_scheduled_block_ticks_for_range(
+    config: &ServerConfig,
+    sessions: &SessionRegistry,
+    start: u64,
+    end: u64,
+) -> ScheduledBlockTickReport {
+    let mut report = ScheduledBlockTickReport::default();
+    for tick in start..=end {
+        report = run_scheduled_block_ticks(config, sessions, tick).await;
+    }
+    report
+}
+
 #[tokio::test]
-async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_without_generating_neighbors()
+async fn scheduled_hopper_tick_pulls_one_item_into_hopper_before_ejecting_without_generating_neighbors()
  {
     struct CountingAirGenerator {
         calls: Arc<AtomicUsize>,
@@ -4074,22 +4087,27 @@ async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_w
             .unwrap()
             .expect("target chest");
         assert_eq!(source.slots[0].count, 1);
-        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
         assert_eq!(
-            target.slots[0],
+            hopper.slots[0],
             mc_world::FurnaceSlot {
                 count: 1,
                 item_id: 42,
                 damage: None,
             }
         );
+        assert!(
+            hopper.slots[1..]
+                .iter()
+                .all(mc_world::FurnaceSlot::is_empty)
+        );
+        assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
         let scheduled = storage
             .scheduled_block_ticks(ChunkPos { x: 0, z: 0 })
             .unwrap()
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 21);
         assert_eq!(
             scheduled[0].block,
             Identifier::parse("minecraft:hopper").unwrap()
@@ -4110,78 +4128,7 @@ async fn scheduled_hopper_tick_moves_one_item_from_above_chest_to_facing_chest_w
         }
         other => panic!("unexpected outbound command: {other:?}"),
     }
-    match target_rx
-        .try_recv()
-        .expect("target viewer receives chest slots")
-    {
-        OutboundCommand::ChestSlots {
-            position,
-            state_id,
-            slots,
-        } => {
-            assert_eq!(position, target_pos);
-            assert_eq!(state_id, 2);
-            assert_eq!(slots[0], ItemStack::new(42, 1));
-        }
-        other => panic!("unexpected outbound command: {other:?}"),
-    }
-
-    let report = run_scheduled_block_ticks(&config, &sessions, 28).await;
-
-    assert_eq!(report.drained, 1);
-    assert_eq!(report.applied, 1);
-    {
-        let mut storage = world.lock().await;
-        assert_eq!(generated_chunks.load(Ordering::Relaxed), 0);
-        assert_eq!(storage.cache_len(), 1);
-        let source = storage
-            .chest_block_entity(source_pos)
-            .unwrap()
-            .expect("source chest");
-        let target = storage
-            .chest_block_entity(target_pos)
-            .unwrap()
-            .expect("target chest");
-        assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
-        assert_eq!(
-            target.slots[0],
-            mc_world::FurnaceSlot {
-                count: 2,
-                item_id: 42,
-                damage: None,
-            }
-        );
-    }
-    match source_rx
-        .try_recv()
-        .expect("source viewer receives second chest slots")
-    {
-        OutboundCommand::ChestSlots {
-            position,
-            state_id,
-            slots,
-        } => {
-            assert_eq!(position, source_pos);
-            assert_eq!(state_id, 3);
-            assert_eq!(slots[0], ItemStack::EMPTY);
-        }
-        other => panic!("unexpected outbound command: {other:?}"),
-    }
-    match target_rx
-        .try_recv()
-        .expect("target viewer receives second chest slots")
-    {
-        OutboundCommand::ChestSlots {
-            position,
-            state_id,
-            slots,
-        } => {
-            assert_eq!(position, target_pos);
-            assert_eq!(state_id, 3);
-            assert_eq!(slots[0], ItemStack::new(42, 2));
-        }
-        other => panic!("unexpected outbound command: {other:?}"),
-    }
+    assert!(target_rx.try_recv().is_err());
 }
 
 #[tokio::test]
@@ -4277,7 +4224,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         .expect("chunk scheduled ticks");
     assert_eq!(scheduled.len(), 1);
     assert_eq!(scheduled[0].pos, target_pos);
-    assert_eq!(scheduled[0].trigger_tick, HOPPER_TRANSFER_DELAY_TICKS);
+    assert_eq!(scheduled[0].trigger_tick, HOPPER_TICK_DELAY_TICKS);
     assert_eq!(
         scheduled[0].block,
         Identifier::parse("minecraft:hopper").unwrap()
@@ -4361,14 +4308,14 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 21);
         assert_eq!(
             scheduled[0].block,
             Identifier::parse("minecraft:hopper").unwrap()
         );
     }
 
-    let second = run_scheduled_block_ticks(&config, &sessions, 28).await;
+    let second = run_scheduled_block_ticks(&config, &sessions, 21).await;
 
     assert_eq!(second.drained, 1);
     assert_eq!(second.applied, 1);
@@ -4382,14 +4329,19 @@ async fn scheduled_block_pass_backfills_loaded_hopper_missing_initial_tick() {
         .unwrap()
         .expect("target chest");
     assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+    let hopper = storage
+        .hopper_block_entity(hopper_pos)
+        .unwrap()
+        .expect("hopper");
     assert_eq!(
-        target.slots[0],
+        hopper.slots[0],
         mc_world::FurnaceSlot {
             count: 1,
             item_id: 42,
             damage: None,
         }
     );
+    assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
 }
 
 #[tokio::test]
@@ -4593,6 +4545,9 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
+    assert_eq!(final_report.drained, 1);
+    assert_eq!(final_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let source = storage
@@ -4625,7 +4580,7 @@ async fn scheduled_hopper_tick_feeds_valid_input_into_furnace_below() {
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 29);
     }
     match source_rx
         .try_recv()
@@ -4773,6 +4728,9 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
+    assert_eq!(final_report.drained, 1);
+    assert_eq!(final_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let source = storage
@@ -4805,7 +4763,7 @@ async fn scheduled_hopper_tick_feeds_side_fuel_into_furnace() {
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 29);
     }
     match source_rx
         .try_recv()
@@ -4955,6 +4913,9 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
+    assert_eq!(final_report.drained, 1);
+    assert_eq!(final_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let furnace = storage
@@ -4987,7 +4948,7 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 29);
     }
     match furnace_rx
         .try_recv()
@@ -5138,6 +5099,9 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
+    assert_eq!(final_report.drained, 1);
+    assert_eq!(final_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let source = storage
@@ -5156,7 +5120,7 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
             .expect("chunk scheduled ticks");
         assert_eq!(scheduled.len(), 1);
         assert_eq!(scheduled[0].pos, hopper_pos);
-        assert_eq!(scheduled[0].trigger_tick, 28);
+        assert_eq!(scheduled[0].trigger_tick, 29);
     }
 
     let mut saw_chest = false;
@@ -5300,6 +5264,10 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
         .chest_block_entity(target_pos)
         .unwrap()
         .expect("target chest");
+    let hopper = storage
+        .hopper_block_entity(hopper_pos)
+        .unwrap()
+        .expect("hopper");
     assert!(
         source_left
             .slots
@@ -5313,13 +5281,14 @@ async fn scheduled_hopper_tick_pulls_from_second_half_of_double_chest() {
             .all(mc_world::FurnaceSlot::is_empty)
     );
     assert_eq!(
-        target.slots[0],
+        hopper.slots[0],
         mc_world::FurnaceSlot {
             count: 1,
             item_id: 42,
             damage: None,
         }
     );
+    assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
 }
 
 #[tokio::test]
@@ -5423,6 +5392,9 @@ async fn scheduled_hopper_tick_inserts_into_second_half_of_double_chest() {
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 1);
+    let final_report = run_scheduled_block_ticks_for_range(&config, &sessions, 21, 28).await;
+    assert_eq!(final_report.drained, 1);
+    assert_eq!(final_report.applied, 1);
     {
         let mut storage = world.lock().await;
         let source = storage
@@ -5569,18 +5541,18 @@ async fn scheduled_hopper_tick_does_not_extract_empty_furnace_output() {
         assert!(furnace.slots.iter().all(mc_world::FurnaceSlot::is_empty));
         assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
         assert!(target.slots.iter().all(mc_world::FurnaceSlot::is_empty));
-        assert!(
-            storage
-                .scheduled_block_ticks(cpos)
-                .unwrap()
-                .unwrap_or_default()
-                .is_empty()
-        );
+        let scheduled = storage
+            .scheduled_block_ticks(cpos)
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 21);
     }
 }
 
 #[test]
-fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
+fn scheduled_hopper_transfer_merges_hopper_slot_into_matching_chest_stack() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
@@ -5590,7 +5562,6 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
                 properties: prop_schema(&[("facing", &["east"])]),
                 states: vec![state(2, true, &[("facing", "east")])],
             },
-            simple_block(3, "minecraft:furnace"),
         ])
         .unwrap(),
     );
@@ -5599,7 +5570,6 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
         protocol_id: 43,
     }]);
     let cpos = ChunkPos { x: 0, z: 0 };
-    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
     let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
     let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
@@ -5613,12 +5583,14 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
             ),
         )
         .unwrap();
-    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
     storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
     storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
-    let mut furnace = mc_world::FurnaceBlockEntity::default();
-    furnace.slots[2] = mc_world::FurnaceSlot {
-        count: 2,
+    let mut hopper = mc_world::HopperBlockEntity {
+        transfer_cooldown: 0,
+        ..Default::default()
+    };
+    hopper.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
         item_id: 43,
         damage: None,
     };
@@ -5628,12 +5600,7 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
         item_id: 43,
         damage: None,
     };
-    storage
-        .set_furnace_block_entity(furnace_pos, furnace)
-        .unwrap();
-    storage
-        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
-        .unwrap();
+    storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
 
     let tags = TagsData::default();
@@ -5646,26 +5613,21 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
         recipes: recipes.as_slice(),
         sessions: &sessions,
     };
-    let updates = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
+    let result = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
         .expect("transfer should apply");
 
-    assert_eq!(updates.len(), 2);
-    let furnace = storage
-        .furnace_block_entity(furnace_pos)
+    assert!(result.moved);
+    assert_eq!(result.updates.len(), 1);
+    let hopper = storage
+        .hopper_block_entity(hopper_pos)
         .unwrap()
-        .expect("furnace");
+        .expect("hopper");
     let target = storage
         .chest_block_entity(target_pos)
         .unwrap()
         .expect("target chest");
-    assert_eq!(
-        furnace.slots[2],
-        mc_world::FurnaceSlot {
-            count: 1,
-            item_id: 43,
-            damage: None,
-        }
-    );
+    assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+    assert_eq!(hopper.transfer_cooldown, HOPPER_TRANSFER_DELAY_TICKS as i32);
     assert_eq!(
         target.slots[0],
         mc_world::FurnaceSlot {
@@ -5677,7 +5639,7 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
 }
 
 #[test]
-fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() {
+fn scheduled_hopper_transfer_preserves_hopper_slot_when_target_has_no_room() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
             simple_block(0, "minecraft:air"),
@@ -5687,7 +5649,6 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
                 properties: prop_schema(&[("facing", &["east"])]),
                 states: vec![state(2, true, &[("facing", "east")])],
             },
-            simple_block(3, "minecraft:furnace"),
         ])
         .unwrap(),
     );
@@ -5696,7 +5657,6 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
         protocol_id: 43,
     }]);
     let cpos = ChunkPos { x: 0, z: 0 };
-    let furnace_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
     let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
     let target_pos = mc_world::BlockPos { x: 2, y: 65, z: 1 };
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
@@ -5710,11 +5670,13 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
             ),
         )
         .unwrap();
-    storage.set_block_at(furnace_pos, BlockStateId(3)).unwrap();
     storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
     storage.set_block_at(target_pos, BlockStateId(1)).unwrap();
-    let mut furnace = mc_world::FurnaceBlockEntity::default();
-    furnace.slots[2] = mc_world::FurnaceSlot {
+    let mut hopper = mc_world::HopperBlockEntity {
+        transfer_cooldown: 0,
+        ..Default::default()
+    };
+    hopper.slots[0] = mc_world::FurnaceSlot {
         count: 1,
         item_id: 43,
         damage: None,
@@ -5727,12 +5689,7 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
             damage: None,
         };
     }
-    storage
-        .set_furnace_block_entity(furnace_pos, furnace)
-        .unwrap();
-    storage
-        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
-        .unwrap();
+    storage.set_hopper_block_entity(hopper_pos, hopper).unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
 
     let tags = TagsData::default();
@@ -5745,26 +5702,28 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
         recipes: recipes.as_slice(),
         sessions: &sessions,
     };
-    assert!(
-        scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2)).is_none()
-    );
+    let result = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
+        .expect("hopper tick runs");
 
-    let furnace = storage
-        .furnace_block_entity(furnace_pos)
+    assert!(!result.moved);
+    assert!(result.updates.is_empty());
+    let hopper = storage
+        .hopper_block_entity(hopper_pos)
         .unwrap()
-        .expect("furnace");
+        .expect("hopper");
     let target = storage
         .chest_block_entity(target_pos)
         .unwrap()
         .expect("target chest");
     assert_eq!(
-        furnace.slots[2],
+        hopper.slots[0],
         mc_world::FurnaceSlot {
             count: 1,
             item_id: 43,
             damage: None,
         }
     );
+    assert_eq!(hopper.transfer_cooldown, 0);
     assert!(target.slots.iter().all(|slot| {
         *slot
             == mc_world::FurnaceSlot {

@@ -888,7 +888,10 @@ fn decode_hopper(
     cmp: &[(String, Tag)],
     items: &ItemRegistry,
 ) -> Result<HopperBlockEntity, ChunkNbtError> {
-    let mut hopper = HopperBlockEntity::default();
+    let mut hopper = HopperBlockEntity {
+        transfer_cooldown: get_optional_int(cmp, "TransferCooldown")?.unwrap_or(-1),
+        ..Default::default()
+    };
     if let Some(list) = get_optional_list(cmp, "Items")? {
         for tag in &list.elements {
             let item = expect_compound(tag, "Items[]")?;
@@ -1045,6 +1048,10 @@ fn encode_hopper(
         ("x".into(), Tag::Int(pos.x)),
         ("y".into(), Tag::Int(pos.y)),
         ("z".into(), Tag::Int(pos.z)),
+        (
+            "TransferCooldown".into(),
+            Tag::Int(hopper.transfer_cooldown),
+        ),
     ];
 
     let mut item_tags = Vec::new();
@@ -1131,6 +1138,23 @@ fn get_field<'a>(cmp: &'a [(String, Tag)], name: &'static str) -> Result<&'a Tag
 fn get_int(cmp: &[(String, Tag)], name: &'static str) -> Result<i32, ChunkNbtError> {
     match get_field(cmp, name)? {
         Tag::Int(v) => Ok(*v),
+        other => Err(ChunkNbtError::WrongType {
+            field: name,
+            expected: "Int",
+            got: other.type_id(),
+        }),
+    }
+}
+
+fn get_optional_int(
+    cmp: &[(String, Tag)],
+    name: &'static str,
+) -> Result<Option<i32>, ChunkNbtError> {
+    let Some(tag) = cmp.iter().find(|(k, _)| k == name).map(|(_, v)| v) else {
+        return Ok(None);
+    };
+    match tag {
+        Tag::Int(v) => Ok(Some(*v)),
         other => Err(ChunkNbtError::WrongType {
             field: name,
             expected: "Int",
@@ -1480,7 +1504,10 @@ mod tests {
         let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome);
         let pos = BlockPos { x: 4, y: 64, z: 5 };
         chunk.set_block(4, 64, 5, BlockStateId(1)).unwrap();
-        let mut hopper = HopperBlockEntity::default();
+        let mut hopper = HopperBlockEntity {
+            transfer_cooldown: 5,
+            ..Default::default()
+        };
         hopper.slots[0] = FurnaceSlot {
             count: 64,
             item_id: 10,
@@ -1510,6 +1537,7 @@ mod tests {
             panic!("hopper block entity must be a compound");
         };
         assert_eq!(get_string(cmp, "id").unwrap(), "minecraft:hopper");
+        assert_eq!(get_int(cmp, "TransferCooldown").unwrap(), 5);
 
         let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
         assert_eq!(decoded.hoppers.get(&pos), Some(&hopper));

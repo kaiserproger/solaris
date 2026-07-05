@@ -2107,7 +2107,10 @@ mod tests {
         world.set_block_at(pos, BlockStateId(2)).unwrap();
         world.get_chunk_mut(cpos).unwrap().unwrap().dirty = false;
 
-        let mut hopper = crate::chunk::HopperBlockEntity::default();
+        let mut hopper = crate::chunk::HopperBlockEntity {
+            transfer_cooldown: 6,
+            ..Default::default()
+        };
         hopper.slots[0] = crate::chunk::FurnaceSlot {
             count: 64,
             item_id: 10,
