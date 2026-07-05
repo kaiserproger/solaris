@@ -168,17 +168,17 @@ use spawn::spawn_y_from_chunk;
 use spawn::{chunk_pos_from_coords, pack_block_pos, spawn_dimension, spawn_position};
 use survival::{
     PendingBreak, PendingUse, SurvivalState, UseKind, arrow_entity_type_id, block_break_is_denied,
-    block_drop_stacks, bow_draw_power, consume_arrow, damage_held_bow_after_shot,
-    damage_held_tool_after_mining, damage_held_weapon_after_attack, entity_item_stack,
-    falling_block_entity_type_id, held_attack_damage, held_food_use, held_item_id, is_bow_item,
-    is_hostile_entity, item_entity_type_id, max_tool_damage_for_path, mining_time_for_target,
-    mob_drop_stack, mob_drop_stack_from, mob_xp_value, pending_break_is_complete,
-    pending_break_matches, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
+    block_drop_stacks, block_drop_stacks_from, bow_draw_power, consume_arrow,
+    damage_held_bow_after_shot, damage_held_tool_after_mining, damage_held_weapon_after_attack,
+    entity_item_stack, falling_block_entity_type_id, held_attack_damage, held_food_use,
+    held_item_id, is_bow_item, is_hostile_entity, item_entity_type_id, max_tool_damage_for_path,
+    mining_time_for_target, mob_drop_stack, mob_drop_stack_from, mob_xp_value,
+    pending_break_is_complete, pending_break_matches, pending_use_is_complete, pending_use_matches,
+    xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{
-    attack_damage_for_item, block_drop_stacks_from, fallback_mining_time, food_rule_for_item,
-    is_durability_tool_path,
+    attack_damage_for_item, fallback_mining_time, food_rule_for_item, is_durability_tool_path,
 };
 use wire_entities::{
     send_entity_data, send_entity_despawn, send_entity_relative_move, send_entity_spawn,
@@ -5732,6 +5732,7 @@ pub(crate) async fn land_falling_blocks(
     let table = config.block_light.as_deref();
     let mut outcome = BlockEditBatchOutcome::default();
     let mut landed_ids = Vec::new();
+    let mut drop_spawns = Vec::new();
     {
         let mut storage = world.lock().await;
         for candidate in candidates {
@@ -5742,6 +5743,26 @@ pub(crate) async fn land_falling_blocks(
                 continue;
             };
             if falling_block_landing_cell_is_solid(config, current) {
+                landed_ids.push(candidate.id);
+                drop_spawns.extend(
+                    block_drop_stacks_from(
+                        &config.loot,
+                        &config.items,
+                        &config.blocks,
+                        candidate.state,
+                    )
+                    .into_iter()
+                    .map(|drop| {
+                        (
+                            Vec3::new(
+                                f64::from(candidate.pos.x) + 0.5,
+                                f64::from(candidate.pos.y) + 0.5,
+                                f64::from(candidate.pos.z) + 0.5,
+                            ),
+                            drop,
+                        )
+                    }),
+                );
                 continue;
             }
             let applied_before = outcome.applied.len();
@@ -5760,7 +5781,25 @@ pub(crate) async fn land_falling_blocks(
         }
     }
 
+    if let Some(entity_type_id) = item_entity_type_id(&config.entity_types) {
+        for (position, drop) in drop_spawns {
+            dispatch_visibility_commands(sessions.spawn_item_drop(
+                entity_type_id,
+                position,
+                entity_item_stack(drop),
+            ));
+        }
+    } else if !drop_spawns.is_empty() {
+        debug!(
+            count = drop_spawns.len(),
+            "falling block drops ignored: item entity type unavailable"
+        );
+    }
+
     if outcome.applied.is_empty() {
+        if !landed_ids.is_empty() {
+            sessions.remove_landed_falling_blocks(&landed_ids);
+        }
         return 0;
     }
     sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
@@ -5777,7 +5816,9 @@ pub(crate) async fn land_falling_blocks(
             broadcast_light_updates_to_sessions(sessions, &light_updates, None);
         }
     }
-    sessions.remove_landed_falling_blocks(&landed_ids);
+    if !landed_ids.is_empty() {
+        sessions.remove_landed_falling_blocks(&landed_ids);
+    }
     outcome.applied.len()
 }
 

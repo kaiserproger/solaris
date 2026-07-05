@@ -2415,6 +2415,98 @@ fn falling_block_starts_when_support_edit_becomes_replaceable() {
     );
 }
 
+#[tokio::test]
+async fn falling_block_landing_on_solid_drops_item_and_despawns_entity() {
+    let blocks = Arc::new(fluid_test_registry());
+    let mut storage = in_memory_button_world(Arc::clone(&blocks));
+    let landing_pos = mc_world::BlockPos { x: 4, y: 64, z: 4 };
+    storage
+        .set_block_at(landing_pos, mc_world::BlockStateId(1))
+        .expect("place occupied landing block");
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: Identifier::parse("minecraft:sand").unwrap(),
+        protocol_id: 42,
+    }]));
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
+        mc_data::entity_types::EntityTypeReport {
+            id: Identifier::parse("minecraft:item").unwrap(),
+            protocol_id: 2,
+        },
+        mc_data::entity_types::EntityTypeReport {
+            id: Identifier::parse("minecraft:falling_block").unwrap(),
+            protocol_id: 70,
+        },
+    ]));
+    let config = ServerConfig {
+        blocks: Arc::clone(&blocks),
+        world: Some(Arc::clone(&world)),
+        items,
+        entity_types,
+        block_facts: Arc::new(fluid_test_facts()),
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(46),
+        name: "FallingBlockViewer".to_string(),
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(4.5, 64.0, 4.5),
+    );
+    let _ = sessions.mark_loaded(session_id, (0, 0));
+
+    let falling_id = sessions
+        .spawn_falling_block(70, Vec3::new(4.5, 65.0, 4.5), mc_world::BlockStateId(16))
+        .into_iter()
+        .find_map(|dispatch| match dispatch.command {
+            OutboundCommand::SpawnEntity(entity) => Some(entity.id),
+            _ => None,
+        })
+        .expect("falling block spawn dispatch");
+    while rx.try_recv().is_ok() {}
+
+    let applied = land_falling_blocks(
+        &config,
+        &sessions,
+        &[LandedFallingBlock {
+            id: falling_id,
+            pos: landing_pos,
+            state: mc_world::BlockStateId(16),
+        }],
+    )
+    .await;
+
+    assert_eq!(applied, 0);
+    assert_eq!(
+        world.lock().await.get_cached_block(landing_pos),
+        Some(mc_world::BlockStateId(1))
+    );
+    assert!(sessions.server_entity_snapshot(falling_id).is_none());
+
+    let item_spawn = rx
+        .try_recv()
+        .expect("blocked falling block should spawn item drop");
+    assert!(matches!(
+        item_spawn,
+        OutboundCommand::SpawnEntity(ServerEntitySnapshot {
+            type_name,
+            item_stack: Some(stack),
+            ..
+        }) if type_name == "minecraft:item" && stack == EntityItemStack::new(42, 1)
+    ));
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(OutboundCommand::DespawnEntity(entity)) if entity.id == falling_id
+    ));
+}
+
 #[test]
 fn cactus_column_cascades_when_support_breaks() {
     let registry = Arc::new(fluid_test_registry());
