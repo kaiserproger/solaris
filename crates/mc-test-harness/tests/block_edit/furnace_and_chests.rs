@@ -1013,6 +1013,214 @@ async fn two_clients_stale_chest_click_after_peer_update_resyncs() {
 }
 
 #[tokio::test]
+async fn server_origin_hopper_tick_updates_open_chests_over_tcp() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
+    let world = Some(Arc::clone(&world_handle));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let chest_id = mc_data::Identifier::parse("minecraft:chest").unwrap();
+    let hopper_id = mc_data::Identifier::parse("minecraft:hopper").unwrap();
+    let dirt_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+    let chest_state_id = blocks.block(&chest_id).expect("chest block").default;
+    let hopper_state_id = blocks
+        .by_name_and_props(
+            &hopper_id,
+            &[
+                ("enabled".to_string(), "true".to_string()),
+                ("facing".to_string(), "down".to_string()),
+            ],
+        )
+        .expect("enabled down-facing hopper state");
+    let chest_menu_id = 2;
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M100 hopper TCP chest updates".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut source_client, sync) = connect_to_play(addr, "M100HopperSource").await;
+    drain_until_chunk(&mut source_client, (0, 0)).await;
+    let hopper_pos = mc_world::BlockPos {
+        x: 1,
+        y: sync.y.floor() as i32 - 2,
+        z: 0,
+    };
+    let source_pos = mc_world::BlockPos {
+        y: hopper_pos.y + 1,
+        ..hopper_pos
+    };
+    let target_pos = mc_world::BlockPos {
+        y: hopper_pos.y - 1,
+        ..hopper_pos
+    };
+    {
+        let mut world = world_handle.lock().await;
+        world
+            .set_block_at(source_pos, chest_state_id)
+            .expect("set source chest block")
+            .expect("source chunk exists");
+        world
+            .set_block_at(hopper_pos, hopper_state_id)
+            .expect("set hopper block")
+            .expect("hopper chunk exists");
+        world
+            .set_block_at(target_pos, chest_state_id)
+            .expect("set target chest block")
+            .expect("target chunk exists");
+
+        let mut source_chest = mc_world::ChestBlockEntity::default();
+        source_chest.slots[0] = mc_world::FurnaceSlot {
+            item_id: dirt_id,
+            count: 1,
+            damage: None,
+        };
+        world
+            .set_chest_block_entity(source_pos, source_chest)
+            .expect("seed source chest entity");
+        world
+            .set_chest_block_entity(target_pos, mc_world::ChestBlockEntity::default())
+            .expect("seed target chest entity");
+    }
+
+    source_client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(source_pos.x, source_pos.y, source_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 230,
+        })
+        .await
+        .expect("source viewer opens chest");
+    let source_opened = wait_for_open_screen(&mut source_client, chest_menu_id).await;
+    let source_initial =
+        wait_for_furnace_content(&mut source_client, source_opened.container_id, |pkt| {
+            pkt.items[0].item_id == dirt_id
+                && pkt.items[0].count == 1
+                && pkt.carried_item.is_empty()
+        })
+        .await;
+
+    let (mut target_client, _) = connect_to_play(addr, "M100HopperTarget").await;
+    drain_until_chunk(&mut target_client, (0, 0)).await;
+    target_client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(target_pos.x, target_pos.y, target_pos.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 231,
+        })
+        .await
+        .expect("target viewer opens chest");
+    let target_opened = wait_for_open_screen(&mut target_client, chest_menu_id).await;
+    let target_initial =
+        wait_for_furnace_content(&mut target_client, target_opened.container_id, |pkt| {
+            pkt.items[0].is_empty() && pkt.carried_item.is_empty()
+        })
+        .await;
+
+    {
+        let mut world = world_handle.lock().await;
+        world
+            .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+            .expect("seed hopper entity");
+        assert!(
+            world
+                .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+                    hopper_pos,
+                    hopper_id.clone(),
+                    0,
+                    0,
+                ))
+                .expect("schedule hopper tick"),
+            "hopper tick should be newly scheduled after viewers open"
+        );
+    }
+
+    let source_empty = wait_for_container_slot(
+        &mut source_client,
+        source_opened.container_id,
+        0,
+        mc_protocol::packets::play::ItemStack::is_empty,
+    )
+    .await;
+    assert!(
+        source_empty.state_id > source_initial.state_id,
+        "server-origin hopper pull should advance the source chest state"
+    );
+
+    let target_dirt = wait_for_container_slot(
+        &mut target_client,
+        target_opened.container_id,
+        0,
+        |stack| stack.item_id == dirt_id && stack.count == 1,
+    )
+    .await;
+    assert!(
+        target_dirt.state_id > target_initial.state_id,
+        "cooldown-delayed hopper eject should advance the target chest state"
+    );
+}
+
+#[tokio::test]
 async fn unsupported_chest_click_modes_resync_without_trusting_client_slots() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
