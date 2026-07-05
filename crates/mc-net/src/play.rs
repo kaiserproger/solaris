@@ -2929,6 +2929,25 @@ async fn persist_campfire_block_entity(
     cooking: &CampfireCookingState,
 ) -> bool {
     let mut storage = world.lock().await;
+    let saved =
+        persist_campfire_block_entity_in_storage(&mut storage, blocks, items, position, cooking);
+    drop(storage);
+    if saved {
+        sessions.invalidate_prepared_chunks(&HashSet::from([(
+            position.x.div_euclid(16),
+            position.z.div_euclid(16),
+        )]));
+    }
+    saved
+}
+
+fn persist_campfire_block_entity_in_storage(
+    storage: &mut mc_world::WorldStorage,
+    blocks: &BlockRegistry,
+    items: &ItemRegistry,
+    position: mc_world::BlockPos,
+    cooking: &CampfireCookingState,
+) -> bool {
     let block_entity_id =
         match storage.get_block(position) {
             Ok(Some(block_state)) => blocks.by_id(block_state).and_then(|block_state| {
@@ -2964,11 +2983,6 @@ async fn persist_campfire_block_entity(
         warn!(error = %err, ?position, "campfire block entity save failed");
         return false;
     }
-    drop(storage);
-    sessions.invalidate_prepared_chunks(&HashSet::from([(
-        position.x.div_euclid(16),
-        position.z.div_euclid(16),
-    )]));
     true
 }
 
@@ -5536,6 +5550,13 @@ pub(crate) async fn run_scheduled_block_ticks(
     let mut applied_mutations = 0usize;
     let mut hopper_updates = Vec::new();
     let mut outcome = BlockEditBatchOutcome::default();
+    let hopper_context = HopperTransferContext {
+        blocks: config.blocks.as_ref(),
+        items: config.items.as_ref(),
+        tags: config.tags.as_ref(),
+        recipes: config.recipes.as_slice(),
+        sessions,
+    };
     {
         let mut storage = world.lock().await;
         backfill_loaded_hopper_ticks(
@@ -5562,15 +5583,9 @@ pub(crate) async fn run_scheduled_block_ticks(
                 if state.block.id != tick.block {
                     continue;
                 }
-                if let Some(updates) = scheduled_hopper_transfer(
-                    &config.blocks,
-                    &config.items,
-                    &config.tags,
-                    config.recipes.as_slice(),
-                    &mut storage,
-                    tick.pos,
-                    state_id,
-                ) {
+                if let Some(updates) =
+                    scheduled_hopper_transfer(&hopper_context, &mut storage, tick.pos, state_id)
+                {
                     applied_mutations += 1;
                     hopper_updates.extend(updates);
                     if let Err(err) = storage.schedule_block_tick(ScheduledBlockTick::new(
@@ -5594,6 +5609,7 @@ pub(crate) async fn run_scheduled_block_ticks(
             }
         }
     }
+    let mut hopper_visible_chunks = HashSet::new();
     for update in hopper_updates {
         match update {
             HopperTransferUpdate::Chest { position, slots } => {
@@ -5604,7 +5620,21 @@ pub(crate) async fn run_scheduled_block_ticks(
                 let (_, dispatches) = sessions.server_furnace_slot_dispatches(position, slots);
                 dispatch_visibility_commands(dispatches);
             }
+            HopperTransferUpdate::Campfire { position, cooking } => {
+                hopper_visible_chunks
+                    .insert((position.x.div_euclid(16), position.z.div_euclid(16)));
+                dispatch_campfire_block_entity_update(
+                    &config.items,
+                    sessions,
+                    None,
+                    position,
+                    &cooking,
+                );
+            }
         }
+    }
+    if !hopper_visible_chunks.is_empty() {
+        sessions.invalidate_prepared_chunks(&hopper_visible_chunks);
     }
     let budget_exhausted = drained >= policy.fluid_tick_budget;
     if budget_exhausted {
@@ -7194,16 +7224,21 @@ fn scheduled_block_tick_edits(
     Some(edits)
 }
 
+struct HopperTransferContext<'a> {
+    blocks: &'a mc_world::BlockRegistry,
+    items: &'a ItemRegistry,
+    tags: &'a TagsData,
+    recipes: &'a [mc_data::recipes::Recipe],
+    sessions: &'a SessionRegistry,
+}
+
 fn scheduled_hopper_transfer(
-    blocks: &mc_world::BlockRegistry,
-    items: &ItemRegistry,
-    tags: &TagsData,
-    recipes: &[mc_data::recipes::Recipe],
+    context: &HopperTransferContext<'_>,
     storage: &mut mc_world::WorldStorage,
     pos: mc_world::BlockPos,
     state_id: mc_world::BlockStateId,
 ) -> Option<Vec<HopperTransferUpdate>> {
-    let state = blocks.by_id(state_id)?;
+    let state = context.blocks.by_id(state_id)?;
     if state.block.id.path() != "hopper" {
         return None;
     }
@@ -7213,12 +7248,15 @@ fn scheduled_hopper_transfer(
         ..pos
     };
     let target_pos = hopper_facing_target(pos, facing)?;
-    let source_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, source_pos);
-    let source_is_furnace = cached_furnace_kind(blocks, storage, source_pos).is_some();
-    let target_is_chest_like = cached_storage_block_is_chest_like(blocks, storage, target_pos);
-    let target_furnace_kind = cached_furnace_kind(blocks, storage, target_pos);
+    let source_is_chest_like =
+        cached_storage_block_is_chest_like(context.blocks, storage, source_pos);
+    let source_is_furnace = cached_furnace_kind(context.blocks, storage, source_pos).is_some();
+    let target_is_chest_like =
+        cached_storage_block_is_chest_like(context.blocks, storage, target_pos);
+    let target_furnace_kind = cached_furnace_kind(context.blocks, storage, target_pos);
+    let target_is_campfire = cached_storage_block_is_campfire(context.blocks, storage, target_pos);
     if (!source_is_chest_like && !source_is_furnace)
-        || (!target_is_chest_like && target_furnace_kind.is_none())
+        || (!target_is_chest_like && target_furnace_kind.is_none() && !target_is_campfire)
     {
         return None;
     }
@@ -7272,16 +7310,15 @@ fn scheduled_hopper_transfer(
                     slots: chest_slots_from_block_entity(&target),
                 });
             }
-        } else {
-            let furnace_kind = target_furnace_kind?;
+        } else if let Some(furnace_kind) = target_furnace_kind {
             let Ok(Some(mut target)) = storage.furnace_block_entity(target_pos) else {
                 return None;
             };
             let target_before = target.clone();
             insert_hopper_stack_into_furnace(
-                items,
-                tags,
-                recipes,
+                context.items,
+                context.tags,
+                context.recipes,
                 facing,
                 furnace_kind,
                 &mut target,
@@ -7306,6 +7343,21 @@ fn scheduled_hopper_transfer(
                     slots: furnace_slot_stacks(&target),
                 });
             }
+        } else {
+            let cooking = insert_hopper_stack_into_campfire(context, storage, target_pos, &moving)?;
+            decrement_furnace_slot(&mut source.slots[source_slot]);
+
+            if !storage
+                .set_chest_block_entity(source_pos, source.clone())
+                .unwrap_or(false)
+            {
+                return None;
+            }
+
+            updates.push(HopperTransferUpdate::Campfire {
+                position: target_pos,
+                cooking,
+            });
         }
 
         if source != source_before {
@@ -7377,6 +7429,10 @@ enum HopperTransferUpdate {
         position: mc_world::BlockPos,
         slots: [ItemStack; 3],
     },
+    Campfire {
+        position: mc_world::BlockPos,
+        cooking: CampfireCookingState,
+    },
 }
 
 fn hopper_facing_target(pos: mc_world::BlockPos, facing: &str) -> Option<mc_world::BlockPos> {
@@ -7427,6 +7483,16 @@ fn cached_furnace_kind(
         .and_then(|state| furnace_kind_for_block_id(state.block.id.as_str()))
 }
 
+fn cached_storage_block_is_campfire(
+    blocks: &mc_world::BlockRegistry,
+    storage: &mc_world::WorldStorage,
+    pos: mc_world::BlockPos,
+) -> bool {
+    storage
+        .get_cached_block(pos)
+        .is_some_and(|state_id| is_campfire_block(blocks, state_id))
+}
+
 fn target_hopper_insert_slot(target: &ChestBlockEntity, moving: &FurnaceSlot) -> Option<usize> {
     target.slots.iter().position(|slot| {
         slot.is_empty()
@@ -7467,6 +7533,41 @@ fn insert_hopper_input_into_furnace(
     } else {
         None
     }
+}
+
+fn insert_hopper_stack_into_campfire(
+    context: &HopperTransferContext<'_>,
+    storage: &mut mc_world::WorldStorage,
+    position: mc_world::BlockPos,
+    moving: &FurnaceSlot,
+) -> Option<CampfireCookingState> {
+    if moving.is_empty() {
+        return None;
+    }
+    let recipe =
+        find_campfire_recipe_in(context.recipes, context.items, context.tags, moving.item_id)?;
+    let result = campfire_recipe_result_stack(context.items, &recipe)?;
+    let cooking_time = match &recipe.kind {
+        mc_data::recipes::RecipeKind::CampfireCooking(smelting) => smelting.cooking_time,
+        _ => return None,
+    };
+    let input = ItemStack {
+        count: 1,
+        item_id: moving.item_id,
+        damage: moving.damage,
+    };
+    let cooking =
+        context
+            .sessions
+            .insert_campfire_cooking(position, input, result, cooking_time)?;
+    persist_campfire_block_entity_in_storage(
+        storage,
+        context.blocks,
+        context.items,
+        position,
+        &cooking,
+    );
+    Some(cooking)
 }
 
 fn insert_hopper_stack_into_furnace(

@@ -5024,6 +5024,192 @@ async fn scheduled_hopper_tick_extracts_furnace_output_into_chest() {
 }
 
 #[tokio::test]
+async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
+    use mc_data::recipes::{
+        Ingredient, IngredientAlternative, Recipe, RecipeKind, RecipeResult, SmeltingRecipe,
+    };
+
+    let porkchop = Identifier::parse("minecraft:porkchop").unwrap();
+    let cooked_porkchop = Identifier::parse("minecraft:cooked_porkchop").unwrap();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:chest"),
+            BlockReport {
+                id: Identifier::parse("minecraft:hopper").unwrap(),
+                properties: prop_schema(&[("facing", &["down"])]),
+                states: vec![state(2, true, &[("facing", "down")])],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:campfire").unwrap(),
+                properties: prop_schema(&[("lit", &["true"])]),
+                states: vec![state(3, true, &[("lit", "true")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let items = Arc::new(ItemRegistry::from_report(&[
+        ItemReport {
+            id: porkchop.clone(),
+            protocol_id: 42,
+        },
+        ItemReport {
+            id: cooked_porkchop.clone(),
+            protocol_id: 43,
+        },
+    ]));
+    let recipes = Arc::new(vec![Recipe {
+        id: Identifier::parse("minecraft:test_campfire").unwrap(),
+        kind: RecipeKind::CampfireCooking(SmeltingRecipe {
+            ingredient: Ingredient {
+                alternatives: vec![IngredientAlternative::Item(porkchop.clone())],
+            },
+            cooking_time: 1,
+        }),
+        result: RecipeResult {
+            item: cooked_porkchop,
+            count: 1,
+        },
+    }]);
+    let cpos = ChunkPos { x: 0, z: 0 };
+    let source_pos = mc_world::BlockPos { x: 1, y: 66, z: 1 };
+    let hopper_pos = mc_world::BlockPos { x: 1, y: 65, z: 1 };
+    let campfire_pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    storage
+        .insert_generated_chunk(
+            cpos,
+            Chunk::empty(
+                cpos,
+                BlockStateId(0),
+                Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    storage.set_block_at(source_pos, BlockStateId(1)).unwrap();
+    storage.set_block_at(hopper_pos, BlockStateId(2)).unwrap();
+    storage.set_block_at(campfire_pos, BlockStateId(3)).unwrap();
+    let mut source = mc_world::ChestBlockEntity::default();
+    source.slots[0] = mc_world::FurnaceSlot {
+        count: 1,
+        item_id: 42,
+        damage: None,
+    };
+    storage.set_chest_block_entity(source_pos, source).unwrap();
+    storage
+        .set_hopper_block_entity(hopper_pos, mc_world::HopperBlockEntity::default())
+        .unwrap();
+    storage
+        .schedule_block_tick(mc_world::ScheduledBlockTick::new(
+            hopper_pos,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        ))
+        .unwrap();
+
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let config = ServerConfig {
+        world: Some(Arc::clone(&world)),
+        blocks,
+        items,
+        tags: Arc::new(TagsData::default()),
+        recipes,
+        ..play_loop_slow_client_test_config()
+    };
+    let sessions = SessionRegistry::new();
+    let profile = LoggedInProfile {
+        uuid: uuid::Uuid::from_u128(51),
+        name: "HopperCampfireViewer".to_string(),
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    let (session_id, _) = sessions.register(
+        &profile,
+        (0, 0),
+        0,
+        HashSet::from([(0, 0)]),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    let _ = sessions.mark_loaded(session_id, (0, 0));
+    assert_eq!(sessions.register_chest_viewer(session_id, source_pos), 1);
+
+    let report = run_scheduled_block_ticks(&config, &sessions, 20).await;
+
+    assert_eq!(report.drained, 1);
+    assert_eq!(report.applied, 1);
+    {
+        let mut storage = world.lock().await;
+        let source = storage
+            .chest_block_entity(source_pos)
+            .unwrap()
+            .expect("source chest");
+        let hopper = storage
+            .hopper_block_entity(hopper_pos)
+            .unwrap()
+            .expect("hopper");
+        assert!(source.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        assert!(hopper.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+        let scheduled = storage
+            .scheduled_block_ticks(cpos)
+            .unwrap()
+            .expect("chunk scheduled ticks");
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, hopper_pos);
+        assert_eq!(scheduled[0].trigger_tick, 28);
+    }
+
+    let mut saw_chest = false;
+    let mut saw_campfire = false;
+    for _ in 0..2 {
+        match rx.try_recv().expect("hopper campfire update") {
+            OutboundCommand::ChestSlots {
+                position,
+                state_id,
+                slots,
+            } => {
+                assert_eq!(position, source_pos);
+                assert_eq!(state_id, 2);
+                assert_eq!(slots[0], ItemStack::EMPTY);
+                saw_chest = true;
+            }
+            OutboundCommand::BlockEntityData {
+                position,
+                block_entity_type,
+                nbt,
+            } => {
+                assert_eq!(position, campfire_pos);
+                assert_eq!(block_entity_type, CAMPFIRE_BLOCK_ENTITY_TYPE_ID);
+                assert_eq!(
+                    nbt,
+                    Tag::Compound(vec![(
+                        "Items".into(),
+                        Tag::List(ListTag {
+                            element_type: mc_nbt::tag_type::COMPOUND,
+                            elements: vec![Tag::Compound(vec![
+                                ("Slot".into(), Tag::Int(0)),
+                                ("id".into(), Tag::String(porkchop.as_str().to_string())),
+                                ("count".into(), Tag::Int(1)),
+                            ])],
+                        }),
+                    )])
+                );
+                saw_campfire = true;
+            }
+            other => panic!("unexpected outbound command: {other:?}"),
+        }
+    }
+    assert!(saw_chest);
+    assert!(saw_campfire);
+
+    let cook_report = run_campfire_cooking_ticks(&config, &sessions).await;
+
+    assert_eq!(cook_report.persisted, 1);
+    assert_eq!(cook_report.completed, 1);
+    assert_eq!(cook_report.dropped, 0);
+}
+
+#[tokio::test]
 async fn scheduled_hopper_tick_does_not_extract_empty_furnace_output() {
     let blocks = Arc::new(
         mc_world::BlockRegistry::from_report(&[
@@ -5187,16 +5373,18 @@ fn scheduled_hopper_transfer_merges_furnace_output_into_matching_chest_stack() {
         .unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
 
-    let updates = scheduled_hopper_transfer(
-        &blocks,
-        &items,
-        &TagsData::default(),
-        &[],
-        &mut storage,
-        hopper_pos,
-        BlockStateId(2),
-    )
-    .expect("transfer should apply");
+    let tags = TagsData::default();
+    let recipes = Vec::new();
+    let sessions = SessionRegistry::new();
+    let context = HopperTransferContext {
+        blocks: blocks.as_ref(),
+        items: &items,
+        tags: &tags,
+        recipes: recipes.as_slice(),
+        sessions: &sessions,
+    };
+    let updates = scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2))
+        .expect("transfer should apply");
 
     assert_eq!(updates.len(), 2);
     let furnace = storage
@@ -5284,17 +5472,18 @@ fn scheduled_hopper_transfer_preserves_furnace_output_when_target_has_no_room() 
         .unwrap();
     storage.set_chest_block_entity(target_pos, target).unwrap();
 
+    let tags = TagsData::default();
+    let recipes = Vec::new();
+    let sessions = SessionRegistry::new();
+    let context = HopperTransferContext {
+        blocks: blocks.as_ref(),
+        items: &items,
+        tags: &tags,
+        recipes: recipes.as_slice(),
+        sessions: &sessions,
+    };
     assert!(
-        scheduled_hopper_transfer(
-            &blocks,
-            &items,
-            &TagsData::default(),
-            &[],
-            &mut storage,
-            hopper_pos,
-            BlockStateId(2),
-        )
-        .is_none()
+        scheduled_hopper_transfer(&context, &mut storage, hopper_pos, BlockStateId(2)).is_none()
     );
 
     let furnace = storage
