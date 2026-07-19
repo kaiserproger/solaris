@@ -1604,8 +1604,10 @@ fn apply_goal_to_entity(
             };
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
-            transform.rotation.head_yaw = transform.rotation.yaw;
+            if motion.velocity.horizontal_len() > 0.0 {
+                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
+                transform.rotation.head_yaw = transform.rotation.yaw;
+            }
         }
         GoalState::AquaticWander {
             speed,
@@ -1636,8 +1638,10 @@ fn apply_goal_to_entity(
             };
             motion.velocity.x = direction.x * speed;
             motion.velocity.z = direction.z * speed;
-            transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
-            transform.rotation.head_yaw = transform.rotation.yaw;
+            if motion.velocity.horizontal_len() > 0.0 {
+                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
+                transform.rotation.head_yaw = transform.rotation.yaw;
+            }
         }
         GoalState::FollowPosition { target, speed } => {
             let vertical_velocity = motion.velocity.y;
@@ -1668,8 +1672,10 @@ fn apply_goal_to_entity(
                 vertical_velocity
             };
             motion.velocity.z = direction.z * speed;
-            transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
-            transform.rotation.head_yaw = transform.rotation.yaw;
+            if motion.velocity.horizontal_len() > 0.0 {
+                transform.rotation.yaw = crate::yaw_from_velocity(motion.velocity);
+                transform.rotation.head_yaw = transform.rotation.yaw;
+            }
         }
     }
     stats.decisions_applied += 1;

@@ -4,18 +4,16 @@ use mc_protocol::packets::play::ItemStack;
 use mc_world::{BlockPos, ChestBlockEntity};
 
 use super::furnace::{furnace_slot_to_stack, stack_to_furnace_slot};
+use super::quickcraft::{
+    QUICKCRAFT_TYPE_CHARITABLE, QUICKCRAFT_TYPE_GREEDY, QuickCraftClick, QuickCraftState,
+    QuickCraftStep, quickcraft_distribution_count,
+};
 use crate::play::inventory::{PlayerInventory, can_stack, item_max_stack};
 
 pub(in crate::play) const CHEST_MENU_TYPE_ID: i32 = 2;
 pub(in crate::play) const DOUBLE_CHEST_MENU_TYPE_ID: i32 = 5;
 pub(in crate::play) const SINGLE_CHEST_STORAGE_SLOTS: usize = 27;
 pub(in crate::play) const PLAYER_CONTAINER_STORAGE_SLOTS: usize = 36;
-
-const QUICKCRAFT_TYPE_CHARITABLE: i8 = 0;
-const QUICKCRAFT_TYPE_GREEDY: i8 = 1;
-const QUICKCRAFT_HEADER_START: i8 = 0;
-const QUICKCRAFT_HEADER_CONTINUE: i8 = 1;
-const QUICKCRAFT_HEADER_END: i8 = 2;
 
 #[derive(Debug, Clone)]
 pub(in crate::play) struct ChestWindow {
@@ -53,43 +51,6 @@ impl ChestWindow {
 }
 
 #[derive(Debug, Clone)]
-pub(in crate::play) struct QuickCraftState {
-    status: i8,
-    kind: i8,
-    slots: Vec<usize>,
-}
-
-impl Default for QuickCraftState {
-    fn default() -> Self {
-        Self {
-            status: 0,
-            kind: -1,
-            slots: Vec::new(),
-        }
-    }
-}
-
-impl QuickCraftState {
-    pub(in crate::play) fn reset(&mut self) {
-        self.status = 0;
-        self.kind = -1;
-        self.slots.clear();
-    }
-
-    fn start(&mut self, kind: i8) {
-        self.status = 1;
-        self.kind = kind;
-        self.slots.clear();
-    }
-
-    fn add_slot(&mut self, slot: usize) {
-        if !self.slots.contains(&slot) {
-            self.slots.push(slot);
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
 pub(in crate::play) struct ChestView {
     pub(in crate::play) chests: Vec<ChestBlockEntity>,
 }
@@ -109,13 +70,6 @@ pub(in crate::play) enum ChestClickAction {
     Throw { slot: usize, button: i8 },
     QuickCraft(QuickCraftClick),
     Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::play) struct QuickCraftClick {
-    pub(in crate::play) header: i8,
-    pub(in crate::play) kind: i8,
-    pub(in crate::play) slot: Option<usize>,
 }
 
 pub(in crate::play) struct ChestClickInput<'a> {
@@ -343,14 +297,6 @@ fn can_quickcraft_replace(
             && slot_stack.count <= item_max_stack(item_facts, items, stack)
 }
 
-fn quickcraft_place_count(source_count: i32, selected_slots: usize, kind: i8) -> i32 {
-    match kind {
-        QUICKCRAFT_TYPE_CHARITABLE => source_count / selected_slots as i32,
-        QUICKCRAFT_TYPE_GREEDY => 1,
-        _ => 0,
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_quickcraft_click(
     items: &ItemRegistry,
@@ -361,55 +307,24 @@ fn apply_quickcraft_click(
     window: &mut ChestWindow,
     click: QuickCraftClick,
 ) -> bool {
-    let expected_status = window.quickcraft.status;
-    if (expected_status != QUICKCRAFT_HEADER_CONTINUE || click.header != QUICKCRAFT_HEADER_END)
-        && expected_status != click.header
-    {
-        window.quickcraft.reset();
-        return false;
-    }
-    if carried_item.is_empty() {
-        window.quickcraft.reset();
-        return false;
-    }
-
-    match click.header {
-        QUICKCRAFT_HEADER_START => {
-            if matches!(
-                click.kind,
-                QUICKCRAFT_TYPE_CHARITABLE | QUICKCRAFT_TYPE_GREEDY
-            ) {
-                window.quickcraft.start(click.kind);
-            } else {
-                window.quickcraft.reset();
-            }
-            false
-        }
-        QUICKCRAFT_HEADER_CONTINUE => {
-            let Some(menu_slot) = click.slot else {
+    match window.quickcraft.advance(carried_item.is_empty(), click) {
+        QuickCraftStep::Started | QuickCraftStep::Rejected => false,
+        QuickCraftStep::Continued { slot } => {
+            let Some(menu_slot) = slot else {
                 window.quickcraft.reset();
                 return false;
             };
-            if matches!(
-                window.quickcraft.kind,
-                QUICKCRAFT_TYPE_CHARITABLE | QUICKCRAFT_TYPE_GREEDY
-            ) && can_quickcraft_replace(
-                items,
-                item_facts,
-                view,
-                inventory,
-                menu_slot,
-                carried_item,
-            ) && carried_item.count > window.quickcraft.slots.len() as i32
+            if can_quickcraft_replace(items, item_facts, view, inventory, menu_slot, carried_item)
+                && carried_item.count > window.quickcraft.selected_slot_count() as i32
             {
                 window.quickcraft.add_slot(menu_slot);
             }
             false
         }
-        QUICKCRAFT_HEADER_END => {
-            let quickcraft_kind = window.quickcraft.kind;
-            let quickcraft_slots = window.quickcraft.slots.clone();
-            window.quickcraft.reset();
+        QuickCraftStep::Finished => {
+            let quickcraft = window.quickcraft.finish();
+            let quickcraft_kind = quickcraft.kind;
+            let quickcraft_slots = quickcraft.slots;
             if quickcraft_slots.is_empty()
                 || !matches!(
                     quickcraft_kind,
@@ -433,8 +348,11 @@ fn apply_quickcraft_click(
             if source.is_empty() || source.count < quickcraft_slots.len() as i32 {
                 return false;
             }
-            let place_count =
-                quickcraft_place_count(source.count, quickcraft_slots.len(), quickcraft_kind);
+            let place_count = quickcraft_distribution_count(
+                source.count,
+                quickcraft_slots.len(),
+                quickcraft_kind,
+            );
             if place_count <= 0 {
                 return false;
             }
@@ -473,10 +391,6 @@ fn apply_quickcraft_click(
                 cursor
             };
             changed
-        }
-        _ => {
-            window.quickcraft.reset();
-            false
         }
     }
 }

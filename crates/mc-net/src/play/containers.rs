@@ -13,11 +13,12 @@ mod chest;
 mod crafting;
 mod enchanting;
 mod furnace;
+pub(in crate::play) mod quickcraft;
 mod stonecutter;
 
 pub(in crate::play) use chest::{
-    ChestClickAction, ChestClickInput, ChestView, ChestWindow, QuickCraftClick,
-    adjacent_chest_positions, chest_slot_stacks, chest_wire_items, plan_click as plan_chest_click,
+    ChestClickAction, ChestClickInput, ChestView, ChestWindow, adjacent_chest_positions,
+    chest_slot_stacks, chest_wire_items, plan_click as plan_chest_click,
 };
 #[cfg(test)]
 pub(in crate::play) use chest::{
@@ -56,6 +57,7 @@ pub(in crate::play) use furnace::{
     furnace_menu_title_for_block_id, furnace_output_was_taken, furnace_slot_to_stack, plan_click,
     tick,
 };
+pub(in crate::play) use quickcraft::{QuickCraftClick, QuickCraftOutcome, QuickCraftState};
 pub(in crate::play) use stonecutter::{
     STONECUTTER_MENU_TYPE_ID, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
     plan_click as plan_stonecutter_click, select_stonecutter_recipe, set_stonecutter_input,

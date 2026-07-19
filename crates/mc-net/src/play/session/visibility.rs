@@ -42,6 +42,22 @@ pub(super) struct LastSentEntityState {
     pub(super) on_ground: bool,
 }
 
+pub(super) fn quantized_entity_delta(current: Vec3, previous: Vec3) -> Vec3 {
+    fn java_round(value: f64) -> f64 {
+        (value + 0.5).floor()
+    }
+
+    fn axis(current: f64, previous: f64) -> f64 {
+        (java_round(current * 4096.0) - java_round(previous * 4096.0)) / 4096.0
+    }
+
+    Vec3::new(
+        axis(current.x, previous.x),
+        axis(current.y, previous.y),
+        axis(current.z, previous.z),
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum VisibilityTransition {
     Spawn,
@@ -158,11 +174,7 @@ pub(super) fn publish_entity_movement_locked(
         initialize_entity_wire_state_from_snapshot_locked(inner, snapshot);
         return Vec::new();
     };
-    let delta = Vec3::new(
-        position.x - last_sent.position.x,
-        position.y - last_sent.position.y,
-        position.z - last_sent.position.z,
-    );
+    let delta = quantized_entity_delta(position, last_sent.position);
     if delta == Vec3::ZERO {
         return Vec::new();
     }

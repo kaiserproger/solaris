@@ -880,11 +880,7 @@ impl SessionRegistry {
             let Some(last_sent) = inner.last_sent_entity_states.get(&step.id).copied() else {
                 continue;
             };
-            let delta = Vec3 {
-                x: step.position.x - last_sent.position.x,
-                y: step.position.y - last_sent.position.y,
-                z: step.position.z - last_sent.position.z,
-            };
+            let delta = quantized_entity_delta(step.position, last_sent.position);
             let position_changed = delta != Vec3::ZERO;
             let rotation = applied_rotations
                 .get(&step.id)

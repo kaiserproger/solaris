@@ -96,6 +96,9 @@ use crate::{
 };
 
 mod beds;
+mod block_break;
+#[cfg(test)]
+mod block_break_tests;
 mod block_edit_commit;
 mod block_placement;
 mod block_wire;
@@ -185,8 +188,7 @@ pub(crate) use simulation::simulation_channel;
 use simulation::{
     ActiveShieldTransition, AnimalFeedPlan, AnimalFeedTargets, AuthoritativePlayerStateSnapshot,
     BowReleasePlan, FoodUsePlan, PlayerSurvivalCommitOutcome, PlayerSurvivalPlan,
-    SelectedItemDropPlan, SheepShearPlan, SurvivalBlockBreakPlan, SurvivalBreakDrop,
-    SurvivalBreakHeldItem,
+    SelectedItemDropPlan, SheepShearPlan,
 };
 pub(crate) use simulation::{
     SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationSaveSnapshot,
@@ -200,6 +202,11 @@ use beds::{
     bed_sleep_is_blocked_by_monster, bed_sleep_is_obstructed, plan_bed_occupied_edits,
     plan_loaded_bed_interaction, safe_bed_wake_pose,
 };
+use block_break::{
+    PendingBreak, block_break_loot_seed, break_replacement_state_in_storage,
+    handle_block_destroy_action, plan_break_block_edits, plan_break_edit_preconditions,
+    plan_survival_break_drops, tick_delayed_break,
+};
 #[cfg(test)]
 use block_edit_commit::{
     apply_block_edit_batch_to_storage_conditionally,
@@ -207,9 +214,8 @@ use block_edit_commit::{
     send_loaded_block_edit_resyncs,
 };
 use block_edit_commit::{
-    apply_block_edit_to_storage, apply_player_block_edit_batch,
-    apply_player_block_edit_batch_conditionally, apply_visible_block_edit_batch_conditionally,
-    finalize_visible_block_edit_outcome,
+    apply_block_edit_to_storage, apply_player_block_edit_batch_conditionally,
+    apply_visible_block_edit_batch_conditionally,
 };
 #[cfg(test)]
 use block_placement::{
@@ -217,8 +223,8 @@ use block_placement::{
     placed_sign_edit, sign_block_entity_update_nbt, sign_placement_state,
 };
 use block_wire::{
-    BlockDelta, broadcast_block_deltas_to_sessions, broadcast_level_event,
-    broadcast_light_updates_to_sessions, send_block_deltas, send_light_updates,
+    BlockDelta, broadcast_block_deltas_to_sessions, broadcast_light_updates_to_sessions,
+    send_block_deltas, send_light_updates,
 };
 #[cfg(test)]
 use block_wire::{BlockDeltaPacket, plan_block_delta_packets};
@@ -253,8 +259,9 @@ use containers::{
     ActiveContainer, CRAFTING_MENU_TYPE_ID, ChestClickAction, ChestClickInput, ChestView,
     ChestWindow, CraftingTableWindow, ENCHANTING_MENU_SLOT_COUNT, ENCHANTING_MENU_TYPE_ID,
     EnchantingTableWindow, FURNACE_MENU_SLOT_COUNT, FurnaceClickAction, FurnaceClickInput,
-    FurnaceKind, FurnaceWindow, QuickCraftClick, STONECUTTER_MENU_TYPE_ID, StonecutterClickAction,
-    StonecutterClickInput, StonecutterWindow, adjacent_chest_positions,
+    FurnaceKind, FurnaceWindow, QuickCraftClick, QuickCraftOutcome, QuickCraftState,
+    STONECUTTER_MENU_TYPE_ID, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
+    adjacent_chest_positions,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
     chest_menu_title_nbt, chest_slot_stacks, chest_wire_items, count_valid_enchanting_bookshelves,
     crafting_menu_title_nbt, crafting_table_input_from_projection, crafting_table_input_projection,
@@ -285,10 +292,9 @@ use containers::{
     repair_item_crafting_result, set_chest_menu_stack, stack_to_furnace_slot,
 };
 #[cfg(test)]
-use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits};
+use fluids::{WATER_FLOW_DELAY_TICKS, fluid_tick_edits, supported_flow_state};
 use fluids::{
     fluid_state_with_level, plan_fluid_ticks_near_applied, scheduled_fluid_planning_chunks,
-    supported_flow_state,
 };
 #[cfg(test)]
 use inventory::damage_equipped_armor;
@@ -355,10 +361,9 @@ use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
     PlayerEntitySnapshot, ServerEntityMove, ServerEntitySnapshot, SessionAdmissionError, SessionId,
     SessionRegistration, SleepOutcome, VisibilityDispatch, dispatch_visibility_commands,
-    within_block_reach,
 };
 #[cfg(test)]
-use session::{PlayerDamagePublication, PlayerInventorySlotDelta};
+use session::{PlayerDamagePublication, PlayerInventorySlotDelta, within_block_reach};
 #[cfg(test)]
 use session::{entity_aabb, within_entity_reach};
 #[cfg(test)]
@@ -367,18 +372,17 @@ use spawn::spawn_chunk_pos;
 use spawn::spawn_y_from_chunk;
 use spawn::{chunk_pos_from_coords, pack_block_pos, spawn_dimension, spawn_position};
 use survival::{
-    BlockMutationSnapshot, PendingBreak, PendingUse, SurvivalHealthTick, SurvivalState, UseKind,
+    BlockMutationSnapshot, PendingUse, SurvivalHealthTick, SurvivalState, UseKind,
     arrow_entity_type_id, available_arrow_slot, block_break_is_denied, block_tag_contains,
     bow_draw_power, entity_item_stack, falling_block_entity_type_id, held_bow_max_damage,
-    held_food_use, held_item_id, held_item_stack, is_bow_item, is_hostile_entity,
-    item_entity_type_id, item_use_ticks, max_tool_damage_for_path, mining_progress_for_block,
-    mining_target_for, mob_drop_stacks_from_seed, mob_xp_value, pending_break_is_complete,
-    pending_break_matches, pending_use_is_complete, pending_use_matches, xp_orb_entity_type_id,
+    held_food_use, is_bow_item, is_hostile_entity, item_entity_type_id, item_use_ticks,
+    mob_drop_stacks_from_seed, mob_xp_value, pending_use_is_complete, pending_use_matches,
+    xp_orb_entity_type_id,
 };
 #[cfg(test)]
 use survival::{
     block_drop_stacks_from, fallback_mining_time, fallback_tool_allows_block_drop,
-    food_rule_for_item, is_durability_tool_path,
+    food_rule_for_item, is_durability_tool_path, max_tool_damage_for_path,
 };
 #[cfg(test)]
 use toggles::toggled_bool_state;
@@ -1684,6 +1688,7 @@ where
             inventory: initial_inventory,
             carried_item: player_state.carried_item.clone(),
             inventory_state_id: 1,
+            inventory_quickcraft: QuickCraftState::default(),
             items: Arc::clone(&config.items),
             item_facts: Arc::clone(&config.item_facts),
             entity_types: Arc::clone(&config.entity_types),
@@ -1694,6 +1699,7 @@ where
             next_container_id: FURNACE_CONTAINER_ID_MIN,
             active_container: None,
             pending_break: None,
+            delayed_break: None,
             pending_use: None,
             pending_sign_edit: None,
             shield_use: None,
@@ -1809,6 +1815,7 @@ struct InteractionState {
     /// it to detect desyncs. Starts at 1 (after the seed
     /// ContainerSetContent on login).
     inventory_state_id: i32,
+    inventory_quickcraft: QuickCraftState,
     items: Arc<ItemRegistry>,
     item_facts: Arc<ItemFactsTable>,
     entity_types: Arc<EntityTypeRegistry>,
@@ -1821,6 +1828,7 @@ struct InteractionState {
     next_container_id: i32,
     active_container: Option<ActiveContainer>,
     pending_break: Option<PendingBreak>,
+    delayed_break: Option<PendingBreak>,
     pending_use: Option<PendingUse>,
     pending_sign_edit: Option<PendingSignEdit>,
     shield_use: Option<ShieldUseState>,
@@ -1928,6 +1936,18 @@ async fn write_block_resync_then_ack<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    write_block_resync(state, writer, position).await?;
+    write_block_ack(writer, state.compression, sequence).await
+}
+
+async fn write_block_resync<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    position: i64,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let (x, y, z) = unpack_block_pos(position);
     let block_position = mc_world::BlockPos { x, y, z };
     #[cfg(test)]
@@ -1957,7 +1977,7 @@ where
     if let Some(update) = update {
         write_packet(writer, &update, state.compression).await?;
     }
-    write_block_ack(writer, state.compression, sequence).await
+    Ok(())
 }
 
 async fn write_loaded_block_resync_then_ack<W>(
@@ -2121,12 +2141,17 @@ where
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
+    let action = classify_container_click(&packet);
+    if !matches!(action, ContainerClickAction::QuickCraft(_)) {
+        window.quickcraft.reset();
+    }
     let before_inventory = state.inventory.clone();
     let before_carried_item = state.carried_item.clone();
     let before_window = window.clone();
     let mut dropped = None;
     let mut discarded_remainders = Vec::new();
-    let changed = match classify_container_click(&packet) {
+    let mut quickcraft_outcome = None;
+    let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = window.apply_pickup_click(
                 &state.items,
@@ -2182,7 +2207,19 @@ where
                 false
             }
         }
-        ContainerClickAction::QuickCraft(_) => false,
+        ContainerClickAction::QuickCraft(click) => {
+            let outcome = window.apply_quickcraft_click(
+                &state.items,
+                &state.item_facts,
+                &mut state.inventory,
+                &mut state.carried_item,
+                click,
+                &state.tags,
+                &state.recipes,
+            );
+            quickcraft_outcome = Some(outcome);
+            outcome == QuickCraftOutcome::Changed
+        }
         ContainerClickAction::Unsupported => false,
     };
     for remaining in discarded_remainders {
@@ -2192,10 +2229,22 @@ where
             "dropping crafting remainder because inventory is full"
         );
     }
+    if quickcraft_outcome == Some(QuickCraftOutcome::Pending) {
+        if client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+            return Ok(window);
+        }
+        state.inventory = before_inventory;
+        state.carried_item = before_carried_item;
+        window = before_window;
+        window.quickcraft.reset();
+        write_crafting_content(state, writer, &window).await?;
+        return Ok(window);
+    }
     if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
         state.inventory = before_inventory;
         state.carried_item = before_carried_item;
         window = before_window;
+        window.quickcraft.reset();
         write_crafting_content(state, writer, &window).await?;
         return Ok(window);
     }
@@ -4979,17 +5028,19 @@ where
         debug!(
             client_state = packet.state_id,
             server_state = state.inventory_state_id,
-            "container click resynced stale state"
+            "applying queued container click against current server state"
         );
-        write_inventory_content_resync(state, writer).await?;
-        return Ok(());
     }
 
     let before_inventory = state.inventory.clone();
     let before_carried_item = state.carried_item.clone();
     let mut dropped = None;
     let mut discarded_remainders = Vec::new();
-    let changed = match classify_container_click(&packet) {
+    let action = classify_container_click(&packet);
+    if !matches!(action, ContainerClickAction::QuickCraft(_)) {
+        state.inventory_quickcraft.reset();
+    }
+    let changed = match action {
         ContainerClickAction::Pickup { slot, button } => {
             let (changed, discarded) = state.inventory.apply_crafting_pickup_click(
                 &state.items,
@@ -5041,7 +5092,27 @@ where
                 false
             }
         }
-        ContainerClickAction::QuickCraft(_) => false,
+        ContainerClickAction::QuickCraft(click) => {
+            match state.inventory.apply_crafting_quickcraft_click(
+                &state.items,
+                &state.item_facts,
+                &mut state.carried_item,
+                &mut state.inventory_quickcraft,
+                click,
+                &state.tags,
+                &state.recipes,
+            ) {
+                QuickCraftOutcome::Pending => {
+                    if !client_carried_item_matches(&packet.carried_item, &state.carried_item) {
+                        state.inventory_quickcraft.reset();
+                        write_inventory_content_resync(state, writer).await?;
+                    }
+                    return Ok(());
+                }
+                QuickCraftOutcome::Changed => true,
+                QuickCraftOutcome::Rejected => false,
+            }
+        }
         ContainerClickAction::Unsupported => false,
     };
     for remaining in discarded_remainders {
@@ -5834,282 +5905,6 @@ fn player_attack_cost_plan(
     }
 }
 
-async fn complete_block_break<W>(
-    state: &mut InteractionState,
-    writer: &mut W,
-    sequence: i32,
-    position: i64,
-    drop_items: bool,
-    _player_pose: PlayerPose,
-    expected_target: Option<BlockMutationSnapshot>,
-) -> Result<bool, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    let (x, y, z) = unpack_block_pos(position);
-    let pos = mc_world::BlockPos { x, y, z };
-    if let Some(expected_target) = expected_target {
-        dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-        let held = state.inventory.held(state.selected_hotbar_slot).clone();
-        let max_damage = if held.is_empty() {
-            None
-        } else {
-            state
-                .items
-                .name_of(held.item_id)
-                .and_then(|item| max_tool_damage_for_path(item.path()))
-        };
-        let committed = match state
-            .simulation
-            .commit_survival_block_break(SurvivalBlockBreakPlan {
-                position: pos,
-                expected_target,
-                blocks: Arc::clone(&state.blocks),
-                block_facts: Arc::clone(&state.block_facts),
-                water: state.water,
-                items: Arc::clone(&state.items),
-                item_facts: Arc::clone(&state.item_facts),
-                loot: Arc::clone(&state.loot),
-                item_entity_type_id: item_entity_type_id(&state.entity_types),
-                falling_block_entity_type_id: falling_block_entity_type_id(&state.entity_types),
-                held: SurvivalBreakHeldItem {
-                    hotbar_slot: state.selected_hotbar_slot,
-                    expected: held,
-                    max_damage,
-                },
-                drop_items,
-            })
-            .await
-        {
-            Ok(Some(committed)) => committed,
-            Ok(None) => {
-                debug!(
-                    sequence,
-                    x,
-                    y,
-                    z,
-                    expected_state = expected_target.state.0,
-                    expected_chunk_instance = expected_target.token.chunk_instance_id,
-                    expected_version = expected_target.token.version,
-                    "survival block break rejected after transaction precondition changed"
-                );
-                write_block_resync_then_ack(state, writer, position, sequence).await?;
-                return Ok(false);
-            }
-            Err(error) => {
-                debug!(
-                    ?error,
-                    sequence, x, y, z, "simulation survival break rejected"
-                );
-                write_block_resync_then_ack(state, writer, position, sequence).await?;
-                return Ok(false);
-            }
-        };
-        let destroyed_state = committed
-            .block
-            .applied
-            .iter()
-            .find(|edit| {
-                edit.pos == pos
-                    && edit.previous == expected_target.state
-                    && edit.previous != edit.new_state
-            })
-            .map(|edit| edit.previous);
-        state.inventory = committed.inventory;
-        let changed_slots = committed.changed_slots;
-        if let Some(destroyed_state) = destroyed_state {
-            broadcast_level_event(
-                state,
-                pos,
-                2001,
-                destroyed_state.0 as i32,
-                Some(state.session_id),
-            );
-        }
-        let outcome =
-            finalize_visible_block_edit_outcome(state, writer, committed.block, false).await?;
-        write_packet(writer, &BlockChangedAck { sequence }, state.compression).await?;
-        if !changed_slots.is_empty() {
-            write_inventory_slot_updates(state, writer, changed_slots).await?;
-        }
-        let changed = !outcome.applied.is_empty();
-        return Ok(changed);
-    }
-
-    let air = air_state_id(&state.blocks);
-    let edits = {
-        let mut storage = state.world.lock().await;
-        let replacement = break_replacement_state_in_storage(
-            &state.blocks,
-            &state.block_facts,
-            state.water,
-            &*storage,
-            pos,
-            air,
-        );
-        match storage.get_block(pos) {
-            Ok(Some(previous)) => {
-                plan_break_block_edits(&state.blocks, &*storage, pos, previous, replacement, air)
-            }
-            Ok(None) => Vec::new(),
-            Err(error) => {
-                warn!(%error, x, y, z, "block break target read failed");
-                Vec::new()
-            }
-        }
-    };
-    if edits.is_empty() {
-        write_block_resync_then_ack(state, writer, position, sequence).await?;
-        return Ok(false);
-    }
-    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-
-    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
-    if let Some(destroyed_state) = outcome
-        .applied
-        .iter()
-        .find(|edit| edit.pos == pos && edit.previous != edit.new_state)
-        .map(|edit| edit.previous)
-    {
-        broadcast_level_event(
-            state,
-            pos,
-            2001,
-            destroyed_state.0 as i32,
-            Some(state.session_id),
-        );
-    }
-    let changed = !outcome.applied.is_empty();
-    if changed {
-        schedule_fluid_ticks_for_interaction(state, &outcome.applied).await;
-        start_falling_blocks_after_edits(state, writer, &outcome.applied).await?;
-    }
-    Ok(changed)
-}
-
-fn plan_break_edit_preconditions(
-    storage: &impl BlockPlanningRead,
-    edits: &[BlockEdit],
-    root: mc_world::BlockPos,
-    expected_root: BlockMutationSnapshot,
-) -> Option<Vec<BlockEditPrecondition>> {
-    edits
-        .iter()
-        .map(|edit| {
-            if edit.pos == root {
-                return Some(BlockEditPrecondition {
-                    pos: root,
-                    expected_state: expected_root.state,
-                    expected_token: expected_root.token,
-                });
-            }
-            Some(BlockEditPrecondition {
-                pos: edit.pos,
-                expected_state: storage.get_cached_block(edit.pos)?,
-                expected_token: storage.block_mutation_token(edit.pos)?,
-            })
-        })
-        .collect()
-}
-
-fn plan_survival_break_drops(
-    request: &SurvivalBlockBreakPlan,
-    edits: &[BlockEdit],
-    preconditions: &[BlockEditPrecondition],
-    air: mc_world::BlockStateId,
-) -> Vec<SurvivalBreakDrop> {
-    let Some(entity_type_id) = request.item_entity_type_id else {
-        return Vec::new();
-    };
-    let held_item = (!request.held.expected.is_empty()).then_some(&request.held.expected);
-    edits
-        .iter()
-        .zip(preconditions)
-        .filter(|(edit, precondition)| {
-            edit.pos == request.position
-                || (edit.new_state == air
-                    && is_vertical_support_cascade_state(
-                        &request.blocks,
-                        precondition.expected_state,
-                    ))
-        })
-        .flat_map(|(edit, precondition)| {
-            let loot_seed = block_break_loot_seed(
-                edit.pos,
-                precondition.expected_state,
-                precondition.expected_token,
-            );
-            survival::block_drop_stacks_with_tool_and_facts_from_seeded(
-                &request.loot,
-                &request.items,
-                &request.item_facts,
-                &request.blocks,
-                precondition.expected_state,
-                held_item,
-                loot_seed,
-            )
-            .into_iter()
-            .map(move |drop| SurvivalBreakDrop {
-                entity_type_id,
-                position: Vec3::new(
-                    f64::from(edit.pos.x) + 0.5,
-                    f64::from(edit.pos.y) + 0.5,
-                    f64::from(edit.pos.z) + 0.5,
-                ),
-                stack: entity_item_stack(drop),
-            })
-        })
-        .collect()
-}
-
-fn block_break_loot_seed(
-    position: mc_world::BlockPos,
-    state: mc_world::BlockStateId,
-    token: mc_world::BlockMutationToken,
-) -> u64 {
-    let mut seed = token.chunk_instance_id ^ token.version.rotate_left(29);
-    seed = splitmix64(seed ^ u64::from(state.0));
-    seed = splitmix64(seed ^ (position.x as i64 as u64).rotate_left(11));
-    seed = splitmix64(seed ^ (position.y as i64 as u64).rotate_left(31));
-    splitmix64(seed ^ (position.z as i64 as u64).rotate_left(47))
-}
-
-fn plan_break_block_edits(
-    blocks: &mc_world::BlockRegistry,
-    storage: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    state_id: mc_world::BlockStateId,
-    replacement: mc_world::BlockStateId,
-    air: mc_world::BlockStateId,
-) -> Vec<BlockEdit> {
-    let mut edits = vec![BlockEdit {
-        pos,
-        new_state: replacement,
-    }];
-    let Some(state) = blocks.by_id(state_id) else {
-        return edits;
-    };
-    if state.block.id.path().ends_with("_door") {
-        let other_y = match block_state_property(state, "half") {
-            Some("lower") => pos.y + 1,
-            Some("upper") => pos.y - 1,
-            _ => return edits,
-        };
-        let other_pos = mc_world::BlockPos { y: other_y, ..pos };
-        if let Some(other_state_id) = storage.get_cached_block(other_pos)
-            && let Some(other_state) = blocks.by_id(other_state_id)
-            && other_state.block.id == state.block.id
-        {
-            edits.push(BlockEdit {
-                pos: other_pos,
-                new_state: air,
-            });
-        }
-    }
-    append_vertical_support_cascade(blocks, storage, &mut edits, pos, air);
-    edits
-}
-
 async fn start_falling_blocks_after_edits<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -6171,46 +5966,6 @@ where
         ));
     }
     Ok(())
-}
-
-fn append_vertical_support_cascade(
-    blocks: &mc_world::BlockRegistry,
-    storage: &impl BlockPlanningRead,
-    edits: &mut Vec<BlockEdit>,
-    base: mc_world::BlockPos,
-    air: mc_world::BlockStateId,
-) {
-    let mut y = base.y + 1;
-    loop {
-        let pos = mc_world::BlockPos { y, ..base };
-        let Some(state_id) = storage.get_cached_block(pos) else {
-            break;
-        };
-        let Some(state) = blocks.by_id(state_id) else {
-            break;
-        };
-        if !is_vertical_support_cascade_block(state.block.id.path()) {
-            break;
-        }
-        edits.push(BlockEdit {
-            pos,
-            new_state: air,
-        });
-        y += 1;
-    }
-}
-
-fn is_vertical_support_cascade_block(path: &str) -> bool {
-    matches!(path, "sugar_cane" | "cactus" | "bamboo")
-}
-
-fn is_vertical_support_cascade_state(
-    blocks: &mc_world::BlockRegistry,
-    state_id: mc_world::BlockStateId,
-) -> bool {
-    blocks
-        .by_id(state_id)
-        .is_some_and(|state| is_vertical_support_cascade_block(state.block.id.path()))
 }
 
 /// M5.d/M22.b: handle serverbound block-destroy actions. Creative keeps the
@@ -6395,237 +6150,16 @@ where
         return Ok(());
     }
 
-    if game_mode == GameMode::Survival && survival_state.is_dead() {
-        state.pending_break = None;
-        state.pending_use = None;
-        debug!(
-            sequence = action.sequence,
-            "survival block break ignored for dead player"
-        );
-        return write_block_ack(writer, state.compression, action.sequence).await;
-    }
-
-    if !within_block_reach(player_pose, action.position, game_mode) {
-        state.pending_break = None;
-        state.pending_use = None;
-        debug!(
-            sequence = action.sequence,
-            "block break ignored: target out of reach"
-        );
-        return write_loaded_block_resync_then_ack(state, writer, action.position, action.sequence)
-            .await;
-    }
-
-    match game_mode {
-        GameMode::Creative => {
-            state.pending_break = None;
-            state.pending_use = None;
-            if matches!(action.action, PlayerActionKind::AbortDestroyBlock) {
-                return write_block_ack(writer, state.compression, action.sequence).await;
-            }
-            complete_block_break(
-                state,
-                writer,
-                action.sequence,
-                action.position,
-                false,
-                player_pose,
-                None,
-            )
-            .await
-            .map(|_| ())
-        }
-        GameMode::Survival => match action.action {
-            PlayerActionKind::StartDestroyBlock => {
-                let (expected_target, progress_per_tick) =
-                    mining_target_for(state, action.position, player_pose).await;
-                let breaks_on_start = expected_target.is_some() && progress_per_tick >= 1.0;
-                if breaks_on_start {
-                    state.pending_break = None;
-                    let changed = complete_block_break(
-                        state,
-                        writer,
-                        action.sequence,
-                        action.position,
-                        true,
-                        player_pose,
-                        expected_target,
-                    )
-                    .await?;
-                    let mut updated_survival = *survival_state;
-                    if changed
-                        && updated_survival.add_exhaustion(SurvivalState::BLOCK_BREAK_EXHAUSTION)
-                    {
-                        let expected_inventory = state.inventory.clone();
-                        commit_player_survival_update(
-                            state,
-                            writer,
-                            survival_state,
-                            xp_state,
-                            expected_inventory,
-                            updated_survival,
-                            xp_state.clone(),
-                            None,
-                            true,
-                            player_pose,
-                        )
-                        .await?;
-                    }
-                    return Ok(());
-                }
-                let held_item = held_item_stack(state).cloned();
-                state.pending_break = Some(PendingBreak {
-                    position: action.position,
-                    direction: action.direction,
-                    started_tick: state.sessions.simulation_tick(),
-                    started_progress_per_tick: progress_per_tick,
-                    held_hotbar_slot: state.selected_hotbar_slot,
-                    held_item: held_item.clone(),
-                    expected_target,
-                });
-                debug!(
-                    sequence = action.sequence,
-                    position = action.position,
-                    direction = ?action.direction,
-                    held_slot = state.selected_hotbar_slot,
-                    held_item = ?held_item.as_ref().map(|stack| stack.item_id),
-                    expected_target = ?expected_target,
-                    progress_per_tick,
-                    "survival block break started"
-                );
-                write_block_ack(writer, state.compression, action.sequence).await
-            }
-            PlayerActionKind::AbortDestroyBlock => {
-                let pending = state.pending_break.as_ref();
-                debug!(
-                    sequence = action.sequence,
-                    position = action.position,
-                    direction = ?action.direction,
-                    pending_present = pending.is_some(),
-                    pending_position = pending.map(|pending| pending.position),
-                    pending_direction = ?pending.map(|pending| pending.direction),
-                    "survival block break aborted"
-                );
-                state.pending_break = None;
-                write_block_ack(writer, state.compression, action.sequence).await
-            }
-            PlayerActionKind::StopDestroyBlock => {
-                let current_tick = state.sessions.simulation_tick();
-                let pending = state.pending_break.as_ref();
-                let pending_present = pending.is_some();
-                let position_matches =
-                    pending.is_some_and(|pending| pending.position == action.position);
-                let direction_matches =
-                    pending.is_some_and(|pending| pending.direction == action.direction);
-                let held_slot_matches = pending
-                    .is_some_and(|pending| pending.held_hotbar_slot == state.selected_hotbar_slot);
-                let held_item_matches = pending
-                    .is_some_and(|pending| pending.held_item.as_ref() == held_item_stack(state));
-                let elapsed_ticks =
-                    pending.map(|pending| current_tick.saturating_sub(pending.started_tick));
-                let started_progress_per_tick =
-                    pending.map(|pending| pending.started_progress_per_tick);
-                let pending_position = pending.map(|pending| pending.position);
-                let pending_direction = pending.map(|pending| pending.direction);
-                let pending_held_slot = pending.map(|pending| pending.held_hotbar_slot);
-                let pending_held_item = pending
-                    .and_then(|pending| pending.held_item.as_ref())
-                    .map(|stack| stack.item_id);
-                let pending_expected_target = pending.and_then(|pending| pending.expected_target);
-                let current_held_item = held_item_id(state);
-                let current_held_stack = held_item_stack(state);
-                let current_progress_per_tick = pending_expected_target.map_or(0.0, |target| {
-                    mining_progress_for_block(
-                        &state.blocks,
-                        &state.block_facts,
-                        &state.items,
-                        &state.item_facts,
-                        &state.tags,
-                        target.state,
-                        current_held_stack,
-                        player_pose,
-                    )
-                });
-                let can_complete = pending.is_some_and(|pending| {
-                    pending_break_matches(state, pending, &action)
-                        && pending_break_is_complete(
-                            pending,
-                            current_tick,
-                            current_progress_per_tick,
-                        )
-                        && pending.expected_target.is_some()
-                });
-                state.pending_break = None;
-                if can_complete {
-                    let changed = complete_block_break(
-                        state,
-                        writer,
-                        action.sequence,
-                        action.position,
-                        true,
-                        player_pose,
-                        pending_expected_target,
-                    )
-                    .await?;
-                    let mut updated_survival = *survival_state;
-                    if changed
-                        && updated_survival.add_exhaustion(SurvivalState::BLOCK_BREAK_EXHAUSTION)
-                    {
-                        let expected_inventory = state.inventory.clone();
-                        commit_player_survival_update(
-                            state,
-                            writer,
-                            survival_state,
-                            xp_state,
-                            expected_inventory,
-                            updated_survival,
-                            xp_state.clone(),
-                            None,
-                            true,
-                            player_pose,
-                        )
-                        .await?;
-                    }
-                    Ok(())
-                } else {
-                    debug!(
-                        sequence = action.sequence,
-                        pending_present,
-                        position_matches,
-                        direction_matches,
-                        held_slot_matches,
-                        held_item_matches,
-                        elapsed_ticks,
-                        started_progress_per_tick,
-                        current_progress_per_tick,
-                        action_position = action.position,
-                        action_direction = ?action.direction,
-                        action_held_slot = state.selected_hotbar_slot,
-                        action_held_item = ?current_held_item,
-                        pending_position,
-                        pending_direction = ?pending_direction,
-                        pending_held_slot,
-                        pending_held_item,
-                        pending_expected_target = ?pending_expected_target,
-                        "survival block break rejected before completion"
-                    );
-                    write_block_resync_then_ack(state, writer, action.position, action.sequence)
-                        .await
-                }
-            }
-            _ => write_block_ack(writer, state.compression, action.sequence).await,
-        },
-        GameMode::Adventure | GameMode::Spectator => {
-            state.pending_break = None;
-            state.pending_use = None;
-            debug!(
-                mode = ?game_mode,
-                sequence = action.sequence,
-                "block break denied outside survival/creative"
-            );
-            write_block_ack(writer, state.compression, action.sequence).await
-        }
-    }
+    handle_block_destroy_action(
+        state,
+        writer,
+        game_mode,
+        survival_state,
+        xp_state,
+        player_pose,
+        action,
+    )
+    .await
 }
 
 fn arrow_spawn_position(pose: PlayerPose) -> Vec3 {
@@ -7410,6 +6944,9 @@ async fn run_random_ticks_owned(
             }
         }
         let plan = plan_indexed_random_tick_edits(config, policy, world_tick, &snapshot, &group);
+        // The plan owns every edit and precondition needed below. Releasing the
+        // snapshot here lets the resident mutation update its chunk in place.
+        drop(snapshot);
         eligible += plan.eligible;
         if plan.edits.is_empty() {
             continue;
@@ -10538,45 +10075,6 @@ fn fluid_state_ids(
     states
 }
 
-fn break_replacement_state_in_storage(
-    blocks: &mc_world::BlockRegistry,
-    block_facts: &mc_data::block_facts::BlockFactsTable,
-    water: Option<mc_world::BlockStateId>,
-    storage: &impl BlockPlanningRead,
-    pos: mc_world::BlockPos,
-    air: mc_world::BlockStateId,
-) -> mc_world::BlockStateId {
-    let mc_world::BlockPos { x, y, z } = pos;
-    let neighbours = [
-        (x, y + 1, z),
-        (x + 1, y, z),
-        (x - 1, y, z),
-        (x, y, z + 1),
-        (x, y, z - 1),
-    ];
-    let neighbour_states =
-        neighbours.map(|(x, y, z)| storage.get_cached_block(mc_world::BlockPos { x, y, z }));
-    for fluid in neighbour_states
-        .into_iter()
-        .flatten()
-        .filter_map(|state_id| block_facts.fluid(state_id.0))
-    {
-        if let Some(flow_state) = supported_flow_state(blocks, block_facts, storage, pos, fluid) {
-            return flow_state;
-        }
-    }
-
-    if let Some(water) = water
-        && neighbour_states
-            .into_iter()
-            .any(|state| state == Some(water))
-    {
-        return water;
-    }
-
-    air
-}
-
 fn published_block_precondition(
     state: &InteractionState,
     position: mc_world::BlockPos,
@@ -11887,6 +11385,16 @@ where
                     food_tick_timer = 0;
                 }
                 if let Some(state) = interaction.as_deref_mut() {
+                    tick_delayed_break(
+                        state,
+                        writer,
+                        game_mode,
+                        &mut survival_state,
+                        &mut xp_state,
+                        player_pose,
+                        current_tick,
+                    )
+                    .await?;
                     tick_pending_use(
                         state,
                         writer,

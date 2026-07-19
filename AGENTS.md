@@ -192,6 +192,16 @@ For non-trivial code changes:
    abstractions, broad config, unrelated churn, and unsupported claims.
 7. Run focused validation, then broader gates at the checkpoint.
 
+Treat `mc-net` as a modular monolith. Root orchestration files such as
+`play.rs`, `session.rs`, and their aggregate test files route work but do not
+own new domain behavior. Put each state machine, authority boundary, and
+transaction policy in a focused domain module with a narrow explicit interface.
+When changing legacy behavior still embedded in a root file, move that touched
+domain into its own module in the same slice when the extraction is mechanical
+and bounded. Keep substantial unit-test modules in sibling `*_tests.rs` files;
+do not grow `play/tests.rs`, `session/tests.rs`, or inline production-file test
+blocks further.
+
 Subagents are useful for scouting, implementation, and review when file
 ownership is separable. The main agent remains responsible for inspecting
 their diff and reporting exact validation evidence.

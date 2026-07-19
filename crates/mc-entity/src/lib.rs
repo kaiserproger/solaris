@@ -2572,8 +2572,10 @@ impl EntityStore {
                     };
                     self.velocities[slot].x = direction.x * speed;
                     self.velocities[slot].z = direction.z * speed;
-                    self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                    self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    if self.velocities[slot].horizontal_len() > 0.0 {
+                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
+                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    }
                 }
                 GoalState::AquaticWander {
                     speed,
@@ -2612,8 +2614,10 @@ impl EntityStore {
                     };
                     self.velocities[slot].x = velocity.x * speed;
                     self.velocities[slot].z = velocity.z * speed;
-                    self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                    self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    if self.velocities[slot].horizontal_len() > 0.0 {
+                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
+                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    }
                 }
                 GoalState::FollowPosition { target, speed } => {
                     let vertical_velocity = self.velocities[slot].y;
@@ -2640,8 +2644,10 @@ impl EntityStore {
                         self.velocities[slot].y = vertical_velocity;
                     }
                     self.velocities[slot].z = velocity.z * speed;
-                    self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                    self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    if self.velocities[slot].horizontal_len() > 0.0 {
+                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
+                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
+                    }
                 }
             }
             stats.decisions_applied += 1;
@@ -2893,6 +2899,20 @@ fn resolve_retained_pathing(
             break;
         }
         path.current_node = path.current_node.saturating_add(1);
+    }
+    if path.current_target().is_none()
+        && (request.target.x - current.x).hypot(request.target.z - current.z) <= reach
+    {
+        probes.direct_path_resolved(request.id);
+        path.was_moving = false;
+        return (
+            PathingDecision {
+                velocity: Vec3::ZERO,
+                kind: PathingDecisionKind::Move,
+                direct: true,
+            },
+            path,
+        );
     }
 
     let following_detour = path.current_node.saturating_add(1) < path.node_count;
@@ -4787,6 +4807,40 @@ mod tests {
             request.target, request.expected_path.target,
             "moving within one Wander period must not replace the retained absolute target"
         );
+    }
+
+    #[test]
+    fn wander_stops_after_reaching_its_retained_target() {
+        let mut store = EntityStore::new();
+        let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
+        entity.goal = GoalState::Wander {
+            speed: 3.0,
+            period_ticks: 40,
+        };
+        let id = store.spawn_authoritative(entity);
+        let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
+
+        for tick in 1..=6 {
+            store.tick_goals_with_pathing(tick, &probe, PathingBudget::DEFAULT);
+            store.tick_positions(PathingBudget::TICK_SECONDS);
+        }
+
+        let prepared = store.prepare_goal_tick_with_pathing_for_ids(7, &HashSet::from([id]));
+        let request = &prepared.pathing_requests[0];
+        let position = store.snapshot(id).expect("wanderer snapshot").position;
+        let reach = 3.0 * PathingBudget::TICK_SECONDS * 1.25;
+        assert!(
+            (request.target.x - position.x).hypot(request.target.z - position.z) <= reach,
+            "fixture must enter the retained target radius"
+        );
+        let rotation = store.snapshot(id).unwrap().rotation;
+
+        store.apply_prepared_goal_tick(prepared.resolve(&probe, PathingBudget::DEFAULT));
+
+        assert_eq!(store.snapshot(id).unwrap().velocity, Vec3::ZERO);
+        assert_eq!(store.snapshot(id).unwrap().rotation, rotation);
+        store.tick_positions(PathingBudget::TICK_SECONDS);
+        assert_eq!(store.snapshot(id).unwrap().position, position);
     }
 
     #[test]

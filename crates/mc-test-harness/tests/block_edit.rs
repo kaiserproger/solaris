@@ -48,7 +48,9 @@ use support::*;
 
 const VIEW_DISTANCE: i32 = 2;
 
-include!("block_edit/breaks_and_crafting.rs");
+include!("block_edit/container_support.rs");
+include!("block_edit/block_breaking.rs");
+include!("block_edit/survival_inventory.rs");
 include!("block_edit/campfire.rs");
 include!("block_edit/cauldron.rs");
 include!("block_edit/crop_bonemeal.rs");
@@ -57,7 +59,16 @@ include!("block_edit/fluid_scheduling.rs");
 include!("block_edit/placement_rejection.rs");
 include!("block_edit/plant_harvest.rs");
 include!("block_edit/plant_lifecycle.rs");
-include!("block_edit/furnace_and_chests.rs");
+include!("block_edit/inventory_crafting.rs");
+include!("block_edit/embedded_playable.rs");
+include!("block_edit/persistence.rs");
+include!("block_edit/survival_crafting.rs");
+include!("block_edit/crafting_table.rs");
+include!("block_edit/furnaces.rs");
+include!("block_edit/chests_and_hoppers.rs");
+include!("block_edit/enchanting.rs");
+include!("block_edit/inventory_clicks.rs");
+include!("block_edit/stations_and_placement.rs");
 include!("block_edit/multiplayer_sleep.rs");
 include!("block_edit/pvp.rs");
 include!("block_edit/sapling_growth.rs");

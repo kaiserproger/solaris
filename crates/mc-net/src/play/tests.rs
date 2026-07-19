@@ -1074,38 +1074,6 @@ async fn enchanting_button_commits_xp_through_owner_before_mutating_table_inputs
     assert!(!writer.is_empty());
 }
 
-#[test]
-fn pending_break_rejects_same_item_id_with_changed_enchantments() {
-    let pickaxe_name = Identifier::parse("minecraft:stone_pickaxe").unwrap();
-    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
-        id: pickaxe_name,
-        protocol_id: 10,
-    }]));
-    let mut state = interaction_state_for_items(items);
-    let plain = ItemStack::new(10, 1);
-    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = plain.clone();
-    let pending = PendingBreak {
-        position: 0,
-        direction: Direction::Up,
-        started_tick: 0,
-        started_progress_per_tick: 0.1,
-        held_hotbar_slot: 0,
-        held_item: Some(plain),
-        expected_target: None,
-    };
-    let action = ServerboundPlayerAction {
-        action: PlayerActionKind::StopDestroyBlock,
-        position: 0,
-        direction: Direction::Up,
-        sequence: 1,
-    };
-    assert!(pending_break_matches(&state, &pending, &action));
-
-    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(10, 1)
-        .with_enchantment(Identifier::parse("minecraft:efficiency").unwrap(), 1);
-    assert!(!pending_break_matches(&state, &pending, &action));
-}
-
 #[tokio::test]
 async fn play_loop_closes_session_when_outbound_write_stalls() {
     let (_client, mut reader) = tokio::io::duplex(64);
@@ -2523,7 +2491,7 @@ fn fluid_test_reports() -> Vec<BlockReport> {
     ]
 }
 
-fn fluid_test_registry() -> mc_world::BlockRegistry {
+pub(super) fn fluid_test_registry() -> mc_world::BlockRegistry {
     mc_world::BlockRegistry::from_report(&fluid_test_reports()).unwrap()
 }
 
@@ -2581,7 +2549,9 @@ fn fluid_test_facts() -> mc_data::block_facts::BlockFactsTable {
     mc_data::block_facts::BlockFactsTable::from_blocks_report(&fluid_test_reports())
 }
 
-fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> InteractionState {
+pub(super) fn interaction_state_for_blocks(
+    blocks: Arc<mc_world::BlockRegistry>,
+) -> InteractionState {
     let items = Arc::new(ItemRegistry::from_report(&[]));
     let storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     let world_read = storage.read_view();
@@ -2604,6 +2574,7 @@ fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> Interac
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         inventory_state_id: 1,
+        inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
         entity_types: Arc::new(EntityTypeRegistry::default()),
@@ -2614,6 +2585,7 @@ fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> Interac
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
+        delayed_break: None,
         pending_use: None,
         pending_sign_edit: None,
         shield_use: None,
@@ -2621,7 +2593,7 @@ fn interaction_state_for_blocks(blocks: Arc<mc_world::BlockRegistry>) -> Interac
     }
 }
 
-async fn insert_fluid_test_chunk(state: &InteractionState) {
+pub(super) async fn insert_fluid_test_chunk(state: &InteractionState) {
     let cpos = ChunkPos { x: 0, z: 0 };
     state
         .world
@@ -9081,6 +9053,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         inventory_state_id: 1,
+        inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
         entity_types: Arc::new(EntityTypeRegistry::default()),
@@ -9091,6 +9064,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
+        delayed_break: None,
         pending_use: None,
         pending_sign_edit: None,
         shield_use: None,
@@ -12873,6 +12847,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         inventory_state_id: 1,
+        inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
         entity_types: Arc::new(EntityTypeRegistry::default()),
@@ -12883,6 +12858,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: None,
+        delayed_break: None,
         pending_use: None,
         pending_sign_edit: None,
         shield_use: None,
@@ -18423,6 +18399,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         inventory: PlayerInventory::empty(),
         carried_item: ItemStack::EMPTY,
         inventory_state_id: 1,
+        inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
         entity_types: Arc::new(EntityTypeRegistry::default()),
@@ -18433,6 +18410,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         next_container_id: FURNACE_CONTAINER_ID_MIN,
         active_container: None,
         pending_break: Some(PendingBreak {
+            sequence: 0,
             position: pack_block_pos(pos.x, pos.y, pos.z),
             direction: Direction::Up,
             started_tick: 0,
@@ -18441,6 +18419,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
             held_item: None,
             expected_target: None,
         }),
+        delayed_break: None,
         pending_use: None,
         pending_sign_edit: None,
         shield_use: None,

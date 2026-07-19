@@ -141,7 +141,7 @@ use visibility::{
     entity_event_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
     install_committed_entity_publications_locked, ordered_session_recipient,
-    packed_rotation_changed, publish_server_entity_snapshot_locked,
+    packed_rotation_changed, publish_server_entity_snapshot_locked, quantized_entity_delta,
     refresh_entity_target_visibility_locked, session_recipients,
     spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
     spawned_xp_observer_ids, visibility_dispatches, visible_entity_observers_locked,
@@ -1500,3 +1500,6 @@ fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk:
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+#[path = "session/visibility_tests.rs"]
+mod visibility_tests;

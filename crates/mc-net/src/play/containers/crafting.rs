@@ -6,6 +6,10 @@ use mc_data::tags::TagsData;
 use mc_nbt::Tag;
 use mc_protocol::packets::play::ItemStack;
 
+use super::quickcraft::{
+    QuickCraftClick, QuickCraftOutcome, QuickCraftState, QuickCraftStep,
+    quickcraft_distribution_count,
+};
 use crate::play::inventory::{
     PlayerInventory, apply_regular_pickup_slot, apply_regular_swap_slot, apply_regular_throw_slot,
     armor_entry_for_item, armor_slot_for_kind, can_place_in_player_slot, can_stack,
@@ -22,6 +26,7 @@ pub(in crate::play) struct CraftingTableWindow {
     pub(in crate::play) state_id: i32,
     pub(in crate::play) input: [ItemStack; 9],
     pub(in crate::play) result: ItemStack,
+    pub(in crate::play) quickcraft: QuickCraftState,
 }
 
 impl CraftingTableWindow {
@@ -31,6 +36,7 @@ impl CraftingTableWindow {
             state_id: 1,
             input: std::array::from_fn(|_| ItemStack::EMPTY),
             result: ItemStack::EMPTY,
+            quickcraft: QuickCraftState::default(),
         }
     }
 }
@@ -394,6 +400,91 @@ fn consume_inventory_crafting_ingredients(
 
 impl CraftingTableWindow {
     #[allow(clippy::too_many_arguments)]
+    pub(in crate::play) fn apply_quickcraft_click(
+        &mut self,
+        items: &ItemRegistry,
+        item_facts: &ItemFactsTable,
+        inventory: &mut PlayerInventory,
+        carried_item: &mut ItemStack,
+        click: QuickCraftClick,
+        tags: &TagsData,
+        recipes: &[Recipe],
+    ) -> QuickCraftOutcome {
+        match self.quickcraft.advance(carried_item.is_empty(), click) {
+            QuickCraftStep::Started => QuickCraftOutcome::Pending,
+            QuickCraftStep::Continued { slot } => {
+                if let Some(slot) = slot
+                    && (1..=9).contains(&slot)
+                    && can_place_in_crafting_menu_slot(items, slot, carried_item)
+                    && crafting_menu_stack(self, inventory, slot).is_some_and(|stack| {
+                        (stack.is_empty() || can_stack(&stack, carried_item))
+                            && stack.count < item_max_stack(item_facts, items, carried_item)
+                    })
+                    && carried_item.count > self.quickcraft.selected_slot_count() as i32
+                {
+                    self.quickcraft.add_slot(slot);
+                }
+                QuickCraftOutcome::Pending
+            }
+            QuickCraftStep::Finished => {
+                let quickcraft = self.quickcraft.finish();
+                let kind = quickcraft.kind;
+                let slots = quickcraft.slots;
+                if slots.is_empty() {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let source = carried_item.clone();
+                if source.count < slots.len() as i32 {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let place_count = quickcraft_distribution_count(source.count, slots.len(), kind);
+                if place_count <= 0 {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let max_stack = item_max_stack(item_facts, items, &source);
+                let mut remaining = source.count;
+                let mut changed = false;
+                for slot in slots {
+                    let Some(current_stack) = crafting_menu_stack(self, inventory, slot) else {
+                        continue;
+                    };
+                    if !(1..=9).contains(&slot)
+                        || !can_place_in_crafting_menu_slot(items, slot, &source)
+                        || !(current_stack.is_empty() || can_stack(&current_stack, &source))
+                    {
+                        continue;
+                    }
+                    let current = current_stack.count.max(0);
+                    let new_count = (current + place_count).min(max_stack);
+                    let moved = new_count - current;
+                    if moved <= 0 {
+                        continue;
+                    }
+                    let mut placed = source.clone();
+                    placed.count = new_count;
+                    if set_crafting_menu_stack(self, inventory, slot, placed) {
+                        remaining -= moved;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let mut remaining_stack = source;
+                remaining_stack.count = remaining;
+                *carried_item = if remaining <= 0 {
+                    ItemStack::EMPTY
+                } else {
+                    remaining_stack
+                };
+                refresh_crafting_result(items, item_facts, tags, recipes, self);
+                QuickCraftOutcome::Changed
+            }
+            QuickCraftStep::Rejected => QuickCraftOutcome::Rejected,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::play) fn apply_pickup_click(
         &mut self,
         items: &ItemRegistry,
@@ -588,6 +679,87 @@ impl CraftingTableWindow {
 
 impl PlayerInventory {
     #[allow(clippy::too_many_arguments)]
+    pub(in crate::play) fn apply_crafting_quickcraft_click(
+        &mut self,
+        items: &ItemRegistry,
+        item_facts: &ItemFactsTable,
+        carried_item: &mut ItemStack,
+        quickcraft: &mut QuickCraftState,
+        click: QuickCraftClick,
+        tags: &TagsData,
+        recipes: &[Recipe],
+    ) -> QuickCraftOutcome {
+        match quickcraft.advance(carried_item.is_empty(), click) {
+            QuickCraftStep::Started => QuickCraftOutcome::Pending,
+            QuickCraftStep::Continued { slot } => {
+                if let Some(slot) = slot
+                    && slot > 0
+                    && slot < self.slots.len()
+                    && can_place_in_player_slot(items, slot, carried_item)
+                    && (self.slots[slot].is_empty() || can_stack(&self.slots[slot], carried_item))
+                    && self.slots[slot].count < item_max_stack(item_facts, items, carried_item)
+                    && carried_item.count > quickcraft.selected_slot_count() as i32
+                {
+                    quickcraft.add_slot(slot);
+                }
+                QuickCraftOutcome::Pending
+            }
+            QuickCraftStep::Finished => {
+                let quickcraft = quickcraft.finish();
+                let kind = quickcraft.kind;
+                let slots = quickcraft.slots;
+                if slots.is_empty() {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let source = carried_item.clone();
+                if source.count < slots.len() as i32 {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let place_count = quickcraft_distribution_count(source.count, slots.len(), kind);
+                if place_count <= 0 {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let max_stack = item_max_stack(item_facts, items, &source);
+                let mut remaining = source.count;
+                let mut changed = false;
+                for slot in slots {
+                    if slot == 0
+                        || slot >= self.slots.len()
+                        || !can_place_in_player_slot(items, slot, &source)
+                        || !(self.slots[slot].is_empty() || can_stack(&self.slots[slot], &source))
+                    {
+                        continue;
+                    }
+                    let current = self.slots[slot].count.max(0);
+                    let new_count = (current + place_count).min(max_stack);
+                    let moved = new_count - current;
+                    if moved <= 0 {
+                        continue;
+                    }
+                    let mut placed = source.clone();
+                    placed.count = new_count;
+                    self.slots[slot] = placed;
+                    remaining -= moved;
+                    changed = true;
+                }
+                if !changed {
+                    return QuickCraftOutcome::Rejected;
+                }
+                let mut remaining_stack = source;
+                remaining_stack.count = remaining;
+                *carried_item = if remaining <= 0 {
+                    ItemStack::EMPTY
+                } else {
+                    remaining_stack
+                };
+                refresh_inventory_crafting_result(items, item_facts, tags, recipes, self);
+                QuickCraftOutcome::Changed
+            }
+            QuickCraftStep::Rejected => QuickCraftOutcome::Rejected,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::play) fn apply_crafting_pickup_click(
         &mut self,
         items: &ItemRegistry,
@@ -772,167 +944,5 @@ impl PlayerInventory {
 }
 
 #[cfg(test)]
-mod tests {
-    use mc_data::Identifier;
-    use mc_data::item_components::{ItemFacts, ItemFactsTable};
-    use mc_data::items::{ItemRegistry, ItemReport};
-    use mc_data::tags::TagsData;
-    use mc_protocol::packets::play::ItemStack;
-
-    use super::{CraftingTableWindow, crafting_remainder_for_item, repair_item_crafting_result};
-    use crate::play::inventory::PlayerInventory;
-
-    #[test]
-    fn repair_combines_remaining_durability_and_five_percent_bonus() {
-        let item = Identifier::parse("minecraft:iron_pickaxe").unwrap();
-        let items = ItemRegistry::from_report(&[ItemReport {
-            id: item.clone(),
-            protocol_id: 42,
-        }]);
-        let facts = ItemFactsTable::from_entries([(
-            item,
-            ItemFacts {
-                max_damage: Some(100),
-                ..ItemFacts::default()
-            },
-        )]);
-        let mut input = std::array::from_fn(|_| ItemStack::EMPTY);
-        input[0] = ItemStack::new(42, 1).with_damage(80);
-        input[8] = ItemStack::new(42, 1).with_damage(80);
-
-        assert_eq!(
-            repair_item_crafting_result(&items, &facts, &input),
-            Some(ItemStack::new(42, 1).with_damage(55))
-        );
-    }
-
-    #[test]
-    fn inventory_result_quick_move_is_transactional_when_only_part_fits() {
-        let items = ItemRegistry::from_report(&[]);
-        let item_facts = ItemFactsTable::default();
-        let tags = TagsData::default();
-        let mut inventory = PlayerInventory::empty();
-        inventory.slots[0] = ItemStack::new(42, 4);
-        inventory.slots[1] = ItemStack::new(7, 1);
-        inventory.slots[9] = ItemStack::new(42, 62);
-        for slot in 10..=44 {
-            inventory.slots[slot] = ItemStack::new(99, 64);
-        }
-        let before = inventory.clone();
-
-        let (changed, discarded_remainders) =
-            inventory.apply_crafting_quick_move_click(&items, &item_facts, &tags, &[], 0);
-
-        assert!(!changed);
-        assert!(discarded_remainders.is_empty());
-        assert_eq!(inventory.slots, before.slots);
-    }
-
-    #[test]
-    fn crafting_table_result_pickup_consumes_the_matching_grid() {
-        let items = ItemRegistry::from_report(&[]);
-        let item_facts = ItemFactsTable::default();
-        let tags = TagsData::default();
-        let mut inventory = PlayerInventory::empty();
-        let mut carried_item = ItemStack::EMPTY;
-        let mut window = CraftingTableWindow::new(7);
-        window.input[0] = ItemStack::new(7, 1);
-        window.result = ItemStack::new(42, 4);
-
-        let (changed, discarded_remainders) = window.apply_pickup_click(
-            &items,
-            &item_facts,
-            &tags,
-            &[],
-            &mut inventory,
-            &mut carried_item,
-            0,
-            0,
-        );
-
-        assert!(changed);
-        assert!(discarded_remainders.is_empty());
-        assert_eq!(carried_item, ItemStack::new(42, 4));
-        assert!(window.input.iter().all(ItemStack::is_empty));
-        assert!(window.result.is_empty());
-    }
-
-    #[test]
-    fn filled_bucket_crafting_remainder_is_an_empty_bucket() {
-        let bucket = Identifier::parse("minecraft:bucket").unwrap();
-        let milk_bucket = Identifier::parse("minecraft:milk_bucket").unwrap();
-        let items = ItemRegistry::from_report(&[
-            ItemReport {
-                id: bucket,
-                protocol_id: 1,
-            },
-            ItemReport {
-                id: milk_bucket,
-                protocol_id: 2,
-            },
-        ]);
-
-        assert_eq!(
-            crafting_remainder_for_item(&items, 2),
-            Some(ItemStack::new(1, 1))
-        );
-    }
-
-    #[test]
-    fn crafting_table_player_quick_move_preserves_the_stack() {
-        let items = ItemRegistry::from_report(&[]);
-        let item_facts = ItemFactsTable::default();
-        let tags = TagsData::default();
-        let mut inventory = PlayerInventory::empty();
-        inventory.slots[9] = ItemStack::new(42, 3);
-        let mut window = CraftingTableWindow::new(7);
-
-        let (changed, discarded_remainders) =
-            window.apply_quick_move_click(&items, &item_facts, &tags, &[], &mut inventory, 10);
-
-        assert!(changed);
-        assert!(discarded_remainders.is_empty());
-        assert!(inventory.slots[9].is_empty());
-        assert_eq!(inventory.slots[36], ItemStack::new(42, 3));
-    }
-
-    #[test]
-    fn inventory_main_quick_move_keeps_hotbar_overflow_in_source_slot() {
-        let items = ItemRegistry::from_report(&[]);
-        let item_facts = ItemFactsTable::default();
-        let tags = TagsData::default();
-        let mut inventory = PlayerInventory::empty();
-        inventory.slots[9] = ItemStack::new(42, 3);
-        inventory.slots[36] = ItemStack::new(42, 63);
-        for slot in 37..=44 {
-            inventory.slots[slot] = ItemStack::new(99, 64);
-        }
-
-        let (changed, discarded_remainders) =
-            inventory.apply_crafting_quick_move_click(&items, &item_facts, &tags, &[], 9);
-
-        assert!(changed);
-        assert!(discarded_remainders.is_empty());
-        assert_eq!(inventory.slots[36], ItemStack::new(42, 64));
-        assert_eq!(inventory.slots[9], ItemStack::new(42, 2));
-        assert!(inventory.slots[10].is_empty());
-    }
-
-    #[test]
-    fn crafting_table_grid_quick_move_returns_input_to_inventory() {
-        let items = ItemRegistry::from_report(&[]);
-        let item_facts = ItemFactsTable::default();
-        let tags = TagsData::default();
-        let mut inventory = PlayerInventory::empty();
-        let mut window = CraftingTableWindow::new(7);
-        window.input[0] = ItemStack::new(42, 3);
-
-        let (changed, discarded_remainders) =
-            window.apply_quick_move_click(&items, &item_facts, &tags, &[], &mut inventory, 1);
-
-        assert!(changed);
-        assert!(discarded_remainders.is_empty());
-        assert!(window.input[0].is_empty());
-        assert_eq!(inventory.slots[9], ItemStack::new(42, 3));
-    }
-}
+#[path = "crafting_tests.rs"]
+mod tests;

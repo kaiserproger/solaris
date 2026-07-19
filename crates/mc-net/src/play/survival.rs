@@ -154,17 +154,6 @@ pub(super) struct BlockMutationSnapshot {
     pub(super) token: mc_world::BlockMutationToken,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct PendingBreak {
-    pub(super) position: i64,
-    pub(super) direction: Direction,
-    pub(super) started_tick: u64,
-    pub(super) started_progress_per_tick: f32,
-    pub(super) held_hotbar_slot: u8,
-    pub(super) held_item: Option<ItemStack>,
-    pub(super) expected_target: Option<BlockMutationSnapshot>,
-}
-
 #[derive(Debug, Clone, Copy)]
 pub(super) enum UseKind {
     Food(mc_data::food::FoodEntry),
@@ -182,7 +171,6 @@ pub(super) struct PendingUse {
     pub(super) kind: UseKind,
 }
 
-const VANILLA_STOP_DESTROY_THRESHOLD: f32 = 0.7;
 const VANILLA_SUBMERGED_MINING_SPEED: f32 = 0.2;
 const FALLBACK_UNKNOWN_DESTROY_SPEED: f32 = 0.8;
 
@@ -195,17 +183,6 @@ pub(super) fn held_item_stack(state: &InteractionState) -> Option<&ItemStack> {
     (!held.is_empty()).then_some(held)
 }
 
-pub(super) fn pending_break_matches(
-    state: &InteractionState,
-    pending: &PendingBreak,
-    action: &ServerboundPlayerAction,
-) -> bool {
-    pending.position == action.position
-        && pending.direction == action.direction
-        && pending.held_hotbar_slot == state.selected_hotbar_slot
-        && pending.held_item.as_ref() == held_item_stack(state)
-}
-
 pub(super) fn mining_ticks(duration: Duration) -> u64 {
     let ticks = duration.as_nanos().div_ceil(ENTITY_TICK_PERIOD.as_nanos());
     u64::try_from(ticks).unwrap_or(u64::MAX).max(1)
@@ -213,17 +190,6 @@ pub(super) fn mining_ticks(duration: Duration) -> u64 {
 
 pub(super) fn item_use_ticks(duration: Duration) -> u64 {
     mining_ticks(duration)
-}
-
-pub(super) fn pending_break_is_complete(
-    pending: &PendingBreak,
-    current_tick: u64,
-    progress_per_tick: f32,
-) -> bool {
-    let elapsed_with_start = current_tick
-        .saturating_sub(pending.started_tick)
-        .saturating_add(1);
-    progress_per_tick * elapsed_with_start as f32 >= VANILLA_STOP_DESTROY_THRESHOLD
 }
 
 fn fallback_mining_facts(block_path: &str) -> mc_data::block_mining::BlockMiningFacts {
@@ -1065,22 +1031,6 @@ mod tests {
         assert_eq!(mining_ticks(Duration::from_millis(50)), 1);
         assert_eq!(mining_ticks(Duration::from_millis(51)), 2);
         assert_eq!(mining_ticks(Duration::from_millis(1_600)), 32);
-    }
-
-    #[test]
-    fn pending_break_completion_uses_simulation_ticks() {
-        let pending = PendingBreak {
-            position: 0,
-            direction: Direction::Up,
-            started_tick: 10,
-            started_progress_per_tick: 0.2,
-            held_hotbar_slot: 0,
-            held_item: None,
-            expected_target: None,
-        };
-
-        assert!(!pending_break_is_complete(&pending, 12, 0.2));
-        assert!(pending_break_is_complete(&pending, 13, 0.2));
     }
 
     #[test]
