@@ -37,7 +37,15 @@ if [[ ! -x "$JAVA" ]]; then
 fi
 
 RUN_DIR="$(mktemp -d)"
-trap 'rm -rf "$RUN_DIR"' EXIT
+PID=""
+cleanup() {
+  if [[ -n "$PID" ]] && kill -0 "$PID" 2>/dev/null; then
+    kill -KILL "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+  fi
+  rm -rf "$RUN_DIR"
+}
+trap cleanup EXIT
 
 echo "[1/4] Preparing run dir at $RUN_DIR …"
 echo "eula=true" > "$RUN_DIR/eula.txt"
@@ -64,72 +72,86 @@ if [[ -n "${REGION_FILE_COMPRESSION:-}" ]]; then
   printf 'region-file-compression=%s\n' "$REGION_FILE_COMPRESSION" >> "$RUN_DIR/server.properties"
 fi
 
-echo "[2/4] Starting server, waiting for save → SIGINT → kill …"
+echo "[2/4] Starting server and waiting for listener readiness …"
 LOG="$RUN_DIR/server.log"
 WORLD="$RUN_DIR/world"
 # In 26.1 the Overworld lives under dimensions/minecraft/overworld/.
 # (Pre-1.20-ish layouts had region/ at world/region/.)
 REGION_DIR="$WORLD/dimensions/minecraft/overworld/region"
 REGION_FILE="$REGION_DIR/r.0.0.mca"
-(
+coproc VANILLA_SERVER {
   cd "$RUN_DIR"
-  "$JAVA" -Xmx512M -jar "$BUNDLE_JAR" --nogui >"$LOG" 2>&1 &
-  echo $! > server.pid
-)
-PID="$(cat "$RUN_DIR/server.pid")"
+  exec "$JAVA" -Xmx512M -jar "$BUNDLE_JAR" --nogui 2>&1
+}
+PID="$VANILLA_SERVER_PID"
+SERVER_OUTPUT_FD="${VANILLA_SERVER[0]}"
 
-# Wait up to 90 s for spawn save: the server runs synchronously
-# through worldgen of the spawn chunks before the "Done" line, but
-# it doesn't flush region files until shortly after. As soon as
-# the "Done" line lands, ask it to save and stop.
+# Read the process pipe directly. Each log line wakes this loop; the timeout
+# only fails a server that stops producing readiness evidence.
 done_seen=0
-for _ in $(seq 1 90); do
-  if grep -q 'Done (' "$LOG" 2>/dev/null; then
-    done_seen=1
-    echo "[3/4] Server up; sending SIGINT (graceful save) …"
-    kill -INT "$PID" || true
+while true; do
+  if IFS= read -r -t 90 line <&"$SERVER_OUTPUT_FD"; then
+    printf '%s\n' "$line" >> "$LOG"
+    if [[ "$line" == *'Done ('* ]]; then
+      done_seen=1
+      echo "[3/4] Server up; sending SIGINT for graceful save …"
+      kill -INT "$PID"
+      break
+    fi
+  else
+    read_status=$?
+    if [[ $read_status -gt 128 ]]; then
+      echo "error: timed out waiting for the next server readiness event" >&2
+    else
+      echo "error: server output closed before readiness" >&2
+    fi
     break
   fi
-  sleep 1
 done
 if [[ $done_seen -eq 0 ]]; then
   echo "error: server never printed 'Done ('; tail of log:" >&2
   tail -30 "$LOG" >&2
   kill -KILL "$PID" 2>/dev/null || true
+  wait "$PID" 2>/dev/null || true
+  PID=""
   exit 1
 fi
 
-# Poll for the region file to appear and be non-empty, up to 60 s.
-# As soon as we see it stop growing for 2 s we're done.
-last_size=0
-stable_for=0
-for _ in $(seq 1 60); do
-  if [[ -f "$REGION_FILE" ]]; then
-    cur_size="$(stat -c %s "$REGION_FILE")"
-    if [[ "$cur_size" -gt 0 && "$cur_size" -eq "$last_size" ]]; then
-      stable_for=$((stable_for + 1))
-      if [[ $stable_for -ge 2 ]]; then
-        break
-      fi
-    else
-      stable_for=0
-    fi
-    last_size="$cur_size"
+# Continue draining the exact process output until EOF. A timeout only kills
+# a shutdown that is stuck; elapsed time is never treated as successful save.
+while true; do
+  if IFS= read -r -t 60 line <&"$SERVER_OUTPUT_FD"; then
+    printf '%s\n' "$line" >> "$LOG"
+    continue
   fi
-  sleep 1
+  read_status=$?
+  if [[ $read_status -gt 128 ]]; then
+    echo "error: server did not close its output after SIGINT; tail of log:" >&2
+    tail -30 "$LOG" >&2
+    kill -KILL "$PID" 2>/dev/null || true
+    wait "$PID" 2>/dev/null || true
+    PID=""
+    exit 1
+  fi
+  break
 done
 
-if [[ ! -s "$REGION_FILE" ]]; then
-  echo "error: $REGION_FILE not produced; tail of server log:" >&2
+set +e
+wait "$PID"
+server_status=$?
+set -e
+PID=""
+if [[ $server_status -ne 0 && $server_status -ne 130 ]]; then
+  echo "error: server exited unexpectedly with status $server_status; tail of log:" >&2
   tail -30 "$LOG" >&2
-  kill -KILL "$PID" 2>/dev/null || true
   exit 1
 fi
 
-# Kill the server immediately — we have what we need.
-kill -KILL "$PID" 2>/dev/null || true
-# Give the OS a moment to flush file descriptors.
-sleep 1
+if [[ ! -s "$REGION_FILE" ]]; then
+  echo "error: $REGION_FILE not produced by graceful save; tail of server log:" >&2
+  tail -30 "$LOG" >&2
+  exit 1
+fi
 
 echo "[4/4] Copying world to $OUT_DIR …"
 mkdir -p "$OUT_DIR"

@@ -11,6 +11,7 @@ use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_cha
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
+use tokio::sync::Notify;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -63,6 +64,304 @@ impl ExtensionApiVersion {
 
 pub const fn supports_extension_api_version(requested: ExtensionApiVersion) -> bool {
     requested.is_supported_by(EXTENSION_API_VERSION)
+}
+
+const MAX_BRIDGE_ID_LEN: usize = 64;
+const MAX_NAMESPACED_ID_LEN: usize = 128;
+
+/// Client-mod bridge capabilities requested during extension handshakes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ClientBridgeManifest {
+    bridge_id: String,
+    requested_extension_api_version: ExtensionApiVersion,
+    protocol_families: Vec<BridgeProtocolFamilySchemas>,
+    custom_payload_channels: Vec<String>,
+}
+
+impl ClientBridgeManifest {
+    /// Create a manifest for a client bridge and its supported protocol schemas.
+    pub fn new(
+        bridge_id: impl Into<String>,
+        requested_extension_api_version: ExtensionApiVersion,
+        protocol_families: impl IntoIterator<Item = BridgeProtocolFamilySchemas>,
+    ) -> Self {
+        Self {
+            bridge_id: bridge_id.into(),
+            requested_extension_api_version,
+            protocol_families: protocol_families.into_iter().collect(),
+            custom_payload_channels: Vec::new(),
+        }
+    }
+
+    /// Replace the optional custom payload channel declaration.
+    pub fn with_custom_payload_channels(
+        mut self,
+        channels: impl IntoIterator<Item = String>,
+    ) -> Self {
+        self.custom_payload_channels = channels.into_iter().collect();
+        self
+    }
+
+    pub fn bridge_id(&self) -> &str {
+        &self.bridge_id
+    }
+
+    pub const fn requested_extension_api_version(&self) -> ExtensionApiVersion {
+        self.requested_extension_api_version
+    }
+
+    pub fn protocol_families(&self) -> &[BridgeProtocolFamilySchemas] {
+        &self.protocol_families
+    }
+
+    pub fn custom_payload_channels(&self) -> &[String] {
+        &self.custom_payload_channels
+    }
+
+    /// Validate this manifest into a canonical, migration-friendly DTO.
+    pub fn validate(&self) -> Result<ValidatedClientBridgeManifest, ClientBridgeManifestError> {
+        if !is_valid_bridge_id(&self.bridge_id) {
+            return Err(ClientBridgeManifestError::InvalidBridgeId {
+                bridge_id: self.bridge_id.clone(),
+            });
+        }
+
+        if !supports_extension_api_version(self.requested_extension_api_version) {
+            return Err(ClientBridgeManifestError::UnsupportedExtensionApiVersion {
+                requested: self.requested_extension_api_version,
+                supported: EXTENSION_API_VERSION,
+            });
+        }
+
+        let mut validated_families = Vec::with_capacity(self.protocol_families.len());
+        for family in &self.protocol_families {
+            let normalized_family = normalize_protocol_family(&family.family)?;
+            if validated_families
+                .iter()
+                .any(|existing: &ValidatedBridgeProtocolFamilySchemas| {
+                    existing.family == normalized_family
+                })
+            {
+                return Err(ClientBridgeManifestError::DuplicateProtocolFamily {
+                    family: normalized_family,
+                });
+            }
+            if family.schema_versions.is_empty() {
+                return Err(ClientBridgeManifestError::MissingSchemaVersions {
+                    family: normalized_family,
+                });
+            }
+
+            let mut schema_versions = Vec::with_capacity(family.schema_versions.len());
+            for version in &family.schema_versions {
+                if *version == 0 {
+                    return Err(ClientBridgeManifestError::InvalidSchemaVersion {
+                        family: normalized_family,
+                        version: *version,
+                    });
+                }
+                if schema_versions.contains(version) {
+                    return Err(ClientBridgeManifestError::DuplicateSchemaVersion {
+                        family: normalized_family,
+                        version: *version,
+                    });
+                }
+                schema_versions.push(*version);
+            }
+
+            validated_families.push(ValidatedBridgeProtocolFamilySchemas {
+                family: normalized_family,
+                schema_versions,
+            });
+        }
+
+        let mut custom_payload_channels = Vec::with_capacity(self.custom_payload_channels.len());
+        for channel in &self.custom_payload_channels {
+            if channel.contains('*') {
+                return Err(ClientBridgeManifestError::UnboundedCustomPayloadChannel {
+                    channel: channel.clone(),
+                });
+            }
+            if !is_valid_namespaced_id(channel) {
+                return Err(ClientBridgeManifestError::InvalidCustomPayloadChannel {
+                    channel: channel.clone(),
+                });
+            }
+            if custom_payload_channels.contains(channel) {
+                return Err(ClientBridgeManifestError::DuplicateCustomPayloadChannel {
+                    channel: channel.clone(),
+                });
+            }
+            custom_payload_channels.push(channel.clone());
+        }
+
+        Ok(ValidatedClientBridgeManifest {
+            bridge_id: self.bridge_id.clone(),
+            requested_extension_api_version: self.requested_extension_api_version,
+            protocol_families: validated_families,
+            custom_payload_channels,
+        })
+    }
+}
+
+/// Supported schema versions for one extension protocol family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BridgeProtocolFamilySchemas {
+    family: String,
+    schema_versions: Vec<u16>,
+}
+
+impl BridgeProtocolFamilySchemas {
+    pub fn new(family: impl Into<String>, schema_versions: impl IntoIterator<Item = u16>) -> Self {
+        Self {
+            family: family.into(),
+            schema_versions: schema_versions.into_iter().collect(),
+        }
+    }
+
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn schema_versions(&self) -> &[u16] {
+        &self.schema_versions
+    }
+}
+
+/// Validated client-mod bridge manifest with canonical protocol family ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidatedClientBridgeManifest {
+    bridge_id: String,
+    requested_extension_api_version: ExtensionApiVersion,
+    protocol_families: Vec<ValidatedBridgeProtocolFamilySchemas>,
+    custom_payload_channels: Vec<String>,
+}
+
+impl ValidatedClientBridgeManifest {
+    pub fn bridge_id(&self) -> &str {
+        &self.bridge_id
+    }
+
+    pub const fn requested_extension_api_version(&self) -> ExtensionApiVersion {
+        self.requested_extension_api_version
+    }
+
+    pub fn protocol_families(&self) -> &[ValidatedBridgeProtocolFamilySchemas] {
+        &self.protocol_families
+    }
+
+    pub fn custom_payload_channels(&self) -> &[String] {
+        &self.custom_payload_channels
+    }
+}
+
+/// Validated schema versions for one canonical extension protocol family.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ValidatedBridgeProtocolFamilySchemas {
+    family: String,
+    schema_versions: Vec<u16>,
+}
+
+impl ValidatedBridgeProtocolFamilySchemas {
+    pub fn family(&self) -> &str {
+        &self.family
+    }
+
+    pub fn schema_versions(&self) -> &[u16] {
+        &self.schema_versions
+    }
+}
+
+/// Reason a client bridge capability manifest failed validation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientBridgeManifestError {
+    InvalidBridgeId {
+        bridge_id: String,
+    },
+    UnsupportedExtensionApiVersion {
+        requested: ExtensionApiVersion,
+        supported: ExtensionApiVersion,
+    },
+    InvalidProtocolFamily {
+        family: String,
+    },
+    DuplicateProtocolFamily {
+        family: String,
+    },
+    MissingSchemaVersions {
+        family: String,
+    },
+    InvalidSchemaVersion {
+        family: String,
+        version: u16,
+    },
+    DuplicateSchemaVersion {
+        family: String,
+        version: u16,
+    },
+    InvalidCustomPayloadChannel {
+        channel: String,
+    },
+    DuplicateCustomPayloadChannel {
+        channel: String,
+    },
+    UnboundedCustomPayloadChannel {
+        channel: String,
+    },
+}
+
+fn normalize_protocol_family(family: &str) -> Result<String, ClientBridgeManifestError> {
+    let normalized = family.trim().to_ascii_lowercase();
+    if !is_valid_namespaced_id(&normalized) {
+        return Err(ClientBridgeManifestError::InvalidProtocolFamily {
+            family: family.to_owned(),
+        });
+    }
+    Ok(normalized)
+}
+
+fn is_valid_bridge_id(bridge_id: &str) -> bool {
+    if bridge_id.is_empty() || bridge_id.len() > MAX_BRIDGE_ID_LEN {
+        return false;
+    }
+
+    let bytes = bridge_id.as_bytes();
+    bytes
+        .first()
+        .is_some_and(|byte| is_ascii_lower_alnum(*byte))
+        && bytes.last().is_some_and(|byte| is_ascii_lower_alnum(*byte))
+        && bytes
+            .iter()
+            .all(|byte| is_ascii_lower_alnum(*byte) || matches!(*byte, b'.' | b'-' | b'_'))
+}
+
+fn is_valid_namespaced_id(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_NAMESPACED_ID_LEN {
+        return false;
+    }
+
+    let Some((namespace, path)) = value.split_once(':') else {
+        return false;
+    };
+    if namespace.is_empty() || path.is_empty() {
+        return false;
+    }
+
+    namespace
+        .bytes()
+        .all(|byte| is_ascii_lower_alnum(byte) || matches!(byte, b'.' | b'-' | b'_'))
+        && path
+            .bytes()
+            .all(|byte| is_ascii_lower_alnum(byte) || matches!(byte, b'.' | b'-' | b'_' | b'/'))
+}
+
+fn is_ascii_lower_alnum(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit()
 }
 
 /// Stable player/session identifier snapshot for extension DTOs.
@@ -252,13 +551,18 @@ impl From<TryRecvError> for QueueRecvError {
 #[derive(Debug, Clone)]
 pub struct ExtensionBoundary {
     event_tx: SyncSender<InboundEvent>,
+    event_ready: Arc<Notify>,
     command_rx: Arc<Mutex<Receiver<OutboundCommand>>>,
+    command_ready: Arc<Notify>,
 }
 
 impl ExtensionBoundary {
     /// Try to enqueue one inbound event without blocking server tasks.
     pub fn try_enqueue_event(&self, event: InboundEvent) -> Result<(), QueueError<InboundEvent>> {
-        self.event_tx.try_send(event).map_err(QueueError::from)
+        self.event_tx
+            .try_send(event)
+            .map(|()| self.event_ready.notify_one())
+            .map_err(QueueError::from)
     }
 
     /// Try to receive one outbound command emitted by the extension side.
@@ -269,19 +573,53 @@ impl ExtensionBoundary {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         command_rx.try_recv().map_err(QueueRecvError::from)
     }
+
+    /// Wait for one outbound command without polling the queue.
+    pub async fn recv_command(&self) -> Result<OutboundCommand, QueueRecvError> {
+        loop {
+            let command_ready = self.command_ready.notified();
+            match self.try_recv_command() {
+                Err(QueueRecvError::Empty) => command_ready.await,
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Drop for ExtensionBoundary {
+    fn drop(&mut self) {
+        self.event_ready.notify_one();
+    }
 }
 
 /// Extension-host side of the boundary.
 #[derive(Debug)]
 pub struct ExtensionEndpoint {
-    event_rx: Receiver<InboundEvent>,
+    event_rx: Arc<Mutex<Receiver<InboundEvent>>>,
+    event_ready: Arc<Notify>,
     command_tx: SyncSender<OutboundCommand>,
+    command_ready: Arc<Notify>,
 }
 
 impl ExtensionEndpoint {
     /// Try to receive one inbound event snapshot without blocking.
     pub fn try_recv_event(&self) -> Result<InboundEvent, QueueRecvError> {
-        self.event_rx.try_recv().map_err(QueueRecvError::from)
+        let event_rx = self
+            .event_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        event_rx.try_recv().map_err(QueueRecvError::from)
+    }
+
+    /// Wait for one inbound event without polling the queue.
+    pub async fn recv_event(&self) -> Result<InboundEvent, QueueRecvError> {
+        loop {
+            let event_ready = self.event_ready.notified();
+            match self.try_recv_event() {
+                Err(QueueRecvError::Empty) => event_ready.await,
+                result => return result,
+            }
+        }
     }
 
     /// Try to submit one outbound command without blocking extension workers.
@@ -289,7 +627,16 @@ impl ExtensionEndpoint {
         &self,
         command: OutboundCommand,
     ) -> Result<(), QueueError<OutboundCommand>> {
-        self.command_tx.try_send(command).map_err(QueueError::from)
+        self.command_tx
+            .try_send(command)
+            .map(|()| self.command_ready.notify_one())
+            .map_err(QueueError::from)
+    }
+}
+
+impl Drop for ExtensionEndpoint {
+    fn drop(&mut self) {
+        self.command_ready.notify_one();
     }
 }
 
@@ -300,15 +647,21 @@ pub fn boundary_pair(
 ) -> (ExtensionBoundary, ExtensionEndpoint) {
     let (event_tx, event_rx) = sync_channel(event_capacity.get());
     let (command_tx, command_rx) = sync_channel(command_capacity.get());
+    let event_ready = Arc::new(Notify::new());
+    let command_ready = Arc::new(Notify::new());
 
     (
         ExtensionBoundary {
             event_tx,
+            event_ready: Arc::clone(&event_ready),
             command_rx: Arc::new(Mutex::new(command_rx)),
+            command_ready: Arc::clone(&command_ready),
         },
         ExtensionEndpoint {
-            event_rx,
+            event_rx: Arc::new(Mutex::new(event_rx)),
+            event_ready,
             command_tx,
+            command_ready,
         },
     )
 }
@@ -392,6 +745,87 @@ mod tests {
         assert_eq!(boundary.try_recv_command(), Err(QueueRecvError::Empty));
     }
 
+    #[tokio::test]
+    async fn recv_command_wakes_when_endpoint_submits_command() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let expected = OutboundCommand::DisconnectPlayer {
+            player_id: PlayerId::new(9),
+            reason: "event-driven".to_owned(),
+        };
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            boundary.recv_command().await
+        });
+        started_rx.await.unwrap();
+
+        endpoint.try_submit_command(expected.clone()).unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("submitted command must wake receiver")
+            .unwrap();
+        assert_eq!(received, Ok(expected));
+    }
+
+    #[tokio::test]
+    async fn recv_command_wakes_when_endpoint_closes() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            boundary.recv_command().await
+        });
+        started_rx.await.unwrap();
+
+        drop(endpoint);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("closed command channel must wake receiver")
+            .unwrap();
+        assert_eq!(received, Err(QueueRecvError::Closed));
+    }
+
+    #[tokio::test]
+    async fn recv_event_wakes_when_boundary_enqueues_event() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let expected = joined("event-driven");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            endpoint.recv_event().await
+        });
+        started_rx.await.unwrap();
+
+        boundary.try_enqueue_event(expected.clone()).unwrap();
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("enqueued event must wake receiver")
+            .unwrap();
+        assert_eq!(received, Ok(expected));
+    }
+
+    #[tokio::test]
+    async fn recv_event_wakes_when_boundary_closes() {
+        let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            endpoint.recv_event().await
+        });
+        started_rx.await.unwrap();
+
+        drop(boundary);
+
+        let received = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("closed event channel must wake receiver")
+            .unwrap();
+        assert_eq!(received, Err(QueueRecvError::Closed));
+    }
+
     #[test]
     fn closed_extension_queue_maps_to_api_owned_closed_error() {
         let (boundary, endpoint) = boundary_pair(nonzero(1), nonzero(1));
@@ -473,5 +907,164 @@ mod tests {
         assert!(!supports_extension_api_version(ExtensionApiVersion::new(
             1, 0, 0
         )));
+    }
+
+    #[test]
+    fn client_bridge_manifest_validates_and_normalizes_protocol_families() {
+        let manifest = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [BridgeProtocolFamilySchemas::new(" Solaris:Loader ", [2, 1])],
+        )
+        .with_custom_payload_channels(["solaris:hello".to_owned(), "minecraft:brand".to_owned()]);
+
+        let validated = manifest.validate().unwrap();
+
+        assert_eq!(validated.bridge_id(), "solaris-client");
+        assert_eq!(
+            validated.requested_extension_api_version(),
+            EXTENSION_API_VERSION
+        );
+        assert_eq!(validated.protocol_families().len(), 1);
+        assert_eq!(validated.protocol_families()[0].family(), "solaris:loader");
+        assert_eq!(validated.protocol_families()[0].schema_versions(), &[2, 1]);
+        assert_eq!(
+            validated.custom_payload_channels(),
+            &["solaris:hello".to_owned(), "minecraft:brand".to_owned()]
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_invalid_bridge_id_and_api_version() {
+        let invalid_id = ClientBridgeManifest::new("Solaris Client", EXTENSION_API_VERSION, []);
+        assert_eq!(
+            invalid_id.validate(),
+            Err(ClientBridgeManifestError::InvalidBridgeId {
+                bridge_id: "Solaris Client".to_owned()
+            })
+        );
+
+        let unsupported_api = ClientBridgeManifest::new(
+            "solaris-client",
+            ExtensionApiVersion::new(EXTENSION_API_VERSION.major() + 1, 0, 0),
+            [],
+        );
+        assert_eq!(
+            unsupported_api.validate(),
+            Err(ClientBridgeManifestError::UnsupportedExtensionApiVersion {
+                requested: ExtensionApiVersion::new(EXTENSION_API_VERSION.major() + 1, 0, 0),
+                supported: EXTENSION_API_VERSION,
+            })
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_duplicate_protocol_families_after_normalization() {
+        let manifest = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [
+                BridgeProtocolFamilySchemas::new("solaris:loader", [1]),
+                BridgeProtocolFamilySchemas::new(" SOLARIS:LOADER ", [2]),
+            ],
+        );
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ClientBridgeManifestError::DuplicateProtocolFamily {
+                family: "solaris:loader".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_invalid_protocol_family() {
+        let manifest = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [BridgeProtocolFamilySchemas::new("solaris loader", [1])],
+        );
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ClientBridgeManifestError::InvalidProtocolFamily {
+                family: "solaris loader".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_invalid_protocol_family_schema_versions() {
+        let empty_versions = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [BridgeProtocolFamilySchemas::new("solaris:loader", [])],
+        );
+        assert_eq!(
+            empty_versions.validate(),
+            Err(ClientBridgeManifestError::MissingSchemaVersions {
+                family: "solaris:loader".to_owned()
+            })
+        );
+
+        let zero_version = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [BridgeProtocolFamilySchemas::new("solaris:loader", [0])],
+        );
+        assert_eq!(
+            zero_version.validate(),
+            Err(ClientBridgeManifestError::InvalidSchemaVersion {
+                family: "solaris:loader".to_owned(),
+                version: 0,
+            })
+        );
+
+        let duplicate_version = ClientBridgeManifest::new(
+            "solaris-client",
+            EXTENSION_API_VERSION,
+            [BridgeProtocolFamilySchemas::new("solaris:loader", [1, 1])],
+        );
+        assert_eq!(
+            duplicate_version.validate(),
+            Err(ClientBridgeManifestError::DuplicateSchemaVersion {
+                family: "solaris:loader".to_owned(),
+                version: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_duplicate_and_invalid_custom_payload_channels() {
+        let duplicate = ClientBridgeManifest::new("solaris-client", EXTENSION_API_VERSION, [])
+            .with_custom_payload_channels(["solaris:hello".to_owned(), "solaris:hello".to_owned()]);
+        assert_eq!(
+            duplicate.validate(),
+            Err(ClientBridgeManifestError::DuplicateCustomPayloadChannel {
+                channel: "solaris:hello".to_owned()
+            })
+        );
+
+        let invalid = ClientBridgeManifest::new("solaris-client", EXTENSION_API_VERSION, [])
+            .with_custom_payload_channels(["Solaris:Hello".to_owned()]);
+        assert_eq!(
+            invalid.validate(),
+            Err(ClientBridgeManifestError::InvalidCustomPayloadChannel {
+                channel: "Solaris:Hello".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn client_bridge_manifest_rejects_unbounded_wildcard_custom_payload_channels() {
+        let manifest = ClientBridgeManifest::new("solaris-client", EXTENSION_API_VERSION, [])
+            .with_custom_payload_channels(["solaris:*".to_owned()]);
+
+        assert_eq!(
+            manifest.validate(),
+            Err(ClientBridgeManifestError::UnboundedCustomPayloadChannel {
+                channel: "solaris:*".to_owned()
+            })
+        );
     }
 }

@@ -291,11 +291,11 @@ impl CustomPayload {
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         match self {
             Self::Brand(brand) => {
-                buf.write_identifier(Self::brand_channel());
+                buf.write_identifier(Self::brand_channel())?;
                 buf.write_string(brand, DEFAULT_MAX_STRING_LEN)?;
             }
             Self::Unknown { channel, payload } => {
-                buf.write_identifier(channel);
+                buf.write_identifier(channel)?;
                 buf.put_slice(payload);
             }
         }

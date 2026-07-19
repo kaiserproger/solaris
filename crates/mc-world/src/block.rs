@@ -26,6 +26,7 @@ pub struct BlockStateId(pub u32);
 #[derive(Debug)]
 pub struct Block {
     pub id: Identifier,
+    pub raw_id: i32,
     pub properties: Vec<(String, Vec<String>)>,
     pub default: BlockStateId,
     pub states: Vec<BlockStateId>,
@@ -64,6 +65,28 @@ impl BlockRegistry {
     /// every block declares exactly one default state.
     pub fn from_report(report: &[BlockReport]) -> Result<Self, RegistryError> {
         let total_states: usize = report.iter().map(|b| b.states.len()).sum();
+        let mut blocks_by_first_state: Vec<_> = report
+            .iter()
+            .filter_map(|block| {
+                block
+                    .states
+                    .iter()
+                    .map(|state| state.id)
+                    .min()
+                    .map(|first_state| (first_state, block.id.clone()))
+            })
+            .collect();
+        blocks_by_first_state.sort_by_key(|(first_state, _)| *first_state);
+        let raw_ids: HashMap<_, _> = blocks_by_first_state
+            .into_iter()
+            .enumerate()
+            .map(|(raw_id, (_, id))| {
+                (
+                    id,
+                    i32::try_from(raw_id).expect("block registry raw id fits i32"),
+                )
+            })
+            .collect();
         let mut by_id_pre: Vec<Option<Arc<BlockState>>> = (0..total_states).map(|_| None).collect();
         let mut by_name = HashMap::with_capacity(report.len());
         let mut by_key = HashMap::with_capacity(total_states);
@@ -86,6 +109,9 @@ impl BlockRegistry {
             let states: Vec<BlockStateId> = raw.states.iter().map(|s| BlockStateId(s.id)).collect();
             let block = Arc::new(Block {
                 id: raw.id.clone(),
+                raw_id: *raw_ids
+                    .get(&raw.id)
+                    .expect("block with a default state has a raw id"),
                 properties: schema.clone(),
                 default,
                 states: states.clone(),
@@ -258,6 +284,8 @@ mod tests {
         let air_id = Identifier::parse("minecraft:air").unwrap();
         assert_eq!(reg.block(&air_id).unwrap().default, BlockStateId(0));
         assert_eq!(reg.by_id(BlockStateId(0)).unwrap().block.id, air_id);
+        assert_eq!(reg.by_id(BlockStateId(0)).unwrap().block.raw_id, 0);
+        assert_eq!(reg.by_id(BlockStateId(1)).unwrap().block.raw_id, 1);
 
         let oak = Identifier::parse("minecraft:oak_log").unwrap();
         assert_eq!(

@@ -1,21 +1,86 @@
 //! # mc-script
 //!
-//! Safe script runtime contract primitives.
+//! Safe script runtime contracts and the built-in Lua plugin host.
 //!
-//! This crate intentionally does not embed Lua, WASM, or any other VM. It only
-//! defines the lock-free API shape a future script host can use: immutable event
-//! snapshots enter the runtime, and bounded command batches leave it. Runtime
-//! controls for fuel, memory, deadlines, and cooperative shutdown are modeled now
-//! so the eventual VM cannot grow an unbounded host-facing surface by default.
+//! Immutable event snapshots enter runtimes and bounded command batches leave
+//! them. The optional `lua-runtime` feature adds an isolated Lua VM per plugin on
+//! one dedicated host thread, with fixed memory and instruction limits.
 
+use std::collections::BTreeMap;
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use tokio::sync::{Mutex, mpsc};
+
+#[cfg(feature = "lua-runtime")]
+mod lua;
+
+#[cfg(feature = "lua-runtime")]
+pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Semantic version of the stable script API contract.
-pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 2, 0);
+pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 5, 0);
+
+/// First script API version that exposes allow-listed entity spawns.
+pub const ENTITY_SPAWN_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 5, 0);
+
+/// First script API version that exposes plugin-owned player commands.
+pub const PLAYER_COMMANDS_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 3, 0);
+
+/// First script API version that exposes operator-only plugin player commands.
+pub const OPERATOR_COMMANDS_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 4, 0);
+
+/// Maximum entity types one plugin may allow-list for spawning.
+pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
+
+/// Maximum byte length of a script-visible namespaced resource identifier.
+pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
+
+/// Maximum absolute horizontal coordinate accepted from Lua.
+pub const SCRIPT_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
+
+/// Maximum absolute vertical coordinate accepted from Lua.
+pub const SCRIPT_VERTICAL_COORDINATE_LIMIT: f64 = 20_000_000.0;
+
+/// Maximum byte length of one ASCII plugin player-command root.
+pub const MAX_PLAYER_COMMAND_ROOT_BYTES: usize = 64;
+
+/// Maximum number of active plugin player-command roots across the server.
+pub const MAX_PLAYER_COMMAND_ROOTS: usize = 128;
+
+/// Maximum command-tree nodes added by active plugin roots.
+pub const MAX_PLAYER_COMMAND_TREE_NODES: usize = MAX_PLAYER_COMMAND_ROOTS * 2;
+
+/// Player command roots reserved by Solaris' built-in command parser.
+pub const BUILT_IN_PLAYER_COMMAND_ROOTS: &[&str] = &[
+    "debug",
+    "defaultgamemode",
+    "gamemode",
+    "gamerule",
+    "give",
+    "kill",
+    "save-all",
+    "status",
+    "stop",
+    "summon",
+    "teleport",
+    "time",
+    "tp",
+];
+
+/// Result of admitting a player command to a plugin-owned root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PlayerCommandAdmission {
+    NotOwned,
+    Enqueued,
+    Dropped,
+    PermissionDenied,
+}
 
 /// Version requested by a script runtime or supported by the server host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -76,6 +141,140 @@ impl ScriptPlayerId {
     }
 }
 
+/// Validated immutable position carried by script commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ScriptPosition {
+    x_bits: u64,
+    y_bits: u64,
+    z_bits: u64,
+}
+
+impl ScriptPosition {
+    #[must_use]
+    pub fn try_new(x: f64, y: f64, z: f64) -> Option<Self> {
+        (x.is_finite()
+            && y.is_finite()
+            && z.is_finite()
+            && x.abs() <= SCRIPT_HORIZONTAL_COORDINATE_LIMIT
+            && y.abs() <= SCRIPT_VERTICAL_COORDINATE_LIMIT
+            && z.abs() <= SCRIPT_HORIZONTAL_COORDINATE_LIMIT)
+            .then_some(Self {
+                x_bits: x.to_bits(),
+                y_bits: y.to_bits(),
+                z_bits: z.to_bits(),
+            })
+    }
+
+    #[must_use]
+    pub fn x(self) -> f64 {
+        f64::from_bits(self.x_bits)
+    }
+
+    #[must_use]
+    pub fn y(self) -> f64 {
+        f64::from_bits(self.y_bits)
+    }
+
+    #[must_use]
+    pub fn z(self) -> f64 {
+        f64::from_bits(self.z_bits)
+    }
+}
+
+/// Immutable server-authoritative player context attached to gameplay events.
+///
+/// This is a point-in-time value. It deliberately contains no connection or
+/// network-address data and cannot be used to query live server state. Legacy
+/// event constructors retain their signatures but carry unavailable context;
+/// callers must not treat missing values as server authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPlayerContext {
+    snapshot: Option<Box<ScriptPlayerContextSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ScriptPlayerContextSnapshot {
+    uuid: String,
+    username: String,
+    operator: bool,
+    x_bits: u64,
+    y_bits: u64,
+    z_bits: u64,
+}
+
+impl ScriptPlayerContext {
+    #[must_use]
+    pub fn new(
+        uuid: impl Into<String>,
+        username: impl Into<String>,
+        operator: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Self {
+        Self {
+            snapshot: Some(Box::new(ScriptPlayerContextSnapshot {
+                uuid: uuid.into(),
+                username: username.into(),
+                operator,
+                x_bits: x.to_bits(),
+                y_bits: y.to_bits(),
+                z_bits: z.to_bits(),
+            })),
+        }
+    }
+
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.snapshot.is_some()
+    }
+
+    #[must_use]
+    pub fn uuid(&self) -> Option<&str> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.uuid.as_str())
+    }
+
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| snapshot.username.as_str())
+    }
+
+    #[must_use]
+    pub fn operator(&self) -> Option<bool> {
+        self.snapshot.as_deref().map(|snapshot| snapshot.operator)
+    }
+
+    #[must_use]
+    pub fn x(&self) -> Option<f64> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| f64::from_bits(snapshot.x_bits))
+    }
+
+    #[must_use]
+    pub fn y(&self) -> Option<f64> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| f64::from_bits(snapshot.y_bits))
+    }
+
+    #[must_use]
+    pub fn z(&self) -> Option<f64> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| f64::from_bits(snapshot.z_bits))
+    }
+
+    fn unavailable() -> Self {
+        Self { snapshot: None }
+    }
+}
+
 /// Stable entity identifier snapshot for script-visible DTOs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -94,6 +293,7 @@ impl ScriptEntityId {
 /// Immutable inbound event snapshots visible to script runtimes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptEvent {
+    target_plugin_id: Option<String>,
     kind: ScriptEventKind,
 }
 
@@ -101,6 +301,7 @@ impl ScriptEvent {
     /// Build a server-started event snapshot.
     pub fn server_started() -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::ServerStarted,
         }
     }
@@ -108,6 +309,7 @@ impl ScriptEvent {
     /// Build a server-stopping event snapshot.
     pub fn server_stopping(reason: impl Into<String>) -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::ServerStopping {
                 reason: reason.into(),
             },
@@ -117,9 +319,29 @@ impl ScriptEvent {
     /// Build a player-joined event snapshot.
     pub fn player_joined(player_id: ScriptPlayerId, username: impl Into<String>) -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::PlayerJoined {
                 player_id,
                 username: username.into(),
+                context: ScriptPlayerContext::unavailable(),
+            },
+        }
+    }
+
+    /// Build a player-joined event snapshot with server-authoritative context.
+    pub fn player_joined_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+    ) -> Self {
+        Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerJoined {
+                player_id,
+                username: context
+                    .username()
+                    .expect("player context must include a verified username")
+                    .to_owned(),
+                context,
             },
         }
     }
@@ -127,6 +349,7 @@ impl ScriptEvent {
     /// Build a player-left event snapshot.
     pub fn player_left(player_id: ScriptPlayerId, reason: impl Into<String>) -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::PlayerLeft {
                 player_id,
                 reason: reason.into(),
@@ -136,10 +359,64 @@ impl ScriptEvent {
 
     /// Build a player-chat event snapshot.
     pub fn player_chat(player_id: ScriptPlayerId, message: impl Into<String>) -> Self {
+        Self::player_chat_with_context(player_id, message, ScriptPlayerContext::unavailable())
+    }
+
+    /// Build a player-chat event snapshot with server-authoritative context.
+    pub fn player_chat_with_context(
+        player_id: ScriptPlayerId,
+        message: impl Into<String>,
+        context: ScriptPlayerContext,
+    ) -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::PlayerChat {
                 player_id,
                 message: message.into(),
+                context,
+            },
+        }
+    }
+
+    /// Build a player command event targeted to the plugin that owns its root.
+    pub fn player_command(
+        target_plugin_id: impl Into<String>,
+        player_id: ScriptPlayerId,
+        username: impl Into<String>,
+        root: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            target_plugin_id: Some(target_plugin_id.into()),
+            kind: ScriptEventKind::PlayerCommand {
+                player_id,
+                username: username.into(),
+                root: root.into(),
+                arguments: arguments.into(),
+                context: ScriptPlayerContext::unavailable(),
+            },
+        }
+    }
+
+    /// Build a player command event with server-authoritative context.
+    pub fn player_command_with_context(
+        target_plugin_id: impl Into<String>,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        root: impl Into<String>,
+        arguments: impl Into<String>,
+    ) -> Self {
+        Self {
+            target_plugin_id: Some(target_plugin_id.into()),
+            kind: ScriptEventKind::PlayerCommand {
+                player_id,
+                username: context
+                    .username()
+                    .expect("player context must include a verified username")
+                    .to_owned(),
+                root: root.into(),
+                arguments: arguments.into(),
+                context,
             },
         }
     }
@@ -147,13 +424,32 @@ impl ScriptEvent {
     /// Build a server-tick event snapshot.
     pub fn server_tick(tick: u64) -> Self {
         Self {
+            target_plugin_id: None,
             kind: ScriptEventKind::ServerTick { tick },
         }
+    }
+
+    /// Return the plugin id for an event that must not be broadcast to other runtimes.
+    pub fn target_plugin_id(&self) -> Option<&str> {
+        self.target_plugin_id.as_deref()
     }
 
     /// Return the immutable event kind.
     pub fn kind(&self) -> &ScriptEventKind {
         &self.kind
+    }
+
+    /// Return the stable manifest subscription name for this event.
+    pub fn event_name(&self) -> &'static str {
+        match self.kind {
+            ScriptEventKind::ServerStarted => "server.started",
+            ScriptEventKind::ServerStopping { .. } => "server.stopping",
+            ScriptEventKind::PlayerJoined { .. } => "player.joined",
+            ScriptEventKind::PlayerLeft { .. } => "player.left",
+            ScriptEventKind::PlayerChat { .. } => "player.chat",
+            ScriptEventKind::PlayerCommand { .. } => "player.command",
+            ScriptEventKind::ServerTick { .. } => "server.tick",
+        }
     }
 }
 
@@ -168,6 +464,7 @@ pub enum ScriptEventKind {
     PlayerJoined {
         player_id: ScriptPlayerId,
         username: String,
+        context: ScriptPlayerContext,
     },
     PlayerLeft {
         player_id: ScriptPlayerId,
@@ -176,6 +473,14 @@ pub enum ScriptEventKind {
     PlayerChat {
         player_id: ScriptPlayerId,
         message: String,
+        context: ScriptPlayerContext,
+    },
+    PlayerCommand {
+        player_id: ScriptPlayerId,
+        username: String,
+        root: String,
+        arguments: String,
+        context: ScriptPlayerContext,
     },
     ServerTick {
         tick: u64,
@@ -200,6 +505,11 @@ pub enum ScriptCommand {
     RunConsoleCommand {
         command: String,
     },
+    SpawnEntity {
+        actor: ScriptPlayerId,
+        entity_type: String,
+        position: ScriptPosition,
+    },
 }
 
 impl ScriptCommand {
@@ -214,8 +524,329 @@ impl ScriptCommand {
                     root: console_command_root(command),
                 })
             }
+            Self::SpawnEntity { entity_type, .. } => {
+                Some(ScriptCommandCapability::SpawnEntityType {
+                    entity_type: entity_type.clone(),
+                })
+            }
         }
     }
+}
+
+/// Error returned when a bounded script queue cannot accept an item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptQueueError<T> {
+    Full(T),
+    Closed(T),
+}
+
+impl<T> From<mpsc::error::TrySendError<T>> for ScriptQueueError<T> {
+    fn from(error: mpsc::error::TrySendError<T>) -> Self {
+        match error {
+            mpsc::error::TrySendError::Full(item) => Self::Full(item),
+            mpsc::error::TrySendError::Closed(item) => Self::Closed(item),
+        }
+    }
+}
+
+/// Server-owned side of the script boundary.
+#[derive(Debug, Clone)]
+pub struct ScriptBoundary {
+    event_tx: mpsc::Sender<ScriptEvent>,
+    command_rx: Arc<Mutex<mpsc::Receiver<ScriptCommand>>>,
+    player_command_owners: PlayerCommandOwners,
+}
+
+impl ScriptBoundary {
+    /// Enqueue an immutable event without blocking a server task.
+    pub fn try_enqueue_event(
+        &self,
+        event: ScriptEvent,
+    ) -> Result<(), ScriptQueueError<ScriptEvent>> {
+        self.event_tx
+            .try_send(event)
+            .map_err(ScriptQueueError::from)
+    }
+
+    /// Return a sorted snapshot of currently active plugin command roots.
+    pub fn player_command_roots(&self) -> Vec<String> {
+        self.player_command_owners.roots(false)
+    }
+
+    /// Return a sorted snapshot of active operator-only plugin command roots.
+    pub fn operator_command_roots(&self) -> Vec<String> {
+        self.player_command_owners.roots(true)
+    }
+
+    /// Route a raw player command to its active plugin owner without blocking.
+    ///
+    /// `Ok(false)` means no plugin owns the root. Queue errors retain the event
+    /// so the caller can apply the existing full/closed backpressure policy.
+    pub fn try_enqueue_player_command(
+        &self,
+        player_id: ScriptPlayerId,
+        username: impl Into<String>,
+        raw: &str,
+    ) -> Result<bool, ScriptQueueError<ScriptEvent>> {
+        match self.try_enqueue_player_command_with_operator(player_id, username, raw, false)? {
+            PlayerCommandAdmission::Enqueued => Ok(true),
+            PlayerCommandAdmission::NotOwned
+            | PlayerCommandAdmission::Dropped
+            | PlayerCommandAdmission::PermissionDenied => Ok(false),
+        }
+    }
+
+    /// Route a raw player command through the legacy compatibility API.
+    ///
+    /// The boolean argument is retained for source compatibility but is not
+    /// authoritative. Operator-only roots always report denial before the bounded
+    /// event queue; callers must use `try_enqueue_player_command_with_context`
+    /// with a verified server context to authorize them.
+    pub fn try_enqueue_player_command_with_operator(
+        &self,
+        player_id: ScriptPlayerId,
+        username: impl Into<String>,
+        raw: &str,
+        _is_operator: bool,
+    ) -> Result<PlayerCommandAdmission, ScriptQueueError<ScriptEvent>> {
+        let Some((root, arguments)) = split_player_command(raw) else {
+            return Ok(PlayerCommandAdmission::NotOwned);
+        };
+        let Some(owner) = self.player_command_owners.owner(root) else {
+            return Ok(PlayerCommandAdmission::NotOwned);
+        };
+        if owner.operator_only {
+            return Ok(PlayerCommandAdmission::PermissionDenied);
+        }
+        let event =
+            ScriptEvent::player_command(owner.plugin_id, player_id, username, root, arguments);
+        match self.try_enqueue_event(event) {
+            Ok(()) => Ok(PlayerCommandAdmission::Enqueued),
+            Err(error @ ScriptQueueError::Full(_)) => Err(error),
+            Err(error @ ScriptQueueError::Closed(_)) => {
+                self.player_command_owners.clear();
+                Err(error)
+            }
+        }
+    }
+
+    /// Route a raw player command with the immutable context observed by the server.
+    ///
+    /// Permission is checked before the bounded event queue so an operator-only
+    /// root always reports denial instead of inheriting queue backpressure.
+    pub fn try_enqueue_player_command_with_context(
+        &self,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        raw: &str,
+    ) -> Result<PlayerCommandAdmission, ScriptQueueError<ScriptEvent>> {
+        let Some((root, arguments)) = split_player_command(raw) else {
+            return Ok(PlayerCommandAdmission::NotOwned);
+        };
+        let Some(owner) = self.player_command_owners.owner(root) else {
+            return Ok(PlayerCommandAdmission::NotOwned);
+        };
+        if owner.operator_only && context.operator() != Some(true) {
+            return Ok(PlayerCommandAdmission::PermissionDenied);
+        };
+        let event = ScriptEvent::player_command_with_context(
+            owner.plugin_id,
+            player_id,
+            context,
+            root,
+            arguments,
+        );
+        match self.try_enqueue_event(event) {
+            Ok(()) => Ok(PlayerCommandAdmission::Enqueued),
+            Err(error @ ScriptQueueError::Full(_)) => Err(error),
+            Err(error @ ScriptQueueError::Closed(_)) => {
+                self.player_command_owners.clear();
+                Err(error)
+            }
+        }
+    }
+
+    /// Wait for the next command emitted by the script host.
+    pub async fn recv_command(&self) -> Option<ScriptCommand> {
+        self.command_rx.lock().await.recv().await
+    }
+}
+
+/// Script-host side of the bounded boundary.
+#[derive(Debug)]
+pub struct ScriptHostEndpoint {
+    event_rx: mpsc::Receiver<ScriptEvent>,
+    command_tx: mpsc::Sender<ScriptCommand>,
+    player_command_owners: PlayerCommandOwners,
+}
+
+impl ScriptHostEndpoint {
+    /// Wait asynchronously until an event arrives or the server side closes.
+    pub async fn recv_event(&mut self) -> Option<ScriptEvent> {
+        self.event_rx.recv().await
+    }
+
+    /// Block the dedicated host thread until an event arrives or the server side closes.
+    pub fn recv_event_blocking(&mut self) -> Option<ScriptEvent> {
+        self.event_rx.blocking_recv()
+    }
+
+    /// Submit a command without blocking the host thread.
+    pub fn try_submit_command(
+        &self,
+        command: ScriptCommand,
+    ) -> Result<(), ScriptQueueError<ScriptCommand>> {
+        self.command_tx
+            .try_send(command)
+            .map_err(ScriptQueueError::from)
+    }
+
+    /// Register the player command roots from one validated plugin manifest.
+    pub fn register_player_commands(
+        &self,
+        manifest: &ValidatedScriptPluginManifest,
+    ) -> Result<(), PlayerCommandRegistrationError> {
+        self.player_command_owners.register(
+            manifest.plugin_id(),
+            manifest.player_command_roots(),
+            manifest.operator_command_roots(),
+        )
+    }
+
+    /// Remove every active player command root owned by one plugin.
+    pub fn unregister_player_commands(&self, plugin_id: &str) {
+        self.player_command_owners.unregister(plugin_id);
+    }
+}
+
+/// Error returned when active player-command roots cannot be registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PlayerCommandRegistrationError {
+    RootConflict {
+        root: String,
+        owner_plugin_id: String,
+    },
+    RootLimitExceeded {
+        limit: usize,
+        requested: usize,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+struct PlayerCommandOwners {
+    owners: Arc<RwLock<BTreeMap<String, PlayerCommandOwner>>>,
+}
+
+#[derive(Debug, Clone)]
+struct PlayerCommandOwner {
+    plugin_id: String,
+    operator_only: bool,
+}
+
+impl PlayerCommandOwners {
+    fn roots(&self, operator_only: bool) -> Vec<String> {
+        self.read()
+            .iter()
+            .filter(|(_, owner)| owner.operator_only == operator_only)
+            .map(|(root, _)| root.clone())
+            .collect()
+    }
+
+    fn owner(&self, root: &str) -> Option<PlayerCommandOwner> {
+        self.read().get(root).cloned()
+    }
+
+    fn register(
+        &self,
+        plugin_id: &str,
+        player_roots: &[String],
+        operator_roots: &[String],
+    ) -> Result<(), PlayerCommandRegistrationError> {
+        let mut owners = self.write();
+        let requested_roots = player_roots
+            .iter()
+            .chain(operator_roots)
+            .collect::<Vec<_>>();
+        let requested = owners.len().saturating_add(requested_roots.len());
+        if requested > MAX_PLAYER_COMMAND_ROOTS {
+            return Err(PlayerCommandRegistrationError::RootLimitExceeded {
+                limit: MAX_PLAYER_COMMAND_ROOTS,
+                requested,
+            });
+        }
+        if let Some((root, owner_plugin_id)) = requested_roots
+            .iter()
+            .find_map(|root| owners.get(*root).map(|owner| (root, &owner.plugin_id)))
+        {
+            return Err(PlayerCommandRegistrationError::RootConflict {
+                root: (*root).clone(),
+                owner_plugin_id: owner_plugin_id.clone(),
+            });
+        }
+        for root in player_roots {
+            owners.insert(
+                root.clone(),
+                PlayerCommandOwner {
+                    plugin_id: plugin_id.to_owned(),
+                    operator_only: false,
+                },
+            );
+        }
+        for root in operator_roots {
+            owners.insert(
+                root.clone(),
+                PlayerCommandOwner {
+                    plugin_id: plugin_id.to_owned(),
+                    operator_only: true,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn unregister(&self, plugin_id: &str) {
+        self.write().retain(|_, owner| owner.plugin_id != plugin_id);
+    }
+
+    fn clear(&self) {
+        self.write().clear();
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, PlayerCommandOwner>> {
+        self.owners
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, PlayerCommandOwner>> {
+        self.owners
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// Construct the bounded server/host script boundary.
+pub fn script_boundary_pair(
+    event_capacity: NonZeroUsize,
+    command_capacity: NonZeroUsize,
+) -> (ScriptBoundary, ScriptHostEndpoint) {
+    let (event_tx, event_rx) = mpsc::channel(event_capacity.get());
+    let (command_tx, command_rx) = mpsc::channel(command_capacity.get());
+    let player_command_owners = PlayerCommandOwners::default();
+    (
+        ScriptBoundary {
+            event_tx,
+            command_rx: Arc::new(Mutex::new(command_rx)),
+            player_command_owners: player_command_owners.clone(),
+        },
+        ScriptHostEndpoint {
+            event_rx,
+            command_tx,
+            player_command_owners,
+        },
+    )
 }
 
 /// Host capability required by privileged outbound script commands.
@@ -223,6 +854,69 @@ impl ScriptCommand {
 #[non_exhaustive]
 pub enum ScriptCommandCapability {
     RunConsoleCommandRoot { root: String },
+    SpawnEntityType { entity_type: String },
+}
+
+/// Declarative subscription to one Solaris script event name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ScriptEventSubscription {
+    event_name: String,
+}
+
+impl ScriptEventSubscription {
+    pub fn new(event_name: impl Into<String>) -> Self {
+        Self {
+            event_name: event_name.into(),
+        }
+    }
+
+    pub fn event_name(&self) -> &str {
+        &self.event_name
+    }
+}
+
+/// Plugin load phase hint for a future script loader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum ScriptPluginLoadPhase {
+    Startup,
+    #[default]
+    PostWorld,
+}
+
+/// Relationship between this plugin and another Solaris plugin id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptPluginDependencyRelation {
+    Required,
+    Optional,
+    LoadBefore,
+}
+
+/// Declarative dependency or load-order edge for a future script loader.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct ScriptPluginDependency {
+    plugin_id: String,
+    relation: ScriptPluginDependencyRelation,
+}
+
+impl ScriptPluginDependency {
+    pub fn new(plugin_id: impl Into<String>, relation: ScriptPluginDependencyRelation) -> Self {
+        Self {
+            plugin_id: plugin_id.into(),
+            relation,
+        }
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn relation(&self) -> ScriptPluginDependencyRelation {
+        self.relation
+    }
 }
 
 /// Plugin manifest contract consumed by a future server-side script loader.
@@ -233,7 +927,12 @@ pub struct ScriptPluginManifest {
     display_name: String,
     version: String,
     requested_api_version: ScriptApiVersion,
+    load_phase: ScriptPluginLoadPhase,
+    event_subscriptions: Vec<ScriptEventSubscription>,
+    dependencies: Vec<ScriptPluginDependency>,
     declared_command_capabilities: Vec<ScriptCommandCapability>,
+    player_command_roots: Vec<String>,
+    operator_command_roots: Vec<String>,
     declared_permissions: Vec<String>,
 }
 
@@ -250,15 +949,65 @@ impl ScriptPluginManifest {
             display_name: display_name.into(),
             version: version.into(),
             requested_api_version,
+            load_phase: ScriptPluginLoadPhase::default(),
+            event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
             declared_command_capabilities: Vec::new(),
+            player_command_roots: Vec::new(),
+            operator_command_roots: Vec::new(),
             declared_permissions: Vec::new(),
         }
+    }
+
+    /// Declare the preferred load phase for a future loader.
+    pub fn with_load_phase(mut self, load_phase: ScriptPluginLoadPhase) -> Self {
+        self.load_phase = load_phase;
+        self
+    }
+
+    /// Declare interest in one Solaris-native script event name.
+    pub fn subscribe_event(mut self, event_name: impl Into<String>) -> Self {
+        self.event_subscriptions
+            .push(ScriptEventSubscription::new(event_name));
+        self
+    }
+
+    /// Declare a plugin dependency or load-order edge.
+    pub fn declare_dependency(
+        mut self,
+        plugin_id: impl Into<String>,
+        relation: ScriptPluginDependencyRelation,
+    ) -> Self {
+        self.dependencies
+            .push(ScriptPluginDependency::new(plugin_id, relation));
+        self
     }
 
     /// Declare that this plugin requests access to a console command root.
     pub fn declare_console_command_root(mut self, root: impl Into<String>) -> Self {
         self.declared_command_capabilities
             .push(ScriptCommandCapability::RunConsoleCommandRoot { root: root.into() });
+        self
+    }
+
+    /// Declare one exact entity type this plugin may spawn.
+    pub fn declare_spawn_entity_type(mut self, entity_type: impl Into<String>) -> Self {
+        self.declared_command_capabilities
+            .push(ScriptCommandCapability::SpawnEntityType {
+                entity_type: entity_type.into(),
+            });
+        self
+    }
+
+    /// Declare a literal command root that players may invoke for this plugin.
+    pub fn declare_player_command_root(mut self, root: impl Into<String>) -> Self {
+        self.player_command_roots.push(root.into());
+        self
+    }
+
+    /// Declare a literal player command root that only operators may invoke.
+    pub fn declare_operator_command_root(mut self, root: impl Into<String>) -> Self {
+        self.operator_command_roots.push(root.into());
         self
     }
 
@@ -284,8 +1033,28 @@ impl ScriptPluginManifest {
         self.requested_api_version
     }
 
+    pub fn load_phase(&self) -> ScriptPluginLoadPhase {
+        self.load_phase
+    }
+
+    pub fn event_subscriptions(&self) -> &[ScriptEventSubscription] {
+        &self.event_subscriptions
+    }
+
+    pub fn dependencies(&self) -> &[ScriptPluginDependency] {
+        &self.dependencies
+    }
+
     pub fn declared_command_capabilities(&self) -> &[ScriptCommandCapability] {
         &self.declared_command_capabilities
+    }
+
+    pub fn player_command_roots(&self) -> &[String] {
+        &self.player_command_roots
+    }
+
+    pub fn operator_command_roots(&self) -> &[String] {
+        &self.operator_command_roots
     }
 
     pub fn declared_permissions(&self) -> &[String] {
@@ -294,6 +1063,10 @@ impl ScriptPluginManifest {
 
     /// Validate and normalize this manifest for trusted host-side use.
     pub fn validate(&self) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
+        if self.plugin_id.trim().is_empty() {
+            return Err(ScriptPluginManifestError::BlankPluginId);
+        }
+
         if !is_valid_plugin_id(&self.plugin_id) {
             return Err(ScriptPluginManifestError::InvalidPluginId {
                 plugin_id: self.plugin_id.clone(),
@@ -305,6 +1078,78 @@ impl ScriptPluginManifest {
                 requested: self.requested_api_version,
                 supported: SCRIPT_API_VERSION,
             });
+        }
+
+        if !self.player_command_roots.is_empty()
+            && self.requested_api_version < PLAYER_COMMANDS_API_VERSION
+        {
+            return Err(
+                ScriptPluginManifestError::PlayerCommandsRequireScriptApiVersion {
+                    requested: self.requested_api_version,
+                    minimum: PLAYER_COMMANDS_API_VERSION,
+                },
+            );
+        }
+        if !self.operator_command_roots.is_empty()
+            && self.requested_api_version < OPERATOR_COMMANDS_API_VERSION
+        {
+            return Err(
+                ScriptPluginManifestError::OperatorCommandsRequireScriptApiVersion {
+                    requested: self.requested_api_version,
+                    minimum: OPERATOR_COMMANDS_API_VERSION,
+                },
+            );
+        }
+        if self
+            .declared_command_capabilities
+            .iter()
+            .any(|capability| matches!(capability, ScriptCommandCapability::SpawnEntityType { .. }))
+            && self.requested_api_version < ENTITY_SPAWN_API_VERSION
+        {
+            return Err(
+                ScriptPluginManifestError::SpawnEntitiesRequireScriptApiVersion {
+                    requested: self.requested_api_version,
+                    minimum: ENTITY_SPAWN_API_VERSION,
+                },
+            );
+        }
+
+        let mut normalized_event_subscriptions = Vec::with_capacity(self.event_subscriptions.len());
+        for subscription in &self.event_subscriptions {
+            let event_name = normalize_event_name(subscription.event_name());
+            if !is_supported_event_name(&event_name) {
+                return Err(ScriptPluginManifestError::InvalidEventName { event_name });
+            }
+            if normalized_event_subscriptions.iter().any(
+                |subscription: &ScriptEventSubscription| subscription.event_name() == event_name,
+            ) {
+                return Err(ScriptPluginManifestError::DuplicateEventSubscription { event_name });
+            }
+            normalized_event_subscriptions.push(ScriptEventSubscription::new(event_name));
+        }
+
+        let mut normalized_dependencies = Vec::with_capacity(self.dependencies.len());
+        for dependency in &self.dependencies {
+            let plugin_id = normalize_plugin_id(dependency.plugin_id());
+            if plugin_id.is_empty() {
+                return Err(ScriptPluginManifestError::BlankDependencyPluginId);
+            }
+            if !is_valid_plugin_id(&plugin_id) {
+                return Err(ScriptPluginManifestError::InvalidDependencyPluginId { plugin_id });
+            }
+            if plugin_id == self.plugin_id {
+                return Err(ScriptPluginManifestError::SelfDependency { plugin_id });
+            }
+            if normalized_dependencies
+                .iter()
+                .any(|dependency: &ScriptPluginDependency| dependency.plugin_id() == plugin_id)
+            {
+                return Err(ScriptPluginManifestError::DuplicateDependency { plugin_id });
+            }
+            normalized_dependencies.push(ScriptPluginDependency::new(
+                plugin_id,
+                dependency.relation(),
+            ));
         }
 
         let mut normalized_capabilities =
@@ -321,6 +1166,59 @@ impl ScriptPluginManifest {
                     normalized_capabilities
                         .push(ScriptCommandCapability::RunConsoleCommandRoot { root });
                 }
+                ScriptCommandCapability::SpawnEntityType { entity_type } => {
+                    let entity_type = validate_script_resource_id(entity_type)?;
+                    let spawn_count = normalized_capabilities
+                        .iter()
+                        .filter(|capability| {
+                            matches!(capability, ScriptCommandCapability::SpawnEntityType { .. })
+                        })
+                        .count();
+                    if spawn_count >= MAX_SPAWN_ENTITY_TYPES {
+                        return Err(ScriptPluginManifestError::TooManySpawnEntityTypes {
+                            max: MAX_SPAWN_ENTITY_TYPES,
+                        });
+                    }
+                    if normalized_capabilities.iter().any(|capability| {
+                        matches!(capability, ScriptCommandCapability::SpawnEntityType { entity_type: existing } if existing == &entity_type)
+                    }) {
+                        return Err(ScriptPluginManifestError::DuplicateSpawnEntityType {
+                            entity_type,
+                        });
+                    }
+                    normalized_capabilities
+                        .push(ScriptCommandCapability::SpawnEntityType { entity_type });
+                }
+            }
+        }
+
+        let mut player_command_roots = Vec::with_capacity(self.player_command_roots.len());
+        for root in &self.player_command_roots {
+            validate_player_command_root(root)?;
+            if BUILT_IN_PLAYER_COMMAND_ROOTS.contains(&root.as_str()) {
+                return Err(ScriptPluginManifestError::ReservedPlayerCommandRoot {
+                    root: root.clone(),
+                });
+            }
+            if !player_command_roots.contains(root) {
+                player_command_roots.push(root.clone());
+            }
+        }
+        let mut operator_command_roots = Vec::with_capacity(self.operator_command_roots.len());
+        for root in &self.operator_command_roots {
+            validate_player_command_root(root)?;
+            if BUILT_IN_PLAYER_COMMAND_ROOTS.contains(&root.as_str()) {
+                return Err(ScriptPluginManifestError::ReservedPlayerCommandRoot {
+                    root: root.clone(),
+                });
+            }
+            if player_command_roots.contains(root) {
+                return Err(ScriptPluginManifestError::ConflictingPlayerCommandRoot {
+                    root: root.clone(),
+                });
+            }
+            if !operator_command_roots.contains(root) {
+                operator_command_roots.push(root.clone());
             }
         }
 
@@ -329,7 +1227,12 @@ impl ScriptPluginManifest {
             display_name: self.display_name.clone(),
             version: self.version.clone(),
             requested_api_version: self.requested_api_version,
+            load_phase: self.load_phase,
+            event_subscriptions: normalized_event_subscriptions,
+            dependencies: normalized_dependencies,
             declared_command_capabilities: normalized_capabilities,
+            player_command_roots,
+            operator_command_roots,
             declared_permissions: self.declared_permissions.clone(),
         })
     }
@@ -343,7 +1246,12 @@ pub struct ValidatedScriptPluginManifest {
     display_name: String,
     version: String,
     requested_api_version: ScriptApiVersion,
+    load_phase: ScriptPluginLoadPhase,
+    event_subscriptions: Vec<ScriptEventSubscription>,
+    dependencies: Vec<ScriptPluginDependency>,
     declared_command_capabilities: Vec<ScriptCommandCapability>,
+    player_command_roots: Vec<String>,
+    operator_command_roots: Vec<String>,
     declared_permissions: Vec<String>,
 }
 
@@ -364,8 +1272,28 @@ impl ValidatedScriptPluginManifest {
         self.requested_api_version
     }
 
+    pub fn load_phase(&self) -> ScriptPluginLoadPhase {
+        self.load_phase
+    }
+
+    pub fn event_subscriptions(&self) -> &[ScriptEventSubscription] {
+        &self.event_subscriptions
+    }
+
+    pub fn dependencies(&self) -> &[ScriptPluginDependency] {
+        &self.dependencies
+    }
+
     pub fn declared_command_capabilities(&self) -> &[ScriptCommandCapability] {
         &self.declared_command_capabilities
+    }
+
+    pub fn player_command_roots(&self) -> &[String] {
+        &self.player_command_roots
+    }
+
+    pub fn operator_command_roots(&self) -> &[String] {
+        &self.operator_command_roots
     }
 
     pub fn declared_permissions(&self) -> &[String] {
@@ -382,6 +1310,9 @@ impl ValidatedScriptPluginManifest {
                 ScriptCommandCapability::RunConsoleCommandRoot { root } => {
                     capabilities = capabilities.allow_console_command_root(root);
                 }
+                ScriptCommandCapability::SpawnEntityType { entity_type } => {
+                    capabilities = capabilities.allow_spawn_entity_type(entity_type);
+                }
             }
         }
         capabilities
@@ -392,6 +1323,7 @@ impl ValidatedScriptPluginManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptPluginManifestError {
+    BlankPluginId,
     InvalidPluginId {
         plugin_id: String,
     },
@@ -399,11 +1331,61 @@ pub enum ScriptPluginManifestError {
         requested: ScriptApiVersion,
         supported: ScriptApiVersion,
     },
+    PlayerCommandsRequireScriptApiVersion {
+        requested: ScriptApiVersion,
+        minimum: ScriptApiVersion,
+    },
+    OperatorCommandsRequireScriptApiVersion {
+        requested: ScriptApiVersion,
+        minimum: ScriptApiVersion,
+    },
+    SpawnEntitiesRequireScriptApiVersion {
+        requested: ScriptApiVersion,
+        minimum: ScriptApiVersion,
+    },
+    InvalidEventName {
+        event_name: String,
+    },
+    DuplicateEventSubscription {
+        event_name: String,
+    },
+    BlankDependencyPluginId,
+    InvalidDependencyPluginId {
+        plugin_id: String,
+    },
+    SelfDependency {
+        plugin_id: String,
+    },
+    DuplicateDependency {
+        plugin_id: String,
+    },
     BlankCommandRoot,
     UnboundedCommandRoot {
         root: String,
     },
     DuplicateCommandRoot {
+        root: String,
+    },
+    InvalidSpawnEntityType {
+        entity_type: String,
+    },
+    DuplicateSpawnEntityType {
+        entity_type: String,
+    },
+    TooManySpawnEntityTypes {
+        max: usize,
+    },
+    InvalidPlayerCommandRoot {
+        root: String,
+    },
+    PlayerCommandRootTooLong {
+        root: String,
+        max_bytes: usize,
+    },
+    ReservedPlayerCommandRoot {
+        root: String,
+    },
+    ConflictingPlayerCommandRoot {
         root: String,
     },
 }
@@ -429,6 +1411,7 @@ let _forged = CommandCapabilities::none().allow_console_command_root("stop");
 #[non_exhaustive]
 pub struct CommandCapabilities {
     console_command_roots: Vec<String>,
+    spawn_entity_types: Vec<String>,
 }
 
 impl CommandCapabilities {
@@ -463,6 +1446,20 @@ impl CommandCapabilities {
         self
     }
 
+    /// Trusted host-side builder for allowing one exact entity type.
+    #[cfg(any(test, feature = "host-api"))]
+    pub fn allow_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
+        let entity_type = entity_type.as_ref().to_owned();
+        if !self
+            .spawn_entity_types
+            .iter()
+            .any(|allowed| allowed == &entity_type)
+        {
+            self.spawn_entity_types.push(entity_type);
+        }
+        self
+    }
+
     /// Return whether this allow-list grants the requested command capability.
     pub fn allows(&self, capability: &ScriptCommandCapability) -> bool {
         match capability {
@@ -470,6 +1467,10 @@ impl CommandCapabilities {
                 .console_command_roots
                 .iter()
                 .any(|allowed| allowed == root),
+            ScriptCommandCapability::SpawnEntityType { entity_type } => self
+                .spawn_entity_types
+                .iter()
+                .any(|allowed| allowed == entity_type),
         }
     }
 }
@@ -557,6 +1558,26 @@ fn console_command_root(command: &str) -> String {
         .to_owned()
 }
 
+fn normalize_event_name(event_name: &str) -> String {
+    event_name.trim().to_ascii_lowercase()
+}
+
+fn is_supported_event_name(event_name: &str) -> bool {
+    matches!(
+        event_name,
+        "server.started"
+            | "server.stopping"
+            | "player.joined"
+            | "player.left"
+            | "player.chat"
+            | "server.tick"
+    )
+}
+
+fn normalize_plugin_id(plugin_id: &str) -> String {
+    plugin_id.trim().to_ascii_lowercase()
+}
+
 fn is_valid_plugin_id(plugin_id: &str) -> bool {
     let mut chars = plugin_id.chars();
     let Some(first) = chars.next() else {
@@ -578,6 +1599,66 @@ fn validate_command_root(root: &str) -> Result<String, ScriptPluginManifestError
         return Err(ScriptPluginManifestError::UnboundedCommandRoot { root });
     }
     Ok(root)
+}
+
+fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManifestError> {
+    if value.len() > MAX_SCRIPT_RESOURCE_ID_BYTES {
+        return Err(ScriptPluginManifestError::InvalidSpawnEntityType {
+            entity_type: value.to_owned(),
+        });
+    }
+    let Some((namespace, path)) = value.split_once(':') else {
+        return Err(ScriptPluginManifestError::InvalidSpawnEntityType {
+            entity_type: value.to_owned(),
+        });
+    };
+    if namespace.is_empty()
+        || path.is_empty()
+        || path.contains(':')
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+        || !path.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/')
+        })
+    {
+        return Err(ScriptPluginManifestError::InvalidSpawnEntityType {
+            entity_type: value.to_owned(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_player_command_root(root: &str) -> Result<(), ScriptPluginManifestError> {
+    if root.is_empty()
+        || !root.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+    {
+        return Err(ScriptPluginManifestError::InvalidPlayerCommandRoot {
+            root: root.to_owned(),
+        });
+    }
+    if root.len() > MAX_PLAYER_COMMAND_ROOT_BYTES {
+        return Err(ScriptPluginManifestError::PlayerCommandRootTooLong {
+            root: root.to_owned(),
+            max_bytes: MAX_PLAYER_COMMAND_ROOT_BYTES,
+        });
+    }
+    Ok(())
+}
+
+fn split_player_command(raw: &str) -> Option<(&str, &str)> {
+    let command = raw.trim_start();
+    let command = command.strip_prefix('/').unwrap_or(command);
+    let root_end = command.find(char::is_whitespace).unwrap_or(command.len());
+    let root = &command[..root_end];
+    if root.is_empty() {
+        return None;
+    }
+    Some((root, command[root_end..].trim_start()))
 }
 
 /// Future VM resource and lifecycle controls reserved in the host contract.
@@ -702,16 +1783,40 @@ mod tests {
     }
 
     #[test]
+    fn script_boundary_is_bounded_and_preserves_the_first_event() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let first = ScriptEvent::server_started();
+        let second = ScriptEvent::server_tick(1);
+
+        boundary.try_enqueue_event(first.clone()).unwrap();
+
+        assert_eq!(
+            boundary.try_enqueue_event(second.clone()),
+            Err(ScriptQueueError::Full(second))
+        );
+        assert_eq!(endpoint.recv_event_blocking(), Some(first));
+    }
+
+    #[test]
+    fn script_event_queue_errors_stay_below_the_result_size_threshold() {
+        assert!(
+            std::mem::size_of::<ScriptQueueError<ScriptEvent>>() <= 128,
+            "queue errors must remain small enough to return directly"
+        );
+    }
+
+    #[test]
     fn event_dtos_are_stable_snapshots_without_host_handles() {
         let event = ScriptEvent::player_joined(ScriptPlayerId::new(42), "kaiser");
 
-        assert_eq!(
+        assert!(matches!(
             event.kind(),
-            &ScriptEventKind::PlayerJoined {
-                player_id: ScriptPlayerId::new(42),
-                username: "kaiser".to_owned(),
-            }
-        );
+            ScriptEventKind::PlayerJoined {
+                player_id,
+                username,
+                ..
+            } if *player_id == ScriptPlayerId::new(42) && username == "kaiser"
+        ));
         assert_eq!(ScriptPlayerId::new(42).value(), 42);
         assert_eq!(ScriptEntityId::new(99).value(), 99);
 
@@ -727,6 +1832,42 @@ mod tests {
                 "script contract must not expose {name}"
             );
         }
+    }
+
+    #[test]
+    fn queued_player_context_keeps_the_pose_observed_at_publication() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let mut latest_accepted_pose = (12.25, 70.0, -4.5);
+        boundary
+            .try_enqueue_event(ScriptEvent::player_chat_with_context(
+                ScriptPlayerId::new(42),
+                "snapshot",
+                ScriptPlayerContext::new(
+                    "123e4567-e89b-12d3-a456-426614174000",
+                    "kaiser",
+                    true,
+                    latest_accepted_pose.0,
+                    latest_accepted_pose.1,
+                    latest_accepted_pose.2,
+                ),
+            ))
+            .unwrap();
+
+        latest_accepted_pose = (23.5, 71.0, 8.75);
+        assert_eq!(latest_accepted_pose, (23.5, 71.0, 8.75));
+
+        let event = endpoint.recv_event_blocking().unwrap();
+        let ScriptEventKind::PlayerChat { context, .. } = event.kind() else {
+            panic!("expected player chat event");
+        };
+        assert!(context.is_verified());
+        assert_eq!(context.uuid(), Some("123e4567-e89b-12d3-a456-426614174000"));
+        assert_eq!(context.username(), Some("kaiser"));
+        assert_eq!(context.operator(), Some(true));
+        assert_eq!(
+            (context.x(), context.y(), context.z()),
+            (Some(12.25), Some(70.0), Some(-4.5))
+        );
     }
 
     #[test]
@@ -806,7 +1947,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unsupported_requested_api_version() {
-        let requested = ScriptApiVersion::new(0, 3, 0);
+        let requested = ScriptApiVersion::new(0, 6, 0);
         let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested)
             .declare_console_command_root("time");
 
@@ -817,6 +1958,101 @@ mod tests {
                 supported: SCRIPT_API_VERSION,
             })
         );
+    }
+
+    #[test]
+    fn entity_spawn_api_is_available_at_0_5_0() {
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 5, 0));
+    }
+
+    #[test]
+    fn spawn_entity_capability_is_exact_and_manifest_bounded() {
+        let legacy = ScriptPluginManifest::new(
+            "spawn-test",
+            "Spawn Test",
+            "0.1.0",
+            ScriptApiVersion::new(0, 4, 0),
+        )
+        .declare_spawn_entity_type("minecraft:pig");
+        assert!(matches!(
+            legacy.validate(),
+            Err(ScriptPluginManifestError::SpawnEntitiesRequireScriptApiVersion { .. })
+        ));
+
+        let invalid =
+            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
+                .declare_spawn_entity_type("pig");
+        assert!(matches!(
+            invalid.validate(),
+            Err(ScriptPluginManifestError::InvalidSpawnEntityType { .. })
+        ));
+
+        for invalid_type in [
+            "minecraft:Pig".to_owned(),
+            ":pig".to_owned(),
+            "minecraft:".to_owned(),
+            format!("minecraft:{}", "a".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES)),
+        ] {
+            let invalid =
+                ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
+                    .declare_spawn_entity_type(invalid_type);
+            assert!(matches!(
+                invalid.validate(),
+                Err(ScriptPluginManifestError::InvalidSpawnEntityType { .. })
+            ));
+        }
+
+        let duplicate =
+            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
+                .declare_spawn_entity_type("minecraft:pig")
+                .declare_spawn_entity_type("minecraft:pig");
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ScriptPluginManifestError::DuplicateSpawnEntityType { .. })
+        ));
+
+        let mut bounded =
+            ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION);
+        for index in 0..=MAX_SPAWN_ENTITY_TYPES {
+            bounded = bounded.declare_spawn_entity_type(format!("minecraft:test_{index}"));
+        }
+        assert!(matches!(
+            bounded.validate(),
+            Err(ScriptPluginManifestError::TooManySpawnEntityTypes { .. })
+        ));
+
+        let position = ScriptPosition::try_new(1.25, 64.0, -2.5).unwrap();
+        let pig = ScriptCommand::SpawnEntity {
+            actor: ScriptPlayerId::new(7),
+            entity_type: "minecraft:pig".to_owned(),
+            position,
+        };
+        let cow = ScriptCommand::SpawnEntity {
+            actor: ScriptPlayerId::new(7),
+            entity_type: "minecraft:cow".to_owned(),
+            position,
+        };
+        let capabilities = CommandCapabilities::none().allow_spawn_entity_type("minecraft:pig");
+        let mut batch = CommandBatch::new(nonzero(2));
+
+        assert_eq!(
+            pig.required_capability(),
+            Some(ScriptCommandCapability::SpawnEntityType {
+                entity_type: "minecraft:pig".to_owned(),
+            })
+        );
+        batch
+            .try_push_authorized(pig.clone(), &capabilities)
+            .unwrap();
+        assert_eq!(
+            batch.try_push_authorized(cow, &capabilities),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapability::SpawnEntityType {
+                    entity_type: "minecraft:cow".to_owned(),
+                },
+            })
+        );
+        assert_eq!(batch.commands(), std::slice::from_ref(&pig));
     }
 
     #[test]
@@ -835,6 +2071,12 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_invalid_ids_and_unbounded_command_roots() {
+        let blank_id = ScriptPluginManifest::new(" ", "Daytime", "0.1.0", SCRIPT_API_VERSION);
+        assert_eq!(
+            blank_id.validate(),
+            Err(ScriptPluginManifestError::BlankPluginId)
+        );
+
         let invalid_id =
             ScriptPluginManifest::new("Day Time", "Daytime", "0.1.0", SCRIPT_API_VERSION);
         assert_eq!(
@@ -859,6 +2101,346 @@ mod tests {
         assert_eq!(
             blank.validate(),
             Err(ScriptPluginManifestError::BlankCommandRoot)
+        );
+    }
+
+    #[test]
+    fn manifest_validation_accepts_and_deduplicates_safe_player_command_roots() {
+        let manifest =
+            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("hello")
+                .declare_player_command_root("hello")
+                .declare_player_command_root("warp_home-2");
+
+        assert_eq!(
+            manifest.validate().unwrap().player_command_roots(),
+            &["hello".to_owned(), "warp_home-2".to_owned()]
+        );
+    }
+
+    #[test]
+    fn manifest_validation_enforces_player_command_root_byte_limit() {
+        let boundary_root = "a".repeat(MAX_PLAYER_COMMAND_ROOT_BYTES);
+        let boundary =
+            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root(&boundary_root);
+        assert_eq!(
+            boundary.validate().unwrap().player_command_roots(),
+            &[boundary_root]
+        );
+
+        let over_limit_root = "a".repeat(MAX_PLAYER_COMMAND_ROOT_BYTES + 1);
+        let over_limit =
+            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root(&over_limit_root);
+        assert_eq!(
+            over_limit.validate(),
+            Err(ScriptPluginManifestError::PlayerCommandRootTooLong {
+                root: over_limit_root,
+                max_bytes: MAX_PLAYER_COMMAND_ROOT_BYTES,
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unsafe_and_reserved_player_command_roots() {
+        for root in ["Hello", "/hello", "hello there", "hello.world", ""] {
+            let manifest =
+                ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                    .declare_player_command_root(root);
+
+            assert_eq!(
+                manifest.validate(),
+                Err(ScriptPluginManifestError::InvalidPlayerCommandRoot {
+                    root: root.to_owned(),
+                })
+            );
+        }
+
+        for root in ["gamemode", "defaultgamemode", "tp", "teleport"] {
+            let manifest =
+                ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                    .declare_player_command_root(root);
+
+            assert_eq!(
+                manifest.validate(),
+                Err(ScriptPluginManifestError::ReservedPlayerCommandRoot {
+                    root: root.to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn player_command_event_is_an_immutable_targeted_snapshot() {
+        let event = ScriptEvent::player_command(
+            "greetings",
+            ScriptPlayerId::new(42),
+            "Alex",
+            "hello",
+            "one  two ",
+        );
+
+        assert_eq!(event.event_name(), "player.command");
+        assert_eq!(event.target_plugin_id(), Some("greetings"));
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerCommand {
+                player_id,
+                username,
+                root,
+                arguments,
+                ..
+            } if *player_id == ScriptPlayerId::new(42)
+                && username == "Alex"
+                && root == "hello"
+                && arguments == "one  two "
+        ));
+    }
+
+    #[test]
+    fn player_command_boundary_routes_one_owner_and_retains_queue_full_policy() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest =
+            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("hello")
+                .validate()
+                .unwrap();
+        endpoint.register_player_commands(&manifest).unwrap();
+
+        assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
+        assert_eq!(
+            boundary.try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "missing arg"),
+            Ok(false)
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "/hello one  two "),
+            Ok(true)
+        );
+        let full = boundary
+            .try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "hello later")
+            .unwrap_err();
+        assert!(matches!(
+            full,
+            ScriptQueueError::Full(event)
+                if event.target_plugin_id() == Some("greetings")
+                    && matches!(
+                        event.kind(),
+                        ScriptEventKind::PlayerCommand { root, arguments, .. }
+                            if root == "hello" && arguments == "later"
+                    )
+        ));
+        assert_eq!(
+            endpoint.recv_event_blocking(),
+            Some(ScriptEvent::player_command(
+                "greetings",
+                ScriptPlayerId::new(7),
+                "Alex",
+                "hello",
+                "one  two ",
+            ))
+        );
+    }
+
+    #[test]
+    fn operator_player_commands_require_verified_context_and_are_denied_before_a_full_queue() {
+        let api_0_3 = ScriptPluginManifest::new(
+            "admin-day",
+            "Admin Day",
+            "0.1.0",
+            ScriptApiVersion::new(0, 3, 0),
+        )
+        .declare_operator_command_root("adminday");
+        assert_eq!(
+            api_0_3.validate(),
+            Err(
+                ScriptPluginManifestError::OperatorCommandsRequireScriptApiVersion {
+                    requested: ScriptApiVersion::new(0, 3, 0),
+                    minimum: OPERATOR_COMMANDS_API_VERSION,
+                }
+            )
+        );
+
+        let manifest = ScriptPluginManifest::new(
+            "admin-day",
+            "Admin Day",
+            "0.1.0",
+            ScriptApiVersion::new(0, 4, 0),
+        )
+        .declare_operator_command_root("adminday")
+        .validate()
+        .unwrap();
+        assert!(manifest.player_command_roots().is_empty());
+        assert_eq!(manifest.operator_command_roots(), ["adminday"]);
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        endpoint.register_player_commands(&manifest).unwrap();
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_operator(
+                ScriptPlayerId::new(7),
+                "Alex",
+                "adminday",
+                false,
+            ),
+            Ok(PlayerCommandAdmission::PermissionDenied)
+        );
+        assert_eq!(
+            endpoint.recv_event_blocking(),
+            Some(ScriptEvent::server_started()),
+            "denied command must not be enqueued behind a full queue"
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_operator(
+                ScriptPlayerId::new(7),
+                "Alex",
+                "adminday",
+                true,
+            ),
+            Ok(PlayerCommandAdmission::PermissionDenied)
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                ScriptPlayerContext::new("verified-id", "Alex", true, 0.0, 0.0, 0.0),
+                "adminday",
+            ),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+    }
+
+    #[test]
+    fn player_command_registration_enforces_aggregate_root_limit_atomically() {
+        let mut boundary_manifest =
+            ScriptPluginManifest::new("boundary", "Boundary", "0.1.0", SCRIPT_API_VERSION);
+        for index in 0..MAX_PLAYER_COMMAND_ROOTS {
+            boundary_manifest =
+                boundary_manifest.declare_player_command_root(format!("command{index}"));
+        }
+        let boundary_manifest = boundary_manifest.validate().unwrap();
+        let over_limit_manifest =
+            ScriptPluginManifest::new("over-limit", "Over Limit", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("one_more")
+                .validate()
+                .unwrap();
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+
+        endpoint
+            .register_player_commands(&boundary_manifest)
+            .unwrap();
+        assert_eq!(
+            boundary.player_command_roots().len(),
+            MAX_PLAYER_COMMAND_ROOTS
+        );
+        assert_eq!(
+            endpoint.register_player_commands(&over_limit_manifest),
+            Err(PlayerCommandRegistrationError::RootLimitExceeded {
+                limit: MAX_PLAYER_COMMAND_ROOTS,
+                requested: MAX_PLAYER_COMMAND_ROOTS + 1,
+            })
+        );
+        assert_eq!(
+            boundary.player_command_roots().len(),
+            MAX_PLAYER_COMMAND_ROOTS,
+            "over-limit registration must not partially mutate ownership"
+        );
+    }
+
+    #[test]
+    fn manifest_validation_normalizes_event_subscriptions_and_dependencies() {
+        let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .with_load_phase(ScriptPluginLoadPhase::Startup)
+            .subscribe_event(" Player.Chat ")
+            .subscribe_event("server.tick")
+            .declare_dependency(" Economy ", ScriptPluginDependencyRelation::Required)
+            .declare_dependency("chat-tools", ScriptPluginDependencyRelation::Optional)
+            .declare_dependency("spawn-protect", ScriptPluginDependencyRelation::LoadBefore);
+
+        let validated = manifest.validate().unwrap();
+
+        assert_eq!(validated.load_phase(), ScriptPluginLoadPhase::Startup);
+        assert_eq!(
+            validated.event_subscriptions(),
+            &[
+                ScriptEventSubscription::new("player.chat"),
+                ScriptEventSubscription::new("server.tick"),
+            ]
+        );
+        assert_eq!(
+            validated.dependencies(),
+            &[
+                ScriptPluginDependency::new("economy", ScriptPluginDependencyRelation::Required),
+                ScriptPluginDependency::new("chat-tools", ScriptPluginDependencyRelation::Optional),
+                ScriptPluginDependency::new(
+                    "spawn-protect",
+                    ScriptPluginDependencyRelation::LoadBefore,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unsafe_event_subscriptions() {
+        let invalid = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .subscribe_event("player.inventory.clicked");
+        assert_eq!(
+            invalid.validate(),
+            Err(ScriptPluginManifestError::InvalidEventName {
+                event_name: "player.inventory.clicked".to_owned(),
+            })
+        );
+
+        let duplicate =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+                .subscribe_event("player.chat")
+                .subscribe_event(" Player.Chat ");
+        assert_eq!(
+            duplicate.validate(),
+            Err(ScriptPluginManifestError::DuplicateEventSubscription {
+                event_name: "player.chat".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn manifest_validation_rejects_unsafe_dependency_declarations() {
+        let blank = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .declare_dependency(" ", ScriptPluginDependencyRelation::Required);
+        assert_eq!(
+            blank.validate(),
+            Err(ScriptPluginManifestError::BlankDependencyPluginId)
+        );
+
+        let invalid = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+            .declare_dependency("Economy Tools", ScriptPluginDependencyRelation::Required);
+        assert_eq!(
+            invalid.validate(),
+            Err(ScriptPluginManifestError::InvalidDependencyPluginId {
+                plugin_id: "economy tools".to_owned(),
+            })
+        );
+
+        let self_dependency =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+                .declare_dependency("Daytime", ScriptPluginDependencyRelation::Required);
+        assert_eq!(
+            self_dependency.validate(),
+            Err(ScriptPluginManifestError::SelfDependency {
+                plugin_id: "daytime".to_owned(),
+            })
+        );
+
+        let duplicate =
+            ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
+                .declare_dependency("Economy", ScriptPluginDependencyRelation::Required)
+                .declare_dependency(" economy ", ScriptPluginDependencyRelation::Optional);
+        assert_eq!(
+            duplicate.validate(),
+            Err(ScriptPluginManifestError::DuplicateDependency {
+                plugin_id: "economy".to_owned(),
+            })
         );
     }
 
@@ -912,7 +2494,10 @@ mod tests {
                 context: RuntimeContext<'_>,
             ) -> RuntimeResult<CommandBatch> {
                 let mut batch = context.command_batch();
-                if let ScriptEventKind::PlayerChat { player_id, message } = event.kind() {
+                if let ScriptEventKind::PlayerChat {
+                    player_id, message, ..
+                } = event.kind()
+                {
                     batch
                         .try_push(ScriptCommand::SendChatMessage {
                             player_id: *player_id,
@@ -940,23 +2525,54 @@ mod tests {
                 message: "echo: hello".to_owned(),
             }]
         );
-        assert_eq!(
+        assert!(matches!(
             event.kind(),
-            &ScriptEventKind::PlayerChat {
-                player_id: ScriptPlayerId::new(7),
-                message: "hello".to_owned(),
-            }
-        );
+            ScriptEventKind::PlayerChat {
+                player_id, message, ..
+            } if *player_id == ScriptPlayerId::new(7) && message == "hello"
+        ));
     }
 
     #[test]
     fn script_api_version_accepts_current_and_older_minor_only() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 2, 0));
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 5, 0));
         assert!(supports_script_api_version(SCRIPT_API_VERSION));
+        assert!(supports_script_api_version(ScriptApiVersion::new(0, 2, 0)));
+        assert!(supports_script_api_version(ScriptApiVersion::new(0, 2, 99)));
         assert!(supports_script_api_version(ScriptApiVersion::new(0, 1, 0)));
         assert!(supports_script_api_version(ScriptApiVersion::new(0, 0, 0)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 2, 1)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 3, 0)));
+        assert!(supports_script_api_version(ScriptApiVersion::new(0, 3, 1)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 5, 1)));
+        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 6, 0)));
         assert!(!supports_script_api_version(ScriptApiVersion::new(1, 0, 0)));
+    }
+
+    #[test]
+    fn manifest_without_player_commands_remains_compatible_with_api_0_2() {
+        let manifest =
+            ScriptPluginManifest::new("legacy", "Legacy", "0.1.0", ScriptApiVersion::new(0, 2, 0));
+
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn manifest_player_commands_require_api_0_3() {
+        let manifest = ScriptPluginManifest::new(
+            "legacy-commands",
+            "Legacy Commands",
+            "0.1.0",
+            ScriptApiVersion::new(0, 2, 0),
+        )
+        .declare_player_command_root("hello");
+
+        assert_eq!(
+            manifest.validate(),
+            Err(
+                ScriptPluginManifestError::PlayerCommandsRequireScriptApiVersion {
+                    requested: ScriptApiVersion::new(0, 2, 0),
+                    minimum: PLAYER_COMMANDS_API_VERSION,
+                }
+            )
+        );
     }
 }

@@ -1,0 +1,55 @@
+[server]
+name = "solaris-playable"
+motd = "Solaris playable spike"
+# Playable spike profile: keep the real-client join loop fast. This is not
+# the view-distance-8 replacement-readiness profile.
+view_distance = 4
+simulation_distance = 4
+
+[network]
+bind_address = "127.0.0.1"
+port = 25565
+
+[auth]
+# Offline loopback profile for local real-client testing only.
+online_mode = false
+whitelist_enabled = false
+whitelist = []
+banned_players = []
+
+[admin]
+operators = []
+allow_local_dev_operators = false
+
+[plugins]
+directory = "plugins"
+
+[data]
+world_dir = ".analysis/test-world"
+vanilla_data_dir = "data/vanilla"
+seed = 0
+# worldgen_mode = "tellus_like"
+
+[simulation]
+random_tick_speed = 5
+save_interval_ticks = 1200
+
+[chunk_pipeline]
+chunk_send_rate = 8
+chunk_load_rate = 16
+chunk_generate_rate = 16
+chunk_prepare_budget_ms = 0
+chunk_prepare_batch_size = 8
+chunk_result_queue_size = 64
+region_cache_size = 9
+# compression_level = 1
+
+[autoscale]
+enabled = true
+profile = "balanced"
+min_view_distance = 4
+max_view_distance = 4
+# target_tick_ms = 50
+# target_first_chunk_ms = 1500
+# scale_down_after_ticks = 3
+# scale_up_after_ticks = 10

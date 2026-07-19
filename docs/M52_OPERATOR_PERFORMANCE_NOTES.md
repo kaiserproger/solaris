@@ -85,9 +85,12 @@ scraping full server logs.
 Outbound/session pressure is exposed through `OutboundPressureSnapshot` and
 runtime tick log fields:
 
-- `visibility_command_drops`: coalescible visibility updates dropped because the
+- `best_effort_animation_drops`: cosmetic arm animations dropped because the
   outbound lane was full. Occasional increases under a paused reader are expected;
   active readers must still make progress.
+- `reliable_command_drops`: reliable commands discarded because the bounded
+  backlog overflowed. Any increase means that the affected session was closed and
+  the gate must not report clean delivery.
 - `reliable_command_retries`: total reliable commands that had to wait for a full
   outbound lane.
 - `reliable_command_retries_in_flight`: reliable retry tasks currently retained by

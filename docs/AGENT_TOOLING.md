@@ -7,11 +7,44 @@ contains the rules; this file contains the local wiring.
 
 | Tool | Status | Use |
 |---|---|---|
+| CodeGraph | installed globally via npm as `@colbymchenry/codegraph@1.2.0`; Codex MCP server `codegraph` registered; telemetry disabled; Solaris index lives in ignored `.codegraph/` | Targeted symbol graph questions: callers/callees, mutation paths, lock holders, affected tests, and blast-radius checks. Refresh with `codegraph sync .` after edits before relying on it. |
 | Serena | enabled globally through opencode MCP | Symbol search/editing and project memories. Prefer it for Rust code navigation before full-file reads. |
 | Context7 | enabled globally through opencode MCP and verified 2026-06-11 | External library/framework docs. Use `resolve-library-id` before `query-docs`. |
 | RTK | installed at `/home/kaiserroman/.cargo/bin/rtk` | Compact shell output. OpenCode plugin installed globally at `~/.config/opencode/plugins/rtk.ts`; restart opencode before relying on auto-rewrite. |
 | Headroom | installed by `uv tool install "headroom-ai[all]"` at `/home/kaiserroman/.local/bin/headroom` | Optional context compression/proxy/MCP/learning. Do not route opencode provider traffic through Headroom unless explicitly asked. |
 | Agent harness | installed globally under `~/.config/opencode/bin/agent-harness` | Spec-first implementation, refactor, cleanup, and slop-review flows. Prefer native opencode slash commands over external LLM subprocesses. |
+| Minecraft client MCP | embedded in the repo's NeoForge 26.1.2 development mod; loopback Streamable HTTP endpoint | Structured real-client observation, connection, inventory/entity waits, input, selected-item drop, and reusable multi-client core gates without screenshot assertions. |
+
+## Minecraft Client MCP
+
+Validate the fixed launcher without starting Minecraft:
+
+```sh
+SOLARIS_CLIENT_MCP_TOKEN=local-check-token \
+  bash tools/run-minecraft-client-mcp.sh --check
+```
+
+Launch one client with an isolated game directory and username:
+
+```sh
+export SOLARIS_CLIENT_MCP_TOKEN="$(openssl rand -hex 32)"
+export SOLARIS_CLIENT_MCP_PORT=39095
+export SOLARIS_CLIENT_MCP_GAME_DIR=.analysis/minecraft-mcp-primary
+export SOLARIS_CLIENT_MCP_USERNAME=SolarisMcpA
+bash tools/run-minecraft-client-mcp.sh
+```
+
+Use a second port, token, game directory, and username for multiplayer gates.
+The endpoint is `http://127.0.0.1:<port>/mcp`. Inventory, entity, login, and
+client lifecycle waits block on packet/lifecycle state notifications. A
+separate tick notification is used only when tick progression itself drives
+the operation. Every timeout is failure, not a success condition.
+
+The current bridge also provides push-driven motion and entity-removal waits
+over the virtual-thread transport. Canonical interaction checks fence reach,
+raycast, and authoritative world state before reporting success. The focused
+bridge/java/client-mod gate passed after adding test-only client dependencies;
+`runClient` has not been run, so this is tooling-path evidence only.
 
 ## Useful External Candidates
 

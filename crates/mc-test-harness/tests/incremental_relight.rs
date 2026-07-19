@@ -25,7 +25,7 @@ use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundKeepAlive, ConfirmTeleportation, Direction, GameEvent,
     LevelChunkWithLight, LightUpdate, ServerboundChatCommand, ServerboundKeepAlive,
     ServerboundSetCarriedItem, ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition,
-    pack_block_pos,
+    pack_block_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::light::{LightWorkspace, compute_chunk_light_in};
@@ -161,21 +161,54 @@ async fn incremental_relight_wire_matches_full_recompute() {
         }
     }
 
-    // Select dirt (hotbar slot 1) and place one block above the
-    // top block at local (8, 8). That column is far enough from every
-    // chunk seam (lx/lz in 1..=14) that light propagation stays inside
-    // chunk (0, 0).
+    // Select dirt (hotbar slot 1) and place one block above the known
+    // skylit mid-chunk column used by this parity fixture.
     let target_y = {
-        let mut guard = world_handle.lock().await;
-        let chunk = guard
-            .get_chunk_mut(ChunkPos { x: 0, z: 0 })
-            .expect("chunk read")
+        let guard = world_handle.lock().await;
+        let mut chunk = guard
+            .cached_chunk(ChunkPos { x: 0, z: 0 })
             .expect("origin chunk present");
         chunk.rebuild_highest_opaque(&block_light);
         chunk
             .highest_opaque_y(8, 8)
             .expect("origin local column has terrain")
     };
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: format!("tp 8.5 {} 8.5", target_y + 2),
+        })
+        .await
+        .expect("teleport beside relight fixture");
+    let teleported = loop {
+        let frame = client
+            .read_frame_with_timeout(Duration::from_secs(30))
+            .await
+            .expect("relight fixture teleport");
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body;
+            let keepalive = ClientboundKeepAlive::decode(&mut body).expect("decode KeepAlive");
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await
+                .expect("echo KeepAlive");
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            break SynchronizePlayerPosition::decode(&mut body).expect("decode fixture teleport");
+        }
+    };
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: teleported.teleport_id,
+        })
+        .await
+        .expect("confirm relight fixture teleport");
+    let dx = teleported.x - 8.5;
+    let dy = teleported.y + 1.62 - (f64::from(target_y) + 0.5);
+    let dz = teleported.z - 8.5;
+    assert!(
+        dx * dx + dy * dy + dz * dz <= 36.0,
+        "relight fixture must be within creative block reach"
+    );
     client
         .write_packet(&ServerboundSetCarriedItem { slot: 1 })
         .await
@@ -203,6 +236,7 @@ async fn incremental_relight_wire_matches_full_recompute() {
     // BlockChangedAck.
     let mut light_updates: Vec<LightUpdate> = Vec::new();
     let mut saw_block_update = false;
+    let mut block_updates = Vec::new();
     let mut saw_ack = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !saw_ack {
@@ -212,7 +246,11 @@ async fn incremental_relight_wire_matches_full_recompute() {
             .await
             .unwrap_or_else(|e| panic!("place response stalled: {e}"));
         if frame.id == BlockUpdate::ID {
-            saw_block_update = true;
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
+            let position = unpack_block_pos(packet.position);
+            block_updates.push((position, packet.state_id));
+            saw_block_update |= position == (8, target_y + 1, 8);
         } else if frame.id == LightUpdate::ID {
             let mut body = frame.body;
             let pkt = LightUpdate::decode(&mut body).expect("decode LightUpdate");
@@ -224,7 +262,10 @@ async fn incremental_relight_wire_matches_full_recompute() {
             saw_ack = true;
         }
     }
-    assert!(saw_block_update, "BlockUpdate must arrive before ack");
+    assert!(
+        saw_block_update,
+        "placed-block update must arrive before ack; updates={block_updates:?}"
+    );
 
     // M9.c claim: mid-chunk edit -> exactly one LightUpdate, for
     // the centre chunk. (Edge-of-chunk edits can touch up to 9.)

@@ -19,14 +19,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
     ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
-    ClientboundTakeItemEntity, ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay,
-    MovePlayerFlags, RemoveEntities, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
-    SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerRot, ServerboundMovePlayerStatusOnly,
+    ServerboundPlayerLoaded, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::client::Client;
 
@@ -121,7 +121,8 @@ pub fn parse_java_major_version(version_output: &str) -> Option<u32> {
 }
 
 /// A normalized fact captured from either Solaris or vanilla.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationFact {
     PacketSeen {
         id: i32,
@@ -191,7 +192,8 @@ pub enum ObservationFact {
 
 /// Observations for one scenario phase. Facts are sorted before diffing so packet
 /// timing noise does not hide stable world-state mismatches.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObservationSet {
     pub subject: String,
     pub phase: String,
@@ -285,7 +287,8 @@ pub enum ServerKind {
     Vanilla,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CoreAction {
     WaitTicks { ticks: u8 },
     MoveBy { dx_cm: i16, dz_cm: i16 },
@@ -451,9 +454,9 @@ impl ParityScenario for CoreActionSequenceScenario {
     }
 }
 
-async fn observe_core_action_sequence(
+pub async fn observe_core_action_sequence(
     ctx: ScenarioContext,
-    phase: &'static str,
+    phase: &str,
     actions: &[CoreAction],
 ) -> Result<ObservationSet> {
     let subject = match ctx.kind {
@@ -520,25 +523,34 @@ async fn observe_core_action_sequence(
         .await?;
     client.write_packet(&ServerboundPlayerLoaded).await?;
 
+    let mut saw_inventory = false;
     execute_core_actions(
         &mut client,
         &mut observations,
+        &mut saw_inventory,
         actions,
         sync.x,
         sync.y,
         sync.z,
     )
     .await?;
-    observe_post_action_liveness(&mut client, &mut observations).await?;
+    observe_post_action_liveness(&mut client, &mut observations, saw_inventory).await?;
     Ok(observations.normalized())
 }
 
 async fn observe_post_action_liveness(
     client: &mut Client,
     observations: &mut ObservationSet,
+    mut saw_inventory: bool,
 ) -> Result<()> {
+    if saw_inventory {
+        observations.push(ObservationFact::Note {
+            key: "post_action_liveness".into(),
+            value: "clientbound_frame".into(),
+        });
+        return Ok(());
+    }
     let mut saw_frame = false;
-    let mut saw_inventory = false;
     for index in 0..64 {
         let timeout = if index == 0 {
             Duration::from_secs(5)
@@ -547,105 +559,20 @@ async fn observe_post_action_liveness(
         };
         let frame = match client.read_frame_with_timeout(timeout).await {
             Ok(frame) => frame,
-            Err(_err) if saw_inventory => break,
             Err(err) if saw_frame => {
                 return Err(err).context("post-action frame drain ended before inventory snapshot");
             }
             Err(err) => return Err(err).context("wait for post-action server liveness frame"),
         };
         saw_frame = true;
-
-        match frame.id {
-            id if id == ClientboundKeepAlive::ID => {
-                let mut body = frame.body.clone();
-                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-                client
-                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-                    .await?;
-            }
-            id if id == ClientboundSetHeldSlot::ID => {
-                let mut body = frame.body.clone();
-                let held = ClientboundSetHeldSlot::decode(&mut body)?;
-                observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-            }
-            id if id == ClientboundContainerSetContent::ID => {
-                let mut body = frame.body.clone();
-                let inventory = ClientboundContainerSetContent::decode(&mut body)?;
-                let slots = u16::try_from(inventory.items.len())
-                    .context("inventory slot count exceeds observation range")?;
-                let non_empty_slots = u16::try_from(
-                    inventory
-                        .items
-                        .iter()
-                        .filter(|item| !item.is_empty())
-                        .count(),
-                )
-                .context("non-empty inventory slot count exceeds observation range")?;
-                observations.push(ObservationFact::InventoryContent {
-                    container_id: inventory.container_id,
-                    state_id: inventory.state_id,
-                    slots,
-                    non_empty_slots,
-                    carried_count: inventory.carried_item.count,
-                });
-                saw_inventory = true;
-            }
-            id if id == ClientboundSetHealth::ID => {
-                let mut body = frame.body.clone();
-                let health = ClientboundSetHealth::decode(&mut body)?;
-                observations.push(ObservationFact::Health {
-                    half_hearts_milli: (health.health * 1000.0).round() as i32,
-                    food: health.food,
-                });
-            }
-            id if id == AddEntity::ID => {
-                let mut body = frame.body.clone();
-                let add = AddEntity::decode(&mut body)?;
-                observations.push(ObservationFact::EntitySpawned {
-                    entity_id: add.entity_id,
-                    entity_type_id: add.entity_type_id,
-                    x: add.x.floor() as i64,
-                    y: add.y.floor() as i64,
-                    z: add.z.floor() as i64,
-                });
-            }
-            id if id == RemoveEntities::ID => {
-                let mut body = frame.body.clone();
-                let removed = RemoveEntities::decode(&mut body)?;
-                for eid in removed.entity_ids {
-                    observations.push(ObservationFact::EntityRemoved { entity_id: eid });
-                }
-            }
-            id if id == EntityEvent::ID => {
-                let mut body = frame.body.clone();
-                let event = EntityEvent::decode(&mut body)?;
-                observations.push(ObservationFact::ProjectileEvent {
-                    entity_id: event.entity_id,
-                    event_id: event.event_id,
-                });
-            }
-            id if id == ClientboundContainerSetSlot::ID => {
-                let mut body = frame.body.clone();
-                let slot = ClientboundContainerSetSlot::decode(&mut body)?;
-                observations.push(ObservationFact::ContainerSlotContent {
-                    container_id: slot.container_id,
-                    state_id: slot.state_id,
-                    slot: slot.slot,
-                    item_id: slot.item_stack.item_id,
-                    count: slot.item_stack.count,
-                });
-            }
-            id if id == ClientboundTakeItemEntity::ID => {
-                let mut body = frame.body.clone();
-                let take = ClientboundTakeItemEntity::decode(&mut body)?;
-                observations.push(ObservationFact::DropEvent {
-                    item_entity_id: take.item_entity_id,
-                    player_entity_id: Some(take.player_entity_id),
-                    amount: take.amount,
-                });
-            }
-            _ => {}
-        }
+        observe_core_frame(
+            client,
+            observations,
+            frame.id,
+            &frame.body,
+            &mut saw_inventory,
+        )
+        .await?;
 
         if saw_inventory {
             break;
@@ -661,9 +588,104 @@ async fn observe_post_action_liveness(
     Ok(())
 }
 
+async fn observe_core_frame(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+    id: i32,
+    body: &bytes::Bytes,
+    saw_inventory: &mut bool,
+) -> Result<Option<i64>> {
+    // Ambient entity packets belong to the dedicated lifecycle scenario. Their
+    // runtime IDs depend on chunk completion order and are not core-action state.
+    if id == ClientboundKeepAlive::ID {
+        let mut body = body.clone();
+        let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+        client
+            .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+            .await?;
+    } else if id == ClientboundSetTime::ID {
+        let mut body = body.clone();
+        return Ok(Some(ClientboundSetTime::decode(&mut body)?.game_time));
+    } else if id == ClientboundSetHeldSlot::ID {
+        let mut body = body.clone();
+        let held = ClientboundSetHeldSlot::decode(&mut body)?;
+        observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+    } else if id == ClientboundContainerSetContent::ID {
+        let mut body = body.clone();
+        let inventory = ClientboundContainerSetContent::decode(&mut body)?;
+        let slots = u16::try_from(inventory.items.len())
+            .context("inventory slot count exceeds observation range")?;
+        let non_empty_slots = u16::try_from(
+            inventory
+                .items
+                .iter()
+                .filter(|item| !item.is_empty())
+                .count(),
+        )
+        .context("non-empty inventory slot count exceeds observation range")?;
+        observations.push(ObservationFact::InventoryContent {
+            container_id: inventory.container_id,
+            state_id: inventory.state_id,
+            slots,
+            non_empty_slots,
+            carried_count: inventory.carried_item.count,
+        });
+        *saw_inventory = true;
+    } else if id == ClientboundSetHealth::ID {
+        let mut body = body.clone();
+        let health = ClientboundSetHealth::decode(&mut body)?;
+        observations.push(ObservationFact::Health {
+            half_hearts_milli: (health.health * 1000.0).round() as i32,
+            food: health.food,
+        });
+    } else if id == ClientboundContainerSetSlot::ID {
+        let mut body = body.clone();
+        let slot = ClientboundContainerSetSlot::decode(&mut body)?;
+        observations.push(ObservationFact::ContainerSlotContent {
+            container_id: slot.container_id,
+            state_id: slot.state_id,
+            slot: slot.slot,
+            item_id: slot.item_stack.item_id,
+            count: slot.item_stack.count,
+        });
+    }
+    Ok(None)
+}
+
+async fn wait_for_server_ticks(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+    saw_inventory: &mut bool,
+    ticks: u64,
+) -> Result<()> {
+    if ticks == 0 {
+        return Ok(());
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut baseline = None;
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("wait for server tick notification")?;
+        let Some(game_time) =
+            observe_core_frame(client, observations, frame.id, &frame.body, saw_inventory).await?
+        else {
+            continue;
+        };
+        let start = *baseline.get_or_insert(game_time);
+        if game_time.saturating_sub(start) >= i64::try_from(ticks)? {
+            return Ok(());
+        }
+    }
+}
+
 async fn execute_core_actions(
     client: &mut Client,
     observations: &mut ObservationSet,
+    saw_inventory: &mut bool,
     actions: &[CoreAction],
     mut x: f64,
     y: f64,
@@ -686,7 +708,8 @@ async fn execute_core_actions(
                 observations.push(ObservationFact::PacketSeen {
                     id: ServerboundMovePlayerStatusOnly::ID,
                 });
-                tokio::time::sleep(Duration::from_millis(u64::from(ticks) * 50)).await;
+                wait_for_server_ticks(client, observations, saw_inventory, u64::from(ticks))
+                    .await?;
             }
             CoreAction::MoveBy { dx_cm, dz_cm } => {
                 x += f64::from(dx_cm) / 100.0;
@@ -738,6 +761,7 @@ pub fn reserve_local_port() -> Result<u16> {
 pub struct VanillaServerProcess {
     child: Child,
     stdin: Option<ChildStdin>,
+    log_rx: mpsc::Receiver<String>,
     addr: SocketAddr,
 }
 
@@ -757,7 +781,8 @@ impl VanillaServerProcess {
             ),
         )?;
 
-        let mut child = Command::new("java")
+        let java = std::env::var_os("JAVA").unwrap_or_else(|| "java".into());
+        let mut child = Command::new(&java)
             .arg("-Xms256M")
             .arg("-Xmx1G")
             .arg("-jar")
@@ -768,7 +793,13 @@ impl VanillaServerProcess {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .with_context(|| format!("launch vanilla oracle {}", jar.display()))?;
+            .with_context(|| {
+                format!(
+                    "launch vanilla oracle {} with {}",
+                    jar.display(),
+                    Path::new(&java).display()
+                )
+            })?;
 
         let stdout = child
             .stdout
@@ -783,10 +814,18 @@ impl VanillaServerProcess {
         spawn_log_watcher(stdout, tx.clone());
         spawn_log_watcher(stderr, tx);
 
-        let started = Instant::now();
+        let deadline = Instant::now() + timeout;
         let mut recent = Vec::new();
-        while started.elapsed() < timeout {
-            match rx.recv_timeout(Duration::from_millis(200)) {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = child.kill();
+                bail!(
+                    "timed out waiting for vanilla oracle: {}",
+                    recent.join("\n")
+                );
+            }
+            match rx.recv_timeout(remaining) {
                 Ok(line) => {
                     recent.push(line.clone());
                     if recent.len() > 20 {
@@ -796,26 +835,27 @@ impl VanillaServerProcess {
                         return Ok(Self {
                             child,
                             stdin,
+                            log_rx: rx,
                             addr: SocketAddr::from(([127, 0, 0, 1], port)),
                         });
                     }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if let Some(status) = child.try_wait()? {
-                        bail!(
-                            "vanilla oracle exited before ready with {status}: {}",
-                            recent.join("\n")
-                        );
-                    }
+                    let _ = child.kill();
+                    bail!(
+                        "timed out waiting for vanilla oracle: {}",
+                        recent.join("\n")
+                    );
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let status = child.wait()?;
+                    bail!(
+                        "vanilla oracle exited before ready with {status}: {}",
+                        recent.join("\n")
+                    );
+                }
             }
         }
-        let _ = child.kill();
-        bail!(
-            "timed out waiting for vanilla oracle: {}",
-            recent.join("\n")
-        );
     }
 
     #[must_use]
@@ -834,25 +874,61 @@ impl VanillaServerProcess {
         Ok(())
     }
 
+    pub fn wait_for_log(
+        &mut self,
+        timeout: Duration,
+        matches: impl Fn(&str) -> bool,
+    ) -> Result<String> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                bail!("timed out waiting for vanilla oracle log event");
+            }
+            match self.log_rx.recv_timeout(remaining) {
+                Ok(line) if matches(&line) => return Ok(line),
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let status = self.child.wait()?;
+                    bail!("vanilla oracle exited while waiting for log event: {status}");
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    bail!("timed out waiting for vanilla oracle log event");
+                }
+            }
+        }
+    }
+
     pub fn stop(mut self) -> Result<()> {
         self.stop_inner()
     }
 
     fn stop_inner(&mut self) -> Result<()> {
-        if let Some(stdin) = &mut self.stdin {
+        if let Some(mut stdin) = self.stdin.take() {
             let _ = stdin.write_all(b"stop\n");
             let _ = stdin.flush();
         }
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if self.child.try_wait()?.is_some() {
-                return Ok(());
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                bail!("timed out waiting for vanilla oracle to stop");
             }
-            thread::sleep(Duration::from_millis(100));
+            match self.log_rx.recv_timeout(remaining) {
+                Ok(_) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    let _ = self.child.wait()?;
+                    return Ok(());
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                    bail!("timed out waiting for vanilla oracle to stop");
+                }
+            }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        Ok(())
     }
 }
 

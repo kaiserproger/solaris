@@ -5,8 +5,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, ConfirmTeleportation,
-    GameEvent, GameMode, ServerboundChatCommand, SetCenterChunk, SynchronizePlayerPosition,
+    ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, CommandNodeKind,
+    ConfirmTeleportation, GameEvent, GameMode, ServerboundChat, ServerboundChatCommand,
+    SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -176,6 +177,329 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
     let feedback =
         ClientboundSystemChat::decode(&mut frame.body.clone()).expect("decode SystemChat");
     assert!(!feedback.content_nbt.is_empty());
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule players_sleeping_percentage 50".to_string(),
+        })
+        .await
+        .expect("set sleeping percentage");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "players_sleeping_percentage = 50"
+    );
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamerule players_sleeping_percentage".to_string(),
+        })
+        .await
+        .expect("query sleeping percentage");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "players_sleeping_percentage = 50"
+    );
+}
+
+#[tokio::test]
+async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("greetings");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "greetings"
+            name = "Greetings"
+            version = "0.1.0"
+            api = "0.3.0"
+            player_commands = ["hello"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_command(event)
+                solaris.send_message(
+                    event.player_id,
+                    event.root .. ":" .. event.username .. ":" .. event.arguments
+                )
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua player command wire test".into(),
+        max_players: 1,
+        view_distance: 2,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "LuaCommandPlayer")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let commands: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let roots = commands.nodes[commands.root_index as usize]
+        .children
+        .iter()
+        .filter_map(|index| match &commands.nodes[*index as usize].kind {
+            CommandNodeKind::Literal(root) => Some(root.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(roots.contains(&"hello"));
+    assert!(!roots.contains(&"gamemode"));
+    assert!(!roots.contains(&"stop"));
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "hello one  two".to_owned(),
+        })
+        .await
+        .expect("send plugin command");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "hello:LuaCommandPlayer:one  two"
+    );
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "missing".to_owned(),
+        })
+        .await
+        .expect("send unknown command");
+    assert_eq!(next_system_chat_text(&mut client).await, "Unknown command");
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".to_owned(),
+        })
+        .await
+        .expect("send denied built-in command");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "You do not have permission to use that command"
+    );
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operators() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("admin-day");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "admin-day"
+            name = "Admin Day"
+            version = "0.1.0"
+            api = "0.4.0"
+            operator_commands = ["adminday"]
+            console_commands = ["time"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_command(event)
+                solaris.run_console("time set day")
+                solaris.send_message(event.player_id, "admin-day:" .. event.username)
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua operator command wire test".into(),
+        max_players: 2,
+        view_distance: 2,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(["LuaOperator"], false),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut non_operator = Client::connect(addr).await.expect("non-operator connect");
+    let _ = non_operator
+        .drive_login(addr, "LuaCommandPlayer")
+        .await
+        .expect("non-operator login");
+    non_operator
+        .drive_configuration()
+        .await
+        .expect("non-operator configuration");
+    let _ = non_operator
+        .read_play_login()
+        .await
+        .expect("non-operator play entry");
+    let commands: ClientboundCommands = non_operator.read_typed().await.expect("Commands");
+    let roots = commands.nodes[commands.root_index as usize]
+        .children
+        .iter()
+        .filter_map(|index| match &commands.nodes[*index as usize].kind {
+            CommandNodeKind::Literal(root) => Some(root.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(!roots.contains(&"adminday"));
+
+    non_operator
+        .write_packet(&ServerboundChatCommand {
+            command: "adminday".to_owned(),
+        })
+        .await
+        .expect("send forged operator plugin command");
+    assert_eq!(
+        next_system_chat_text(&mut non_operator).await,
+        "You do not have permission to use that command"
+    );
+
+    let mut operator = Client::connect(addr).await.expect("operator connect");
+    let _ = operator
+        .drive_login(addr, "LuaOperator")
+        .await
+        .expect("operator login");
+    operator
+        .drive_configuration()
+        .await
+        .expect("operator configuration");
+    let _ = operator
+        .read_play_login()
+        .await
+        .expect("operator play entry");
+    let commands: ClientboundCommands = operator.read_typed().await.expect("operator Commands");
+    let admin_day = commands
+        .nodes
+        .iter()
+        .find(|node| matches!(&node.kind, CommandNodeKind::Literal(root) if root == "adminday"));
+    assert!(admin_day.is_some_and(|node| node.restricted && node.executable));
+
+    operator
+        .write_packet(&ServerboundChatCommand {
+            command: "adminday".to_owned(),
+        })
+        .await
+        .expect("send operator plugin command");
+    wait_for_admin_day_effects(&mut operator).await;
+
+    drop(non_operator);
+    drop(operator);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn normal_chat_broadcasts_to_other_players() {
+    let addr = start_server().await;
+    let mut alice = Client::connect(addr).await.expect("alice connect");
+    let _ = alice
+        .drive_login(addr, "M34Alice")
+        .await
+        .expect("alice login");
+    alice
+        .drive_configuration()
+        .await
+        .expect("alice configuration");
+    let _ = alice.read_play_login().await.expect("alice play entry");
+    let _: ClientboundCommands = alice.read_typed().await.expect("alice Commands");
+
+    let mut bob = Client::connect(addr).await.expect("bob connect");
+    let _ = bob.drive_login(addr, "M34Bob").await.expect("bob login");
+    bob.drive_configuration().await.expect("bob configuration");
+    let _ = bob.read_play_login().await.expect("bob play entry");
+    let _: ClientboundCommands = bob.read_typed().await.expect("bob Commands");
+
+    alice
+        .write_packet(&ServerboundChat {
+            message: "p34 hello".to_string(),
+            timestamp_millis: 0,
+            salt: 0,
+            signature: None,
+            last_seen_offset: 0,
+            last_seen_acknowledged: [0; 3],
+            last_seen_checksum: 0,
+        })
+        .await
+        .expect("send normal chat");
+
+    assert_eq!(
+        next_system_chat_text(&mut bob).await,
+        "<M34Alice> p34 hello"
+    );
 }
 
 #[tokio::test]
@@ -346,4 +670,25 @@ async fn next_time_update(client: &mut Client) -> ClientboundSetTime {
     );
     let frame = outcome.frame;
     ClientboundSetTime::decode(&mut frame.body.clone()).expect("decode SetTime")
+}
+
+async fn wait_for_admin_day_effects(client: &mut Client) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut saw_day = false;
+        let mut saw_reply = false;
+        while !saw_day || !saw_reply {
+            let frame = client.read_frame().await.expect("admin-day packet");
+            if frame.id == ClientboundSetTime::ID {
+                let packet = ClientboundSetTime::decode(&mut frame.body.clone())
+                    .expect("decode admin-day SetTime");
+                saw_day |= packet.game_time == 1000;
+            } else if frame.id == ClientboundSystemChat::ID {
+                let packet = ClientboundSystemChat::decode(&mut frame.body.clone())
+                    .expect("decode admin-day SystemChat");
+                saw_reply |= text_component_text(&packet) == "admin-day:LuaOperator";
+            }
+        }
+    })
+    .await
+    .expect("admin-day Lua effects timeout");
 }

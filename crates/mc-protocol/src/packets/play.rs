@@ -17,6 +17,7 @@ use uuid::Uuid;
 use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
+use crate::packets::login::GameProfileProperty;
 
 /// Vanilla's ceiling on the chunk-data payload (`TWO_MEGABYTES` in
 /// `ClientboundLevelChunkPacketData`). Decoding rejects buffers larger
@@ -31,26 +32,46 @@ const MAX_LONG_ARRAY_LEN: usize = 4096;
 
 /// A section contains at most 16^3 block changes.
 const MAX_SECTION_BLOCK_UPDATE_ENTRIES: usize = 4096;
+/// Allocation safety ceiling for the packet-local weighted block-particle list.
+/// TNT currently emits two entries; 4096 leaves section-scale headroom.
+const MAX_EXPLOSION_BLOCK_PARTICLES: usize = 4096;
 const MAX_PLAYER_INFO_ENTRIES: usize = 1024;
+const MAX_GAME_PROFILE_PROPERTIES: usize = 16;
+const MAX_GAME_PROFILE_PROPERTY_NAME_LEN: usize = 64;
+const MAX_GAME_PROFILE_PROPERTY_VALUE_LEN: usize = 32_767;
+const MAX_GAME_PROFILE_PROPERTY_SIGNATURE_LEN: usize = 1024;
 const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
 const MAX_ENTITY_DATA_VALUES: usize = 64;
 const MAX_CONTAINER_CLICK_CHANGED_SLOTS: usize = 128;
 const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
+const MAX_RECIPE_BOOK_ENTRIES: usize = 8192;
+const MAX_RECIPE_BOOK_SLOTS: usize = 256;
+const MAX_RECIPE_BOOK_REQUIREMENTS: usize = 256;
+const MAX_RECIPE_BOOK_INGREDIENT_ITEMS: usize = 2048;
+const MAX_RECIPE_BOOK_SLOT_DEPTH: usize = 16;
 const MAX_COMMAND_LEN: usize = 32_767;
+const MAX_CHAT_MESSAGE_LEN: usize = 256;
 const MAX_COMMAND_NODE_COUNT: usize = 1024;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
 const SIGN_LINE_COUNT: usize = 4;
 const MAX_SIGN_LINE_LEN: usize = 384;
+const LAST_SEEN_FIXED_BITSET_BYTES: usize = 3;
 pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ENTITY_DATA_BYTE_SERIALIZER_ID: i32 = 0;
+pub const ENTITY_DATA_BOOLEAN_SERIALIZER_ID: i32 = 8;
 pub const ENTITY_DATA_POSE_SERIALIZER_ID: i32 = 20;
 pub const ENTITY_DATA_SHARED_FLAGS_INDEX: u8 = 0;
 pub const ENTITY_DATA_POSE_INDEX: u8 = 6;
 pub const LIVING_ENTITY_DATA_FLAGS_INDEX: u8 = 8;
+/// `AgeableMob.DATA_BABY_ID` on the bundled vanilla 26.1.2 server.
+pub const AGEABLE_ENTITY_DATA_BABY_INDEX: u8 = 16;
+/// `Sheep.DATA_WOOL_ID` on the bundled vanilla 26.1.2 server.
+pub const SHEEP_ENTITY_DATA_WOOL_INDEX: u8 = 18;
 pub const LIVING_ENTITY_FLAG_USING_ITEM: i8 = 0x01;
 pub const LIVING_ENTITY_FLAG_OFF_HAND: i8 = 0x02;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
 pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
+pub const DATA_COMPONENT_ENCHANTMENTS_ID: i32 = 13;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
     let len = i32::try_from(longs.len()).map_err(|_| CodecError::StringTooLong {
@@ -102,6 +123,13 @@ fn write_count<B: BufMut>(buf: &mut B, len: usize) -> Result<(), CodecError> {
     })?;
     buf.write_varint(len);
     Ok(())
+}
+
+fn write_bounded_count<B: BufMut>(buf: &mut B, len: usize, max: usize) -> Result<(), CodecError> {
+    if len > max {
+        return Err(CodecError::StringTooLong { len, max });
+    }
+    write_count(buf, len)
 }
 
 fn pack_degrees(degrees: f32) -> u8 {
@@ -268,7 +296,7 @@ impl Packet for LoginPlay {
             }
         })?);
         for name in &self.dimension_names {
-            buf.write_identifier(name);
+            buf.write_identifier(name)?;
         }
         buf.write_varint(self.max_players);
         buf.write_varint(self.view_distance);
@@ -277,7 +305,7 @@ impl Packet for LoginPlay {
         buf.write_bool(self.enable_respawn_screen);
         buf.write_bool(self.do_limited_crafting);
         buf.write_varint(self.dimension_type_id);
-        buf.write_identifier(&self.dimension_name);
+        buf.write_identifier(&self.dimension_name)?;
         buf.write_i64(self.hashed_seed);
         buf.write_u8(self.game_mode);
         buf.write_i8(self.previous_game_mode);
@@ -286,7 +314,7 @@ impl Packet for LoginPlay {
         match &self.death_location {
             Some((dim, pos)) => {
                 buf.write_bool(true);
-                buf.write_identifier(dim);
+                buf.write_identifier(dim)?;
                 buf.write_i64(*pos);
             }
             None => buf.write_bool(false),
@@ -379,7 +407,7 @@ impl Packet for ClientboundRespawn {
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_varint(self.dimension_type_id);
-        buf.write_identifier(&self.dimension_name);
+        buf.write_identifier(&self.dimension_name)?;
         buf.write_i64(self.hashed_seed);
         buf.write_u8(self.game_mode);
         buf.write_i8(self.previous_game_mode);
@@ -388,7 +416,7 @@ impl Packet for ClientboundRespawn {
         match &self.death_location {
             Some((dim, pos)) => {
                 buf.write_bool(true);
-                buf.write_identifier(dim);
+                buf.write_identifier(dim)?;
                 buf.write_i64(*pos);
             }
             None => buf.write_bool(false),
@@ -455,7 +483,7 @@ impl Packet for SetDefaultSpawnPosition {
     const ID: i32 = 0x61;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        buf.write_identifier(&self.dimension);
+        buf.write_identifier(&self.dimension)?;
         buf.write_i64(self.position);
         buf.write_f32(self.yaw);
         buf.write_f32(self.pitch);
@@ -584,6 +612,150 @@ impl Packet for PlayDisconnect {
         let mut bytes = vec![0u8; remaining];
         buf.copy_to_slice(&mut bytes);
         Ok(Self { reason_nbt: bytes })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ExplosionBlockParticle {
+    pub particle_id: i32,
+    pub scaling: f32,
+    pub speed: f32,
+    pub weight: i32,
+}
+
+/// Packet-local outbound TNT subset of vanilla's explode packet.
+///
+/// Particle options are restricted to verified payload-free IDs, and the
+/// sound holder is reference-only. Decode support validates this same subset;
+/// inline sound holders are intentionally unsupported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundExplode {
+    pub center: EntityVec3,
+    pub radius: f32,
+    pub block_count: i32,
+    pub knockback: Option<EntityVec3>,
+    pub explosion_particle_id: i32,
+    /// Semantic registry ID for the reference-only sound-holder subset.
+    /// The wire value is this ID plus one; inline holders are unsupported here.
+    pub sound_reference_id: i32,
+    pub block_particles: Vec<ExplosionBlockParticle>,
+}
+
+fn validate_simple_explosion_particle_id(particle_id: i32) -> Result<i32, CodecError> {
+    // Vanilla 26.1.2 IDs verified for the current TNT packet shape:
+    // explosion_emitter=22, poof=59, smoke=62. These codecs have no payload.
+    match particle_id {
+        22 | 59 | 62 => Ok(particle_id),
+        _ => Err(CodecError::NotSupported(
+            "unsupported simple explosion particle id",
+        )),
+    }
+}
+
+fn write_explosion_sound_reference_holder<B: BufMut>(
+    buf: &mut B,
+    registry_id: i32,
+) -> Result<(), CodecError> {
+    let wire_id = registry_id
+        .checked_add(1)
+        .filter(|holder| *holder > 0)
+        .ok_or(CodecError::NotSupported(
+            "invalid explosion sound reference registry id",
+        ))?;
+    buf.write_varint(wire_id);
+    Ok(())
+}
+
+fn read_explosion_sound_reference_holder<B: Buf>(buf: &mut B) -> Result<i32, CodecError> {
+    let wire_id = buf.read_varint()?;
+    if wire_id == 0 {
+        return Err(CodecError::NotSupported("inline explosion sound holder"));
+    }
+    if wire_id < 0 {
+        return Err(CodecError::NotSupported(
+            "invalid explosion sound reference registry id",
+        ));
+    }
+    Ok(wire_id - 1)
+}
+
+impl Packet for ClientboundExplode {
+    // Vanilla 26.1.2 `CLIENTBOUND_EXPLODE` at game-CB index 36.
+    const ID: i32 = 0x24;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_vec3(buf, self.center);
+        buf.write_f32(self.radius);
+        buf.write_i32(self.block_count);
+        match self.knockback {
+            Some(knockback) => {
+                buf.write_bool(true);
+                write_vec3(buf, knockback);
+            }
+            None => buf.write_bool(false),
+        }
+        buf.write_varint(validate_simple_explosion_particle_id(
+            self.explosion_particle_id,
+        )?);
+        write_explosion_sound_reference_holder(buf, self.sound_reference_id)?;
+        write_bounded_count(
+            buf,
+            self.block_particles.len(),
+            MAX_EXPLOSION_BLOCK_PARTICLES,
+        )?;
+        for particle in &self.block_particles {
+            buf.write_varint(validate_simple_explosion_particle_id(particle.particle_id)?);
+            buf.write_f32(particle.scaling);
+            buf.write_f32(particle.speed);
+            if particle.weight < 0 {
+                return Err(CodecError::NotSupported(
+                    "negative explosion block particle weight",
+                ));
+            }
+            buf.write_varint(particle.weight);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let center = read_vec3(buf)?;
+        let radius = buf.read_f32()?;
+        let block_count = buf.read_i32()?;
+        let knockback = if buf.read_bool()? {
+            Some(read_vec3(buf)?)
+        } else {
+            None
+        };
+        let explosion_particle_id = validate_simple_explosion_particle_id(buf.read_varint()?)?;
+        let sound_reference_id = read_explosion_sound_reference_holder(buf)?;
+        let block_particle_count = read_count(buf, MAX_EXPLOSION_BLOCK_PARTICLES)?;
+        let mut block_particles = Vec::with_capacity(block_particle_count);
+        for _ in 0..block_particle_count {
+            let particle_id = validate_simple_explosion_particle_id(buf.read_varint()?)?;
+            let scaling = buf.read_f32()?;
+            let speed = buf.read_f32()?;
+            let weight = buf.read_varint()?;
+            if weight < 0 {
+                return Err(CodecError::NotSupported(
+                    "negative explosion block particle weight",
+                ));
+            }
+            block_particles.push(ExplosionBlockParticle {
+                particle_id,
+                scaling,
+                speed,
+                weight,
+            });
+        }
+        Ok(Self {
+            center,
+            radius,
+            block_count,
+            knockback,
+            explosion_particle_id,
+            sound_reference_id,
+            block_particles,
+        })
     }
 }
 
@@ -816,22 +988,25 @@ impl Packet for ClientboundSetHealth {
 
 impl Packet for ClientboundSetExperience {
     // Verified from `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_EXPERIENCE
-    // is game-CB index 103 = wire id 0x67. `javap` shows f32 progress,
-    // VarInt total experience, VarInt level.
+    // is game-CB index 103 = wire id 0x67. Vanilla 26.1.2 `javap -p -c`
+    // shows f32 progress, VarInt level, VarInt total experience.
     const ID: i32 = 0x67;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         buf.write_f32(self.experience_progress);
-        buf.write_varint(self.total_experience);
         buf.write_varint(self.experience_level);
+        buf.write_varint(self.total_experience);
         Ok(())
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let experience_progress = buf.read_f32()?;
+        let experience_level = buf.read_varint()?;
+        let total_experience = buf.read_varint()?;
         Ok(Self {
-            experience_progress: buf.read_f32()?,
-            total_experience: buf.read_varint()?,
-            experience_level: buf.read_varint()?,
+            experience_progress,
+            total_experience,
+            experience_level,
         })
     }
 }
@@ -1007,6 +1182,7 @@ impl PlayerInfoActions {
 pub struct PlayerInfoEntry {
     pub profile_id: Uuid,
     pub name: String,
+    pub properties: Vec<GameProfileProperty>,
     pub listed: bool,
     pub latency: i32,
     pub game_mode: i32,
@@ -1033,7 +1209,24 @@ impl Packet for PlayerInfoUpdate {
             buf.write_uuid(entry.profile_id);
             if self.actions.contains(PlayerInfoActions::ADD_PLAYER) {
                 buf.write_string(&entry.name, 16)?;
-                buf.write_varint(0);
+                if entry.properties.len() > MAX_GAME_PROFILE_PROPERTIES {
+                    return Err(CodecError::StringTooLong {
+                        len: entry.properties.len(),
+                        max: MAX_GAME_PROFILE_PROPERTIES,
+                    });
+                }
+                write_count(buf, entry.properties.len())?;
+                for property in &entry.properties {
+                    buf.write_string(&property.name, MAX_GAME_PROFILE_PROPERTY_NAME_LEN)?;
+                    buf.write_string(&property.value, MAX_GAME_PROFILE_PROPERTY_VALUE_LEN)?;
+                    match &property.signature {
+                        Some(signature) => {
+                            buf.write_bool(true);
+                            buf.write_string(signature, MAX_GAME_PROFILE_PROPERTY_SIGNATURE_LEN)?;
+                        }
+                        None => buf.write_bool(false),
+                    }
+                }
             }
             if self.actions.contains(PlayerInfoActions::INITIALIZE_CHAT) {
                 return Err(CodecError::NotSupported("player chat session data"));
@@ -1070,6 +1263,7 @@ impl Packet for PlayerInfoUpdate {
         for _ in 0..count {
             let profile_id = buf.read_uuid()?;
             let mut name = String::new();
+            let mut properties = Vec::new();
             let mut listed = false;
             let mut latency = 0;
             let mut game_mode = 0;
@@ -1077,9 +1271,21 @@ impl Packet for PlayerInfoUpdate {
             let mut show_hat = false;
             if actions.contains(PlayerInfoActions::ADD_PLAYER) {
                 name = buf.read_string(16)?;
-                let property_count = read_count(buf, 16)?;
-                if property_count != 0 {
-                    return Err(CodecError::NotSupported("game profile properties"));
+                let property_count = read_count(buf, MAX_GAME_PROFILE_PROPERTIES)?;
+                properties.reserve(property_count);
+                for _ in 0..property_count {
+                    let property_name = buf.read_string(MAX_GAME_PROFILE_PROPERTY_NAME_LEN)?;
+                    let value = buf.read_string(MAX_GAME_PROFILE_PROPERTY_VALUE_LEN)?;
+                    let signature = if buf.read_bool()? {
+                        Some(buf.read_string(MAX_GAME_PROFILE_PROPERTY_SIGNATURE_LEN)?)
+                    } else {
+                        None
+                    };
+                    properties.push(GameProfileProperty {
+                        name: property_name,
+                        value,
+                        signature,
+                    });
                 }
             }
             if actions.contains(PlayerInfoActions::INITIALIZE_CHAT) {
@@ -1109,6 +1315,7 @@ impl Packet for PlayerInfoUpdate {
             entries.push(PlayerInfoEntry {
                 profile_id,
                 name,
+                properties,
                 listed,
                 latency,
                 game_mode,
@@ -1455,6 +1662,7 @@ impl Packet for SetEntityMotion {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EntityDataValue {
     Byte { index: u8, value: i8 },
+    Boolean { index: u8, value: bool },
     ItemStack { index: u8, stack: ItemStack },
     Pose { index: u8, pose: EntityPose },
 }
@@ -1466,6 +1674,11 @@ impl EntityDataValue {
                 buf.write_u8(*index);
                 buf.write_varint(ENTITY_DATA_BYTE_SERIALIZER_ID);
                 buf.write_i8(*value);
+            }
+            Self::Boolean { index, value } => {
+                buf.write_u8(*index);
+                buf.write_varint(ENTITY_DATA_BOOLEAN_SERIALIZER_ID);
+                buf.write_bool(*value);
             }
             Self::ItemStack { index, stack } => {
                 buf.write_u8(*index);
@@ -1486,6 +1699,10 @@ impl EntityDataValue {
             ENTITY_DATA_BYTE_SERIALIZER_ID => Ok(Self::Byte {
                 index,
                 value: buf.read_i8()?,
+            }),
+            ENTITY_DATA_BOOLEAN_SERIALIZER_ID => Ok(Self::Boolean {
+                index,
+                value: buf.read_bool()?,
             }),
             ENTITY_DATA_ITEM_STACK_SERIALIZER_ID => Ok(Self::ItemStack {
                 index,
@@ -1650,6 +1867,41 @@ impl Packet for RemoveEntities {
             entity_ids.push(buf.read_varint()?);
         }
         Ok(Self { entity_ids })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundSetPassengers {
+    pub vehicle_id: i32,
+    pub passenger_ids: Vec<i32>,
+}
+
+impl Packet for ClientboundSetPassengers {
+    // Verified via `.analysis/protocol-dump.txt`: CLIENTBOUND_SET_PASSENGERS
+    // is game-CB index 107 = wire id 0x6B. Body is a vehicle VarInt followed
+    // by a VarInt-length-prefixed array of passenger entity VarInts.
+    const ID: i32 = 0x6B;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.vehicle_id);
+        write_bounded_count(buf, self.passenger_ids.len(), MAX_ENTITY_ID_LIST_LEN)?;
+        for passenger_id in &self.passenger_ids {
+            buf.write_varint(*passenger_id);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let vehicle_id = buf.read_varint()?;
+        let count = read_count(buf, MAX_ENTITY_ID_LIST_LEN)?;
+        let mut passenger_ids = Vec::with_capacity(count);
+        for _ in 0..count {
+            passenger_ids.push(buf.read_varint()?);
+        }
+        Ok(Self {
+            vehicle_id,
+            passenger_ids,
+        })
     }
 }
 
@@ -1963,6 +2215,42 @@ impl Packet for LevelChunkWithLight {
     }
 }
 
+/// `ClientboundLevelEventPacket` (CB). Vanilla uses this compact event
+/// channel for client-rendered world effects such as block destroy particles
+/// and their matching sound.
+///
+/// Verified against the local 26.1.2 source: raw `i32` event id, packed
+/// `BlockPos`, raw `i32` event data, then one global-event boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LevelEvent {
+    pub event_id: i32,
+    pub position: i64,
+    pub data: i32,
+    pub global: bool,
+}
+
+impl Packet for LevelEvent {
+    // CLIENTBOUND_LEVEL_EVENT at game-CB index 46 = wire id 0x2E.
+    const ID: i32 = 0x2E;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_i32(self.event_id);
+        buf.write_i64(self.position);
+        buf.write_i32(self.data);
+        buf.write_bool(self.global);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            event_id: buf.read_i32()?,
+            position: buf.read_i64()?,
+            data: buf.read_i32()?,
+            global: buf.read_bool()?,
+        })
+    }
+}
+
 /// `Set Center Chunk` (CB). Tells the client which chunk is the center
 /// of its view-distance window — the chunk it is "looking from". Every
 /// `LevelChunkWithLight` packet that follows is rendered relative to
@@ -2075,6 +2363,80 @@ impl Packet for ServerboundChatCommand {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             command: buf.read_string(MAX_COMMAND_LEN)?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerboundChat {
+    pub message: String,
+    pub timestamp_millis: i64,
+    pub salt: i64,
+    pub signature: Option<[u8; 256]>,
+    pub last_seen_offset: i32,
+    pub last_seen_acknowledged: [u8; LAST_SEEN_FIXED_BITSET_BYTES],
+    pub last_seen_checksum: i8,
+}
+
+impl Packet for ServerboundChat {
+    // Verified from `.analysis/protocol-dump.txt`: SERVERBOUND_CHAT is
+    // game-SB index 9 = wire id 0x09. Local decompiled
+    // `ServerboundChatPacket` reads UTF(256), Instant as epoch millis, salt,
+    // nullable MessageSignature (256 bytes), then LastSeenMessages.Update:
+    // VarInt offset, fixed 20-bit BitSet, and checksum byte.
+    const ID: i32 = 0x09;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_string(&self.message, MAX_CHAT_MESSAGE_LEN)?;
+        buf.write_i64(self.timestamp_millis);
+        buf.write_i64(self.salt);
+        match self.signature {
+            Some(signature) => {
+                buf.write_bool(true);
+                buf.put_slice(&signature);
+            }
+            None => buf.write_bool(false),
+        }
+        buf.write_varint(self.last_seen_offset);
+        buf.put_slice(&self.last_seen_acknowledged);
+        buf.write_i8(self.last_seen_checksum);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let message = buf.read_string(MAX_CHAT_MESSAGE_LEN)?;
+        let timestamp_millis = buf.read_i64()?;
+        let salt = buf.read_i64()?;
+        let signature = if buf.read_bool()? {
+            let mut signature = [0_u8; 256];
+            if buf.remaining() < signature.len() {
+                return Err(CodecError::Underflow {
+                    needed: signature.len() - buf.remaining(),
+                    available: buf.remaining(),
+                });
+            }
+            buf.copy_to_slice(&mut signature);
+            Some(signature)
+        } else {
+            None
+        };
+        let last_seen_offset = buf.read_varint()?;
+        let mut last_seen_acknowledged = [0_u8; LAST_SEEN_FIXED_BITSET_BYTES];
+        if buf.remaining() < last_seen_acknowledged.len() {
+            return Err(CodecError::Underflow {
+                needed: last_seen_acknowledged.len() - buf.remaining(),
+                available: buf.remaining(),
+            });
+        }
+        buf.copy_to_slice(&mut last_seen_acknowledged);
+        Ok(Self {
+            message,
+            timestamp_millis,
+            salt,
+            signature,
+            last_seen_offset,
+            last_seen_acknowledged,
+            last_seen_checksum: buf.read_i8()?,
         })
     }
 }
@@ -2371,7 +2733,7 @@ impl CommandNode {
                 buf.write_string(name, MAX_COMMAND_LEN)?;
                 parser.encode(buf);
                 if let Some(suggestions) = suggestions {
-                    buf.write_identifier(suggestions);
+                    buf.write_identifier(suggestions)?;
                 }
             }
         }
@@ -3558,6 +3920,8 @@ pub struct ItemStack {
     /// Narrow M23 component support: `minecraft:damage`, encoded as
     /// DataComponents registration id 3 with a VarInt integer payload.
     pub damage: Option<i32>,
+    /// `minecraft:enchantments`, encoded as a registry-id to level map.
+    pub enchantments: Vec<mc_data::ItemEnchantment>,
 }
 
 impl ItemStack {
@@ -3566,6 +3930,7 @@ impl ItemStack {
         count: 0,
         item_id: 0,
         damage: None,
+        enchantments: Vec::new(),
     };
 
     #[must_use]
@@ -3579,12 +3944,23 @@ impl ItemStack {
             count,
             item_id,
             damage: None,
+            enchantments: Vec::new(),
         }
     }
 
     #[must_use]
     pub fn with_damage(mut self, damage: i32) -> Self {
         self.damage = Some(damage.max(0));
+        self
+    }
+
+    #[must_use]
+    pub fn with_enchantment(mut self, id: Identifier, level: i32) -> Self {
+        self.enchantments.retain(|enchantment| enchantment.id != id);
+        self.enchantments
+            .push(mc_data::ItemEnchantment { id, level });
+        self.enchantments
+            .sort_unstable_by(|left, right| left.id.cmp(&right.id));
         self
     }
 
@@ -3595,11 +3971,28 @@ impl ItemStack {
         }
         buf.write_varint(self.count);
         buf.write_varint(self.item_id as i32);
-        buf.write_varint(i32::from(self.damage.is_some()));
+        let component_count =
+            i32::from(self.damage.is_some()) + i32::from(!self.enchantments.is_empty());
+        buf.write_varint(component_count);
         buf.write_varint(0);
         if let Some(damage) = self.damage {
             buf.write_varint(DATA_COMPONENT_DAMAGE_ID);
             buf.write_varint(damage);
+        }
+        if !self.enchantments.is_empty() {
+            buf.write_varint(DATA_COMPONENT_ENCHANTMENTS_ID);
+            write_count(buf, self.enchantments.len())?;
+            for enchantment in &self.enchantments {
+                let protocol_id =
+                    mc_data::required_registry_entry_id("enchantment", &enchantment.id).ok_or(
+                        CodecError::NotSupported("unknown enchantment registry entry"),
+                    )?;
+                if !(1..=255).contains(&enchantment.level) {
+                    return Err(CodecError::NotSupported("invalid enchantment level"));
+                }
+                buf.write_varint(protocol_id as i32);
+                buf.write_varint(enchantment.level);
+            }
         }
         Ok(())
     }
@@ -3615,26 +4008,57 @@ impl ItemStack {
         if n_add < 0 || n_remove < 0 {
             return Err(CodecError::NegativeLength(n_add.min(n_remove)));
         }
-        if n_add > 1 || n_remove != 0 {
+        if n_add > 2 || n_remove != 0 {
             return Err(CodecError::NotSupported(
                 "ItemStack with unsupported DataComponentPatch shape",
             ));
         }
-        let damage = if n_add == 1 {
+        let mut damage = None;
+        let mut enchantments = Vec::new();
+        for _ in 0..n_add {
             let component_id = buf.read_varint()?;
-            if component_id != DATA_COMPONENT_DAMAGE_ID {
-                return Err(CodecError::NotSupported(
-                    "ItemStack with unsupported DataComponentPatch component",
-                ));
+            match component_id {
+                DATA_COMPONENT_DAMAGE_ID if damage.is_none() => {
+                    damage = Some(buf.read_varint()?.max(0));
+                }
+                DATA_COMPONENT_ENCHANTMENTS_ID if enchantments.is_empty() => {
+                    let count = read_count(buf, 256)?;
+                    enchantments.reserve(count);
+                    for _ in 0..count {
+                        let protocol_id = buf.read_varint()?;
+                        let protocol_id = u32::try_from(protocol_id).map_err(|_| {
+                            CodecError::NotSupported("negative enchantment registry id")
+                        })?;
+                        let id = mc_data::required_registry_entry("enchantment", protocol_id)
+                            .ok_or(CodecError::NotSupported(
+                                "unknown enchantment registry entry",
+                            ))?;
+                        let level = buf.read_varint()?;
+                        if !(1..=255).contains(&level)
+                            || enchantments
+                                .iter()
+                                .any(|entry: &mc_data::ItemEnchantment| entry.id == id)
+                        {
+                            return Err(CodecError::NotSupported(
+                                "invalid ItemStack enchantments component",
+                            ));
+                        }
+                        enchantments.push(mc_data::ItemEnchantment { id, level });
+                    }
+                    enchantments.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+                }
+                _ => {
+                    return Err(CodecError::NotSupported(
+                        "ItemStack with unsupported DataComponentPatch component",
+                    ));
+                }
             }
-            Some(buf.read_varint()?.max(0))
-        } else {
-            None
-        };
+        }
         Ok(Self {
             count,
             item_id,
             damage,
+            enchantments,
         })
     }
 }
@@ -3994,6 +4418,31 @@ impl ContainerInput {
     }
 }
 
+/// `Serverbound Container Button Click` (SB). Vanilla 26.1.2 encodes the
+/// container id with `ContainerId.STREAM_CODEC`, followed by a VarInt button id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerboundContainerButtonClick {
+    pub container_id: i32,
+    pub button_id: i32,
+}
+
+impl Packet for ServerboundContainerButtonClick {
+    const ID: i32 = 0x11;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.container_id);
+        buf.write_varint(self.button_id);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            container_id: buf.read_varint()?,
+            button_id: buf.read_varint()?,
+        })
+    }
+}
+
 /// `Serverbound Container Click` (SB). Verified against the local vanilla 26.1.2 class:
 /// `ServerboundContainerClickPacket(int containerId, int stateId, short slotNum,
 /// byte buttonNum, ContainerInput containerInput, Int2ObjectMap<HashedStack>
@@ -4105,6 +4554,616 @@ impl Packet for ServerboundPlaceRecipe {
             container_id: buf.read_varint()?,
             recipe_display_id: buf.read_varint()?,
             use_max_items: buf.read_bool()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecipeBookTypeSettings {
+    pub is_open: bool,
+    pub is_filtering: bool,
+}
+
+/// Clientbound recipe-book UI settings. The local vanilla 26.1.2 codec writes
+/// one open/filtering boolean pair for each of the four recipe-book types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClientboundRecipeBookSettings {
+    pub crafting: RecipeBookTypeSettings,
+    pub furnace: RecipeBookTypeSettings,
+    pub blast_furnace: RecipeBookTypeSettings,
+    pub smoker: RecipeBookTypeSettings,
+}
+
+impl Packet for ClientboundRecipeBookSettings {
+    const ID: i32 = 0x4C;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        for settings in [self.crafting, self.furnace, self.blast_furnace, self.smoker] {
+            buf.write_bool(settings.is_open);
+            buf.write_bool(settings.is_filtering);
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let mut read_settings = || -> Result<RecipeBookTypeSettings, CodecError> {
+            Ok(RecipeBookTypeSettings {
+                is_open: buf.read_bool()?,
+                is_filtering: buf.read_bool()?,
+            })
+        };
+        Ok(Self {
+            crafting: read_settings()?,
+            furnace: read_settings()?,
+            blast_furnace: read_settings()?,
+            smoker: read_settings()?,
+        })
+    }
+}
+
+/// The slot-display variants Solaris emits in initial recipe-book entries.
+/// Registry ids are pinned to the bundled 26.1.2 `minecraft:slot_display`
+/// registry report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeBookSlotDisplay {
+    Empty,
+    AnyFuel,
+    Item { item_id: i32 },
+    ItemStack { item_id: i32, count: i32 },
+    Tag(Identifier),
+    Composite(Vec<RecipeBookSlotDisplay>),
+}
+
+impl RecipeBookSlotDisplay {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.encode_with_depth(buf, 0)
+    }
+
+    fn encode_with_depth<B: BufMut>(&self, buf: &mut B, depth: usize) -> Result<(), CodecError> {
+        if depth >= MAX_RECIPE_BOOK_SLOT_DEPTH {
+            return Err(CodecError::NotSupported(
+                "recipe-book slot display nesting is too deep",
+            ));
+        }
+        match self {
+            Self::Empty => buf.write_varint(0),
+            Self::AnyFuel => buf.write_varint(1),
+            Self::Item { item_id } => {
+                if *item_id < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe-book item registry id",
+                    ));
+                }
+                buf.write_varint(4);
+                buf.write_varint(*item_id);
+            }
+            Self::ItemStack { item_id, count } => {
+                if *item_id < 0 || *count <= 0 {
+                    return Err(CodecError::NotSupported("invalid recipe-book item stack"));
+                }
+                buf.write_varint(5);
+                buf.write_varint(*item_id);
+                buf.write_varint(*count);
+                // Recipe displays only need the default item component patch.
+                buf.write_varint(0);
+                buf.write_varint(0);
+            }
+            Self::Tag(tag) => {
+                buf.write_varint(6);
+                buf.write_identifier(tag)?;
+            }
+            Self::Composite(displays) => {
+                buf.write_varint(10);
+                write_bounded_count(buf, displays.len(), MAX_RECIPE_BOOK_SLOTS)?;
+                for display in displays {
+                    display.encode_with_depth(buf, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Self::decode_with_depth(buf, 0)
+    }
+
+    fn decode_with_depth<B: Buf>(buf: &mut B, depth: usize) -> Result<Self, CodecError> {
+        if depth >= MAX_RECIPE_BOOK_SLOT_DEPTH {
+            return Err(CodecError::NotSupported(
+                "recipe-book slot display nesting is too deep",
+            ));
+        }
+        match buf.read_varint()? {
+            0 => Ok(Self::Empty),
+            1 => Ok(Self::AnyFuel),
+            4 => {
+                let item_id = buf.read_varint()?;
+                if item_id < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe-book item registry id",
+                    ));
+                }
+                Ok(Self::Item { item_id })
+            }
+            5 => {
+                let item_id = buf.read_varint()?;
+                let count = buf.read_varint()?;
+                if item_id < 0 || count <= 0 {
+                    return Err(CodecError::NotSupported("invalid recipe-book item stack"));
+                }
+                let components_to_add = buf.read_varint()?;
+                let components_to_remove = buf.read_varint()?;
+                if components_to_add != 0 || components_to_remove != 0 {
+                    return Err(CodecError::NotSupported(
+                        "recipe-book item stack with component patch",
+                    ));
+                }
+                Ok(Self::ItemStack { item_id, count })
+            }
+            6 => Ok(Self::Tag(buf.read_identifier()?)),
+            10 => {
+                let count = read_count(buf, MAX_RECIPE_BOOK_SLOTS)?;
+                let mut displays = Vec::with_capacity(count);
+                for _ in 0..count {
+                    displays.push(Self::decode_with_depth(buf, depth + 1)?);
+                }
+                Ok(Self::Composite(displays))
+            }
+            _ => Err(CodecError::NotSupported(
+                "unsupported recipe-book slot display type",
+            )),
+        }
+    }
+}
+
+/// Vanilla's holder-set representation used by crafting requirements.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecipeBookIngredient {
+    Tag(Identifier),
+    Items(Vec<i32>),
+}
+
+/// One entry in the recipe-property-set map carried by
+/// `ClientboundUpdateRecipesPacket`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecipePropertySet {
+    pub key: Identifier,
+    pub item_ids: Vec<i32>,
+}
+
+/// One input/output offer in vanilla's stonecutter recipe set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StonecutterRecipeEntry {
+    pub input: RecipeBookIngredient,
+    pub result: RecipeBookSlotDisplay,
+}
+
+/// `ClientboundUpdateRecipesPacket` from the local vanilla 26.1.2 jar.
+///
+/// The first field is a map of recipe-property-set keys to item registry-id
+/// lists. The second is the stonecutter's single-input offer list. Solaris
+/// currently sends an empty property-set map and item-stack stonecutter
+/// displays, but the codec remains typed for both fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientboundUpdateRecipes {
+    pub item_sets: Vec<RecipePropertySet>,
+    pub stonecutter_recipes: Vec<StonecutterRecipeEntry>,
+}
+
+impl Packet for ClientboundUpdateRecipes {
+    // GameProtocols' bundle packet is wire id 0. UPDATE_RECIPES is the
+    // 133rd following clientbound registration, giving wire id 0x85.
+    const ID: i32 = 0x85;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_bounded_count(buf, self.item_sets.len(), MAX_RECIPE_BOOK_ENTRIES)?;
+        for item_set in &self.item_sets {
+            buf.write_identifier(&item_set.key)?;
+            write_bounded_count(
+                buf,
+                item_set.item_ids.len(),
+                MAX_RECIPE_BOOK_INGREDIENT_ITEMS,
+            )?;
+            for item_id in &item_set.item_ids {
+                if *item_id < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe property-set item registry id",
+                    ));
+                }
+                buf.write_varint(*item_id);
+            }
+        }
+        write_bounded_count(buf, self.stonecutter_recipes.len(), MAX_RECIPE_BOOK_ENTRIES)?;
+        for recipe in &self.stonecutter_recipes {
+            recipe.input.encode(buf)?;
+            recipe.result.encode(buf)?;
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let item_set_count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
+        let mut item_sets = Vec::with_capacity(item_set_count);
+        for _ in 0..item_set_count {
+            let key = buf.read_identifier()?;
+            let item_count = read_count(buf, MAX_RECIPE_BOOK_INGREDIENT_ITEMS)?;
+            let mut item_ids = Vec::with_capacity(item_count);
+            for _ in 0..item_count {
+                let item_id = buf.read_varint()?;
+                if item_id < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe property-set item registry id",
+                    ));
+                }
+                item_ids.push(item_id);
+            }
+            item_sets.push(RecipePropertySet { key, item_ids });
+        }
+
+        let recipe_count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
+        let mut stonecutter_recipes = Vec::with_capacity(recipe_count);
+        for _ in 0..recipe_count {
+            stonecutter_recipes.push(StonecutterRecipeEntry {
+                input: RecipeBookIngredient::decode(buf)?,
+                result: RecipeBookSlotDisplay::decode(buf)?,
+            });
+        }
+        Ok(Self {
+            item_sets,
+            stonecutter_recipes,
+        })
+    }
+}
+
+impl RecipeBookIngredient {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        match self {
+            Self::Tag(tag) => {
+                buf.write_varint(0);
+                buf.write_identifier(tag)?;
+            }
+            Self::Items(items) => {
+                if items.is_empty() {
+                    return Err(CodecError::NotSupported(
+                        "empty direct recipe-book ingredient",
+                    ));
+                }
+                if items.len() > MAX_RECIPE_BOOK_INGREDIENT_ITEMS {
+                    return Err(CodecError::StringTooLong {
+                        len: items.len(),
+                        max: MAX_RECIPE_BOOK_INGREDIENT_ITEMS,
+                    });
+                }
+                let marker =
+                    i32::try_from(items.len() + 1).map_err(|_| CodecError::StringTooLong {
+                        len: items.len(),
+                        max: i32::MAX as usize - 1,
+                    })?;
+                buf.write_varint(marker);
+                for item_id in items {
+                    if *item_id < 0 {
+                        return Err(CodecError::NotSupported(
+                            "negative recipe-book item registry id",
+                        ));
+                    }
+                    buf.write_varint(*item_id);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let marker = buf.read_varint()?;
+        if marker < 0 {
+            return Err(CodecError::NegativeLength(marker));
+        }
+        if marker == 0 {
+            return Ok(Self::Tag(buf.read_identifier()?));
+        }
+        let count = marker as usize - 1;
+        if count == 0 {
+            return Err(CodecError::NotSupported(
+                "empty direct recipe-book ingredient",
+            ));
+        }
+        if count > MAX_RECIPE_BOOK_INGREDIENT_ITEMS {
+            return Err(CodecError::StringTooLong {
+                len: count,
+                max: MAX_RECIPE_BOOK_INGREDIENT_ITEMS,
+            });
+        }
+        let mut items = Vec::with_capacity(count);
+        for _ in 0..count {
+            let item_id = buf.read_varint()?;
+            if item_id < 0 {
+                return Err(CodecError::NotSupported(
+                    "negative recipe-book item registry id",
+                ));
+            }
+            items.push(item_id);
+        }
+        Ok(Self::Items(items))
+    }
+}
+
+/// Recipe display variants currently backed by Solaris' recipe executor.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RecipeBookDisplay {
+    Shapeless {
+        ingredients: Vec<RecipeBookSlotDisplay>,
+        result: RecipeBookSlotDisplay,
+        crafting_station: RecipeBookSlotDisplay,
+    },
+    Shaped {
+        width: i32,
+        height: i32,
+        ingredients: Vec<RecipeBookSlotDisplay>,
+        result: RecipeBookSlotDisplay,
+        crafting_station: RecipeBookSlotDisplay,
+    },
+    Furnace {
+        ingredient: RecipeBookSlotDisplay,
+        fuel: RecipeBookSlotDisplay,
+        result: RecipeBookSlotDisplay,
+        crafting_station: RecipeBookSlotDisplay,
+        duration: i32,
+        experience: f32,
+    },
+}
+
+impl RecipeBookDisplay {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        match self {
+            Self::Shapeless {
+                ingredients,
+                result,
+                crafting_station,
+            } => {
+                buf.write_varint(0);
+                write_bounded_count(buf, ingredients.len(), MAX_RECIPE_BOOK_SLOTS)?;
+                for ingredient in ingredients {
+                    ingredient.encode(buf)?;
+                }
+                result.encode(buf)?;
+                crafting_station.encode(buf)?;
+            }
+            Self::Shaped {
+                width,
+                height,
+                ingredients,
+                result,
+                crafting_station,
+            } => {
+                let expected = recipe_book_shape_size(*width, *height)?;
+                if ingredients.len() != expected {
+                    return Err(CodecError::NotSupported(
+                        "recipe-book shaped ingredient count does not match dimensions",
+                    ));
+                }
+                buf.write_varint(1);
+                buf.write_varint(*width);
+                buf.write_varint(*height);
+                write_bounded_count(buf, ingredients.len(), MAX_RECIPE_BOOK_SLOTS)?;
+                for ingredient in ingredients {
+                    ingredient.encode(buf)?;
+                }
+                result.encode(buf)?;
+                crafting_station.encode(buf)?;
+            }
+            Self::Furnace {
+                ingredient,
+                fuel,
+                result,
+                crafting_station,
+                duration,
+                experience,
+            } => {
+                if *duration < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe-book cooking duration",
+                    ));
+                }
+                buf.write_varint(2);
+                ingredient.encode(buf)?;
+                fuel.encode(buf)?;
+                result.encode(buf)?;
+                crafting_station.encode(buf)?;
+                buf.write_varint(*duration);
+                buf.write_f32(*experience);
+            }
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        match buf.read_varint()? {
+            0 => {
+                let count = read_count(buf, MAX_RECIPE_BOOK_SLOTS)?;
+                let mut ingredients = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ingredients.push(RecipeBookSlotDisplay::decode(buf)?);
+                }
+                Ok(Self::Shapeless {
+                    ingredients,
+                    result: RecipeBookSlotDisplay::decode(buf)?,
+                    crafting_station: RecipeBookSlotDisplay::decode(buf)?,
+                })
+            }
+            1 => {
+                let width = buf.read_varint()?;
+                let height = buf.read_varint()?;
+                let expected = recipe_book_shape_size(width, height)?;
+                let count = read_count(buf, MAX_RECIPE_BOOK_SLOTS)?;
+                if count != expected {
+                    return Err(CodecError::NotSupported(
+                        "recipe-book shaped ingredient count does not match dimensions",
+                    ));
+                }
+                let mut ingredients = Vec::with_capacity(count);
+                for _ in 0..count {
+                    ingredients.push(RecipeBookSlotDisplay::decode(buf)?);
+                }
+                Ok(Self::Shaped {
+                    width,
+                    height,
+                    ingredients,
+                    result: RecipeBookSlotDisplay::decode(buf)?,
+                    crafting_station: RecipeBookSlotDisplay::decode(buf)?,
+                })
+            }
+            2 => {
+                let ingredient = RecipeBookSlotDisplay::decode(buf)?;
+                let fuel = RecipeBookSlotDisplay::decode(buf)?;
+                let result = RecipeBookSlotDisplay::decode(buf)?;
+                let crafting_station = RecipeBookSlotDisplay::decode(buf)?;
+                let duration = buf.read_varint()?;
+                if duration < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative recipe-book cooking duration",
+                    ));
+                }
+                Ok(Self::Furnace {
+                    ingredient,
+                    fuel,
+                    result,
+                    crafting_station,
+                    duration,
+                    experience: buf.read_f32()?,
+                })
+            }
+            _ => Err(CodecError::NotSupported(
+                "unsupported recipe-book display type",
+            )),
+        }
+    }
+}
+
+fn recipe_book_shape_size(width: i32, height: i32) -> Result<usize, CodecError> {
+    if width <= 0 || height <= 0 {
+        return Err(CodecError::NotSupported(
+            "non-positive recipe-book shaped dimensions",
+        ));
+    }
+    let size = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or(CodecError::NotSupported(
+            "recipe-book shaped dimensions overflow",
+        ))?;
+    if size > MAX_RECIPE_BOOK_SLOTS {
+        return Err(CodecError::StringTooLong {
+            len: size,
+            max: MAX_RECIPE_BOOK_SLOTS,
+        });
+    }
+    Ok(size)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecipeBookEntry {
+    pub display_id: i32,
+    pub display: RecipeBookDisplay,
+    pub group: Option<i32>,
+    pub category_id: i32,
+    pub crafting_requirements: Option<Vec<RecipeBookIngredient>>,
+    pub flags: u8,
+}
+
+impl RecipeBookEntry {
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.display_id < 0 || self.category_id < 0 {
+            return Err(CodecError::NotSupported(
+                "negative recipe-book display or category id",
+            ));
+        }
+        buf.write_varint(self.display_id);
+        self.display.encode(buf)?;
+        match self.group {
+            None => buf.write_varint(0),
+            Some(group) if (0..i32::MAX).contains(&group) => buf.write_varint(group + 1),
+            Some(_) => {
+                return Err(CodecError::NotSupported("invalid recipe-book group id"));
+            }
+        }
+        buf.write_varint(self.category_id);
+        match &self.crafting_requirements {
+            None => buf.write_bool(false),
+            Some(requirements) => {
+                buf.write_bool(true);
+                write_bounded_count(buf, requirements.len(), MAX_RECIPE_BOOK_REQUIREMENTS)?;
+                for requirement in requirements {
+                    requirement.encode(buf)?;
+                }
+            }
+        }
+        buf.write_u8(self.flags);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let display_id = buf.read_varint()?;
+        if display_id < 0 {
+            return Err(CodecError::NotSupported("negative recipe-book display id"));
+        }
+        let display = RecipeBookDisplay::decode(buf)?;
+        let group_marker = buf.read_varint()?;
+        if group_marker < 0 {
+            return Err(CodecError::NegativeLength(group_marker));
+        }
+        let group = (group_marker != 0).then_some(group_marker - 1);
+        let category_id = buf.read_varint()?;
+        if category_id < 0 {
+            return Err(CodecError::NotSupported("negative recipe-book category id"));
+        }
+        let crafting_requirements = if buf.read_bool()? {
+            let count = read_count(buf, MAX_RECIPE_BOOK_REQUIREMENTS)?;
+            let mut requirements = Vec::with_capacity(count);
+            for _ in 0..count {
+                requirements.push(RecipeBookIngredient::decode(buf)?);
+            }
+            Some(requirements)
+        } else {
+            None
+        };
+        Ok(Self {
+            display_id,
+            display,
+            group,
+            category_id,
+            crafting_requirements,
+            flags: buf.read_u8()?,
+        })
+    }
+}
+
+/// `ClientboundRecipeBookAddPacket` from the local vanilla 26.1.2 jar.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClientboundRecipeBookAdd {
+    pub entries: Vec<RecipeBookEntry>,
+    pub replace: bool,
+}
+
+impl Packet for ClientboundRecipeBookAdd {
+    const ID: i32 = 0x4A;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_bounded_count(buf, self.entries.len(), MAX_RECIPE_BOOK_ENTRIES)?;
+        for entry in &self.entries {
+            entry.encode(buf)?;
+        }
+        buf.write_bool(self.replace);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = read_count(buf, MAX_RECIPE_BOOK_ENTRIES)?;
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(RecipeBookEntry::decode(buf)?);
+        }
+        Ok(Self {
+            entries,
+            replace: buf.read_bool()?,
         })
     }
 }

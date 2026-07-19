@@ -134,6 +134,7 @@ async fn survival_break_mature_common_crops_drops_deterministic_items() {
             air_state_id,
             item_entity_type,
             sequence,
+            None,
             case.name,
             &mut drops,
         )
@@ -161,12 +162,14 @@ fn expected_crop_drops(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn break_crop_and_wait_for_drops(
     client: &mut Client,
     crop_pos: (i32, i32, i32),
     air_state_id: i32,
     item_entity_type: i32,
     start_sequence: i32,
+    stop_after_ticks: Option<i64>,
     case_name: &str,
     expected: &mut [ExpectedCropDrop],
 ) {
@@ -180,26 +183,30 @@ async fn break_crop_and_wait_for_drops(
         })
         .await
         .unwrap_or_else(|err| panic!("send {case_name} start break: {err}"));
-    read_ack_without_target_update(client, start_sequence, crop_pos).await;
-    tokio::time::sleep(Duration::from_millis(850)).await;
-
-    let stop_sequence = start_sequence + 1;
-    client
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StopDestroyBlock,
-            position: target_pos,
-            direction: Direction::Up,
-            sequence: stop_sequence,
-        })
-        .await
-        .unwrap_or_else(|err| panic!("send {case_name} stop break: {err}"));
+    let completion_sequence = if let Some(ticks) = stop_after_ticks {
+        read_ack_without_target_update(client, start_sequence, crop_pos).await;
+        wait_for_world_ticks(client, ticks).await;
+        let stop_sequence = start_sequence + 1;
+        client
+            .write_packet(&ServerboundPlayerAction {
+                action: PlayerActionKind::StopDestroyBlock,
+                position: target_pos,
+                direction: Direction::Up,
+                sequence: stop_sequence,
+            })
+            .await
+            .unwrap_or_else(|err| panic!("send {case_name} stop break: {err}"));
+        stop_sequence
+    } else {
+        start_sequence
+    };
 
     wait_for_crop_harvest_drops(
         client,
         crop_pos,
         air_state_id,
         item_entity_type,
-        stop_sequence,
+        completion_sequence,
         case_name,
         expected,
     )

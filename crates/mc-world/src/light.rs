@@ -35,12 +35,16 @@
 
 use std::collections::{HashMap, VecDeque};
 
+#[cfg(target_endian = "little")]
+use bytemuck::cast;
 use mc_data::block_light::BlockLightTable;
+#[cfg(target_endian = "little")]
+use wide::{i16x8, u8x16, u16x8};
 
 use crate::block::BlockStateId;
 use crate::chunk::{
-    Chunk, ChunkPos, LIGHT_LAYER_BYTES, MAX_Y, MIN_Y, SECTION_COUNT, SectionLight,
-    heightmap_value_to_world_y, top_opaque_column,
+    Chunk, ChunkGeometry, ChunkPos, LIGHT_LAYER_BYTES, MIN_Y, OVERWORLD_GEOMETRY, SECTION_COUNT,
+    SectionLight, top_opaque_column,
 };
 use crate::section::{SECTION_DIM, SECTION_VOLUME};
 
@@ -53,43 +57,66 @@ const N_X: usize = SECTION_DIM * 3;
 const N_Z: usize = SECTION_DIM * 3;
 const N_VOL: usize = N_X * WORLD_HEIGHT * N_Z;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LightKernelBackend {
+    Scalar,
+    PortableSimd,
+}
+
+impl LightKernelBackend {
+    fn configured() -> Self {
+        match std::env::var("SOLARIS_SIMD_BACKEND").as_deref() {
+            Ok("portable") => Self::PortableSimd,
+            _ => Self::Scalar,
+        }
+    }
+}
+
 /// One light channel for a chunk, stored as lazy per-section nibble
 /// arrays. Missing sections are all-zero; present sections are already
 /// in the 2048-byte vanilla nibble layout, low nibble first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LightLayer {
-    sections: [Option<Box<[u8; crate::chunk::LIGHT_LAYER_BYTES]>>; SECTION_COUNT],
-    nonzero_nibbles: [u16; SECTION_COUNT],
+    sections: Vec<Option<Box<[u8; crate::chunk::LIGHT_LAYER_BYTES]>>>,
+    nonzero_nibbles: Vec<u16>,
 }
 
 impl LightLayer {
     #[must_use]
     pub fn zeroed() -> Self {
+        Self::zeroed_for_sections(SECTION_COUNT)
+    }
+
+    fn zeroed_for_sections(section_count: usize) -> Self {
         Self {
-            sections: std::array::from_fn(|_| None),
-            nonzero_nibbles: [0; SECTION_COUNT],
+            sections: (0..section_count).map(|_| None).collect(),
+            nonzero_nibbles: vec![0; section_count],
         }
     }
 
     #[must_use]
     pub fn filled(value: u8) -> Self {
+        Self::filled_for_sections(value, SECTION_COUNT)
+    }
+
+    fn filled_for_sections(value: u8, section_count: usize) -> Self {
         debug_assert!(value <= 15);
         if value == 0 {
-            return Self::zeroed();
+            return Self::zeroed_for_sections(section_count);
         }
         let packed = value | (value << 4);
         Self {
-            sections: std::array::from_fn(|_| {
-                Some(Box::new([packed; crate::chunk::LIGHT_LAYER_BYTES]))
-            }),
-            nonzero_nibbles: [SECTION_VOLUME as u16; SECTION_COUNT],
+            sections: (0..section_count)
+                .map(|_| Some(Box::new([packed; crate::chunk::LIGHT_LAYER_BYTES])))
+                .collect(),
+            nonzero_nibbles: vec![SECTION_VOLUME as u16; section_count],
         }
     }
 
     #[must_use]
     pub fn get(&self, x: usize, local_y: usize, z: usize) -> u8 {
         debug_assert!(x < SECTION_DIM);
-        debug_assert!(local_y < WORLD_HEIGHT);
+        debug_assert!(local_y < self.sections.len() * SECTION_DIM);
         debug_assert!(z < SECTION_DIM);
         let section_idx = local_y / SECTION_DIM;
         let Some(layer) = self.sections[section_idx].as_ref() else {
@@ -100,7 +127,7 @@ impl LightLayer {
 
     pub fn set(&mut self, x: usize, local_y: usize, z: usize, value: u8) {
         debug_assert!(x < SECTION_DIM);
-        debug_assert!(local_y < WORLD_HEIGHT);
+        debug_assert!(local_y < self.sections.len() * SECTION_DIM);
         debug_assert!(z < SECTION_DIM);
         debug_assert!(value <= 15);
         let section_idx = local_y / SECTION_DIM;
@@ -127,12 +154,15 @@ impl LightLayer {
 
     #[must_use]
     pub fn section(&self, section_idx: usize) -> Option<&[u8; crate::chunk::LIGHT_LAYER_BYTES]> {
-        debug_assert!(section_idx < SECTION_COUNT);
-        self.sections[section_idx].as_deref()
+        self.sections.get(section_idx)?.as_deref()
+    }
+
+    pub(crate) fn section_count(&self) -> usize {
+        self.sections.len()
     }
 
     fn set_section_from_slice(&mut self, section_idx: usize, bytes: &[u8]) -> bool {
-        if section_idx >= SECTION_COUNT || bytes.len() != LIGHT_LAYER_BYTES {
+        if section_idx >= self.sections.len() || bytes.len() != LIGHT_LAYER_BYTES {
             return false;
         }
         let nonzero_nibbles = bytes
@@ -158,6 +188,7 @@ impl LightLayer {
 pub struct ChunkLight {
     pub sky: LightLayer,
     pub block: LightLayer,
+    min_y: i32,
 }
 
 impl ChunkLight {
@@ -165,25 +196,63 @@ impl ChunkLight {
     /// invoking the engine.
     #[must_use]
     pub fn zeroed() -> Self {
+        Self::zeroed_for_sections(SECTION_COUNT)
+    }
+
+    fn zeroed_for_sections(section_count: usize) -> Self {
         Self {
-            sky: LightLayer::zeroed(),
-            block: LightLayer::zeroed(),
+            sky: LightLayer::zeroed_for_sections(section_count),
+            block: LightLayer::zeroed_for_sections(section_count),
+            min_y: MIN_Y,
+        }
+    }
+
+    fn zeroed_for_geometry(geometry: ChunkGeometry) -> Self {
+        Self {
+            sky: LightLayer::zeroed_for_sections(geometry.section_count()),
+            block: LightLayer::zeroed_for_sections(geometry.section_count()),
+            min_y: geometry.min_y(),
         }
     }
 
     #[must_use]
     pub fn filled(sky: u8, block: u8) -> Self {
+        Self::filled_for_geometry(sky, block, OVERWORLD_GEOMETRY)
+    }
+
+    fn filled_for_geometry(sky: u8, block: u8, geometry: ChunkGeometry) -> Self {
         Self {
-            sky: LightLayer::filled(sky),
-            block: LightLayer::filled(block),
+            sky: LightLayer::filled_for_sections(sky, geometry.section_count()),
+            block: LightLayer::filled_for_sections(block, geometry.section_count()),
+            min_y: geometry.min_y(),
         }
     }
 
+    /// Rebuild baked light with the legacy Overworld Y origin.
+    /// Use [`Self::from_chunk`] whenever the owning chunk is available.
     #[must_use]
     pub fn from_section_lights(section_lights: &[SectionLight]) -> Option<Self> {
-        let mut out = Self::zeroed();
+        Self::from_section_lights_into(
+            section_lights,
+            Self::zeroed_for_sections(section_lights.len()),
+        )
+    }
+
+    /// Rebuild baked light using the owning chunk's geometry.
+    #[must_use]
+    pub fn from_chunk(chunk: &Chunk) -> Option<Self> {
+        if chunk.section_lights.len() != chunk.geometry().section_count() {
+            return None;
+        }
+        Self::from_section_lights_into(
+            &chunk.section_lights,
+            Self::zeroed_for_geometry(chunk.geometry()),
+        )
+    }
+
+    fn from_section_lights_into(section_lights: &[SectionLight], mut out: Self) -> Option<Self> {
         let mut any = false;
-        for (section_idx, section) in section_lights.iter().enumerate().take(SECTION_COUNT) {
+        for (section_idx, section) in section_lights.iter().enumerate() {
             if let Some(sky) = &section.sky {
                 if !out.sky.set_section_from_slice(section_idx, sky) {
                     return None;
@@ -201,21 +270,26 @@ impl ChunkLight {
     }
 
     pub(crate) fn write_section_lights(&self, section_lights: &mut [SectionLight]) {
-        for (section_idx, section) in section_lights.iter_mut().enumerate().take(SECTION_COUNT) {
+        for (section_idx, section) in section_lights.iter_mut().enumerate() {
             section.sky = self.sky.section(section_idx).map(|layer| layer.to_vec());
             section.block = self.block.section(section_idx).map(|layer| layer.to_vec());
         }
     }
 
+    pub(crate) fn section_count(&self) -> usize {
+        debug_assert_eq!(self.sky.section_count(), self.block.section_count());
+        self.sky.section_count()
+    }
+
     #[must_use]
     pub fn sky_at(&self, x: u8, y: i32, z: u8) -> u8 {
-        let local_y = (y - MIN_Y) as usize;
+        let local_y = (y - self.min_y) as usize;
         self.sky.get(x as usize, local_y, z as usize)
     }
 
     #[must_use]
     pub fn block_at(&self, x: u8, y: i32, z: u8) -> u8 {
-        let local_y = (y - MIN_Y) as usize;
+        let local_y = (y - self.min_y) as usize;
         self.block.get(x as usize, local_y, z as usize)
     }
 
@@ -256,28 +330,45 @@ fn set_nibble(layer: &mut [u8; crate::chunk::LIGHT_LAYER_BYTES], cell: usize, va
 /// Build one per connection (or one per `emit_chunks_around` call)
 /// and pass it into [`compute_chunk_light`].
 pub struct LightWorkspace {
+    geometry: ChunkGeometry,
     sky: Vec<u8>,
     block: Vec<u8>,
     opacity: Vec<u8>,
     propagates_sky: Vec<bool>,
     queue: VecDeque<u32>,
     emitters: Vec<u32>,
+    kernel_backend: LightKernelBackend,
 }
 
 impl LightWorkspace {
     #[must_use]
     pub fn new() -> Self {
+        Self::with_backend(LightKernelBackend::configured())
+    }
+
+    #[must_use]
+    pub fn with_backend(kernel_backend: LightKernelBackend) -> Self {
         Self {
+            geometry: OVERWORLD_GEOMETRY,
             sky: vec![0; N_VOL],
             block: vec![0; N_VOL],
             opacity: vec![0; N_VOL],
             propagates_sky: vec![true; N_VOL],
             queue: VecDeque::new(),
             emitters: Vec::new(),
+            kernel_backend,
         }
     }
 
-    fn reset(&mut self) {
+    fn reset_for_geometry(&mut self, geometry: ChunkGeometry) {
+        let volume = grid_volume(geometry.height() as usize);
+        if self.geometry != geometry {
+            self.geometry = geometry;
+            self.sky.resize(volume, 0);
+            self.block.resize(volume, 0);
+            self.opacity.resize(volume, 0);
+            self.propagates_sky.resize(volume, true);
+        }
         self.sky.fill(0);
         self.block.fill(0);
         self.opacity.fill(0);
@@ -391,7 +482,8 @@ pub fn apply_block_change_to_light(
 ) -> Vec<ChunkPos> {
     debug_assert!(local_x < SECTION_DIM as u8);
     debug_assert!(local_z < SECTION_DIM as u8);
-    debug_assert!((MIN_Y..MAX_Y).contains(&world_y));
+    let geometry = shared_neighbourhood_geometry(chunks);
+    debug_assert!((geometry.min_y()..geometry.max_y()).contains(&world_y));
 
     let prev_emit = table.emission(prev_state.0).unwrap_or(0);
     let new_emit = table.emission(new_state.0).unwrap_or(0);
@@ -417,7 +509,7 @@ pub fn apply_block_change_to_light(
 
     let world_x = centre_pos.x * SECTION_DIM as i32 + local_x as i32;
     let world_z = centre_pos.z * SECTION_DIM as i32 + local_z as i32;
-    let Some(edit_coord) = world_to_window(centre_pos, world_x, world_y, world_z) else {
+    let Some(edit_coord) = world_to_window(centre_pos, geometry, world_x, world_y, world_z) else {
         return Vec::new();
     };
 
@@ -432,6 +524,7 @@ pub fn apply_block_change_to_light(
         world_z,
         new_op,
         new_emit,
+        geometry,
     );
 
     if prev_op != new_op || prev_sky_pass != new_sky_pass {
@@ -456,6 +549,7 @@ pub fn apply_block_change_to_light(
             new_sky_pass,
             new_op,
             reseed_column,
+            geometry,
         );
     }
 
@@ -477,13 +571,19 @@ pub fn apply_block_change_to_light(
     touched
 }
 
-/// Window-local coordinate inside the 48×384×48 incremental relight
+/// Window-local coordinate inside the 48×height×48 incremental relight
 /// volume: `(gx, ly, gz)` where gx/gz include the 3×3 chunk offset.
 type WCoord = (usize, usize, usize);
 
 #[inline]
-fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WCoord> {
-    if !(MIN_Y..MAX_Y).contains(&wy) {
+fn world_to_window(
+    centre_pos: ChunkPos,
+    geometry: ChunkGeometry,
+    wx: i32,
+    wy: i32,
+    wz: i32,
+) -> Option<WCoord> {
+    if !(geometry.min_y()..geometry.max_y()).contains(&wy) {
         return None;
     }
     let cx = wx.div_euclid(SECTION_DIM as i32);
@@ -495,7 +595,7 @@ fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WC
     }
     let lx = wx.rem_euclid(SECTION_DIM as i32) as usize;
     let lz = wz.rem_euclid(SECTION_DIM as i32) as usize;
-    let ly = (wy - MIN_Y) as usize;
+    let ly = (wy - geometry.min_y()) as usize;
     let gx = (dx + 1) as usize * SECTION_DIM + lx;
     let gz = (dz + 1) as usize * SECTION_DIM + lz;
     Some((gx, ly, gz))
@@ -505,7 +605,7 @@ fn world_to_window(centre_pos: ChunkPos, wx: i32, wy: i32, wz: i32) -> Option<WC
 fn pack_light_queue_entry(coord: WCoord, level: u8) -> u64 {
     let (gx, ly, gz) = coord;
     debug_assert!(gx < N_X);
-    debug_assert!(ly < WORLD_HEIGHT);
+    debug_assert!(ly <= 0x01ff);
     debug_assert!(gz < N_Z);
     debug_assert!(level <= 15);
 
@@ -522,17 +622,16 @@ fn unpack_light_queue_entry(packed: u64) -> (WCoord, u8) {
 }
 
 #[inline]
-fn neighbour_coord(coord: WCoord, delta: (i32, i32, i32)) -> Option<WCoord> {
+fn neighbour_coord(
+    coord: WCoord,
+    delta: (i32, i32, i32),
+    geometry: ChunkGeometry,
+) -> Option<WCoord> {
     let (gx, ly, gz) = coord;
     let nx = gx as i32 + delta.0;
     let ny = ly as i32 + delta.1;
     let nz = gz as i32 + delta.2;
-    if nx < 0
-        || nx >= N_X as i32
-        || ny < 0
-        || ny >= WORLD_HEIGHT as i32
-        || nz < 0
-        || nz >= N_Z as i32
+    if nx < 0 || nx >= N_X as i32 || ny < 0 || ny >= geometry.height() || nz < 0 || nz >= N_Z as i32
     {
         return None;
     }
@@ -560,13 +659,14 @@ fn opacity_at_coord(
     chunks: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
     coord: WCoord,
+    geometry: ChunkGeometry,
 ) -> u8 {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
     let Some(chunk) = chunks[dz][dx] else {
         return 0;
     };
     let state = chunk
-        .get_block(lx as u8, MIN_Y + ly as i32, lz as u8)
+        .get_block(lx as u8, geometry.min_y() + ly as i32, lz as u8)
         .unwrap_or(BlockStateId(0));
     table.opacity(state.0).unwrap_or(0)
 }
@@ -576,13 +676,14 @@ fn propagates_sky_at_coord(
     chunks: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
     coord: WCoord,
+    geometry: ChunkGeometry,
 ) -> bool {
     let (dx, dz, lx, ly, lz) = coord_parts(coord);
     let Some(chunk) = chunks[dz][dx] else {
         return true;
     };
     let state = chunk
-        .get_block(lx as u8, MIN_Y + ly as i32, lz as u8)
+        .get_block(lx as u8, geometry.min_y() + ly as i32, lz as u8)
         .unwrap_or(BlockStateId(0));
     table.propagates_sky(state.0).unwrap_or(true)
 }
@@ -651,7 +752,10 @@ fn highest_opaque_changed(
 
     let (dx, dz, lx, _ly, lz) = coord_parts(edit_coord);
     let post_top = chunks[dz][dx].and_then(|chunk| {
-        heightmap_value_to_world_y(top_opaque_column(chunk, lx as u8, lz as u8, table))
+        heightmap_value_to_world_y_for_geometry(
+            chunk.geometry(),
+            top_opaque_column(chunk, lx as u8, lz as u8, table),
+        )
     });
 
     match (!prev_sky_pass, !new_sky_pass) {
@@ -679,8 +783,9 @@ fn incremental_block_light(
     world_z: i32,
     new_op: u8,
     new_emit: u8,
+    geometry: ChunkGeometry,
 ) {
-    let edit_coord = match world_to_window(centre_pos, world_x, world_y, world_z) {
+    let edit_coord = match world_to_window(centre_pos, geometry, world_x, world_y, world_z) {
         Some(c) => c,
         None => return,
     };
@@ -703,7 +808,7 @@ fn incremental_block_light(
     // propagating *through* the edit cell may now be wrong if opacity
     // changed.
     for delta in NEIGHBOURS {
-        if let Some(coord) = neighbour_coord(edit_coord, delta) {
+        if let Some(coord) = neighbour_coord(edit_coord, delta, geometry) {
             relight.push_back(pack_light_queue_entry(coord, 0));
         }
     }
@@ -711,7 +816,7 @@ fn incremental_block_light(
     while let Some(packed) = removal.pop_front() {
         let (coord, prev_val) = unpack_light_queue_entry(packed);
         for delta in NEIGHBOURS {
-            let Some(ncoord) = neighbour_coord(coord, delta) else {
+            let Some(ncoord) = neighbour_coord(coord, delta, geometry) else {
                 continue;
             };
             if !window_slot_is_some(window, ncoord) {
@@ -729,7 +834,7 @@ fn incremental_block_light(
                 relight.push_back(pack_light_queue_entry(ncoord, n_val));
                 continue;
             }
-            let n_op = opacity_at_coord(chunks, table, ncoord);
+            let n_op = opacity_at_coord(chunks, table, ncoord, geometry);
             let cost = n_op.max(1);
             if n_val == prev_val.saturating_sub(cost) {
                 set_block_light(window, changed, ncoord, 0);
@@ -752,7 +857,7 @@ fn incremental_block_light(
         }
         let best_propagated = cur - 1;
         for delta in NEIGHBOURS {
-            let Some(ncoord) = neighbour_coord(coord, delta) else {
+            let Some(ncoord) = neighbour_coord(coord, delta, geometry) else {
                 continue;
             };
             if !window_slot_is_some(window, ncoord) {
@@ -763,7 +868,7 @@ fn incremental_block_light(
             if block_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
-            let n_op = opacity_at_coord(chunks, table, ncoord);
+            let n_op = opacity_at_coord(chunks, table, ncoord, geometry);
             let cost = n_op.max(1);
             let propagated = cur.saturating_sub(cost);
             if propagated > block_light_at(window, ncoord) {
@@ -797,8 +902,9 @@ fn incremental_sky_light(
     new_sky_pass: bool,
     new_op: u8,
     reseed_column: bool,
+    geometry: ChunkGeometry,
 ) {
-    let edit_coord = match world_to_window(centre_pos, world_x, world_y, world_z) {
+    let edit_coord = match world_to_window(centre_pos, geometry, world_x, world_y, world_z) {
         Some(c) => c,
         None => return,
     };
@@ -816,9 +922,9 @@ fn incremental_sky_light(
     let new_self = if new_sky_pass {
         let mut all_open = true;
         let (gx, edit_ly, gz) = edit_coord;
-        for ly in edit_ly + 1..WORLD_HEIGHT {
+        for ly in edit_ly + 1..geometry.height() as usize {
             let coord = (gx, ly, gz);
-            if !propagates_sky_at_coord(chunks, table, coord) {
+            if !propagates_sky_at_coord(chunks, table, coord, geometry) {
                 all_open = false;
                 break;
             }
@@ -839,7 +945,7 @@ fn incremental_sky_light(
 
     // Column propagation: if propagates_sky flipped at the edit cell,
     // cells *below* may need their 15-status recomputed (they were
-    // direct-sky if and only if every cell from MAX_Y down to them
+    // direct-sky if and only if every cell from the geometry ceiling down to them
     // propagates sky). Walk down from the edit cell, updating each
     // cell's sky to 15 if the column is now open, or to 0 if it just
     // closed; queue removal/relight accordingly. Stop at the first
@@ -853,7 +959,7 @@ fn incremental_sky_light(
             if !window_slot_is_some(window, coord) {
                 break;
             }
-            let cell_passes = propagates_sky_at_coord(chunks, table, coord);
+            let cell_passes = propagates_sky_at_coord(chunks, table, coord, geometry);
             if !cell_passes {
                 break;
             }
@@ -883,7 +989,7 @@ fn incremental_sky_light(
     // Edit-cell neighbours always candidate seeds — sky pushed
     // through the edit cell may now be wrong.
     for delta in NEIGHBOURS {
-        if let Some(coord) = neighbour_coord(edit_coord, delta) {
+        if let Some(coord) = neighbour_coord(edit_coord, delta, geometry) {
             relight.push_back(pack_light_queue_entry(coord, 0));
         }
     }
@@ -891,7 +997,7 @@ fn incremental_sky_light(
     while let Some(packed) = removal.pop_front() {
         let (coord, prev_val) = unpack_light_queue_entry(packed);
         for delta in NEIGHBOURS {
-            let Some(ncoord) = neighbour_coord(coord, delta) else {
+            let Some(ncoord) = neighbour_coord(coord, delta, geometry) else {
                 continue;
             };
             if !window_slot_is_some(window, ncoord) {
@@ -901,7 +1007,7 @@ fn incremental_sky_light(
             if n_val == 0 {
                 continue;
             }
-            let n_op = opacity_at_coord(chunks, table, ncoord);
+            let n_op = opacity_at_coord(chunks, table, ncoord, geometry);
             let cost = n_op.max(1);
             // Sky vertical-down cost is 0 when the source was at 15
             // and the neighbour passes sky — that's the "direct sky
@@ -930,7 +1036,7 @@ fn incremental_sky_light(
         }
         let best_propagated = cur - 1;
         for delta in NEIGHBOURS {
-            let Some(ncoord) = neighbour_coord(coord, delta) else {
+            let Some(ncoord) = neighbour_coord(coord, delta, geometry) else {
                 continue;
             };
             if !window_slot_is_some(window, ncoord) {
@@ -939,7 +1045,7 @@ fn incremental_sky_light(
             if sky_light_at(window, ncoord) >= best_propagated {
                 continue;
             }
-            let n_op = opacity_at_coord(chunks, table, ncoord);
+            let n_op = opacity_at_coord(chunks, table, ncoord, geometry);
             let cost = n_op.max(1);
             let propagated = cur.saturating_sub(cost);
             if propagated > sky_light_at(window, ncoord) {
@@ -977,6 +1083,7 @@ pub fn compute_chunk_light_in(
         neighbourhood[1][1].is_some(),
         "centre chunk must be present",
     );
+    let geometry = shared_neighbourhood_geometry(&neighbourhood);
 
     // Fast path: if every chunk in the 3×3 neighbourhood is fully
     // air (single-state air sections, no biome variation needed for
@@ -986,24 +1093,40 @@ pub fn compute_chunk_light_in(
     // skipping their BFS turns the spawn burst from ~30 s to a few
     // seconds in debug builds.
     if is_all_air_neighbourhood(&neighbourhood) {
-        return ChunkLight::filled(15, 0);
+        return ChunkLight::filled_for_geometry(15, 0, geometry);
     }
 
-    if let Some(light) = compute_columnar_no_emitter_light(&neighbourhood, table) {
+    if let Some(light) = compute_columnar_no_emitter_light(&neighbourhood, table, geometry) {
         return light;
     }
 
-    compute_chunk_light_slow_in(ws, neighbourhood, table)
+    compute_chunk_light_slow_in(ws, neighbourhood, table, geometry)
+}
+
+fn shared_neighbourhood_geometry(neighbourhood: &[[Option<&Chunk>; 3]; 3]) -> ChunkGeometry {
+    let geometry = neighbourhood[1][1]
+        .expect("centre chunk must be present")
+        .geometry();
+    for chunk in neighbourhood.iter().flatten().flatten() {
+        assert_eq!(
+            chunk.geometry(),
+            geometry,
+            "lighting neighbourhood chunks must share geometry",
+        );
+    }
+    geometry
 }
 
 fn compute_chunk_light_slow_in(
     ws: &mut LightWorkspace,
     neighbourhood: [[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
+    geometry: ChunkGeometry,
 ) -> ChunkLight {
     debug_assert!(neighbourhood[1][1].is_some());
 
-    ws.reset();
+    ws.reset_for_geometry(geometry);
+    let world_height = geometry.height() as usize;
 
     populate_grids(
         &neighbourhood,
@@ -1014,37 +1137,39 @@ fn compute_chunk_light_slow_in(
         &mut ws.emitters,
     );
 
-    seed_sky_from_open_columns(&ws.propagates_sky, &mut ws.sky, &mut ws.queue);
-    bfs(&ws.opacity, &mut ws.sky, &mut ws.queue);
+    seed_sky_from_open_columns(&ws.propagates_sky, &mut ws.sky, &mut ws.queue, world_height);
+    bfs(&ws.opacity, &mut ws.sky, &mut ws.queue, world_height);
 
     if !ws.emitters.is_empty() {
         ws.queue.extend(ws.emitters.iter().copied());
-        bfs(&ws.opacity, &mut ws.block, &mut ws.queue);
+        bfs(&ws.opacity, &mut ws.block, &mut ws.queue, world_height);
     }
 
-    extract_centre(&ws.sky, &ws.block)
+    extract_centre_with_backend(&ws.sky, &ws.block, ws.kernel_backend, geometry)
 }
 
 fn compute_columnar_no_emitter_light(
     neighbourhood: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
+    geometry: ChunkGeometry,
 ) -> Option<ChunkLight> {
-    if !neighbourhood_is_columnar_without_emitters(neighbourhood, table) {
+    if !neighbourhood_is_columnar_without_emitters(neighbourhood, table, geometry) {
         return None;
     }
 
     let centre = neighbourhood[1][1]?;
     let air = BlockStateId(0);
-    let mut out = ChunkLight::zeroed();
+    let world_height = geometry.height() as usize;
+    let mut out = ChunkLight::zeroed_for_geometry(geometry);
     for lz in 0..SECTION_DIM {
         for lx in 0..SECTION_DIM {
             if let Some(top_y) = columnar_top_hint(centre, lx as u8, lz as u8) {
-                for ly in ((top_y + 1 - MIN_Y) as usize)..WORLD_HEIGHT {
+                for ly in ((top_y + 1 - geometry.min_y()) as usize)..world_height {
                     out.set_sky_local(lx, ly, lz, 15);
                 }
             } else {
-                for ly in (0..WORLD_HEIGHT).rev() {
-                    let world_y = MIN_Y + ly as i32;
+                for ly in (0..world_height).rev() {
+                    let world_y = geometry.min_y() + ly as i32;
                     let state = centre.get_block(lx as u8, world_y, lz as u8).unwrap_or(air);
                     if table.propagates_sky(state.0).unwrap_or(true) {
                         out.set_sky_local(lx, ly, lz, 15);
@@ -1061,6 +1186,7 @@ fn compute_columnar_no_emitter_light(
 fn neighbourhood_is_columnar_without_emitters(
     neighbourhood: &[[Option<&Chunk>; 3]; 3],
     table: &BlockLightTable,
+    geometry: ChunkGeometry,
 ) -> bool {
     let air = BlockStateId(0);
     for row in neighbourhood {
@@ -1080,8 +1206,7 @@ fn neighbourhood_is_columnar_without_emitters(
                     }
 
                     let mut blocked = false;
-                    for ly in (0..WORLD_HEIGHT).rev() {
-                        let world_y = MIN_Y + ly as i32;
+                    for world_y in (geometry.min_y()..geometry.max_y()).rev() {
                         let state = chunk.get_block(lx as u8, world_y, lz as u8).unwrap_or(air);
                         if table.emission(state.0).unwrap_or(0) > 0 {
                             return false;
@@ -1111,8 +1236,12 @@ fn columnar_top_hint(chunk: &Chunk, x: u8, z: u8) -> Option<i32> {
             .heightmaps
             .get("MOTION_BLOCKING")
             .or_else(|| chunk.heightmaps.get("WORLD_SURFACE"))
-            .and_then(|hm| heightmap_value_to_world_y(hm.get(x, z)))
+            .and_then(|hm| heightmap_value_to_world_y_for_geometry(chunk.geometry(), hm.get(x, z)))
     })
+}
+
+fn heightmap_value_to_world_y_for_geometry(geometry: ChunkGeometry, value: u32) -> Option<i32> {
+    (value != 0).then(|| geometry.min_y() + value as i32 - 1)
 }
 
 fn hinted_column_is_columnar_without_emitters(
@@ -1123,7 +1252,7 @@ fn hinted_column_is_columnar_without_emitters(
     top_y: i32,
 ) -> bool {
     let air = BlockStateId(0);
-    for y in MIN_Y..=top_y {
+    for y in chunk.geometry().min_y()..=top_y {
         let state = chunk.get_block(x, y, z).unwrap_or(air);
         if table.emission(state.0).unwrap_or(0) > 0 {
             return false;
@@ -1178,7 +1307,7 @@ fn populate_grids(
                 // defaults (opacity=0, propagates_sky=true, emission=0).
                 continue;
             };
-            for (section_idx, section) in chunk.sections.iter().enumerate().take(SECTION_COUNT) {
+            for (section_idx, section) in chunk.sections.iter().enumerate() {
                 let base_ly = section_idx * SECTION_DIM;
                 if section.palette().is_none() {
                     let state = section.get(0, 0, 0);
@@ -1282,7 +1411,12 @@ fn populate_indirect_section(
     }
 }
 
-fn seed_sky_from_open_columns(propagates_sky: &[bool], sky: &mut [u8], queue: &mut VecDeque<u32>) {
+fn seed_sky_from_open_columns(
+    propagates_sky: &[bool],
+    sky: &mut [u8],
+    queue: &mut VecDeque<u32>,
+    world_height: usize,
+) {
     // Two-pass seed. Pass 1: walk each column top-down, marking
     // every cell as `sky=15` while `propagates_sky` holds. Don't
     // touch the queue yet — pushing every interior open-sky cell
@@ -1295,7 +1429,7 @@ fn seed_sky_from_open_columns(propagates_sky: &[bool], sky: &mut [u8], queue: &m
     // cells where BFS will actually drive an update.
     for gx in 0..N_X {
         for gz in 0..N_Z {
-            for ly in (0..WORLD_HEIGHT).rev() {
+            for ly in (0..world_height).rev() {
                 let idx = grid_idx(gx, ly, gz);
                 if propagates_sky[idx] {
                     sky[idx] = 15;
@@ -1305,14 +1439,14 @@ fn seed_sky_from_open_columns(propagates_sky: &[bool], sky: &mut [u8], queue: &m
             }
         }
     }
-    for ly in 0..WORLD_HEIGHT {
+    for ly in 0..world_height {
         for gz in 0..N_Z {
             for gx in 0..N_X {
                 let idx = grid_idx(gx, ly, gz);
                 if sky[idx] != 15 {
                     continue;
                 }
-                if has_dark_neighbour(sky, gx, ly, gz) {
+                if has_dark_neighbour(sky, gx, ly, gz, world_height) {
                     queue.push_back(idx as u32);
                 }
             }
@@ -1320,7 +1454,7 @@ fn seed_sky_from_open_columns(propagates_sky: &[bool], sky: &mut [u8], queue: &m
     }
 }
 
-fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize) -> bool {
+fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize, world_height: usize) -> bool {
     const NEIGHBOURS: [(isize, isize, isize); 6] = [
         (-1, 0, 0),
         (1, 0, 0),
@@ -1336,7 +1470,7 @@ fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize) -> bool {
         if nx < 0 || nx >= N_X as isize {
             continue;
         }
-        if ny < 0 || ny >= WORLD_HEIGHT as isize {
+        if ny < 0 || ny >= world_height as isize {
             continue;
         }
         if nz < 0 || nz >= N_Z as isize {
@@ -1350,7 +1484,7 @@ fn has_dark_neighbour(sky: &[u8], gx: usize, ly: usize, gz: usize) -> bool {
 }
 
 /// Generic 6-neighbour BFS used by both passes.
-fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
+fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>, world_height: usize) {
     while let Some(packed) = queue.pop_front() {
         let idx = packed as usize;
         let current = values[idx];
@@ -1379,7 +1513,7 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
             if nx < 0 || nx >= N_X as isize {
                 continue;
             }
-            if ny < 0 || ny >= WORLD_HEIGHT as isize {
+            if ny < 0 || ny >= world_height as isize {
                 continue;
             }
             if nz < 0 || nz >= N_Z as isize {
@@ -1401,20 +1535,153 @@ fn bfs(opacity: &[u8], values: &mut [u8], queue: &mut VecDeque<u32>) {
     }
 }
 
-fn extract_centre(sky: &[u8], block: &[u8]) -> ChunkLight {
+fn extract_centre_with_backend(
+    sky: &[u8],
+    block: &[u8],
+    backend: LightKernelBackend,
+    geometry: ChunkGeometry,
+) -> ChunkLight {
+    let section_count = geometry.section_count();
+    let extract = |grid| match backend {
+        LightKernelBackend::Scalar => extract_light_layer_scalar(grid, section_count),
+        LightKernelBackend::PortableSimd => extract_light_layer_portable(grid, section_count),
+    };
+    ChunkLight {
+        sky: extract(sky),
+        block: extract(block),
+        min_y: geometry.min_y(),
+    }
+}
+
+fn extract_light_layer_scalar(grid: &[u8], section_count: usize) -> LightLayer {
+    extract_light_layer(grid, section_count, |row, output| {
+        let mut nonzero = 0_u16;
+        for (pair, output) in row.chunks_exact(2).zip(output) {
+            let low = pair[0];
+            let high = pair[1];
+            debug_assert!(low <= 15 && high <= 15);
+            *output = low | (high << 4);
+            nonzero += u16::from(low != 0) + u16::from(high != 0);
+        }
+        nonzero
+    })
+}
+
+#[cfg(target_endian = "little")]
+fn extract_light_layer_portable(grid: &[u8], section_count: usize) -> LightLayer {
+    debug_assert_eq!(grid.len(), grid_volume(section_count * SECTION_DIM));
+    let mut sections: Vec<Option<Box<[u8; LIGHT_LAYER_BYTES]>>> =
+        (0..section_count).map(|_| None).collect();
+    let mut nonzero_nibbles = vec![0_u16; section_count];
+    for section_idx in 0..section_count {
+        let mut packed = Box::new([0_u8; LIGHT_LAYER_BYTES]);
+        let mut nonzero = 0_u16;
+        for section_y in 0..SECTION_DIM {
+            let local_y = section_idx * SECTION_DIM + section_y;
+            for local_z in (0..SECTION_DIM).step_by(2) {
+                let first_start = grid_idx(SECTION_DIM, local_y, SECTION_DIM + local_z);
+                let second_start = grid_idx(SECTION_DIM, local_y, SECTION_DIM + local_z + 1);
+                let (first, first_nonzero) =
+                    pack_light_row_portable(&grid[first_start..first_start + SECTION_DIM]);
+                let (second, second_nonzero) =
+                    pack_light_row_portable(&grid[second_start..second_start + SECTION_DIM]);
+                let output_start = (section_y * SECTION_DIM + local_z) * SECTION_DIM / 2;
+                packed[output_start..output_start + SECTION_DIM]
+                    .copy_from_slice(&u8x16::narrow_i16x8(first, second).to_array());
+                nonzero += first_nonzero + second_nonzero;
+            }
+        }
+        if nonzero != 0 {
+            sections[section_idx] = Some(packed);
+            nonzero_nibbles[section_idx] = nonzero;
+        }
+    }
+    LightLayer {
+        sections,
+        nonzero_nibbles,
+    }
+}
+
+#[cfg(target_endian = "little")]
+#[inline]
+fn pack_light_row_portable(row: &[u8]) -> (i16x8, u16) {
+    let row: [u8; SECTION_DIM] = row.try_into().expect("light row width");
+    debug_assert!(row.iter().all(|value| *value <= 15));
+    let values = u8x16::new(row);
+    let words: u16x8 = cast(values);
+    let packed = (words & u16x8::splat(0x000f)) | ((words >> 4_u16) & u16x8::splat(0x00f0));
+    let nonzero = values.simd_ne(u8x16::ZERO).to_bitmask().count_ones() as u16;
+    (cast(packed), nonzero)
+}
+
+#[cfg(not(target_endian = "little"))]
+fn extract_light_layer_portable(grid: &[u8], section_count: usize) -> LightLayer {
+    extract_light_layer_scalar(grid, section_count)
+}
+
+fn extract_light_layer(
+    grid: &[u8],
+    section_count: usize,
+    mut pack_row: impl FnMut(&[u8], &mut [u8]) -> u16,
+) -> LightLayer {
+    debug_assert_eq!(grid.len(), grid_volume(section_count * SECTION_DIM));
+    let mut sections: Vec<Option<Box<[u8; LIGHT_LAYER_BYTES]>>> =
+        (0..section_count).map(|_| None).collect();
+    let mut nonzero_nibbles = vec![0_u16; section_count];
+    for section_idx in 0..section_count {
+        let mut packed = Box::new([0_u8; LIGHT_LAYER_BYTES]);
+        let mut nonzero = 0_u16;
+        for section_y in 0..SECTION_DIM {
+            let local_y = section_idx * SECTION_DIM + section_y;
+            for local_z in 0..SECTION_DIM {
+                let start = grid_idx(SECTION_DIM, local_y, SECTION_DIM + local_z);
+                let output_start = (section_y * SECTION_DIM + local_z) * SECTION_DIM / 2;
+                nonzero += pack_row(
+                    &grid[start..start + SECTION_DIM],
+                    &mut packed[output_start..output_start + SECTION_DIM / 2],
+                );
+            }
+        }
+        if nonzero != 0 {
+            sections[section_idx] = Some(packed);
+            nonzero_nibbles[section_idx] = nonzero;
+        }
+    }
+    LightLayer {
+        sections,
+        nonzero_nibbles,
+    }
+}
+
+#[doc(hidden)]
+#[must_use]
+pub fn benchmark_extract_centre(
+    sky: &[u8],
+    block: &[u8],
+    backend: LightKernelBackend,
+) -> ChunkLight {
+    assert_eq!(sky.len(), N_VOL);
+    assert_eq!(block.len(), N_VOL);
+    extract_centre_with_backend(sky, block, backend, OVERWORLD_GEOMETRY)
+}
+
+#[cfg(test)]
+fn extract_centre_reference(sky: &[u8], block: &[u8]) -> ChunkLight {
     let mut out = ChunkLight::zeroed();
-    for ly in 0..WORLD_HEIGHT {
-        for lz in 0..SECTION_DIM {
-            for lx in 0..SECTION_DIM {
-                let gx = SECTION_DIM + lx;
-                let gz = SECTION_DIM + lz;
-                let src = grid_idx(gx, ly, gz);
-                out.set_sky_local(lx, ly, lz, sky[src]);
-                out.set_block_local(lx, ly, lz, block[src]);
+    for local_y in 0..WORLD_HEIGHT {
+        for local_z in 0..SECTION_DIM {
+            for local_x in 0..SECTION_DIM {
+                let source = grid_idx(SECTION_DIM + local_x, local_y, SECTION_DIM + local_z);
+                out.set_sky_local(local_x, local_y, local_z, sky[source]);
+                out.set_block_local(local_x, local_y, local_z, block[source]);
             }
         }
     }
     out
+}
+
+fn grid_volume(world_height: usize) -> usize {
+    N_X * world_height * N_Z
 }
 
 fn grid_idx(gx: usize, ly: usize, gz: usize) -> usize {
@@ -1436,7 +1703,7 @@ mod tests {
     use mc_data::Identifier;
 
     use crate::block::BlockRegistry;
-    use crate::chunk::{ChunkPos, MAX_Y};
+    use crate::chunk::{ChunkGeometry, ChunkPos, MAX_Y};
 
     fn tiny_table() -> BlockLightTable {
         // State ids:
@@ -1460,6 +1727,12 @@ mod tests {
         Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), plains)
     }
 
+    fn custom_air_chunk() -> Chunk {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let geometry = ChunkGeometry::new(0, 256).unwrap();
+        Chunk::empty_with_geometry(ChunkPos { x: 0, z: 0 }, BlockStateId(0), plains, geometry)
+    }
+
     fn solo(chunk: Chunk) -> [[Option<Chunk>; 3]; 3] {
         // Centre-only neighbourhood. Wrapped in Option so the borrow
         // pattern in `compute_chunk_light` matches.
@@ -1475,6 +1748,36 @@ mod tests {
     }
 
     #[test]
+    fn scalar_and_portable_extraction_are_bit_identical() {
+        let mut sky = vec![0; N_VOL];
+        let mut block = vec![0; N_VOL];
+        let mut state = 0x6a09_e667_f3bc_c909_u64;
+        for value in sky.iter_mut().chain(&mut block) {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *value = (state & 0x0f) as u8;
+        }
+
+        let scalar = extract_centre_with_backend(
+            &sky,
+            &block,
+            LightKernelBackend::Scalar,
+            OVERWORLD_GEOMETRY,
+        );
+        let portable = extract_centre_with_backend(
+            &sky,
+            &block,
+            LightKernelBackend::PortableSimd,
+            OVERWORLD_GEOMETRY,
+        );
+        let reference = extract_centre_reference(&sky, &block);
+
+        assert_eq!(scalar, reference);
+        assert_eq!(portable, reference);
+    }
+
+    #[test]
     fn open_air_chunk_is_sky_15_everywhere_and_block_0() {
         let table = tiny_table();
         let input = solo(air_chunk());
@@ -1487,6 +1790,22 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn custom_geometry_computes_open_sky_and_block_light() {
+        let table = tiny_table();
+        let mut chunk = custom_air_chunk();
+        chunk.set_block(8, 64, 8, BlockStateId(3));
+        let input = solo(chunk);
+
+        let out = compute_chunk_light(borrow(&input), &table);
+
+        assert_eq!(out.section_count(), 16);
+        assert_eq!(out.sky_at(8, 0, 8), 15);
+        assert_eq!(out.sky_at(8, 255, 8), 15);
+        assert_eq!(out.block_at(8, 64, 8), 15);
+        assert_eq!(out.block_at(9, 64, 8), 14);
     }
 
     #[test]
@@ -1507,6 +1826,19 @@ mod tests {
         assert_eq!(light.sky.get(0, 0, 0), 1);
         assert_eq!(light.sky.get(1, 0, 0), 2);
         assert_eq!(light.block.section(0), None);
+    }
+
+    #[test]
+    fn custom_geometry_baked_light_uses_chunk_world_y() {
+        let mut chunk = custom_air_chunk();
+        let mut block = vec![0; crate::chunk::LIGHT_LAYER_BYTES];
+        block[0] = 0x0F;
+        chunk.section_lights[0].block = Some(block);
+
+        let light =
+            ChunkLight::from_chunk(&chunk).expect("present baked layer should rebuild chunk light");
+
+        assert_eq!(light.block_at(0, 0, 0), 15);
     }
 
     #[test]
@@ -1572,10 +1904,10 @@ mod tests {
         }
         let input = solo(chunk);
         let borrowed = borrow(&input);
-        let fast = compute_columnar_no_emitter_light(&borrowed, &table)
+        let fast = compute_columnar_no_emitter_light(&borrowed, &table, OVERWORLD_GEOMETRY)
             .expect("columnar terrain should use fast path");
         let mut ws = LightWorkspace::new();
-        let slow = compute_chunk_light_slow_in(&mut ws, borrowed, &table);
+        let slow = compute_chunk_light_slow_in(&mut ws, borrowed, &table, OVERWORLD_GEOMETRY);
         assert_eq!(fast, slow);
     }
 
@@ -1586,7 +1918,10 @@ mod tests {
         let mut emitter = air_chunk();
         emitter.set_block(8, 64, 8, BlockStateId(3));
         let input = solo(emitter);
-        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
+        assert!(
+            compute_columnar_no_emitter_light(&borrow(&input), &table, OVERWORLD_GEOMETRY)
+                .is_none()
+        );
 
         let mut cave = air_chunk();
         for y in MIN_Y..=64 {
@@ -1594,7 +1929,10 @@ mod tests {
         }
         cave.set_block(8, 0, 8, BlockStateId(0));
         let input = solo(cave);
-        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
+        assert!(
+            compute_columnar_no_emitter_light(&borrow(&input), &table, OVERWORLD_GEOMETRY)
+                .is_none()
+        );
 
         let mut soft_blocker = air_chunk();
         for y in MIN_Y..64 {
@@ -1602,7 +1940,10 @@ mod tests {
         }
         soft_blocker.set_block(8, 64, 8, BlockStateId(4));
         let input = solo(soft_blocker);
-        assert!(compute_columnar_no_emitter_light(&borrow(&input), &table).is_none());
+        assert!(
+            compute_columnar_no_emitter_light(&borrow(&input), &table, OVERWORLD_GEOMETRY)
+                .is_none()
+        );
     }
 
     #[test]
@@ -1859,6 +2200,122 @@ mod tests {
             &table,
         );
         assert_light_eq(inc, &full, "place glowstone");
+    }
+
+    #[test]
+    fn incremental_custom_geometry_updates_the_edited_world_y() {
+        let table = tiny_table();
+        let pre = custom_air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        let mut post = pre.clone();
+        post.set_block(8, 0, 8, BlockStateId(3));
+        let touched = apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            0,
+            8,
+            BlockStateId(0),
+            BlockStateId(3),
+        );
+
+        let incremental = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_eq!(touched, vec![pos]);
+        assert_eq!(incremental.block_at(8, 0, 8), full.block_at(8, 0, 8));
+        assert_eq!(incremental.block_at(9, 0, 8), full.block_at(9, 0, 8));
+    }
+
+    #[test]
+    fn incremental_custom_geometry_updates_sky_at_the_edited_world_y() {
+        let table = tiny_table();
+        let pre = custom_air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        seed_cache_from_full(&mut cache, &[(pos, &pre)], &table);
+
+        let mut post = pre.clone();
+        post.set_block(8, 0, 8, BlockStateId(1));
+        apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            0,
+            8,
+            BlockStateId(0),
+            BlockStateId(1),
+        );
+
+        let incremental = cache.get(pos).unwrap();
+        let full = full_recompute(
+            [
+                [None, None, None],
+                [None, Some(&post), None],
+                [None, None, None],
+            ],
+            &table,
+        );
+        assert_eq!(incremental.sky_at(8, 0, 8), full.sky_at(8, 0, 8));
+        assert_eq!(incremental.sky_at(8, 1, 8), full.sky_at(8, 1, 8));
+    }
+
+    #[test]
+    #[should_panic(expected = "lighting neighbourhood chunks must share geometry")]
+    fn incremental_mixed_geometry_fails_closed() {
+        let table = tiny_table();
+        let centre = custom_air_chunk();
+        let east = air_chunk();
+        let pos = ChunkPos { x: 0, z: 0 };
+        let mut cache = LightCache::new();
+        cache.insert(
+            pos,
+            full_recompute(
+                [
+                    [None, None, None],
+                    [None, Some(&centre), None],
+                    [None, None, None],
+                ],
+                &table,
+            ),
+        );
+
+        apply_block_change_to_light(
+            &mut cache,
+            &[
+                [None, None, None],
+                [None, Some(&centre), Some(&east)],
+                [None, None, None],
+            ],
+            &table,
+            pos,
+            8,
+            0,
+            8,
+            BlockStateId(0),
+            BlockStateId(3),
+        );
     }
 
     #[test]

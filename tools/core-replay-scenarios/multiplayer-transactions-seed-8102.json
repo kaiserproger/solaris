@@ -1,0 +1,141 @@
+{
+  "schema": "solaris.core_replay.scenario.v1",
+  "id": "multiplayer-transactions-seed-8102",
+  "seed": 8102,
+  "actions": [],
+  "concurrent_groups": [
+    {
+      "id": "same-target-placement",
+      "repetitions": 8,
+      "fixture": {
+        "type": "same_target_placement"
+      },
+      "actions": [
+        {
+          "type": "place_block",
+          "actor": "dirt-player",
+          "item": "minecraft:dirt"
+        },
+        {
+          "type": "place_block",
+          "actor": "stone-player",
+          "item": "minecraft:stone"
+        }
+      ]
+    },
+    {
+      "id": "shared-chest-pickup",
+      "repetitions": 1,
+      "fixture": {
+        "type": "shared_chest",
+        "item": "minecraft:dirt",
+        "initial_count": 2
+      },
+      "actions": [
+        {
+          "type": "chest_pickup",
+          "actor": "left-player",
+          "slot": 0
+        },
+        {
+          "type": "chest_pickup",
+          "actor": "right-player",
+          "slot": 0
+        }
+      ]
+    }
+  ],
+  "state_expectations": [
+    {
+      "id": "placement-state",
+      "after_group": "same-target-placement",
+      "invariant_id": "placement-conservation",
+      "values": [
+        {
+          "key": "authoritative_blocks",
+          "value": 8
+        },
+        {
+          "key": "conservation_failures",
+          "value": 0
+        },
+        {
+          "key": "consumed_items",
+          "value": 8
+        },
+        {
+          "key": "persisted_authoritative_blocks",
+          "value": 1
+        },
+        {
+          "key": "rounds",
+          "value": 8
+        }
+      ]
+    },
+    {
+      "id": "chest-state",
+      "after_group": "shared-chest-pickup",
+      "invariant_id": "chest-conservation",
+      "values": [
+        {
+          "key": "container_items",
+          "value": 1
+        },
+        {
+          "key": "cursor_items",
+          "value": 1
+        },
+        {
+          "key": "persisted_container_items",
+          "value": 1
+        },
+        {
+          "key": "persisted_player_items",
+          "value": 1
+        },
+        {
+          "key": "persisted_total_items",
+          "value": 2
+        },
+        {
+          "key": "reconnected_player_items",
+          "value": 1
+        },
+        {
+          "key": "total_items",
+          "value": 2
+        },
+        {
+          "key": "winning_cursors",
+          "value": 1
+        }
+      ]
+    }
+  ],
+  "lanes": [
+    {
+      "driver": "solaris_protocol",
+      "required_gates": [
+        {
+          "id": "multiplayer-transaction-replay",
+          "evidence_kind": "harness"
+        }
+      ]
+    }
+  ],
+  "expected_invariants": [
+    {
+      "id": "placement-conservation",
+      "description": "Every concurrent placement round commits one block and consumes one item."
+    },
+    {
+      "id": "chest-conservation",
+      "description": "One shared chest pickup commits and the seeded item total is conserved."
+    },
+    {
+      "id": "deterministic-normalized-state",
+      "description": "Repeated runs produce the same symmetric conservation observations."
+    }
+  ]
+}

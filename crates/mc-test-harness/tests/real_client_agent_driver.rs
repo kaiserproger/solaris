@@ -2,11 +2,259 @@ use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
 
+use mc_test_harness::replay::{
+    ReplayDriver, ReplayOutcome, ReplayRunResult, ReplayScenarioManifest,
+};
 use serde_json::{Value, json};
+
+#[test]
+fn real_client_gate_rejects_runs_without_gradle_runtime_classes_provenance() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+
+    std::fs::copy(
+        repo_root.join("docs/real-client-regression/manifests/m94-regression-pack.json"),
+        run_dir.path().join("manifest.json"),
+    )
+    .expect("copy real-client manifest");
+    std::fs::create_dir(run_dir.path().join("screenshots")).expect("create screenshots dir");
+    for artifact in ["client.log", "server.log", "git.txt", "toolchain.txt"] {
+        std::fs::write(run_dir.path().join(artifact), "").expect("write required artifact");
+    }
+    std::fs::write(
+        run_dir.path().join("observations.json"),
+        r#"{
+  "schema": "solaris.real_client_observations.v1",
+  "client_gate": "agent-run-real-client",
+  "quality_label": "stabilization",
+  "result": "passed",
+  "scenarios": [{
+    "id": "m94-02b-rejected-block-resync",
+    "result": "passed",
+    "screenshots": ["screenshots/m94-02b-rejected-block-resync.png"]
+  }]
+}"#,
+    )
+    .expect("write completed observations");
+    std::fs::write(
+        run_dir.path().join("automation-driver.txt"),
+        "client_kind=gradle-runclient\n\
+client_adapter_source=auto-gradle-runclient\n\
+client_adapter_task=:fabric-agent:runClientAgent\n\
+client_agent_driver_exit_status=0\n\
+client_agent_phase_exit_status_m94-02b-rejected-block-resync=0\n\
+client_agent_bridge_wait_status_primary=ready\n",
+    )
+    .expect("write pre-provenance automation driver");
+
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--validate-run")
+        .arg(run_dir.path())
+        .output()
+        .expect("run real-client validator");
+
+    assert!(
+        !output.status.success(),
+        "validator accepted a run without loaded runtime provenance\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("runtime classes provenance"),
+        "validator must reject missing Gradle runtime provenance before unrelated artifacts\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn agent_driver_executes_checked_core_replay_manifest_and_emits_valid_result() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    std::fs::write(
+        run_dir.path().join("server.toml"),
+        "[network]\nview_distance = 8\n",
+    )
+    .expect("write replay config fingerprint input");
+    std::fs::write(
+        run_dir.path().join("client.log"),
+        "fake Gradle runClient log\n",
+    )
+    .expect("write replay client evidence");
+    let manifest_path = repo_root.join("tools/core-replay-scenarios/core-actions-seed-81.json");
+    let bridge = FakeBridge::start(13);
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+        .arg("--secret")
+        .arg("test-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("core-actions-seed-81")
+        .arg("--replay-manifest")
+        .arg(&manifest_path)
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client core replay driver");
+
+    assert!(
+        output.status.success(),
+        "core replay driver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = bridge.join();
+    let commands: Vec<_> = requests
+        .iter()
+        .map(|request| request["command"].as_str().expect("command is present"))
+        .collect();
+    assert_eq!(
+        commands,
+        [
+            "ping",
+            "wait_play",
+            "state",
+            "wait_ticks",
+            "state",
+            "move_by",
+            "state",
+            "look",
+            "state",
+            "wait_ticks",
+            "state",
+            "screenshot",
+            "disconnect"
+        ]
+    );
+    assert_eq!(requests[3]["payload"], json!({"ticks": 2}));
+    assert_eq!(requests[5]["payload"], json!({"dx_cm": 100, "dz_cm": -50}));
+    assert_eq!(
+        requests[7]["payload"],
+        json!({"yaw_deg": 90, "pitch_deg": 0})
+    );
+    assert_eq!(requests[9]["payload"], json!({"ticks": 4}));
+
+    let scenario = ReplayScenarioManifest::from_json(
+        &std::fs::read_to_string(&manifest_path).expect("read checked replay manifest"),
+    )
+    .expect("checked replay manifest parses");
+    let result_path = run_dir.path().join("core-replay-result.json");
+    let result = ReplayRunResult::from_json(
+        &std::fs::read_to_string(&result_path).expect("core replay result exists"),
+    )
+    .expect("core replay result parses");
+    result
+        .validate_against(&scenario)
+        .expect("real-client result cross-validates against checked manifest");
+    assert_eq!(result.driver, ReplayDriver::RealClient);
+    assert_eq!(result.outcome, ReplayOutcome::Degraded);
+    assert_eq!(result.actions, scenario.actions);
+    assert_eq!(result.observations.len(), 1);
+    assert!(result.observations[0].facts().iter().any(|fact| matches!(
+        fact,
+        mc_test_harness::parity::ObservationFact::Note { key, value }
+            if key == "post_action_liveness" && value == "client_play_state"
+    )));
+    let validator = Command::new(env!("CARGO_BIN_EXE_core-replay-validate"))
+        .arg(&manifest_path)
+        .arg(&result_path)
+        .output()
+        .expect("run core replay result validator");
+    assert!(
+        validator.status.success(),
+        "core replay validator failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&validator.stdout),
+        String::from_utf8_lossy(&validator.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&validator.stdout)
+            .contains("CORE_REPLAY_RESULT_VALID scenario=core-actions-seed-81")
+    );
+
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(run_dir.path().join("observations.json"))
+            .expect("real-client observations exist"),
+    )
+    .expect("real-client observations parse");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(observations["scenarios"][0]["id"], "core-actions-seed-81");
+}
+
+#[test]
+fn agent_driver_rejects_malformed_core_replay_before_bridge_rpcs() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let mut manifest: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            repo_root.join("tools/core-replay-scenarios/core-actions-seed-81.json"),
+        )
+        .expect("read checked replay manifest"),
+    )
+    .expect("checked replay manifest parses");
+    manifest["actions"][0]["silent_default"] = json!(true);
+    let manifest_path = run_dir.path().join("malformed-replay.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode malformed manifest"),
+    )
+    .expect("write malformed manifest");
+    let bridge = FakeBridge::start(1);
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+        .arg("--secret")
+        .arg("test-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("core-actions-seed-81")
+        .arg("--replay-manifest")
+        .arg(&manifest_path)
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run malformed real-client core replay driver");
+
+    assert!(
+        !output.status.success(),
+        "driver accepted malformed replay manifest\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        bridge.join().is_empty(),
+        "malformed replay manifest must fail before bridge RPCs"
+    );
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(run_dir.path().join("observations.json"))
+            .expect("failed observations exist"),
+    )
+    .expect("failed observations parse");
+    assert_eq!(observations["result"], "failed");
+    assert!(
+        observations["error"]["message"]
+            .as_str()
+            .is_some_and(
+                |message| message.contains("unknown") && message.contains("silent_default")
+            )
+    );
+}
 
 #[test]
 fn agent_driver_writes_passed_observation_from_loopback_bridge() {
@@ -96,10 +344,66 @@ fn agent_driver_writes_passed_observation_from_loopback_bridge() {
 }
 
 #[test]
+fn agent_driver_runs_generated_ruin_cache_phases_without_screenshots() {
+    let repo_root = repo_root();
+    for scenario_id in [
+        "playable-46-generated-ruin-cache-before",
+        "playable-46-generated-ruin-cache-after",
+    ] {
+        let run_dir = tempfile::tempdir().expect("create run dir");
+        let bridge = FakeBridge::start(5);
+
+        let output = Command::new("python3")
+            .arg(repo_root.join("tools/real-client-agent-driver.py"))
+            .arg("--bridge-url")
+            .arg(format!("http://127.0.0.1:{}/rpc", bridge.port))
+            .arg("--secret")
+            .arg("test-secret")
+            .arg("--run-dir")
+            .arg(run_dir.path())
+            .arg("--scenario")
+            .arg(scenario_id)
+            .arg("--server-addr")
+            .arg("127.0.0.1:25565")
+            .arg("--timeout-seconds")
+            .arg("3")
+            .output()
+            .expect("run playable-46 real-client agent driver");
+
+        assert!(
+            output.status.success(),
+            "driver failed for {scenario_id}\\nstdout:\\n{}\\nstderr:\\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let requests = bridge.join();
+        let commands: Vec<_> = requests
+            .iter()
+            .map(|request| request["command"].as_str().expect("command is present"))
+            .collect();
+        assert_eq!(
+            commands,
+            ["ping", "wait_play", "run_scenario", "state", "disconnect"]
+        );
+        assert_eq!(requests[2]["payload"]["id"], scenario_id);
+
+        let observations: Value = serde_json::from_slice(
+            &std::fs::read(run_dir.path().join("observations.json"))
+                .expect("observations.json exists"),
+        )
+        .expect("observations.json is valid JSON");
+        assert_eq!(observations["result"], "passed");
+        assert_eq!(observations["scenarios"][0]["id"], scenario_id);
+        assert_eq!(observations["scenarios"][0]["screenshots"], json!([]));
+    }
+}
+
+#[test]
 fn agent_driver_rejects_non_loopback_server_addr() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
-    let bridge = FakeBridge::start_with_deadline(6, Duration::from_millis(200));
+    let bridge = FakeBridge::start(6);
 
     let output = Command::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
@@ -265,12 +569,14 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
         7,
         vec![
             json!({
+                "state_version": 1,
                 "in_play": true,
                 "dimension": "minecraft:overworld",
                 "current_screen": "net.minecraft.client.gui.screens.LevelLoadingScreen",
                 "disconnect_reason": "",
             }),
             json!({
+                "state_version": 2,
                 "in_play": true,
                 "dimension": "minecraft:overworld",
                 "current_screen": "none",
@@ -313,7 +619,7 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
         [
             "ping",
             "wait_play",
-            "wait_play",
+            "wait_state_change",
             "run_scenario",
             "state",
             "screenshot",
@@ -324,10 +630,73 @@ fn agent_driver_waits_for_interactive_play_screen_before_scenario() {
 }
 
 #[test]
+fn interactive_pause_close_waits_for_the_client_thread_response() {
+    let repo_root = repo_root();
+    let driver = repo_root.join("tools/real-client-agent-driver.py");
+    let probe = r#"
+import importlib.util
+import pathlib
+import sys
+
+driver_path = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("solaris_real_client_driver", driver_path)
+driver = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(driver)
+
+driver.time.monotonic = lambda: 0.0
+calls = []
+
+def call_and_record(client, transcript, command, payload, timeout_seconds, actor=None):
+    calls.append((command, timeout_seconds))
+    if command == "close_screen":
+        if timeout_seconds < 10.0:
+            raise RuntimeError("simulated busy Minecraft client thread")
+        return {"status": "ok"}
+    if command == "state":
+        return {
+            "state_version": 2,
+            "in_play": True,
+            "current_screen": "none",
+        }
+    raise AssertionError(f"unexpected command {command}")
+
+driver.call_and_record = call_and_record
+result = driver.wait_for_interactive_play(
+    object(),
+    [],
+    {
+        "state_version": 1,
+        "in_play": True,
+        "current_screen": "net.minecraft.client.gui.screens.PauseScreen",
+    },
+    30.0,
+)
+
+assert result["current_screen"] == "none", result
+assert calls[0][0] == "close_screen", calls
+assert calls[0][1] >= 10.0, calls
+"#;
+
+    let output = Command::new("python3")
+        .arg("-c")
+        .arg(probe)
+        .arg(driver)
+        .output()
+        .expect("run interactive pause-close probe");
+
+    assert!(
+        output.status.success(),
+        "pause-close probe failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn agent_driver_waits_for_async_screenshot_file() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
-    let bridge = FakeBridge::start_with_delayed_screenshot(6, Duration::from_millis(150));
+    let bridge = FakeBridge::start_with_deferred_screenshot(6);
 
     let output = Command::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
@@ -546,7 +915,7 @@ fn agent_driver_runs_join_rejoin_movement_scenario_without_run_scenario_rpc() {
             "disconnect"
         ]
     );
-    assert_eq!(requests[3]["payload"]["duration_millis"], 750);
+    assert_eq!(requests[3]["payload"]["ticks"], 15);
     assert_eq!(
         requests[7]["command"], "state",
         "driver must poll client state after disconnect"
@@ -591,18 +960,6 @@ fn agent_driver_waits_for_server_session_release_before_rejoin() {
     let bridge =
         FakeBridge::start_requiring_server_release_before_connect(13, server_log_path.clone());
 
-    let release_writer = thread::spawn({
-        let server_log_path = server_log_path.clone();
-        move || {
-            thread::sleep(Duration::from_millis(150));
-            std::fs::write(
-                &server_log_path,
-                "2026-06-22T14:10:54.741091Z  INFO mc_net::play: saved player state player=SolarisAgent state=pos=(-2.31,80.00,-6.58)\n",
-            )
-            .expect("write server release marker");
-        }
-    });
-
     let output = Command::new("python3")
         .arg(repo_root.join("tools/real-client-agent-driver.py"))
         .arg("--bridge-url")
@@ -620,7 +977,6 @@ fn agent_driver_waits_for_server_session_release_before_rejoin() {
         .output()
         .expect("run real-client agent driver");
 
-    release_writer.join().expect("release writer joins");
     assert!(
         output.status.success(),
         "driver failed\nstdout:\n{}\nstderr:\n{}",
@@ -1207,6 +1563,422 @@ fn agent_driver_coordinates_two_real_client_bridges_for_m94_06_shared_pickup() {
 }
 
 #[test]
+fn agent_driver_coordinates_two_real_client_bridges_for_playable_38_inventory_drop_handoff() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let primary = FakeBridge::start_with_scenario_result(7, "passed");
+    let secondary = FakeBridge::start_with_scenario_result(7, "passed");
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-38-two-client-inventory-drop-handoff")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        output.status.success(),
+        "two-client inventory-drop driver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let primary_requests = primary.join();
+    let primary_scenarios: Vec<_> = primary_requests
+        .iter()
+        .filter(|request| request["command"] == "run_scenario")
+        .map(|request| request["payload"]["id"].as_str().expect("scenario id"))
+        .collect();
+    assert_eq!(
+        primary_scenarios,
+        [
+            "playable-38-two-client-inventory-drop-primary",
+            "playable-38-two-client-inventory-drop-gone-observe"
+        ]
+    );
+    assert!(
+        primary_requests
+            .iter()
+            .all(|request| request["secret"] == "primary-secret"),
+        "primary inventory-drop bridge requests must use only the primary secret"
+    );
+
+    let secondary_requests = secondary.join();
+    let secondary_scenarios: Vec<_> = secondary_requests
+        .iter()
+        .filter(|request| request["command"] == "run_scenario")
+        .map(|request| request["payload"]["id"].as_str().expect("scenario id"))
+        .collect();
+    assert_eq!(
+        secondary_scenarios,
+        [
+            "playable-38-two-client-inventory-drop-observe",
+            "playable-38-two-client-inventory-drop-secondary-pickup"
+        ]
+    );
+    assert!(
+        secondary_requests
+            .iter()
+            .all(|request| request["secret"] == "secondary-secret"),
+        "secondary inventory-drop bridge requests must use only the secondary secret"
+    );
+
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("observations.json exists"),
+    )
+    .expect("observations.json is valid JSON");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(
+        observations["scenarios"][0]["id"],
+        "playable-38-two-client-inventory-drop-handoff"
+    );
+    assert!(
+        observations["scenarios"][0]["agent_report"]["observations"]
+            .as_array()
+            .is_some_and(
+                |entries| entries.iter().any(|entry| entry
+                    .as_str()
+                    .is_some_and(|text| text.contains(
+                        "secondary bridge scenario=playable-38-two-client-inventory-drop-secondary-pickup result=passed"
+                    )))
+            ),
+        "combined report must record secondary inventory-drop pickup observation"
+    );
+    assert!(
+        observations["scenarios"][0]["agent_report"]["observations"]
+            .as_array()
+            .is_some_and(
+                |entries| entries.iter().any(|entry| entry
+                    .as_str()
+                    .is_some_and(|text| text.contains(
+                        "primary bridge scenario=playable-38-two-client-inventory-drop-gone-observe result=passed"
+                    )))
+            ),
+        "combined report must record primary inventory-drop removal observation"
+    );
+    assert!(
+        observations["scenarios"][0]["screenshots"]
+            .as_array()
+            .is_some_and(|screenshots| screenshots.len() == 2),
+        "inventory-drop handoff run must attach both client screenshots"
+    );
+}
+
+#[test]
+fn agent_driver_coordinates_two_real_client_bridges_for_playable_39_short_soak() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let primary = FakeBridge::start_with_scenario_result(17, "passed");
+    let secondary = FakeBridge::start_with_scenario_result(17, "passed");
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-39-two-client-short-soak")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        output.status.success(),
+        "two-client short-soak driver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let primary_requests = primary.join();
+    let primary_commands: Vec<_> = primary_requests
+        .iter()
+        .map(|request| request["command"].as_str().expect("command"))
+        .collect();
+    assert_eq!(
+        primary_commands,
+        [
+            "ping",
+            "wait_play",
+            "state",
+            "move_forward",
+            "state",
+            "move_forward",
+            "state",
+            "move_forward",
+            "state",
+            "move_forward",
+            "state",
+            "move_forward",
+            "state",
+            "move_forward",
+            "state",
+            "screenshot",
+            "disconnect"
+        ]
+    );
+    assert!(
+        primary_requests
+            .iter()
+            .all(|request| request["secret"] == "primary-secret"),
+        "primary short-soak bridge requests must use only the primary secret"
+    );
+
+    let secondary_requests = secondary.join();
+    let secondary_commands: Vec<_> = secondary_requests
+        .iter()
+        .map(|request| request["command"].as_str().expect("command"))
+        .collect();
+    assert_eq!(secondary_commands, primary_commands);
+    assert!(
+        secondary_requests
+            .iter()
+            .all(|request| request["secret"] == "secondary-secret"),
+        "secondary short-soak bridge requests must use only the secondary secret"
+    );
+
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("observations.json exists"),
+    )
+    .expect("observations.json is valid JSON");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(
+        observations["scenarios"][0]["id"],
+        "playable-39-two-client-short-soak"
+    );
+    assert!(
+        observations["scenarios"][0]["agent_report"]["observations"]
+            .as_array()
+            .is_some_and(|entries| entries.iter().any(|entry| entry
+                .as_str()
+                .is_some_and(|text| text.contains("two-client short soak: passed pulses=6")))),
+        "combined report must record short-soak liveness pulse coverage"
+    );
+    assert!(
+        observations["scenarios"][0]["screenshots"]
+            .as_array()
+            .is_some_and(|screenshots| screenshots.len() == 2),
+        "short-soak run must attach both client screenshots"
+    );
+}
+
+#[test]
+fn agent_driver_coordinates_two_real_client_bridges_for_playable_40_chunk_crossing() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let primary = FakeBridge::start_with_scenario_result(29, "passed");
+    let secondary = FakeBridge::start_with_scenario_result(29, "passed");
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-40-two-client-chunk-stream-crossing")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        output.status.success(),
+        "two-client chunk-crossing driver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let primary_requests = primary.join();
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| request["command"] == "move_forward")
+            .count(),
+        12,
+        "primary must perform enough movement pulses to cross chunk boundaries"
+    );
+    assert!(
+        primary_requests
+            .iter()
+            .all(|request| request["secret"] == "primary-secret"),
+        "primary chunk-crossing bridge requests must use only the primary secret"
+    );
+
+    let secondary_requests = secondary.join();
+    assert_eq!(
+        secondary_requests
+            .iter()
+            .filter(|request| request["command"] == "move_forward")
+            .count(),
+        12,
+        "secondary must perform enough movement pulses to cross chunk boundaries"
+    );
+    assert!(
+        secondary_requests
+            .iter()
+            .all(|request| request["secret"] == "secondary-secret"),
+        "secondary chunk-crossing bridge requests must use only the secondary secret"
+    );
+
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("observations.json exists"),
+    )
+    .expect("observations.json is valid JSON");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(
+        observations["scenarios"][0]["id"],
+        "playable-40-two-client-chunk-stream-crossing"
+    );
+    assert!(
+        observations["scenarios"][0]["agent_report"]["observations"]
+            .as_array()
+            .is_some_and(|entries| entries
+                .iter()
+                .any(|entry| entry.as_str().is_some_and(|text| text
+                    .contains("two-client chunk crossing: passed pulses=12 min_chunk_delta=1")))),
+        "combined report must record chunk-crossing pulse and chunk coverage"
+    );
+    assert!(
+        observations["scenarios"][0]["screenshots"]
+            .as_array()
+            .is_some_and(|screenshots| screenshots.len() == 2),
+        "chunk-crossing run must attach both client screenshots"
+    );
+}
+
+#[test]
+fn agent_driver_coordinates_two_real_client_bridges_for_playable_41_chunk_prewarm_crossing() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let primary = FakeBridge::start_with_scenario_result(29, "passed");
+    let secondary = FakeBridge::start_with_scenario_result(29, "passed");
+
+    let output = Command::new("python3")
+        .arg(repo_root.join("tools/real-client-agent-driver.py"))
+        .arg("--bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+        .arg("--secret")
+        .arg("primary-secret")
+        .arg("--secondary-bridge-url")
+        .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+        .arg("--secondary-secret")
+        .arg("secondary-secret")
+        .arg("--run-dir")
+        .arg(run_dir.path())
+        .arg("--scenario")
+        .arg("playable-41-two-client-chunk-prewarm-crossing")
+        .arg("--server-addr")
+        .arg("127.0.0.1:25565")
+        .arg("--timeout-seconds")
+        .arg("3")
+        .output()
+        .expect("run real-client agent driver");
+
+    assert!(
+        output.status.success(),
+        "two-client chunk-prewarm driver failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let primary_requests = primary.join();
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| request["command"] == "move_forward")
+            .count(),
+        12,
+        "primary must perform enough movement pulses to hit prewarmed chunk boundaries"
+    );
+    assert!(
+        primary_requests
+            .iter()
+            .all(|request| request["secret"] == "primary-secret"),
+        "primary chunk-prewarm bridge requests must use only the primary secret"
+    );
+
+    let secondary_requests = secondary.join();
+    assert_eq!(
+        secondary_requests
+            .iter()
+            .filter(|request| request["command"] == "move_forward")
+            .count(),
+        12,
+        "secondary must perform enough movement pulses to hit prewarmed chunk boundaries"
+    );
+    assert!(
+        secondary_requests
+            .iter()
+            .all(|request| request["secret"] == "secondary-secret"),
+        "secondary chunk-prewarm bridge requests must use only the secondary secret"
+    );
+
+    let observations_path = run_dir.path().join("observations.json");
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(&observations_path).expect("observations.json exists"),
+    )
+    .expect("observations.json is valid JSON");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(
+        observations["scenarios"][0]["id"],
+        "playable-41-two-client-chunk-prewarm-crossing"
+    );
+    assert!(
+        observations["scenarios"][0]["agent_report"]["observations"]
+            .as_array()
+            .is_some_and(
+                |entries| entries.iter().any(|entry| entry
+                    .as_str()
+                    .is_some_and(|text| text.contains(
+                        "two-client chunk prewarm crossing: passed pulses=12 min_chunk_delta=1"
+                    )))
+            ),
+        "combined report must record chunk-prewarm pulse and chunk coverage"
+    );
+    assert!(
+        observations["scenarios"][0]["screenshots"]
+            .as_array()
+            .is_some_and(|screenshots| screenshots.len() == 2),
+        "chunk-prewarm run must attach both client screenshots"
+    );
+}
+
+#[test]
 fn agent_driver_fails_closed_without_bridge() {
     let repo_root = repo_root();
     let run_dir = tempfile::tempdir().expect("create run dir");
@@ -1303,6 +2075,145 @@ fn agent_driver_reports_structured_bridge_error_body() {
     );
 }
 
+#[test]
+fn agent_driver_coordinates_two_client_shared_chest_across_restart_phases() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let primary = FakeBridge::start_with_options(
+        14,
+        vec![wait_play_payload(true), wait_play_payload(false)],
+        false,
+        None,
+        "passed",
+        VALID_PNG_1X1,
+    );
+    let secondary = FakeBridge::start_with_options(
+        13,
+        vec![wait_play_payload(true), wait_play_payload(false)],
+        false,
+        None,
+        "passed",
+        VALID_PNG_1X1,
+    );
+
+    let run_phase = |scenario: &str, append: bool| {
+        let mut command = Command::new("python3");
+        command
+            .arg(repo_root.join("tools/real-client-agent-driver.py"))
+            .arg("--bridge-url")
+            .arg(format!("http://127.0.0.1:{}/rpc", primary.port))
+            .arg("--secret")
+            .arg("primary-secret")
+            .arg("--secondary-bridge-url")
+            .arg(format!("http://127.0.0.1:{}/rpc", secondary.port))
+            .arg("--secondary-secret")
+            .arg("secondary-secret")
+            .arg("--run-dir")
+            .arg(run_dir.path())
+            .arg("--scenario")
+            .arg(scenario)
+            .arg("--server-addr")
+            .arg("127.0.0.1:25565")
+            .arg("--timeout-seconds")
+            .arg("3");
+        if append {
+            command.arg("--append-observations");
+        }
+        command.output().expect("run P45 driver phase")
+    };
+
+    let before = run_phase(
+        "playable-45-two-client-shared-chest-save-restart-before",
+        false,
+    );
+    assert!(
+        before.status.success(),
+        "P45 before phase failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&before.stdout),
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let after = run_phase(
+        "playable-45-two-client-shared-chest-save-restart-after",
+        true,
+    );
+    assert!(
+        after.status.success(),
+        "P45 after phase failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&after.stdout),
+        String::from_utf8_lossy(&after.stderr)
+    );
+
+    let primary_requests = primary.join();
+    let primary_scenarios: Vec<_> = primary_requests
+        .iter()
+        .filter(|request| request["command"] == "run_scenario")
+        .map(|request| {
+            request["payload"]["id"]
+                .as_str()
+                .expect("primary scenario id")
+        })
+        .collect();
+    assert_eq!(
+        primary_scenarios,
+        [
+            "playable-31-two-client-earned-shared-chest-deposit",
+            "playable-31-two-client-earned-shared-chest-observe-empty",
+        ]
+    );
+    assert_eq!(
+        primary_requests
+            .iter()
+            .filter(|request| request["command"] == "connect")
+            .count(),
+        1,
+        "primary must reconnect after the restart boundary"
+    );
+
+    let secondary_requests = secondary.join();
+    let secondary_scenarios: Vec<_> = secondary_requests
+        .iter()
+        .filter(|request| request["command"] == "run_scenario")
+        .map(|request| {
+            request["payload"]["id"]
+                .as_str()
+                .expect("secondary scenario id")
+        })
+        .collect();
+    assert_eq!(
+        secondary_scenarios,
+        ["playable-31-two-client-earned-shared-chest-withdraw"]
+    );
+    assert_eq!(
+        secondary_requests
+            .iter()
+            .filter(|request| request["command"] == "connect")
+            .count(),
+        1,
+        "secondary must reconnect after the restart boundary"
+    );
+
+    let observations: Value = serde_json::from_slice(
+        &std::fs::read(run_dir.path().join("observations.json")).expect("P45 observations exist"),
+    )
+    .expect("P45 observations are valid JSON");
+    assert_eq!(observations["result"], "passed");
+    assert_eq!(
+        observations["scenarios"]
+            .as_array()
+            .expect("P45 scenarios array")
+            .len(),
+        2
+    );
+    assert_eq!(
+        observations["scenarios"][0]["id"],
+        "playable-45-two-client-shared-chest-save-restart-before"
+    );
+    assert_eq!(
+        observations["scenarios"][1]["id"],
+        "playable-45-two-client-shared-chest-save-restart-after"
+    );
+}
+
 fn repo_root() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -1314,67 +2225,66 @@ fn reserve_then_release_port() -> u16 {
 
 struct FailingWaitPlayBridge {
     port: u16,
+    stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl FailingWaitPlayBridge {
     fn start() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind failing bridge");
-        listener
-            .set_nonblocking(true)
-            .expect("failing bridge nonblocking");
         let port = listener.local_addr().expect("failing bridge addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
             let mut requests = 0;
-            while Instant::now() < deadline && requests < 2 {
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let request = read_json_request(&mut stream);
-                        requests += 1;
-                        let request_id = request["id"].as_u64().expect("request id");
-                        if request["command"].as_str() == Some("wait_play") {
-                            write_json_response_with_status(
-                                &mut stream,
-                                &json!({
-                                    "id": request_id,
-                                    "ok": false,
-                                    "payload": null,
-                                    "error": {
-                                        "code": "command-failed",
-                                        "message": "snapshot boom",
-                                    },
-                                }),
-                                500,
-                            );
-                        } else {
-                            write_json_response(
-                                &mut stream,
-                                &json!({
-                                    "id": request_id,
-                                    "ok": true,
-                                    "payload": {"agent": "fake-real-client"},
-                                    "error": null,
-                                }),
-                            );
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("failing bridge accept failed: {error}"),
+            while requests < 2 {
+                let (mut stream, _) = listener.accept().expect("failing bridge accepts request");
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let request = read_json_request(&mut stream);
+                requests += 1;
+                let request_id = request["id"].as_u64().expect("request id");
+                if request["command"].as_str() == Some("wait_play") {
+                    write_json_response_with_status(
+                        &mut stream,
+                        &json!({
+                            "id": request_id,
+                            "ok": false,
+                            "payload": null,
+                            "error": {
+                                "code": "command-failed",
+                                "message": "snapshot boom",
+                            },
+                        }),
+                        500,
+                    );
+                } else {
+                    write_json_response(
+                        &mut stream,
+                        &json!({
+                            "id": request_id,
+                            "ok": true,
+                            "payload": {"agent": "fake-real-client"},
+                            "error": null,
+                        }),
+                    );
                 }
             }
         });
 
         Self {
             port,
+            stop,
             handle: Some(handle),
         }
     }
 
     fn join(mut self) {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
         self.handle
             .take()
             .expect("failing bridge thread exists")
@@ -1386,24 +2296,13 @@ impl FailingWaitPlayBridge {
 struct FakeBridge {
     port: u16,
     requests: Arc<Mutex<Vec<Value>>>,
+    stop: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl FakeBridge {
     fn start(expected_requests: usize) -> Self {
         Self::start_with_wait_play(expected_requests, vec![true])
-    }
-
-    fn start_with_deadline(expected_requests: usize, deadline: Duration) -> Self {
-        Self::start_with_options_and_deadline(
-            expected_requests,
-            vec![wait_play_payload(true)],
-            Duration::ZERO,
-            None,
-            "passed",
-            VALID_PNG_1X1,
-            deadline,
-        )
     }
 
     fn start_with_wait_play(expected_requests: usize, wait_play_results: Vec<bool>) -> Self {
@@ -1423,18 +2322,18 @@ impl FakeBridge {
         Self::start_with_options(
             expected_requests,
             wait_play_results,
-            Duration::ZERO,
+            false,
             None,
             "passed",
             VALID_PNG_1X1,
         )
     }
 
-    fn start_with_delayed_screenshot(expected_requests: usize, screenshot_delay: Duration) -> Self {
+    fn start_with_deferred_screenshot(expected_requests: usize) -> Self {
         Self::start_with_options(
             expected_requests,
             vec![wait_play_payload(true)],
-            screenshot_delay,
+            true,
             None,
             "passed",
             VALID_PNG_1X1,
@@ -1448,7 +2347,7 @@ impl FakeBridge {
         Self::start_with_options(
             expected_requests,
             vec![wait_play_payload(true)],
-            Duration::ZERO,
+            false,
             None,
             "passed",
             screenshot_bytes,
@@ -1462,7 +2361,7 @@ impl FakeBridge {
         Self::start_with_options(
             expected_requests,
             vec![wait_play_payload(true)],
-            Duration::ZERO,
+            false,
             Some(server_release_log_path),
             "passed",
             VALID_PNG_1X1,
@@ -1473,7 +2372,7 @@ impl FakeBridge {
         Self::start_with_options(
             expected_requests,
             vec![wait_play_payload(true)],
-            Duration::ZERO,
+            false,
             None,
             scenario_result,
             VALID_PNG_1X1,
@@ -1483,74 +2382,65 @@ impl FakeBridge {
     fn start_with_options(
         expected_requests: usize,
         wait_play_results: Vec<Value>,
-        screenshot_delay: Duration,
+        defer_screenshot_until_response: bool,
         server_release_log_path: Option<std::path::PathBuf>,
         scenario_result: &'static str,
         screenshot_bytes: &'static [u8],
-    ) -> Self {
-        Self::start_with_options_and_deadline(
-            expected_requests,
-            wait_play_results,
-            screenshot_delay,
-            server_release_log_path,
-            scenario_result,
-            screenshot_bytes,
-            Duration::from_secs(5),
-        )
-    }
-
-    fn start_with_options_and_deadline(
-        expected_requests: usize,
-        wait_play_results: Vec<Value>,
-        screenshot_delay: Duration,
-        server_release_log_path: Option<std::path::PathBuf>,
-        scenario_result: &'static str,
-        screenshot_bytes: &'static [u8],
-        deadline_duration: Duration,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake bridge");
-        listener
-            .set_nonblocking(true)
-            .expect("fake bridge nonblocking");
         let port = listener.local_addr().expect("fake bridge addr").port();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_requests = Arc::clone(&requests);
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
         let wait_play_results = Arc::new(Mutex::new(VecDeque::from(wait_play_results)));
         let thread_wait_play_results = Arc::clone(&wait_play_results);
         let movement_count = Arc::new(Mutex::new(0_u32));
         let thread_movement_count = Arc::clone(&movement_count);
+        let replay_movement_cm = Arc::new(Mutex::new((0_i32, 0_i32)));
+        let thread_replay_movement_cm = Arc::clone(&replay_movement_cm);
         let play_state = Arc::new(Mutex::new(true));
         let thread_play_state = Arc::clone(&play_state);
 
         let handle = thread::spawn(move || {
-            let deadline = Instant::now() + deadline_duration;
-            while Instant::now() < deadline {
+            loop {
                 if thread_requests.lock().expect("requests lock").len() >= expected_requests {
                     break;
                 }
 
-                match listener.accept() {
-                    Ok((mut stream, _)) => {
-                        let request = read_json_request(&mut stream);
-                        let response = bridge_response(
-                            &request,
-                            &thread_wait_play_results,
-                            &thread_movement_count,
-                            &thread_play_state,
-                            BridgeResponseOptions {
-                                screenshot_delay,
-                                server_release_log_path: server_release_log_path.as_deref(),
-                                scenario_result,
-                                screenshot_bytes,
-                            },
-                        );
-                        thread_requests.lock().expect("requests lock").push(request);
-                        write_json_response(&mut stream, &response);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(10));
-                    }
-                    Err(error) => panic!("fake bridge accept failed: {error}"),
+                let (mut stream, _) = listener.accept().expect("fake bridge accepts request");
+                if thread_stop.load(Ordering::Acquire) {
+                    break;
+                }
+
+                let request = read_json_request(&mut stream);
+                let deferred_screenshot_path = defer_screenshot_until_response
+                    .then(|| request["command"].as_str())
+                    .flatten()
+                    .filter(|command| *command == "screenshot")
+                    .map(|_| {
+                        request["payload"]["path"]
+                            .as_str()
+                            .expect("screenshot path")
+                            .to_owned()
+                    });
+                let response = bridge_response(
+                    &request,
+                    &thread_wait_play_results,
+                    &thread_movement_count,
+                    &thread_replay_movement_cm,
+                    &thread_play_state,
+                    BridgeResponseOptions {
+                        defer_screenshot_until_response,
+                        server_release_log_path: server_release_log_path.as_deref(),
+                        scenario_result,
+                        screenshot_bytes,
+                    },
+                );
+                thread_requests.lock().expect("requests lock").push(request);
+                write_json_response(&mut stream, &response);
+                if let Some(path) = deferred_screenshot_path {
+                    std::fs::write(path, screenshot_bytes).expect("write deferred fake screenshot");
                 }
             }
         });
@@ -1558,11 +2448,14 @@ impl FakeBridge {
         Self {
             port,
             requests,
+            stop,
             handle: Some(handle),
         }
     }
 
     fn join(mut self) -> Vec<Value> {
+        self.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
         self.handle
             .take()
             .expect("fake bridge thread exists")
@@ -1614,6 +2507,7 @@ fn bridge_response(
     request: &Value,
     wait_play_results: &Mutex<VecDeque<Value>>,
     movement_count: &Mutex<u32>,
+    replay_movement_cm: &Mutex<(i32, i32)>,
     play_state: &Mutex<bool>,
     options: BridgeResponseOptions<'_>,
 ) -> Value {
@@ -1643,7 +2537,7 @@ fn bridge_response(
                 "server_addr": request["payload"]["server_addr"],
             })
         }
-        "wait_play" => wait_play_results
+        "wait_play" | "wait_state_change" => wait_play_results
             .lock()
             .expect("wait_play lock")
             .pop_front()
@@ -1652,6 +2546,13 @@ fn bridge_response(
             *movement_count.lock().expect("movement lock") += 1;
             json!({"status": "ok"})
         }
+        "move_by" => {
+            let mut movement = replay_movement_cm.lock().expect("replay movement lock");
+            movement.0 += request["payload"]["dx_cm"].as_i64().expect("move_by dx_cm") as i32;
+            movement.1 += request["payload"]["dz_cm"].as_i64().expect("move_by dz_cm") as i32;
+            json!({"status": "ok"})
+        }
+        "wait_ticks" | "look" => json!({"status": "ok"}),
         "run_scenario" => json!({
             "result": options.scenario_result,
             "id": request["payload"]["id"],
@@ -1660,14 +2561,17 @@ fn bridge_response(
             ],
         }),
         "state" => {
-            let moved = *movement_count.lock().expect("movement lock") > 0;
+            let movement_count = *movement_count.lock().expect("movement lock");
+            let replay_movement = *replay_movement_cm.lock().expect("replay movement lock");
             let in_play = *play_state.lock().expect("play lock");
             json!({
+                "state_version": 1,
                 "in_play": in_play,
                 "dimension": if in_play { "minecraft:overworld" } else { "" },
-                "x": 0.5,
+                "x": 0.5 + f64::from(replay_movement.0) / 100.0,
                 "y": 64.0,
-                "z": if moved { 1.25 } else { 0.5 },
+                "z": 0.5 + f64::from(movement_count) * 3.0
+                    + f64::from(replay_movement.1) / 100.0,
                 "selected_hotbar_slot": 0,
                 "screen": null,
             })
@@ -1676,21 +2580,20 @@ fn bridge_response(
             let path = request["payload"]["path"]
                 .as_str()
                 .expect("screenshot path");
-            if options.screenshot_delay.is_zero() {
+            if !options.defer_screenshot_until_response {
                 std::fs::write(path, options.screenshot_bytes).expect("write fake screenshot");
-            } else {
-                let path = path.to_owned();
-                let screenshot_delay = options.screenshot_delay;
-                let screenshot_bytes = options.screenshot_bytes;
-                thread::spawn(move || {
-                    thread::sleep(screenshot_delay);
-                    std::fs::write(path, screenshot_bytes).expect("write delayed fake screenshot");
-                });
             }
             json!({"path": path})
         }
         "disconnect" => {
             *play_state.lock().expect("play lock") = false;
+            if let Some(path) = options.server_release_log_path {
+                std::fs::write(
+                    path,
+                    "2026-06-22T14:10:54.741091Z  INFO mc_net::play: saved player state player=SolarisAgent state=pos=(-2.31,80.00,-6.58)\n",
+                )
+                .expect("write server release marker after disconnect");
+            }
             json!({"disconnected": true})
         }
         other => json!({"unknown_command": other}),
@@ -1705,7 +2608,7 @@ fn bridge_response(
 }
 
 struct BridgeResponseOptions<'a> {
-    screenshot_delay: Duration,
+    defer_screenshot_until_response: bool,
     server_release_log_path: Option<&'a std::path::Path>,
     scenario_result: &'static str,
     screenshot_bytes: &'static [u8],
@@ -1722,12 +2625,14 @@ const VALID_PNG_1X1: &[u8] = &[
 fn wait_play_payload(in_play: bool) -> Value {
     if in_play {
         json!({
+            "state_version": 1,
             "in_play": true,
             "dimension": "minecraft:overworld",
             "player": {"x": 0.5, "y": 64.0, "z": 0.5},
         })
     } else {
         json!({
+            "state_version": 1,
             "in_play": false,
             "dimension": "",
             "player": null,

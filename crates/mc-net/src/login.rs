@@ -1,27 +1,33 @@
-//! Login state handler — offline-mode only.
+//! Login state handler for offline and Mojang-authenticated online mode.
 //!
-//! M1.d: drive the client from `LoginStart` through `LoginSuccess` and
-//! `LoginAcknowledged`. After acknowledgement the connection is in the
-//! Configuration state, which is M1.e; for now we just drop the
-//! connection, which surfaces to the vanilla client as a generic
-//! "connection lost" message.
-//!
-//! Online-mode (encryption + Mojang session-server authentication) is a
-//! deliberate later milestone.
+//! Online mode performs the RSA challenge, enables the continuous AES-CFB8
+//! transport, verifies the account with the session service, and only then
+//! enables compression and enters Configuration.
+
+use std::net::IpAddr;
+use std::sync::Arc;
 
 use bytes::BytesMut;
 use mc_protocol::State;
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::login::{
-    LoginAcknowledged, LoginDisconnect, LoginStart, LoginSuccess, SetCompression,
+    GameProfileProperty, LoginAcknowledged, LoginDisconnect, LoginStart, LoginSuccess,
+    SetCompression,
 };
 use md5::{Digest, Md5};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::info;
 use uuid::Uuid;
 
-use crate::connection::{PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout, write_packet};
+use crate::connection::{
+    ConnectionReader, ConnectionWriter, PRE_PLAY_READ_TIMEOUT, read_packet_with_timeout,
+    write_packet,
+};
 use crate::error::ConnectionError;
+use crate::session_auth::{
+    RsaIdentity, SessionVerifier, VerifiedSession, VerifySession, VerifySessionError,
+    minecraft_server_hash,
+};
 
 pub(crate) const LOGIN_COMPRESSION_THRESHOLD: i32 = 256;
 
@@ -34,12 +40,20 @@ pub(crate) struct LoggedInProfile {
     pub name: String,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct LoginOutcome {
+    pub profile: LoggedInProfile,
+    pub properties: Vec<GameProfileProperty>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LoginAccessConfig {
     pub online_mode: bool,
     pub whitelist_enabled: bool,
     pub whitelist: std::collections::BTreeSet<String>,
     pub banned_players: std::collections::BTreeSet<String>,
+    session_verifier: Option<Arc<dyn SessionVerifier>>,
+    prevent_proxy_connections: bool,
 }
 
 impl LoginAccessConfig {
@@ -66,6 +80,49 @@ impl LoginAccessConfig {
             whitelist_enabled,
             whitelist: normalize_access_set(whitelist),
             banned_players: normalize_access_set(banned_players),
+            session_verifier: None,
+            prevent_proxy_connections: false,
+        }
+    }
+
+    #[must_use]
+    pub fn with_session_verifier(mut self, verifier: Arc<dyn SessionVerifier>) -> Self {
+        self.session_verifier = Some(verifier);
+        self
+    }
+
+    #[must_use]
+    pub fn with_prevent_proxy_connections(mut self, enabled: bool) -> Self {
+        self.prevent_proxy_connections = enabled;
+        self
+    }
+
+    pub(crate) fn session_verifier(&self) -> Option<Arc<dyn SessionVerifier>> {
+        self.session_verifier.clone()
+    }
+
+    pub(crate) fn prevent_proxy_connections(&self) -> bool {
+        self.prevent_proxy_connections
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OnlineAuthentication {
+    identity: RsaIdentity,
+    verifier: Arc<dyn SessionVerifier>,
+    prevent_proxy_connections: bool,
+}
+
+impl OnlineAuthentication {
+    pub(crate) fn new(
+        identity: RsaIdentity,
+        verifier: Arc<dyn SessionVerifier>,
+        prevent_proxy_connections: bool,
+    ) -> Self {
+        Self {
+            identity,
+            verifier,
+            prevent_proxy_connections,
         }
     }
 }
@@ -85,7 +142,6 @@ where
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum LoginRejection {
-    OnlineModeUnsupported,
     Banned,
     Whitelist,
 }
@@ -93,9 +149,6 @@ pub(crate) enum LoginRejection {
 impl LoginRejection {
     fn message(self) -> &'static str {
         match self {
-            Self::OnlineModeUnsupported => {
-                "Solaris M89 only supports offline-mode private/local authentication"
-            }
             Self::Banned => "You are banned from this Solaris server",
             Self::Whitelist => "You are not whitelisted on this Solaris server",
         }
@@ -121,18 +174,21 @@ pub fn offline_uuid(name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle<R, W>(
-    reader: &mut R,
-    writer: &mut W,
+    reader: &mut ConnectionReader<R>,
+    writer: &mut ConnectionWriter<W>,
     buf: &mut BytesMut,
     compression_threshold: i32,
     compression: &mut Compression,
     compression_level: Option<u32>,
     access: &LoginAccessConfig,
-) -> Result<Option<LoggedInProfile>, ConnectionError>
+    online_authentication: Option<&OnlineAuthentication>,
+    peer_ip: IpAddr,
+) -> Result<Option<LoginOutcome>, ConnectionError>
 where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
     let login_start = read_packet_with_timeout::<LoginStart, _>(
         reader,
@@ -142,18 +198,85 @@ where
         PRE_PLAY_READ_TIMEOUT,
     )
     .await?;
-    // Offline mode: ignore the UUID the client just sent us and stamp our
-    // own derived one. This is what vanilla does too — clients always send
-    // *some* UUID (since 1.20.2 it is mandatory in LoginStart) but it is
-    // not authoritative.
-    let uuid = offline_uuid(&login_start.name);
     let name = login_start.name;
+    let (uuid, properties) = if access.online_mode {
+        let authentication = online_authentication.ok_or(ConnectionError::OnlineAuthentication(
+            "server authentication context is unavailable",
+        ))?;
+        let challenge = authentication.identity.new_challenge();
+        write_packet(
+            writer,
+            &mc_protocol::packets::login::EncryptionRequest {
+                server_id: String::new(),
+                public_key: authentication.identity.public_key_der().to_vec(),
+                verify_token: challenge.to_vec(),
+                should_authenticate: true,
+            },
+            Compression::Disabled,
+        )
+        .await?;
+        let response =
+            read_packet_with_timeout::<mc_protocol::packets::login::EncryptionResponse, _>(
+                reader,
+                buf,
+                Compression::Disabled,
+                State::Login,
+                PRE_PLAY_READ_TIMEOUT,
+            )
+            .await?;
+        let shared_secret = authentication
+            .identity
+            .decrypt_response(
+                &response.encrypted_shared_secret,
+                &response.encrypted_verify_token,
+                challenge,
+            )
+            .map_err(|_| ConnectionError::OnlineAuthentication("invalid encryption response"))?;
+        reader.enable_encryption(&shared_secret, buf);
+        writer.enable_encryption(&shared_secret);
+
+        let verified = authentication
+            .verifier
+            .verify(VerifySession {
+                username: name.clone(),
+                server_id_hash: minecraft_server_hash(
+                    b"",
+                    &shared_secret,
+                    authentication.identity.public_key_der(),
+                ),
+                client_ip: authentication.prevent_proxy_connections.then_some(peer_ip),
+            })
+            .await;
+        let VerifiedSession { uuid, properties } = match verified {
+            Ok(profile) => profile,
+            Err(VerifySessionError::Unverified) => {
+                write_login_disconnect(writer, "Failed to verify username!").await?;
+                info!(player = %name, "online login rejected: unverified session");
+                return Ok(None);
+            }
+            Err(VerifySessionError::Unavailable) => {
+                write_login_disconnect(
+                    writer,
+                    "Authentication servers are down. Please try again later, sorry!",
+                )
+                .await?;
+                info!(player = %name, "online login rejected: session service unavailable");
+                return Ok(None);
+            }
+        };
+        info!(player = %name, %uuid, "online login verified");
+        (uuid, properties)
+    } else {
+        // Offline mode ignores the client UUID and derives the vanilla UUID.
+        let uuid = offline_uuid(&name);
+        info!(player = %name, %uuid, "offline login");
+        (uuid, Vec::new())
+    };
     if let Some(rejection) = access_rejection(access, &name, uuid) {
         write_login_disconnect(writer, rejection.message()).await?;
         info!(player = %name, %uuid, reason = ?rejection, "login rejected");
         return Ok(None);
     }
-    info!(player = %name, %uuid, "offline login");
 
     let compression_threshold = compression_threshold.max(0);
     write_packet(
@@ -172,7 +295,7 @@ where
     let success = LoginSuccess {
         uuid,
         name: name.clone(),
-        properties: Vec::new(),
+        properties: properties.clone(),
     };
     write_packet(writer, &success, *compression).await?;
 
@@ -185,7 +308,10 @@ where
     )
     .await?;
 
-    Ok(Some(LoggedInProfile { uuid, name }))
+    Ok(Some(LoginOutcome {
+        profile: LoggedInProfile { uuid, name },
+        properties,
+    }))
 }
 
 pub(crate) fn access_rejection(
@@ -193,9 +319,6 @@ pub(crate) fn access_rejection(
     name: &str,
     uuid: Uuid,
 ) -> Option<LoginRejection> {
-    if access.online_mode {
-        return Some(LoginRejection::OnlineModeUnsupported);
-    }
     let name = name.to_ascii_lowercase();
     let uuid = uuid.to_string().to_ascii_lowercase();
     if access.banned_players.contains(&name) || access.banned_players.contains(&uuid) {
@@ -212,7 +335,7 @@ pub(crate) fn access_rejection(
 
 async fn write_login_disconnect<W>(writer: &mut W, reason: &str) -> Result<(), ConnectionError>
 where
-    W: AsyncWriteExt + Unpin,
+    W: AsyncWrite + Unpin,
 {
     write_packet(
         writer,
@@ -226,7 +349,29 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use super::*;
+    use mc_protocol::packets::login::{
+        EncryptionRequest, EncryptionResponse, GameProfileProperty, LoginAcknowledged, LoginStart,
+        LoginSuccess, SetCompression,
+    };
+    use rsa::pkcs8::DecodePublicKey;
+    use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
+
+    #[derive(Debug)]
+    struct RecordingVerifier {
+        requests: Mutex<Vec<VerifySession>>,
+        result: VerifiedSession,
+    }
+
+    impl SessionVerifier for RecordingVerifier {
+        fn verify(&self, request: VerifySession) -> crate::SessionVerifierFuture<'_> {
+            self.requests.lock().unwrap().push(request);
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
 
     /// Regression guard against accidentally changing the offline UUID
     /// derivation. The values pinned here were captured from this
@@ -269,13 +414,146 @@ mod tests {
         assert_ne!(offline_uuid("a"), offline_uuid("b"));
     }
 
+    #[tokio::test]
+    async fn online_login_encrypts_before_compression_and_uses_verified_profile() {
+        const SHARED_SECRET: [u8; 16] = *b"0123456789abcdef";
+        let verified_uuid = Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+        let properties = vec![GameProfileProperty {
+            name: "textures".to_owned(),
+            value: "texture-value".to_owned(),
+            signature: Some("texture-signature".to_owned()),
+        }];
+        let verifier = Arc::new(RecordingVerifier {
+            requests: Mutex::new(Vec::new()),
+            result: VerifiedSession {
+                uuid: verified_uuid,
+                properties: properties.clone(),
+            },
+        });
+        let authentication =
+            OnlineAuthentication::new(RsaIdentity::generate().unwrap(), verifier.clone(), true);
+        let access = LoginAccessConfig::normalized(
+            true,
+            false,
+            std::iter::empty::<&str>(),
+            std::iter::empty::<&str>(),
+        );
+        let (server_io, client_io) = tokio::io::duplex(4096);
+        let (server_read, server_write) = tokio::io::split(server_io);
+        let (client_read, client_write) = tokio::io::split(client_io);
+        let mut server_reader = ConnectionReader::new(server_read);
+        let mut server_writer = ConnectionWriter::new(server_write);
+        let mut client_reader = ConnectionReader::new(client_read);
+        let mut client_writer = ConnectionWriter::new(client_write);
+        let mut server_buf = BytesMut::new();
+        let mut client_buf = BytesMut::new();
+        let mut server_compression = Compression::Disabled;
+
+        let server = async {
+            handle(
+                &mut server_reader,
+                &mut server_writer,
+                &mut server_buf,
+                LOGIN_COMPRESSION_THRESHOLD,
+                &mut server_compression,
+                None,
+                &access,
+                Some(&authentication),
+                "203.0.113.9".parse().unwrap(),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        };
+        let client = async {
+            write_packet(
+                &mut client_writer,
+                &LoginStart {
+                    name: "OnlinePlayer".to_owned(),
+                    player_uuid: Uuid::nil(),
+                },
+                Compression::Disabled,
+            )
+            .await
+            .unwrap();
+            let request = read_packet_with_timeout::<EncryptionRequest, _>(
+                &mut client_reader,
+                &mut client_buf,
+                Compression::Disabled,
+                State::Login,
+                PRE_PLAY_READ_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let public_key = RsaPublicKey::from_public_key_der(&request.public_key).unwrap();
+            let mut rng = rsa::rand_core::OsRng;
+            let encrypted_shared_secret = public_key
+                .encrypt(&mut rng, Pkcs1v15Encrypt, &SHARED_SECRET)
+                .unwrap();
+            let encrypted_verify_token = public_key
+                .encrypt(&mut rng, Pkcs1v15Encrypt, &request.verify_token)
+                .unwrap();
+            write_packet(
+                &mut client_writer,
+                &EncryptionResponse {
+                    encrypted_shared_secret,
+                    encrypted_verify_token,
+                },
+                Compression::Disabled,
+            )
+            .await
+            .unwrap();
+            client_reader.enable_encryption(&SHARED_SECRET, &mut client_buf);
+            client_writer.enable_encryption(&SHARED_SECRET);
+
+            let set_compression = read_packet_with_timeout::<SetCompression, _>(
+                &mut client_reader,
+                &mut client_buf,
+                Compression::Disabled,
+                State::Login,
+                PRE_PLAY_READ_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            let compression = Compression::Threshold(set_compression.threshold as usize);
+            let success = read_packet_with_timeout::<LoginSuccess, _>(
+                &mut client_reader,
+                &mut client_buf,
+                compression,
+                State::Login,
+                PRE_PLAY_READ_TIMEOUT,
+            )
+            .await
+            .unwrap();
+            write_packet(&mut client_writer, &LoginAcknowledged, compression)
+                .await
+                .unwrap();
+            let expected_hash = minecraft_server_hash(b"", &SHARED_SECRET, &request.public_key);
+            (success, expected_hash)
+        };
+
+        let (outcome, (success, expected_hash)) = tokio::join!(server, client);
+
+        assert_eq!(outcome.profile.uuid, verified_uuid);
+        assert_eq!(outcome.profile.name, "OnlinePlayer");
+        assert_eq!(outcome.properties, properties);
+        assert_eq!(success.uuid, verified_uuid);
+        assert_eq!(success.name, "OnlinePlayer");
+        assert_eq!(success.properties, properties);
+        let requests = verifier.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].username, "OnlinePlayer");
+        assert_eq!(requests[0].server_id_hash, expected_hash);
+        assert_eq!(requests[0].client_ip, Some("203.0.113.9".parse().unwrap()));
+    }
+
     #[test]
-    fn access_rejection_fails_closed_for_online_mode() {
+    fn access_rejection_allows_verified_online_profile() {
         let access =
             LoginAccessConfig::normalized(true, false, ["notch"], std::iter::empty::<&str>());
         assert_eq!(
             access_rejection(&access, "Notch", offline_uuid("Notch")),
-            Some(LoginRejection::OnlineModeUnsupported)
+            None
         );
     }
 

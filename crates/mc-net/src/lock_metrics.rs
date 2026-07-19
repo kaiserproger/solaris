@@ -11,6 +11,7 @@ const SLOW_HOLD_WARNING_US: u64 = 25_000;
 pub(crate) enum LockMetricKind {
     WorldStorage,
     SessionRegistry,
+    ContainerRegistry,
     SaveAllFlush,
     ChunkPrepare,
     PlayerPersistence,
@@ -30,6 +31,7 @@ pub struct LockMetricSnapshot {
 pub struct LockMetricsSnapshot {
     pub world_storage: LockMetricSnapshot,
     pub session_registry: LockMetricSnapshot,
+    pub container_registry: LockMetricSnapshot,
     pub save_all_flush: LockMetricSnapshot,
     pub chunk_prepare: LockMetricSnapshot,
     pub player_persistence: LockMetricSnapshot,
@@ -70,6 +72,7 @@ impl LockMetric {
 
 static WORLD_STORAGE: LockMetric = LockMetric::new();
 static SESSION_REGISTRY: LockMetric = LockMetric::new();
+static CONTAINER_REGISTRY: LockMetric = LockMetric::new();
 static SAVE_ALL_FLUSH: LockMetric = LockMetric::new();
 static CHUNK_PREPARE: LockMetric = LockMetric::new();
 static PLAYER_PERSISTENCE: LockMetric = LockMetric::new();
@@ -107,6 +110,7 @@ pub(crate) fn snapshot() -> LockMetricsSnapshot {
     LockMetricsSnapshot {
         world_storage: WORLD_STORAGE.snapshot(),
         session_registry: SESSION_REGISTRY.snapshot(),
+        container_registry: CONTAINER_REGISTRY.snapshot(),
         save_all_flush: SAVE_ALL_FLUSH.snapshot(),
         chunk_prepare: CHUNK_PREPARE.snapshot(),
         player_persistence: PLAYER_PERSISTENCE.snapshot(),
@@ -157,6 +161,7 @@ impl LockMetricKind {
         match self {
             Self::WorldStorage => "world_storage",
             Self::SessionRegistry => "session_registry",
+            Self::ContainerRegistry => "container_registry",
             Self::SaveAllFlush => "save_all_flush",
             Self::ChunkPrepare => "chunk_prepare",
             Self::PlayerPersistence => "player_persistence",
@@ -167,6 +172,7 @@ impl LockMetricKind {
         match self {
             Self::WorldStorage => &WORLD_STORAGE,
             Self::SessionRegistry => &SESSION_REGISTRY,
+            Self::ContainerRegistry => &CONTAINER_REGISTRY,
             Self::SaveAllFlush => &SAVE_ALL_FLUSH,
             Self::ChunkPrepare => &CHUNK_PREPARE,
             Self::PlayerPersistence => &PLAYER_PERSISTENCE,

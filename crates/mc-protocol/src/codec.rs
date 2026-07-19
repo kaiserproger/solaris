@@ -29,11 +29,12 @@ pub const MAX_VARINT_BYTES: usize = 5;
 /// Maximum number of bytes a Minecraft VarLong may occupy on the wire.
 pub const MAX_VARLONG_BYTES: usize = 10;
 
-/// VarInt-prefixed strings cap at this many UTF-16 code units in vanilla;
-/// we apply the limit to chars (each char is one UTF-16 code unit for the
-/// basic plane and two for surrogates — we accept the slight overcounting
-/// in exchange for not having to scan the string twice).
+/// VarInt-prefixed strings cap at this many UTF-16 code units in vanilla.
 pub const DEFAULT_MAX_STRING_LEN: usize = 32_767;
+
+fn utf16_code_units(s: &str) -> usize {
+    s.encode_utf16().count()
+}
 
 // -----------------------------------------------------------------------
 // VarInt / VarLong as standalone functions (used by the framing layer).
@@ -181,9 +182,8 @@ pub trait ReadMc: Buf {
         Err(CodecError::VarLongTooLong)
     }
 
-    /// Length-prefixed string. `max` is the maximum permitted *char count*
-    /// (vanilla measures in UTF-16 code units; chars are usually a good
-    /// enough proxy and never *under*count the limit).
+    /// Length-prefixed string. `max` is the maximum permitted number of
+    /// UTF-16 code units, matching Java's `String.length()`.
     fn read_string(&mut self, max: usize) -> Result<String, CodecError> {
         let len_signed = self.read_varint()?;
         if len_signed < 0 {
@@ -204,9 +204,10 @@ pub trait ReadMc: Buf {
         let mut bytes = vec![0u8; len];
         self.copy_to_slice(&mut bytes);
         let s = String::from_utf8(bytes).map_err(|_| CodecError::InvalidUtf8)?;
-        if s.chars().count() > max {
+        let code_units = utf16_code_units(&s);
+        if code_units > max {
             return Err(CodecError::StringTooLong {
-                len: s.chars().count(),
+                len: code_units,
                 max,
             });
         }
@@ -336,9 +337,10 @@ pub trait WriteMc: BufMut {
     }
 
     fn write_string(&mut self, s: &str, max: usize) -> Result<(), CodecError> {
-        if s.chars().count() > max {
+        let code_units = utf16_code_units(s);
+        if code_units > max {
             return Err(CodecError::StringTooLong {
-                len: s.chars().count(),
+                len: code_units,
                 max,
             });
         }
@@ -349,10 +351,8 @@ pub trait WriteMc: BufMut {
         Ok(())
     }
 
-    fn write_identifier(&mut self, id: &Identifier) {
-        // Identifier construction has already validated length; the unwrap
-        // is unreachable for any value that exists at runtime.
-        let _ = self.write_string(id.as_str(), DEFAULT_MAX_STRING_LEN);
+    fn write_identifier(&mut self, id: &Identifier) -> Result<(), CodecError> {
+        self.write_string(id.as_str(), DEFAULT_MAX_STRING_LEN)
     }
 
     fn write_uuid(&mut self, uuid: Uuid) {
@@ -538,6 +538,31 @@ mod tests {
     }
 
     #[test]
+    fn string_write_limit_counts_utf16_code_units() {
+        let mut buf = Vec::new();
+        assert_eq!(
+            buf.write_string("\u{1F600}", 1).unwrap_err(),
+            CodecError::StringTooLong { len: 2, max: 1 }
+        );
+        assert!(buf.is_empty());
+
+        buf.write_string("\u{1F600}", 2).unwrap();
+    }
+
+    #[test]
+    fn string_read_limit_counts_utf16_code_units() {
+        let encoded = [4, 0xF0, 0x9F, 0x98, 0x80];
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(
+            cursor.read_string(1).unwrap_err(),
+            CodecError::StringTooLong { len: 2, max: 1 }
+        );
+
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(cursor.read_string(2).unwrap(), "\u{1F600}");
+    }
+
+    #[test]
     fn string_rejected_on_negative_length() {
         // VarInt -1 = 0xFF 0xFF 0xFF 0xFF 0x0F, then no bytes.
         let buf: &[u8] = &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F];
@@ -641,10 +666,27 @@ mod tests {
     fn identifier_round_trip() {
         let id = Identifier::parse("solaris:musket").unwrap();
         let mut buf = Vec::new();
-        buf.write_identifier(&id);
+        buf.write_identifier(&id).unwrap();
         let mut cursor: &[u8] = &buf;
         let decoded = cursor.read_identifier().unwrap();
         assert_eq!(decoded, id);
+    }
+
+    #[test]
+    fn oversized_identifier_write_returns_error_without_mutating_buffer() {
+        let id =
+            Identifier::parse(format!("minecraft:{}", "a".repeat(DEFAULT_MAX_STRING_LEN))).unwrap();
+        let expected_len = id.as_str().len();
+        let mut buf = vec![0xAA];
+
+        assert_eq!(
+            buf.write_identifier(&id).unwrap_err(),
+            CodecError::StringTooLong {
+                len: expected_len,
+                max: DEFAULT_MAX_STRING_LEN,
+            }
+        );
+        assert_eq!(buf, vec![0xAA]);
     }
 
     #[test]

@@ -314,16 +314,16 @@ fn item_list_tag(slots: &[FurnaceSlot], items: &ItemRegistry) -> Tag {
     })
 }
 
-/// Encode all 24 sections of `chunk` into the paletted-container blob
+/// Encode all sections of `chunk` into the paletted-container blob
 /// that fills `LevelChunkWithLight.data`.
 ///
 /// `biomes` is the `worldgen/biome` registry; the chunk's biome
 /// palette stores identifiers and the wire format needs numeric
 /// registry indices, so the registry has to be supplied.
 pub fn encode_chunk_data(chunk: &Chunk, biomes: &Registry) -> Result<Vec<u8>, WireError> {
-    debug_assert_eq!(chunk.sections.len(), SECTION_COUNT);
-    debug_assert_eq!(chunk.biomes.len(), SECTION_COUNT);
-    let mut buf = Vec::with_capacity(SECTION_COUNT * 16);
+    debug_assert_eq!(chunk.sections.len(), chunk.geometry().section_count());
+    debug_assert_eq!(chunk.biomes.len(), chunk.geometry().section_count());
+    let mut buf = Vec::with_capacity(chunk.geometry().section_count() * 16);
     for (sec, bsec) in chunk.sections.iter().zip(chunk.biomes.iter()) {
         // i16 non_air_block_count + i16 fluid_count (we don't model
         // fluids yet, so always 0). Both big-endian on the wire.
@@ -489,10 +489,9 @@ fn registry_index_of(registry: &Registry, biome: &Identifier) -> Result<i32, Wir
 /// world-model types into the protocol crate, matching the same
 /// posture `encode_chunk_data` / `client_heightmaps` already establish.
 ///
-/// Y-slot indexing: 26 slots covering section-Y `-5..=20` (one slab
-/// below the bottom of the world, 24 in-world sections, one slab
-/// above the top). Slot 0 = `Y=-5`, slot 25 = `Y=20`. Slot `i`
-/// corresponds to in-world chunk section index `i - 1`.
+/// Y-slot indexing contains one slab below the world, all in-world
+/// sections, and one slab above the world. Slot `i` corresponds to
+/// in-world chunk section index `i - 1`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LightWire {
     pub sky_y_mask: Vec<i64>,
@@ -508,13 +507,16 @@ pub struct LightWire {
 pub const WIRE_LIGHT_SECTIONS: usize = SECTION_COUNT + 2;
 
 /// Pack a per-chunk computed [`ChunkLight`] into the wire payload
-/// `LevelChunkWithLight` expects. Always emits all 26 slots: each
+/// `LevelChunkWithLight` expects. Always emits every light slot: each
 /// section is either listed in the `*_y_mask` with its 2048-byte
 /// nibble layer, or in the `empty_*_y_mask`. The below-world slab is
 /// emitted empty for both channels; the above-world slab is emitted
 /// as `sky=15` (open sky) and `block=0` (empty for block channel).
 #[must_use]
 pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
+    let section_count = light.section_count();
+    let wire_light_sections = section_count + 2;
+    assert!(wire_light_sections <= u64::BITS as usize);
     let mut sky_mask: u64 = 0;
     let mut block_mask: u64 = 0;
     let mut empty_sky_mask: u64 = 0;
@@ -526,8 +528,8 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
     empty_sky_mask |= 1 << 0;
     empty_block_mask |= 1 << 0;
 
-    // Slots 1..=24 — in-world sections 0..=23 of the ChunkLight.
-    for section_idx in 0..SECTION_COUNT {
+    // In-world sections occupy slots 1..=section_count.
+    for section_idx in 0..section_count {
         let slot = section_idx + 1;
         let sky_layer = pack_section_layer(&light.sky, section_idx);
         let block_layer = pack_section_layer(&light.block, section_idx);
@@ -545,10 +547,11 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
         }
     }
 
-    // Slot 25 (Y=20, above world): sky=15 (open sky), block empty.
-    sky_mask |= 1 << 25;
+    // The slot above the world is sky=15 (open sky), block empty.
+    let top_slot = section_count + 1;
+    sky_mask |= 1 << top_slot;
     sky_updates.push(vec![0xFF; LIGHT_LAYER_BYTES]);
-    empty_block_mask |= 1 << 25;
+    empty_block_mask |= 1 << top_slot;
 
     LightWire {
         sky_y_mask: vec![sky_mask as i64],
@@ -564,7 +567,6 @@ pub fn encode_chunk_light(light: &ChunkLight) -> LightWire {
 /// light. Missing lazy sections are all-zero and omitted from the wire
 /// present mask.
 fn pack_section_layer(channel: &LightLayer, section_idx: usize) -> Option<Vec<u8>> {
-    debug_assert!(section_idx < SECTION_COUNT);
     let layer = channel.section(section_idx)?;
     Some(layer.to_vec())
 }
@@ -589,7 +591,7 @@ fn write_varint(buf: &mut Vec<u8>, value: i32) {
 mod tests {
     use super::*;
     use crate::block::BlockStateId;
-    use crate::chunk::{Chunk, ChunkPos, FurnaceSlot, Heightmap};
+    use crate::chunk::{Chunk, ChunkGeometry, ChunkPos, FurnaceSlot, Heightmap};
     use mc_data::Registry;
     use mc_data::blocks::{BlockReport, BlockStateReport};
     use mc_data::items::{ItemRegistry, ItemReport};
@@ -688,6 +690,33 @@ mod tests {
     }
 
     #[test]
+    fn custom_geometry_encodes_chunk_data_and_baked_light_sections() {
+        let geometry = ChunkGeometry::new(0, 256).expect("valid custom geometry");
+        let mut chunk = Chunk::empty_with_geometry(
+            ChunkPos { x: 0, z: 0 },
+            AIR,
+            Identifier::parse("minecraft:plains").unwrap(),
+            geometry,
+        );
+
+        let data = encode_chunk_data(&chunk, &biome_registry()).expect("encode chunk data");
+        assert_eq!(data.len(), geometry.section_count() * 8);
+
+        chunk.section_lights[15].block = Some(vec![0x0F; LIGHT_LAYER_BYTES]);
+        let light = ChunkLight::from_section_lights(&chunk.section_lights)
+            .expect("rebuild baked custom-geometry light");
+        let wire = encode_chunk_light(&light);
+
+        assert_eq!(wire.block_y_mask, vec![1 << 16]);
+        assert_eq!(wire.block_updates.len(), 1);
+        assert_eq!(wire.block_updates[0], vec![0x0F; LIGHT_LAYER_BYTES]);
+        assert_eq!(wire.sky_y_mask, vec![1 << 17]);
+        assert_eq!(wire.sky_updates, vec![vec![0xFF; LIGHT_LAYER_BYTES]]);
+        assert_eq!(wire.empty_block_y_mask, vec![(1 << 18) - 1 - (1 << 16)]);
+        assert_eq!(wire.empty_sky_y_mask, vec![(1 << 18) - 1 - (1 << 17)]);
+    }
+
+    #[test]
     fn client_block_entities_emit_stripped_chest_update_tag() {
         let registry = air_chest_registry();
         let items = item_registry();
@@ -699,6 +728,7 @@ mod tests {
             count: 2,
             item_id: 9,
             damage: None,
+            enchantments: Vec::new(),
         };
         chunk.chests.insert(pos, chest);
 

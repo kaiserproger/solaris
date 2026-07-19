@@ -135,12 +135,14 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() 
             item_id: dirt_id,
             count: 5,
             damage: None,
+            enchantments: Vec::new(),
         };
         let mut right_chest = mc_world::ChestBlockEntity::default();
         right_chest.slots[0] = mc_world::FurnaceSlot {
             item_id: dirt_id,
             count: 7,
             damage: None,
+            enchantments: Vec::new(),
         };
         world
             .set_chest_block_entity(left_pos, left_chest)
@@ -207,7 +209,7 @@ async fn survival_double_chest_opens_combined_storage_and_mutates_second_half() 
 }
 
 #[tokio::test]
-async fn survival_armor_slot_reduces_debug_damage() {
+async fn survival_generic_damage_bypasses_armor_and_durability() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -308,7 +310,7 @@ async fn survival_armor_slot_reduces_debug_damage() {
         })
         .await
         .expect("equip chestplate");
-    wait_for_inventory_content(&mut client, |pkt| {
+    let equipped = wait_for_inventory_content(&mut client, |pkt| {
         pkt.carried_item.is_empty() && pkt.items[6].item_id == chestplate_id
     })
     .await;
@@ -316,11 +318,33 @@ async fn survival_armor_slot_reduces_debug_damage() {
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 10".into(),
+        })
+        .await
+        .expect("damage armored player");
+    wait_for_health_near(&mut client, 10.0, 0.02).await;
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: 0,
+            state_id: equipped.state_id,
+            slot_num: 6,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: Vec::new(),
+            carried_item: HashedStack::Actual {
+                item_id: chestplate_id,
+                count: 1,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("inspect chestplate after generic damage");
+    wait_for_inventory_content(&mut client, |pkt| {
+        pkt.carried_item.item_id == chestplate_id
+            && pkt.carried_item.count == 1
+            && pkt.carried_item.damage.unwrap_or_default() == 0
     })
-    .await
-    .expect("damage armored player");
-    wait_for_health_near(&mut client, 10.48, 0.02).await;
-    wait_for_slot_damage(&mut client, 6, chestplate_id, 2).await;
+    .await;
 }
 
 #[tokio::test]
@@ -453,6 +477,63 @@ async fn survival_use_item_eats_apple_and_updates_food() {
             }
         }
     }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::SwapItemWithOffhand,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 42,
+        })
+        .await
+        .expect("move remaining apple to offhand");
+    assert_offhand_swap_before_ack(&mut client, 42, apple_id, true).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug survival exhaust 20".into(),
+        })
+        .await
+        .expect("exhaust hunger before offhand use");
+    wait_for_food_level(&mut client, 18).await;
+    client
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::OffHand,
+            sequence: 43,
+            y_rot: 0.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("eat apple from offhand");
+    read_ack_without_food_or_slot_change(&mut client, 43, apple_id).await;
+
+    let mut saw_offhand_empty = false;
+    let mut saw_offhand_food = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_offhand_empty && saw_offhand_food) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("offhand eat response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode offhand food SetSlot");
+            saw_offhand_empty |= packet.container_id == 0
+                && packet.slot == 45
+                && packet.item_stack.is_empty();
+        } else if frame.id == ClientboundSetHealth::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetHealth::decode(&mut body)
+                .expect("decode offhand food health");
+            saw_offhand_food |= packet.food == 20 && packet.saturation > 0.0;
+        }
+    }
 }
 
 #[tokio::test]
@@ -545,11 +626,10 @@ async fn survival_use_item_release_cancels_food_use() {
             sequence: 81,
             y_rot: 0.0,
             x_rot: 0.0,
-        })
-        .await
-        .expect("start eating apple");
+    })
+    .await
+    .expect("start eating apple");
     read_ack_without_food_or_slot_change(&mut client, 81, apple_id).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::ReleaseUseItem,
@@ -557,10 +637,10 @@ async fn survival_use_item_release_cancels_food_use() {
             direction: Direction::Down,
             sequence: 82,
         })
-        .await
-        .expect("release use item");
+    .await
+    .expect("release use item");
     read_ack_without_food_or_slot_change(&mut client, 82, apple_id).await;
-    assert_no_food_or_slot_change(&mut client, apple_id, Duration::from_millis(1_800)).await;
+    assert_no_food_or_slot_change_until_world_ticks(&mut client, apple_id, 40).await;
 }
 
 #[tokio::test]
@@ -707,10 +787,10 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
             y_rot: 0.0,
             x_rot: 0.0,
         })
-        .await
-        .expect("start drawing bow");
+    .await
+    .expect("start drawing bow");
     wait_for_block_ack(&mut client, 91).await;
-    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    wait_for_world_ticks(&mut client, 20).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::ReleaseUseItem,
@@ -723,12 +803,14 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
 
     let mut arrow_entity_id = None;
     let mut saw_arrow_decrement = false;
+    let mut saw_bow_damage = false;
     let mut saw_release_ack = false;
     let mut saw_initial_motion = false;
     let mut saw_relative_move = false;
     let mut saw_arrow_despawn = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_arrow_decrement
+        && saw_bow_damage
         && saw_release_ack
         && saw_initial_motion
         && saw_relative_move
@@ -741,7 +823,7 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
             .await
             .unwrap_or_else(|err| {
                 panic!(
-                    "bow arrow lifecycle response: {err}; decrement={saw_arrow_decrement} ack={saw_release_ack} motion={saw_initial_motion} move={saw_relative_move} despawn={saw_arrow_despawn} arrow={arrow_entity_id:?}"
+                    "bow arrow lifecycle response: {err}; decrement={saw_arrow_decrement} bow_damage={saw_bow_damage} ack={saw_release_ack} motion={saw_initial_motion} move={saw_relative_move} despawn={saw_arrow_despawn} arrow={arrow_entity_id:?}"
                 )
             });
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
@@ -776,14 +858,293 @@ async fn survival_bow_release_spawns_and_moves_arrow() {
             saw_arrow_despawn |= arrow_entity_id.is_some_and(|id| pkt.entity_ids.contains(&id));
         } else if frame.id == ClientboundContainerSetSlot::ID {
             let mut body = frame.body;
-            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode arrow slot");
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode inventory slot");
             saw_arrow_decrement |= pkt.item_stack.item_id == arrow_id && pkt.item_stack.count == 2;
+            saw_bow_damage |= pkt.item_stack.item_id == bow_id
+                && pkt.item_stack.count == 1
+                && pkt.item_stack.damage == Some(1);
         } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
             let pkt = BlockChangedAck::decode(&mut body).expect("decode release ack");
             saw_release_ack |= pkt.sequence == 92;
         }
     }
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::SwapItemWithOffhand,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 93,
+        })
+        .await
+        .expect("move bow to offhand");
+    assert_offhand_swap_before_ack(&mut client, 93, bow_id, true).await;
+
+    client
+        .write_packet(&ServerboundUseItem {
+            hand: InteractionHand::OffHand,
+            sequence: 94,
+            y_rot: 0.0,
+            x_rot: 0.0,
+        })
+        .await
+        .expect("start drawing bow from offhand");
+    wait_for_block_ack(&mut client, 94).await;
+    wait_for_world_ticks(&mut client, 20).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::ReleaseUseItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 95,
+        })
+        .await
+        .expect("release offhand bow");
+
+    let mut saw_offhand_arrow = false;
+    let mut saw_second_arrow_decrement = false;
+    let mut saw_offhand_bow_damage = false;
+    let mut saw_offhand_release_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_offhand_arrow
+        && saw_second_arrow_decrement
+        && saw_offhand_bow_damage
+        && saw_offhand_release_ack)
+    {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "offhand bow release response: {error}; arrow={saw_offhand_arrow} decrement={saw_second_arrow_decrement} bow_damage={saw_offhand_bow_damage} ack={saw_offhand_release_ack}"
+                )
+            });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode offhand arrow AddEntity");
+            saw_offhand_arrow |= packet.entity_type_id == arrow_entity_type;
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode offhand bow inventory slot");
+            saw_second_arrow_decrement |= packet.slot == 37
+                && packet.item_stack.item_id == arrow_id
+                && packet.item_stack.count == 1;
+            saw_offhand_bow_damage |= packet.slot == 45
+                && packet.item_stack.item_id == bow_id
+                && packet.item_stack.count == 1
+                && packet.item_stack.damage == Some(2);
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode offhand release ack");
+            saw_offhand_release_ack |= packet.sequence == 95;
+        }
+    }
+}
+
+#[tokio::test]
+async fn selected_item_drop_debits_slot_and_spawns_exact_stack() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let item_id = data
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log item");
+    let item_entity_type = mc_data::entity_types::solaris_required_entity_types()
+        .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
+        .and_then(|id| i32::try_from(id).ok())
+        .expect("item entity type");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "Prompt 03B selected item drop");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "AtomicDropWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:birch_log 2 0".into(),
+        })
+        .await
+        .expect("give selected drop fixture");
+    wait_for_slot_stack(&mut client, item_id, 2).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::DropItem,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 93,
+        })
+        .await
+        .expect("drop selected item");
+
+    let mut item_entities = HashSet::new();
+    let mut saw_drop_stack = false;
+    let mut saw_slot_debit = false;
+    let mut saw_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_drop_stack && saw_slot_debit && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "selected item drop response: {error}; stack={saw_drop_stack} debit={saw_slot_debit} ack={saw_ack}"
+                )
+            });
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == AddEntity::ID {
+            let mut body = frame.body;
+            let packet = AddEntity::decode(&mut body).expect("decode selected drop AddEntity");
+            if packet.entity_type_id == item_entity_type {
+                item_entities.insert(packet.entity_id);
+            }
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode selected drop entity data");
+            if item_entities.contains(&packet.entity_id) {
+                saw_drop_stack |= packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::ItemStack { index, stack }
+                            if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                                && stack.item_id == item_id
+                                && stack.count == 1
+                    )
+                });
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body)
+                .expect("decode selected drop SetSlot");
+            saw_slot_debit |= packet.slot == 36
+                && packet.item_stack.item_id == item_id
+                && packet.item_stack.count == 1;
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode selected drop ack");
+            saw_ack |= packet.sequence == 93;
+        }
+    }
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("selected item drop server shutdown")
+        .expect("selected item drop server join")
+        .expect("selected item drop server serve");
+}
+
+async fn assert_offhand_swap_before_ack(
+    client: &mut Client,
+    sequence: i32,
+    item_id: u32,
+    item_moves_to_offhand: bool,
+) {
+    let item_slot = if item_moves_to_offhand { 45 } else { 36 };
+    let empty_slot = if item_moves_to_offhand { 36 } else { 45 };
+    let mut saw_item = false;
+    let mut saw_empty = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("offhand swap response");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet =
+                ClientboundContainerSetSlot::decode(&mut body).expect("decode swap SetSlot");
+            saw_item |= packet.container_id == 0
+                && packet.slot == item_slot
+                && packet.item_stack.item_id == item_id
+                && packet.item_stack.count == 1;
+            saw_empty |= packet.container_id == 0
+                && packet.slot == empty_slot
+                && packet.item_stack.is_empty();
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode swap ack");
+            if packet.sequence == sequence {
+                assert!(saw_item, "offhand swap must send the moved stack before ack");
+                assert!(saw_empty, "offhand swap must clear the old slot before ack");
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn offhand_swap_updates_both_slots_and_owner_inventory() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let item_id = data
+        .items
+        .id_of(&mc_data::Identifier::parse("minecraft:birch_log").unwrap())
+        .expect("birch log item");
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "offhand swap");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "OffhandSwapWire").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:birch_log 1 0".into(),
+        })
+        .await
+        .expect("give offhand swap fixture");
+    wait_for_slot_stack(&mut client, item_id, 1).await;
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::SwapItemWithOffhand,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 94,
+        })
+        .await
+        .expect("swap item into offhand");
+    assert_offhand_swap_before_ack(&mut client, 94, item_id, true).await;
+
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::SwapItemWithOffhand,
+            position: 0,
+            direction: Direction::Down,
+            sequence: 95,
+        })
+        .await
+        .expect("swap item back to main hand");
+    assert_offhand_swap_before_ack(&mut client, 95, item_id, false).await;
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("offhand swap server shutdown")
+        .expect("offhand swap server join")
+        .expect("offhand swap server serve");
 }
 
 #[tokio::test]
@@ -890,10 +1251,9 @@ async fn dead_survival_player_cannot_mine_or_eat() {
             direction: Direction::Up,
             sequence: 71,
         })
-        .await
-        .expect("dead start break");
+    .await
+    .expect("dead start break");
     read_ack_without_target_update(&mut client, 71, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -949,6 +1309,9 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     let apple_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
         .expect("apple item");
+    let dirt_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -965,7 +1328,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -982,11 +1345,11 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     drain_complete_spawn_view(&mut client).await;
     client
         .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:apple 1 0".into(),
+            command: "debug give minecraft:dirt 1 0".into(),
         })
         .await
-        .expect("give apple");
-    wait_for_slot_stack(&mut client, apple_id, 1).await;
+        .expect("give dirt");
+    wait_for_slot_stack(&mut client, dirt_id, 1).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug survival damage 100".into(),
@@ -1006,8 +1369,14 @@ async fn dead_survival_player_can_respawn_and_act_again() {
     let mut saw_respawn_chunk = false;
     let mut saw_load_start = false;
     let mut saw_full_health = false;
+    let mut saw_position_sync = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(saw_respawn && saw_center_chunk && saw_respawn_chunk && saw_load_start && saw_full_health)
+    while !(saw_respawn
+        && saw_center_chunk
+        && saw_respawn_chunk
+        && saw_load_start
+        && saw_full_health
+        && saw_position_sync)
     {
         let frame = client
             .read_frame_with_timeout(
@@ -1016,7 +1385,7 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             .await
             .unwrap_or_else(|error| {
                 panic!(
-                    "respawn response timed out: respawn={saw_respawn} center={saw_center_chunk} chunk={saw_respawn_chunk} load_start={saw_load_start} health={saw_full_health}: {error}"
+                    "respawn response timed out: respawn={saw_respawn} center={saw_center_chunk} chunk={saw_respawn_chunk} load_start={saw_load_start} health={saw_full_health} position_sync={saw_position_sync}: {error}"
                 )
             });
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
@@ -1027,6 +1396,17 @@ async fn dead_survival_player_can_respawn_and_act_again() {
             let pkt = ClientboundRespawn::decode(&mut body).expect("decode Respawn");
             assert_eq!(pkt.game_mode, 0);
             saw_respawn = true;
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            let pkt = SynchronizePlayerPosition::decode(&mut body)
+                .expect("decode respawn SynchronizePlayerPosition");
+            client
+                .write_packet(&ConfirmTeleportation {
+                    teleport_id: pkt.teleport_id,
+                })
+                .await
+                .expect("confirm respawn teleport");
+            saw_position_sync = true;
         } else if frame.id == ClientboundSetHealth::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
@@ -1086,7 +1466,11 @@ async fn dead_survival_player_can_respawn_and_act_again() {
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("post-respawn eat response");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "post-respawn eat response timed out: consume={saw_consume} food={saw_food}: {error}"
+                )
+            });
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
             continue;
         }

@@ -1,5 +1,5 @@
 #[tokio::test]
-async fn bonemeal_grows_young_crop_once_and_mature_crop_does_not_consume() {
+async fn bonemeal_growth_debits_only_successful_survival_use() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -74,12 +74,15 @@ async fn bonemeal_grows_young_crop_once_and_mature_crop_does_not_consume() {
     let support_y = sync.y.floor() as i32 - 2;
     let young_pos = (0, support_y + 1, 2);
     let mature_pos = (1, support_y + 1, 2);
+    let creative_pos = (2, support_y + 1, 2);
     {
         let mut storage = world.lock().await;
         crop_test_set(&mut storage, (0, support_y, 2), farmland);
         crop_test_set(&mut storage, young_pos, wheat_age0);
         crop_test_set(&mut storage, (1, support_y, 2), farmland);
         crop_test_set(&mut storage, mature_pos, wheat_age7);
+        crop_test_set(&mut storage, (2, support_y, 2), farmland);
+        crop_test_set(&mut storage, creative_pos, wheat_age0);
     }
 
     client
@@ -122,6 +125,36 @@ async fn bonemeal_grows_young_crop_once_and_mature_crop_does_not_consume() {
         .await
         .expect("bonemeal mature wheat");
     wait_for_mature_bonemeal_noop(&mut client, mature_pos, 202).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(creative_pos.0, creative_pos.1, creative_pos.2),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 203,
+        })
+        .await
+        .expect("bonemeal wheat in creative");
+    wait_for_block_update(&mut client, creative_pos, wheat_age1.0 as i32).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "give minecraft:bone_meal 1".into(),
+        })
+        .await
+        .expect("probe creative-preserved bone meal stack");
+    wait_for_slot_stack(&mut client, bone_meal_item_id, 2).await;
 }
 
 fn crop_test_state(

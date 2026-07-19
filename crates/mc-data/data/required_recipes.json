@@ -48,6 +48,24 @@
     "ingredients": [{ "tag": "minecraft:cherry_logs" }],
     "result": { "id": "minecraft:cherry_planks", "count": 4 }
   },
+  "minecraft:charcoal": {
+    "type": "minecraft:smelting",
+    "ingredient": { "tag": "minecraft:logs_that_burn" },
+    "result": { "id": "minecraft:charcoal", "count": 1 },
+    "experience": 0.15,
+    "cookingtime": 200
+  },
+  "minecraft:chest": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "# #", "###"],
+    "key": { "#": { "tag": "minecraft:planks" } },
+    "result": { "id": "minecraft:chest", "count": 1 }
+  },
+  "minecraft:bone_meal": {
+    "type": "minecraft:crafting_shapeless",
+    "ingredients": ["minecraft:bone"],
+    "result": { "id": "minecraft:bone_meal", "count": 3 }
+  },
   "minecraft:pale_oak_planks": {
     "type": "minecraft:crafting_shapeless",
     "ingredients": [{ "tag": "minecraft:pale_oak_logs" }],
@@ -99,6 +117,12 @@
     "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
     "result": { "id": "minecraft:wooden_sword", "count": 1 }
   },
+  "minecraft:wooden_hoe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", " X", " X"],
+    "key": { "#": { "tag": "minecraft:planks" }, "X": "minecraft:stick" },
+    "result": { "id": "minecraft:wooden_hoe", "count": 1 }
+  },
   "minecraft:stone_pickaxe": {
     "type": "minecraft:crafting_shaped",
     "pattern": ["###", " X ", " X "],
@@ -123,6 +147,12 @@
     "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
     "result": { "id": "minecraft:stone_sword", "count": 1 }
   },
+  "minecraft:stone_hoe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", " X", " X"],
+    "key": { "#": "minecraft:cobblestone", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:stone_hoe", "count": 1 }
+  },
   "minecraft:furnace": {
     "type": "minecraft:crafting_shaped",
     "pattern": ["###", "# #", "###"],
@@ -133,42 +163,338 @@
     "type": "minecraft:smelting",
     "ingredient": "minecraft:raw_iron",
     "result": { "id": "minecraft:iron_ingot", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.7,
+    "cookingtime": 200
   },
   "minecraft:gold_ingot_from_smelting_raw_gold": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:raw_gold",
     "result": { "id": "minecraft:gold_ingot", "count": 1 },
-    "cooking_time": 200
+    "experience": 1.0,
+    "cookingtime": 200
   },
   "minecraft:copper_ingot_from_smelting_raw_copper": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:raw_copper",
     "result": { "id": "minecraft:copper_ingot", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.7,
+    "cookingtime": 200
   },
   "minecraft:cooked_beef": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:beef",
     "result": { "id": "minecraft:cooked_beef", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.35,
+    "cookingtime": 200
   },
   "minecraft:cooked_porkchop": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:porkchop",
     "result": { "id": "minecraft:cooked_porkchop", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.35,
+    "cookingtime": 200
   },
   "minecraft:cooked_chicken": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:chicken",
     "result": { "id": "minecraft:cooked_chicken", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.35,
+    "cookingtime": 200
   },
   "minecraft:baked_potato": {
     "type": "minecraft:smelting",
     "ingredient": "minecraft:potato",
     "result": { "id": "minecraft:baked_potato", "count": 1 },
-    "cooking_time": 200
+    "experience": 0.35,
+    "cookingtime": 200
+  },
+  "minecraft:zz_playable_white_bed": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "PPP"],
+    "key": {
+      "#": "minecraft:white_wool",
+      "P": { "tag": "minecraft:planks" }
+    },
+    "result": { "id": "minecraft:white_bed", "count": 1 }
+  },
+  "minecraft:zz_playable_wooden_acacia_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:acacia_planks" },
+    "result": { "id": "minecraft:acacia_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_birch_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:birch_planks" },
+    "result": { "id": "minecraft:birch_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_cherry_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:cherry_planks" },
+    "result": { "id": "minecraft:cherry_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_dark_oak_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:dark_oak_planks" },
+    "result": { "id": "minecraft:dark_oak_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_jungle_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:jungle_planks" },
+    "result": { "id": "minecraft:jungle_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_mangrove_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:mangrove_planks" },
+    "result": { "id": "minecraft:mangrove_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_oak_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:oak_planks" },
+    "result": { "id": "minecraft:oak_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_pale_oak_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:pale_oak_planks" },
+    "result": { "id": "minecraft:pale_oak_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_spruce_door": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["##", "##", "##"],
+    "key": { "#": "minecraft:spruce_planks" },
+    "result": { "id": "minecraft:spruce_door", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_acacia": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:acacia_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:acacia_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_birch": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:birch_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:birch_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_cherry": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:cherry_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:cherry_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_dark_oak": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:dark_oak_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:dark_oak_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_jungle": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:jungle_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:jungle_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_mangrove": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:mangrove_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:mangrove_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_oak": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:oak_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:oak_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_pale_oak": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:pale_oak_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:pale_oak_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_wooden_zsign_spruce": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", "###", " X "],
+    "key": { "#": "minecraft:spruce_planks", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:spruce_sign", "count": 3 }
+  },
+  "minecraft:zz_playable_zz_campfire": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": [" S ", "SCS", "LLL"],
+    "key": {
+      "S": "minecraft:stick",
+      "C": "minecraft:charcoal",
+      "L": { "tag": "minecraft:logs_that_burn" }
+    },
+    "result": { "id": "minecraft:campfire", "count": 1 }
+  },
+  "minecraft:zz_playable_zz_campfire_cooked_beef": {
+    "type": "minecraft:campfire_cooking",
+    "ingredient": "minecraft:beef",
+    "result": { "id": "minecraft:cooked_beef", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 600
+  },
+  "minecraft:zz_playable_zz_campfire_cooked_chicken": {
+    "type": "minecraft:campfire_cooking",
+    "ingredient": "minecraft:chicken",
+    "result": { "id": "minecraft:cooked_chicken", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 600
+  },
+  "minecraft:zz_playable_zz_campfire_cooked_porkchop": {
+    "type": "minecraft:campfire_cooking",
+    "ingredient": "minecraft:porkchop",
+    "result": { "id": "minecraft:cooked_porkchop", "count": 1 },
+    "experience": 0.35,
+    "cookingtime": 600
+  },
+  "minecraft:zz_playable_zz_iron_sword": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "#", "X"],
+    "key": { "#": "minecraft:iron_ingot", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:iron_sword", "count": 1 }
+  },
+  "minecraft:zz_playable_zz_shield": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["PIP", "PPP", " P "],
+    "key": {
+      "P": { "tag": "minecraft:planks" },
+      "I": "minecraft:iron_ingot"
+    },
+    "result": { "id": "minecraft:shield", "count": 1 }
+  },
+  "minecraft:zz_playable_zzz_iron_chestplate": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["# #", "###", "###"],
+    "key": { "#": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:iron_chestplate", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzz_bread": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###"],
+    "key": { "#": "minecraft:wheat" },
+    "result": { "id": "minecraft:bread", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzz_iron_pickaxe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", " X ", " X "],
+    "key": { "#": "minecraft:iron_ingot", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:iron_pickaxe", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzz_diamond_pickaxe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["###", " X ", " X "],
+    "key": { "#": "minecraft:diamond", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:diamond_pickaxe", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzz_diamond_sword": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["#", "#", "X"],
+    "key": { "#": "minecraft:diamond", "X": "minecraft:stick" },
+    "result": { "id": "minecraft:diamond_sword", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzz_bucket": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["# #", " # "],
+    "key": { "#": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:bucket", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzz_iron_axe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XX", "X#", " #"],
+    "key": { "X": "minecraft:iron_ingot", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:iron_axe", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzzz_iron_shovel": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X", "#", "#"],
+    "key": { "X": "minecraft:iron_ingot", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:iron_shovel", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzzzz_iron_hoe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XX", " #", " #"],
+    "key": { "X": "minecraft:iron_ingot", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:iron_hoe", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzzzzz_iron_helmet": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XXX", "X X"],
+    "key": { "X": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:iron_helmet", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzzzzzz_iron_leggings": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XXX", "X X", "X X"],
+    "key": { "X": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:iron_leggings", "count": 1 }
+  },
+  "minecraft:zz_playable_zzzzzzzzzzzzzz_iron_boots": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X X", "X X"],
+    "key": { "X": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:iron_boots", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_axe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XX", "X#", " #"],
+    "key": { "X": "minecraft:diamond", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:diamond_axe", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_boots": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X X", "X X"],
+    "key": { "X": "minecraft:diamond" },
+    "result": { "id": "minecraft:diamond_boots", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_chestplate": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X X", "XXX", "XXX"],
+    "key": { "X": "minecraft:diamond" },
+    "result": { "id": "minecraft:diamond_chestplate", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_helmet": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XXX", "X X"],
+    "key": { "X": "minecraft:diamond" },
+    "result": { "id": "minecraft:diamond_helmet", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_hoe": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XX", " #", " #"],
+    "key": { "X": "minecraft:diamond", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:diamond_hoe", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_leggings": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["XXX", "X X", "X X"],
+    "key": { "X": "minecraft:diamond" },
+    "result": { "id": "minecraft:diamond_leggings", "count": 1 }
+  },
+  "minecraft:zzz_playable_diamond_shovel": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": ["X", "#", "#"],
+    "key": { "X": "minecraft:diamond", "#": "minecraft:stick" },
+    "result": { "id": "minecraft:diamond_shovel", "count": 1 }
+  },
+  "minecraft:zzzz_playable_bow": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": [" #X", "# X", " #X"],
+    "key": { "#": "minecraft:stick", "X": "minecraft:string" },
+    "result": { "id": "minecraft:bow", "count": 1 }
+  },
+  "minecraft:zzzzz_playable_shears": {
+    "type": "minecraft:crafting_shaped",
+    "pattern": [" #", "# "],
+    "key": { "#": "minecraft:iron_ingot" },
+    "result": { "id": "minecraft:shears", "count": 1 }
   }
 }

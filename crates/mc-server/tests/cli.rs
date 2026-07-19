@@ -20,6 +20,9 @@ motd = "Hello"
 [network]
 bind_address = "127.0.0.1"
 port = 30000
+
+[data]
+world_dir = ".analysis/cli-check-world"
 "#;
 
 fn write_current_vanilla_version(vanilla_dir: &Path) {
@@ -51,7 +54,7 @@ fn write_valid_block_light_report(vanilla_dir: &Path) {
     std::fs::write(
         reports_dir.join("block_light.json"),
         format!(
-            r#"{{"version":"{}","max_state_id":0,"entries":[[0,0,1]]}}"#,
+            r#"{{"version":"{}","max_state_id":0,"entries":[[0,0,1,0]]}}"#,
             mc_protocol::TARGET_RELEASE
         ),
     )
@@ -141,7 +144,7 @@ fn check_prints_parsed_config_and_exits_zero() {
 }
 
 #[test]
-fn check_prints_effective_thread_minimums() {
+fn check_prints_automatic_worker_capacity() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(
         br#"
@@ -153,10 +156,8 @@ fn check_prints_effective_thread_minimums() {
             bind_address = "127.0.0.1"
             port = 30000
 
-            [chunk_pipeline]
-            chunk_io_threads_percent = 0
-            chunk_worker_threads_percent = 0
-            entity_worker_threads_percent = 0
+            [data]
+            world_dir = ".analysis/cli-worker-world"
         "#,
     )
     .expect("write toml");
@@ -169,13 +170,12 @@ fn check_prints_effective_thread_minimums() {
         .assert()
         .success()
         .stdout(contains("\"effective_chunk_pipeline\""))
-        .stdout(contains("\"chunk_io_threads\": 1"))
-        .stdout(contains("\"chunk_worker_threads\": 1"))
-        .stdout(contains("\"entity_worker_threads\": 1"));
+        .stdout(contains("\"chunk_io_threads\""))
+        .stdout(contains("\"chunk_worker_threads\""));
 }
 
 #[test]
-fn check_reports_zero_save_interval_warning() {
+fn check_rejects_zero_save_interval() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let mut file = NamedTempFile::new().expect("tempfile");
     let toml = format!(
@@ -204,10 +204,76 @@ fn check_reports_zero_save_interval_warning() {
         .arg("--config")
         .arg(file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("simulation_save_interval_ticks_zero"))
-        .stdout(contains("missing_world_dir").not());
+        .failure()
+        .stderr(contains(
+            "simulation.save_interval_ticks must be greater than 0",
+        ));
+}
+
+#[test]
+fn check_rejects_view_distance_above_vanilla_limit() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let mut file = NamedTempFile::new().expect("tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "OversizedViewDistance"
+            motd = "Hello"
+            view_distance = 33
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_dir.path().display()
+    );
+    file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains("server.view_distance must be between 2 and 32"));
+}
+
+#[test]
+fn check_rejects_simulation_distance_above_vanilla_limit() {
+    let world_dir = tempfile::tempdir().expect("world tempdir");
+    let mut file = NamedTempFile::new().expect("tempfile");
+    let toml = format!(
+        r#"
+            [server]
+            name = "OversizedSimulationDistance"
+            motd = "Hello"
+            simulation_distance = 33
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+
+            [data]
+            world_dir = "{}"
+        "#,
+        world_dir.path().display()
+    );
+    file.write_all(toml.as_bytes()).expect("write toml");
+
+    Command::cargo_bin("mc-server")
+        .expect("locate mc-server binary")
+        .arg("--check")
+        .arg("--config")
+        .arg(file.path())
+        .assert()
+        .failure()
+        .stderr(contains(
+            "server.simulation_distance must be between 2 and 32",
+        ));
 }
 
 #[test]
@@ -298,6 +364,9 @@ fn check_reports_public_bind_security_warnings() {
             bind_address = "8.8.8.8"
             port = 30000
 
+            [data]
+            world_dir = ".analysis/cli-public-world"
+
             [admin]
             allow_local_dev_operators = true
         "#,
@@ -317,7 +386,7 @@ fn check_reports_public_bind_security_warnings() {
 }
 
 #[test]
-fn check_reports_online_mode_warning_on_loopback() {
+fn check_accepts_online_mode_on_loopback() {
     let mut file = NamedTempFile::new().expect("tempfile");
     file.write_all(
         br#"
@@ -328,6 +397,9 @@ fn check_reports_online_mode_warning_on_loopback() {
             [network]
             bind_address = "127.0.0.1"
             port = 30000
+
+            [data]
+            world_dir = ".analysis/cli-online-world"
 
             [auth]
             online_mode = true
@@ -343,14 +415,25 @@ fn check_reports_online_mode_warning_on_loopback() {
         .assert()
         .success()
         .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("online_mode_unsupported"))
+        .stdout(contains("online_mode_unsupported").not())
         .stdout(contains("public_bind_online_mode").not());
 }
 
 #[test]
-fn check_reports_missing_world_dir_warning() {
+fn check_rejects_missing_world_dir() {
     let mut file = NamedTempFile::new().expect("tempfile");
-    file.write_all(SAMPLE_TOML.as_bytes()).expect("write toml");
+    file.write_all(
+        br#"
+            [server]
+            name = "MissingWorldConfig"
+            motd = "Hello"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 30000
+        "#,
+    )
+    .expect("write toml");
 
     Command::cargo_bin("mc-server")
         .expect("locate mc-server binary")
@@ -358,13 +441,12 @@ fn check_reports_missing_world_dir_warning() {
         .arg("--config")
         .arg(file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("missing_world_dir"));
+        .failure()
+        .stderr(contains("data.world_dir is required"));
 }
 
 #[test]
-fn check_reports_world_dir_file_warning() {
+fn check_rejects_world_dir_file() {
     let world_file = NamedTempFile::new().expect("world tempfile");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
     let toml = format!(
@@ -390,9 +472,8 @@ fn check_reports_world_dir_file_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("world_dir_not_directory"));
+        .failure()
+        .stderr(contains("data.world_dir is not a directory"));
 }
 
 #[test]
@@ -429,7 +510,7 @@ fn check_reports_missing_world_dir_path_warning() {
 }
 
 #[test]
-fn check_reports_world_dir_parent_file_warning() {
+fn check_rejects_world_dir_parent_file() {
     let world_parent_file = NamedTempFile::new().expect("world parent tempfile");
     let world_dir = world_parent_file.path().join("child-world");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
@@ -456,14 +537,12 @@ fn check_reports_world_dir_parent_file_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("world_dir_parent_not_directory"))
-        .stdout(contains("world_dir_missing_on_disk").not());
+        .failure()
+        .stderr(contains("data.world_dir has a non-directory parent"));
 }
 
 #[test]
-fn check_reports_world_region_file_warning() {
+fn check_rejects_world_region_file() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     std::fs::write(world_dir.path().join("region"), b"not a directory")
         .expect("write blocking region file");
@@ -491,11 +570,8 @@ fn check_reports_world_region_file_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("world_region_not_directory"))
-        .stdout(contains("world_dir_not_directory").not())
-        .stdout(contains("world_dir_missing_on_disk").not());
+        .failure()
+        .stderr(contains("data.world_dir region path is not a directory"));
 }
 
 #[test]
@@ -541,7 +617,7 @@ fn check_accepts_legacy_region_file_when_modern_region_exists() {
 }
 
 #[test]
-fn check_reports_vanilla_data_protocol_mismatch_warning() {
+fn check_rejects_vanilla_data_protocol_mismatch() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -579,13 +655,12 @@ fn check_reports_vanilla_data_protocol_mismatch_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_protocol_mismatch"));
+        .failure()
+        .stderr(contains("protocol_version 999999 does not match"));
 }
 
 #[test]
-fn check_reports_vanilla_data_release_mismatch_warning() {
+fn check_rejects_vanilla_data_release_mismatch() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -623,15 +698,12 @@ fn check_reports_vanilla_data_release_mismatch_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_release_mismatch"))
-        .stdout(contains("vanilla_data_world_version_mismatch").not())
-        .stdout(contains("vanilla_data_protocol_mismatch").not());
+        .failure()
+        .stderr(contains("release id \"26.0-test\" does not match"));
 }
 
 #[test]
-fn check_reports_vanilla_data_world_version_mismatch_warning() {
+fn check_rejects_vanilla_data_world_version_mismatch() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -669,15 +741,12 @@ fn check_reports_vanilla_data_world_version_mismatch_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_world_version_mismatch"))
-        .stdout(contains("vanilla_data_release_mismatch").not())
-        .stdout(contains("vanilla_data_protocol_mismatch").not());
+        .failure()
+        .stderr(contains("world_version 999999 does not match"));
 }
 
 #[test]
-fn check_reports_version_drift_before_block_light_warning() {
+fn check_rejects_version_drift_before_loading_sidecar_data() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -726,14 +795,8 @@ fn check_reports_version_drift_before_block_light_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_protocol_mismatch"))
-        .stdout(contains("vanilla_data_registry_tree_incomplete").not())
-        .stdout(contains("vanilla_data_block_light_report_invalid").not())
-        .stdout(contains("vanilla_data_tags_unavailable").not())
-        .stdout(contains("vanilla_data_recipes_unavailable").not())
-        .stdout(contains("vanilla_data_loot_unavailable").not());
+        .failure()
+        .stderr(contains("protocol_version 999999 does not match"));
 }
 
 #[test]
@@ -994,7 +1057,7 @@ fn check_reports_missing_vanilla_loot_warning_after_recipes() {
 }
 
 #[test]
-fn check_reports_missing_vanilla_data_version_warning() {
+fn check_rejects_missing_vanilla_data_version() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
@@ -1023,13 +1086,12 @@ fn check_reports_missing_vanilla_data_version_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_missing"));
+        .failure()
+        .stderr(contains("reading vanilla sidecar version"));
 }
 
 #[test]
-fn check_reports_invalid_vanilla_data_version_warning() {
+fn check_rejects_invalid_vanilla_data_version() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(vanilla_dir.path().join("version.json"), b"not json")
@@ -1060,13 +1122,12 @@ fn check_reports_invalid_vanilla_data_version_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_invalid"));
+        .failure()
+        .stderr(contains("parsing vanilla sidecar version"));
 }
 
 #[test]
-fn check_reports_unreadable_vanilla_data_version_warning() {
+fn check_rejects_non_utf8_vanilla_data_version() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(vanilla_dir.path().join("version.json"), [0xff, 0xfe, 0xfd])
@@ -1097,14 +1158,12 @@ fn check_reports_unreadable_vanilla_data_version_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_invalid"))
-        .stdout(contains("vanilla_data_version_missing").not());
+        .failure()
+        .stderr(contains("parsing vanilla sidecar version"));
 }
 
 #[test]
-fn check_reports_vanilla_data_version_without_protocol_warning() {
+fn check_rejects_vanilla_data_version_without_protocol() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -1142,13 +1201,12 @@ fn check_reports_vanilla_data_version_without_protocol_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_invalid"));
+        .failure()
+        .stderr(contains("missing field `protocol_version`"));
 }
 
 #[test]
-fn check_reports_vanilla_data_version_without_id_warning() {
+fn check_rejects_vanilla_data_version_without_id() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -1186,13 +1244,12 @@ fn check_reports_vanilla_data_version_without_id_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_invalid"));
+        .failure()
+        .stderr(contains("missing field `id`"));
 }
 
 #[test]
-fn check_reports_vanilla_data_version_without_world_version_warning() {
+fn check_rejects_vanilla_data_version_without_world_version() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
     std::fs::write(
@@ -1230,13 +1287,12 @@ fn check_reports_vanilla_data_version_without_world_version_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_version_invalid"));
+        .failure()
+        .stderr(contains("missing field `world_version`"));
 }
 
 #[test]
-fn check_reports_missing_vanilla_data_dir_warning() {
+fn check_rejects_missing_vanilla_data_dir() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_parent = tempfile::tempdir().expect("vanilla parent tempdir");
     let vanilla_dir = vanilla_parent.path().join("missing-sidecar");
@@ -1266,14 +1322,12 @@ fn check_reports_missing_vanilla_data_dir_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_dir_missing_on_disk"))
-        .stdout(contains("vanilla_data_version_missing").not());
+        .failure()
+        .stderr(contains("reading vanilla sidecar directory metadata"));
 }
 
 #[test]
-fn check_reports_vanilla_data_dir_file_warning() {
+fn check_rejects_vanilla_data_dir_file() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_file = NamedTempFile::new().expect("vanilla file");
     let mut config_file = NamedTempFile::new().expect("config tempfile");
@@ -1302,14 +1356,12 @@ fn check_reports_vanilla_data_dir_file_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_dir_not_directory"))
-        .stdout(contains("vanilla_data_version_missing").not());
+        .failure()
+        .stderr(contains("data.vanilla_data_dir is not a directory"));
 }
 
 #[test]
-fn check_reports_vanilla_data_dir_parent_file_warning() {
+fn check_rejects_vanilla_data_dir_parent_file() {
     let world_dir = tempfile::tempdir().expect("world tempdir");
     let vanilla_parent_file = NamedTempFile::new().expect("vanilla parent tempfile");
     let vanilla_dir = vanilla_parent_file.path().join("child-sidecar");
@@ -1339,12 +1391,8 @@ fn check_reports_vanilla_data_dir_parent_file_warning() {
         .arg("--config")
         .arg(config_file.path())
         .assert()
-        .success()
-        .stdout(contains("\"operator_warnings\""))
-        .stdout(contains("vanilla_data_dir_parent_not_directory"))
-        .stdout(contains("vanilla_data_dir_metadata_unavailable").not())
-        .stdout(contains("vanilla_data_dir_missing_on_disk").not())
-        .stdout(contains("vanilla_data_version_missing").not());
+        .failure()
+        .stderr(contains("reading vanilla sidecar directory metadata"));
 }
 
 #[test]

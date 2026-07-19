@@ -1,9 +1,19 @@
 use super::*;
+use mc_protocol::packets::play::SetEntityMotion;
+
+fn wire_velocity(velocity: Vec3) -> EntityVec3 {
+    EntityVec3 {
+        x: velocity.x * mc_physics::TICK_SECONDS,
+        y: velocity.y * mc_physics::TICK_SECONDS,
+        z: velocity.z * mc_physics::TICK_SECONDS,
+    }
+}
 
 fn player_info_entry(player: &PlayerEntitySnapshot) -> PlayerInfoEntry {
     PlayerInfoEntry {
         profile_id: player.uuid,
         name: player.name.clone(),
+        properties: player.properties.clone(),
         listed: true,
         latency: 0,
         game_mode: 0,
@@ -32,11 +42,7 @@ fn entity_position(entity: &ServerEntitySnapshot) -> PositionMoveRotation {
             y: entity.position.y,
             z: entity.position.z,
         },
-        delta_movement: EntityVec3 {
-            x: entity.velocity.x,
-            y: entity.velocity.y,
-            z: entity.velocity.z,
-        },
+        delta_movement: wire_velocity(entity.velocity),
         yaw: entity.rotation.yaw,
         pitch: entity.rotation.pitch,
     }
@@ -193,11 +199,7 @@ where
             x: entity.position.x,
             y: entity.position.y,
             z: entity.position.z,
-            movement: EntityVec3 {
-                x: entity.velocity.x,
-                y: entity.velocity.y,
-                z: entity.velocity.z,
-            },
+            movement: wire_velocity(entity.velocity),
             pitch: entity.rotation.pitch,
             yaw: entity.rotation.yaw,
             head_yaw: entity.rotation.head_yaw,
@@ -222,21 +224,38 @@ pub(super) async fn send_entity_data<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let Some(stack) = entity.item_stack else {
+    let mut values = Vec::new();
+    if let Some(ref stack) = entity.item_stack {
+        values.push(EntityDataValue::ItemStack {
+            index: ITEM_ENTITY_DATA_ITEM_INDEX,
+            stack: ItemStack {
+                item_id: stack.item_id,
+                count: stack.count,
+                damage: stack.damage,
+                enchantments: stack.enchantments.clone(),
+            },
+        });
+    }
+    if let Some(animal) = entity.animal {
+        values.push(EntityDataValue::Boolean {
+            index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+            value: animal.is_baby(),
+        });
+        if let Some(wool) = animal.sheep_wool {
+            values.push(EntityDataValue::Byte {
+                index: SHEEP_ENTITY_DATA_WOOL_INDEX,
+                value: wool.packed_metadata(),
+            });
+        }
+    }
+    if values.is_empty() {
         return Ok(());
-    };
+    }
     write_packet(
         writer,
         &ClientboundSetEntityData {
             entity_id: entity.id.0,
-            values: vec![EntityDataValue::ItemStack {
-                index: ITEM_ENTITY_DATA_ITEM_INDEX,
-                stack: ItemStack {
-                    item_id: stack.item_id,
-                    count: stack.count,
-                    damage: stack.damage,
-                },
-            }],
+            values,
         },
         compression,
     )
@@ -265,11 +284,7 @@ where
         writer,
         &SetEntityMotion {
             entity_id: entity.id.0,
-            movement: EntityVec3 {
-                x: entity.velocity.x,
-                y: entity.velocity.y,
-                z: entity.velocity.z,
-            },
+            movement: wire_velocity(entity.velocity),
         },
         compression,
     )
@@ -294,39 +309,38 @@ pub(super) async fn send_entity_relative_move<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    write_packet(
-        writer,
-        &MoveEntityPosRot {
-            entity_id: movement.id.0,
-            delta_x: MoveEntityPosRot::delta_to_short(movement.delta.x),
-            delta_y: MoveEntityPosRot::delta_to_short(movement.delta.y),
-            delta_z: MoveEntityPosRot::delta_to_short(movement.delta.z),
-            yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
-            pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
-            on_ground: movement.on_ground,
-        },
-        compression,
-    )
-    .await?;
-    write_packet(
-        writer,
-        &RotateHead {
-            entity_id: movement.id.0,
-            head_yaw: movement.rotation.head_yaw,
-        },
-        compression,
-    )
-    .await?;
+    debug_assert!(movement.send_position_rotation || movement.send_velocity);
+    if movement.send_position_rotation {
+        write_packet(
+            writer,
+            &MoveEntityPosRot {
+                entity_id: movement.id.0,
+                delta_x: MoveEntityPosRot::delta_to_short(movement.delta.x),
+                delta_y: MoveEntityPosRot::delta_to_short(movement.delta.y),
+                delta_z: MoveEntityPosRot::delta_to_short(movement.delta.z),
+                yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
+                pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
+                on_ground: movement.on_ground,
+            },
+            compression,
+        )
+        .await?;
+        write_packet(
+            writer,
+            &RotateHead {
+                entity_id: movement.id.0,
+                head_yaw: movement.rotation.head_yaw,
+            },
+            compression,
+        )
+        .await?;
+    }
     if movement.send_velocity {
         write_packet(
             writer,
             &SetEntityMotion {
                 entity_id: movement.id.0,
-                movement: EntityVec3 {
-                    x: movement.velocity.x,
-                    y: movement.velocity.y,
-                    z: movement.velocity.z,
-                },
+                movement: wire_velocity(movement.velocity),
             },
             compression,
         )
@@ -397,4 +411,64 @@ where
         compression,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn physics_velocity_is_converted_from_blocks_per_second_to_blocks_per_tick() {
+        let movement = wire_velocity(Vec3::new(
+            2.0,
+            mc_physics::LIVING_JUMP_SPEED_BLOCKS_PER_SECOND,
+            -2.5,
+        ));
+
+        assert!((movement.x - 0.1).abs() < 1.0e-12);
+        assert!((movement.y - 0.419_999_986_886_978_15).abs() < 1.0e-12);
+        assert!((movement.z + 0.125).abs() < 1.0e-12);
+    }
+
+    #[tokio::test]
+    async fn sheep_spawn_metadata_encodes_authoritative_color() {
+        let entity = ServerEntitySnapshot {
+            id: EntityId(42),
+            uuid: uuid::Uuid::from_u128(42),
+            type_id: 2,
+            type_name: "minecraft:sheep".to_owned(),
+            position: Vec3::new(1.5, 64.0, 1.5),
+            rotation: Rotation::ZERO,
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            animal: Some(mc_entity::AnimalBreedingState::adult_sheep(
+                mc_entity::SheepColor::Brown,
+            )),
+        };
+        let mut writer = Vec::new();
+
+        send_entity_data(&mut writer, Compression::Disabled, &entity)
+            .await
+            .unwrap();
+
+        let mut bytes = BytesMut::from(writer.as_slice());
+        let mut frame = mc_protocol::frame::try_decode_frame(&mut bytes, Compression::Disabled)
+            .unwrap()
+            .expect("set entity data frame");
+        assert_eq!(frame.id, ClientboundSetEntityData::ID);
+        let packet = ClientboundSetEntityData::decode(&mut frame.body).unwrap();
+        assert_eq!(packet.entity_id, entity.id.0);
+        assert!(packet.values.iter().any(|value| {
+            matches!(
+                value,
+                EntityDataValue::Byte { index, value }
+                    if *index == SHEEP_ENTITY_DATA_WOOL_INDEX
+                        && *value == i8::try_from(mc_entity::SheepColor::Brown.id()).unwrap()
+            )
+        }));
+        assert!(bytes.is_empty());
+    }
 }

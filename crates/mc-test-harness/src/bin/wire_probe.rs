@@ -29,14 +29,14 @@ use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess};
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundSetEntityData, ClientboundSetHealth, ClientboundTakeItemEntity,
-    ConfirmTeleportation, Direction, GameMode, InteractionHand, LoginPlay, MoveEntityPos,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput,
-    RemoveEntities, ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
-    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
-    ServerboundSetCarriedItem, ServerboundSwing, SetEntityMotion, SynchronizePlayerPosition,
-    pack_block_pos, unpack_block_pos,
+    ClientboundSetEntityData, ClientboundSetHealth, ClientboundSystemChat,
+    ClientboundTakeItemEntity, ConfirmTeleportation, Direction, GameMode, InteractionHand,
+    LoginPlay, MoveEntityPos, MoveEntityPosRot, MovePlayerFlags, PlayerActionKind,
+    PlayerCommandAction, PlayerInput, RemoveEntities, ServerboundChangeGameMode,
+    ServerboundChatCommand, ServerboundClientTickEnd, ServerboundKeepAlive,
+    ServerboundMovePlayerPosRot, ServerboundPlayerAction, ServerboundPlayerCommand,
+    ServerboundPlayerInput, ServerboundPlayerLoaded, ServerboundSetCarriedItem, ServerboundSwing,
+    SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -54,11 +54,12 @@ struct Cli {
     /// Player name to send in LoginStart.
     #[arg(long, default_value = "probe")]
     name: String,
-    /// How many seconds to keep reading clientbound frames after Play
-    /// state is reached. Default 5s — long enough to see the spawn
-    /// burst, short enough not to wait for the first keepalive.
+    /// Maximum seconds to wait for each command-fenced Play capture.
     #[arg(long, default_value_t = 5)]
     play_seconds: u64,
+    /// Keep a passive Play session connected until SIGINT or server disconnect.
+    #[arg(long)]
+    hold_open: bool,
     /// Stable scenario name written into captures.
     #[arg(long, default_value = "spawn-burst")]
     scenario: String,
@@ -355,52 +356,108 @@ impl Probe {
         }
     }
 
-    /// Read whatever frames arrive in `duration`, dumping each.
-    async fn dump_for(
+    async fn dump_until_command_response(
         &mut self,
         label: &str,
-        duration: Duration,
+        timeout: Duration,
         capture: &mut CaptureWriter,
     ) -> Result<usize> {
-        let deadline = tokio::time::Instant::now() + duration;
+        let deadline = tokio::time::Instant::now() + timeout;
         let mut count = 0;
         loop {
-            let timeout = tokio::time::timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-                self.read_frame(),
-            )
-            .await;
-            match timeout {
-                Ok(Ok(frame)) => {
-                    log_frame(capture, label, &frame)?;
-                    if label == "PLAY" && frame.id == ClientboundKeepAlive::ID {
-                        let mut body = frame.body.clone();
-                        let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+            let frame = tokio::time::timeout_at(deadline, self.read_frame())
+                .await
+                .with_context(|| format!("timed out waiting for {label} command response"))??;
+            log_frame(capture, label, &frame)?;
+            count += 1;
+            if label == "PLAY" && frame.id == ClientboundKeepAlive::ID {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                self.write_packet_logged(
+                    &ServerboundKeepAlive { id: keepalive.id },
+                    "PLAY",
+                    "KeepAlive",
+                    capture,
+                )
+                .await?;
+            } else if label == "PLAY" && frame.id == SynchronizePlayerPosition::ID {
+                let mut body = frame.body.clone();
+                let sync = SynchronizePlayerPosition::decode(&mut body)?;
+                self.write_packet_logged(
+                    &ConfirmTeleportation {
+                        teleport_id: sync.teleport_id,
+                    },
+                    "PLAY",
+                    "ConfirmTeleportation(command-fence)",
+                    capture,
+                )
+                .await?;
+            } else if label == "PLAY" && frame.id == ClientboundSystemChat::ID {
+                let mut body = frame.body.clone();
+                let _response = ClientboundSystemChat::decode(&mut body)?;
+                return Ok(count);
+            }
+        }
+    }
+
+    async fn hold_play_until_interrupt(&mut self, capture: &mut CaptureWriter) -> Result<()> {
+        capture.line("holding Play session until SIGINT or server disconnect")?;
+        let mut frames = 0_u64;
+        loop {
+            tokio::select! {
+                signal = tokio::signal::ctrl_c() => {
+                    signal.context("listen for hold-open SIGINT")?;
+                    capture.line(format!("hold-open interrupted by SIGINT after {frames} frames"))?;
+                    return Ok(());
+                }
+                frame = self.read_frame() => {
+                    let frame = frame?;
+                    frames = frames.saturating_add(1);
+                    if frame.id == ClientboundKeepAlive::ID {
+                        let keepalive = ClientboundKeepAlive::decode(&mut frame.body.clone())?;
                         self.write_packet_logged(
                             &ServerboundKeepAlive { id: keepalive.id },
                             "PLAY",
-                            "KeepAlive",
+                            "KeepAlive(hold-open)",
+                            capture,
+                        )
+                        .await?;
+                    } else if frame.id == SynchronizePlayerPosition::ID {
+                        let sync = SynchronizePlayerPosition::decode(&mut frame.body.clone())?;
+                        self.write_packet_logged(
+                            &ConfirmTeleportation {
+                                teleport_id: sync.teleport_id,
+                            },
+                            "PLAY",
+                            "ConfirmTeleportation(hold-open)",
                             capture,
                         )
                         .await?;
                     }
-                    // If a Set Compression packet is implied (very small
-                    // body, id matching login.0x03), enable compression
-                    // for subsequent frames. We don't try to be smart
-                    // here — we just detect the marker pattern. The
-                    // server-state machine is more reliable, but this
-                    // probe is a minimum viable wire dumper.
-                    count += 1;
-                }
-                Ok(Err(e)) => {
-                    capture.line(format!("[{label}] read ended: {e}"))?;
-                    return Ok(count);
-                }
-                Err(_) => {
-                    return Ok(count);
                 }
             }
         }
+    }
+
+    async fn send_capture_fence(
+        &mut self,
+        label: &str,
+        timeout: Duration,
+        capture: &mut CaptureWriter,
+    ) -> Result<usize> {
+        self.write_packet_logged(
+            &ServerboundChatCommand {
+                command: "list".to_string(),
+            },
+            "PLAY",
+            "ChatCommand(capture-fence)",
+            capture,
+        )
+        .await?;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
+        self.dump_until_command_response(label, timeout, capture)
+            .await
     }
 
     async fn dump_until_play_start(
@@ -645,7 +702,7 @@ impl Probe {
         .await?;
         self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
             .await?;
-        self.drain_setup_frames(Duration::from_millis(150), capture)
+        self.dump_until_command_response("PLAY", Duration::from_secs(5), capture)
             .await?;
         Ok(())
     }
@@ -655,10 +712,12 @@ impl Probe {
         duration: Duration,
         capture: &mut CaptureWriter,
     ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + duration;
-        let mut ticks = 0;
-        while tokio::time::Instant::now() < deadline {
-            if ticks % 4 == 0 {
+        let tick_count = usize::try_from((duration.as_millis() / 50).max(1))?;
+        let mut ticker = tokio::time::interval(Duration::from_millis(50));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        ticker.tick().await;
+        for tick in 0..tick_count {
+            if tick % 4 == 0 {
                 self.write_packet_logged(
                     &ServerboundSwing {
                         hand: InteractionHand::MainHand,
@@ -671,57 +730,9 @@ impl Probe {
             }
             self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
                 .await?;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            ticks += 1;
+            ticker.tick().await;
         }
         Ok(())
-    }
-
-    async fn drain_setup_frames(
-        &mut self,
-        duration: Duration,
-        capture: &mut CaptureWriter,
-    ) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + duration;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                return Ok(());
-            }
-            let timeout = tokio::time::timeout(remaining, self.read_frame()).await;
-            let frame = match timeout {
-                Ok(Ok(frame)) => frame,
-                Ok(Err(err)) => {
-                    capture.line(format!("[PLAY] setup read ended: {err}"))?;
-                    return Ok(());
-                }
-                Err(_) => return Ok(()),
-            };
-            log_frame(capture, "PLAY", &frame)?;
-            if frame.id == ClientboundKeepAlive::ID {
-                let mut body = frame.body.clone();
-                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-                self.write_packet_logged(
-                    &ServerboundKeepAlive { id: keepalive.id },
-                    "PLAY",
-                    "KeepAlive",
-                    capture,
-                )
-                .await?;
-            } else if frame.id == SynchronizePlayerPosition::ID {
-                let mut body = frame.body.clone();
-                let sync = SynchronizePlayerPosition::decode(&mut body)?;
-                self.write_packet_logged(
-                    &ConfirmTeleportation {
-                        teleport_id: sync.teleport_id,
-                    },
-                    "PLAY",
-                    "ConfirmTeleportation(setup)",
-                    capture,
-                )
-                .await?;
-            }
-        }
     }
 
     async fn run_player_shallow_water_entry(
@@ -761,7 +772,8 @@ impl Probe {
         for step in water_steps {
             self.write_packet_logged(&step, "PLAY", "MovePlayerPosRot", capture)
                 .await?;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+                .await?;
         }
         self.write_packet_logged(
             &ServerboundPlayerCommand {
@@ -804,7 +816,7 @@ impl Probe {
         .await?;
 
         let n = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!("script captured {n} post-input Play-state frames"))?;
         Ok(())
@@ -847,7 +859,8 @@ impl Probe {
         for step in water_steps {
             self.write_packet_logged(&step, "PLAY", "MovePlayerPosRot", capture)
                 .await?;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+                .await?;
         }
         self.write_packet_logged(
             &ServerboundPlayerCommand {
@@ -890,7 +903,7 @@ impl Probe {
         .await?;
 
         let n = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!("script captured {n} post-input Play-state frames"))?;
         Ok(())
@@ -933,7 +946,8 @@ impl Probe {
         for step in water_steps {
             self.write_packet_logged(&step, "PLAY", "MovePlayerPosRot", capture)
                 .await?;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+                .await?;
         }
         self.write_packet_logged(
             &ServerboundPlayerCommand {
@@ -976,7 +990,7 @@ impl Probe {
         .await?;
 
         let n = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!("script captured {n} post-input Play-state frames"))?;
         Ok(())
@@ -1044,8 +1058,6 @@ impl Probe {
             capture,
         )
         .await?;
-        self.drain_setup_frames(Duration::from_millis(150), capture)
-            .await?;
         self.send_client_ticks_for(Duration::from_millis(1500), capture)
             .await?;
         self.write_packet_logged(
@@ -1064,7 +1076,7 @@ impl Probe {
             .await?;
 
         let visible_frames = self
-            .dump_for("PLAY", Duration::from_millis(400), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(5), capture)
             .await?;
         self.write_packet_logged(
             &ServerboundMovePlayerPosRot {
@@ -1081,7 +1093,7 @@ impl Probe {
         )
         .await?;
         let pickup_frames = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(5)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(5)), capture)
             .await?;
         capture.line(format!(
             "script captured {visible_frames} visible-window frames and {pickup_frames} pickup-window frames"
@@ -1104,7 +1116,7 @@ impl Probe {
                 .await?;
         }
         let frames = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(8)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(8)), capture)
             .await?;
         capture.line(format!(
             "script captured {frames} entity-water Play-state frames"
@@ -1242,7 +1254,7 @@ impl Probe {
         }
 
         let n = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!(
             "script captured {n} final collision-wall-step-fall frames for entity_id={}",
@@ -1279,7 +1291,7 @@ impl Probe {
         self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
             .await?;
         let frames = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!(
             "script captured {frames} water-lava-replacement Play-state frames for entity_id={}",
@@ -1321,11 +1333,11 @@ impl Probe {
             self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
                 .await?;
             let _ = self
-                .dump_for("PLAY", Duration::from_millis(400), capture)
+                .send_capture_fence("PLAY", Duration::from_secs(5), capture)
                 .await?;
         }
         let frames = self
-            .dump_for("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(play_seconds.max(3)), capture)
             .await?;
         capture.line(format!(
             "script captured {frames} final sand-gravel-fall-start frames for entity_id={}",
@@ -1347,9 +1359,10 @@ impl Probe {
             capture,
         )
         .await?;
-        tokio::time::sleep(Duration::from_millis(75)).await;
+        self.write_packet_logged(&ServerboundClientTickEnd, "PLAY", "ClientTickEnd", capture)
+            .await?;
         let _ = self
-            .dump_for("PLAY", Duration::from_millis(125), capture)
+            .send_capture_fence("PLAY", Duration::from_secs(5), capture)
             .await?;
         Ok(())
     }
@@ -1557,11 +1570,26 @@ async fn main() -> Result<()> {
         "=== PLAY STATE (reading for {}s) ===",
         cli.play_seconds
     ))?;
+    if cli.hold_open {
+        anyhow::ensure!(
+            ProbeScenario::from_name(&cli.scenario) == ProbeScenario::Passive,
+            "--hold-open requires the passive scenario"
+        );
+        probe
+            .start_scripted_play("hold-open", cli.play_seconds, &mut capture, None)
+            .await?;
+        probe.hold_play_until_interrupt(&mut capture).await?;
+        return Ok(());
+    }
     let vanilla_setup_player = (cli.server_kind == "vanilla").then_some(cli.name.as_str());
     match ProbeScenario::from_name(&cli.scenario) {
         ProbeScenario::Passive => {
             let n = probe
-                .dump_for("PLAY", Duration::from_secs(cli.play_seconds), &mut capture)
+                .send_capture_fence(
+                    "PLAY",
+                    Duration::from_secs(cli.play_seconds.max(3)),
+                    &mut capture,
+                )
                 .await?;
             capture.line(format!("captured {n} Play-state frames"))?;
         }
@@ -1640,4 +1668,16 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_exposes_event_driven_hold_open_mode() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("--hold-open"));
+    }
 }

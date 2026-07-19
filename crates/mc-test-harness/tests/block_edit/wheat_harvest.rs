@@ -95,17 +95,6 @@ async fn survival_break_mature_wheat_drops_wheat_and_seeds() {
         })
         .await
         .expect("send wheat start break");
-    read_ack_without_target_update(&mut client, 581, wheat_pos).await;
-    tokio::time::sleep(Duration::from_millis(850)).await;
-    client
-        .write_packet(&ServerboundPlayerAction {
-            action: PlayerActionKind::StopDestroyBlock,
-            position: target_pos,
-            direction: Direction::Up,
-            sequence: 582,
-        })
-        .await
-        .expect("send wheat stop break");
 
     wait_for_wheat_harvest_drops(
         &mut client,
@@ -114,7 +103,7 @@ async fn survival_break_mature_wheat_drops_wheat_and_seeds() {
         item_entity_type,
         wheat_item_id,
         seeds_item_id,
-        582,
+        581,
     )
     .await;
 }

@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{AcquireError, Notify, OwnedSemaphorePermit, Semaphore};
 
 use crate::control_plane::RuntimeControlConfig;
 
@@ -21,8 +21,8 @@ pub struct ChunkPipelinePolicy {
     pub chunk_prepare_budget_ms: u64,
     pub chunk_prepare_batch_size: usize,
     pub chunk_io_threads: usize,
+    /// Shared CPU capacity for chunk work and entity physics.
     pub chunk_worker_threads: usize,
-    pub entity_worker_threads: usize,
     pub chunk_result_queue_size: usize,
     pub region_cache_size: usize,
     pub compression_threshold: i32,
@@ -32,15 +32,18 @@ pub struct ChunkPipelinePolicy {
 
 impl Default for ChunkPipelinePolicy {
     fn default() -> Self {
+        let available = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        let (chunk_io_threads, cpu_worker_threads) = automatic_worker_limits(available);
         Self {
             chunk_send_rate: 16,
             chunk_load_rate: 64,
             chunk_generate_rate: 32,
             chunk_prepare_budget_ms: 0,
             chunk_prepare_batch_size: 8,
-            chunk_io_threads: 2,
-            chunk_worker_threads: default_worker_threads(),
-            entity_worker_threads: 2,
+            chunk_io_threads,
+            chunk_worker_threads: cpu_worker_threads,
             chunk_result_queue_size: 64,
             region_cache_size: 4,
             compression_threshold: crate::login::LOGIN_COMPRESSION_THRESHOLD,
@@ -54,6 +57,13 @@ impl Default for ChunkPipelinePolicy {
 pub(crate) struct ChunkPipelineResources {
     io_permits: Arc<Semaphore>,
     cpu_permits: Arc<Semaphore>,
+    prepare_request_permits: Arc<Semaphore>,
+    cpu_capacity: usize,
+    cpu_limit: Arc<AtomicUsize>,
+    cpu_admission_changed: Arc<Notify>,
+    prepare_admission_changed: Arc<Notify>,
+    active_prepare_tasks: Arc<AtomicUsize>,
+    active_prepare_requests: Arc<AtomicUsize>,
     metrics: ChunkPipelineResourceMetrics,
 }
 
@@ -63,7 +73,10 @@ pub struct ChunkPipelineResourceMetrics {
     max_io_active: Arc<AtomicUsize>,
     active_cpu: Arc<AtomicUsize>,
     max_cpu_active: Arc<AtomicUsize>,
+    max_result_queue_depth: Arc<AtomicUsize>,
     stop_reasons: Arc<ChunkPipelineStopReasonMetrics>,
+    cancellations: Arc<ChunkPipelineCancellationMetrics>,
+    idle_changed: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +85,14 @@ pub struct ChunkPipelineResourceSnapshot {
     pub max_io_active: usize,
     pub active_cpu: usize,
     pub max_cpu_active: usize,
+    pub max_result_queue_depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkPipelineCancellationSnapshot {
+    pub cancelled_streams: usize,
+    pub cancelled_requests: usize,
+    pub stale_results_rejected: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -100,14 +121,42 @@ struct ChunkPipelineStopReasonMetrics {
     complete: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct ChunkPipelineCancellationMetrics {
+    cancelled_streams: AtomicUsize,
+    cancelled_requests: AtomicUsize,
+    stale_results_rejected: AtomicUsize,
+}
+
 pub(crate) struct ChunkPipelinePermit {
     _permit: OwnedSemaphorePermit,
     active: Arc<AtomicUsize>,
+    idle_changed: Arc<Notify>,
+    admission_changed: Option<Arc<Notify>>,
+}
+
+pub(crate) struct ChunkPipelinePrepareTask {
+    active: Arc<AtomicUsize>,
+    idle_changed: Arc<Notify>,
 }
 
 impl Drop for ChunkPipelinePermit {
     fn drop(&mut self) {
-        self.active.fetch_sub(1, Ordering::AcqRel);
+        let previous = self.active.fetch_sub(1, Ordering::AcqRel);
+        if let Some(changed) = self.admission_changed.as_ref() {
+            changed.notify_one();
+        }
+        if previous == 1 {
+            self.idle_changed.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ChunkPipelinePrepareTask {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.idle_changed.notify_waiters();
+        }
     }
 }
 
@@ -119,6 +168,7 @@ impl ChunkPipelineResourceMetrics {
             max_io_active: self.max_io_active.load(Ordering::Acquire),
             active_cpu: self.active_cpu.load(Ordering::Acquire),
             max_cpu_active: self.max_cpu_active.load(Ordering::Acquire),
+            max_result_queue_depth: self.max_result_queue_depth.load(Ordering::Acquire),
         }
     }
 
@@ -132,9 +182,47 @@ impl ChunkPipelineResourceMetrics {
         self.stop_reason_counts().observed_reasons()
     }
 
+    #[must_use]
+    pub fn cancellation_snapshot(&self) -> ChunkPipelineCancellationSnapshot {
+        ChunkPipelineCancellationSnapshot {
+            cancelled_streams: self.cancellations.cancelled_streams.load(Ordering::Acquire),
+            cancelled_requests: self
+                .cancellations
+                .cancelled_requests
+                .load(Ordering::Acquire),
+            stale_results_rejected: self
+                .cancellations
+                .stale_results_rejected
+                .load(Ordering::Acquire),
+        }
+    }
+
     pub(crate) fn record_stop_reason(&self, reason: ChunkPipelineStopReason) {
         self.stop_reasons
             .counter(reason)
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) fn observe_result_queue_depth(&self, depth: usize) {
+        self.max_result_queue_depth
+            .fetch_max(depth, Ordering::AcqRel);
+    }
+
+    pub(crate) fn record_stream_cancellation(&self, requests: usize) {
+        if requests == 0 {
+            return;
+        }
+        self.cancellations
+            .cancelled_streams
+            .fetch_add(1, Ordering::AcqRel);
+        self.cancellations
+            .cancelled_requests
+            .fetch_add(requests, Ordering::AcqRel);
+    }
+
+    pub(crate) fn record_stale_result_rejection(&self) {
+        self.cancellations
+            .stale_results_rejected
             .fetch_add(1, Ordering::AcqRel);
     }
 }
@@ -211,12 +299,47 @@ impl ChunkPipelineResources {
     }
 
     #[must_use]
-    pub(crate) fn with_limits(chunk_io_threads: usize, chunk_worker_threads: usize) -> Self {
+    pub(crate) fn with_limits(chunk_io_threads: usize, cpu_worker_threads: usize) -> Self {
+        let cpu_capacity = cpu_worker_threads.max(1);
         Self {
             io_permits: Arc::new(Semaphore::new(chunk_io_threads.max(1))),
-            cpu_permits: Arc::new(Semaphore::new(chunk_worker_threads.max(1))),
+            cpu_permits: Arc::new(Semaphore::new(cpu_capacity)),
+            prepare_request_permits: Arc::new(Semaphore::new(cpu_capacity)),
+            cpu_capacity,
+            cpu_limit: Arc::new(AtomicUsize::new(cpu_capacity)),
+            cpu_admission_changed: Arc::new(Notify::new()),
+            prepare_admission_changed: Arc::new(Notify::new()),
+            active_prepare_tasks: Arc::new(AtomicUsize::new(0)),
+            active_prepare_requests: Arc::new(AtomicUsize::new(0)),
             metrics: ChunkPipelineResourceMetrics::default(),
         }
+    }
+
+    #[must_use]
+    pub(crate) fn cpu_limit(&self) -> usize {
+        self.cpu_limit.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn apply_runtime_control_action(
+        &self,
+        action: crate::AutoscaleAction,
+        draining: bool,
+    ) -> usize {
+        let current = self.cpu_limit();
+        let next = if draining {
+            1
+        } else {
+            match action {
+                crate::AutoscaleAction::Hold => current,
+                crate::AutoscaleAction::ScaleDown => current.div_ceil(2).max(1),
+                crate::AutoscaleAction::ScaleUp => current.saturating_mul(2).min(self.cpu_capacity),
+            }
+        };
+        if self.cpu_limit.swap(next, Ordering::AcqRel) != next {
+            self.cpu_admission_changed.notify_waiters();
+            self.prepare_admission_changed.notify_waiters();
+        }
+        next
     }
 
     #[must_use]
@@ -224,37 +347,169 @@ impl ChunkPipelineResources {
         self.metrics.clone()
     }
 
+    pub(crate) async fn wait_for_idle(&self) {
+        loop {
+            let idle_changed = self.metrics.idle_changed.notified();
+            tokio::pin!(idle_changed);
+            idle_changed.as_mut().enable();
+            let snapshot = self.metrics.snapshot();
+            if snapshot.active_io == 0
+                && snapshot.active_cpu == 0
+                && self.active_prepare_tasks.load(Ordering::Acquire) == 0
+                && self.active_prepare_requests.load(Ordering::Acquire) == 0
+            {
+                return;
+            }
+            idle_changed.await;
+        }
+    }
+
+    pub(crate) fn begin_prepare_task(&self) -> ChunkPipelinePrepareTask {
+        self.active_prepare_tasks.fetch_add(1, Ordering::AcqRel);
+        ChunkPipelinePrepareTask {
+            active: Arc::clone(&self.active_prepare_tasks),
+            idle_changed: Arc::clone(&self.metrics.idle_changed),
+        }
+    }
+
     pub(crate) fn record_stop_reason(&self, reason: ChunkPipelineStopReason) {
         self.metrics.record_stop_reason(reason);
     }
 
+    pub(crate) fn observe_result_queue_depth(&self, depth: usize) {
+        self.metrics.observe_result_queue_depth(depth);
+    }
+
+    pub(crate) fn record_stream_cancellation(&self, requests: usize) {
+        self.metrics.record_stream_cancellation(requests);
+    }
+
+    pub(crate) fn record_stale_result_rejection(&self) {
+        self.metrics.record_stale_result_rejection();
+    }
+
     pub(crate) async fn acquire_io(&self) -> Result<ChunkPipelinePermit, AcquireError> {
         let permit = Arc::clone(&self.io_permits).acquire_owned().await?;
-        Ok(self.track_permit(permit, true))
+        Ok(self.track_io_permit(permit))
     }
 
     pub(crate) async fn acquire_cpu(&self) -> Result<ChunkPipelinePermit, AcquireError> {
         let permit = Arc::clone(&self.cpu_permits).acquire_owned().await?;
-        Ok(self.track_permit(permit, false))
+        loop {
+            let changed = self.cpu_admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.try_reserve_cpu_slot() {
+                return Ok(self.track_reserved_cpu_permit(permit));
+            }
+            changed.await;
+        }
     }
 
-    fn track_permit(&self, permit: OwnedSemaphorePermit, io: bool) -> ChunkPipelinePermit {
-        let (active, max_active) = if io {
-            (&self.metrics.active_io, &self.metrics.max_io_active)
-        } else {
-            (&self.metrics.active_cpu, &self.metrics.max_cpu_active)
-        };
+    pub(crate) async fn acquire_prepare_request(
+        &self,
+    ) -> Result<ChunkPipelinePermit, AcquireError> {
+        let permit = Arc::clone(&self.prepare_request_permits)
+            .acquire_owned()
+            .await?;
+        loop {
+            let changed = self.prepare_admission_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self
+                .try_reserve_limited_slot(&self.active_prepare_requests)
+                .is_some()
+            {
+                return Ok(ChunkPipelinePermit {
+                    _permit: permit,
+                    active: Arc::clone(&self.active_prepare_requests),
+                    idle_changed: Arc::clone(&self.metrics.idle_changed),
+                    admission_changed: Some(Arc::clone(&self.prepare_admission_changed)),
+                });
+            }
+            changed.await;
+        }
+    }
+
+    pub(crate) fn try_acquire_cpu(&self) -> Option<ChunkPipelinePermit> {
+        let permit = Arc::clone(&self.cpu_permits).try_acquire_owned().ok()?;
+        if !self.try_reserve_cpu_slot() {
+            return None;
+        }
+        Some(self.track_reserved_cpu_permit(permit))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_acquire_prepare_request(&self) -> Option<ChunkPipelinePermit> {
+        let permit = Arc::clone(&self.prepare_request_permits)
+            .try_acquire_owned()
+            .ok()?;
+        self.try_reserve_limited_slot(&self.active_prepare_requests)?;
+        Some(ChunkPipelinePermit {
+            _permit: permit,
+            active: Arc::clone(&self.active_prepare_requests),
+            idle_changed: Arc::clone(&self.metrics.idle_changed),
+            admission_changed: Some(Arc::clone(&self.prepare_admission_changed)),
+        })
+    }
+
+    fn track_io_permit(&self, permit: OwnedSemaphorePermit) -> ChunkPipelinePermit {
+        let active = &self.metrics.active_io;
         let now = active.fetch_add(1, Ordering::AcqRel) + 1;
-        max_active.fetch_max(now, Ordering::AcqRel);
+        self.metrics.max_io_active.fetch_max(now, Ordering::AcqRel);
         ChunkPipelinePermit {
             _permit: permit,
             active: Arc::clone(active),
+            idle_changed: Arc::clone(&self.metrics.idle_changed),
+            admission_changed: None,
+        }
+    }
+
+    fn try_reserve_cpu_slot(&self) -> bool {
+        let Some(active) = self.try_reserve_limited_slot(&self.metrics.active_cpu) else {
+            return false;
+        };
+        self.metrics
+            .max_cpu_active
+            .fetch_max(active, Ordering::AcqRel);
+        true
+    }
+
+    fn try_reserve_limited_slot(&self, active_slots: &AtomicUsize) -> Option<usize> {
+        let mut active = active_slots.load(Ordering::Acquire);
+        loop {
+            if active >= self.cpu_limit() {
+                return None;
+            }
+            match active_slots.compare_exchange_weak(
+                active,
+                active + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(active + 1),
+                Err(observed) => active = observed,
+            }
+        }
+    }
+
+    fn track_reserved_cpu_permit(&self, permit: OwnedSemaphorePermit) -> ChunkPipelinePermit {
+        ChunkPipelinePermit {
+            _permit: permit,
+            active: Arc::clone(&self.metrics.active_cpu),
+            idle_changed: Arc::clone(&self.metrics.idle_changed),
+            admission_changed: Some(Arc::clone(&self.cpu_admission_changed)),
         }
     }
 }
 
-fn default_worker_threads() -> usize {
-    4
+/// Derive bounded worker capacity from the process-visible CPU limit.
+#[must_use]
+pub fn automatic_worker_limits(available_parallelism: usize) -> (usize, usize) {
+    let available = available_parallelism.max(1);
+    let io_workers = available.div_ceil(4);
+    let cpu_workers = available.div_ceil(2);
+    (io_workers, cpu_workers)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -357,6 +612,34 @@ impl ChunkScheduler {
         self.replace_view(desired);
     }
 
+    pub fn reprioritize_queued<I>(&mut self, desired: I)
+    where
+        I: IntoIterator<Item = (i32, i32, ChunkPriority)>,
+    {
+        let priorities: HashMap<_, _> = desired
+            .into_iter()
+            .enumerate()
+            .map(|(rank, (chunk_x, chunk_z, priority))| ((chunk_x, chunk_z), (rank, priority)))
+            .collect();
+        let mut queued: Vec<_> = self.queue.drain(..).enumerate().collect();
+
+        for (_, request) in &mut queued {
+            if let Some((_, priority)) = priorities.get(&(request.chunk_x, request.chunk_z)) {
+                request.priority = *priority;
+            }
+        }
+        queued.sort_by_key(|(old_rank, request)| {
+            (
+                priorities
+                    .get(&(request.chunk_x, request.chunk_z))
+                    .map_or(usize::MAX, |(rank, _)| *rank),
+                *old_rank,
+            )
+        });
+        self.queue
+            .extend(queued.into_iter().map(|(_, request)| request));
+    }
+
     #[must_use]
     pub fn current_generation(&self) -> ChunkPipelineGeneration {
         ChunkPipelineGeneration(self.generation)
@@ -407,6 +690,24 @@ impl ChunkScheduler {
 
         self.in_flight.remove(&coord);
         self.queue.push_back(request);
+        true
+    }
+
+    pub fn defer_front(&mut self, request: ChunkRequest) -> bool {
+        if !self.is_current(request) {
+            return false;
+        }
+
+        let coord = (request.chunk_x, request.chunk_z);
+        let Some(generation) = self.in_flight.get(&coord).copied() else {
+            return false;
+        };
+        if generation != request.generation {
+            return false;
+        }
+
+        self.in_flight.remove(&coord);
+        self.queue.push_front(request);
         true
     }
 
@@ -477,6 +778,169 @@ mod tests {
     }
 
     #[test]
+    fn resource_metrics_keep_the_maximum_observed_result_queue_depth() {
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let metrics = resources.metrics();
+
+        resources.observe_result_queue_depth(2);
+        resources.observe_result_queue_depth(7);
+        resources.observe_result_queue_depth(3);
+
+        assert_eq!(metrics.snapshot().max_result_queue_depth, 7);
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_wakes_when_last_active_permit_drops() {
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let io_permit = resources.acquire_io().await.unwrap();
+        let cpu_permit = resources.acquire_cpu().await.unwrap();
+        let mut idle = std::pin::pin!(resources.wait_for_idle());
+
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        probe_tx.send(()).unwrap();
+        tokio::select! {
+            biased;
+            () = &mut idle => panic!("pipeline reported idle with active permits"),
+            result = probe_rx => result.unwrap(),
+        }
+
+        drop(io_permit);
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        probe_tx.send(()).unwrap();
+        tokio::select! {
+            biased;
+            () = &mut idle => panic!("pipeline reported idle with active CPU permit"),
+            result = probe_rx => result.unwrap(),
+        }
+
+        drop(cpu_permit);
+        tokio::time::timeout(std::time::Duration::from_secs(1), idle)
+            .await
+            .expect("last permit drop must wake idle waiter");
+    }
+
+    #[tokio::test]
+    async fn wait_for_idle_includes_async_prepare_task_lifetime() {
+        let resources = ChunkPipelineResources::with_limits(1, 1);
+        let task = resources.begin_prepare_task();
+        let permit = resources.acquire_cpu().await.unwrap();
+        drop(permit);
+        let mut idle = std::pin::pin!(resources.wait_for_idle());
+
+        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
+        probe_tx.send(()).unwrap();
+        tokio::select! {
+            biased;
+            () = &mut idle => panic!("pipeline reported idle before prepare task completed"),
+            result = probe_rx => result.unwrap(),
+        }
+
+        drop(task);
+        tokio::time::timeout(std::time::Duration::from_secs(1), idle)
+            .await
+            .expect("prepare task completion must wake idle waiter");
+    }
+
+    #[tokio::test]
+    async fn adaptive_cpu_limit_wakes_waiter_on_scale_up() {
+        let resources = ChunkPipelineResources::with_limits(1, 4);
+        let first = resources.acquire_cpu().await.unwrap();
+        let second = resources.acquire_cpu().await.unwrap();
+
+        assert_eq!(
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
+            2
+        );
+        assert_eq!(resources.cpu_limit(), 2);
+        assert!(resources.try_acquire_cpu().is_none());
+
+        let mut third = std::pin::pin!(resources.acquire_cpu());
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(third.as_mut(), cx).is_pending(),
+                "reduced CPU admission must hold new background work"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        assert_eq!(
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleUp, false),
+            4
+        );
+        let third = third.await.unwrap();
+        assert_eq!(resources.metrics().snapshot().active_cpu, 3);
+
+        drop((first, second, third));
+    }
+
+    #[tokio::test]
+    async fn adaptive_cpu_limit_wakes_waiter_after_active_work_releases() {
+        let resources = ChunkPipelineResources::with_limits(1, 2);
+        let first = resources.acquire_cpu().await.unwrap();
+        let second = resources.acquire_cpu().await.unwrap();
+        assert_eq!(
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
+            1
+        );
+
+        let mut waiting = std::pin::pin!(resources.acquire_cpu());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(waiting.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        drop(first);
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), cx).is_pending(),
+                "active work must fall below the new limit before admission"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        drop(second);
+        let waiting = waiting.await.unwrap();
+        assert_eq!(resources.metrics().snapshot().active_cpu, 1);
+        drop(waiting);
+    }
+
+    #[tokio::test]
+    async fn prepare_request_admission_shares_the_runtime_cpu_limit() {
+        let resources = ChunkPipelineResources::with_limits(1, 2);
+        assert_eq!(
+            resources.apply_runtime_control_action(crate::AutoscaleAction::ScaleDown, false),
+            1
+        );
+        let first = resources.acquire_prepare_request().await.unwrap();
+        assert!(resources.try_acquire_prepare_request().is_none());
+
+        let mut waiting = std::pin::pin!(resources.acquire_prepare_request());
+        std::future::poll_fn(|cx| {
+            assert!(
+                std::future::Future::poll(waiting.as_mut(), cx).is_pending(),
+                "a second batch must not bypass global request admission"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        drop(first);
+        let second = waiting.await.unwrap();
+        drop(second);
+    }
+
+    #[test]
+    fn automatic_worker_limits_reserve_runtime_cpu_and_scale_io() {
+        assert_eq!(automatic_worker_limits(1), (1, 1));
+        assert_eq!(automatic_worker_limits(4), (1, 2));
+        assert_eq!(automatic_worker_limits(8), (2, 4));
+        assert_eq!(automatic_worker_limits(32), (8, 16));
+    }
+
+    #[test]
     fn scheduler_dedupes_desired_chunks() {
         let scheduler = ChunkScheduler::new([
             (0, 0, priority(0)),
@@ -501,6 +965,38 @@ mod tests {
 
         assert_eq!(scheduler.queued_len(), 2);
         assert_eq!(scheduler.finished_len(), 0);
+    }
+
+    #[test]
+    fn scheduler_reprioritizes_only_queued_requests() {
+        let mut scheduler = ChunkScheduler::new([
+            (0, 0, priority(0)),
+            (1, 0, priority(1)),
+            (2, 0, priority(2)),
+            (3, 0, priority(3)),
+        ]);
+        let finished = scheduler.poll_next().expect("finished request");
+        assert!(scheduler.mark_finished(finished));
+        let in_flight = scheduler.poll_next().expect("in-flight request");
+        let generation = scheduler.current_generation();
+
+        scheduler.reprioritize_queued([
+            (3, 0, priority(0)),
+            (2, 0, priority(1)),
+            (1, 0, priority(2)),
+            (0, 0, priority(3)),
+        ]);
+
+        assert_eq!(scheduler.current_generation(), generation);
+        assert_eq!(scheduler.finished_len(), 1);
+        assert_eq!(scheduler.in_flight_len(), 1);
+        assert!(scheduler.mark_finished(in_flight));
+        let first_reprioritized = scheduler.poll_next().expect("reprioritized request");
+        assert_eq!(
+            (first_reprioritized.chunk_x, first_reprioritized.chunk_z),
+            (3, 0)
+        );
+        assert_eq!(first_reprioritized.priority, priority(0));
     }
 
     #[test]

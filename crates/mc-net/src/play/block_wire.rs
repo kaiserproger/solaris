@@ -123,6 +123,34 @@ pub(super) fn broadcast_block_deltas_to_sessions(
     );
 }
 
+pub(super) fn broadcast_level_event(
+    state: &InteractionState,
+    position: mc_world::BlockPos,
+    event_id: i32,
+    data: i32,
+    except: Option<SessionId>,
+) {
+    let chunks = HashSet::from([(position.x.div_euclid(16), position.z.div_euclid(16))]);
+    dispatch_visibility_commands(
+        state
+            .sessions
+            .loaded_recipients_for_chunks(&chunks, except)
+            .into_iter()
+            .map(|recipient| VisibilityDispatch {
+                recipient,
+                command: OutboundCommand::LevelEvent(LevelEvent {
+                    event_id,
+                    position: mc_protocol::packets::play::pack_block_pos(
+                        position.x, position.y, position.z,
+                    ),
+                    data,
+                    global: false,
+                }),
+            })
+            .collect(),
+    );
+}
+
 pub(super) fn broadcast_light_updates(
     state: &InteractionState,
     updates: &[OutboundLightUpdate],

@@ -19,7 +19,16 @@ path = "src/bin/wire_probe.rs"
 name = "coverage-audit"
 path = "src/bin/coverage_audit.rs"
 
+[[bin]]
+name = "core-replay-validate"
+path = "src/bin/core_replay_validate.rs"
+
+[[bin]]
+name = "registry-data-extract"
+path = "src/bin/registry_data_extract.rs"
+
 [dependencies]
+mc-data = { path = "../mc-data" }
 mc-protocol = { path = "../mc-protocol" }
 mc-nbt = { path = "../mc-nbt" }
 bytes = { workspace = true }
@@ -29,11 +38,12 @@ clap = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
-
-[dev-dependencies]
-mc-data = { path = "../mc-data" }
-mc-net = { path = "../mc-net" }
-mc-world = { path = "../mc-world" }
-mc-worldgen = { path = "../mc-worldgen" }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = "3"
+
+[dev-dependencies]
+mc-net = { path = "../mc-net" }
+mc-script = { path = "../mc-script", features = ["lua-runtime"] }
+mc-world = { path = "../mc-world" }
+mc-worldgen = { path = "../mc-worldgen" }

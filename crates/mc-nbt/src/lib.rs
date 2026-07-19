@@ -13,18 +13,9 @@
 //! Both flavours are exposed via [`read_named`] / [`write_named`] and
 //! [`read_network`] / [`write_network`]; the payload format is shared.
 //!
-//! String encoding: Mojang's spec calls for *Modified UTF-8* (a.k.a.
-//! CESU-8). For ASCII strings — which is what every key and most values
-//! in vanilla data are — Modified UTF-8 is identical to UTF-8 and our
-//! implementation interoperates correctly. Non-ASCII BMP characters
-//! also pass through unchanged. The two divergences are the `NUL`
-//! character (vanilla encodes it as `0xC0 0x80`; we emit a plain `0x00`)
-//! and supplementary characters above `U+FFFF` (vanilla emits a CESU-8
-//! surrogate pair; we emit standard UTF-8 four-byte sequences). Neither
-//! case turns up in any vanilla data file Solaris currently reads, but
-//! they will need fixing before we support user-supplied text content.
-//! Flipping both paths to strict MUTF-8 is a tracked follow-up; it has
-//! no caller today.
+//! NBT strings use Java's Modified UTF-8: `NUL` is encoded as `C0 80`,
+//! and supplementary Unicode characters are encoded as UTF-16 surrogate
+//! pairs with three bytes per code unit.
 
 use bytes::{Buf, BufMut};
 use thiserror::Error;
@@ -115,11 +106,12 @@ impl ListTag {
 // Errors
 // -----------------------------------------------------------------------
 
-/// Hard ceiling we apply to every length-prefixed array (`ByteArray`,
-/// `String`, `List`, `IntArray`, `LongArray`). Picked generously enough
-/// that no legitimate NBT we care about gets near it; tight enough that
-/// a malicious peer cannot make us allocate gigabytes.
+/// Hard ceiling for array payloads and list backing allocations.
+/// Strings have their own `u16` wire-length limit.
 pub const MAX_NBT_LENGTH: usize = 16 * 1024 * 1024;
+
+/// Vanilla rejects container nesting beyond 512 levels.
+pub const MAX_NBT_DEPTH: usize = 512;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum NbtError {
@@ -132,13 +124,19 @@ pub enum NbtError {
     #[error("unknown tag-id {0}")]
     UnknownTag(u8),
 
-    #[error("NBT array of length {0} exceeds the {MAX_NBT_LENGTH}-byte ceiling")]
+    #[error("NBT collection payload of {0} bytes exceeds the {MAX_NBT_LENGTH}-byte ceiling")]
     ArrayTooLong(i64),
+
+    #[error("Modified UTF-8 string payload of {0} bytes exceeds the u16 wire-length limit")]
+    StringTooLong(usize),
 
     #[error("negative NBT array length: {0}")]
     NegativeLength(i32),
 
-    #[error("string is not valid UTF-8")]
+    #[error("NBT container nesting exceeds the {MAX_NBT_DEPTH}-level limit")]
+    NestingTooDeep,
+
+    #[error("string is not valid Modified UTF-8")]
     InvalidString,
 
     #[error("non-Compound type {0:#x} used where a Compound is required")]
@@ -169,31 +167,126 @@ fn read_string<B: Buf>(buf: &mut B) -> Result<String, NbtError> {
     ensure_remaining(buf, len)?;
     let mut bytes = vec![0u8; len];
     buf.copy_to_slice(&mut bytes);
-    String::from_utf8(bytes).map_err(|_| NbtError::InvalidString)
+
+    let mut code_units = Vec::with_capacity(len);
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let first = bytes[offset];
+        match first {
+            0x01..=0x7F => {
+                code_units.push(u16::from(first));
+                offset += 1;
+            }
+            0xC0..=0xDF => {
+                let second = *bytes.get(offset + 1).ok_or(NbtError::InvalidString)?;
+                if second & 0xC0 != 0x80 {
+                    return Err(NbtError::InvalidString);
+                }
+
+                let code_unit = (u16::from(first & 0x1F) << 6) | u16::from(second & 0x3F);
+                if code_unit == 0 {
+                    if first != 0xC0 || second != 0x80 {
+                        return Err(NbtError::InvalidString);
+                    }
+                } else if code_unit < 0x80 {
+                    return Err(NbtError::InvalidString);
+                }
+
+                code_units.push(code_unit);
+                offset += 2;
+            }
+            0xE0..=0xEF => {
+                let second = *bytes.get(offset + 1).ok_or(NbtError::InvalidString)?;
+                let third = *bytes.get(offset + 2).ok_or(NbtError::InvalidString)?;
+                if second & 0xC0 != 0x80 || third & 0xC0 != 0x80 {
+                    return Err(NbtError::InvalidString);
+                }
+
+                let code_unit = (u16::from(first & 0x0F) << 12)
+                    | (u16::from(second & 0x3F) << 6)
+                    | u16::from(third & 0x3F);
+                if code_unit < 0x800 {
+                    return Err(NbtError::InvalidString);
+                }
+
+                code_units.push(code_unit);
+                offset += 3;
+            }
+            _ => return Err(NbtError::InvalidString),
+        }
+    }
+
+    String::from_utf16(&code_units).map_err(|_| NbtError::InvalidString)
 }
 
 fn write_string<B: BufMut>(buf: &mut B, s: &str) -> Result<(), NbtError> {
-    let bytes = s.as_bytes();
-    let len = u16::try_from(bytes.len()).map_err(|_| NbtError::ArrayTooLong(bytes.len() as i64))?;
+    let encoded_len = s
+        .encode_utf16()
+        .map(|code_unit| match code_unit {
+            0x0001..=0x007F => 1usize,
+            0x0000..=0x07FF => 2,
+            _ => 3,
+        })
+        .sum::<usize>();
+    let len = u16::try_from(encoded_len).map_err(|_| NbtError::StringTooLong(encoded_len))?;
     buf.put_u16(len);
-    buf.put_slice(bytes);
+
+    for code_unit in s.encode_utf16() {
+        match code_unit {
+            0x0001..=0x007F => buf.put_u8(code_unit as u8),
+            0x0000..=0x07FF => {
+                buf.put_u8(0xC0 | ((code_unit >> 6) as u8));
+                buf.put_u8(0x80 | ((code_unit & 0x3F) as u8));
+            }
+            _ => {
+                buf.put_u8(0xE0 | ((code_unit >> 12) as u8));
+                buf.put_u8(0x80 | (((code_unit >> 6) & 0x3F) as u8));
+                buf.put_u8(0x80 | ((code_unit & 0x3F) as u8));
+            }
+        }
+    }
+
     Ok(())
 }
 
-fn read_length<B: Buf>(buf: &mut B) -> Result<usize, NbtError> {
+fn collection_payload_bytes(len: usize, element_size: usize) -> Result<usize, NbtError> {
+    let bytes = len
+        .checked_mul(element_size)
+        .ok_or(NbtError::ArrayTooLong(i64::MAX))?;
+    if bytes > MAX_NBT_LENGTH {
+        return Err(NbtError::ArrayTooLong(
+            i64::try_from(bytes).unwrap_or(i64::MAX),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn read_length<B: Buf>(buf: &mut B, element_size: usize) -> Result<usize, NbtError> {
     ensure_remaining(buf, 4)?;
     let len = buf.get_i32();
     if len < 0 {
         return Err(NbtError::NegativeLength(len));
     }
     let len = len as usize;
-    if len > MAX_NBT_LENGTH {
-        return Err(NbtError::ArrayTooLong(len as i64));
-    }
+    collection_payload_bytes(len, element_size)?;
     Ok(len)
 }
 
-fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
+fn write_length<B: BufMut>(buf: &mut B, len: usize, element_size: usize) -> Result<(), NbtError> {
+    collection_payload_bytes(len, element_size)?;
+    let len = i32::try_from(len).map_err(|_| NbtError::ArrayTooLong(i64::MAX))?;
+    buf.put_i32(len);
+    Ok(())
+}
+
+fn ensure_container_depth(depth: usize) -> Result<(), NbtError> {
+    if depth > MAX_NBT_DEPTH {
+        return Err(NbtError::NestingTooDeep);
+    }
+    Ok(())
+}
+
+fn read_payload<B: Buf>(buf: &mut B, tag_id: u8, depth: usize) -> Result<Tag, NbtError> {
     match tag_id {
         tag_type::BYTE => {
             ensure_remaining(buf, 1)?;
@@ -220,7 +313,7 @@ fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
             Ok(Tag::Double(buf.get_f64()))
         }
         tag_type::BYTE_ARRAY => {
-            let len = read_length(buf)?;
+            let len = read_length(buf, size_of::<i8>())?;
             ensure_remaining(buf, len)?;
             let mut data = vec![0i8; len];
             // copy_to_slice wants u8; reinterpret via from_raw_parts is
@@ -232,9 +325,10 @@ fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
         }
         tag_type::STRING => Ok(Tag::String(read_string(buf)?)),
         tag_type::LIST => {
+            ensure_container_depth(depth)?;
             ensure_remaining(buf, 1)?;
             let element_type = buf.get_u8();
-            let len = read_length(buf)?;
+            let len = read_length(buf, size_of::<Tag>())?;
             if element_type == tag_type::END && len > 0 {
                 return Err(NbtError::HeterogeneousList {
                     parent: tag_type::LIST,
@@ -243,17 +337,17 @@ fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
             }
             let mut elements = Vec::with_capacity(len);
             for _ in 0..len {
-                elements.push(read_payload(buf, element_type)?);
+                elements.push(read_payload(buf, element_type, depth + 1)?);
             }
             Ok(Tag::List(ListTag {
                 element_type,
                 elements,
             }))
         }
-        tag_type::COMPOUND => read_compound_payload(buf),
+        tag_type::COMPOUND => read_compound_payload(buf, depth),
         tag_type::INT_ARRAY => {
-            let len = read_length(buf)?;
-            ensure_remaining(buf, len.saturating_mul(4))?;
+            let len = read_length(buf, size_of::<i32>())?;
+            ensure_remaining(buf, len * size_of::<i32>())?;
             let mut data = Vec::with_capacity(len);
             for _ in 0..len {
                 data.push(buf.get_i32());
@@ -261,8 +355,8 @@ fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
             Ok(Tag::IntArray(data))
         }
         tag_type::LONG_ARRAY => {
-            let len = read_length(buf)?;
-            ensure_remaining(buf, len.saturating_mul(8))?;
+            let len = read_length(buf, size_of::<i64>())?;
+            ensure_remaining(buf, len * size_of::<i64>())?;
             let mut data = Vec::with_capacity(len);
             for _ in 0..len {
                 data.push(buf.get_i64());
@@ -273,7 +367,8 @@ fn read_payload<B: Buf>(buf: &mut B, tag_id: u8) -> Result<Tag, NbtError> {
     }
 }
 
-fn read_compound_payload<B: Buf>(buf: &mut B) -> Result<Tag, NbtError> {
+fn read_compound_payload<B: Buf>(buf: &mut B, depth: usize) -> Result<Tag, NbtError> {
+    ensure_container_depth(depth)?;
     let mut entries = Vec::new();
     loop {
         ensure_remaining(buf, 1)?;
@@ -282,12 +377,12 @@ fn read_compound_payload<B: Buf>(buf: &mut B) -> Result<Tag, NbtError> {
             return Ok(Tag::Compound(entries));
         }
         let name = read_string(buf)?;
-        let value = read_payload(buf, tag_id)?;
+        let value = read_payload(buf, tag_id, depth + 1)?;
         entries.push((name, value));
     }
 }
 
-fn write_payload<B: BufMut>(buf: &mut B, tag: &Tag) -> Result<(), NbtError> {
+fn write_payload<B: BufMut>(buf: &mut B, tag: &Tag, depth: usize) -> Result<(), NbtError> {
     match tag {
         Tag::Byte(v) => buf.put_i8(*v),
         Tag::Short(v) => buf.put_i16(*v),
@@ -296,19 +391,16 @@ fn write_payload<B: BufMut>(buf: &mut B, tag: &Tag) -> Result<(), NbtError> {
         Tag::Float(v) => buf.put_f32(*v),
         Tag::Double(v) => buf.put_f64(*v),
         Tag::ByteArray(data) => {
-            let len =
-                i32::try_from(data.len()).map_err(|_| NbtError::ArrayTooLong(data.len() as i64))?;
-            buf.put_i32(len);
+            write_length(buf, data.len(), size_of::<i8>())?;
             for v in data {
                 buf.put_i8(*v);
             }
         }
         Tag::String(s) => write_string(buf, s)?,
         Tag::List(list) => {
+            ensure_container_depth(depth)?;
             buf.put_u8(list.element_type);
-            let len = i32::try_from(list.elements.len())
-                .map_err(|_| NbtError::ArrayTooLong(list.elements.len() as i64))?;
-            buf.put_i32(len);
+            write_length(buf, list.elements.len(), size_of::<Tag>())?;
             for element in &list.elements {
                 if element.type_id() != list.element_type {
                     return Err(NbtError::HeterogeneousList {
@@ -316,29 +408,26 @@ fn write_payload<B: BufMut>(buf: &mut B, tag: &Tag) -> Result<(), NbtError> {
                         found: element.type_id(),
                     });
                 }
-                write_payload(buf, element)?;
+                write_payload(buf, element, depth + 1)?;
             }
         }
         Tag::Compound(entries) => {
+            ensure_container_depth(depth)?;
             for (name, value) in entries {
                 buf.put_u8(value.type_id());
                 write_string(buf, name)?;
-                write_payload(buf, value)?;
+                write_payload(buf, value, depth + 1)?;
             }
             buf.put_u8(tag_type::END);
         }
         Tag::IntArray(data) => {
-            let len =
-                i32::try_from(data.len()).map_err(|_| NbtError::ArrayTooLong(data.len() as i64))?;
-            buf.put_i32(len);
+            write_length(buf, data.len(), size_of::<i32>())?;
             for v in data {
                 buf.put_i32(*v);
             }
         }
         Tag::LongArray(data) => {
-            let len =
-                i32::try_from(data.len()).map_err(|_| NbtError::ArrayTooLong(data.len() as i64))?;
-            buf.put_i32(len);
+            write_length(buf, data.len(), size_of::<i64>())?;
             for v in data {
                 buf.put_i64(*v);
             }
@@ -359,7 +448,7 @@ pub fn read_network<B: Buf>(buf: &mut B) -> Result<Tag, NbtError> {
     if tag_id != tag_type::COMPOUND {
         return Err(NbtError::NotCompound(tag_id));
     }
-    read_compound_payload(buf)
+    read_compound_payload(buf, 1)
 }
 
 /// Write a *network-format* NBT root. `root` must be a [`Tag::Compound`].
@@ -368,7 +457,7 @@ pub fn write_network<B: BufMut>(buf: &mut B, root: &Tag) -> Result<(), NbtError>
         return Err(NbtError::RootMustBeCompound(root.type_id()));
     }
     buf.put_u8(tag_type::COMPOUND);
-    write_payload(buf, root)
+    write_payload(buf, root, 1)
 }
 
 /// Read a *named* NBT root: the disk format used by region files and
@@ -380,7 +469,7 @@ pub fn read_named<B: Buf>(buf: &mut B) -> Result<(String, Tag), NbtError> {
         return Err(NbtError::NotCompound(tag_id));
     }
     let name = read_string(buf)?;
-    let value = read_compound_payload(buf)?;
+    let value = read_compound_payload(buf, 1)?;
     Ok((name, value))
 }
 
@@ -391,7 +480,7 @@ pub fn write_named<B: BufMut>(buf: &mut B, name: &str, root: &Tag) -> Result<(),
     }
     buf.put_u8(tag_type::COMPOUND);
     write_string(buf, name)?;
-    write_payload(buf, root)
+    write_payload(buf, root, 1)
 }
 
 /// Crate version, exposed so other crates and the binary can report it.
@@ -449,8 +538,136 @@ mod tests {
         round_trip_network(Tag::Compound(vec![
             ("ascii".into(), Tag::String("hello, world".into())),
             ("bmp".into(), Tag::String("ümlauts, шифры, 漢字".into())),
+            ("modified".into(), Tag::String("nul:\0 face:😀".into())),
             ("empty".into(), Tag::String(String::new())),
         ]));
+    }
+
+    #[test]
+    fn modified_utf8_encodes_ascii_exactly() {
+        let mut buf = Vec::new();
+        write_string(&mut buf, "ASCII").unwrap();
+
+        assert_eq!(buf, [0x00, 0x05, b'A', b'S', b'C', b'I', b'I']);
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(read_string(&mut cursor).unwrap(), "ASCII");
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn modified_utf8_encodes_embedded_nul_as_c0_80() {
+        let mut buf = Vec::new();
+        write_string(&mut buf, "A\0B").unwrap();
+
+        assert_eq!(buf, [0x00, 0x04, b'A', 0xC0, 0x80, b'B']);
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(read_string(&mut cursor).unwrap(), "A\0B");
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn modified_utf8_encodes_bmp_boundaries_exactly() {
+        let mut buf = Vec::new();
+        write_string(&mut buf, "\u{0001}\u{007f}\u{0080}\u{07ff}\u{0800}\u{ffff}").unwrap();
+
+        assert_eq!(
+            buf,
+            vec![
+                0x00, 0x0C, 0x01, 0x7F, 0xC2, 0x80, 0xDF, 0xBF, 0xE0, 0xA0, 0x80, 0xEF, 0xBF, 0xBF,
+            ]
+        );
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(
+            read_string(&mut cursor).unwrap(),
+            "\u{0001}\u{007f}\u{0080}\u{07ff}\u{0800}\u{ffff}"
+        );
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn modified_utf8_encodes_supplementary_code_point_as_surrogate_pair() {
+        let mut buf = Vec::new();
+        write_string(&mut buf, "😀").unwrap();
+
+        assert_eq!(buf, [0x00, 0x06, 0xED, 0xA0, 0xBD, 0xED, 0xB8, 0x80]);
+
+        let mut cursor = buf.as_slice();
+        assert_eq!(read_string(&mut cursor).unwrap(), "😀");
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn modified_utf8_rejects_standard_four_byte_sequence() {
+        let mut cursor: &[u8] = &[0x00, 0x04, 0xF0, 0x9F, 0x98, 0x80];
+        assert_eq!(read_string(&mut cursor), Err(NbtError::InvalidString));
+    }
+
+    #[test]
+    fn modified_utf8_rejects_noncanonical_and_truncated_sequences() {
+        for bytes in [
+            &[0x00][..],
+            &[0x80],
+            &[0xC1, 0x81],
+            &[0xC2],
+            &[0xC2, b'A'],
+            &[0xE0, 0x80, 0x80],
+            &[0xE1, 0x80],
+            &[0xE1, b'A', 0x80],
+        ] {
+            let mut encoded = Vec::with_capacity(bytes.len() + 2);
+            encoded.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            encoded.extend_from_slice(bytes);
+            let mut cursor = encoded.as_slice();
+            assert_eq!(read_string(&mut cursor), Err(NbtError::InvalidString));
+        }
+
+        let mut truncated_payload: &[u8] = &[0x00, 0x02, 0xC2];
+        assert_eq!(
+            read_string(&mut truncated_payload),
+            Err(NbtError::Underflow {
+                needed: 1,
+                available: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn modified_utf8_rejects_unpaired_and_reversed_surrogates() {
+        for bytes in [
+            &[0xED, 0xA0, 0x80][..],
+            &[0xED, 0xB0, 0x80],
+            &[0xED, 0xB0, 0x80, 0xED, 0xA0, 0x80],
+            &[0xED, 0xA0, 0x80, 0xED, 0xA0, 0x80],
+        ] {
+            let mut encoded = Vec::with_capacity(bytes.len() + 2);
+            encoded.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            encoded.extend_from_slice(bytes);
+            let mut cursor = encoded.as_slice();
+            assert_eq!(read_string(&mut cursor), Err(NbtError::InvalidString));
+        }
+    }
+
+    #[test]
+    fn modified_utf8_enforces_encoded_u16_wire_length() {
+        let exact_limit = "a".repeat(usize::from(u16::MAX));
+        let mut output = Vec::new();
+        write_string(&mut output, &exact_limit).unwrap();
+        assert_eq!(&output[..2], &[0xFF, 0xFF]);
+        assert_eq!(output.len(), usize::from(u16::MAX) + 2);
+        let mut cursor = output.as_slice();
+        assert_eq!(read_string(&mut cursor).unwrap(), exact_limit);
+        assert!(cursor.is_empty());
+
+        let too_long = "\0".repeat(32_768);
+        output.clear();
+        assert_eq!(
+            write_string(&mut output, &too_long),
+            Err(NbtError::StringTooLong(65_536))
+        );
+        assert!(output.is_empty());
     }
 
     #[test]
@@ -564,6 +781,48 @@ mod tests {
     }
 
     #[test]
+    fn int_array_limit_counts_payload_bytes() {
+        let too_many_ints = MAX_NBT_LENGTH / size_of::<i32>() + 1;
+        let mut encoded = vec![tag_type::COMPOUND, tag_type::INT_ARRAY, 0, 1, b'x'];
+        encoded.extend_from_slice(&(too_many_ints as i32).to_be_bytes());
+        let mut cursor = encoded.as_slice();
+
+        assert!(matches!(
+            read_network(&mut cursor),
+            Err(NbtError::ArrayTooLong(_))
+        ));
+
+        let tag = Tag::Compound(vec![("x".into(), Tag::IntArray(vec![0; too_many_ints]))]);
+        let mut output = Vec::new();
+        assert!(matches!(
+            write_network(&mut output, &tag),
+            Err(NbtError::ArrayTooLong(_))
+        ));
+    }
+
+    #[test]
+    fn reader_and_writer_reject_excessive_nesting() {
+        let nested_containers = MAX_NBT_DEPTH;
+        let mut encoded = vec![tag_type::COMPOUND];
+        for _ in 0..nested_containers {
+            encoded.extend_from_slice(&[tag_type::COMPOUND, 0, 0]);
+        }
+        encoded.resize(encoded.len() + nested_containers + 1, tag_type::END);
+        let mut cursor = encoded.as_slice();
+        assert_eq!(read_network(&mut cursor), Err(NbtError::NestingTooDeep));
+
+        let mut tag = Tag::Compound(Vec::new());
+        for _ in 0..nested_containers {
+            tag = Tag::Compound(vec![(String::new(), tag)]);
+        }
+        let mut output = Vec::new();
+        assert_eq!(
+            write_network(&mut output, &tag),
+            Err(NbtError::NestingTooDeep)
+        );
+    }
+
+    #[test]
     fn read_rejects_truncated_buffer() {
         // Compound header but no payload bytes follow.
         let buf: &[u8] = &[tag_type::COMPOUND, tag_type::INT, 0, 1, b'x'];
@@ -623,6 +882,16 @@ mod tests {
             let (decoded_name, decoded) = read_named(&mut cursor).unwrap();
             prop_assert_eq!(decoded_name, name);
             prop_assert!(tags_bitwise_eq(&decoded, &tag));
+        }
+
+        #[test]
+        fn proptest_modified_utf8_round_trip(value in any::<String>()) {
+            let mut buf = Vec::new();
+            write_string(&mut buf, &value).unwrap();
+            let mut cursor = buf.as_slice();
+            let decoded = read_string(&mut cursor).unwrap();
+            prop_assert_eq!(decoded, value);
+            prop_assert!(cursor.is_empty());
         }
     }
 

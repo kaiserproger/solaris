@@ -11,6 +11,8 @@
 //!   attenuators like water/ice/leaves).
 //! - `propagates_sky` — `BlockState.propagatesSkylightDown()`, the
 //!   predicate that drives sky-light's heightmap shortcut.
+//! - `suffocating` — `BlockState.isSuffocating()`, used by gameplay
+//!   checks that require a full blocking collision shape.
 //!
 //! The script's output is data (ADR 0001); the table is loaded at
 //! server start with the same posture as `blocks.json`.
@@ -54,7 +56,8 @@ pub enum BlockLightError {
     },
     #[error(
         "entry at state-id {state_id} has {got} elements; \
-         expected 3 ([emission, opacity, propagates_sky])"
+         expected 4 ([emission, opacity, propagates_sky, suffocating]); \
+         rerun tools/extract-block-light.sh"
     )]
     EntryShape { state_id: u32, got: usize },
     #[error("entry at state-id {state_id} has {field} = {value}; must be in 0..=15")]
@@ -65,6 +68,8 @@ pub enum BlockLightError {
     },
     #[error("entry at state-id {state_id} has propagates_sky = {value}; must be 0 or 1")]
     InvalidBool { state_id: u32, value: i64 },
+    #[error("entry at state-id {state_id} has suffocating = {value}; must be 0 or 1")]
+    InvalidSuffocating { state_id: u32, value: i64 },
 }
 
 /// Per-state light metadata, indexed by global block-state id (the
@@ -79,6 +84,7 @@ pub struct BlockLightTable {
     emission: Vec<u8>,
     opacity: Vec<u8>,
     propagates_sky: Vec<bool>,
+    suffocating: Vec<bool>,
 }
 
 impl BlockLightTable {
@@ -112,6 +118,11 @@ impl BlockLightTable {
         self.propagates_sky.get(state_id as usize).copied()
     }
 
+    #[must_use]
+    pub fn suffocating(&self, state_id: u32) -> Option<bool> {
+        self.suffocating.get(state_id as usize).copied()
+    }
+
     /// Build a table from in-memory arrays; used by tests and by
     /// callers that don't want to stage a filesystem layout.
     /// Panics if the three arrays have different lengths.
@@ -124,11 +135,33 @@ impl BlockLightTable {
     ) -> Self {
         assert_eq!(emission.len(), opacity.len());
         assert_eq!(emission.len(), propagates_sky.len());
+        let suffocating = opacity.iter().map(|opacity| *opacity == 15).collect();
         Self {
             version: version.into(),
             emission,
             opacity,
             propagates_sky,
+            suffocating,
+        }
+    }
+
+    #[must_use]
+    pub fn from_arrays_with_suffocating(
+        version: impl Into<String>,
+        emission: Vec<u8>,
+        opacity: Vec<u8>,
+        propagates_sky: Vec<bool>,
+        suffocating: Vec<bool>,
+    ) -> Self {
+        assert_eq!(emission.len(), opacity.len());
+        assert_eq!(emission.len(), propagates_sky.len());
+        assert_eq!(emission.len(), suffocating.len());
+        Self {
+            version: version.into(),
+            emission,
+            opacity,
+            propagates_sky,
+            suffocating,
         }
     }
 
@@ -147,6 +180,7 @@ impl BlockLightTable {
         let mut emission = vec![0; len];
         let mut opacity = vec![15; len];
         let mut propagates_sky = vec![false; len];
+        let mut suffocating = vec![false; len];
 
         for block in report {
             let path = block.id.path();
@@ -156,6 +190,7 @@ impl BlockLightTable {
                 let op = conservative_opacity(path);
                 opacity[idx] = op;
                 propagates_sky[idx] = op == 0;
+                suffocating[idx] = op == 15;
             }
         }
 
@@ -164,11 +199,19 @@ impl BlockLightTable {
             emission,
             opacity,
             propagates_sky,
+            suffocating,
         }
     }
 }
 
 fn conservative_opacity(path: &str) -> u8 {
+    if matches!(
+        path,
+        "kelp" | "kelp_plant" | "chorus_flower" | "chorus_plant"
+    ) {
+        return 1;
+    }
+
     if matches!(path, "air" | "cave_air" | "void_air")
         || path.contains("glass")
         || path.contains("pane")
@@ -178,6 +221,7 @@ fn conservative_opacity(path: &str) -> u8 {
         || path.ends_with("torch")
         || matches!(path, "lantern" | "soul_lantern")
         || is_transparent_plant(path)
+        || is_transparent_crop(path)
         || path == "sugar_cane"
         || path == "cactus"
         || path.contains("flower")
@@ -205,6 +249,26 @@ fn conservative_opacity(path: &str) -> u8 {
     } else {
         15
     }
+}
+
+fn is_transparent_crop(path: &str) -> bool {
+    matches!(
+        path,
+        "wheat"
+            | "carrots"
+            | "potatoes"
+            | "beetroots"
+            | "torchflower_crop"
+            | "pitcher_crop"
+            | "melon_stem"
+            | "attached_melon_stem"
+            | "pumpkin_stem"
+            | "attached_pumpkin_stem"
+            | "sweet_berry_bush"
+            | "nether_wart"
+            | "cocoa"
+            | "bamboo"
+    )
 }
 
 fn is_transparent_plant(path: &str) -> bool {
@@ -237,6 +301,14 @@ fn is_transparent_plant(path: &str) -> bool {
 fn conservative_emission(path: &str, props: &std::collections::BTreeMap<String, String>) -> u8 {
     if props.get("lit").is_some_and(|v| v == "false") {
         return 0;
+    }
+    if matches!(path, "torchflower" | "torchflower_crop") {
+        return 0;
+    }
+    if matches!(path, "cave_vines" | "cave_vines_plant")
+        && props.get("berries").is_some_and(|value| value == "true")
+    {
+        return 14;
     }
     if path.contains("redstone_torch") {
         return 7;
@@ -298,8 +370,9 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
     let mut emission = Vec::with_capacity(expected);
     let mut opacity = Vec::with_capacity(expected);
     let mut propagates_sky = Vec::with_capacity(expected);
+    let mut suffocating = Vec::with_capacity(expected);
     for (state_id, e) in raw.entries.iter().enumerate() {
-        if e.len() != 3 {
+        if e.len() != 4 {
             return Err(BlockLightError::EntryShape {
                 state_id: state_id as u32,
                 got: e.len(),
@@ -308,6 +381,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
         let em = e[0];
         let op = e[1];
         let ps = e[2];
+        let sf = e[3];
         if !(0..=15).contains(&em) {
             return Err(BlockLightError::OutOfRange {
                 state_id: state_id as u32,
@@ -328,9 +402,16 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
                 value: ps,
             });
         }
+        if !(0..=1).contains(&sf) {
+            return Err(BlockLightError::InvalidSuffocating {
+                state_id: state_id as u32,
+                value: sf,
+            });
+        }
         emission.push(em as u8);
         opacity.push(op as u8);
         propagates_sky.push(ps == 1);
+        suffocating.push(sf == 1);
     }
 
     Ok(BlockLightTable {
@@ -338,6 +419,7 @@ pub fn load(path: impl AsRef<Path>) -> Result<BlockLightTable, BlockLightError> 
         emission,
         opacity,
         propagates_sky,
+        suffocating,
     })
 }
 
@@ -389,6 +471,7 @@ mod tests {
         assert_eq!(table.emission(0), Some(0));
         assert_eq!(table.opacity(2), Some(15));
         assert_eq!(table.propagates_sky(1), Some(true));
+        assert_eq!(table.suffocating(2), Some(true));
         assert_eq!(table.emission(99), None);
     }
 
@@ -403,10 +486,11 @@ mod tests {
             block(5, "minecraft:glowstone"),
             block(6, "minecraft:poppy"),
             block(7, "minecraft:sugar_cane"),
+            block(8, "minecraft:wheat"),
         ]);
 
         assert_eq!(table.version, "blocks-report-conservative");
-        assert_eq!(table.len(), 8);
+        assert_eq!(table.len(), 9);
         assert_eq!(table.opacity(0), Some(0));
         assert_eq!(table.propagates_sky(0), Some(true));
         assert_eq!(table.opacity(1), Some(15));
@@ -421,6 +505,73 @@ mod tests {
         assert_eq!(table.emission(5), Some(15));
         assert_eq!(table.opacity(6), Some(0));
         assert_eq!(table.opacity(7), Some(0));
+        assert_eq!(table.opacity(8), Some(0));
+        assert_eq!(table.propagates_sky(8), Some(true));
+    }
+
+    #[test]
+    fn conservative_table_matches_supported_crop_light_classes() {
+        let full_sky = [
+            "minecraft:wheat",
+            "minecraft:carrots",
+            "minecraft:potatoes",
+            "minecraft:beetroots",
+            "minecraft:torchflower_crop",
+            "minecraft:torchflower",
+            "minecraft:pitcher_crop",
+            "minecraft:pitcher_plant",
+            "minecraft:melon_stem",
+            "minecraft:attached_melon_stem",
+            "minecraft:pumpkin_stem",
+            "minecraft:attached_pumpkin_stem",
+            "minecraft:sweet_berry_bush",
+            "minecraft:nether_wart",
+            "minecraft:cocoa",
+            "minecraft:cactus",
+            "minecraft:sugar_cane",
+            "minecraft:bamboo",
+            "minecraft:bamboo_sapling",
+        ];
+        let soft_light = [
+            "minecraft:kelp",
+            "minecraft:kelp_plant",
+            "minecraft:chorus_flower",
+            "minecraft:chorus_plant",
+        ];
+        let reports = full_sky
+            .iter()
+            .chain(soft_light.iter())
+            .enumerate()
+            .map(|(id, name)| block(id as u32, name))
+            .collect::<Vec<_>>();
+        let table = BlockLightTable::conservative_from_blocks_report(&reports);
+
+        for (id, name) in full_sky.iter().enumerate() {
+            assert_eq!(table.emission(id as u32), Some(0), "{name}");
+            assert_eq!(table.opacity(id as u32), Some(0), "{name}");
+            assert_eq!(table.propagates_sky(id as u32), Some(true), "{name}");
+        }
+        for (offset, name) in soft_light.iter().enumerate() {
+            let id = (full_sky.len() + offset) as u32;
+            assert_eq!(table.emission(id), Some(0), "{name}");
+            assert_eq!(table.opacity(id), Some(1), "{name}");
+            assert_eq!(table.propagates_sky(id), Some(false), "{name}");
+        }
+    }
+
+    #[test]
+    fn conservative_table_matches_glow_berry_vine_emission() {
+        let mut berries = BTreeMap::new();
+        berries.insert("berries".to_string(), "true".to_string());
+        let mut empty = BTreeMap::new();
+        empty.insert("berries".to_string(), "false".to_string());
+
+        assert_eq!(conservative_emission("cave_vines", &berries), 14);
+        assert_eq!(conservative_emission("cave_vines", &empty), 0);
+        assert_eq!(conservative_emission("cave_vines_plant", &berries), 14);
+        assert_eq!(conservative_emission("cave_vines_plant", &empty), 0);
+        assert_eq!(conservative_opacity("cave_vines"), 0);
+        assert_eq!(conservative_opacity("cave_vines_plant"), 0);
     }
 
     #[test]
@@ -432,7 +583,7 @@ mod tests {
             r#"{
                 "version": "26.1.2-test",
                 "max_state_id": 2,
-                "entries": [[0,0,1],[14,0,1],[0,15,0]]
+                "entries": [[0,0,1,0],[14,0,1,0],[0,15,0,1]]
             }"#,
         );
         let t = load(&path).unwrap();
@@ -441,6 +592,48 @@ mod tests {
         assert_eq!(t.emission(1), Some(14));
         assert_eq!(t.opacity(2), Some(15));
         assert_eq!(t.propagates_sky(2), Some(false));
+    }
+
+    #[test]
+    fn loads_synthetic_table_with_suffocation_fact() {
+        let dir = TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            "block_light.json",
+            r#"{
+                "version": "26.1.2-test",
+                "max_state_id": 1,
+                "entries": [[0,0,1,0],[0,15,0,1]]
+            }"#,
+        );
+
+        let table = load(&path).expect("four-field block-state facts should load");
+        assert_eq!(table.len(), 2);
+        assert_eq!(table.suffocating(0), Some(false));
+        assert_eq!(table.suffocating(1), Some(true));
+    }
+
+    #[test]
+    fn three_field_table_requires_regeneration() {
+        let dir = TempDir::new().unwrap();
+        let path = write_json(
+            &dir,
+            "block_light.json",
+            r#"{
+                "version": "26.1.2-test",
+                "max_state_id": 0,
+                "entries": [[0,0,1]]
+            }"#,
+        );
+
+        let error = load(&path).expect_err("old table must not guess suffocation from opacity");
+        assert!(matches!(
+            error,
+            BlockLightError::EntryShape {
+                state_id: 0,
+                got: 3
+            }
+        ));
     }
 
     #[test]
@@ -467,7 +660,7 @@ mod tests {
         let path = write_json(
             &dir,
             "x.json",
-            r#"{"version":"v","max_state_id":0,"entries":[[16,0,1]]}"#,
+            r#"{"version":"v","max_state_id":0,"entries":[[16,0,1,0]]}"#,
         );
         let err = load(&path).unwrap_err();
         assert!(matches!(
@@ -486,7 +679,7 @@ mod tests {
         let path = write_json(
             &dir,
             "x.json",
-            r#"{"version":"v","max_state_id":0,"entries":[[0,0,2]]}"#,
+            r#"{"version":"v","max_state_id":0,"entries":[[0,0,2,0]]}"#,
         );
         let err = load(&path).unwrap_err();
         assert!(matches!(err, BlockLightError::InvalidBool { value: 2, .. }));
@@ -558,6 +751,17 @@ mod tests {
         assert_eq!(table.emission(stone), Some(0));
         assert_eq!(table.opacity(stone), Some(15));
         assert_eq!(table.propagates_sky(stone), Some(false));
+        assert_eq!(table.suffocating(stone), Some(true));
+
+        let slab = default_state("minecraft:oak_slab");
+        assert_eq!(table.suffocating(slab), Some(false));
+
+        let soul_sand = default_state("minecraft:soul_sand");
+        assert_eq!(table.suffocating(soul_sand), Some(true));
+
+        let barrier = default_state("minecraft:barrier");
+        assert_eq!(table.opacity(barrier), Some(0));
+        assert_eq!(table.suffocating(barrier), Some(true));
 
         // glowstone: full luminance (15).
         let glowstone = default_state("minecraft:glowstone");

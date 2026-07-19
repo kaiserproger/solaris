@@ -1,60 +1,155 @@
-# Agent guide — Solaris
+# Agent Guide - Solaris
 
-Custom Minecraft Java Edition 26.1-compatible server, written in
-Rust. This file is read by AI coding agents (Claude Code,
-opencode, etc.) at session start. `CLAUDE.md` is a symlink to
-this file.
+Solaris is a custom Minecraft Java Edition 26.1-compatible server,
+written in Rust. `CLAUDE.md` is a symlink to this file.
 
-The owner is `kaiserproger <kaisergrobe@gmail.com>` — that is the
-local git identity, do not change it.
+Owner/local git identity: `kaiserproger <kaisergrobe@gmail.com>`.
+Do not change git config.
 
-## Read these first
+## Operating Mode
 
-1. `docs/PROJECT_SPEC.md` (especially §9 "Milestone roadmap") —
-   the target shape. Note: delivery has drifted from spec
-   starting at M4 (lighting in place of "Block physics +
-   fluids"); the milestone docs are authoritative for what
-   actually shipped.
-2. `docs/milestones/MX.md` for the most recent milestone(s) and
-   the one currently on the active `dev/` branch — every doc
-   has a "What landed where" table at the bottom.
-3. `docs/decisions/` — ADRs in force:
-   - **ADR 0001** — vanilla data sidecar (Mojang bytes never
-     enter the repo; live in `.analysis/` and `data/vanilla/`
-     and are gitignored).
-   - **ADR 0002** — protocol metadata comes from `wire-probe`
-     + `javap` against the bundled Mojang server, never from
-     guessing or memory.
-4. `README.md` for the build + run summary (mirrors what's in
-   `example.toml`).
-5. `docs/DEFINITION_OF_DONE.md` — the hard DoD, autonomous
-   preflight, validation labels, and stabilization rules. Read this
-   before claiming readiness or closing a milestone.
-6. `docs/NEXT_SESSION.md` when starting a fresh session without a
-   more specific milestone prompt.
-7. `docs/CORE_M77_M100_ROADMAP.md` for core-MVP stabilization work
-   through the M100 validation milestone.
+Default to autonomous, terse, evidence-first engineering.
 
-## Repo layout
+Do not blanket-read the whole docs stack at startup. Start from the user
+prompt, branch/status, and the smallest local context that can answer the
+task. Read broader docs only when the task route below calls for them.
 
-- `crates/` — workspace members. Cross-references in commit
-  bodies use the crate name (`mc-net`, `mc-world`, …).
-- `crates/mc-test-harness/tests/` — wire-level integration
-  tests; the canonical CI gate for each milestone.
-- `docs/` — design + per-milestone plans/closeouts +
-  PROJECT_SPEC + ADRs.
-- `tools/` — vanilla-data extraction + protocol-dump scripts.
-- `.analysis/` — local-only: bundled Mojang `server.jar`,
-  extracted test-world, protocol-dump.txt. Gitignored.
-- `data/vanilla/` — extracted vanilla data sidecar (reports +
-  registries). Gitignored.
-- `x-ui-pro/` — ignored accidental nested checkout; not part of Solaris.
-- `example.toml` — the dev config; points at
-  `.analysis/test-world` and the vanilla data dir.
+For long `/goal` work, keep moving across checkpoints instead of stopping
+on every uncertainty. Make a reasonable local decision, record the
+assumption in the next update or milestone note, run validation at slice
+boundaries, and continue on independent work when one gate is degraded.
+Mark a task blocked only after repeated concrete attempts cannot make
+meaningful progress without owner input or an external state change.
 
-## Build / test / lint baseline
+Keep the quality bar high without turning it into ceremony: no protocol
+guesses, no fake validation, no hidden parity claims, no unrelated
+rewrites, no untracked local artifacts in commits, and no invented
+abstractions that tests do not need.
 
-Every commit must keep the following green:
+Optimization hacks and deliberately narrow fast paths are allowed when they
+move a measured bottleneck. Document the reason, applicability boundary,
+correctness fence, measured effect, and removal or fallback path in the same
+slice. Prefer a reversible local hack over a broad speculative abstraction.
+This permission does not override the non-negotiables below.
+
+Apply the Pareto rule to delivery. Prioritize the small set of changes that
+unlocks most real gameplay, multiplayer correctness, and scaling value.
+Cover common and costly edge cases, but do not spend extended time polishing
+rare cases while the next critical gameplay or core-architecture path is still
+missing. Stop a hardening pass once its dominant risks are proved and move the
+main objective forward.
+
+The `superpowers` Codex plugin is intentionally left alone. Do not add
+project instructions that require extra local plugin layers unless the
+owner explicitly asks.
+
+## Context Routing
+
+- Long-goal continuation or recovery after compaction: read `docs/MEMORY.md`,
+  then follow only the route for the active task.
+- Fresh session with no specific prompt: read `docs/NEXT_SESSION.md`.
+- Milestone plan, closeout, or readiness claim: read
+  `docs/DEFINITION_OF_DONE.md` and the relevant `docs/milestones/MX.md`.
+- Roadmap or target-shape questions: read `docs/PROJECT_SPEC.md` and, for
+  M77-M100 work, `docs/CORE_M77_M100_ROADMAP.md`.
+- Core performance, regional ownership, ECS, or autoscale work outside
+  Playable Spike Mode: read the matching route in `docs/MEMORY.md`, the
+  relevant M90-M93 milestone, and ADR 0004/0005. Use
+  `docs/M52_OPERATOR_PERFORMANCE_NOTES.md` only for metric definitions.
+- Minecraft client MCP or agent-tool wiring: read `docs/AGENT_TOOLING.md` and
+  `client-mod/solaris-client-agent/README.md`.
+- Server Lua plugin/API work: read `docs/PLUGINS.md` and the ownership ADR
+  linked from `docs/MEMORY.md`.
+- Architecture, ownership, threading, or policy changes: read the relevant
+  ADR and affected `docs/PROJECT_SPEC.md` section. Update the ADR in the same
+  slice; record staged scope or supersession explicitly instead of silently
+  drifting from the documented decision.
+- Protocol or packet work: read ADR 0002, use
+  `.analysis/protocol-dump.txt`, `tools/dump-vanilla-protocol.sh`, and
+  `crates/mc-test-harness/src/bin/wire_probe.rs` as needed.
+- Build/run questions: read `README.md` and `example.toml`.
+- Tooling questions: read `docs/AGENT_TOOLING.md` only when the local tool
+  itself is relevant.
+
+Prefer `rg`/`rg --files` for discovery. Use Serena or other symbol tools
+when they are already useful, not as mandatory startup work.
+
+## Playable Spike Mode
+
+When the owner says "playable", "20-minute loop", "играбельно", or
+"start over", route to `docs/playable/README.md` and
+`docs/playable/ACTIVE.md`.
+
+In this mode:
+
+- Optimize for a real-client 20-minute playable loop, not M100 replacement
+  readiness.
+- Do not read `docs/NEXT_SESSION.md`, `docs/VALIDATION_LEDGER.md`,
+  `docs/VALIDATION_COVERAGE_AUDIT.md`, or
+  `docs/REPLACEMENT_READINESS.md` unless the task explicitly asks for
+  readiness/ledger work.
+- Do not edit readiness/ledger docs unless the owner asks.
+- Use focused runtime tests and real-client/manual checks as feedback, but
+  do not try to promote rows to `ready`.
+- Prefer deleting/de-scoping broken breadth over adding new subsystems.
+- Manual/client checks in this mode use
+  `cargo run --bin mc-server -- --config playable.toml` unless the owner
+  asks for another config.
+- Navigation starts with `rg`. CodeGraph MCP is configured for Codex and may
+  be used for targeted callers/callees, mutation paths, and blast-radius
+  checks; do not use it as mandatory startup context.
+
+## Non-Negotiables
+
+- Agents never `git push`, merge into `main`, or create tags unless the
+  owner explicitly instructs it.
+- Never use wall-clock sleeps (`std::thread::sleep`, `tokio::time::sleep`,
+  Python `time.sleep`, shell `sleep`, or equivalents) in production code,
+  tests, harnesses, or tools. Synchronize through channels, notifications,
+  process readiness, observed protocol/world state, or simulation events.
+- All waiting must be push-driven: await the exact channel message,
+  notification, socket packet, process-state change, or simulation event that
+  proves readiness. Never treat guessed elapsed time, a quiet period, polling,
+  or an arbitrary tick count as success. A timeout may only fail a stuck
+  operation; it must never be the success condition. Waiting for simulation
+  ticks is allowed only when tick progression itself is the behavior being
+  tested or a protocol rule, not as a proxy for some other event.
+- Use push, not pull: the producer that changes state must notify its consumers.
+  Waiting code must block on that notification instead of periodically reading
+  state to discover that something may have happened.
+- Do not reintroduce operator-configured worker-thread percentages. Derive the
+  process capacity once, then let runtime measurements and the autoscaler shift
+  bounded work budgets and admissions between subsystems.
+- Prefer the simplest direct implementation that is easy to read and prove,
+  even when it takes more lines. Do not introduce indirection, generic helpers,
+  or compact abstractions merely to make the diff shorter.
+- Mojang bytes never enter the repo. Keep `.analysis/*` and
+  `data/vanilla/*` gitignored.
+- Packet IDs and field layouts come from `wire-probe`/`javap` against the
+  bundled Mojang server, never memory or guesses.
+- Gameplay parity claims need an oracle: vanilla capture, decompiled
+  source inspection, or side-by-side harness evidence.
+- Do not use `--release` for the dev loop; debug builds are the default.
+- Do not skip hooks/signing flags unless the owner asks.
+- Do not commit `Cargo.lock` changes without a concrete dependency reason.
+
+Local-only paths that must not be staged unless the owner explicitly asks:
+`.analysis/`, `data/vanilla/`, `.serena/`, `.opencode/`, `x-ui-pro/`,
+`YOLO_MODE.md`, `log.log`, and local `opencode.json` overlays.
+
+## Repo Map
+
+- `crates/` - workspace members.
+- `crates/mc-test-harness/tests/` - wire-level integration tests and the
+  canonical harness gate.
+- `docs/` - design notes, milestone plans/closeouts, ADRs, and DoD.
+- `tools/` - vanilla extraction and protocol dump scripts.
+- `example.toml` - development config, pointing at local vanilla sidecars.
+
+## Validation
+
+Full baseline before commits, release-ready language, and final milestone
+closeout:
 
 ```sh
 cargo run -p xtask -- code-health
@@ -63,228 +158,104 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
-If a commit breaks the baseline, fix it in the same commit or
-the next `fix:` — don't leave the tree broken between commits.
+For inner-loop work, run the focused real-path tests first, plus
+`cargo fmt --all -- --check` and `cargo run -p xtask -- code-health`
+when practical. Run workspace `test`/`clippy` after the final slice or
+before a checkpoint commit.
 
-Baseline green is necessary, not sufficient. A milestone closeout must
-also say which higher-level gates were run: vanilla oracle, harness,
-manual/client, performance, and concurrency. Use the labels in
-`docs/DEFINITION_OF_DONE.md`; never collapse skipped/manual-pending
-coverage into "green".
+If a higher-level gate was not run, say exactly that. Use the DoD labels
+for vanilla oracle, harness, manual/client, performance, and concurrency;
+never compress skipped or manual-pending coverage into "green". When a
+state is degraded only because a gate was skipped or stale, proactively
+restore normal by rerunning or replacing that gate before making readiness
+claims.
 
-`xtask code-health` is a fail-only architecture tripwire. It is part of
-the normal post-change gate, but it is not gameplay, oracle, client,
-performance, or soak evidence by itself.
+`xtask code-health` is a fail-only architecture tripwire. It is useful,
+but it is not gameplay, oracle, client, performance, or soak evidence.
 
-**Always use debug builds for dev.** Release has hung at the
-`mc-server` binary linking step in past sessions; debug is
-plenty fast for the manual gate. CI flips to release only when
-the owner asks.
+## Development Workflow
 
-## Rust toolchain
+For non-trivial code changes:
 
-Pinned to `1.94` in `rust-toolchain.toml`. Known trap: if cargo
-errors with `could not compile sharded-slab` or
-`cannot find module u32x4x2_avx2`, the toolchain is half-removed.
-Reinstall:
-
-```sh
-rustup toolchain uninstall 1.94 && \
-  rustup toolchain install 1.94 --profile minimal -c rustfmt -c clippy
-```
-
-## Milestone workflow
-
-Each milestone X gets its own branch and a tag on `main`:
-
-1. Branch: `dev/MX-<short-name>` cut from `main` at the
-   previous milestone's tag.
-2. **First commit is the plan**: `docs/milestones/MX.md` —
-   goal, strategy, sub-milestones, acceptance, pitfalls, open
-   questions. `docs: MX plan — <title>`. Wait for owner review
-   before any code.
-3. Sub-milestones land one commit at a time
-   (`feat: MX.a …`, `feat: MX.b …`, `docs: MX.f closeout …`).
-   Conventional Commits; each commit's body explains "why" in
-   1–3 short paragraphs.
-4. **Owner merges + tags.** Agents never run `git push`, never
-   `git merge` into `main`, never `git tag`. The owner does
-   these explicitly.
-
-Fast implementation passes are allowed when the owner asks for them,
-but they are draft work unless the hard DoD says otherwise. Label the
-state as `draft`, `stabilization`, or `release-ready` in the milestone
-doc and final response. Do not let a draft closeout sound like vanilla
-parity or production readiness.
-
-## Development workflow
-
-Default development mode during core readiness work is negative-code
-stabilization: reduce duplication, lock scope, fake abstraction, noisy
-tests, and unsupported claims before adding gameplay breadth.
-
-Use a bounded pipeline for non-trivial code work:
-
-1. Scout the candidate and name the exact files/symbols.
-2. Plan one independently revertible slice.
+1. Scout the exact files/symbols.
+2. Choose one independently revertible slice.
 3. Identify focused real-path tests before editing.
-4. Implement the smallest behavior-preserving diff.
-5. Run focused tests plus `cargo fmt --all -- --check` and
-   `cargo run -p xtask -- code-health`.
-6. Run a negative-code review.
-7. Run workspace `test`/`clippy` after the final slice.
+4. Implement the smallest defensible diff.
+5. Enumerate and test every reachable failure branch changed by the slice, not
+   only the happy path: stale preconditions, owner rejection, partial/failed
+   mutation, empty/no-op input, mode-specific behavior, and cleanup/publication
+   failure where applicable.
+6. Review the diff for negative-code issues: duplication, fake
+   abstractions, broad config, unrelated churn, and unsupported claims.
+7. Run focused validation, then broader gates at the checkpoint.
 
-Do not chase an arbitrary chunk count. If the remaining candidates are
-only churn or behavior-risky without strong tests, stop and report that
-frontier. A smaller kept diff is better than sixteen forced rewrites.
+Subagents are useful for scouting, implementation, and review when file
+ownership is separable. The main agent remains responsible for inspecting
+their diff and reporting exact validation evidence.
 
-For risky cleanup, use one slice at a time. Keep packet-specific guards,
-protocol labels, ordering, lock boundaries, and accounting local unless
-the tests prove the extraction preserves them. If review says `REWORK`,
-fix the small issue or revert your own slice; do not stack more changes
-on top of a questionable risky diff.
+Timebox each concrete independently revertible task to 90-120 minutes. If the
+scope will not fit, split it early into disjoint write sets and delegate those
+slices to subagents instead of stretching one task indefinitely. The timebox
+limits scope; it never permits skipped correctness fences or fake validation.
 
-Subagents are useful for scouting, planning, implementation, and review,
-but the main agent remains responsible for checking their diff, rerunning
-the required gates, and reporting exact evidence. Empty subagent output is
-not a verdict.
+Clean up old worktrees after their task ends. Remove clean worktrees immediately;
+for dirty worktrees, first verify or archive any unique source changes, then remove
+the worktree. Do not leave reproducible `target`, Gradle, build, or client run
+artifacts consuming disk in inactive worktrees.
 
-## Fast pipeline mode
+Fast pipeline mode: if the prompt contains the exact token
+`quaka-whaka-zaka-du`, split independent domains across parallel agents.
+This increases throughput only; it does not relax the non-negotiables or
+final validation.
 
-If a user prompt contains the exact token `quaka-whaka-zaka-du`, switch
-to the fast parallel pipeline mode used in the June 2026 stabilization
-session: split independent domains across multiple `task()` agents. This
-means launching independent agents in parallel; each agent must run its
-own complete scout -> plan -> test -> review -> implement -> review ->
-verify loop inside that agent session. Do not replace this with one
-main-thread plan plus helper searches. Fast-pipeline agents must run on
-`gpt-5.5` with high reasoning. Parallelize implementation, validation,
-and review where file ownership can be kept separate.
+## Milestones
 
-This mode increases throughput only; it does not relax repository rules.
-Still avoid protocol guesses, fake validation, hidden parity claims,
-unreviewed slop, untracked local artifacts, and unrelated rewrites. The
-main agent remains responsible for merging the pipelines, resolving
-conflicts, running final workspace validation, and reporting exact
-evidence.
+Milestone branches are `dev/MX-<short-name>` from `main` at the previous
+milestone tag. The owner merges and tags.
 
-Before any milestone code, run the autonomous preflight from
-`docs/DEFINITION_OF_DONE.md` and paste a terse result into the plan or
-session update. If a preflight item is missing, either fix it, mark the
-validation coverage as degraded, or stop when it invalidates the task.
+For a new milestone, the first commit is normally
+`docs/milestones/MX.md` with goal, strategy, sub-milestones, acceptance,
+pitfalls, and open questions. If the owner has already authorized a fast
+implementation pass, agents may commit logical draft checkpoints, but the
+milestone doc and final response must label the state as `draft`,
+`stabilization`, or `release-ready` according to actual evidence.
 
-## Style
+Use Conventional Commits. Commit bodies should explain "why" in a few
+sentences, not repeat the diff.
 
-- **Terse.** Updates to the owner in 1–3 sentences, not
-  paragraphs. No "let me now…" / "I'll analyse…" — do the work
-  and report the result.
-- **No silent stalls.** If a command takes >5 minutes
-  (compiles, big test runs, long searches), say so and proceed
-  instead of blocking.
-- **No fake validation.** Tests must exercise real code paths;
-  manufactured data that passes by construction is worse than
-  no test.
-- **Hard DoD wording.** Say exactly what was proved and what was not.
-  Phrases like "ready", "parity", "replacement-ready", and "done"
-  require the evidence matrix from `docs/DEFINITION_OF_DONE.md`.
-- **Comments only when "why" is non-obvious.** Identifiers
-  carry the "what." Don't write "added for MX" / "used by Y"
-  comments — those rot. PR/commit bodies are where this
-  context lives.
-- **No emojis** in code, docs, or commit messages unless the
-  owner asks. Same for CLI output.
+## Manual Gates
 
-## Things to never do
+Manual/client gate: PrismLauncher 26.1.2 against
+`cargo run --bin mc-server -- --config example.toml` in debug mode.
+The owner normally runs the real client; agents prepare the server and
+say "ready, connect."
 
-- Push to remote, merge to `main`, or create tags without
-  explicit owner instruction.
-- Modify `git config` (local user is set deliberately —
-  see [[feedback-git-author]]).
-- Loosen `.gitignore` entries for `.analysis/*` or
-  `data/vanilla/*` — Mojang bytes stay local.
-- Commit `Cargo.lock` changes without a reason (gratuitous
-  bumps clutter the diff).
-- Use `--release` for the dev loop.
-- Skip pre-commit hooks (`--no-verify`) or signing
-  (`--no-gpg-sign`) unless the owner asks.
-- Ask clarifying questions every 5 minutes. If stuck, try
-  something reasonable, document the choice in the next
-  message, and move on.
+For client-visible or gameplay mechanics, plan the manual/client check
+and record whether it was owner-run, agent-run through approved client
+automation, or not run.
 
-## Manual gates
+## Memory And Tooling
 
-PrismLauncher 26.1.2 client against a debug-build
-`cargo run --bin mc-server -- --config example.toml`. The
-owner runs these; agents prepare the server and say "ready,
-connect."
+Do not treat Codex, Serena, opencode session logs, or generated memories
+as mandatory startup context. Load memory only for a concrete need:
+recovering prior project state, validating an owner preference, finding
+local oracle/tool paths, or continuing a long goal after compaction.
 
-Manual gates are no longer an afterthought. For client-visible or
-gameplay mechanics, plan the manual/client check before implementation
-and record whether it was run by the owner, run by an agent through an
-approved client automation path, or not run. A future Minecraft-client
-MCP server is an approved direction for making this autonomous, but it
-must exercise a real vanilla client and report reproducible evidence.
+Update memory only for durable future value: milestone state, oracle
+paths, validation workflow, owner preferences, or stable tooling setup.
+Do not store transient command output, guessed parity, secrets, or
+Mojang/vendor artifacts.
 
-## Protocol & data oracles
+Keep local plugin/tooling surface lean. Project-specific `.opencode`
+plugins, MCP overlays, and large node_modules trees should stay disabled
+unless the owner asks for that exact workflow. Prefer repo-native
+commands and focused searches over extra always-on guardrails.
 
-- `.analysis/server.jar` — bundled Mojang server (any 26.1.x).
-- `tools/dump-vanilla-protocol.sh` → `.analysis/protocol-dump.txt`
-  (javap dump of clientbound + serverbound IDs and shapes).
-- `crates/mc-test-harness/src/bin/wire_probe.rs` — typed
-  async driver that connects to a real vanilla server and
-  dumps frames. Use this before adding any new packet.
-- `mc_test_harness::client::Client` — same driver, used in
-  integration tests (see `chunk_stream.rs`,
-  `block_edit.rs`, etc.).
+## Communication
 
-Packet IDs and field layouts are **cited from the javap dump
-or a wire-probe capture, never guessed**. See ADR 0002.
+Be terse. Updates to the owner are 1-3 sentences. If a command runs for
+more than about 5 minutes, report the wait and keep useful work moving.
 
-Gameplay parity claims also need an oracle. Prefer vanilla captures,
-decompiled source inspection, or side-by-side harness scenarios before
-Solaris fixes. Solaris-only tests are useful scaffolding, not vanilla
-parity evidence.
-
-## Agent memory
-
-Use Serena memories on demand, not as a blanket startup read. First call
-Serena's onboarding check, then load only the memories needed for the
-active domain.
-
-| Domain | Load these memories |
-|---|---|
-| Any code change | `project/status`, `project/structure`, `style-and-conventions`, `feedback/terse-no-stalls`, `feedback/use-subagents-and-verify` |
-| Protocol or packets | `project/adrs`, `project/26-1-2-is-real`, `reference/validation-workflow`, `feedback/verify-claims`, `feedback/protocol-oracles-prefer-decompiled` |
-| Vanilla data, assets, or local artifacts | `project/adrs`, `reference/local-paths`, `feedback/no-external-artifacts` |
-| Milestone plan or closeout | `project/status`, `task-completion`, `reference/validation-workflow`, `feedback/verify-claims` |
-| Validation, CI, or gates | `suggested_commands`, `task-completion`, `reference/validation-workflow`, `feedback/verify-claims` |
-| Agent/tooling setup | `reference/agent-tooling`, `feedback/terse-no-stalls`, `feedback/use-subagents-and-verify` |
-| User communication only | `user-profile`, `feedback/terse-no-stalls` |
-
-Update memory only when the new fact is likely to help future sessions:
-milestone state, oracle paths, validation workflow, owner preference, or
-tooling setup. Do not store transient command output or guessed parity.
-
-## Agent tooling
-
-- `docs/AGENT_TOOLING.md` is the detailed local setup reference for
-  opencode commands, harnesses, RTK, Headroom, Context7, and session logs.
-- Serena is available through opencode MCP and should be preferred for
-  Rust symbol navigation/edits before full-file reads.
-- Context7 is available and was verified on 2026-06-11. Use it for
-  external library/framework docs; call library resolution before docs
-  queries. If Context7 is down, fall back to local docs or direct web
-  sources and state that fallback.
-- RTK is installed at `/home/kaiserroman/.cargo/bin/rtk`; the global
-  opencode RTK plugin rewrites Bash commands after opencode restart.
-- Headroom is installed at `/home/kaiserroman/.local/bin/headroom` via
-  `uv tool install "headroom-ai[all]"`. Do not route opencode provider
-  traffic through `headroom proxy` unless the owner explicitly asks.
-- Prior opencode sessions are part of project evidence when prior-session
-  context matters. Start with `opencode session list`; for details query
-  `~/.local/share/opencode/opencode.db`, especially `session`, `message`,
-  and `part` tables. Useful text usually lives in `part.data` with JSON
-  `type == "text"`.
-- For non-trivial diffs, run a negative-code review before finalizing.
-  Prefer the `harness-slop-reviewer` subagent or `/negative-code-review`;
-  for small diffs, a direct self-review of `git diff` is acceptable.
+Before saying work is ready/done/parity/replacement-ready, state what was
+actually proved and what was not. Hard readiness language requires the
+DoD evidence matrix.

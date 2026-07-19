@@ -11,7 +11,7 @@
 //     "version": "<vanilla version id, e.g. 26.1.2>",
 //     "max_state_id": <largest BlockState id seen>,
 //     "entries": [
-//        [emission, dampening, propagates_sky_0_or_1],
+//        [emission, dampening, propagates_sky_0_or_1, suffocating_0_or_1],
 //        ...    // index = global state-id; states with no Block
 //        ...    // entry in the registry get [0, 0, 1] (sentinel).
 //     ]
@@ -24,8 +24,10 @@ import java.io.IOException;
 import java.util.Arrays;
 
 import net.minecraft.SharedConstants;
+import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.server.Bootstrap;
+import net.minecraft.world.level.EmptyBlockGetter;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.state.BlockState;
 
@@ -60,7 +62,13 @@ public final class LightExtractor {
                 int emission = state.getLightEmission();
                 int dampening = state.getLightDampening();
                 boolean propagates = state.propagatesSkylightDown();
-                entries[id] = new int[] { emission, dampening, propagates ? 1 : 0 };
+                boolean suffocating = state.isSuffocating(EmptyBlockGetter.INSTANCE, BlockPos.ZERO);
+                entries[id] = new int[] {
+                    emission,
+                    dampening,
+                    propagates ? 1 : 0,
+                    suffocating ? 1 : 0
+                };
             }
         }
 
@@ -68,7 +76,7 @@ public final class LightExtractor {
         for (int i = 0; i <= maxId; i++) {
             if (entries[i] == null) {
                 gaps++;
-                entries[i] = new int[] { 0, 0, 1 };
+                entries[i] = new int[] { 0, 0, 1, 0 };
             }
         }
 
@@ -83,6 +91,7 @@ public final class LightExtractor {
                 w.value(e[0]);
                 w.value(e[1]);
                 w.value(e[2]);
+                w.value(e[3]);
                 w.endArray();
             }
             w.endArray();

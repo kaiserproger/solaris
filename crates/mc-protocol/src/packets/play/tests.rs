@@ -1,4 +1,5 @@
 use super::*;
+use crate::packets::login::GameProfileProperty;
 use crate::packets::{ChatVisibility, MainHand, ParticleStatus, ResourcePackAction};
 
 fn round_trip<P: Packet + PartialEq + std::fmt::Debug>(p: P) {
@@ -387,6 +388,7 @@ fn player_info_update_minimal_add_player_wire_layout() {
         entries: vec![PlayerInfoEntry {
             profile_id: uuid,
             name: "Steve".to_string(),
+            properties: Vec::new(),
             listed: true,
             latency: 0,
             game_mode: 0,
@@ -406,6 +408,97 @@ fn player_info_update_minimal_add_player_wire_layout() {
     let decoded = PlayerInfoUpdate::decode(&mut cursor).unwrap();
     assert_eq!(decoded, packet);
     assert!(cursor.is_empty());
+}
+
+#[test]
+fn player_info_add_player_properties_match_vanilla_wire_layout() {
+    let uuid = Uuid::from_u128(0x00112233445566778899aabbccddeeff);
+    let packet = PlayerInfoUpdate {
+        actions: PlayerInfoActions::ADD_PLAYER,
+        entries: vec![PlayerInfoEntry {
+            profile_id: uuid,
+            name: "Alex".to_string(),
+            properties: vec![
+                GameProfileProperty {
+                    name: "textures".to_string(),
+                    value: "signed-value".to_string(),
+                    signature: Some("sig".to_string()),
+                },
+                GameProfileProperty {
+                    name: "rank".to_string(),
+                    value: "builder".to_string(),
+                    signature: None,
+                },
+            ],
+            listed: false,
+            latency: 0,
+            game_mode: 0,
+            list_order: 0,
+            show_hat: false,
+        }],
+    };
+
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+
+    let mut expected = vec![PlayerInfoActions::ADD_PLAYER.0, 1];
+    expected.extend_from_slice(uuid.as_bytes());
+    expected.extend_from_slice(&[4, b'A', b'l', b'e', b'x', 2]);
+    expected.extend_from_slice(b"\x08textures\x0csigned-value\x01\x03sig");
+    expected.extend_from_slice(b"\x04rank\x07builder\x00");
+    assert_eq!(buf, expected);
+
+    let mut cursor = buf.as_slice();
+    assert_eq!(PlayerInfoUpdate::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+fn player_info_add_player_prefix(property_count: i32) -> Vec<u8> {
+    let mut buf = vec![PlayerInfoActions::ADD_PLAYER.0, 1];
+    buf.extend_from_slice(Uuid::nil().as_bytes());
+    buf.write_string("Alex", 16).unwrap();
+    buf.write_varint(property_count);
+    buf
+}
+
+#[test]
+fn player_info_add_player_rejects_negative_property_count() {
+    let buf = player_info_add_player_prefix(-1);
+    assert_eq!(
+        PlayerInfoUpdate::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::NegativeLength(-1)
+    );
+}
+
+#[test]
+fn player_info_add_player_rejects_more_than_sixteen_properties() {
+    let buf = player_info_add_player_prefix(17);
+    assert_eq!(
+        PlayerInfoUpdate::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::StringTooLong { len: 17, max: 16 }
+    );
+}
+
+#[test]
+fn player_info_add_player_enforces_property_string_limits() {
+    let mut long_name = player_info_add_player_prefix(1);
+    long_name.write_string(&"n".repeat(65), 65).unwrap();
+    assert!(matches!(
+        PlayerInfoUpdate::decode(&mut long_name.as_slice()),
+        Err(CodecError::StringTooLong { max: 64, .. })
+    ));
+
+    let mut long_signature = player_info_add_player_prefix(1);
+    long_signature.write_string("textures", 64).unwrap();
+    long_signature.write_string("value", 32_767).unwrap();
+    long_signature.write_bool(true);
+    long_signature
+        .write_string(&"s".repeat(1025), 1025)
+        .unwrap();
+    assert!(matches!(
+        PlayerInfoUpdate::decode(&mut long_signature.as_slice()),
+        Err(CodecError::StringTooLong { max: 1024, .. })
+    ));
 }
 
 #[test]
@@ -468,6 +561,50 @@ fn set_entity_data_item_stack_layout_matches_javap() {
             0xFF,
         ]
     );
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundSetEntityData::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn set_entity_data_baby_boolean_layout_matches_vanilla_26_1_2() {
+    assert_eq!(ENTITY_DATA_BOOLEAN_SERIALIZER_ID, 8);
+    let packet = ClientboundSetEntityData {
+        entity_id: 301,
+        values: vec![EntityDataValue::Boolean {
+            index: 16,
+            value: true,
+        }],
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0xAD, 0x02, 16, 8, 1, 0xFF]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundSetEntityData::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn set_entity_data_sheep_wool_layout_matches_vanilla_26_1_2() {
+    assert_eq!(ENTITY_DATA_BYTE_SERIALIZER_ID, 0);
+    let packet = ClientboundSetEntityData {
+        entity_id: 301,
+        values: vec![EntityDataValue::Byte {
+            index: SHEEP_ENTITY_DATA_WOOL_INDEX,
+            value: 0x10,
+        }],
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0xAD, 0x02, 18, 0, 0x10, 0xFF]);
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(
@@ -705,6 +842,34 @@ fn serverbound_chat_command_id_and_layout_match_javap() {
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(ServerboundChatCommand::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn serverbound_chat_id_and_layout_match_local_decompiled_sources() {
+    assert_eq!(ServerboundChat::ID, 0x09);
+    let packet = ServerboundChat {
+        message: "p34 hello".to_string(),
+        timestamp_millis: 1234,
+        salt: 55,
+        signature: None,
+        last_seen_offset: 2,
+        last_seen_acknowledged: [0b0000_0011, 0, 0],
+        last_seen_checksum: 0,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf[0], 9);
+    assert_eq!(&buf[1..10], b"p34 hello");
+    assert_eq!(&buf[10..18], &1234_i64.to_be_bytes());
+    assert_eq!(&buf[18..26], &55_i64.to_be_bytes());
+    assert_eq!(buf[26], 0);
+    assert_eq!(buf[27], 2);
+    assert_eq!(&buf[28..31], &[0b0000_0011, 0, 0]);
+    assert_eq!(buf[31], 0);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(ServerboundChat::decode(&mut cursor).unwrap(), packet);
     assert!(cursor.is_empty());
 }
 
@@ -965,6 +1130,45 @@ fn change_difficulty_id_and_wire_layout_match_javap() {
 }
 
 #[test]
+fn update_recipes_stonecutter_id_and_layout_match_local_vanilla_sources() {
+    assert_eq!(ClientboundUpdateRecipes::ID, 0x85);
+    let packet = ClientboundUpdateRecipes {
+        item_sets: vec![RecipePropertySet {
+            key: Identifier::parse("x:y").unwrap(),
+            item_ids: vec![12, 13],
+        }],
+        stonecutter_recipes: vec![StonecutterRecipeEntry {
+            input: RecipeBookIngredient::Items(vec![14, 15]),
+            result: RecipeBookSlotDisplay::ItemStack {
+                item_id: 16,
+                count: 2,
+            },
+        }],
+    };
+
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(
+        buf,
+        vec![
+            1, // one RecipePropertySet map entry
+            3, b'x', b':', b'y', // resource key identifier
+            2, 12, 13, // RecipePropertySet's ordinary item list
+            1,  // one stonecutter recipe
+            3, 14, 15, // direct Ingredient holder set: size + 1, item ids
+            5, 16, 2, 0, 0, // item-stack SlotDisplay with empty component patch
+        ]
+    );
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ClientboundUpdateRecipes::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn set_health_id_and_wire_layout_match_javap() {
     assert_eq!(ClientboundSetHealth::ID, 0x68);
     let packet = ClientboundSetHealth {
@@ -994,8 +1198,8 @@ fn set_experience_id_and_wire_layout_match_javap() {
     let mut buf = Vec::new();
     packet.encode(&mut buf).unwrap();
     assert_eq!(&buf[0..4], &0.5_f32.to_be_bytes());
-    assert_eq!(buf[4], 9);
-    assert_eq!(buf[5], 1);
+    assert_eq!(buf[4], 1);
+    assert_eq!(buf[5], 9);
 
     let mut cursor: &[u8] = &buf;
     assert_eq!(
@@ -1170,3 +1374,4 @@ fn level_chunk_with_light_rejects_oversized_chunk_data_on_decode() {
 // ---- M5.a: serverbound interaction packets ----
 
 include!("tests/serverbound_and_slots.rs");
+include!("tests/set_passengers.rs");

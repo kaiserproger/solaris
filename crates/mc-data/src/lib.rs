@@ -23,18 +23,23 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use thiserror::Error;
 use tracing::{debug, trace};
 
 const REQUIRED_REGISTRY_INDEX: &str = include_str!("../data/required_registry_index.json");
+static REQUIRED_REGISTRY_ENTRIES: OnceLock<BTreeMap<String, Vec<Identifier>>> = OnceLock::new();
 
 pub mod armor;
 pub mod biomes;
 pub mod block_entity_types;
+pub mod block_explosion;
 pub mod block_facts;
 pub mod block_light;
+pub mod block_mining;
 pub mod blocks;
+pub mod collision_shapes;
 pub mod damage_types;
 pub mod entity_types;
 pub mod food;
@@ -91,6 +96,22 @@ pub const KNOWN_REGISTRIES: &[(&str, &str)] = &[
     ("zombie_nautilus_variant", "zombie_nautilus_variant"),
 ];
 
+/// Exact Network-NBT payloads captured from vanilla after declining its known pack.
+pub const NETWORK_REGISTRY_PAYLOAD_DIR: &str = "reports/registry_network_nbt";
+
+#[must_use]
+pub fn network_registry_payload_path(
+    root: &Path,
+    registry: &Identifier,
+    entry: &Identifier,
+) -> PathBuf {
+    root.join(NETWORK_REGISTRY_PAYLOAD_DIR)
+        .join(registry.namespace())
+        .join(registry.path())
+        .join(entry.namespace())
+        .join(format!("{}.nbt", entry.path()))
+}
+
 #[derive(Debug, Error)]
 pub enum DataError {
     #[error(
@@ -111,6 +132,16 @@ pub enum DataError {
         #[source]
         source: std::io::Error,
     },
+
+    #[error("captured registry Network-NBT is invalid at {path}: {source}")]
+    RegistryPayloadNbt {
+        path: PathBuf,
+        #[source]
+        source: mc_nbt::NbtError,
+    },
+
+    #[error("captured registry Network-NBT has trailing bytes at {path}")]
+    RegistryPayloadTrailing { path: PathBuf },
 }
 
 /// One built-in registry — the registry name plus the sorted list of
@@ -126,11 +157,20 @@ pub struct Registry {
     pub entries: Vec<Identifier>,
 }
 
+#[derive(
+    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+pub struct ItemEnchantment {
+    pub id: Identifier,
+    pub level: i32,
+}
+
 /// The whole vanilla-data sidecar, indexed.
 #[derive(Debug, Clone)]
 pub struct VanillaData {
     root: PathBuf,
     registries: BTreeMap<String, Registry>,
+    registry_payloads: BTreeMap<String, BTreeMap<String, Arc<[u8]>>>,
     sidecar_root: bool,
 }
 
@@ -175,6 +215,38 @@ impl VanillaData {
         self.registries.values().map(|r| r.entries.len()).sum()
     }
 
+    /// Pre-encoded Network-NBT for one sidecar registry entry. In-memory and
+    /// embedded indexes intentionally return `None`: they carry identifiers,
+    /// not invented data-pack definitions.
+    #[must_use]
+    pub fn registry_entry_payload(
+        &self,
+        registry: &Identifier,
+        entry: &Identifier,
+    ) -> Option<Arc<[u8]>> {
+        self.registry_payloads
+            .get(registry.as_str())?
+            .get(entry.as_str())
+            .map(Arc::clone)
+    }
+
+    /// Whether every indexed registry entry has a sidecar-backed payload.
+    #[must_use]
+    pub fn has_full_registry_payloads(&self) -> bool {
+        self.entry_count() > 0
+            && self.registries.values().all(|registry| {
+                self.registry_payloads
+                    .get(registry.id.as_str())
+                    .is_some_and(|payloads| {
+                        payloads.len() == registry.entries.len()
+                            && registry
+                                .entries
+                                .iter()
+                                .all(|entry| payloads.contains_key(entry.as_str()))
+                    })
+            })
+    }
+
     /// Build a `VanillaData` from in-memory registries. Used by tests
     /// that don't want to stage a filesystem layout and by future code
     /// that loads from somewhere other than disk. `root` is recorded
@@ -188,6 +260,7 @@ impl VanillaData {
         Self {
             root: root.into(),
             registries: map,
+            registry_payloads: BTreeMap::new(),
             sidecar_root: false,
         }
     }
@@ -225,8 +298,7 @@ pub mod testing {
 /// Configuration state and keep worldgen/survival baselines running.
 #[must_use]
 pub fn solaris_required_data() -> VanillaData {
-    let index: BTreeMap<String, Vec<String>> = serde_json::from_str(REQUIRED_REGISTRY_INDEX)
-        .expect("embedded required registry index JSON is valid");
+    let index = required_registry_entries();
 
     let registries = KNOWN_REGISTRIES
         .iter()
@@ -234,12 +306,7 @@ pub fn solaris_required_data() -> VanillaData {
             let entries = index
                 .get(*path)
                 .unwrap_or_else(|| panic!("embedded required registry index missing {path}"))
-                .iter()
-                .map(|entry| {
-                    Identifier::parse(entry.clone())
-                        .expect("embedded required registry entry id is valid")
-                })
-                .collect();
+                .to_vec();
             Registry {
                 id: Identifier::parse(format!("minecraft:{path}"))
                     .expect("KNOWN_REGISTRIES paths are valid identifiers"),
@@ -248,6 +315,63 @@ pub fn solaris_required_data() -> VanillaData {
         })
         .collect();
     VanillaData::from_registries("<solaris-built-in>", registries)
+}
+
+#[must_use]
+pub fn required_registry_entry_id(registry: &str, entry: &Identifier) -> Option<u32> {
+    let registry = registry.strip_prefix("minecraft:").unwrap_or(registry);
+    required_registry_entries()
+        .get(registry)?
+        .binary_search(entry)
+        .ok()
+        .and_then(|id| u32::try_from(id).ok())
+}
+
+#[must_use]
+pub fn required_registry_entry(registry: &str, protocol_id: u32) -> Option<Identifier> {
+    let registry = registry.strip_prefix("minecraft:").unwrap_or(registry);
+    required_registry_entries()
+        .get(registry)?
+        .get(protocol_id as usize)
+        .cloned()
+}
+
+fn required_registry_entries() -> &'static BTreeMap<String, Vec<Identifier>> {
+    REQUIRED_REGISTRY_ENTRIES.get_or_init(|| {
+        let raw: BTreeMap<String, Vec<String>> = serde_json::from_str(REQUIRED_REGISTRY_INDEX)
+            .expect("embedded required registry index JSON is valid");
+        raw.into_iter()
+            .map(|(registry, entries)| {
+                let entries = entries
+                    .into_iter()
+                    .map(|entry| {
+                        Identifier::parse(entry)
+                            .expect("embedded required registry entry id is valid")
+                    })
+                    .collect();
+                (registry, entries)
+            })
+            .collect()
+    })
+}
+
+fn load_registry_payload(path: &Path) -> Result<Vec<u8>, DataError> {
+    let bytes = std::fs::read(path).map_err(|source| DataError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mut remaining = bytes.as_slice();
+    let _ =
+        mc_nbt::read_network(&mut remaining).map_err(|source| DataError::RegistryPayloadNbt {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if !remaining.is_empty() {
+        return Err(DataError::RegistryPayloadTrailing {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok(bytes)
 }
 
 /// Load the vanilla data sidecar rooted at `path` (typically
@@ -263,8 +387,10 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
         return Err(DataError::Missing(root));
     }
     let mc_root = root.join("data").join("minecraft");
+    let has_network_payloads = root.join(NETWORK_REGISTRY_PAYLOAD_DIR).is_dir();
 
     let mut registries = BTreeMap::new();
+    let mut registry_payloads = BTreeMap::new();
     for (registry_path, fs_subpath) in KNOWN_REGISTRIES {
         let dir = mc_root.join(fs_subpath);
         if !dir.is_dir() {
@@ -283,24 +409,32 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
         }
         entries.sort();
 
-        let identifiers = entries
-            .into_iter()
-            .map(|stem| {
-                let qualified = format!("minecraft:{stem}");
+        let registry_id = Identifier::parse(format!("minecraft:{registry_path}"))
+            .expect("KNOWN_REGISTRIES paths are well-formed");
+        let mut identifiers = Vec::with_capacity(entries.len());
+        let mut payloads = BTreeMap::new();
+        for stem in entries {
+            let qualified = format!("minecraft:{stem}");
+            let identifier =
                 Identifier::parse(qualified.clone()).map_err(|_| DataError::InvalidEntry {
                     entry: qualified,
                     path: dir.clone(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        let registry_id = Identifier::parse(format!("minecraft:{registry_path}"))
-            .expect("KNOWN_REGISTRIES paths are well-formed");
+                })?;
+            if has_network_payloads {
+                let payload_path = network_registry_payload_path(&root, &registry_id, &identifier);
+                let payload = load_registry_payload(&payload_path)?;
+                payloads.insert(identifier.as_str().to_string(), payload.into());
+            }
+            identifiers.push(identifier);
+        }
         debug!(
             registry = %registry_id,
             entries = identifiers.len(),
             "loaded registry"
         );
+        if has_network_payloads {
+            registry_payloads.insert(registry_id.as_str().to_string(), payloads);
+        }
         registries.insert(
             (*registry_path).to_string(),
             Registry {
@@ -313,6 +447,7 @@ pub fn load(path: impl Into<PathBuf>) -> Result<VanillaData, DataError> {
     Ok(VanillaData {
         root,
         registries,
+        registry_payloads,
         sidecar_root: true,
     })
 }
@@ -415,12 +550,38 @@ mod tests {
         dir
     }
 
+    fn write_captured_payloads(dir: &Path) {
+        for (registry_path, _) in KNOWN_REGISTRIES {
+            let registry = Identifier::parse(format!("minecraft:{registry_path}")).unwrap();
+            for entry_path in ["alpha", "beta"] {
+                let entry = Identifier::parse(format!("minecraft:{entry_path}")).unwrap();
+                let tag = if *registry_path == "dimension_type" && entry_path == "alpha" {
+                    mc_nbt::Tag::Compound(vec![
+                        ("height".into(), mc_nbt::Tag::Int(384)),
+                        ("source".into(), mc_nbt::Tag::String("captured".into())),
+                    ])
+                } else {
+                    mc_nbt::Tag::Compound(vec![(
+                        "source".into(),
+                        mc_nbt::Tag::String("captured".into()),
+                    )])
+                };
+                let mut payload = Vec::new();
+                mc_nbt::write_network(&mut payload, &tag).unwrap();
+                let path = network_registry_payload_path(dir, &registry, &entry);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, payload).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn load_indexes_every_known_registry() {
         let dir = make_minimal_layout();
         let data = load(dir.path()).unwrap();
         assert_eq!(data.sidecar_root(), Some(dir.path()));
         assert_eq!(data.registry_count(), KNOWN_REGISTRIES.len());
+        assert!(!data.has_full_registry_payloads());
         for (registry_path, _) in KNOWN_REGISTRIES {
             let reg = data
                 .registry(registry_path)
@@ -432,6 +593,60 @@ mod tests {
                 "entries should be lexicographically sorted"
             );
         }
+    }
+
+    #[test]
+    fn load_indexes_every_captured_network_nbt_payload() {
+        let dir = make_minimal_layout();
+        write_captured_payloads(dir.path());
+
+        let data = load(dir.path()).unwrap();
+        assert!(data.has_full_registry_payloads());
+        let registry = data.registry("dimension_type").unwrap();
+        let entry = registry
+            .entries
+            .iter()
+            .find(|entry| entry.as_str() == "minecraft:alpha")
+            .unwrap();
+        let payload = data
+            .registry_entry_payload(&registry.id, entry)
+            .expect("loaded sidecar entry has a payload");
+        let mut payload = payload.as_ref();
+        let tag = mc_nbt::read_network(&mut payload).unwrap();
+        assert!(payload.is_empty());
+        assert_eq!(
+            tag,
+            mc_nbt::Tag::Compound(vec![
+                ("height".into(), mc_nbt::Tag::Int(384)),
+                ("source".into(), mc_nbt::Tag::String("captured".into())),
+            ])
+        );
+    }
+
+    #[test]
+    fn partial_captured_payload_directory_fails_closed() {
+        let dir = make_minimal_layout();
+        let registry = Identifier::parse("minecraft:dimension_type").unwrap();
+        let entry = Identifier::parse("minecraft:alpha").unwrap();
+        let path = network_registry_payload_path(dir.path(), &registry, &entry);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut payload = Vec::new();
+        mc_nbt::write_network(&mut payload, &mc_nbt::Tag::Compound(Vec::new())).unwrap();
+        fs::write(path, payload).unwrap();
+
+        let error = load(dir.path()).unwrap_err();
+        assert!(matches!(error, DataError::Io { .. }));
+    }
+
+    #[test]
+    fn embedded_registry_index_has_no_invented_payloads() {
+        let data = solaris_required_data();
+        assert!(!data.has_full_registry_payloads());
+        let registry = data.registry("dimension_type").unwrap();
+        assert_eq!(
+            data.registry_entry_payload(&registry.id, &registry.entries[0]),
+            None
+        );
     }
 
     #[test]

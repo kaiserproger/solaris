@@ -17,6 +17,13 @@
     "max_damage": 59,
     "attack_damage_modifier": 6.0
   },
+  "minecraft:wooden_hoe": {
+    "max_damage": 59,
+    "weapon": true,
+    "weapon_damage_per_attack": 2,
+    "attack_damage_modifier": 0.0,
+    "attack_speed_modifier": -3.0
+  },
   "minecraft:stone_sword": {
     "max_damage": 131,
     "weapon": true,
@@ -34,6 +41,13 @@
   "minecraft:stone_axe": {
     "max_damage": 131,
     "attack_damage_modifier": 8.0
+  },
+  "minecraft:stone_hoe": {
+    "max_damage": 131,
+    "weapon": true,
+    "weapon_damage_per_attack": 2,
+    "attack_damage_modifier": 0.0,
+    "attack_speed_modifier": -2.0
   },
   "minecraft:beef": {
     "food": { "food": 3, "saturation": 1.8 },
@@ -74,5 +88,9 @@
     "food": { "food": 5, "saturation": 6.0 },
     "use_duration_ticks": 32,
     "use_action": "eat"
+  },
+  "minecraft:shears": {
+    "max_damage": 238,
+    "max_stack_size": 1
   }
 }

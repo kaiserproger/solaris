@@ -340,9 +340,10 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
 
     let mut observer_saw_update = false;
     let mut observer_saw_animation = false;
+    let mut observer_saw_break_event = false;
     let mut observer_saw_ack = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    while !(observer_saw_update && observer_saw_animation) {
+    while !(observer_saw_update && observer_saw_animation && observer_saw_break_event) {
         let frame = observer
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
@@ -367,6 +368,15 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
             if pkt.action == EntityAnimationAction::SwingMainHand {
                 observer_saw_animation = true;
             }
+        } else if frame.id == LevelEvent::ID {
+            let mut body = frame.body;
+            let pkt = LevelEvent::decode(&mut body).expect("decode observer level event");
+            let (px, py, pz) = unpack_block_pos(pkt.position);
+            assert_eq!((px, py, pz), (0, target_y, 0));
+            assert_eq!(pkt.event_id, 2001);
+            assert_ne!(pkt.data, air_state_id);
+            assert!(!pkt.global);
+            observer_saw_break_event = true;
         }
     }
     assert!(!observer_saw_ack, "observer must not receive actor ack");
@@ -483,7 +493,11 @@ async fn survival_break_requires_timed_stop_before_mutation() {
         .await
         .expect("send timed survival start break");
     read_ack_without_target_update(&mut client, 24, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    wait_for_world_ticks(
+        &mut client,
+        vanilla_stop_destroy_ticks(1.5, 1.0, false),
+    )
+    .await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -526,7 +540,440 @@ async fn survival_break_requires_timed_stop_before_mutation() {
 }
 
 #[tokio::test]
-async fn out_of_reach_survival_break_resyncs_target_before_ack() {
+async fn stale_survival_break_cannot_break_peer_replacement() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
+    let stone_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .map(|block| block.default)
+        .expect("stone in registry");
+    let dirt_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .map(|block| block.default)
+        .expect("dirt in registry");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let target_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn terrain");
+    let target = mc_world::BlockPos {
+        x: 0,
+        y: target_y,
+        z: 0,
+    };
+    storage
+        .set_block_at(target, stone_state)
+        .expect("seed stone target")
+        .expect("replace generated top block");
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let dirt_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
+    let stone_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .expect("stone item");
+    let entity_report =
+        mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
+    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
+        &entity_report,
+    ));
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Prompt 02 stale block break".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world: Some(Arc::clone(&world)),
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut miner, miner_sync) = connect_to_play(addr, "Prompt02Miner").await;
+    let (mut peer, peer_sync) = connect_to_play(addr, "Prompt02Peer").await;
+    drain_until_chunk(&mut miner, (0, 0)).await;
+    drain_until_chunk(&mut peer, (0, 0)).await;
+    assert_eq!(miner_sync.y.floor() as i32 - 2, target_y);
+    assert_eq!(peer_sync.y.floor() as i32 - 2, target_y);
+
+    peer.write_packet(&ServerboundChatCommand {
+        command: "gamemode creative".into(),
+    })
+    .await
+    .expect("make peer creative");
+    peer.write_packet(&ServerboundChatCommand {
+        command: "debug give minecraft:dirt 1 0".into(),
+    })
+    .await
+    .expect("give peer replacement block");
+    wait_for_slot_stack(&mut peer, dirt_item_id, 1).await;
+
+    let target_pos = pack_block_pos(0, target_y, 0);
+    miner
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 300,
+        })
+        .await
+        .expect("start survival break");
+    read_ack_without_target_update(&mut miner, 300, (0, target_y, 0)).await;
+
+    peer.write_packet(&ServerboundPlayerAction {
+        action: PlayerActionKind::StartDestroyBlock,
+        position: target_pos,
+        direction: Direction::Up,
+        sequence: 301,
+    })
+    .await
+    .expect("peer breaks original target");
+    wait_for_block_state_and_ack(&mut peer, 301, (0, target_y, 0), air_state.0 as i32).await;
+
+    peer.write_packet(&ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        position: pack_block_pos(0, target_y - 1, 0),
+        direction: Direction::Up,
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: 302,
+    })
+    .await
+    .expect("peer places replacement target");
+    wait_for_block_state_and_ack(&mut peer, 302, (0, target_y, 0), dirt_state.0 as i32).await;
+    wait_for_block_state(&mut miner, (0, target_y, 0), dirt_state.0 as i32).await;
+
+    wait_for_world_ticks(&mut miner, 32).await;
+    miner
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 303,
+        })
+        .await
+        .expect("stop stale survival break");
+    wait_for_stale_break_resync(
+        &mut miner,
+        303,
+        (0, target_y, 0),
+        dirt_state.0 as i32,
+    )
+    .await;
+
+    let final_state = world
+        .lock()
+        .await
+        .get_block(target)
+        .expect("read final target");
+    assert_eq!(
+        final_state,
+        Some(dirt_state),
+        "stale mining completion must preserve the peer replacement"
+    );
+
+    peer.write_packet(&ServerboundPlayerAction {
+        action: PlayerActionKind::StartDestroyBlock,
+        position: target_pos,
+        direction: Direction::Up,
+        sequence: 304,
+    })
+    .await
+    .expect("peer clears first replacement");
+    wait_for_block_state_and_ack(&mut peer, 304, (0, target_y, 0), air_state.0 as i32).await;
+    peer.write_packet(&ServerboundChatCommand {
+        command: "debug give minecraft:stone 1 0".into(),
+    })
+    .await
+    .expect("give peer stone setup block");
+    wait_for_slot_stack(&mut peer, stone_item_id, 1).await;
+    peer.write_packet(&ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        position: pack_block_pos(0, target_y - 1, 0),
+        direction: Direction::Up,
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: 305,
+    })
+    .await
+    .expect("peer restores stone before ABA test");
+    wait_for_block_state_and_ack(&mut peer, 305, (0, target_y, 0), stone_state.0 as i32).await;
+    wait_for_block_state(&mut miner, (0, target_y, 0), stone_state.0 as i32).await;
+
+    miner
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 306,
+        })
+        .await
+        .expect("start ABA survival break");
+    read_ack_without_target_update(&mut miner, 306, (0, target_y, 0)).await;
+
+    peer.write_packet(&ServerboundPlayerAction {
+        action: PlayerActionKind::StartDestroyBlock,
+        position: target_pos,
+        direction: Direction::Up,
+        sequence: 307,
+    })
+    .await
+    .expect("peer starts ABA transition");
+    wait_for_block_state_and_ack(&mut peer, 307, (0, target_y, 0), air_state.0 as i32).await;
+    peer.write_packet(&ServerboundChatCommand {
+        command: "debug give minecraft:dirt 1 0".into(),
+    })
+    .await
+    .expect("give peer ABA dirt");
+    wait_for_slot_stack(&mut peer, dirt_item_id, 1).await;
+    peer.write_packet(&ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        position: pack_block_pos(0, target_y - 1, 0),
+        direction: Direction::Up,
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: 308,
+    })
+    .await
+    .expect("peer places ABA dirt");
+    wait_for_block_state_and_ack(&mut peer, 308, (0, target_y, 0), dirt_state.0 as i32).await;
+    peer.write_packet(&ServerboundPlayerAction {
+        action: PlayerActionKind::StartDestroyBlock,
+        position: target_pos,
+        direction: Direction::Up,
+        sequence: 309,
+    })
+    .await
+    .expect("peer clears ABA dirt");
+    wait_for_block_state_and_ack(&mut peer, 309, (0, target_y, 0), air_state.0 as i32).await;
+    peer.write_packet(&ServerboundChatCommand {
+        command: "debug give minecraft:stone 1 0".into(),
+    })
+    .await
+    .expect("give peer ABA stone");
+    wait_for_slot_stack(&mut peer, stone_item_id, 1).await;
+    peer.write_packet(&ServerboundUseItemOn {
+        hand: InteractionHand::MainHand,
+        position: pack_block_pos(0, target_y - 1, 0),
+        direction: Direction::Up,
+        cursor_x: 0.5,
+        cursor_y: 1.0,
+        cursor_z: 0.5,
+        inside: false,
+        world_border_hit: false,
+        sequence: 310,
+    })
+    .await
+    .expect("peer completes ABA stone restore");
+    wait_for_block_state_and_ack(&mut peer, 310, (0, target_y, 0), stone_state.0 as i32).await;
+    wait_for_block_state(&mut miner, (0, target_y, 0), stone_state.0 as i32).await;
+
+    wait_for_world_ticks(&mut miner, 32).await;
+    miner
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target_pos,
+            direction: Direction::Up,
+            sequence: 311,
+        })
+        .await
+        .expect("stop ABA survival break");
+    wait_for_stale_break_resync(
+        &mut miner,
+        311,
+        (0, target_y, 0),
+        stone_state.0 as i32,
+    )
+    .await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(target)
+            .expect("read ABA final target"),
+        Some(stone_state),
+        "ABA mutation version must preserve the peer-restored stone"
+    );
+}
+
+async fn wait_for_block_state_and_ack(
+    client: &mut Client,
+    sequence: i32,
+    target: (i32, i32, i32),
+    expected_state: i32,
+) {
+    let mut saw_state = false;
+    let mut saw_ack = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_state && saw_ack) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("block state and ack");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode block state");
+            if unpack_block_pos(packet.position) == target && packet.state_id == expected_state {
+                saw_state = true;
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let packet =
+                SectionBlocksUpdate::decode(&mut body).expect("decode section block state");
+            saw_state |= section_update_contains_state(&packet, target, expected_state);
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode block ack");
+            saw_ack |= packet.sequence == sequence;
+        }
+    }
+}
+
+async fn wait_for_block_state(
+    client: &mut Client,
+    target: (i32, i32, i32),
+    expected_state: i32,
+) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("peer block state");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode peer block state");
+            if unpack_block_pos(packet.position) == target && packet.state_id == expected_state {
+                return;
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let packet =
+                SectionBlocksUpdate::decode(&mut body).expect("decode peer section block state");
+            if section_update_contains_state(&packet, target, expected_state) {
+                return;
+            }
+        }
+    }
+}
+
+fn section_update_contains_state(
+    packet: &SectionBlocksUpdate,
+    target: (i32, i32, i32),
+    expected_state: i32,
+) -> bool {
+    packet.section_pos
+        == pack_section_pos(
+            target.0.div_euclid(16),
+            target.1.div_euclid(16),
+            target.2.div_euclid(16),
+        )
+        && packet.changes.iter().any(|change| {
+            change.relative_pos == pack_section_relative_pos(target.0, target.1, target.2)
+                && change.state_id == expected_state
+        })
+}
+
+async fn wait_for_stale_break_resync(
+    client: &mut Client,
+    sequence: i32,
+    target: (i32, i32, i32),
+    expected_state: i32,
+) {
+    let mut saw_resync = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("stale break resync");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode stale break resync");
+            if unpack_block_pos(packet.position) == target {
+                assert_eq!(
+                    packet.state_id, expected_state,
+                    "stale break must resync the peer replacement instead of mutating it"
+                );
+                saw_resync = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode stale break ack");
+            if packet.sequence == sequence {
+                assert!(saw_resync, "stale break resync must precede its ack");
+                return;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -604,8 +1051,8 @@ async fn out_of_reach_survival_break_resyncs_target_before_ack() {
     let dy = sync.y + 1.62 - (f64::from(seeded_y) + 0.5);
     let dz = sync.z - 0.5;
     assert!(
-        dx * dx + dy * dy + dz * dz > 25.0,
-        "seeded break target must be outside survival reach"
+        dx * dx + dy * dy + dz * dz > 36.0,
+        "seeded break target must be outside creative reach"
     );
 
     client
@@ -618,6 +1065,157 @@ async fn out_of_reach_survival_break_resyncs_target_before_ack() {
         .await
         .expect("send out-of-reach survival start break");
     read_rejected_break_resync_before_ack(&mut client, 26, (6, seeded_y, 0), stone_state_id).await;
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(6, seeded_y, 0),
+            direction: Direction::Up,
+            sequence: 27,
+        })
+        .await
+        .expect("send out-of-reach creative start break");
+    read_rejected_break_resync_before_ack(&mut client, 27, (6, seeded_y, 0), stone_state_id).await;
+}
+
+#[tokio::test]
+async fn bedrock_break_resyncs_survival_and_succeeds_in_creative() {
+    let data = embedded_play_data();
+    let air = embedded_block_state(&data, "minecraft:air");
+    let bedrock = embedded_block_state(&data, "minecraft:bedrock");
+    let mut world = embedded_world(&data);
+    let target_y = top_non_air_y(&mut world, 0, 0, air).expect("spawn column has terrain");
+    world
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 0,
+                y: target_y,
+                z: 0,
+            },
+            bedrock,
+        )
+        .expect("seed creative bedrock target")
+        .expect("replace generated spawn surface");
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut cfg = embedded_playable_config(&data, world, "creative bedrock break");
+    cfg.shutdown = shutdown.clone();
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
+
+    let (mut client, _) = connect_to_play(addr, "CreativeBedrock").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    let target = pack_block_pos(0, target_y, 0);
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target,
+            direction: Direction::Up,
+            sequence: 28,
+        })
+        .await
+        .expect("start survival bedrock break");
+    wait_for_world_ticks(&mut client, 18).await;
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StopDestroyBlock,
+            position: target,
+            direction: Direction::Up,
+            sequence: 29,
+        })
+        .await
+        .expect("stop survival bedrock break");
+
+    let mut saw_bedrock_resync = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("survival bedrock break response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode bedrock resync");
+            if unpack_block_pos(packet.position) == (0, target_y, 0) {
+                assert_eq!(packet.state_id, bedrock.0 as i32);
+                saw_bedrock_resync = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode survival bedrock ack");
+            if packet.sequence == 29 {
+                assert!(
+                    saw_bedrock_resync,
+                    "denied survival bedrock break must resync before ack"
+                );
+                break;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "gamemode creative".into(),
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: target,
+            direction: Direction::Up,
+            sequence: 30,
+        })
+        .await
+        .expect("break creative bedrock target");
+
+    let mut saw_air = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("creative bedrock break response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode bedrock BlockUpdate");
+            if unpack_block_pos(packet.position) == (0, target_y, 0) {
+                assert_eq!(packet.state_id, air.0 as i32);
+                saw_air = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode bedrock ack");
+            if packet.sequence == 30 {
+                assert!(saw_air, "creative bedrock removal must precede its ack");
+                break;
+            }
+        }
+    }
+
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("creative bedrock server shutdown")
+        .expect("creative bedrock server join")
+        .expect("creative bedrock server serve");
 }
 
 #[tokio::test]
@@ -823,6 +1421,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let runtime_telemetry = bound.runtime_telemetry_handle();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -850,7 +1449,7 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 31, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    wait_for_world_ticks(&mut client, 34).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -867,12 +1466,14 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
     let mut slot_stacks = Vec::new();
     let mut saw_break_update = false;
     let mut saw_break_ack = false;
+    let mut tool_damage_updates = 0;
     let mut saw_slot = false;
     let mut saw_take = false;
     let mut saw_remove = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_break_update
         && saw_break_ack
+        && tool_damage_updates == 1
         && dropped_stack.is_some()
         && saw_slot
         && saw_take
@@ -906,6 +1507,10 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
             if pkt.entity_type_id == item_entity_type {
                 assert!(saw_break_update, "item spawned before break block update");
                 assert!(saw_break_ack, "item spawned before break ack");
+                assert_eq!(
+                    tool_damage_updates, 1,
+                    "item spawned before the atomic tool durability update"
+                );
                 item_entity_id = Some(pkt.entity_id);
             }
         } else if frame.id == ClientboundSetEntityData::ID {
@@ -935,6 +1540,17 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         } else if frame.id == ClientboundContainerSetSlot::ID {
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode set slot");
+            if pkt.slot == 36
+                && pkt.item_stack.item_id == pickaxe_id
+                && pkt.item_stack.count == 1
+                && pkt.item_stack.damage == Some(1)
+            {
+                tool_damage_updates += 1;
+                assert_eq!(
+                    tool_damage_updates, 1,
+                    "timed break damaged the held tool more than once"
+                );
+            }
             slot_stacks.push(pkt.item_stack.clone());
             if let Some(stack) = &dropped_stack
                 && pkt.item_stack.item_id == stack.item_id
@@ -973,6 +1589,38 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
             }
         }
     }
+    let simulation = runtime_telemetry.snapshot();
+    eprintln!(
+        "Prompt 03 pickup queue capacity={} enqueued={} processed={} block_edits={} item_pickups={} depth={} max_depth={} max_batch={}",
+        simulation.simulation_queue_capacity,
+        simulation.simulation_commands_enqueued,
+        simulation.simulation_commands_processed,
+        simulation.simulation_block_edits_processed,
+        simulation.simulation_item_pickups_processed,
+        simulation.simulation_queue_depth,
+        simulation.simulation_queue_max_depth,
+        simulation.simulation_max_batch,
+    );
+    assert_eq!(simulation.simulation_queue_capacity, 1024);
+    assert_eq!(tool_damage_updates, 1);
+    assert_eq!(simulation.simulation_block_edits_processed, 1);
+    assert_eq!(simulation.simulation_item_pickups_processed, 1);
+    assert!(simulation.simulation_commands_enqueued >= 1);
+    assert!(simulation.simulation_commands_processed >= 1);
+    assert_eq!(simulation.simulation_queue_depth, 0);
+    assert!((1..=simulation.simulation_queue_capacity).contains(&simulation.simulation_queue_max_depth));
+    assert!((1..=simulation.simulation_queue_max_depth).contains(&simulation.simulation_max_batch));
+    assert_eq!(simulation.simulation_commands_rejected_full, 0);
+    assert_eq!(simulation.simulation_commands_rejected_closed, 0);
+    assert_eq!(simulation.simulation_commands_rejected_shutdown, 0);
+    assert_eq!(simulation.simulation_commands_rejected_world_busy, 0);
+    assert_eq!(
+        simulation.simulation_commands_rejected_world_unavailable,
+        0
+    );
+    assert_eq!(simulation.simulation_commands_rejected_world_mutation, 0);
+    assert_eq!(simulation.simulation_commands_rejected_stale_session, 0);
+    assert_eq!(simulation.simulation_commands_cancelled, 0);
 }
 
 #[tokio::test]
@@ -1060,7 +1708,11 @@ async fn survival_can_place_naturally_picked_up_block() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 81, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_world_ticks(
+        &mut client,
+        vanilla_stop_destroy_ticks(0.5, 1.0, true),
+    )
+    .await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -1217,7 +1869,11 @@ async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 91, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_for_world_ticks(
+        &mut client,
+        vanilla_stop_destroy_ticks(0.5, 1.0, true),
+    )
+    .await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -1383,7 +2039,7 @@ async fn survival_break_damages_held_tool() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 51, (0, target_y, 0)).await;
-    tokio::time::sleep(Duration::from_millis(1_700)).await;
+    wait_for_world_ticks(&mut client, 34).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -1422,6 +2078,159 @@ async fn survival_break_damages_held_tool() {
             let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
             if pkt.sequence == 52 {
                 saw_ack = true;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn survival_hoe_use_tills_dirt_and_damages_tool() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|b| b.default)
+        .expect("air in registry");
+    let dirt_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .map(|b| b.default)
+        .expect("dirt in registry");
+    let farmland_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:farmland").unwrap())
+        .map(|b| b.default)
+        .expect("farmland in registry");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let surface_y = top_non_air_y(&mut storage, 0, 0, air_state_id).expect("spawn column terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 0,
+                y: surface_y,
+                z: 0,
+            },
+            dirt_state_id,
+        )
+        .expect("seed dirt")
+        .expect("replace generated surface");
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let wooden_hoe_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:wooden_hoe").unwrap())
+        .expect("wooden hoe item");
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "P2 hoe tilling".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, "P2HoeTiller").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:wooden_hoe 1 0".into(),
+        })
+        .await
+        .expect("give wooden hoe");
+    wait_for_slot_stack(&mut client, wooden_hoe_id, 1).await;
+
+    let target_y = sync.y.floor() as i32 - 2;
+    assert_eq!(target_y, surface_y, "spawn target should be seeded dirt");
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, target_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 121,
+        })
+        .await
+        .expect("use hoe on dirt");
+
+    let mut saw_farmland = false;
+    let mut saw_ack = false;
+    let mut saw_damage = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !(saw_farmland && saw_ack && saw_damage) {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("hoe tilling response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let pkt = BlockUpdate::decode(&mut body).expect("decode till BlockUpdate");
+            if unpack_block_pos(pkt.position) == (0, target_y, 0) {
+                assert_eq!(pkt.state_id, farmland_state_id.0 as i32);
+                saw_farmland = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode till ack");
+            if pkt.sequence == 121 {
+                saw_ack = true;
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode set slot");
+            if pkt.slot == 36
+                && pkt.item_stack.item_id == wooden_hoe_id
+                && pkt.item_stack.count == 1
+                && pkt.item_stack.damage == Some(1)
+            {
+                saw_damage = true;
             }
         }
     }

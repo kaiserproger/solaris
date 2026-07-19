@@ -14,5 +14,11 @@ workspace = true
 [features]
 default = []
 host-api = []
+lua-runtime = ["host-api", "dep:mlua", "dep:serde", "dep:toml", "dep:tracing"]
 
 [dependencies]
+mlua = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+tokio = { workspace = true }
+toml = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }

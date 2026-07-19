@@ -292,6 +292,31 @@ fn block_update_round_trip() {
 }
 
 #[test]
+fn level_event_id_and_wire_layout_match_local_vanilla() {
+    assert_eq!(LevelEvent::ID, 0x2E);
+    let position = pack_block_pos(-2, 70, 3);
+    let packet = LevelEvent {
+        event_id: 2001,
+        position,
+        data: 1234,
+        global: false,
+    };
+    let mut encoded = Vec::new();
+    packet.encode(&mut encoded).unwrap();
+
+    let mut expected = Vec::new();
+    expected.extend_from_slice(&2001_i32.to_be_bytes());
+    expected.extend_from_slice(&position.to_be_bytes());
+    expected.extend_from_slice(&1234_i32.to_be_bytes());
+    expected.push(0);
+    assert_eq!(encoded, expected);
+
+    let mut cursor = encoded.as_slice();
+    assert_eq!(LevelEvent::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
 fn section_blocks_update_id_matches_javap() {
     assert_eq!(SectionBlocksUpdate::ID, 0x54);
 }
@@ -432,6 +457,29 @@ fn item_stack_damage_component_round_trips() {
 }
 
 #[test]
+fn item_stack_enchantments_component_matches_vanilla_stream_codec() {
+    let efficiency = Identifier::parse("minecraft:efficiency").unwrap();
+    let pickaxe = ItemStack::new(777, 1).with_enchantment(efficiency, 1);
+
+    let mut buf = Vec::new();
+    pickaxe.encode(&mut buf).unwrap();
+
+    assert_eq!(
+        buf,
+        vec![
+            0x01, 0x89, 0x06, // count 1, item id 777
+            0x01, 0x00, // one added component, none removed
+            0x0D, // minecraft:enchantments component id
+            0x01, // map size
+            0x08, 0x01, // minecraft:efficiency registry id, level I
+        ]
+    );
+    let mut cur: &[u8] = &buf;
+    assert_eq!(ItemStack::decode(&mut cur).unwrap(), pickaxe);
+    assert!(cur.is_empty());
+}
+
+#[test]
 fn item_stack_decoder_refuses_unsupported_component_patches() {
     // count=1, item_id=1, n_add=1, n_remove=0, unsupported component id=4.
     let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x04];
@@ -525,6 +573,239 @@ fn clientbound_open_screen_layout_matches_local_vanilla() {
     assert_eq!(&buf[..2], &[0x01, 0x0E]);
     let mut cursor: &[u8] = &buf;
     assert_eq!(ClientboundOpenScreen::decode(&mut cursor).unwrap(), packet);
+}
+
+#[test]
+fn serverbound_container_button_click_layout_matches_local_vanilla() {
+    assert_eq!(ServerboundContainerButtonClick::ID, 0x11);
+    let packet = ServerboundContainerButtonClick {
+        container_id: 300,
+        button_id: 2,
+    };
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+    assert_eq!(buf, vec![0xAC, 0x02, 0x02]);
+
+    let mut cursor: &[u8] = &buf;
+    assert_eq!(
+        ServerboundContainerButtonClick::decode(&mut cursor).unwrap(),
+        packet
+    );
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn clientbound_explode_matches_vanilla_tnt_fixture() {
+    let packet = ClientboundExplode {
+        center: EntityVec3 {
+            x: 1.5,
+            y: 64.0625,
+            z: -2.5,
+        },
+        radius: 4.0,
+        block_count: 1,
+        knockback: Some(EntityVec3 {
+            x: 0.25,
+            y: 0.5,
+            z: -0.75,
+        }),
+        explosion_particle_id: 22,
+        sound_reference_id: 697,
+        block_particles: vec![
+            ExplosionBlockParticle {
+                particle_id: 59,
+                scaling: 0.5,
+                speed: 1.0,
+                weight: 1,
+            },
+            ExplosionBlockParticle {
+                particle_id: 62,
+                scaling: 1.0,
+                speed: 1.0,
+                weight: 1,
+            },
+        ],
+    };
+    let expected: [u8; 81] = [
+        0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x50, 0x04, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x3f, 0xd0, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xbf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xba, 0x05,
+        0x02, 0x3b, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01, 0x3e,
+        0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01,
+    ];
+
+    assert_eq!(ClientboundExplode::ID, 0x24);
+    let mut encoded = Vec::new();
+    packet.encode(&mut encoded).unwrap();
+    assert_eq!(encoded, expected);
+
+    let mut cursor: &[u8] = &expected;
+    assert_eq!(ClientboundExplode::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty(), "decoder must consume the exact packet body");
+}
+
+#[test]
+fn clientbound_explode_round_trips_without_knockback() {
+    round_trip(simple_explode_packet());
+}
+
+fn simple_explode_packet() -> ClientboundExplode {
+    ClientboundExplode {
+        center: EntityVec3 {
+            x: 0.0,
+            y: -64.0,
+            z: 12.25,
+        },
+        radius: 0.0,
+        block_count: 0,
+        knockback: None,
+        explosion_particle_id: 22,
+        sound_reference_id: 697,
+        block_particles: Vec::new(),
+    }
+}
+
+fn explode_body_through_sound_holder(
+    explosion_particle_id: i32,
+    sound_holder: i32,
+) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    bytes.write_f64(0.0);
+    bytes.write_f64(0.0);
+    bytes.write_f64(0.0);
+    bytes.write_f32(4.0);
+    bytes.write_i32(0);
+    bytes.write_bool(false);
+    bytes.write_varint(explosion_particle_id);
+    bytes.write_varint(sound_holder);
+    bytes
+}
+
+#[test]
+fn clientbound_explode_rejects_negative_block_particle_count() {
+    let mut bytes = explode_body_through_sound_holder(22, 698);
+    bytes.write_varint(-1);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(err, CodecError::NegativeLength(-1));
+}
+
+#[test]
+fn clientbound_explode_rejects_oversized_block_particle_count() {
+    let mut bytes = explode_body_through_sound_holder(22, 698);
+    bytes.write_varint((MAX_EXPLOSION_BLOCK_PARTICLES + 1) as i32);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::StringTooLong {
+            len: MAX_EXPLOSION_BLOCK_PARTICLES + 1,
+            max: MAX_EXPLOSION_BLOCK_PARTICLES,
+        }
+    );
+}
+
+#[test]
+fn clientbound_explode_rejects_inline_sound_holder() {
+    let bytes = explode_body_through_sound_holder(22, 0);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("inline explosion sound holder")
+    );
+}
+
+#[test]
+fn clientbound_explode_encode_rejects_unsupported_explosion_particle() {
+    let mut packet = simple_explode_packet();
+    packet.explosion_particle_id = 23;
+
+    let err = packet.encode(&mut Vec::new()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("unsupported simple explosion particle id")
+    );
+}
+
+#[test]
+fn clientbound_explode_decode_rejects_unsupported_explosion_particle() {
+    let mut bytes = explode_body_through_sound_holder(23, 698);
+    bytes.write_varint(0);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("unsupported simple explosion particle id")
+    );
+}
+
+#[test]
+fn clientbound_explode_encode_rejects_unsupported_block_particle() {
+    let mut packet = simple_explode_packet();
+    packet.block_particles.push(ExplosionBlockParticle {
+        particle_id: 60,
+        scaling: 1.0,
+        speed: 1.0,
+        weight: 1,
+    });
+
+    let err = packet.encode(&mut Vec::new()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("unsupported simple explosion particle id")
+    );
+}
+
+#[test]
+fn clientbound_explode_decode_rejects_unsupported_block_particle() {
+    let mut bytes = explode_body_through_sound_holder(22, 698);
+    bytes.write_varint(1);
+    bytes.write_varint(60);
+    bytes.write_f32(1.0);
+    bytes.write_f32(1.0);
+    bytes.write_varint(1);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("unsupported simple explosion particle id")
+    );
+}
+
+#[test]
+fn clientbound_explode_encode_rejects_negative_block_particle_weight() {
+    let mut packet = simple_explode_packet();
+    packet.block_particles.push(ExplosionBlockParticle {
+        particle_id: 59,
+        scaling: 1.0,
+        speed: 1.0,
+        weight: -1,
+    });
+
+    let err = packet.encode(&mut Vec::new()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("negative explosion block particle weight")
+    );
+}
+
+#[test]
+fn clientbound_explode_decode_rejects_negative_block_particle_weight() {
+    let mut bytes = explode_body_through_sound_holder(22, 698);
+    bytes.write_varint(1);
+    bytes.write_varint(59);
+    bytes.write_f32(1.0);
+    bytes.write_f32(1.0);
+    bytes.write_varint(-1);
+
+    let err = ClientboundExplode::decode(&mut bytes.as_slice()).unwrap_err();
+    assert_eq!(
+        err,
+        CodecError::NotSupported("negative explosion block particle weight")
+    );
 }
 
 #[test]
@@ -665,6 +946,143 @@ fn serverbound_recipe_book_packets_match_local_vanilla() {
         seen
     );
     assert!(cursor.is_empty());
+}
+
+#[test]
+fn clientbound_recipe_book_packets_match_local_vanilla_2612() {
+    assert_eq!(ClientboundRecipeBookSettings::ID, 0x4C);
+    let settings = ClientboundRecipeBookSettings::default();
+    let mut settings_bytes = Vec::new();
+    settings.encode(&mut settings_bytes).unwrap();
+    assert_eq!(settings_bytes, vec![0; 8]);
+    let mut cursor: &[u8] = &settings_bytes;
+    assert_eq!(
+        ClientboundRecipeBookSettings::decode(&mut cursor).unwrap(),
+        settings
+    );
+    assert!(cursor.is_empty());
+
+    assert_eq!(ClientboundRecipeBookAdd::ID, 0x4A);
+    let birch_logs = sample_identifier("minecraft:birch_logs");
+    let packet = ClientboundRecipeBookAdd {
+        entries: vec![RecipeBookEntry {
+            display_id: 2,
+            display: RecipeBookDisplay::Shapeless {
+                ingredients: vec![RecipeBookSlotDisplay::Tag(birch_logs.clone())],
+                result: RecipeBookSlotDisplay::ItemStack {
+                    item_id: 5,
+                    count: 4,
+                },
+                crafting_station: RecipeBookSlotDisplay::Item { item_id: 6 },
+            },
+            group: None,
+            category_id: 0,
+            crafting_requirements: Some(vec![RecipeBookIngredient::Tag(birch_logs)]),
+            flags: 0,
+        }],
+        replace: true,
+    };
+    let mut bytes = Vec::new();
+    packet.encode(&mut bytes).unwrap();
+    let mut expected = vec![0x01, 0x02, 0x00, 0x01, 0x06, 0x14];
+    expected.extend_from_slice(b"minecraft:birch_logs");
+    expected.extend_from_slice(&[0x05, 0x05, 0x04, 0x00, 0x00, 0x04, 0x06]);
+    expected.extend_from_slice(&[0x00, 0x00, 0x01, 0x01, 0x00, 0x14]);
+    expected.extend_from_slice(b"minecraft:birch_logs");
+    expected.extend_from_slice(&[0x00, 0x01]);
+    assert_eq!(bytes, expected);
+
+    let mut cursor: &[u8] = &bytes;
+    assert_eq!(ClientboundRecipeBookAdd::decode(&mut cursor).unwrap(), packet);
+    assert!(cursor.is_empty());
+}
+
+#[test]
+fn clientbound_recipe_book_round_trips_supported_display_variants() {
+    round_trip(ClientboundRecipeBookAdd {
+        entries: vec![
+            RecipeBookEntry {
+                display_id: 7,
+                display: RecipeBookDisplay::Shaped {
+                    width: 2,
+                    height: 1,
+                    ingredients: vec![
+                        RecipeBookSlotDisplay::Item { item_id: 1 },
+                        RecipeBookSlotDisplay::Empty,
+                    ],
+                    result: RecipeBookSlotDisplay::ItemStack {
+                        item_id: 2,
+                        count: 3,
+                    },
+                    crafting_station: RecipeBookSlotDisplay::Item { item_id: 4 },
+                },
+                group: Some(3),
+                category_id: 2,
+                crafting_requirements: Some(vec![RecipeBookIngredient::Items(vec![1])]),
+                flags: 0,
+            },
+            RecipeBookEntry {
+                display_id: 8,
+                display: RecipeBookDisplay::Furnace {
+                    ingredient: RecipeBookSlotDisplay::Composite(vec![
+                        RecipeBookSlotDisplay::Item { item_id: 9 },
+                        RecipeBookSlotDisplay::Tag(sample_identifier("minecraft:logs")),
+                    ]),
+                    fuel: RecipeBookSlotDisplay::AnyFuel,
+                    result: RecipeBookSlotDisplay::ItemStack {
+                        item_id: 10,
+                        count: 1,
+                    },
+                    crafting_station: RecipeBookSlotDisplay::Item { item_id: 11 },
+                    duration: 200,
+                    experience: 0.35,
+                },
+                group: None,
+                category_id: 4,
+                crafting_requirements: None,
+                flags: 0,
+            },
+        ],
+        replace: false,
+    });
+}
+
+#[test]
+fn clientbound_shaped_recipe_display_writes_ingredient_list_length() {
+    let packet = ClientboundRecipeBookAdd {
+        entries: vec![RecipeBookEntry {
+            display_id: 7,
+            display: RecipeBookDisplay::Shaped {
+                width: 2,
+                height: 1,
+                ingredients: vec![
+                    RecipeBookSlotDisplay::Item { item_id: 1 },
+                    RecipeBookSlotDisplay::Empty,
+                ],
+                result: RecipeBookSlotDisplay::ItemStack {
+                    item_id: 2,
+                    count: 3,
+                },
+                crafting_station: RecipeBookSlotDisplay::Item { item_id: 4 },
+            },
+            group: Some(3),
+            category_id: 2,
+            crafting_requirements: Some(vec![RecipeBookIngredient::Items(vec![1])]),
+            flags: 0,
+        }],
+        replace: true,
+    };
+
+    let mut bytes = Vec::new();
+    packet.encode(&mut bytes).unwrap();
+
+    assert_eq!(
+        bytes,
+        vec![
+            0x01, 0x07, 0x01, 0x02, 0x01, 0x02, 0x04, 0x01, 0x00, 0x05, 0x02, 0x03,
+            0x00, 0x00, 0x04, 0x04, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x01,
+        ]
+    );
 }
 
 #[test]

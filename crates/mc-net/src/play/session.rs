@@ -1,198 +1,248 @@
+use super::combat::{ActiveShield, PlayerHurtResistance};
+use super::explosions::PrimedTntFuse;
+use super::persistence::PlayerPersistedState;
+#[cfg(test)]
+use super::simulation::PlayerStateEvent;
+use super::simulation::SimulationAuthority;
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use mc_entity::{
+    EntityKinematics, EntityMotionState, EntitySnapshot, RegionalOwnerHandle, RegionalOwnerRuntime,
+    RegionalOwnerStatus, VersionedEntitySnapshots,
+};
+#[cfg(test)]
+use mc_entity::{RegionKey, ShadowComparisonStats, ShadowDivergence, ShadowStage};
+use std::cell::RefCell;
+use std::ops::{Deref, DerefMut};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+
+mod campfire_authority;
+mod chunk_view_authority;
+mod container_state;
+mod container_views;
+mod entity_combat;
+mod entity_lifecycle;
+mod entity_owner;
+mod entity_simulation;
+mod explosion_authority;
+mod herd_spawn_authority;
+mod hostile_authority;
+mod interaction_geometry;
+mod outbound;
+mod outbound_publication;
+mod passive_mobs;
+mod pathing;
+mod pickups;
+mod player_combat;
+mod player_item_action_authority;
+mod player_pose_adapter;
+mod player_pose_authority;
+mod player_state;
+mod player_state_adapter;
+mod prepared_chunks;
+mod projectiles;
+mod session_lifecycle;
+mod sleep;
+mod survival_action_authority;
+mod transactions;
+mod visibility;
+
+#[cfg(test)]
+use super::simulation::{PlayerSurvivalCommitOutcome, PlayerSurvivalPlan};
+#[cfg(test)]
+use campfire_authority::CampfireRecoveryProbe;
+use container_state::ContainerRegistryShards;
+pub(super) use container_state::{ContainerCommitContext, ContainerStateCommitError};
+#[cfg(test)]
+use container_state::{
+    ContainerCommitProbe, ServerContainerDispatchProbe, ServerFurnaceCommitProbe,
+};
+pub(super) use entity_combat::ServerEntityPlayerAttack;
+use entity_lifecycle::remove_server_entity_locked;
+#[cfg(test)]
+use entity_lifecycle::{
+    ENTITY_EVENT_DEATH_COMPLETE, nearby_entity_candidate_ids_locked, nearby_entity_snapshots_locked,
+};
+use entity_owner::*;
+#[allow(unused_imports)]
+pub(super) use explosion_authority::{
+    ExpiredPrimedTnt, ExplosionEntityTarget, ExplosionPlayerTarget, ServerEntityExplosionImpact,
+};
+pub(super) use herd_spawn_authority::HerdSpawnOutcome;
+#[cfg(test)]
+use herd_spawn_authority::{ChunkHerdClaimProbe, install_committed_herd_spawns_locked};
+use herd_spawn_authority::{
+    ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked, passive_ground_wander_speed,
+};
+use hostile_authority::update_hostile_targets;
+#[cfg(test)]
+use hostile_authority::{
+    HostileCommitProbe, HostileScanProbe, changed_hostile_goal, hostile_wander_goal,
+};
+pub(super) use interaction_geometry::within_block_reach;
+#[cfg(test)]
+pub(super) use interaction_geometry::{
+    entity_aabb, entity_is_near_player_chunk, within_entity_reach,
+};
+pub(crate) use outbound::{EntityDispatchCounters, SessionPressureSnapshot};
+#[cfg(test)]
+use outbound::{
+    MIN_RELIABLE_RETRY_QUEUE_CAPACITY, RELIABLE_RETRY_OVERFLOW_REASON, ReliableRetryQueue,
+    ReliableRetryWorkerGuard,
+};
+use outbound::{
+    OrderedDispatchState, OutboundPressureMetrics, SessionPressureObservation,
+    dispatch_visibility_command,
+};
+pub(super) use outbound::{
+    OutboundCommand, OutboundLightUpdate, PlayerDamagePublication, PlayerEntitySnapshot,
+    ServerEntityMove, ServerEntitySnapshot, VisibilityDispatch, dispatch_visibility_commands,
+};
+#[cfg(test)]
+pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};
+pub(super) use passive_mobs::SheepGrazingCandidate;
+#[cfg(test)]
+pub(super) use passive_mobs::sheep_grazing_starts_on_tick;
+#[cfg(test)]
+use passive_mobs::{
+    BreedingAnimal, GrazingSheep, SHEEP_GRAZING_ACTION_TICK, SHEEP_GRAZING_ANIMATION_TICKS,
+    advance_sheep_grazing, plan_breeding,
+};
+#[cfg(test)]
+use passive_mobs::{sheep_breeding_color, sheep_recipe_mix};
+use pathing::*;
+#[cfg(test)]
+pub(in crate::play) use pickups::ITEM_PICKUP_DELAY_TICKS;
+#[cfg(test)]
+pub(in crate::play) use pickups::{ClaimedExperience, ClaimedPickup};
+pub(in crate::play) use pickups::{
+    CreditedArrowPickup, CreditedExperiencePickup, CreditedItemPickup, ENTITY_PICKUP_RADIUS,
+};
+use pickups::{
+    ItemPickupOwnerBlock, item_pickup_ready_locked, spawn_item_drop_locked, spawn_xp_orb_locked,
+};
+pub(super) use player_combat::PlayerEntityAttack;
+use player_pose_authority::filter_current_expected_entity_snapshots;
+#[cfg(test)]
+use projectiles::{
+    arrow_entity_candidate_ids_locked, segment_aabb_intersection_t, spawn_arrow_locked,
+};
+use projectiles::{despawn_expired_arrows_locked, resolve_arrow_entity_hits_locked};
+pub(super) use sleep::SleepOutcome;
+#[cfg(test)]
+use sleep::{DEEP_SLEEP_TICKS, sleepers_needed};
+use sleep::{DEFAULT_PLAYERS_SLEEPING_PERCENTAGE, SleepingState};
+pub(super) use transactions::*;
+use visibility::LastSentEntityState;
+pub(super) use visibility::server_entity_snapshot_from;
+use visibility::{
+    entity_event_dispatches_locked, entity_velocity_changed,
+    initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
+    install_committed_entity_publications_locked, ordered_session_recipient,
+    packed_rotation_changed, publish_server_entity_snapshot_locked,
+    refresh_entity_target_visibility_locked, session_recipients,
+    spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
+    spawned_xp_observer_ids, visibility_dispatches, visible_entity_observers_locked,
+    visible_observers_locked,
+};
 
 pub(super) type SessionId = u64;
 
-#[derive(Debug, Clone)]
-pub(super) enum OutboundCommand {
-    BlockDeltas(Vec<BlockDelta>),
-    LightUpdates(Vec<OutboundLightUpdate>),
-    SpawnPlayer(PlayerEntitySnapshot),
-    MovePlayer(PlayerEntitySnapshot),
-    DespawnPlayer(PlayerEntitySnapshot),
-    SpawnEntity(ServerEntitySnapshot),
-    UpdateEntityData(ServerEntitySnapshot),
-    MoveEntityRelative(ServerEntityMove),
-    EntityEvent {
-        entity_id: i32,
-        event_id: i8,
-    },
-    DamagePlayer {
-        amount: f32,
-        source_origin: Option<Vec3>,
-    },
-    TakeItemEntity {
-        item_entity_id: i32,
-        player_entity_id: i32,
-        amount: i32,
-    },
-    DespawnEntity(ServerEntitySnapshot),
-    AnimatePlayer {
-        entity_id: i32,
-    },
-    PlayerEntityData {
-        entity_id: i32,
-        values: Vec<EntityDataValue>,
-    },
-    BlockEntityData {
-        position: mc_world::BlockPos,
-        block_entity_type: i32,
-        nbt: Tag,
-    },
-    FurnaceSlots {
-        position: mc_world::BlockPos,
-        state_id: i32,
-        slots: [ItemStack; 3],
-    },
-    ChestSlots {
-        position: mc_world::BlockPos,
-        state_id: i32,
-        slots: Vec<ItemStack>,
-    },
-    FurnaceData {
-        position: mc_world::BlockPos,
-        changed: Vec<(i16, i16)>,
-    },
-    CustomPayload {
-        channel: Identifier,
-        payload: Vec<u8>,
-    },
-    DisconnectPlayer {
-        reason: String,
-    },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OutboundLane {
-    Reliable,
-    Coalescible,
-}
-
-impl OutboundCommand {
-    fn lane(&self) -> OutboundLane {
-        match self {
-            Self::MovePlayer(_) | Self::MoveEntityRelative(_) | Self::AnimatePlayer { .. } => {
-                OutboundLane::Coalescible
-            }
-            Self::SpawnPlayer(_)
-            | Self::DespawnPlayer(_)
-            | Self::SpawnEntity(_)
-            | Self::UpdateEntityData(_)
-            | Self::BlockDeltas(_)
-            | Self::LightUpdates(_)
-            | Self::EntityEvent { .. }
-            | Self::DamagePlayer { .. }
-            | Self::TakeItemEntity { .. }
-            | Self::DespawnEntity(_)
-            | Self::PlayerEntityData { .. }
-            | Self::BlockEntityData { .. }
-            | Self::FurnaceSlots { .. }
-            | Self::ChestSlots { .. }
-            | Self::FurnaceData { .. }
-            | Self::CustomPayload { .. }
-            | Self::DisconnectPlayer { .. } => OutboundLane::Reliable,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct OutboundLightUpdate {
-    pub(super) pos: ChunkPos,
-    pub(super) light: ChunkLight,
-    pub(super) wire: LightData,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct SessionRecipient {
-    pub(super) id: SessionId,
-    pub(super) tx: mpsc::Sender<OutboundCommand>,
-}
-
+const ENTITY_DEATH_TICKS: u64 = 20;
+const ENTITY_EVENT_DEATH: i8 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SessionAdmissionError {
     ServerFull { active: usize, max: usize },
     DuplicateProfile { existing_session: SessionId },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct EntityDispatchCounters {
-    pub(crate) spawn: u64,
-    pub(crate) move_relative: u64,
-    pub(crate) data: u64,
-    pub(crate) take: u64,
-    pub(crate) remove: u64,
+#[derive(Debug)]
+pub(super) enum PlayerInventoryCommitError {
+    MissingPlayer,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct SessionPressureSnapshot {
-    pub(crate) sessions: usize,
-    pub(crate) ticketed_chunks: usize,
-    pub(crate) prepared_chunks: usize,
-    pub(crate) server_entities: usize,
-    pub(crate) furnace_viewer_sets: usize,
-    pub(crate) chest_viewer_sets: usize,
-    pub(crate) entity_dispatches: EntityDispatchCounters,
-    pub(crate) visibility_command_drops: u64,
-    pub(crate) reliable_command_retries: u64,
-    pub(crate) reliable_command_retries_in_flight: u64,
-    pub(crate) max_reliable_command_retries_in_flight: u64,
-    pub(crate) slow_client_write_timeouts: u64,
-    pub(crate) slow_client_pressure_sheds: u64,
+#[derive(Debug)]
+pub(super) enum EntityAttackOutcome {
+    Damaged {
+        damage: mc_entity::EntityDamage,
+        dispatches: Vec<VisibilityDispatch>,
+        attacker_costs: Option<CommittedPlayerAttackCosts>,
+    },
+    Killed {
+        damage: mc_entity::EntityDamage,
+        entity: ServerEntitySnapshot,
+        dispatches: Vec<VisibilityDispatch>,
+        attacker_costs: Option<CommittedPlayerAttackCosts>,
+    },
+    PlayerDamaged {
+        target_session: SessionId,
+        dispatches: Vec<VisibilityDispatch>,
+        damage_applied: bool,
+        attacker_costs: Option<CommittedPlayerAttackCosts>,
+    },
 }
 
-static VISIBILITY_COMMAND_DROPS: AtomicU64 = AtomicU64::new(0);
-static RELIABLE_COMMAND_RETRIES: AtomicU64 = AtomicU64::new(0);
-static RELIABLE_COMMAND_RETRIES_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-static RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-static SLOW_CLIENT_WRITE_TIMEOUTS: AtomicU64 = AtomicU64::new(0);
-static SLOW_CLIENT_PRESSURE_SHEDS: AtomicU64 = AtomicU64::new(0);
-static RELIABLE_RETRY_RECIPIENTS: OnceLock<Mutex<HashSet<SessionId>>> = OnceLock::new();
-
-fn reliable_retry_recipients() -> &'static Mutex<HashSet<SessionId>> {
-    RELIABLE_RETRY_RECIPIENTS.get_or_init(|| Mutex::new(HashSet::new()))
+#[derive(Debug)]
+pub(super) struct CommittedPlayerAttackCosts {
+    pub(super) survival: SurvivalState,
+    pub(super) inventory: PlayerInventory,
 }
 
-fn lock_reliable_retry_recipients() -> MutexGuard<'static, HashSet<SessionId>> {
-    reliable_retry_recipients()
-        .lock()
-        .unwrap_or_else(|poisoned| {
-            warn!("reliable retry recipient set was poisoned; recovering state");
-            poisoned.into_inner()
-        })
+#[derive(Debug)]
+pub(super) enum PlayerAttackResult {
+    ValidationRejected,
+    AcceptedNoDamage,
+    Damaged(Box<EntityAttackOutcome>),
 }
 
-fn record_reliable_retry_in_flight(current: u64) {
-    let mut observed = RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT.load(Ordering::Relaxed);
-    while current > observed {
-        match RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT.compare_exchange_weak(
-            observed,
-            current,
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        ) {
-            Ok(_) => return,
-            Err(actual) => observed = actual,
+#[derive(Debug, Clone, Default)]
+pub(super) struct EntityKillRewards {
+    pub(super) items: Vec<(i32, EntityItemStack)>,
+    pub(super) experience: Option<(i32, i32)>,
+}
+
+#[cfg(test)]
+impl EntityAttackOutcome {
+    pub(super) fn damage(&self) -> &mc_entity::EntityDamage {
+        match self {
+            Self::Damaged { damage, .. } | Self::Killed { damage, .. } => damage,
+            Self::PlayerDamaged { .. } => panic!("player damage is committed by player authority"),
+        }
+    }
+
+    pub(super) fn dispatches(&self) -> &[VisibilityDispatch] {
+        match self {
+            Self::Damaged { dispatches, .. }
+            | Self::Killed { dispatches, .. }
+            | Self::PlayerDamaged { dispatches, .. } => dispatches,
         }
     }
 }
 
-pub(super) fn record_slow_client_write_timeout() {
-    SLOW_CLIENT_WRITE_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-}
+impl EntityAttackOutcome {
+    #[cfg(test)]
+    pub(super) fn into_dispatches(self) -> Vec<VisibilityDispatch> {
+        match self {
+            Self::Damaged { dispatches, .. }
+            | Self::Killed { dispatches, .. }
+            | Self::PlayerDamaged { dispatches, .. } => dispatches,
+        }
+    }
 
-pub(super) fn record_slow_client_pressure_shed() {
-    SLOW_CLIENT_PRESSURE_SHEDS.fetch_add(1, Ordering::Relaxed);
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ClaimedPickup {
-    pub(super) stack: EntityItemStack,
-    pub(super) dispatches: Vec<VisibilityDispatch>,
+    fn dispatches_mut(&mut self) -> &mut Vec<VisibilityDispatch> {
+        match self {
+            Self::Damaged { dispatches, .. }
+            | Self::Killed { dispatches, .. }
+            | Self::PlayerDamaged { dispatches, .. } => dispatches,
+        }
+    }
 }
 
 pub(super) struct SessionRegistration<'a> {
     pub(super) profile: &'a LoggedInProfile,
+    pub(super) properties: &'a [mc_protocol::packets::login::GameProfileProperty],
     pub(super) center: (i32, i32),
     pub(super) view_distance: i32,
     pub(super) desired: HashSet<(i32, i32)>,
@@ -201,51 +251,11 @@ pub(super) struct SessionRegistration<'a> {
     pub(super) max_sessions: usize,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct VisibilityDispatch {
-    pub(crate) recipient: SessionRecipient,
-    pub(crate) command: OutboundCommand,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct PlayerEntitySnapshot {
-    pub(super) session_id: SessionId,
-    pub(super) entity_id: i32,
-    pub(super) uuid: uuid::Uuid,
-    pub(super) name: String,
-    pub(super) pose: PlayerPose,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ServerEntitySnapshot {
-    pub(super) id: EntityId,
-    pub(super) uuid: uuid::Uuid,
-    pub(super) type_id: i32,
-    pub(super) type_name: String,
-    pub(super) position: Vec3,
-    pub(super) rotation: mc_entity::Rotation,
-    pub(super) velocity: Vec3,
-    pub(super) on_ground: bool,
-    pub(super) item_stack: Option<EntityItemStack>,
-    pub(super) experience_value: Option<i32>,
-    pub(super) block_state: Option<u32>,
-    pub(super) attack_damage: Option<f64>,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct ServerEntityMove {
-    pub(super) id: EntityId,
-    pub(super) delta: Vec3,
-    pub(super) velocity: Vec3,
-    pub(super) rotation: mc_entity::Rotation,
-    pub(super) on_ground: bool,
-    pub(super) send_velocity: bool,
-}
-
 #[derive(Debug)]
 struct PlaySession {
     name: String,
     uuid: uuid::Uuid,
+    properties: Vec<mc_protocol::packets::login::GameProfileProperty>,
     entity_id: i32,
     pose: PlayerPose,
     center: (i32, i32),
@@ -253,1040 +263,932 @@ struct PlaySession {
     desired: HashSet<(i32, i32)>,
     loaded: HashSet<(i32, i32)>,
     visible_players: HashSet<SessionId>,
-    visible_entities: HashSet<EntityId>,
+    visible_entities: Arc<HashSet<EntityId>>,
     tx: mpsc::Sender<OutboundCommand>,
+    pressure: Arc<OutboundPressureMetrics>,
+    ordered_dispatch: Arc<OrderedDispatchState>,
 }
 
 #[derive(Debug, Clone)]
-struct FurnaceViewer {
-    tx: mpsc::Sender<OutboundCommand>,
+struct DisconnectedPlayerPersistence {
+    generation: u64,
+    state: Arc<Mutex<PlayerPersistedState>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct SessionRegistryInner {
     next_id: SessionId,
     sessions: HashMap<SessionId, PlaySession>,
+    loaded_chunk_refcounts: HashMap<(i32, i32), usize>,
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
-    prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
-    prepared_in_flight: HashMap<(i32, i32), PreparedChunkClaim>,
-    next_prepared_claim: u64,
-    entities: EntityStore,
     entities_by_chunk: HashMap<(i32, i32), HashSet<EntityId>>,
     entity_chunks: HashMap<EntityId, (i32, i32)>,
+    published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
-    last_sent_entity_positions: HashMap<EntityId, Vec3>,
+    terrain_pathing_entities: HashSet<EntityId>,
+    last_sent_entity_states: HashMap<EntityId, LastSentEntityState>,
     last_entity_damage_ticks: HashMap<EntityId, u64>,
     item_pickup_ready_ticks: HashMap<EntityId, u64>,
+    item_pickup_owner_blocks: HashMap<EntityId, ItemPickupOwnerBlock>,
     entity_spawn_ticks: HashMap<EntityId, u64>,
+    item_spawn_ticks: HashMap<EntityId, u64>,
     arrow_spawn_ticks: HashMap<EntityId, u64>,
     arrow_owner_sessions: HashMap<EntityId, SessionId>,
+    arrow_owner_entities: HashMap<EntityId, EntityId>,
+    primed_tnt: HashMap<EntityId, PrimedTntFuse>,
+    dying_entity_remove_ticks: HashMap<EntityId, u64>,
+    sheep_grazing_ticks: HashMap<EntityId, u8>,
     spawned_entity_chunks: HashSet<(i32, i32)>,
-    furnace_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
-    furnace_state_ids: HashMap<mc_world::BlockPos, i32>,
-    chest_viewers: HashMap<mc_world::BlockPos, HashMap<SessionId, FurnaceViewer>>,
-    chest_state_ids: HashMap<mc_world::BlockPos, i32>,
-    campfire_cooking: HashMap<mc_world::BlockPos, CampfireCookingState>,
+    pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
+    player_hurt_resistance: HashMap<SessionId, PlayerHurtResistance>,
+    active_shields: HashMap<SessionId, ActiveShield>,
+    disconnected_player_persistence: HashMap<uuid::Uuid, DisconnectedPlayerPersistence>,
+    next_disconnected_player_generation: u64,
+    sleeping_sessions: HashMap<SessionId, SleepingState>,
+    spectator_sessions: HashSet<SessionId>,
     entity_dispatches: EntityDispatchCounters,
-    world_time: u64,
-    entity_lifecycle_tick: u64,
     arrow_kill_rewards: ArrowKillRewards,
+    player_combat: PlayerCombatResources,
+}
+
+#[derive(Debug, Default)]
+struct PreparedChunkCache {
+    prepared: HashMap<(i32, i32), Arc<PreparedChunkFrame>>,
+    prewarmed_prepared: VecDeque<(i32, i32)>,
+    prepared_in_flight: HashMap<(i32, i32), PreparedChunkClaim>,
+    prepared_revisions: HashMap<(i32, i32), u64>,
+    next_prepared_claim: u64,
+    ticket_counts: HashMap<(i32, i32), usize>,
+    pending_subscriber_counts: HashMap<(i32, i32), usize>,
+    prewarm_frontier_counts: HashMap<(i32, i32), usize>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ArrowKillRewards {
     item_entity_type_id: Option<i32>,
     xp_orb_entity_type_id: Option<i32>,
+    arrow_entity_type_id: Option<i32>,
     items: Option<Arc<ItemRegistry>>,
+    item_facts: Option<Arc<ItemFactsTable>>,
     loot: Option<Arc<mc_data::loot::LootTables>>,
 }
 
-impl Default for SessionRegistryInner {
+#[derive(Debug, Clone)]
+struct PlayerCombatResources {
+    item_entity_type_id: Option<i32>,
+    xp_orb_entity_type_id: Option<i32>,
+    items: Arc<ItemRegistry>,
+    item_facts: Arc<ItemFactsTable>,
+}
+
+impl Default for PlayerCombatResources {
     fn default() -> Self {
         Self {
-            next_id: 0,
-            sessions: HashMap::new(),
-            tickets: HashMap::new(),
-            prepared: HashMap::new(),
-            prepared_in_flight: HashMap::new(),
-            next_prepared_claim: 0,
-            entities: EntityStore::with_next_id(SERVER_ENTITY_ID_START - 1),
-            entities_by_chunk: HashMap::new(),
-            entity_chunks: HashMap::new(),
-            entity_type_aabbs: HashMap::new(),
-            last_sent_entity_positions: HashMap::new(),
-            last_entity_damage_ticks: HashMap::new(),
-            item_pickup_ready_ticks: HashMap::new(),
-            entity_spawn_ticks: HashMap::new(),
-            arrow_spawn_ticks: HashMap::new(),
-            arrow_owner_sessions: HashMap::new(),
-            spawned_entity_chunks: HashSet::new(),
-            furnace_viewers: HashMap::new(),
-            furnace_state_ids: HashMap::new(),
-            chest_viewers: HashMap::new(),
-            chest_state_ids: HashMap::new(),
-            campfire_cooking: HashMap::new(),
-            player_persistence: HashMap::new(),
-            entity_dispatches: EntityDispatchCounters::default(),
-            world_time: 0,
-            entity_lifecycle_tick: 0,
-            arrow_kill_rewards: ArrowKillRewards::default(),
+            item_entity_type_id: None,
+            xp_orb_entity_type_id: None,
+            items: Arc::new(ItemRegistry::default()),
+            item_facts: Arc::new(ItemFactsTable::default()),
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct PreparedChunkClaim(pub(super) u64);
+pub(super) struct PreparedChunkClaim {
+    id: u64,
+    pub(super) revision: u64,
+}
 
 #[derive(Debug, Clone)]
 pub(super) enum PreparedChunkClaimResult {
-    Cached(Arc<PreparedChunkFrame>),
+    Cached,
     Claimed(PreparedChunkClaim),
     InFlight,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone)]
+pub(super) enum SessionPreparedChunkClaimResult {
+    Cached(Arc<PreparedChunkFrame>, u64),
+    Claimed(PreparedChunkClaim),
+    InFlight,
+    WaitingForEarlierSession,
+}
+
+#[derive(Debug)]
 pub(crate) struct SessionRegistry {
     inner: Mutex<SessionRegistryInner>,
+    prepared_cache: Mutex<PreparedChunkCache>,
+    entities: SessionEntityOwners,
+    world_chunk_journal: Mutex<Option<super::world_journal::WorldChunkJournal>>,
+    world_chunk_journal_failure: tokio::sync::watch::Sender<bool>,
+    containers: ContainerRegistryShards,
+    campfire_cooking: Arc<Mutex<HashMap<mc_world::BlockPos, CampfireCookingState>>>,
+    pressure_observation: Arc<SessionPressureObservation>,
+    outbound_pressure: Arc<OutboundPressureMetrics>,
+    world_time: AtomicU64,
+    players_sleeping_percentage: AtomicU32,
+    entity_lifecycle_tick: AtomicU64,
+    simulation_tick_sender: tokio::sync::watch::Sender<u64>,
+    active_session_sender: tokio::sync::watch::Sender<usize>,
+    session_empty_generation: AtomicU64,
+    session_became_empty: tokio::sync::Notify,
+    player_save_generation: AtomicU64,
+    player_save_requested: tokio::sync::Notify,
+    prepared_change_generation: AtomicU64,
+    prepared_changed: tokio::sync::Notify,
     #[cfg(test)]
     prepared_claim_calls: AtomicU64,
+    #[cfg(test)]
+    move_fanout_probe: Mutex<Option<MoveFanoutProbe>>,
+    #[cfg(test)]
+    entity_apply_release_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    physics_owner_apply_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    breeding_plan_probe: Mutex<Option<BreedingPlanProbe>>,
+    #[cfg(test)]
+    breeding_commit_probe: Mutex<Option<BreedingCommitProbe>>,
+    #[cfg(test)]
+    sheep_grazing_plan_probe: Mutex<Option<SheepGrazingPlanProbe>>,
+    #[cfg(test)]
+    sheep_grazing_commit_probe: Mutex<Option<SheepGrazingCommitProbe>>,
+    #[cfg(test)]
+    sheep_grazing_owner_read_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    entity_save_owner_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    hostile_scan_probe: Mutex<Option<HostileScanProbe>>,
+    #[cfg(test)]
+    hostile_commit_probe: Mutex<Option<HostileCommitProbe>>,
+    #[cfg(test)]
+    player_push_commit_probe: Mutex<Option<PlayerPushCommitProbe>>,
+    #[cfg(test)]
+    pickup_snapshot_probe: Mutex<Option<PickupSnapshotProbe>>,
+    #[cfg(test)]
+    server_container_dispatch_probe: Mutex<Option<ServerContainerDispatchProbe>>,
+    #[cfg(test)]
+    server_relight_compute_probe: Mutex<Option<ServerRelightComputeProbe>>,
+    #[cfg(test)]
+    entity_goal_compute_probe: Mutex<Option<EntityGoalComputeProbe>>,
+    #[cfg(test)]
+    server_furnace_commit_probe: Mutex<Option<ServerFurnaceCommitProbe>>,
+    #[cfg(test)]
+    container_commit_probe: Mutex<Option<ContainerCommitProbe>>,
+    #[cfg(test)]
+    chunk_herd_claim_probe: Mutex<Option<ChunkHerdClaimProbe>>,
+    #[cfg(test)]
+    campfire_d1_probe: Mutex<Option<CampfireRecoveryProbe>>,
+    #[cfg(test)]
+    campfire_entity_probe: Mutex<Option<CampfireRecoveryProbe>>,
+    #[cfg(test)]
+    physics_boundary_observer_scans: AtomicU64,
+    #[cfg(test)]
+    active_entity_selection_visits: AtomicU64,
+    #[cfg(test)]
+    player_push_entity_visits: AtomicU64,
+    #[cfg(test)]
+    breeding_state_updates: AtomicU64,
+    #[cfg(test)]
+    breeding_commits: AtomicU64,
+    #[cfg(test)]
+    breeding_entity_scan_visits: AtomicU64,
+    #[cfg(test)]
+    sheep_grazing_entity_visits: AtomicU64,
+    #[cfg(test)]
+    hostile_attack_candidates: AtomicU64,
+    #[cfg(test)]
+    hostile_entity_scan_visits: AtomicU64,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct MoveFanoutProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct EntityApplyReleaseProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BreedingPlanProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct BreedingCommitProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SheepGrazingPlanProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct SheepGrazingCommitProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PlayerPushCommitProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct PickupSnapshotProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ServerRelightComputeProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct EntityGoalComputeProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+struct SessionInnerGuard<'a> {
+    guard: crate::lock_metrics::TimedGuard<MutexGuard<'a, SessionRegistryInner>>,
+    observation: &'a SessionPressureObservation,
+    dirty: bool,
+}
+
+impl Deref for SessionInnerGuard<'_> {
+    type Target = SessionRegistryInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl DerefMut for SessionInnerGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.dirty = true;
+        &mut self.guard
+    }
+}
+
+impl Drop for SessionInnerGuard<'_> {
+    fn drop(&mut self) {
+        if self.dirty {
+            self.observation.publish_sessions(&self.guard);
+        }
+    }
+}
+
+struct EntityStoreGuard<'a> {
+    access: EntityOwnerAccess,
+    marker: std::marker::PhantomData<&'a SessionRegistry>,
+}
+
+impl Deref for EntityStoreGuard<'_> {
+    type Target = EntityOwnerAccess;
+
+    fn deref(&self) -> &Self::Target {
+        &self.access
+    }
+}
+
+impl DerefMut for EntityStoreGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.access
+    }
+}
+
+struct SessionEntityGuards<'a> {
+    inner: SessionInnerGuard<'a>,
+    entities: EntityStoreGuard<'a>,
+    entity_lifecycle_tick: u64,
+}
+
+impl Deref for SessionEntityGuards<'_> {
+    type Target = SessionRegistryInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for SessionEntityGuards<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+impl Default for SessionRegistry {
+    fn default() -> Self {
+        let lane_count = std::thread::available_parallelism().map_or(1, usize::from);
+        Self::with_entity_owner_lanes(lane_count)
+    }
 }
 
 impl SessionRegistry {
+    fn with_entity_owner_lanes(lane_count: usize) -> Self {
+        Self::with_entity_owner_lanes_and_journal(lane_count, None)
+    }
+
+    fn with_entity_owner_lanes_and_journal(
+        lane_count: usize,
+        journal: Option<Box<dyn mc_entity::RegionalDecisionJournal>>,
+    ) -> Self {
+        let (simulation_tick_sender, _) = tokio::sync::watch::channel(0);
+        let (active_session_sender, _) = tokio::sync::watch::channel(0);
+        let pressure_observation = Arc::new(SessionPressureObservation::default());
+        Self {
+            inner: Mutex::new(SessionRegistryInner::default()),
+            prepared_cache: Mutex::new(PreparedChunkCache::default()),
+            entities: SessionEntityOwners::new(
+                Arc::clone(&pressure_observation),
+                lane_count,
+                journal,
+            ),
+            world_chunk_journal: Mutex::new(None),
+            world_chunk_journal_failure: tokio::sync::watch::channel(false).0,
+            containers: ContainerRegistryShards::default(),
+            campfire_cooking: Arc::new(Mutex::new(HashMap::new())),
+            pressure_observation,
+            outbound_pressure: Arc::new(OutboundPressureMetrics::default()),
+            world_time: AtomicU64::new(0),
+            players_sleeping_percentage: AtomicU32::new(DEFAULT_PLAYERS_SLEEPING_PERCENTAGE),
+            entity_lifecycle_tick: AtomicU64::new(0),
+            simulation_tick_sender,
+            active_session_sender,
+            session_empty_generation: AtomicU64::new(0),
+            session_became_empty: tokio::sync::Notify::new(),
+            player_save_generation: AtomicU64::new(0),
+            player_save_requested: tokio::sync::Notify::new(),
+            prepared_change_generation: AtomicU64::new(0),
+            prepared_changed: tokio::sync::Notify::new(),
+            #[cfg(test)]
+            prepared_claim_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            move_fanout_probe: Mutex::new(None),
+            #[cfg(test)]
+            entity_apply_release_probe: Mutex::new(None),
+            #[cfg(test)]
+            physics_owner_apply_probe: Mutex::new(None),
+            #[cfg(test)]
+            breeding_plan_probe: Mutex::new(None),
+            #[cfg(test)]
+            breeding_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            sheep_grazing_plan_probe: Mutex::new(None),
+            #[cfg(test)]
+            sheep_grazing_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            sheep_grazing_owner_read_probe: Mutex::new(None),
+            #[cfg(test)]
+            entity_save_owner_probe: Mutex::new(None),
+            #[cfg(test)]
+            hostile_scan_probe: Mutex::new(None),
+            #[cfg(test)]
+            hostile_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            player_push_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            pickup_snapshot_probe: Mutex::new(None),
+            #[cfg(test)]
+            server_container_dispatch_probe: Mutex::new(None),
+            #[cfg(test)]
+            server_relight_compute_probe: Mutex::new(None),
+            #[cfg(test)]
+            entity_goal_compute_probe: Mutex::new(None),
+            #[cfg(test)]
+            server_furnace_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            container_commit_probe: Mutex::new(None),
+            #[cfg(test)]
+            chunk_herd_claim_probe: Mutex::new(None),
+            #[cfg(test)]
+            campfire_d1_probe: Mutex::new(None),
+            #[cfg(test)]
+            campfire_entity_probe: Mutex::new(None),
+            #[cfg(test)]
+            physics_boundary_observer_scans: AtomicU64::new(0),
+            #[cfg(test)]
+            active_entity_selection_visits: AtomicU64::new(0),
+            #[cfg(test)]
+            player_push_entity_visits: AtomicU64::new(0),
+            #[cfg(test)]
+            breeding_state_updates: AtomicU64::new(0),
+            #[cfg(test)]
+            breeding_commits: AtomicU64::new(0),
+            #[cfg(test)]
+            breeding_entity_scan_visits: AtomicU64::new(0),
+            #[cfg(test)]
+            sheep_grazing_entity_visits: AtomicU64::new(0),
+            #[cfg(test)]
+            hostile_attack_candidates: AtomicU64::new(0),
+            #[cfg(test)]
+            hostile_entity_scan_visits: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn install_world_chunk_journal(
+        &self,
+        journal: super::world_journal::WorldChunkJournal,
+    ) {
+        *self
+            .world_chunk_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(journal);
+    }
+
+    pub(crate) fn world_chunk_journal(&self) -> Option<super::world_journal::WorldChunkJournal> {
+        self.world_chunk_journal
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn world_chunk_journal_watermark(&self) -> Option<u64> {
+        self.world_chunk_journal()
+            .and_then(|journal| journal.watermark())
+    }
+
+    pub(crate) fn subscribe_world_chunk_journal_failure(
+        &self,
+    ) -> tokio::sync::watch::Receiver<bool> {
+        self.world_chunk_journal_failure.subscribe()
+    }
+
+    pub(crate) fn report_world_chunk_journal_failure(&self) {
+        self.world_chunk_journal_failure.send_replace(true);
+    }
+
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub(super) fn insert_campfire_cooking(
+    #[must_use]
+    pub(crate) fn new_with_entity_owner_lanes(lane_count: usize) -> Self {
+        Self::with_entity_owner_lanes(lane_count)
+    }
+
+    #[must_use]
+    pub(crate) fn new_with_entity_owner_journal(
+        lane_count: usize,
+        journal: Box<dyn mc_entity::RegionalDecisionJournal>,
+    ) -> Self {
+        Self::with_entity_owner_lanes_and_journal(lane_count, Some(journal))
+    }
+
+    pub(crate) fn clear_recovered_entity_commits(
         &self,
-        position: mc_world::BlockPos,
-        input: ItemStack,
-        result: ItemStack,
-        cooking_time: u32,
-    ) -> Option<CampfireCookingState> {
-        let mut inner = self.lock_inner("insert campfire cooking");
-        let cooking = inner.campfire_cooking.entry(position).or_default();
-        cooking
-            .insert(input, result, cooking_time)
-            .then(|| cooking.clone())
+        phases: &[mc_entity::RegionPhase],
+    ) -> Result<(), mc_entity::RegionOwnerLaneError> {
+        self.entities
+            .handle
+            .clear_recovered_commits(phases.iter().copied())
     }
 
-    pub(super) fn campfire_cooking_positions(&self) -> Vec<mc_world::BlockPos> {
-        let inner = self.lock_inner("list campfire cooking");
-        inner.campfire_cooking.keys().copied().collect()
+    pub(crate) fn reconfigure_entity_owner_lanes(&self, lane_count: usize) -> usize {
+        self.entities.reconfigure_lanes(lane_count)
     }
 
-    pub(super) fn tick_campfire_cooking(
-        &self,
-        cooking_positions: &HashSet<mc_world::BlockPos>,
-    ) -> CampfireCookingUpdates {
-        let mut inner = self.lock_inner("tick campfire cooking");
-        let mut updates = CampfireCookingUpdates::default();
-        inner.campfire_cooking.retain(|position, cooking| {
-            if !cooking_positions.contains(position) {
-                return true;
-            }
-            let tick = cooking.tick();
-            updates
-                .completed
-                .extend(tick.completed.into_iter().map(|stack| (*position, stack)));
-            if tick.dirty {
-                updates.persisted.push((*position, cooking.clone()));
-            }
-            if tick.changed {
-                updates.changed.push((*position, cooking.clone()));
-            }
-            !cooking.is_empty()
-        });
-        updates
-    }
-
-    pub(super) fn restore_campfire_cooking(
-        &self,
-        position: mc_world::BlockPos,
-        cooking: CampfireCookingState,
-    ) -> bool {
-        if cooking.is_empty() {
-            return false;
-        }
-        let mut inner = self.lock_inner("restore campfire cooking");
-        match inner.campfire_cooking.entry(position) {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(cooking);
-                true
-            }
-            std::collections::hash_map::Entry::Occupied(_) => false,
-        }
-    }
-
-    pub(super) fn clear_campfire_cooking(&self, position: mc_world::BlockPos) -> bool {
-        let mut inner = self.lock_inner("clear campfire cooking");
-        inner.campfire_cooking.remove(&position).is_some()
-    }
-
-    fn lock_inner(
-        &self,
-        operation: &'static str,
-    ) -> crate::lock_metrics::TimedGuard<MutexGuard<'_, SessionRegistryInner>> {
-        crate::lock_metrics::timed_guard(
-            crate::lock_metrics::LockMetricKind::SessionRegistry,
-            operation,
-            Instant::now(),
-            self.inner.lock().unwrap_or_else(|poisoned| {
-                warn!(
-                    operation,
-                    "session registry mutex was poisoned; recovering state"
-                );
-                poisoned.into_inner()
-            }),
-        )
-    }
-
-    pub(crate) fn set_world_time(&self, world_time: u64) {
-        let mut inner = self.lock_inner("set world time");
-        inner.world_time = world_time;
-    }
-
-    pub(crate) fn advance_world_time(&self, ticks: u64) -> u64 {
-        let mut inner = self.lock_inner("advance world time");
-        inner.world_time = inner.world_time.wrapping_add(ticks);
-        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.saturating_add(ticks);
-        inner.world_time
-    }
-
-    pub(crate) fn world_time(&self) -> u64 {
-        let inner = self.lock_inner("read world time");
-        inner.world_time
-    }
-
-    pub(crate) fn simulation_tick(&self) -> u64 {
-        let inner = self.lock_inner("read simulation tick");
-        inner.entity_lifecycle_tick
-    }
-
-    pub(super) fn register_player_persistence(
-        &self,
-        id: SessionId,
-        state: Arc<Mutex<PlayerPersistedState>>,
-    ) {
-        let mut inner = self.lock_inner("register player persistence");
-        inner.player_persistence.insert(id, state);
-    }
-
-    pub(crate) fn persisted_player_states(&self) -> Vec<(uuid::Uuid, PlayerPersistedState)> {
-        let entries = {
-            let inner = self.lock_inner("save-all player persistence entries");
-            inner
-                .sessions
-                .iter()
-                .filter_map(|(id, session)| {
-                    inner
-                        .player_persistence
-                        .get(id)
-                        .map(|state| (session.uuid, Arc::clone(state)))
-                })
-                .collect::<Vec<_>>()
-        };
-        entries
-            .into_iter()
-            .map(|(uuid, state)| {
-                let state = crate::lock_metrics::timed_guard(
-                    crate::lock_metrics::LockMetricKind::PlayerPersistence,
-                    "save-all player persistence snapshot",
-                    Instant::now(),
-                    state.lock().unwrap_or_else(|poisoned| {
-                        warn!(
-                            "player persistence mutex was poisoned during save-all; recovering state"
-                        );
-                        poisoned.into_inner()
-                    }),
-                );
-                (uuid, (*state).clone())
-            })
-            .collect()
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) fn entity_owner_lane_count(&self) -> usize {
+        self.entities.status().lane_count
     }
 
     #[cfg(test)]
-    pub(super) fn register(
-        &self,
-        profile: &LoggedInProfile,
-        center: (i32, i32),
-        view_distance: i32,
-        desired: HashSet<(i32, i32)>,
-        tx: mpsc::Sender<OutboundCommand>,
-        pose: PlayerPose,
-    ) -> (SessionId, Vec<VisibilityDispatch>) {
-        self.try_register(SessionRegistration {
-            profile,
-            center,
-            view_distance,
-            desired,
-            tx,
-            pose,
-            max_sessions: usize::MAX,
-        })
-        .expect("unbounded session registration should not fail")
+    pub(super) fn reset_entity_owner_requests_for_test(&self) {
+        self.entities.reset_owner_requests_for_test();
     }
 
-    pub(super) fn try_register(
-        &self,
-        registration: SessionRegistration<'_>,
-    ) -> Result<(SessionId, Vec<VisibilityDispatch>), SessionAdmissionError> {
-        let mut inner = self.lock_inner("register play session");
-        if inner.sessions.len() >= registration.max_sessions {
-            return Err(SessionAdmissionError::ServerFull {
-                active: inner.sessions.len(),
-                max: registration.max_sessions,
-            });
-        }
-        if let Some((&existing_session, _)) = inner.sessions.iter().find(|(_, session)| {
-            session.uuid == registration.profile.uuid
-                || session
-                    .name
-                    .eq_ignore_ascii_case(&registration.profile.name)
-        }) {
-            return Err(SessionAdmissionError::DuplicateProfile { existing_session });
-        }
-        inner.next_id = inner.next_id.wrapping_add(1).max(1);
-        let id = inner.next_id;
-        let entity_id = i32::try_from(id).unwrap_or(i32::MAX);
-        for &chunk in &registration.desired {
-            inner.tickets.entry(chunk).or_default().insert(id);
-        }
-        inner.sessions.insert(
-            id,
-            PlaySession {
-                name: registration.profile.name.clone(),
-                uuid: registration.profile.uuid,
-                entity_id,
-                pose: registration.pose,
-                center: registration.center,
-                view_distance: registration.view_distance,
-                desired: registration.desired,
-                loaded: HashSet::new(),
-                visible_players: HashSet::new(),
-                visible_entities: HashSet::new(),
-                tx: registration.tx,
-            },
-        );
-        let dispatches = refresh_visibility_locked(&mut inner);
-        debug!(
-            session_id = id,
-            entity_id,
-            player = %registration.profile.name,
-            center_cx = registration.center.0,
-            center_cz = registration.center.1,
-            view_distance = registration.view_distance,
-            sessions = inner.sessions.len(),
-            tickets = inner.tickets.len(),
-            "play session registered"
-        );
-        Ok((id, dispatches))
+    #[cfg(test)]
+    pub(super) fn entity_owner_requests_for_test(&self) -> u64 {
+        self.entities.owner_requests_for_test()
     }
 
-    pub(crate) fn active_session_count(&self) -> usize {
-        let inner = self.lock_inner("active session count");
-        inner.sessions.len()
+    fn lock_inner(&self, operation: &'static str) -> SessionInnerGuard<'_> {
+        SessionInnerGuard {
+            guard: crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::SessionRegistry,
+                operation,
+                Instant::now(),
+                self.inner.lock().unwrap_or_else(|poisoned| {
+                    warn!(
+                        operation,
+                        "session registry mutex was poisoned; recovering state"
+                    );
+                    poisoned.into_inner()
+                }),
+            ),
+            observation: &self.pressure_observation,
+            dirty: false,
+        }
+    }
+
+    fn lock_entities(&self, operation: &'static str) -> EntityStoreGuard<'_> {
+        let _ = operation;
+        EntityStoreGuard {
+            access: self.entities.access(),
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    fn current_expected_entity_snapshots(
+        &self,
+        expected: impl IntoIterator<Item = EntitySnapshot>,
+    ) -> Vec<EntitySnapshot> {
+        let expected = expected.into_iter().collect::<Vec<_>>();
+        let ids = expected
+            .iter()
+            .map(|snapshot| snapshot.id)
+            .collect::<HashSet<_>>();
+        #[cfg(test)]
+        self.entities.record_owner_request_for_test();
+        let current = owner_result(self.entities.handle.snapshots_for_ids(&ids));
+        filter_current_expected_entity_snapshots(expected, current)
+    }
+
+    fn lock_session_entities(&self, operation: &'static str) -> SessionEntityGuards<'_> {
+        let entities = self.lock_entities(operation);
+        let inner = self.lock_inner(operation);
+        SessionEntityGuards {
+            inner,
+            entities,
+            entity_lifecycle_tick: self.simulation_tick(),
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_move_fanout_for_test(&self) {
+        let probe = self
+            .move_fanout_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe.reached.send(()).expect("move fanout probe receiver");
+            probe.resume.recv().expect("move fanout probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_session_movement_plan_for_test(&self) {
+        let probe = self
+            .entity_apply_release_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe.reached.send(()).expect("entity apply probe receiver");
+            probe.resume.recv().expect("entity apply probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_physics_owner_apply_for_test(&self) {
+        let probe = self
+            .physics_owner_apply_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("physics owner apply probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("physics owner apply probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_during_breeding_plan_for_test(&self) {
+        let probe = self
+            .breeding_plan_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe.reached.send(()).expect("breeding probe receiver");
+            probe.resume.recv().expect("breeding probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_between_breeding_entity_and_session_commit_for_test(&self) {
+        let probe = self
+            .breeding_commit_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("breeding commit probe receiver");
+            probe.resume.recv().expect("breeding commit probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_during_sheep_grazing_plan_for_test(&self) {
+        let probe = self
+            .sheep_grazing_plan_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("sheep grazing probe receiver");
+            probe.resume.recv().expect("sheep grazing probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_between_sheep_grazing_entity_and_session_commit_for_test(&self) {
+        let probe = self
+            .sheep_grazing_commit_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("sheep grazing commit probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("sheep grazing commit probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_sheep_grazing_owner_read_for_test(&self) {
+        let probe = self
+            .sheep_grazing_owner_read_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("sheep grazing owner read probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("sheep grazing owner read probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_before_entity_save_owner_barrier_for_test(&self) {
+        let probe = self
+            .entity_save_owner_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("entity save owner probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("entity save owner probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_between_player_push_entity_and_session_commit_for_test(&self) {
+        let probe = self
+            .player_push_commit_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("player push commit probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("player push commit probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn pause_during_pickup_snapshot_for_test(&self) {
+        let probe = self
+            .pickup_snapshot_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("pickup snapshot probe receiver");
+            probe.resume.recv().expect("pickup snapshot probe release");
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_server_relight_compute_probe(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .server_relight_compute_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ServerRelightComputeProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    pub(super) fn pause_before_server_relight_compute_for_test(&self) {
+        let probe = self
+            .server_relight_compute_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("server relight compute probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("server relight compute probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn install_entity_goal_compute_probe(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .entity_goal_compute_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(EntityGoalComputeProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_before_entity_goal_compute_for_test(&self) {
+        let probe = self
+            .entity_goal_compute_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("entity goal compute probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("entity goal compute probe release");
+        }
+    }
+
+    pub(crate) fn simulation_tick(&self) -> u64 {
+        self.entity_lifecycle_tick.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn subscribe_simulation_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.simulation_tick_sender.subscribe()
+    }
+
+    pub(super) fn player_pose(&self, id: SessionId) -> Option<PlayerPose> {
+        let inner = self.lock_inner("read player pose");
+        inner.sessions.get(&id).map(|session| session.pose)
     }
 
     pub(crate) fn pressure_snapshot(&self) -> SessionPressureSnapshot {
-        let inner = self.lock_inner("runtime pressure snapshot");
-        SessionPressureSnapshot {
-            sessions: inner.sessions.len(),
-            ticketed_chunks: inner.tickets.len(),
-            prepared_chunks: inner.prepared.len(),
-            server_entities: inner.entities.len(),
-            furnace_viewer_sets: inner.furnace_viewers.len(),
-            chest_viewer_sets: inner.chest_viewers.len(),
-            entity_dispatches: inner.entity_dispatches,
-            visibility_command_drops: VISIBILITY_COMMAND_DROPS.load(Ordering::Relaxed),
-            reliable_command_retries: RELIABLE_COMMAND_RETRIES.load(Ordering::Relaxed),
-            reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_IN_FLIGHT
-                .load(Ordering::Relaxed),
-            max_reliable_command_retries_in_flight: RELIABLE_COMMAND_RETRIES_MAX_IN_FLIGHT
-                .load(Ordering::Relaxed),
-            slow_client_write_timeouts: SLOW_CLIENT_WRITE_TIMEOUTS.load(Ordering::Relaxed),
-            slow_client_pressure_sheds: SLOW_CLIENT_PRESSURE_SHEDS.load(Ordering::Relaxed),
-        }
+        self.pressure_observation.snapshot(&self.outbound_pressure)
     }
 
-    pub(crate) fn disconnect_player(&self, player_id: u64, reason: String) -> bool {
-        let dispatch = {
-            let inner = self.lock_inner("extension disconnect player");
-            inner
-                .sessions
-                .get(&player_id)
-                .map(|session| VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: player_id,
-                        tx: session.tx.clone(),
-                    },
-                    command: OutboundCommand::DisconnectPlayer { reason },
-                })
-        };
-        let Some(dispatch) = dispatch else {
+    pub(crate) fn pressure_change_generation(&self) -> u64 {
+        self.outbound_pressure.change_generation()
+    }
+
+    pub(crate) async fn wait_for_pressure_change(&self, observed: u64) {
+        self.outbound_pressure.wait_for_change(observed).await;
+    }
+
+    pub(super) fn record_slow_client_write_timeout(&self) {
+        self.outbound_pressure.record_slow_client_write_timeout();
+    }
+
+    pub(super) fn record_slow_client_pressure_shed(&self) {
+        self.outbound_pressure.record_slow_client_pressure_shed();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_sheep_sheared_for_test(&self, entity_id: EntityId, sheared: bool) -> bool {
+        let mut inner = self.lock_session_entities("set test sheep sheared state");
+        let Some(entity) = inner.entities.snapshot(entity_id) else {
             return false;
         };
-        dispatch_visibility_commands(vec![dispatch]);
+        let Some(mut animal) = entity.animal else {
+            return false;
+        };
+        let Some(mut wool) = animal.sheep_wool else {
+            return false;
+        };
+        wool.sheared = sheared;
+        animal.sheep_wool = Some(wool);
+        if !inner.entities.set_animal_state(entity_id, animal) {
+            return false;
+        }
+        if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&entity_id) {
+            snapshot.animal = Some(animal);
+        }
         true
     }
 
-    pub(crate) fn send_custom_payload(
-        &self,
-        player_id: u64,
-        channel: Identifier,
-        payload: Vec<u8>,
-    ) -> bool {
-        let dispatch = {
-            let inner = self.lock_inner("extension custom payload");
-            inner
-                .sessions
-                .get(&player_id)
-                .map(|session| VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: player_id,
-                        tx: session.tx.clone(),
-                    },
-                    command: OutboundCommand::CustomPayload { channel, payload },
-                })
-        };
-        let Some(dispatch) = dispatch else {
-            return false;
-        };
-        dispatch_visibility_commands(vec![dispatch]);
-        true
+    #[cfg(test)]
+    fn breeding_state_update_count(&self) -> u64 {
+        self.breeding_state_updates.load(Ordering::Relaxed)
     }
 
-    pub(super) fn unregister(&self, id: SessionId) -> Vec<VisibilityDispatch> {
-        let (snapshot, recipients) = {
-            let mut inner = self.lock_inner("unregister play session");
-            let Some(session) = inner.sessions.remove(&id) else {
-                return Vec::new();
-            };
-            for viewers in inner.furnace_viewers.values_mut() {
-                viewers.remove(&id);
-            }
-            for viewers in inner.chest_viewers.values_mut() {
-                viewers.remove(&id);
-            }
-            inner.player_persistence.remove(&id);
-            inner
-                .furnace_viewers
-                .retain(|_, viewers| !viewers.is_empty());
-            let active_furnace_positions = inner
-                .furnace_viewers
-                .keys()
-                .copied()
-                .collect::<HashSet<_>>();
-            inner
-                .furnace_state_ids
-                .retain(|position, _| active_furnace_positions.contains(position));
-            inner.chest_viewers.retain(|_, viewers| !viewers.is_empty());
-            let active_chest_positions =
-                inner.chest_viewers.keys().copied().collect::<HashSet<_>>();
-            inner
-                .chest_state_ids
-                .retain(|position, _| active_chest_positions.contains(position));
-            let snapshot = session_snapshot(id, &session);
-            let mut recipients = Vec::new();
-            for (&observer_id, observer) in &mut inner.sessions {
-                if observer.visible_players.remove(&id) {
-                    recipients.push(SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    });
-                }
-            }
-            let desired_len = session.desired.len();
-            let loaded_len = session.loaded.len();
-            for chunk in session.desired {
-                if remove_ticket(&mut inner.tickets, chunk, id) {
-                    inner.prepared.remove(&chunk);
-                }
-            }
-            debug!(
-                session_id = id,
-                player = %session.name,
-                desired = desired_len,
-                loaded = loaded_len,
-                sessions = inner.sessions.len(),
-                tickets = inner.tickets.len(),
-                "play session unregistered"
-            );
-            (snapshot, recipients)
-        };
-        visibility_dispatches(recipients, OutboundCommand::DespawnPlayer(snapshot))
-    }
-
-    pub(super) fn register_furnace_viewer(
-        &self,
-        id: SessionId,
-        position: mc_world::BlockPos,
-    ) -> i32 {
-        let mut inner = self.lock_inner("register furnace viewer");
-        let state_id = *inner.furnace_state_ids.entry(position).or_insert(1);
-        let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
-            return state_id;
-        };
-        inner
-            .furnace_viewers
-            .entry(position)
-            .or_default()
-            .insert(id, FurnaceViewer { tx });
-        state_id
-    }
-
-    pub(super) fn unregister_furnace_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
-        let mut inner = self.lock_inner("unregister furnace viewer");
-        if let Some(viewers) = inner.furnace_viewers.get_mut(&position) {
-            viewers.remove(&id);
-            if viewers.is_empty() {
-                inner.furnace_viewers.remove(&position);
-                inner.furnace_state_ids.remove(&position);
-            }
-        }
-    }
-
-    pub(super) fn furnace_state_id(&self, position: mc_world::BlockPos) -> i32 {
-        let inner = self.lock_inner("furnace state id");
-        inner.furnace_state_ids.get(&position).copied().unwrap_or(1)
-    }
-
-    pub(super) fn register_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) -> i32 {
-        let mut inner = self.lock_inner("register chest viewer");
-        let state_id = *inner.chest_state_ids.entry(position).or_insert(1);
-        let Some(tx) = inner.sessions.get(&id).map(|session| session.tx.clone()) else {
-            return state_id;
-        };
-        inner
-            .chest_viewers
-            .entry(position)
-            .or_default()
-            .insert(id, FurnaceViewer { tx });
-        state_id
-    }
-
-    pub(super) fn unregister_chest_viewer(&self, id: SessionId, position: mc_world::BlockPos) {
-        let mut inner = self.lock_inner("unregister chest viewer");
-        if let Some(viewers) = inner.chest_viewers.get_mut(&position) {
-            viewers.remove(&id);
-            if viewers.is_empty() {
-                inner.chest_viewers.remove(&position);
-                inner.chest_state_ids.remove(&position);
-            }
-        }
-    }
-
-    pub(super) fn chest_state_id(&self, position: mc_world::BlockPos) -> i32 {
-        let inner = self.lock_inner("chest state id");
-        inner.chest_state_ids.get(&position).copied().unwrap_or(1)
-    }
-
-    pub(super) fn chest_slot_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        except: SessionId,
-        slots: Vec<ItemStack>,
-    ) -> (i32, Vec<VisibilityDispatch>) {
-        let (state_id, recipients) = {
-            let mut inner = self.lock_inner("chest slot dispatches");
-            let state_id = inner
-                .chest_state_ids
-                .entry(position)
-                .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
-                .or_insert(2);
-            let state_id = *state_id;
-            let recipients = chest_recipients(&inner, position, Some(except));
-            (state_id, recipients)
-        };
-        (
-            state_id,
-            visibility_dispatches(
-                recipients,
-                OutboundCommand::ChestSlots {
-                    position,
-                    state_id,
-                    slots,
-                },
-            ),
-        )
-    }
-
-    pub(super) fn server_chest_slot_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        slots: Vec<ItemStack>,
-    ) -> (i32, Vec<VisibilityDispatch>) {
-        let (state_id, recipients) = {
-            let mut inner = self.lock_inner("server chest slot dispatches");
-            let recipients = chest_recipients(&inner, position, None);
-            if recipients.is_empty() {
-                (
-                    inner.chest_state_ids.get(&position).copied().unwrap_or(1),
-                    recipients,
-                )
-            } else {
-                let state_id = inner
-                    .chest_state_ids
-                    .entry(position)
-                    .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
-                    .or_insert(2);
-                (*state_id, recipients)
-            }
-        };
-        if recipients.is_empty() {
-            return (state_id, Vec::new());
-        }
-        (
-            state_id,
-            visibility_dispatches(
-                recipients,
-                OutboundCommand::ChestSlots {
-                    position,
-                    state_id,
-                    slots,
-                },
-            ),
-        )
-    }
-
-    pub(super) fn block_entity_data_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        except: Option<SessionId>,
-        block_entity_type: i32,
-        nbt: Tag,
-    ) -> Vec<VisibilityDispatch> {
-        let chunk = (position.x.div_euclid(16), position.z.div_euclid(16));
-        let recipients = {
-            let inner = self.lock_inner("block entity data dispatches");
-            inner
-                .sessions
-                .iter()
-                .filter(|&(&id, session)| except != Some(id) && session.loaded.contains(&chunk))
-                .map(|(&id, session)| SessionRecipient {
-                    id,
-                    tx: session.tx.clone(),
-                })
-                .collect::<Vec<_>>()
-        };
-        visibility_dispatches(
-            recipients,
-            OutboundCommand::BlockEntityData {
-                position,
-                block_entity_type,
-                nbt,
-            },
-        )
-    }
-
-    pub(super) fn furnace_slot_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        except: SessionId,
-        slots: [ItemStack; 3],
-    ) -> (i32, Vec<VisibilityDispatch>) {
-        let (state_id, recipients) = {
-            let mut inner = self.lock_inner("furnace slot dispatches");
-            let state_id = inner
-                .furnace_state_ids
-                .entry(position)
-                .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
-                .or_insert(2);
-            let state_id = *state_id;
-            let recipients = furnace_recipients_except(&inner, position, except);
-            (state_id, recipients)
-        };
-        (
-            state_id,
-            visibility_dispatches(
-                recipients,
-                OutboundCommand::FurnaceSlots {
-                    position,
-                    state_id,
-                    slots,
-                },
-            ),
-        )
-    }
-
-    pub(super) fn server_furnace_slot_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        slots: [ItemStack; 3],
-    ) -> (i32, Vec<VisibilityDispatch>) {
-        let (state_id, recipients) = {
-            let mut inner = self.lock_inner("server furnace slot dispatches");
-            let recipients = furnace_recipients(&inner, position);
-            if recipients.is_empty() {
-                (
-                    inner.furnace_state_ids.get(&position).copied().unwrap_or(1),
-                    recipients,
-                )
-            } else {
-                let state_id = inner
-                    .furnace_state_ids
-                    .entry(position)
-                    .and_modify(|state_id| *state_id = state_id.wrapping_add(1))
-                    .or_insert(2);
-                (*state_id, recipients)
-            }
-        };
-        if recipients.is_empty() {
-            return (state_id, Vec::new());
-        }
-        (
-            state_id,
-            visibility_dispatches(
-                recipients,
-                OutboundCommand::FurnaceSlots {
-                    position,
-                    state_id,
-                    slots,
-                },
-            ),
-        )
-    }
-
-    pub(super) fn furnace_data_dispatches(
-        &self,
-        position: mc_world::BlockPos,
-        except: SessionId,
-        changed: Vec<(i16, i16)>,
-    ) -> Vec<VisibilityDispatch> {
-        let recipients = {
-            let inner = self.lock_inner("furnace dispatches");
-            furnace_recipients_except(&inner, position, except)
-        };
-        visibility_dispatches(
-            recipients,
-            OutboundCommand::FurnaceData { position, changed },
-        )
-    }
-
-    pub(super) fn is_furnace_tick_owner(
-        &self,
-        position: mc_world::BlockPos,
-        id: SessionId,
-    ) -> bool {
-        let inner = self.lock_inner("furnace tick owner");
-        inner
-            .furnace_viewers
-            .get(&position)
-            .and_then(|viewers| viewers.keys().min().copied())
-            == Some(id)
-    }
-
-    pub(super) fn replace_view(
-        &self,
-        id: SessionId,
-        center: (i32, i32),
-        view_distance: i32,
-        desired: HashSet<(i32, i32)>,
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("replace chunk view");
-        let (released, acquired, desired_len) = {
-            let Some(session) = inner.sessions.get_mut(&id) else {
-                return Vec::new();
-            };
-            let old = std::mem::replace(&mut session.desired, desired);
-            session.center = center;
-            session.view_distance = view_distance;
-            (
-                old.difference(&session.desired)
-                    .copied()
-                    .collect::<Vec<_>>(),
-                session
-                    .desired
-                    .difference(&old)
-                    .copied()
-                    .collect::<Vec<_>>(),
-                session.desired.len(),
-            )
-        };
-
-        for chunk in released {
-            if remove_ticket(&mut inner.tickets, chunk, id) {
-                inner.prepared.remove(&chunk);
-            }
-        }
-        for chunk in acquired {
-            inner.tickets.entry(chunk).or_default().insert(id);
-        }
-        let dispatches = refresh_visibility_locked(&mut inner);
-        debug!(
-            session_id = id,
-            center_cx = center.0,
-            center_cz = center.1,
-            view_distance,
-            desired = desired_len,
-            global_tickets = inner.tickets.len(),
-            shared_tickets = inner.tickets.values().filter(|s| s.len() > 1).count(),
-            "play session view tickets replaced"
-        );
-        dispatches
-    }
-
-    pub(super) fn mark_loaded(&self, id: SessionId, chunk: (i32, i32)) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("mark chunk loaded");
-        if let Some(session) = inner.sessions.get_mut(&id) {
-            if session.loaded.insert(chunk) {
-                refresh_loaded_chunk_for_session_locked(&mut inner, id, chunk)
-            } else {
-                Vec::new()
-            }
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub(super) fn mark_unloaded(
-        &self,
-        id: SessionId,
-        chunks: &[(i32, i32)],
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("mark chunks unloaded");
-        let mut dispatches = Vec::new();
-        if let Some(session) = inner.sessions.get_mut(&id) {
-            let mut removed = Vec::new();
-            for chunk in chunks {
-                if session.loaded.remove(chunk) {
-                    removed.push(*chunk);
-                }
-            }
-            for chunk in removed {
-                dispatches.extend(refresh_unloaded_chunk_for_session_locked(
-                    &mut inner, id, chunk,
-                ));
-            }
-            dispatches
-        } else {
-            Vec::new()
-        }
-    }
-
-    pub(super) fn update_pose(&self, id: SessionId, pose: PlayerPose) -> Vec<VisibilityDispatch> {
-        let (mut dispatches, snapshot, move_recipients) = {
-            let mut inner = self.lock_inner("update player pose");
-            let old_observers = visible_observers_locked(&inner, id);
-            let old_chunk = inner
-                .sessions
-                .get(&id)
-                .map(|session| session.pose.chunk_pos());
-            let Some(session) = inner.sessions.get_mut(&id) else {
-                return Vec::new();
-            };
-            session.pose = pose;
-            push_entities_from_player_locked(&mut inner, pose);
-            let crossed_chunk = old_chunk.is_some_and(|chunk| chunk != pose.chunk_pos());
-            let dispatches = if crossed_chunk {
-                refresh_player_target_visibility_locked(
-                    &mut inner,
-                    id,
-                    old_chunk.expect("old chunk recorded for existing session"),
-                    pose.chunk_pos(),
-                )
-            } else {
-                Vec::new()
-            };
-            let new_observers = if crossed_chunk {
-                visible_observers_locked(&inner, id)
-            } else {
-                old_observers.clone()
-            };
-            let Some(snapshot) = inner
-                .sessions
-                .get(&id)
-                .map(|session| session_snapshot(id, session))
-            else {
-                return dispatches;
-            };
-            let move_recipients =
-                session_recipients(&inner, old_observers.intersection(&new_observers).copied());
-            (dispatches, snapshot, move_recipients)
-        };
-
-        dispatches.extend(visibility_dispatches(
-            move_recipients,
-            OutboundCommand::MovePlayer(snapshot),
-        ));
-        dispatches
-    }
-
-    pub(super) fn broadcast_player_animation(&self, id: SessionId) -> Vec<VisibilityDispatch> {
-        let (entity_id, recipients) = {
-            let inner = self.lock_inner("broadcast player animation");
-            let Some(session) = inner.sessions.get(&id) else {
-                return Vec::new();
-            };
-            let entity_id = session.entity_id;
-            let recipients = session_recipients(&inner, visible_observers_locked(&inner, id));
-            (entity_id, recipients)
-        };
-        visibility_dispatches(recipients, OutboundCommand::AnimatePlayer { entity_id })
-    }
-
-    pub(super) fn broadcast_player_entity_data(
-        &self,
-        id: SessionId,
-        values: Vec<EntityDataValue>,
-    ) -> Vec<VisibilityDispatch> {
-        let (entity_id, recipients) = {
-            let inner = self.lock_inner("broadcast player entity data");
-            let Some(session) = inner.sessions.get(&id) else {
-                return Vec::new();
-            };
-            let entity_id = session.entity_id;
-            let recipients = session_recipients(&inner, visible_observers_locked(&inner, id));
-            (entity_id, recipients)
-        };
-        visibility_dispatches(
-            recipients,
-            OutboundCommand::PlayerEntityData { entity_id, values },
-        )
-    }
-
-    pub(super) fn ensure_chunk_herd(
-        &self,
-        chunk: (i32, i32),
-        spawns: &[HerdSpawn],
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("ensure chunk herd");
-        if !inner.spawned_entity_chunks.insert(chunk) {
-            return Vec::new();
-        }
-        let mut passive_count = 0_usize;
-        let mut hostile_count = 0_usize;
-        let mut spawned = Vec::new();
-        for spawn in spawns {
-            debug_assert_eq!(spawn.chunk, chunk);
-            if spawn.hostile {
-                if hostile_count >= MAX_HOSTILE_SPAWNS_PER_CHUNK {
-                    continue;
-                }
-            } else if passive_count >= MAX_PASSIVE_SPAWNS_PER_CHUNK {
-                continue;
-            }
-            if !spawn_far_enough_from_players(&inner, spawn.position) {
-                continue;
-            }
-            let uuid = herd_uuid(spawn.chunk, spawn.slot);
-            if inner.entities.contains_uuid(uuid) {
-                continue;
-            }
-            let mut entity = SpawnEntity::new(
-                spawn.entity_type_id,
-                spawn.entity_type_name.clone(),
-                spawn.position,
-            );
-            entity.uuid = Some(uuid);
-            apply_entity_facts(&mut entity);
-            entity.goal = if spawn.hostile {
-                GoalState::Wander {
-                    speed: HOSTILE_WANDER_SPEED,
-                    period_ticks: 20,
-                }
-            } else if entity_type_is_aquatic(&entity.type_name) {
-                entity.on_ground = false;
-                GoalState::AquaticWander {
-                    speed: PASSIVE_WANDER_SPEED * 0.9,
-                    vertical_speed: 0.18,
-                    period_ticks: 45,
-                }
-            } else {
-                GoalState::Wander {
-                    speed: PASSIVE_WANDER_SPEED,
-                    period_ticks: 80,
-                }
-            };
-            let id = inner.entities.spawn(entity);
-            let lifecycle_tick = inner.entity_lifecycle_tick;
-            inner.entity_spawn_ticks.insert(id, lifecycle_tick);
-            inner
-                .entity_type_aabbs
-                .entry(spawn.entity_type_id)
-                .or_insert_with(|| entity_aabb(&spawn.entity_type_name));
-            track_entity_chunk_locked(&mut inner, id, spawn.position);
-            inner.last_sent_entity_positions.insert(id, spawn.position);
-            spawned.push(id);
-            if spawn.hostile {
-                hostile_count += 1;
-            } else {
-                passive_count += 1;
-            }
-        }
-        debug!(
-            cx = chunk.0,
-            cz = chunk.1,
-            entities = spawns.len(),
-            "spawned passive entity herd"
-        );
-        spawned
-            .into_iter()
-            .flat_map(|id| spawn_entity_visibility_locked(&mut inner, id))
-            .collect()
-    }
-
-    pub(super) fn spawn_item_drop(
-        &self,
-        entity_type_id: i32,
-        position: Vec3,
-        stack: EntityItemStack,
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("spawn item drop");
-        spawn_item_drop_locked(&mut inner, entity_type_id, position, stack)
-    }
-
-    pub(super) fn spawn_xp_orb(
-        &self,
-        entity_type_id: i32,
-        position: Vec3,
-        value: i32,
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("spawn xp orb");
-        spawn_xp_orb_locked(&mut inner, entity_type_id, position, value)
+    #[cfg(test)]
+    fn breeding_commit_count(&self) -> u64 {
+        self.breeding_commits.load(Ordering::Relaxed)
     }
 
     pub(crate) fn configure_arrow_kill_rewards(
         &self,
         item_entity_type_id: Option<i32>,
         xp_orb_entity_type_id: Option<i32>,
+        arrow_entity_type_id: Option<i32>,
         items: Arc<ItemRegistry>,
+        item_facts: Arc<ItemFactsTable>,
         loot: Arc<mc_data::loot::LootTables>,
     ) {
         let mut inner = self.lock_inner("configure arrow kill rewards");
         inner.arrow_kill_rewards = ArrowKillRewards {
             item_entity_type_id,
             xp_orb_entity_type_id,
+            arrow_entity_type_id,
             items: Some(items),
+            item_facts: Some(item_facts),
             loot: Some(loot),
         };
     }
 
-    pub(super) fn spawn_falling_block(
+    pub(crate) fn configure_player_combat(
         &self,
-        entity_type_id: i32,
-        position: Vec3,
-        block_state: mc_world::BlockStateId,
-    ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("spawn falling block");
-        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:falling_block", position);
-        entity.block_state = Some(block_state.0);
-        entity.on_ground = false;
-        let id = inner.entities.spawn(entity);
-        let lifecycle_tick = inner.entity_lifecycle_tick;
-        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
-        inner
-            .entity_type_aabbs
-            .entry(entity_type_id)
-            .or_insert_with(|| entity_aabb("minecraft:falling_block"));
-        track_entity_chunk_locked(&mut inner, id, position);
-        inner.last_sent_entity_positions.insert(id, position);
-        spawn_entity_visibility_locked(&mut inner, id)
+        item_entity_type_id: Option<i32>,
+        xp_orb_entity_type_id: Option<i32>,
+        items: Arc<ItemRegistry>,
+        item_facts: Arc<ItemFactsTable>,
+    ) {
+        let mut inner = self.lock_inner("configure player combat resources");
+        inner.player_combat = PlayerCombatResources {
+            item_entity_type_id,
+            xp_orb_entity_type_id,
+            items,
+            item_facts,
+        };
     }
 
-    pub(super) fn spawn_arrow(
+    #[cfg(test)]
+    pub(super) fn spawn_arrow_legacy_for_test(
         &self,
         owner_session: Option<SessionId>,
         entity_type_id: i32,
@@ -1294,68 +1196,50 @@ impl SessionRegistry {
         velocity: Vec3,
         rotation: Rotation,
     ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("spawn arrow");
-        let mut entity = SpawnEntity::new(entity_type_id, "minecraft:arrow", position);
-        entity.velocity = velocity;
-        entity.rotation = rotation;
-        entity.on_ground = false;
-        apply_entity_facts(&mut entity);
-        let aabb = entity_aabb(&entity.type_name);
-        let id = inner.entities.spawn(entity);
-        let lifecycle_tick = inner.entity_lifecycle_tick;
-        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
-        inner.arrow_spawn_ticks.insert(id, lifecycle_tick);
-        if let Some(owner_session) = owner_session {
-            inner.arrow_owner_sessions.insert(id, owner_session);
-        }
-        inner
-            .entity_type_aabbs
-            .entry(entity_type_id)
-            .or_insert(aabb);
-        track_entity_chunk_locked(&mut inner, id, position);
-        inner.last_sent_entity_positions.insert(id, position);
-        spawn_entity_visibility_locked(&mut inner, id)
+        self.spawn_arrow_owned(owner_session, entity_type_id, position, velocity, rotation)
     }
 
-    pub(super) fn spawn_command_entity(
+    #[cfg(test)]
+    fn spawn_arrow_owned(
         &self,
+        owner_session: Option<SessionId>,
         entity_type_id: i32,
-        entity_type_name: String,
         position: Vec3,
+        velocity: Vec3,
+        rotation: Rotation,
     ) -> Vec<VisibilityDispatch> {
-        let mut inner = self.lock_inner("spawn command entity");
-        let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
-        apply_entity_facts(&mut entity);
-        let aabb = entity_aabb(&entity.type_name);
-        let id = inner.entities.spawn(entity);
-        let lifecycle_tick = inner.entity_lifecycle_tick;
-        inner.entity_spawn_ticks.insert(id, lifecycle_tick);
-        inner
-            .entity_type_aabbs
-            .entry(entity_type_id)
-            .or_insert(aabb);
-        track_entity_chunk_locked(&mut inner, id, position);
-        inner.last_sent_entity_positions.insert(id, position);
-        spawn_entity_visibility_locked(&mut inner, id)
+        let mut inner = self.lock_session_entities("spawn arrow");
+        spawn_arrow_locked(
+            &mut inner,
+            owner_session,
+            entity_type_id,
+            position,
+            velocity,
+            rotation,
+        )
+        .1
     }
 
+    #[cfg(test)]
     pub(super) fn nearby_item_entities(
         &self,
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let inner = self.lock_inner("nearby item entities");
+        let inner = self.lock_session_entities("nearby item entities");
         nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
-            entity.item_stack.is_some() && item_pickup_ready_locked(&inner, entity.id)
+            entity.item_stack.is_some()
+                && item_pickup_ready_locked(&inner, entity.id, inner.entity_lifecycle_tick)
         })
     }
 
+    #[cfg(test)]
     pub(super) fn nearby_grounded_arrows(
         &self,
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let inner = self.lock_inner("nearby grounded arrows");
+        let inner = self.lock_session_entities("nearby grounded arrows");
         nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
             entity.type_name == "minecraft:arrow"
                 && entity.on_ground
@@ -1363,729 +1247,45 @@ impl SessionRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn nearby_experience_entities(
         &self,
         position: Vec3,
         radius: f64,
     ) -> Vec<ServerEntitySnapshot> {
-        let inner = self.lock_inner("nearby experience entities");
+        let inner = self.lock_session_entities("nearby experience entities");
         nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
             entity.experience_value.is_some()
         })
     }
 
-    pub(super) fn nearby_hostile_entities(
-        &self,
-        position: Vec3,
-        radius: f64,
-    ) -> Vec<ServerEntitySnapshot> {
-        let inner = self.lock_inner("nearby hostile entities");
-        nearby_entity_snapshots_locked(&inner, position, radius, |entity| {
-            entity.item_stack.is_none() && is_hostile_entity(entity.type_name)
-        })
-    }
-
+    #[cfg(test)]
     pub(super) fn server_entity_snapshot(
         &self,
         entity_id: EntityId,
     ) -> Option<ServerEntitySnapshot> {
-        let inner = self.lock_inner("server entity snapshot");
-        inner
-            .entities
+        let entities = self.lock_entities("server entity snapshot");
+        entities
             .snapshot(entity_id)
             .map(server_entity_snapshot_from)
     }
 
-    pub(super) fn damage_server_entity(
+    #[cfg(test)]
+    pub(super) fn apply_player_melee_knockback_legacy_for_test(
         &self,
         entity_id: EntityId,
-        amount: f32,
-    ) -> Option<mc_entity::EntityDamage> {
-        let mut inner = self.lock_inner("damage server entity");
-        damage_server_entity_locked(&mut inner, entity_id, amount)
-    }
-
-    pub(super) fn claim_item_pickup(
-        &self,
-        entity_id: EntityId,
-        collector_session: SessionId,
-        max_count: i32,
-    ) -> Option<ClaimedPickup> {
-        if max_count <= 0 {
-            return None;
-        }
-        let (picked, update_entity, collector_entity_id, snapshot, recipients) = {
-            let mut inner = self.lock_inner("remove dead entity");
-            let snapshot = inner.entities.snapshot(entity_id)?;
-            if snapshot.lifecycle != EntityLifecycle::Alive {
-                return None;
-            }
-            if !item_pickup_ready_locked(&inner, entity_id) {
-                return None;
-            }
-            let mut stack = snapshot.item_stack?;
-            if stack.count <= 0 {
-                return None;
-            }
-            let picked_count = stack.count.min(max_count);
-            let picked = EntityItemStack {
-                item_id: stack.item_id,
-                count: picked_count,
-                damage: stack.damage,
-            };
-            stack.count -= picked_count;
-
-            if stack.count <= 0 {
-                let snapshot = inner
-                    .entities
-                    .remove(entity_id)
-                    .map(server_entity_snapshot_from)?;
-                clear_removed_entity_tracking_locked(&mut inner, entity_id);
-                let (collector_entity_id, recipients) =
-                    picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
-                (picked, false, collector_entity_id, snapshot, recipients)
-            } else {
-                if !inner.entities.set_item_stack(entity_id, Some(stack)) {
-                    return None;
-                }
-                let snapshot = inner
-                    .entities
-                    .snapshot(entity_id)
-                    .map(server_entity_snapshot_from)?;
-                let recipients =
-                    session_recipients(&inner, visible_entity_observers_locked(&inner, entity_id));
-                inner.entity_dispatches.data += recipients.len() as u64;
-                (picked, true, 0, snapshot, recipients)
-            }
-        };
-        let dispatches = if update_entity {
-            visibility_dispatches(recipients, OutboundCommand::UpdateEntityData(snapshot))
-        } else {
-            picked_entity_dispatches(
-                entity_id,
-                collector_entity_id,
-                picked.count,
-                snapshot,
-                recipients,
-            )
-        };
-        Some(ClaimedPickup {
-            stack: picked,
-            dispatches,
-        })
-    }
-
-    pub(super) fn claim_arrow_pickup(
-        &self,
-        entity_id: EntityId,
-        collector_session: SessionId,
-    ) -> Option<Vec<VisibilityDispatch>> {
-        let (snapshot, collector_entity_id, recipients) = {
-            let mut inner = self.lock_inner("claim arrow pickup");
-            let snapshot = inner.entities.snapshot(entity_id)?;
-            if snapshot.lifecycle != EntityLifecycle::Alive
-                || snapshot.type_name != "minecraft:arrow"
-                || !snapshot.on_ground
-                || snapshot.velocity != Vec3::ZERO
-            {
-                return None;
-            }
-            let snapshot = inner
-                .entities
-                .remove(entity_id)
-                .map(server_entity_snapshot_from)?;
-            clear_removed_entity_tracking_locked(&mut inner, entity_id);
-            let (collector_entity_id, recipients) =
-                picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
-            (snapshot, collector_entity_id, recipients)
-        };
-        Some(picked_entity_dispatches(
-            entity_id,
-            collector_entity_id,
-            1,
-            snapshot,
-            recipients,
-        ))
-    }
-
-    pub(super) fn remove_server_entity(
-        &self,
-        entity_id: EntityId,
-    ) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
-        let mut inner = self.lock_inner("despawn entity");
-        remove_server_entity_locked(&mut inner, entity_id)
-    }
-
-    pub(super) fn remove_picked_item(
-        &self,
-        entity_id: EntityId,
-        collector_session: SessionId,
-        amount: i32,
-    ) -> Option<Vec<VisibilityDispatch>> {
-        let (snapshot, collector_entity_id, recipients) = {
-            let mut inner = self.lock_inner("remove picked item entity");
-            let snapshot = inner
-                .entities
-                .remove(entity_id)
-                .map(server_entity_snapshot_from)?;
-            clear_removed_entity_tracking_locked(&mut inner, entity_id);
-            let (collector_entity_id, recipients) =
-                picked_entity_recipients_locked(&mut inner, entity_id, collector_session);
-            (snapshot, collector_entity_id, recipients)
-        };
-        Some(picked_entity_dispatches(
-            entity_id,
-            collector_entity_id,
-            amount,
-            snapshot,
-            recipients,
-        ))
-    }
-
-    pub(crate) fn tick_entities_and_collect_physics_queries(
-        &self,
-        tick: u64,
-    ) -> Vec<EntityPhysicsQuery> {
-        let mut inner = self.lock_inner("tick entities");
-        if inner.entities.is_empty() {
-            return Vec::new();
-        }
-        let active_chunks: HashSet<_> = inner
-            .sessions
-            .values()
-            .flat_map(|session| session.loaded.iter().copied())
-            .collect();
-        update_hostile_targets_locked(&mut inner);
-        if active_chunks.is_empty() {
-            return Vec::new();
-        }
-        let player_positions: Vec<_> = inner
-            .sessions
-            .values()
-            .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
-            .collect();
-        let pathing_probe = LoadedChunkPathingProbe {
-            active_chunks: &active_chunks,
-        };
-        inner
-            .entities
-            .tick_goals_with_pathing(tick, &pathing_probe, PathingBudget::DEFAULT);
-        let mut candidates: Vec<_> = inner
-            .entities
-            .views()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .filter_map(|entity| {
-                let chunk = chunk_pos_from_coords(entity.position.x, entity.position.z);
-                if !active_chunks.contains(&chunk)
-                    || !entity_is_near_player_chunk(chunk, &player_positions)
-                {
-                    return None;
-                }
-                let aabb = inner
-                    .entity_type_aabbs
-                    .get(&entity.type_id)
-                    .copied()
-                    .unwrap_or_else(|| entity_aabb(entity.type_name));
-                Some((
-                    entity_distance_sq_to_players(entity.position, &player_positions),
-                    EntityPhysicsQuery {
-                        id: entity.id,
-                        position: entity.position,
-                        velocity: entity.velocity,
-                        aabb,
-                        on_ground: entity.on_ground,
-                        kind: if entity.type_name == "minecraft:arrow" {
-                            EntityPhysicsKind::ArrowProjectile
-                        } else {
-                            EntityPhysicsKind::Default
-                        },
-                    },
-                ))
-            })
-            .collect();
-        if candidates.len() > ENTITY_PHYSICS_QUERY_BUDGET_PER_TICK {
-            candidates.select_nth_unstable_by(
-                ENTITY_PHYSICS_QUERY_BUDGET_PER_TICK,
-                |(left, _), (right, _)| left.total_cmp(right),
-            );
-            candidates.truncate(ENTITY_PHYSICS_QUERY_BUDGET_PER_TICK);
-        }
-        candidates.into_iter().map(|(_, query)| query).collect()
-    }
-
-    pub(crate) fn restore_persisted_entities(
-        &self,
-        entities: impl IntoIterator<Item = impl Into<PersistedEntityRecord>>,
-    ) -> usize {
-        let mut inner = self.lock_inner("restore persisted entities");
-        let records = entities
-            .into_iter()
-            .map(Into::into)
-            .collect::<Vec<PersistedEntityRecord>>();
-        let max_age = records
-            .iter()
-            .map(|record| u64::try_from(record.age.max(0)).unwrap_or(0))
-            .max()
-            .unwrap_or(0);
-        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.max(max_age);
-        let mut restored = 0;
-        for record in records {
-            let entity = record.snapshot;
-            let aabb = entity_aabb(&entity.type_name);
-            let chunk = server_entity_chunk_pos(&server_entity_snapshot_from(entity.clone()));
-            let type_id = entity.type_id;
-            let entity_id = entity.id;
-            let position = entity.position;
-            let is_arrow = entity.type_name == "minecraft:arrow";
-            let is_item = entity.item_stack.is_some();
-            if inner.entities.insert_snapshot(entity) {
-                inner.entity_type_aabbs.entry(type_id).or_insert(aabb);
-                track_entity_chunk_locked(&mut inner, entity_id, position);
-                if is_item {
-                    let age = u64::try_from(record.age.max(0)).unwrap_or(0);
-                    let spawn_tick = inner.entity_lifecycle_tick.saturating_sub(age);
-                    inner.entity_spawn_ticks.insert(entity_id, spawn_tick);
-                    if record.pickup_delay > 0 {
-                        let ready_tick = inner
-                            .entity_lifecycle_tick
-                            .saturating_add(u64::try_from(record.pickup_delay).unwrap_or(0));
-                        inner.item_pickup_ready_ticks.insert(entity_id, ready_tick);
-                    }
-                } else {
-                    let age = u64::try_from(record.age.max(0)).unwrap_or(0);
-                    let spawn_tick = inner.entity_lifecycle_tick.saturating_sub(age);
-                    inner.entity_spawn_ticks.insert(entity_id, spawn_tick);
-                }
-                if is_arrow {
-                    let spawn_tick = inner
-                        .entity_spawn_ticks
-                        .get(&entity_id)
-                        .copied()
-                        .unwrap_or(inner.entity_lifecycle_tick);
-                    inner.arrow_spawn_ticks.insert(entity_id, spawn_tick);
-                }
-                inner.spawned_entity_chunks.insert(chunk);
-                restored += 1;
-            }
-        }
-        restored
-    }
-
-    pub(crate) fn persisted_entity_records(&self) -> Vec<PersistedEntityRecord> {
-        let inner = self.lock_inner("persisted entity snapshots");
-        inner
-            .entities
-            .snapshots()
-            .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-            .map(|entity| {
-                let age = inner
-                    .entity_spawn_ticks
-                    .get(&entity.id)
-                    .map(|spawn_tick| inner.entity_lifecycle_tick.saturating_sub(*spawn_tick))
-                    .unwrap_or(0)
-                    .min(i32::MAX as u64) as i32;
-                let pickup_delay = inner
-                    .item_pickup_ready_ticks
-                    .get(&entity.id)
-                    .map(|ready_tick| ready_tick.saturating_sub(inner.entity_lifecycle_tick))
-                    .unwrap_or(0)
-                    .min(i32::from(i16::MAX) as u64) as i32;
-                PersistedEntityRecord {
-                    snapshot: entity,
-                    age,
-                    pickup_delay,
-                }
-            })
-            .collect()
-    }
-
-    pub(crate) fn apply_entity_physics_and_dispatch(&self, tick: u64, steps: &[EntityPhysicsStep]) {
-        let mut inner = self.lock_inner("apply entity physics");
-        inner.entity_lifecycle_tick = inner.entity_lifecycle_tick.max(tick);
-        if inner.entities.is_empty() {
-            return;
-        }
-        let mut dispatches = despawn_expired_arrows_locked(&mut inner);
-        dispatches.extend(despawn_expired_items_locked(&mut inner));
-        let old_chunks: HashMap<_, _> = steps
-            .iter()
-            .filter_map(|step| {
-                inner
-                    .entity_chunks
-                    .get(&step.id)
-                    .copied()
-                    .map(|chunk| (step.id, chunk))
-            })
-            .collect();
-        let old_positions: HashMap<_, _> = steps
-            .iter()
-            .filter_map(|step| {
-                inner
-                    .entities
-                    .view(step.id)
-                    .map(|entity| (step.id, entity.position))
-            })
-            .collect();
-        let crossed_visibility_boundary = steps.iter().any(|step| {
-            old_chunks.get(&step.id).is_some_and(|old_chunk| {
-                *old_chunk != chunk_pos_from_coords(step.position.x, step.position.z)
-            })
-        });
-        let old_observers_by_entity = if crossed_visibility_boundary {
-            steps
-                .iter()
-                .map(|step| {
-                    (
-                        step.id,
-                        visible_entity_observers_locked(&inner, step.id)
-                            .into_iter()
-                            .collect::<HashSet<_>>(),
-                    )
-                })
-                .collect::<HashMap<_, _>>()
-        } else {
-            HashMap::new()
-        };
-        for step in steps {
-            let _ = inner.entities.set_position(step.id, step.position);
-            let _ = inner.entities.set_velocity(step.id, step.velocity);
-            let _ = inner.entities.set_on_ground(step.id, step.on_ground);
-            if let Some(old_chunk) = old_chunks.get(&step.id).copied() {
-                let new_chunk = chunk_pos_from_coords(step.position.x, step.position.z);
-                if old_chunk != new_chunk {
-                    move_entity_chunk_locked(&mut inner, step.id, old_chunk, new_chunk);
-                }
-            }
-        }
-        dispatches.extend(resolve_arrow_entity_hits_locked(
-            &mut inner,
-            steps,
-            &old_positions,
-        ));
-        if crossed_visibility_boundary {
-            dispatches.extend(
-                steps
-                    .iter()
-                    .filter_map(|step| {
-                        let old_chunk = old_chunks.get(&step.id).copied()?;
-                        let new_chunk = chunk_pos_from_coords(step.position.x, step.position.z);
-                        (old_chunk != new_chunk).then_some((step.id, old_chunk, new_chunk))
-                    })
-                    .flat_map(|(entity_id, old_chunk, new_chunk)| {
-                        refresh_entity_target_visibility_locked(
-                            &mut inner, entity_id, old_chunk, new_chunk,
-                        )
-                    }),
-            );
-        }
-        if !tick.is_multiple_of(ENTITY_MOVE_SEND_INTERVAL_TICKS) {
-            drop(inner);
-            dispatch_visibility_commands(dispatches);
-            return;
-        }
-
-        let move_dispatch_start = dispatches.len();
-        for step in steps {
-            let Some(snapshot) = inner
-                .entities
-                .snapshot(step.id)
-                .map(server_entity_snapshot_from)
-            else {
-                continue;
-            };
-            let Some(old_position) = inner.last_sent_entity_positions.get(&snapshot.id).copied()
-            else {
-                inner
-                    .last_sent_entity_positions
-                    .insert(snapshot.id, snapshot.position);
-                continue;
-            };
-            let delta = Vec3 {
-                x: snapshot.position.x - old_position.x,
-                y: snapshot.position.y - old_position.y,
-                z: snapshot.position.z - old_position.z,
-            };
-            if delta.x == 0.0 && delta.y == 0.0 && delta.z == 0.0 {
-                continue;
-            }
-            for observer_id in visible_entity_observers_locked(&inner, snapshot.id) {
-                if crossed_visibility_boundary
-                    && !old_observers_by_entity
-                        .get(&snapshot.id)
-                        .is_some_and(|observers| observers.contains(&observer_id))
-                {
-                    continue;
-                }
-                if let Some(observer) = inner.sessions.get(&observer_id) {
-                    dispatches.push(VisibilityDispatch {
-                        recipient: SessionRecipient {
-                            id: observer_id,
-                            tx: observer.tx.clone(),
-                        },
-                        command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
-                            id: snapshot.id,
-                            delta,
-                            velocity: snapshot.velocity,
-                            rotation: snapshot.rotation,
-                            on_ground: snapshot.on_ground,
-                            send_velocity: entity_should_send_velocity(&snapshot),
-                        }),
-                    });
-                }
-            }
-            inner
-                .last_sent_entity_positions
-                .insert(snapshot.id, snapshot.position);
-        }
-        record_entity_dispatches_locked(&mut inner, &dispatches[move_dispatch_start..]);
-        drop(inner);
-        dispatch_visibility_commands(dispatches);
-    }
-
-    pub(crate) fn landed_falling_blocks(
-        &self,
-        steps: &[EntityPhysicsStep],
-    ) -> Vec<LandedFallingBlock> {
-        let inner = self.lock_inner("collect landed falling blocks");
-        steps
-            .iter()
-            .filter(|step| step.on_ground)
-            .filter_map(|step| {
-                let entity = inner.entities.view(step.id)?;
-                if entity.lifecycle != EntityLifecycle::Alive
-                    || entity.type_name != "minecraft:falling_block"
-                {
-                    return None;
-                }
-                let state = entity.block_state?;
-                Some(LandedFallingBlock {
-                    id: step.id,
-                    pos: mc_world::BlockPos {
-                        x: step.position.x.floor() as i32,
-                        y: step.position.y.floor() as i32,
-                        z: step.position.z.floor() as i32,
-                    },
-                    state: mc_world::BlockStateId(state),
-                })
-            })
-            .collect()
-    }
-
-    pub(crate) fn remove_landed_falling_blocks(&self, ids: &[EntityId]) {
-        if ids.is_empty() {
-            return;
-        }
-        let mut inner = self.lock_inner("remove landed falling blocks");
-        let dispatches = ids
-            .iter()
-            .filter_map(|id| {
-                remove_server_entity_locked(&mut inner, *id).map(|(_, dispatches)| dispatches)
-            })
-            .flatten()
-            .collect::<Vec<_>>();
-        drop(inner);
-        dispatch_visibility_commands(dispatches);
-    }
-
-    pub(super) fn loaded_recipients_for_chunks(
-        &self,
-        chunks: &HashSet<(i32, i32)>,
-        except: Option<SessionId>,
-    ) -> Vec<SessionRecipient> {
-        let inner = self.lock_inner("loaded recipients for chunks");
-        let mut ids = HashSet::new();
-        for chunk in chunks {
-            if let Some(subscribers) = inner.tickets.get(chunk) {
-                ids.extend(subscribers.iter().copied().filter(|id| Some(*id) != except));
-            }
-        }
-        ids.into_iter()
-            .filter_map(|id| {
-                let session = inner.sessions.get(&id)?;
-                if !chunks.iter().any(|chunk| session.loaded.contains(chunk)) {
-                    return None;
-                }
-                Some(SessionRecipient {
-                    id,
-                    tx: session.tx.clone(),
-                })
-            })
-            .collect()
-    }
-
-    pub(super) fn prepared_chunk_or_claim(&self, chunk: (i32, i32)) -> PreparedChunkClaimResult {
-        #[cfg(test)]
-        self.prepared_claim_calls.fetch_add(1, Ordering::Relaxed);
-
-        let mut inner = self.lock_inner("prepared chunk claim");
-        if let Some(prepared) = inner.prepared.get(&chunk).cloned() {
-            return PreparedChunkClaimResult::Cached(prepared);
-        }
-        if inner.prepared_in_flight.contains_key(&chunk) {
-            return PreparedChunkClaimResult::InFlight;
-        }
-
-        inner.next_prepared_claim = inner.next_prepared_claim.wrapping_add(1).max(1);
-        let claim = PreparedChunkClaim(inner.next_prepared_claim);
-        inner.prepared_in_flight.insert(chunk, claim);
-        PreparedChunkClaimResult::Claimed(claim)
+        player_position: Vec3,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_session_entities("legacy player melee knockback test");
+        apply_player_melee_knockback_locked(&mut inner, entity_id, player_position)
     }
 
     #[cfg(test)]
-    pub(super) fn prepared_chunk_claim_call_count(&self) -> u64 {
-        self.prepared_claim_calls.load(Ordering::Relaxed)
+    fn terrain_pathing_entity_count(&self) -> usize {
+        self.lock_inner("terrain pathing entity count")
+            .terrain_pathing_entities
+            .len()
     }
-
-    #[cfg(test)]
-    pub(super) fn prepared_chunk(&self, chunk: (i32, i32)) -> Option<Arc<PreparedChunkFrame>> {
-        let inner = self.lock_inner("prepared chunk lookup");
-        inner.prepared.get(&chunk).cloned()
-    }
-
-    pub(super) fn release_prepared_chunk_claim(
-        &self,
-        chunk: (i32, i32),
-        claim: PreparedChunkClaim,
-    ) -> bool {
-        let mut inner = self.lock_inner("release prepared chunk claim");
-        if inner.prepared_in_flight.get(&chunk).copied() != Some(claim) {
-            return false;
-        }
-        inner.prepared_in_flight.remove(&chunk);
-        true
-    }
-
-    pub(super) fn cache_prepared_chunk(
-        &self,
-        chunk: (i32, i32),
-        prepared: Arc<PreparedChunkFrame>,
-    ) {
-        let mut inner = self.lock_inner("cache prepared chunk");
-        if inner.tickets.contains_key(&chunk) {
-            inner.prepared.entry(chunk).or_insert(prepared);
-        }
-    }
-
-    pub(super) fn invalidate_prepared_chunks(&self, chunks: &HashSet<(i32, i32)>) {
-        if chunks.is_empty() {
-            return;
-        }
-        let mut inner = self.lock_inner("invalidate prepared chunks");
-        for chunk in chunks {
-            inner.prepared.remove(chunk);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn ticketed_chunks_sorted(&self) -> Vec<(i32, i32)> {
-        let inner = self.lock_inner("ticketed chunks sorted");
-        let mut chunks: Vec<_> = inner.tickets.keys().copied().collect();
-        chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
-        chunks
-    }
-
-    pub(crate) fn loaded_chunks_sorted(&self) -> Vec<(i32, i32)> {
-        let inner = self.lock_inner("loaded chunks sorted");
-        let mut chunks: Vec<_> = inner
-            .sessions
-            .values()
-            .flat_map(|session| session.loaded.iter().copied())
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        chunks.sort_unstable_by_key(|&(cx, cz)| (cz, cx));
-        chunks
-    }
-}
-
-struct LoadedChunkPathingProbe<'a> {
-    active_chunks: &'a HashSet<(i32, i32)>,
-}
-
-impl PathingProbe for LoadedChunkPathingProbe<'_> {
-    fn can_stand_at(&self, position: Vec3) -> PathingProbeResult {
-        if !position.y.is_finite()
-            || position.y.floor() < f64::from(mc_world::chunk::MIN_Y)
-            || position.y.floor() >= f64::from(mc_world::chunk::MAX_Y)
-        {
-            return PathingProbeResult::Blocked;
-        }
-
-        // Integrated AI pathing gates movement to loaded chunks and obvious
-        // world-height bounds; terrain collision is handled by the later
-        // sampled entity physics pass.
-        if self
-            .active_chunks
-            .contains(&chunk_pos_from_coords(position.x, position.z))
-        {
-            PathingProbeResult::Walkable
-        } else {
-            PathingProbeResult::Unloaded
-        }
-    }
-}
-
-fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEntitySnapshot {
-    PlayerEntitySnapshot {
-        session_id: id,
-        entity_id: session.entity_id,
-        uuid: session.uuid,
-        name: session.name.clone(),
-        pose: session.pose,
-    }
-}
-
-pub(super) fn server_entity_snapshot_from(
-    entity: mc_entity::EntitySnapshot,
-) -> ServerEntitySnapshot {
-    ServerEntitySnapshot {
-        id: entity.id,
-        uuid: entity.uuid,
-        type_id: entity.type_id,
-        type_name: entity.type_name,
-        position: entity.position,
-        rotation: entity.rotation,
-        velocity: entity.velocity,
-        on_ground: entity.on_ground,
-        item_stack: entity.item_stack,
-        experience_value: entity.experience_value,
-        block_state: entity.block_state,
-        attack_damage: entity.attributes.base(&AttributeKind::AttackDamage),
-    }
-}
-
-fn server_entity_snapshot_from_view(entity: EntityView<'_>) -> ServerEntitySnapshot {
-    ServerEntitySnapshot {
-        id: entity.id,
-        uuid: entity.uuid,
-        type_id: entity.type_id,
-        type_name: entity.type_name.to_owned(),
-        position: entity.position,
-        rotation: entity.rotation,
-        velocity: entity.velocity,
-        on_ground: entity.on_ground,
-        item_stack: entity.item_stack,
-        experience_value: entity.experience_value,
-        block_state: entity.block_state,
-        attack_damage: entity.attributes.base(&AttributeKind::AttackDamage),
-    }
-}
-
-fn nearby_entity_snapshots_locked(
-    inner: &SessionRegistryInner,
-    position: Vec3,
-    radius: f64,
-    predicate: impl Fn(EntityView<'_>) -> bool,
-) -> Vec<ServerEntitySnapshot> {
-    let radius_sq = radius * radius;
-    inner
-        .entities
-        .views()
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .filter(|entity| predicate(*entity))
-        .filter(|entity| distance_sq(entity.position, position) <= radius_sq)
-        .map(server_entity_snapshot_from_view)
-        .collect()
 }
 
 fn apply_entity_facts(entity: &mut SpawnEntity) {
@@ -2111,759 +1311,25 @@ fn apply_entity_facts(entity: &mut SpawnEntity) {
             .attributes
             .set_base(AttributeKind::AttackDamage, value);
     }
-}
-
-fn server_entity_chunk_pos(entity: &ServerEntitySnapshot) -> (i32, i32) {
-    chunk_pos_from_coords(entity.position.x, entity.position.z)
-}
-
-fn spawn_far_enough_from_players(inner: &SessionRegistryInner, position: Vec3) -> bool {
-    let min_distance_sq =
-        MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER * MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER;
-    inner.sessions.values().all(|session| {
-        distance_sq(
-            position,
-            Vec3::new(session.pose.x, session.pose.y, session.pose.z),
-        ) > min_distance_sq
-    })
-}
-
-fn item_pickup_ready_locked(inner: &SessionRegistryInner, entity_id: EntityId) -> bool {
-    inner
-        .item_pickup_ready_ticks
-        .get(&entity_id)
-        .is_none_or(|ready_tick| inner.entity_lifecycle_tick >= *ready_tick)
-}
-
-fn entity_is_near_player_chunk(chunk: (i32, i32), player_positions: &[Vec3]) -> bool {
-    player_positions.iter().any(|position| {
-        let player_chunk = chunk_pos_from_coords(position.x, position.z);
-        (chunk.0 - player_chunk.0).abs() <= ENTITY_SIMULATION_DISTANCE_CHUNKS
-            && (chunk.1 - player_chunk.1).abs() <= ENTITY_SIMULATION_DISTANCE_CHUNKS
-    })
-}
-
-fn entity_distance_sq_to_players(position: Vec3, player_positions: &[Vec3]) -> f64 {
-    player_positions
-        .iter()
-        .map(|player| distance_sq(position, *player))
-        .min_by(f64::total_cmp)
-        .unwrap_or(f64::INFINITY)
-}
-
-fn entity_type_is_aquatic(type_name: &str) -> bool {
-    matches!(
-        type_name,
-        "minecraft:cod"
-            | "minecraft:salmon"
-            | "minecraft:tropical_fish"
-            | "minecraft:pufferfish"
-            | "minecraft:squid"
-            | "minecraft:glow_squid"
-            | "minecraft:dolphin"
-            | "minecraft:axolotl"
-            | "minecraft:turtle"
-    )
-}
-
-fn entity_should_send_velocity(snapshot: &ServerEntitySnapshot) -> bool {
-    if snapshot.velocity == Vec3::ZERO {
-        return false;
-    }
-    !matches!(
-        snapshot.type_name.as_str(),
-        "minecraft:item" | "minecraft:experience_orb"
-    )
-}
-
-fn update_hostile_targets_locked(inner: &mut SessionRegistryInner) {
-    let players: Vec<_> = inner
-        .sessions
-        .values()
-        .map(|session| Vec3::new(session.pose.x, session.pose.y, session.pose.z))
-        .collect();
-    let hostiles: Vec<_> = inner
-        .entities
-        .views()
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .filter(|entity| is_hostile_entity(entity.type_name))
-        .map(|entity| {
-            let follow_range = entity
-                .attributes
-                .base(&AttributeKind::FollowRange)
-                .unwrap_or(16.0);
-            (entity.id, entity.position, follow_range)
-        })
-        .collect();
-    if players.is_empty() {
-        for (hostile_id, _, _) in hostiles {
-            let _ = inner.entities.set_goal(hostile_id, hostile_wander_goal());
+    match entity.type_name.as_str() {
+        "minecraft:sheep" => {
+            entity.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(
+                mc_entity::SheepColor::White,
+            ));
         }
-        return;
-    }
-    for (hostile_id, hostile_position, follow_range) in hostiles {
-        let max_distance_sq = follow_range * follow_range;
-        let target = players
-            .iter()
-            .copied()
-            .filter(|position| distance_sq(*position, hostile_position) <= max_distance_sq)
-            .min_by(|left, right| {
-                distance_sq(*left, hostile_position)
-                    .total_cmp(&distance_sq(*right, hostile_position))
-            });
-        let goal = target.map_or(hostile_wander_goal(), |target| GoalState::FollowPosition {
-            target,
-            speed: HOSTILE_FOLLOW_SPEED,
-        });
-        let _ = inner.entities.set_goal(hostile_id, goal);
+        "minecraft:cow" | "minecraft:chicken" => {
+            entity.animal = Some(mc_entity::AnimalBreedingState::adult());
+        }
+        _ => {}
     }
 }
 
-fn hostile_wander_goal() -> GoalState {
-    GoalState::Wander {
-        speed: HOSTILE_FOLLOW_SPEED,
-        period_ticks: 20,
-    }
-}
-
-pub(super) fn distance_sq(a: Vec3, b: Vec3) -> f64 {
-    let dx = a.x - b.x;
-    let dy = a.y - b.y;
-    let dz = a.z - b.z;
-    dx * dx + dy * dy + dz * dz
-}
-
-pub(super) fn entity_aabb(type_name: &str) -> mc_physics::Aabb {
-    let facts = mc_data::Identifier::parse(type_name.to_string())
-        .map(|id| mc_data::entity_types::fallback_entity_type_facts(id, 0))
-        .ok();
-    facts.map_or(mc_physics::Aabb::COW, |facts| mc_physics::Aabb {
-        half_width: facts.dimensions.half_width(),
-        height: facts.dimensions.height,
-    })
-}
-
-fn push_entities_from_player_locked(inner: &mut SessionRegistryInner, pose: PlayerPose) {
-    const PLAYER_HALF_WIDTH: f64 = 0.3;
-    let player = Vec3::new(pose.x, pose.y, pose.z);
-    let snapshots: Vec<_> = inner
-        .entities
-        .views()
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .filter(|entity| entity.item_stack.is_none())
-        .map(|entity| {
-            let aabb = inner
-                .entity_type_aabbs
-                .get(&entity.type_id)
-                .copied()
-                .unwrap_or_else(|| entity_aabb(entity.type_name));
-            (entity.id, entity.position, aabb)
-        })
-        .collect();
-    for (entity_id, entity_position, aabb) in snapshots {
-        let min_distance = PLAYER_HALF_WIDTH + aabb.half_width;
-        let dx = entity_position.x - player.x;
-        let dz = entity_position.z - player.z;
-        let distance = dx.hypot(dz);
-        if distance >= min_distance || (entity_position.y - player.y).abs() > 1.5 {
-            continue;
-        }
-        let (nx, nz) = if distance > 1.0e-6 {
-            (dx / distance, dz / distance)
-        } else {
-            let yaw = f64::from(pose.yaw).to_radians();
-            (yaw.sin(), -yaw.cos())
-        };
-        let push = min_distance - distance + 0.02;
-        let _ = inner.entities.set_position(
-            entity_id,
-            Vec3::new(
-                entity_position.x + nx * push,
-                entity_position.y,
-                entity_position.z + nz * push,
-            ),
-        );
-    }
-}
-
-fn player_eye_position(pose: PlayerPose) -> Vec3 {
-    Vec3::new(pose.x, pose.y + 1.62, pose.z)
-}
-
-fn block_center(position: i64) -> Vec3 {
-    let (x, y, z) = unpack_block_pos(position);
-    Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
-}
-
-pub(super) fn within_block_reach(pose: PlayerPose, position: i64, game_mode: GameMode) -> bool {
-    let max = if game_mode == GameMode::Creative {
-        6.0
-    } else {
-        5.0
-    };
-    distance_sq(player_eye_position(pose), block_center(position)) <= max * max
-}
-
-pub(super) fn within_entity_reach(
-    pose: PlayerPose,
-    position: Vec3,
-    aabb: mc_physics::Aabb,
-    game_mode: GameMode,
-) -> bool {
-    let max = if game_mode == GameMode::Creative {
-        6.0
-    } else {
-        5.0
-    };
-    distance_sq_to_entity_box(player_eye_position(pose), position, aabb) <= max * max
-}
-
-fn distance_sq_to_entity_box(point: Vec3, position: Vec3, aabb: mc_physics::Aabb) -> f64 {
-    let dx = (point.x - position.x).abs() - aabb.half_width;
-    let dz = (point.z - position.z).abs() - aabb.half_width;
-    let dy = if point.y < position.y {
-        position.y - point.y
-    } else if point.y > position.y + aabb.height {
-        point.y - (position.y + aabb.height)
-    } else {
-        0.0
-    };
-    dx.max(0.0).powi(2) + dy.powi(2) + dz.max(0.0).powi(2)
-}
-
-fn visible_observers_locked(inner: &SessionRegistryInner, target: SessionId) -> HashSet<SessionId> {
-    inner
-        .sessions
-        .iter()
-        .filter_map(|(&observer_id, observer)| {
-            observer
-                .visible_players
-                .contains(&target)
-                .then_some(observer_id)
-        })
-        .collect()
-}
-
-fn session_recipients<I>(inner: &SessionRegistryInner, ids: I) -> Vec<SessionRecipient>
-where
-    I: IntoIterator<Item = SessionId>,
-{
-    ids.into_iter()
-        .filter_map(|id| {
-            inner.sessions.get(&id).map(|session| SessionRecipient {
-                id,
-                tx: session.tx.clone(),
-            })
-        })
-        .collect()
-}
-
-fn furnace_recipients_except(
-    inner: &SessionRegistryInner,
-    position: mc_world::BlockPos,
-    except: SessionId,
-) -> Vec<SessionRecipient> {
-    inner
-        .furnace_viewers
-        .get(&position)
-        .into_iter()
-        .flat_map(|viewers| viewers.iter())
-        .filter(|&(&id, _)| id != except)
-        .map(|(&id, viewer)| SessionRecipient {
-            id,
-            tx: viewer.tx.clone(),
-        })
-        .collect()
-}
-
-fn furnace_recipients(
-    inner: &SessionRegistryInner,
-    position: mc_world::BlockPos,
-) -> Vec<SessionRecipient> {
-    inner
-        .furnace_viewers
-        .get(&position)
-        .into_iter()
-        .flat_map(|viewers| viewers.iter())
-        .map(|(&id, viewer)| SessionRecipient {
-            id,
-            tx: viewer.tx.clone(),
-        })
-        .collect()
-}
-
-fn chest_recipients(
-    inner: &SessionRegistryInner,
-    position: mc_world::BlockPos,
-    except: Option<SessionId>,
-) -> Vec<SessionRecipient> {
-    inner
-        .chest_viewers
-        .get(&position)
-        .into_iter()
-        .flat_map(|viewers| viewers.iter())
-        .filter(|&(&id, _)| except != Some(id))
-        .map(|(&id, viewer)| SessionRecipient {
-            id,
-            tx: viewer.tx.clone(),
-        })
-        .collect()
-}
-
-fn visibility_dispatches(
-    recipients: Vec<SessionRecipient>,
-    command: OutboundCommand,
-) -> Vec<VisibilityDispatch> {
-    recipients
-        .into_iter()
-        .map(|recipient| VisibilityDispatch {
-            recipient,
-            command: command.clone(),
-        })
-        .collect()
-}
-
-fn refresh_loaded_chunk_for_session_locked(
-    inner: &mut SessionRegistryInner,
-    observer_id: SessionId,
-    chunk: (i32, i32),
-) -> Vec<VisibilityDispatch> {
-    let Some(recipient) = inner
-        .sessions
-        .get(&observer_id)
-        .map(|session| SessionRecipient {
-            id: observer_id,
-            tx: session.tx.clone(),
-        })
-    else {
-        return Vec::new();
-    };
-    let players = inner
-        .sessions
-        .iter()
-        .filter(|&(&target_id, target)| {
-            target_id != observer_id && target.pose.chunk_pos() == chunk
-        })
-        .map(|(&target_id, target)| (target_id, session_snapshot(target_id, target)))
-        .collect::<Vec<_>>();
-    let entities = inner
-        .entities_by_chunk
-        .get(&chunk)
-        .into_iter()
-        .flat_map(|entities| entities.iter().copied())
-        .filter_map(|entity_id| {
-            inner
-                .entities
-                .view(entity_id)
-                .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-                .map(server_entity_snapshot_from_view)
-        })
-        .collect::<Vec<_>>();
-
-    let Some(observer) = inner.sessions.get_mut(&observer_id) else {
-        return Vec::new();
-    };
-    let mut dispatches = Vec::new();
-    for (target_id, snapshot) in players {
-        if observer.visible_players.insert(target_id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::SpawnPlayer(snapshot),
-            });
-        }
-    }
-    for snapshot in entities {
-        if observer.visible_entities.insert(snapshot.id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::SpawnEntity(snapshot),
-            });
-        }
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    dispatches
-}
-
-fn refresh_unloaded_chunk_for_session_locked(
-    inner: &mut SessionRegistryInner,
-    observer_id: SessionId,
-    chunk: (i32, i32),
-) -> Vec<VisibilityDispatch> {
-    let Some(observer) = inner.sessions.get(&observer_id) else {
-        return Vec::new();
-    };
-    let recipient = SessionRecipient {
-        id: observer_id,
-        tx: observer.tx.clone(),
-    };
-    let visible_players = observer.visible_players.clone();
-    let visible_entities = observer.visible_entities.clone();
-
-    let players = visible_players
-        .into_iter()
-        .filter_map(|target_id| {
-            let target = inner.sessions.get(&target_id)?;
-            (target.pose.chunk_pos() == chunk)
-                .then(|| (target_id, session_snapshot(target_id, target)))
-        })
-        .collect::<Vec<_>>();
-    let entities = visible_entities
-        .into_iter()
-        .filter_map(|entity_id| {
-            (inner.entity_chunks.get(&entity_id).copied() == Some(chunk)).then(|| {
-                inner
-                    .entities
-                    .view(entity_id)
-                    .map(server_entity_snapshot_from_view)
-            })?
-        })
-        .collect::<Vec<_>>();
-
-    let Some(observer) = inner.sessions.get_mut(&observer_id) else {
-        return Vec::new();
-    };
-    let mut dispatches = Vec::new();
-    for (target_id, snapshot) in players {
-        if observer.visible_players.remove(&target_id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::DespawnPlayer(snapshot),
-            });
-        }
-    }
-    for snapshot in entities {
-        if observer.visible_entities.remove(&snapshot.id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::DespawnEntity(snapshot),
-            });
-        }
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    dispatches
-}
-
-fn refresh_player_target_visibility_locked(
-    inner: &mut SessionRegistryInner,
-    target_id: SessionId,
-    old_chunk: (i32, i32),
-    new_chunk: (i32, i32),
-) -> Vec<VisibilityDispatch> {
-    let Some(snapshot) = inner
-        .sessions
-        .get(&target_id)
-        .map(|session| session_snapshot(target_id, session))
-    else {
-        return Vec::new();
-    };
-    let mut observer_ids = visible_observers_locked(inner, target_id);
-    for (&observer_id, observer) in &inner.sessions {
-        if observer.loaded.contains(&old_chunk) || observer.loaded.contains(&new_chunk) {
-            observer_ids.insert(observer_id);
-        }
-    }
-
-    let mut dispatches = Vec::new();
-    for observer_id in observer_ids {
-        if observer_id == target_id {
-            continue;
-        }
-        let Some(observer) = inner.sessions.get_mut(&observer_id) else {
-            continue;
-        };
-        let desired = observer.loaded.contains(&new_chunk);
-        match update_visibility_set(&mut observer.visible_players, target_id, desired) {
-            Some(VisibilityTransition::Spawn) => {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::SpawnPlayer(snapshot.clone()),
-                });
-            }
-            Some(VisibilityTransition::Despawn) => {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnPlayer(snapshot.clone()),
-                });
-            }
-            None => {}
-        }
-    }
-    dispatches
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum VisibilityTransition {
-    Spawn,
-    Despawn,
-}
-
-fn update_visibility_set<T>(
-    visible: &mut std::collections::HashSet<T>,
-    target: T,
-    desired: bool,
-) -> Option<VisibilityTransition>
-where
-    T: Copy + Eq + std::hash::Hash,
-{
-    if desired {
-        visible
-            .insert(target)
-            .then_some(VisibilityTransition::Spawn)
-    } else {
-        visible
-            .remove(&target)
-            .then_some(VisibilityTransition::Despawn)
-    }
-}
-
-fn spawn_entity_visibility_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-) -> Vec<VisibilityDispatch> {
-    let Some(chunk) = inner.entity_chunks.get(&entity_id).copied() else {
-        return Vec::new();
-    };
-    let Some(snapshot) = inner
-        .entities
-        .view(entity_id)
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .map(server_entity_snapshot_from_view)
-    else {
-        return Vec::new();
-    };
-    let mut dispatches = Vec::new();
-    for (&observer_id, observer) in &mut inner.sessions {
-        if observer.loaded.contains(&chunk) && observer.visible_entities.insert(entity_id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: SessionRecipient {
-                    id: observer_id,
-                    tx: observer.tx.clone(),
-                },
-                command: OutboundCommand::SpawnEntity(snapshot.clone()),
-            });
-        }
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    dispatches
-}
-
-fn refresh_entity_target_visibility_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-    old_chunk: (i32, i32),
-    new_chunk: (i32, i32),
-) -> Vec<VisibilityDispatch> {
-    let Some(snapshot) = inner
-        .entities
-        .view(entity_id)
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .map(server_entity_snapshot_from_view)
-    else {
-        return Vec::new();
-    };
-    let mut observer_ids = visible_entity_observers_locked(inner, entity_id);
-    for (&observer_id, observer) in &inner.sessions {
-        if observer.loaded.contains(&old_chunk) || observer.loaded.contains(&new_chunk) {
-            observer_ids.insert(observer_id);
-        }
-    }
-
-    let mut dispatches = Vec::new();
-    for observer_id in observer_ids {
-        let Some(observer) = inner.sessions.get_mut(&observer_id) else {
-            continue;
-        };
-        let desired = observer.loaded.contains(&new_chunk);
-        match update_visibility_set(&mut observer.visible_entities, entity_id, desired) {
-            Some(VisibilityTransition::Spawn) => {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::SpawnEntity(snapshot.clone()),
-                });
-            }
-            Some(VisibilityTransition::Despawn) => {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
-                });
-            }
-            None => {}
-        }
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    dispatches
-}
-
-fn visible_entity_observers_locked(
-    inner: &SessionRegistryInner,
-    target: EntityId,
-) -> HashSet<SessionId> {
-    inner
-        .sessions
-        .iter()
-        .filter_map(|(&observer_id, observer)| {
-            observer
-                .visible_entities
-                .contains(&target)
-                .then_some(observer_id)
-        })
-        .collect()
-}
-
-fn refresh_visibility_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
-    let ids: Vec<_> = inner.sessions.keys().copied().collect();
-    let snapshots: HashMap<_, _> = inner
-        .sessions
-        .iter()
-        .map(|(&id, session)| (id, session_snapshot(id, session)))
-        .collect();
-    let entity_snapshots: HashMap<_, _> = inner
-        .entities
-        .views()
-        .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
-        .map(|entity| {
-            let snapshot = server_entity_snapshot_from_view(entity);
-            (snapshot.id, snapshot)
-        })
-        .collect();
-    let desired_by_observer: HashMap<_, HashSet<_>> = ids
-        .iter()
-        .filter_map(|observer_id| {
-            let observer = inner.sessions.get(observer_id)?;
-            let desired = ids
-                .iter()
-                .copied()
-                .filter(|target_id| {
-                    target_id != observer_id
-                        && snapshots.get(target_id).is_some_and(|target| {
-                            observer.loaded.contains(&target.pose.chunk_pos())
-                        })
-                })
-                .collect();
-            Some((*observer_id, desired))
-        })
-        .collect();
-    let desired_entities_by_observer: HashMap<_, HashSet<_>> = ids
-        .iter()
-        .filter_map(|observer_id| {
-            let observer = inner.sessions.get(observer_id)?;
-            let desired = observer
-                .loaded
-                .iter()
-                .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
-                .flat_map(|entities| entities.iter().copied())
-                .filter(|entity_id| entity_snapshots.contains_key(entity_id))
-                .collect();
-            Some((*observer_id, desired))
-        })
-        .collect();
-
-    let mut dispatches = Vec::new();
-    for observer_id in ids {
-        let Some(observer) = inner.sessions.get_mut(&observer_id) else {
-            continue;
-        };
-        let desired = desired_by_observer
-            .get(&observer_id)
-            .cloned()
-            .unwrap_or_default();
-        for target_id in desired.difference(&observer.visible_players) {
-            if let Some(snapshot) = snapshots.get(target_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::SpawnPlayer(snapshot.clone()),
-                });
-            }
-        }
-        for target_id in observer.visible_players.difference(&desired) {
-            if let Some(snapshot) = snapshots.get(target_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnPlayer(snapshot.clone()),
-                });
-            }
-        }
-        observer.visible_players = desired;
-
-        let desired_entities = desired_entities_by_observer
-            .get(&observer_id)
-            .cloned()
-            .unwrap_or_default();
-        for entity_id in desired_entities.difference(&observer.visible_entities) {
-            if let Some(snapshot) = entity_snapshots.get(entity_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::SpawnEntity(snapshot.clone()),
-                });
-            }
-        }
-        for entity_id in observer.visible_entities.difference(&desired_entities) {
-            if let Some(snapshot) = entity_snapshots.get(entity_id) {
-                dispatches.push(VisibilityDispatch {
-                    recipient: SessionRecipient {
-                        id: observer_id,
-                        tx: observer.tx.clone(),
-                    },
-                    command: OutboundCommand::DespawnEntity(snapshot.clone()),
-                });
-            }
-        }
-        observer.visible_entities = desired_entities;
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    dispatches
-}
-
-fn despawn_expired_arrows_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
+fn despawn_expired_items_locked(inner: &mut SessionEntityGuards<'_>) -> Vec<VisibilityDispatch> {
     let expired = inner
-        .arrow_spawn_ticks
+        .item_spawn_ticks
         .iter()
         .filter_map(|(&entity_id, &spawn_tick)| {
-            (inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ARROW_DESPAWN_AGE_TICKS)
-                .then_some(entity_id)
-        })
-        .collect::<Vec<_>>();
-    expired
-        .into_iter()
-        .filter_map(|entity_id| {
-            remove_server_entity_locked(inner, entity_id).map(|(_, dispatches)| dispatches)
-        })
-        .flatten()
-        .collect()
-}
-
-fn despawn_expired_items_locked(inner: &mut SessionRegistryInner) -> Vec<VisibilityDispatch> {
-    let expired = inner
-        .entity_spawn_ticks
-        .iter()
-        .filter_map(|(&entity_id, &spawn_tick)| {
-            let is_item = inner
-                .entities
-                .view(entity_id)
-                .is_some_and(|entity| entity.item_stack.is_some());
-            (is_item
-                && inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ITEM_DESPAWN_AGE_TICKS)
+            (inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ITEM_DESPAWN_AGE_TICKS)
                 .then_some(entity_id)
         })
         .take(ITEM_DESPAWN_SWEEP_BUDGET)
@@ -2877,280 +1343,97 @@ fn despawn_expired_items_locked(inner: &mut SessionRegistryInner) -> Vec<Visibil
         .collect()
 }
 
-fn resolve_arrow_entity_hits_locked(
-    inner: &mut SessionRegistryInner,
-    steps: &[EntityPhysicsStep],
-    old_positions: &HashMap<EntityId, Vec3>,
-) -> Vec<VisibilityDispatch> {
-    let mut dispatches = Vec::new();
-    for step in steps {
-        let Some(start) = old_positions.get(&step.id).copied() else {
-            continue;
-        };
-        let Some(arrow) = inner.entities.view(step.id) else {
-            continue;
-        };
-        if arrow.lifecycle != EntityLifecycle::Alive || arrow.type_name != "minecraft:arrow" {
-            continue;
-        }
-        let Some(target) = first_arrow_hit_target_locked(inner, step.id, start, step.position)
-        else {
-            continue;
-        };
-        match target {
-            ArrowHitTarget::Entity(target_id) => {
-                let Some(damage) =
-                    damage_server_entity_locked(inner, target_id, ARROW_ENTITY_HIT_DAMAGE)
-                else {
-                    continue;
-                };
-                if damage.killed {
-                    if let Some((target, target_dispatches)) =
-                        remove_server_entity_locked(inner, target_id)
-                    {
-                        dispatches.extend(target_dispatches);
-                        let item_entity_type_id = inner.arrow_kill_rewards.item_entity_type_id;
-                        let xp_orb_entity_type_id = inner.arrow_kill_rewards.xp_orb_entity_type_id;
-                        let drop =
-                            arrow_kill_drop_stack(&inner.arrow_kill_rewards, &target.type_name);
-                        if let (Some(entity_type_id), Some(drop)) = (item_entity_type_id, drop) {
-                            dispatches.extend(spawn_item_drop_locked(
-                                inner,
-                                entity_type_id,
-                                target.position,
-                                entity_item_stack(drop),
-                            ));
-                        }
-                        if let Some(entity_type_id) = xp_orb_entity_type_id {
-                            dispatches.extend(spawn_xp_orb_locked(
-                                inner,
-                                entity_type_id,
-                                target.position,
-                                mob_xp_value(&target.type_name),
-                            ));
-                        }
-                    }
-                } else {
-                    dispatches.extend(apply_arrow_knockback_locked(
-                        inner,
-                        target_id,
-                        start,
-                        step.position,
-                    ));
-                    dispatches.extend(entity_event_dispatches_locked(inner, target_id, 2));
-                }
-            }
-            ArrowHitTarget::Player(session_id) => {
-                if let Some(session) = inner.sessions.get(&session_id) {
-                    dispatches.push(VisibilityDispatch {
-                        recipient: SessionRecipient {
-                            id: session_id,
-                            tx: session.tx.clone(),
-                        },
-                        command: OutboundCommand::DamagePlayer {
-                            amount: ARROW_ENTITY_HIT_DAMAGE,
-                            source_origin: Some(start),
-                        },
-                    });
-                }
-            }
-        }
-        if let Some((_, arrow_dispatches)) = remove_server_entity_locked(inner, step.id) {
-            dispatches.extend(arrow_dispatches);
-        }
-    }
-    dispatches
-}
-
-fn arrow_kill_drop_stack(config: &ArrowKillRewards, entity_type: &str) -> Option<ItemStack> {
-    mob_drop_stack_from(
-        config.loot.as_deref()?,
-        config.items.as_deref()?,
-        entity_type,
-    )
-}
-
-fn spawn_item_drop_locked(
-    inner: &mut SessionRegistryInner,
-    entity_type_id: i32,
-    position: Vec3,
-    stack: EntityItemStack,
-) -> Vec<VisibilityDispatch> {
-    if stack.is_empty() {
+fn entity_kill_drop_stacks(
+    config: &ArrowKillRewards,
+    entity_type: &str,
+    animal: Option<mc_entity::AnimalBreedingState>,
+    seed: u64,
+) -> Vec<ItemStack> {
+    let (Some(loot), Some(items), Some(item_facts)) = (
+        config.loot.as_deref(),
+        config.items.as_deref(),
+        config.item_facts.as_deref(),
+    ) else {
         return Vec::new();
+    };
+    let mut drops = mob_drop_stacks_from_seed(loot, items, item_facts, entity_type, seed);
+    if entity_type != "minecraft:sheep" {
+        return drops;
     }
-    let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
-    entity.item_stack = Some(stack);
-    entity.velocity = Vec3::new(0.0, 0.1, 0.0);
-    let id = inner.entities.spawn(entity);
-    inner
-        .entity_spawn_ticks
-        .insert(id, inner.entity_lifecycle_tick);
-    inner
-        .entity_type_aabbs
-        .entry(entity_type_id)
-        .or_insert_with(|| entity_aabb("minecraft:item"));
-    track_entity_chunk_locked(inner, id, position);
-    inner.last_sent_entity_positions.insert(id, position);
-    let ready_tick = inner
-        .entity_lifecycle_tick
-        .saturating_add(ITEM_PICKUP_DELAY_TICKS);
-    inner.item_pickup_ready_ticks.insert(id, ready_tick);
-    spawn_entity_visibility_locked(inner, id)
+    let Some(wool) = animal.and_then(|animal| animal.sheep_wool) else {
+        return drops;
+    };
+    let wool_item_id = (!wool.sheared)
+        .then(|| Identifier::parse(wool.color.wool_item_name()).ok())
+        .flatten()
+        .and_then(|item| items.id_of(&item));
+    if !wool.sheared && wool_item_id.is_none() {
+        return drops;
+    }
+
+    drops.retain(|stack| {
+        !items
+            .name_of(stack.item_id)
+            .is_some_and(|item| item.namespace() == "minecraft" && item.path().ends_with("_wool"))
+    });
+    if let Some(item_id) = wool_item_id {
+        drops.push(ItemStack::new(item_id, 1));
+    }
+    drops
 }
 
-fn spawn_xp_orb_locked(
-    inner: &mut SessionRegistryInner,
-    entity_type_id: i32,
-    position: Vec3,
-    value: i32,
-) -> Vec<VisibilityDispatch> {
-    if value <= 0 {
-        return Vec::new();
-    }
-    let mut entity = SpawnEntity::new(entity_type_id, "minecraft:experience_orb", position);
-    entity.experience_value = Some(value);
-    entity.velocity = Vec3::new(0.0, 0.08, 0.0);
-    let id = inner.entities.spawn(entity);
-    inner
-        .entity_spawn_ticks
-        .insert(id, inner.entity_lifecycle_tick);
-    inner
-        .entity_type_aabbs
-        .entry(entity_type_id)
-        .or_insert_with(|| entity_aabb("minecraft:experience_orb"));
-    track_entity_chunk_locked(inner, id, position);
-    inner.last_sent_entity_positions.insert(id, position);
-    spawn_entity_visibility_locked(inner, id)
-}
+const PLAYER_MELEE_KNOCKBACK_HORIZONTAL: f64 = 0.45;
+const PLAYER_MELEE_KNOCKBACK_VERTICAL: f64 = 0.20;
 
-fn apply_arrow_knockback_locked(
-    inner: &mut SessionRegistryInner,
+fn apply_player_melee_knockback_locked(
+    inner: &mut SessionEntityGuards<'_>,
     target_id: EntityId,
-    start: Vec3,
-    end: Vec3,
+    player_position: Vec3,
 ) -> Vec<VisibilityDispatch> {
-    let Some(knockback) = arrow_knockback(start, end) else {
+    let Some(target) = inner.entities.snapshot(target_id) else {
         return Vec::new();
     };
-    let Some(target) = inner.entities.view(target_id) else {
+    let dx = target.position.x - player_position.x;
+    let dz = target.position.z - player_position.z;
+    let horizontal = dx.hypot(dz);
+    if horizontal <= f64::EPSILON {
         return Vec::new();
-    };
+    }
     let velocity = Vec3::new(
-        target.velocity.x + knockback.x,
-        (target.velocity.y + knockback.y).max(knockback.y),
-        target.velocity.z + knockback.z,
+        target.velocity.x + dx / horizontal * PLAYER_MELEE_KNOCKBACK_HORIZONTAL,
+        (target.velocity.y + PLAYER_MELEE_KNOCKBACK_VERTICAL).max(PLAYER_MELEE_KNOCKBACK_VERTICAL),
+        target.velocity.z + dz / horizontal * PLAYER_MELEE_KNOCKBACK_HORIZONTAL,
     );
     if !inner.entities.set_velocity(target_id, velocity) {
         return Vec::new();
     }
-    let Some(snapshot) = inner
-        .entities
-        .view(target_id)
-        .map(server_entity_snapshot_from_view)
-    else {
-        return Vec::new();
+    let snapshot = if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&target_id) {
+        snapshot.velocity = velocity;
+        snapshot.clone()
+    } else {
+        let Some(snapshot) = publish_server_entity_snapshot_locked(inner, target_id) else {
+            return Vec::new();
+        };
+        snapshot
     };
     visible_entity_observers_locked(inner, target_id)
         .into_iter()
         .filter_map(|observer_id| {
             let observer = inner.sessions.get(&observer_id)?;
             Some(VisibilityDispatch {
-                recipient: SessionRecipient {
-                    id: observer_id,
-                    tx: observer.tx.clone(),
-                },
+                recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: target_id,
                     delta: Vec3::ZERO,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,
                     on_ground: snapshot.on_ground,
+                    send_position_rotation: false,
                     send_velocity: true,
                 }),
             })
         })
         .collect()
-}
-
-fn arrow_knockback(start: Vec3, end: Vec3) -> Option<Vec3> {
-    let dx = end.x - start.x;
-    let dz = end.z - start.z;
-    let horizontal = dx.hypot(dz);
-    if horizontal <= f64::EPSILON {
-        return None;
-    }
-    Some(Vec3::new(
-        dx / horizontal * ARROW_ENTITY_HIT_KNOCKBACK,
-        0.1,
-        dz / horizontal * ARROW_ENTITY_HIT_KNOCKBACK,
-    ))
-}
-
-fn damage_server_entity_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-    amount: f32,
-) -> Option<mc_entity::EntityDamage> {
-    let tick = inner.entity_lifecycle_tick;
-    if inner
-        .last_entity_damage_ticks
-        .get(&entity_id)
-        .is_some_and(|last| tick.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
-    {
-        return None;
-    }
-    let damage = inner.entities.damage(entity_id, amount)?;
-    inner.last_entity_damage_ticks.insert(entity_id, tick);
-    Some(damage)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ArrowHitTarget {
-    Entity(EntityId),
-    Player(SessionId),
-}
-
-fn first_arrow_hit_target_locked(
-    inner: &SessionRegistryInner,
-    arrow_id: EntityId,
-    start: Vec3,
-    end: Vec3,
-) -> Option<ArrowHitTarget> {
-    let owner = inner.arrow_owner_sessions.get(&arrow_id).copied();
-    let entity_hit = inner
-        .entities
-        .views()
-        .filter(|entity| arrow_can_hit_entity(arrow_id, *entity))
-        .filter_map(|entity| {
-            let aabb = inner
-                .entity_type_aabbs
-                .get(&entity.type_id)
-                .copied()
-                .unwrap_or_else(|| entity_aabb(entity.type_name));
-            segment_target_aabb_t(start, end, entity.position, aabb)
-                .map(|t| (t, ArrowHitTarget::Entity(entity.id)))
-        })
-        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t));
-    let player_hit = inner
-        .sessions
-        .iter()
-        .filter(|(session_id, _)| Some(**session_id) != owner)
-        .filter_map(|(session_id, session)| {
-            segment_target_aabb_t(
-                start,
-                end,
-                player_collision_position(session.pose),
-                player_aabb(),
-            )
-            .map(|t| (t, ArrowHitTarget::Player(*session_id)))
-        })
-        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t));
-    entity_hit
-        .into_iter()
-        .chain(player_hit)
-        .min_by(|(left_t, _), (right_t, _)| left_t.total_cmp(right_t))
-        .map(|(_, target)| target)
 }
 
 fn player_collision_position(pose: PlayerPose) -> Vec3 {
@@ -3164,298 +1447,22 @@ fn player_aabb() -> mc_physics::Aabb {
     }
 }
 
-fn arrow_can_hit_entity(arrow_id: EntityId, entity: EntityView<'_>) -> bool {
-    entity.id != arrow_id
-        && entity.lifecycle == EntityLifecycle::Alive
-        && entity.type_name != "minecraft:arrow"
-        && entity.item_stack.is_none()
-        && entity.experience_value.is_none()
-        && entity.block_state.is_none()
-}
-
-fn segment_target_aabb_t(
-    start: Vec3,
-    end: Vec3,
-    target_position: Vec3,
-    target_aabb: mc_physics::Aabb,
-) -> Option<f64> {
-    const ARROW_HIT_EXPANSION: f64 = 0.25;
-    let min = Vec3::new(
-        target_position.x - target_aabb.half_width - ARROW_HIT_EXPANSION,
-        target_position.y - ARROW_HIT_EXPANSION,
-        target_position.z - target_aabb.half_width - ARROW_HIT_EXPANSION,
-    );
-    let max = Vec3::new(
-        target_position.x + target_aabb.half_width + ARROW_HIT_EXPANSION,
-        target_position.y + target_aabb.height + ARROW_HIT_EXPANSION,
-        target_position.z + target_aabb.half_width + ARROW_HIT_EXPANSION,
-    );
-    segment_aabb_intersection_t(start, end, min, max)
-}
-
-fn segment_aabb_intersection_t(start: Vec3, end: Vec3, min: Vec3, max: Vec3) -> Option<f64> {
-    let delta = Vec3::new(end.x - start.x, end.y - start.y, end.z - start.z);
-    let mut t_min: f64 = 0.0;
-    let mut t_max: f64 = 1.0;
-    for (origin, direction, min_axis, max_axis) in [
-        (start.x, delta.x, min.x, max.x),
-        (start.y, delta.y, min.y, max.y),
-        (start.z, delta.z, min.z, max.z),
-    ] {
-        if direction.abs() <= f64::EPSILON {
-            if origin < min_axis || origin > max_axis {
-                return None;
-            }
-            continue;
-        }
-        let inv_direction = 1.0 / direction;
-        let mut near = (min_axis - origin) * inv_direction;
-        let mut far = (max_axis - origin) * inv_direction;
-        if near > far {
-            std::mem::swap(&mut near, &mut far);
-        }
-        t_min = t_min.max(near);
-        t_max = t_max.min(far);
-        if t_min > t_max {
-            return None;
-        }
-    }
-    Some(t_min.clamp(0.0, 1.0))
-}
-
-fn entity_event_dispatches_locked(
-    inner: &SessionRegistryInner,
-    entity_id: EntityId,
-    event_id: i8,
-) -> Vec<VisibilityDispatch> {
-    visible_entity_observers_locked(inner, entity_id)
-        .into_iter()
-        .filter_map(|observer_id| {
-            let observer = inner.sessions.get(&observer_id)?;
-            Some(VisibilityDispatch {
-                recipient: SessionRecipient {
-                    id: observer_id,
-                    tx: observer.tx.clone(),
-                },
-                command: OutboundCommand::EntityEvent {
-                    entity_id: entity_id.0,
-                    event_id,
-                },
-            })
-        })
-        .collect()
-}
-
-fn clear_removed_entity_tracking_locked(inner: &mut SessionRegistryInner, entity_id: EntityId) {
-    inner.last_sent_entity_positions.remove(&entity_id);
-    inner.last_entity_damage_ticks.remove(&entity_id);
-    inner.item_pickup_ready_ticks.remove(&entity_id);
-    inner.entity_spawn_ticks.remove(&entity_id);
-    inner.arrow_spawn_ticks.remove(&entity_id);
-    inner.arrow_owner_sessions.remove(&entity_id);
-    untrack_entity_chunk_locked(inner, entity_id);
-}
-
-fn remove_server_entity_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-) -> Option<(ServerEntitySnapshot, Vec<VisibilityDispatch>)> {
-    let snapshot = inner
-        .entities
-        .remove(entity_id)
-        .map(server_entity_snapshot_from)?;
-    clear_removed_entity_tracking_locked(inner, entity_id);
-
-    let mut dispatches = Vec::new();
-    for (&observer_id, observer) in &mut inner.sessions {
-        if observer.visible_entities.remove(&entity_id) {
-            dispatches.push(VisibilityDispatch {
-                recipient: SessionRecipient {
-                    id: observer_id,
-                    tx: observer.tx.clone(),
-                },
-                command: OutboundCommand::DespawnEntity(snapshot.clone()),
-            });
-        }
-    }
-    record_entity_dispatches_locked(inner, &dispatches);
-    Some((snapshot, dispatches))
-}
-
 fn record_entity_dispatches_locked(
     inner: &mut SessionRegistryInner,
     dispatches: &[VisibilityDispatch],
 ) {
     for dispatch in dispatches {
-        match dispatch.command {
+        match &dispatch.command {
             OutboundCommand::SpawnEntity(_) => inner.entity_dispatches.spawn += 1,
             OutboundCommand::UpdateEntityData(_) => inner.entity_dispatches.data += 1,
             OutboundCommand::MoveEntityRelative(_) => inner.entity_dispatches.move_relative += 1,
+            OutboundCommand::MoveEntitiesRelative(movements) => {
+                inner.entity_dispatches.move_relative += movements.len() as u64;
+            }
             OutboundCommand::TakeItemEntity { .. } => inner.entity_dispatches.take += 1,
+            OutboundCommand::PickupCandidates(_) => {}
             OutboundCommand::DespawnEntity(_) => inner.entity_dispatches.remove += 1,
             _ => {}
-        }
-    }
-}
-
-pub(super) fn dispatch_visibility_commands(dispatches: Vec<VisibilityDispatch>) {
-    for dispatch in dispatches {
-        let lane = dispatch.command.lane();
-        let recipient_id = dispatch.recipient.id;
-        match dispatch.recipient.tx.try_send(dispatch.command) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(command)) => match lane {
-                OutboundLane::Reliable => {
-                    retry_reliable_command(dispatch.recipient.tx, recipient_id, command)
-                }
-                OutboundLane::Coalescible => {
-                    VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
-                    debug!(
-                        recipient = recipient_id,
-                        "dropping coalescible outbound command"
-                    );
-                }
-            },
-            Err(mpsc::error::TrySendError::Closed(command)) => {
-                VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
-                match lane {
-                    OutboundLane::Reliable => warn!(
-                        recipient = recipient_id,
-                        command = ?command,
-                        "dropping reliable outbound command for closed session"
-                    ),
-                    OutboundLane::Coalescible => debug!(
-                        recipient = recipient_id,
-                        "dropping coalescible outbound command for closed session"
-                    ),
-                }
-            }
-        }
-    }
-}
-
-fn retry_reliable_command(
-    tx: mpsc::Sender<OutboundCommand>,
-    recipient_id: SessionId,
-    command: OutboundCommand,
-) {
-    {
-        let mut recipients = lock_reliable_retry_recipients();
-        if !recipients.insert(recipient_id) {
-            VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                recipient = recipient_id,
-                "dropping reliable outbound command for already-backpressured session"
-            );
-            return;
-        }
-    }
-    RELIABLE_COMMAND_RETRIES.fetch_add(1, Ordering::Relaxed);
-    let in_flight = RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_add(1, Ordering::Relaxed) + 1;
-    record_reliable_retry_in_flight(in_flight);
-    tokio::spawn(async move {
-        if tx.send(command).await.is_err() {
-            VISIBILITY_COMMAND_DROPS.fetch_add(1, Ordering::Relaxed);
-            debug!(
-                recipient = recipient_id,
-                "reliable outbound retry target closed"
-            );
-        }
-        lock_reliable_retry_recipients().remove(&recipient_id);
-        RELIABLE_COMMAND_RETRIES_IN_FLIGHT.fetch_sub(1, Ordering::Relaxed);
-    });
-}
-
-fn picked_entity_recipients_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-    collector_session: SessionId,
-) -> (i32, Vec<SessionRecipient>) {
-    let collector_entity_id = inner
-        .sessions
-        .get(&collector_session)
-        .map(|session| session.entity_id)
-        .unwrap_or_default();
-    let mut recipients = Vec::new();
-    for (&observer_id, observer) in &mut inner.sessions {
-        if observer.visible_entities.remove(&entity_id) {
-            recipients.push(SessionRecipient {
-                id: observer_id,
-                tx: observer.tx.clone(),
-            });
-        }
-    }
-    inner.entity_dispatches.take += recipients.len() as u64;
-    inner.entity_dispatches.remove += recipients.len() as u64;
-    (collector_entity_id, recipients)
-}
-
-fn picked_entity_dispatches(
-    entity_id: EntityId,
-    collector_entity_id: i32,
-    amount: i32,
-    snapshot: ServerEntitySnapshot,
-    recipients: Vec<SessionRecipient>,
-) -> Vec<VisibilityDispatch> {
-    let mut dispatches = Vec::with_capacity(recipients.len() * 2);
-    for recipient in recipients {
-        dispatches.push(VisibilityDispatch {
-            recipient: recipient.clone(),
-            command: OutboundCommand::TakeItemEntity {
-                item_entity_id: entity_id.0,
-                player_entity_id: collector_entity_id,
-                amount,
-            },
-        });
-        dispatches.push(VisibilityDispatch {
-            recipient,
-            command: OutboundCommand::DespawnEntity(snapshot.clone()),
-        });
-    }
-    dispatches
-}
-
-fn track_entity_chunk_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-    position: Vec3,
-) {
-    let chunk = chunk_pos_from_coords(position.x, position.z);
-    inner.entity_chunks.insert(entity_id, chunk);
-    inner
-        .entities_by_chunk
-        .entry(chunk)
-        .or_default()
-        .insert(entity_id);
-}
-
-fn move_entity_chunk_locked(
-    inner: &mut SessionRegistryInner,
-    entity_id: EntityId,
-    old_chunk: (i32, i32),
-    new_chunk: (i32, i32),
-) {
-    if let Some(entities) = inner.entities_by_chunk.get_mut(&old_chunk) {
-        entities.remove(&entity_id);
-        if entities.is_empty() {
-            inner.entities_by_chunk.remove(&old_chunk);
-        }
-    }
-    inner.entity_chunks.insert(entity_id, new_chunk);
-    inner
-        .entities_by_chunk
-        .entry(new_chunk)
-        .or_default()
-        .insert(entity_id);
-}
-
-fn untrack_entity_chunk_locked(inner: &mut SessionRegistryInner, entity_id: EntityId) {
-    if let Some(chunk) = inner.entity_chunks.remove(&entity_id)
-        && let Some(entities) = inner.entities_by_chunk.get_mut(&chunk)
-    {
-        entities.remove(&entity_id);
-        if entities.is_empty() {
-            inner.entities_by_chunk.remove(&chunk);
         }
     }
 }
@@ -3475,1718 +1482,21 @@ fn remove_ticket(
     false
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::{Mutex, OnceLock};
-    use tokio::sync::{Mutex as TokioMutex, mpsc};
-
-    async fn pressure_counter_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<TokioMutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| TokioMutex::new(())).lock().await
-    }
-
-    fn profile(name: &str) -> LoggedInProfile {
-        LoggedInProfile {
-            uuid: crate::login::offline_uuid(name),
-            name: name.to_string(),
-        }
-    }
-
-    fn register_test_session(registry: &SessionRegistry, name: &str) -> SessionId {
-        let (tx, _rx) = mpsc::channel(8);
-        let (id, _) = registry.register(
-            &profile(name),
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        id
-    }
-
-    #[test]
-    fn prepared_chunk_claim_blocks_duplicate_until_released() {
-        let registry = SessionRegistry::new();
-        let chunk = (2, -3);
-
-        let first_claim = match registry.prepared_chunk_or_claim(chunk) {
-            PreparedChunkClaimResult::Claimed(claim) => claim,
-            other => panic!("expected first claim, got {other:?}"),
-        };
-
-        assert!(matches!(
-            registry.prepared_chunk_or_claim(chunk),
-            PreparedChunkClaimResult::InFlight
-        ));
-
-        assert!(!registry.release_prepared_chunk_claim(
-            chunk,
-            PreparedChunkClaim(first_claim.0.wrapping_add(1))
-        ));
-        assert!(matches!(
-            registry.prepared_chunk_or_claim(chunk),
-            PreparedChunkClaimResult::InFlight
-        ));
-
-        assert!(registry.release_prepared_chunk_claim(chunk, first_claim));
-        assert!(matches!(
-            registry.prepared_chunk_or_claim(chunk),
-            PreparedChunkClaimResult::Claimed(_)
-        ));
-    }
-
-    #[test]
-    fn chest_slot_dispatches_advance_and_carry_shared_state_id() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "ChestStateAlice");
-        let bob = register_test_session(&registry, "ChestStateBob");
-        let position = mc_world::BlockPos { x: 4, y: 64, z: 4 };
-        let stack = ItemStack::new(10, 1);
-
-        assert_eq!(registry.register_chest_viewer(alice, position), 1);
-        assert_eq!(registry.register_chest_viewer(bob, position), 1);
-
-        let (state_id, dispatches) =
-            registry.chest_slot_dispatches(position, alice, vec![stack.clone()]);
-
-        assert_eq!(state_id, 2);
-        assert_eq!(registry.chest_state_id(position), 2);
-        assert_eq!(dispatches.len(), 1);
-        assert_eq!(dispatches[0].recipient.id, bob);
-        match &dispatches[0].command {
-            OutboundCommand::ChestSlots {
-                position: command_position,
-                state_id: command_state_id,
-                slots,
-            } => {
-                assert_eq!(*command_position, position);
-                assert_eq!(*command_state_id, 2);
-                assert_eq!(slots.as_slice(), &[stack]);
-            }
-            other => panic!("expected chest slots dispatch, got {other:?}"),
-        }
-
-        let charlie = register_test_session(&registry, "ChestStateCharlie");
-        assert_eq!(registry.register_chest_viewer(charlie, position), 2);
-        registry.unregister_chest_viewer(alice, position);
-        registry.unregister_chest_viewer(bob, position);
-        registry.unregister_chest_viewer(charlie, position);
-        assert_eq!(registry.chest_state_id(position), 1);
-    }
-
-    #[test]
-    fn server_chest_slot_dispatches_do_not_allocate_state_without_viewers() {
-        let registry = SessionRegistry::new();
-        let position = mc_world::BlockPos { x: 7, y: 64, z: 7 };
-
-        let (state_id, dispatches) =
-            registry.server_chest_slot_dispatches(position, vec![ItemStack::new(10, 1)]);
-
-        assert_eq!(state_id, 1);
-        assert!(dispatches.is_empty());
-        assert_eq!(registry.chest_state_id(position), 1);
-    }
-
-    #[test]
-    fn furnace_slot_dispatches_advance_and_carry_shared_state_id() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "FurnaceStateAlice");
-        let bob = register_test_session(&registry, "FurnaceStateBob");
-        let position = mc_world::BlockPos { x: 5, y: 64, z: 5 };
-        let slots = [ItemStack::new(10, 1), ItemStack::EMPTY, ItemStack::EMPTY];
-
-        assert_eq!(registry.register_furnace_viewer(alice, position), 1);
-        assert_eq!(registry.register_furnace_viewer(bob, position), 1);
-
-        let (state_id, dispatches) =
-            registry.furnace_slot_dispatches(position, alice, slots.clone());
-
-        assert_eq!(state_id, 2);
-        assert_eq!(registry.furnace_state_id(position), 2);
-        assert_eq!(dispatches.len(), 1);
-        assert_eq!(dispatches[0].recipient.id, bob);
-        match &dispatches[0].command {
-            OutboundCommand::FurnaceSlots {
-                position: command_position,
-                state_id: command_state_id,
-                slots: command_slots,
-            } => {
-                assert_eq!(*command_position, position);
-                assert_eq!(*command_state_id, 2);
-                assert_eq!(command_slots, &slots);
-            }
-            other => panic!("expected furnace slots dispatch, got {other:?}"),
-        }
-
-        let charlie = register_test_session(&registry, "FurnaceStateCharlie");
-        assert_eq!(registry.register_furnace_viewer(charlie, position), 2);
-        registry.unregister_furnace_viewer(alice, position);
-        registry.unregister_furnace_viewer(bob, position);
-        registry.unregister_furnace_viewer(charlie, position);
-        assert_eq!(registry.furnace_state_id(position), 1);
-    }
-
-    #[test]
-    fn server_furnace_slot_dispatches_do_not_allocate_state_without_viewers() {
-        let registry = SessionRegistry::new();
-        let position = mc_world::BlockPos { x: 7, y: 64, z: 7 };
-
-        let (state_id, dispatches) = registry.server_furnace_slot_dispatches(
-            position,
-            [ItemStack::new(10, 1), ItemStack::EMPTY, ItemStack::EMPTY],
-        );
-
-        assert_eq!(state_id, 1);
-        assert!(dispatches.is_empty());
-        assert_eq!(registry.furnace_state_id(position), 1);
-    }
-
-    #[test]
-    fn hostile_entity_snapshots_expose_attack_damage_facts() {
-        let mut skeleton = SpawnEntity::new(1, "minecraft:skeleton", Vec3::ZERO);
-        apply_entity_facts(&mut skeleton);
-        let mut store = EntityStore::new();
-        let id = store.spawn(skeleton);
-        let snapshot = server_entity_snapshot_from(store.snapshot(id).unwrap());
-
-        assert_eq!(snapshot.attack_damage, Some(2.0));
-    }
-
-    #[test]
-    fn hostile_forgets_target_when_last_player_unregisters() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "TargetAlice");
-        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-        registry.spawn_command_entity(1, "minecraft:zombie".to_string(), Vec3::new(4.5, 64.0, 0.5));
-
-        let queries = registry.tick_entities_and_collect_physics_queries(1);
-        assert_eq!(queries.len(), 1);
-        {
-            let inner = registry.inner.lock().expect("session registry poisoned");
-            let entity = inner.entities.views().next().expect("spawned hostile");
-            assert!(matches!(entity.goal, GoalState::FollowPosition { .. }));
-        }
-
-        registry.unregister(alice);
-        assert!(
-            registry
-                .tick_entities_and_collect_physics_queries(2)
-                .is_empty()
-        );
-
-        let inner = registry.inner.lock().expect("session registry poisoned");
-        let entity = inner.entities.views().next().expect("spawned hostile");
-        assert!(matches!(entity.goal, GoalState::Wander { .. }));
-    }
-
-    #[test]
-    fn loaded_chunk_pathing_probe_accepts_loaded_world_height_position() {
-        let active_chunks = HashSet::from([(0, 0)]);
-        let probe = LoadedChunkPathingProbe {
-            active_chunks: &active_chunks,
-        };
-
-        assert_eq!(
-            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MIN_Y), 0.5)),
-            PathingProbeResult::Walkable
-        );
-    }
-
-    #[test]
-    fn loaded_chunk_pathing_probe_blocks_out_of_world_height_position() {
-        let active_chunks = HashSet::from([(0, 0)]);
-        let probe = LoadedChunkPathingProbe {
-            active_chunks: &active_chunks,
-        };
-
-        assert_eq!(
-            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MIN_Y) - 0.1, 0.5,)),
-            PathingProbeResult::Blocked
-        );
-        assert_eq!(
-            probe.can_stand_at(Vec3::new(0.5, f64::from(mc_world::chunk::MAX_Y), 0.5)),
-            PathingProbeResult::Blocked
-        );
-    }
-
-    #[test]
-    fn loaded_chunk_pathing_probe_reports_unloaded_chunk_in_world_height() {
-        let active_chunks = HashSet::from([(0, 0)]);
-        let probe = LoadedChunkPathingProbe {
-            active_chunks: &active_chunks,
-        };
-
-        assert_eq!(
-            probe.can_stand_at(Vec3::new(16.5, 64.0, 0.5)),
-            PathingProbeResult::Unloaded
-        );
-    }
-
-    #[test]
-    fn registry_recovers_after_inner_mutex_poison() {
-        let registry = SessionRegistry::new();
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = registry.inner.lock().unwrap();
-            panic!("poison registry");
-        }));
-
-        let id = register_test_session(&registry, "PoisonAlice");
-
-        assert_eq!(registry.active_session_count(), 1);
-        assert_eq!(id, 1);
-    }
-
-    #[test]
-    fn save_all_recovers_after_player_persistence_mutex_poison() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "PoisonPersist");
-        let state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
-            PlayerPose::new(0.5, 64.0, 0.5),
-        )));
-        registry.register_player_persistence(session_id, Arc::clone(&state));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = state.lock().unwrap();
-            panic!("poison player persistence");
-        }));
-
-        let snapshots = registry.persisted_player_states();
-
-        assert_eq!(snapshots.len(), 1);
-        assert_eq!(snapshots[0].0, profile("PoisonPersist").uuid);
-    }
-
-    #[test]
-    fn arrow_despawns_after_lifetime_and_dispatches_remove() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let profile = profile("ArrowAlice");
-        let (session_id, _) = registry.register(
-            &profile,
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-
-        let spawn_dispatches = registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-        assert_eq!(spawn_dispatches.len(), 1);
-        let entity_id = match &spawn_dispatches[0].command {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS);
-        registry.apply_entity_physics_and_dispatch(1, &[]);
-
-        assert!(registry.server_entity_snapshot(entity_id).is_none());
-        match rx.try_recv().expect("arrow despawn dispatch") {
-            OutboundCommand::DespawnEntity(entity) => assert_eq!(entity.id, entity_id),
-            other => panic!("expected arrow despawn dispatch, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn arrow_before_lifetime_remains_tracked() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let profile = profile("ArrowBob");
-        let (session_id, _) = registry.register(
-            &profile,
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        let spawn_dispatches = registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-        let entity_id = match &spawn_dispatches[0].command {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS - 1);
-        registry.apply_entity_physics_and_dispatch(1, &[]);
-
-        assert!(registry.server_entity_snapshot(entity_id).is_some());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn spawned_arrow_uses_projectile_physics_kind() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "ArrowPhysicsAlice");
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-
-        let queries = registry.tick_entities_and_collect_physics_queries(1);
-
-        assert_eq!(queries.len(), 1);
-        assert_eq!(queries[0].kind, EntityPhysicsKind::ArrowProjectile);
-    }
-
-    #[test]
-    fn grounded_zero_velocity_arrow_is_pickup_candidate() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "ArrowPickupAlice");
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        let spawn_dispatches = registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-        let entity_id = match &spawn_dispatches[0].command {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(0.5, 64.0, 0.5),
-                velocity: Vec3::ZERO,
-                on_ground: true,
-            }],
-        );
-
-        let candidates = registry.nearby_grounded_arrows(Vec3::new(0.5, 64.0, 0.5), 2.25);
-
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].id, entity_id);
-    }
-
-    #[test]
-    fn moving_or_airborne_arrow_is_not_pickup_candidate() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "ArrowPickupBob");
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-
-        let candidates = registry.nearby_grounded_arrows(Vec3::new(0.5, 64.0, 0.5), 2.25);
-
-        assert!(candidates.is_empty());
-    }
-
-    #[test]
-    fn arrow_pickup_claim_removes_once_and_dispatches_take() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "ArrowPickupCarol");
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        let spawn_dispatches = registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            Vec3::new(0.0, 0.0, 1.0),
-            Rotation::ZERO,
-        );
-        let entity_id = match &spawn_dispatches[0].command {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(0.5, 64.0, 0.5),
-                velocity: Vec3::ZERO,
-                on_ground: true,
-            }],
-        );
-
-        let dispatches = registry.claim_arrow_pickup(entity_id, session_id).unwrap();
-
-        assert!(registry.claim_arrow_pickup(entity_id, session_id).is_none());
-        assert!(registry.server_entity_snapshot(entity_id).is_none());
-        assert!(dispatches.iter().any(|dispatch| matches!(
-            dispatch.command,
-            OutboundCommand::TakeItemEntity { item_entity_id, amount: 1, .. } if item_entity_id == entity_id.0
-        )));
-        assert!(dispatches.iter().any(|dispatch| matches!(
-            &dispatch.command,
-            OutboundCommand::DespawnEntity(entity) if entity.id == entity_id
-        )));
-    }
-
-    #[test]
-    fn moving_arrow_hit_damages_entity_and_despawns_arrow() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let profile = profile("ArrowHitAlice");
-        let (session_id, _) = registry.register(
-            &profile,
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        let cow_id = match &registry.spawn_command_entity(
-            2,
-            "minecraft:cow".to_string(),
-            Vec3::new(0.5, 64.0, 1.5),
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected cow spawn dispatch, got {other:?}"),
-        };
-        let arrow_id = match &registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.75, 0.0),
-            Vec3::new(0.0, 0.0, 2.0),
-            Rotation::ZERO,
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: arrow_id,
-                position: Vec3::new(0.5, 64.75, 2.0),
-                velocity: Vec3::new(0.0, 0.0, 2.0),
-                on_ground: false,
-            }],
-        );
-
-        let cow_health = registry
-            .lock_inner("test read cow health")
-            .entities
-            .snapshot(cow_id)
-            .expect("cow remains after non-lethal arrow hit")
-            .health;
-        assert_eq!(cow_health, 6.0);
-        let cow_velocity = registry
-            .lock_inner("test read cow velocity")
-            .entities
-            .snapshot(cow_id)
-            .expect("cow remains after non-lethal arrow hit")
-            .velocity;
-        assert!(cow_velocity.z > 0.5);
-        assert!(cow_velocity.y > 0.0);
-        assert!(registry.server_entity_snapshot(arrow_id).is_none());
-
-        let mut saw_hurt = false;
-        let mut saw_knockback = false;
-        let mut saw_arrow_despawn = false;
-        while let Ok(command) = rx.try_recv() {
-            match command {
-                OutboundCommand::EntityEvent {
-                    entity_id,
-                    event_id,
-                } => {
-                    saw_hurt |= entity_id == cow_id.0 && event_id == 2;
-                }
-                OutboundCommand::MoveEntityRelative(movement) => {
-                    saw_knockback |= movement.id == cow_id
-                        && movement.send_velocity
-                        && movement.velocity.z > 0.5;
-                }
-                OutboundCommand::DespawnEntity(entity) => {
-                    saw_arrow_despawn |= entity.id == arrow_id;
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_hurt);
-        assert!(saw_knockback);
-        assert!(saw_arrow_despawn);
-    }
-
-    #[test]
-    fn lethal_arrow_hit_spawns_mob_rewards_and_despawns_targets() {
-        let registry = SessionRegistry::new();
-        let chicken = Identifier::parse("minecraft:chicken".to_string()).unwrap();
-        let feather = Identifier::parse("minecraft:feather".to_string()).unwrap();
-        let items = Arc::new(ItemRegistry::from_report(&[mc_data::items::ItemReport {
-            id: feather.clone(),
-            protocol_id: 42,
-        }]));
-        let loot = Arc::new(mc_data::loot::LootTables::from_maps(
-            BTreeMap::from([(chicken, feather)]),
-            BTreeMap::new(),
-        ));
-        registry.configure_arrow_kill_rewards(Some(98), Some(99), items, loot);
-        let (tx, mut rx) = mpsc::channel(16);
-        let profile = profile("LethalArrowAlice");
-        let (session_id, _) = registry.register(
-            &profile,
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        let chicken_id = match &registry.spawn_command_entity(
-            2,
-            "minecraft:chicken".to_string(),
-            Vec3::new(0.5, 64.0, 1.5),
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected chicken spawn dispatch, got {other:?}"),
-        };
-        let arrow_id = match &registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.75, 0.0),
-            Vec3::new(0.0, 0.0, 2.0),
-            Rotation::ZERO,
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: arrow_id,
-                position: Vec3::new(0.5, 64.75, 2.0),
-                velocity: Vec3::new(0.0, 0.0, 2.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(registry.server_entity_snapshot(chicken_id).is_none());
-        assert!(registry.server_entity_snapshot(arrow_id).is_none());
-        let mut saw_chicken_despawn = false;
-        let mut saw_arrow_despawn = false;
-        let mut saw_drop = false;
-        let mut saw_xp = false;
-        while let Ok(command) = rx.try_recv() {
-            match command {
-                OutboundCommand::DespawnEntity(entity) if entity.id == chicken_id => {
-                    saw_chicken_despawn = true;
-                }
-                OutboundCommand::DespawnEntity(entity) if entity.id == arrow_id => {
-                    saw_arrow_despawn = true;
-                }
-                OutboundCommand::SpawnEntity(entity) if entity.type_name == "minecraft:item" => {
-                    saw_drop = entity.type_id == 98
-                        && entity.position == Vec3::new(0.5, 64.0, 1.5)
-                        && entity.item_stack == Some(EntityItemStack::new(42, 1));
-                }
-                OutboundCommand::SpawnEntity(entity)
-                    if entity.type_name == "minecraft:experience_orb" =>
-                {
-                    saw_xp = entity.type_id == 99
-                        && entity.position == Vec3::new(0.5, 64.0, 1.5)
-                        && entity.experience_value == Some(1);
-                }
-                _ => {}
-            }
-        }
-        assert!(saw_chicken_despawn);
-        assert!(saw_arrow_despawn);
-        assert!(saw_drop);
-        assert!(saw_xp);
-    }
-
-    #[test]
-    fn moving_arrow_ignores_item_entities() {
-        let registry = SessionRegistry::new();
-        let session_id = register_test_session(&registry, "ArrowHitBob");
-        assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-        registry.spawn_item_drop(2, Vec3::new(0.5, 64.0, 1.5), EntityItemStack::new(42, 1));
-        let arrow_id = match &registry.spawn_arrow(
-            Some(session_id),
-            1,
-            Vec3::new(0.5, 64.75, 0.0),
-            Vec3::new(0.0, 0.0, 2.0),
-            Rotation::ZERO,
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: arrow_id,
-                position: Vec3::new(0.5, 64.75, 2.0),
-                velocity: Vec3::new(0.0, 0.0, 2.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(registry.server_entity_snapshot(arrow_id).is_some());
-    }
-
-    #[test]
-    fn moving_arrow_damages_player_target_but_not_owner() {
-        let registry = SessionRegistry::new();
-        let (owner_tx, mut owner_rx) = mpsc::channel(8);
-        let (target_tx, mut target_rx) = mpsc::channel(8);
-        let (owner_id, _) = registry.register(
-            &profile("ArrowPlayerOwner"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            owner_tx,
-            PlayerPose::new(0.5, 64.0, 0.0),
-        );
-        let (target_id, _) = registry.register(
-            &profile("ArrowPlayerTarget"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            target_tx,
-            PlayerPose::new(0.5, 64.0, 1.5),
-        );
-        registry.mark_loaded(owner_id, (0, 0));
-        registry.mark_loaded(target_id, (0, 0));
-        let arrow_id = match &registry.spawn_arrow(
-            Some(owner_id),
-            1,
-            Vec3::new(0.5, 64.75, 0.0),
-            Vec3::new(0.0, 0.0, 2.0),
-            Rotation::ZERO,
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: arrow_id,
-                position: Vec3::new(0.5, 64.75, 2.0),
-                velocity: Vec3::new(0.0, 0.0, 2.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(registry.server_entity_snapshot(arrow_id).is_none());
-        let mut target_damaged = false;
-        while let Ok(command) = target_rx.try_recv() {
-            target_damaged |= matches!(
-                command,
-                OutboundCommand::DamagePlayer { amount, .. }
-                    if (amount - ARROW_ENTITY_HIT_DAMAGE).abs() < f32::EPSILON
-            );
-        }
-        let mut owner_damaged = false;
-        while let Ok(command) = owner_rx.try_recv() {
-            owner_damaged |= matches!(command, OutboundCommand::DamagePlayer { .. });
-        }
-        assert!(target_damaged);
-        assert!(!owner_damaged);
-    }
-
-    #[test]
-    fn moving_arrow_does_not_hit_owner_without_other_targets() {
-        let registry = SessionRegistry::new();
-        let (owner_tx, mut owner_rx) = mpsc::channel(8);
-        let (owner_id, _) = registry.register(
-            &profile("ArrowOwnerSafe"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            owner_tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(owner_id, (0, 0)).is_empty());
-        let arrow_id = match &registry.spawn_arrow(
-            Some(owner_id),
-            1,
-            Vec3::new(0.5, 64.75, 0.0),
-            Vec3::new(0.0, 0.0, 2.0),
-            Rotation::ZERO,
-        )[0]
-        .command
-        {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected arrow spawn dispatch, got {other:?}"),
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: arrow_id,
-                position: Vec3::new(0.5, 64.75, 2.0),
-                velocity: Vec3::new(0.0, 0.0, 2.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(registry.server_entity_snapshot(arrow_id).is_some());
-        while let Ok(command) = owner_rx.try_recv() {
-            assert!(!matches!(command, OutboundCommand::DamagePlayer { .. }));
-        }
-    }
-
-    fn registration<'a>(
-        profile: &'a LoggedInProfile,
-        tx: mpsc::Sender<OutboundCommand>,
-        max_sessions: usize,
-    ) -> SessionRegistration<'a> {
-        SessionRegistration {
-            profile,
-            center: (0, 0),
-            view_distance: 2,
-            desired: HashSet::new(),
-            tx,
-            pose: PlayerPose::new(0.5, 64.0, 0.5),
-            max_sessions,
-        }
-    }
-
-    #[test]
-    fn try_register_enforces_max_sessions() {
-        let registry = SessionRegistry::new();
-        let (tx, _rx) = mpsc::channel(8);
-        let full_alice = profile("FullAlice");
-        let first = registry.try_register(registration(&full_alice, tx, 1));
-        assert!(first.is_ok());
-
-        let (tx, _rx) = mpsc::channel(8);
-        let full_bob = profile("FullBob");
-        let second = registry.try_register(registration(&full_bob, tx, 1));
-        assert!(matches!(
-            second,
-            Err(SessionAdmissionError::ServerFull { active: 1, max: 1 })
-        ));
-    }
-
-    #[test]
-    fn replace_view_updates_view_distance_and_tickets() {
-        let registry = SessionRegistry::new();
-        let (tx, _rx) = mpsc::channel(8);
-        let (id, _) = registry.register(
-            &profile("ViewDistanceAlice"),
-            (0, 0),
-            3,
-            HashSet::from([(0, 0), (1, 0), (2, 0)]),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-
-        registry.replace_view(id, (0, 0), 1, HashSet::from([(0, 0)]));
-
-        let inner = registry.lock_inner("test replace view");
-        let session = inner.sessions.get(&id).unwrap();
-        assert_eq!(session.view_distance, 1);
-        assert_eq!(session.desired, HashSet::from([(0, 0)]));
-        assert!(inner.tickets.contains_key(&(0, 0)));
-        assert!(!inner.tickets.contains_key(&(1, 0)));
-        assert!(!inner.tickets.contains_key(&(2, 0)));
-    }
-
-    #[test]
-    fn try_register_rejects_duplicate_profile_until_unregister() {
-        let registry = SessionRegistry::new();
-        let first_id = register_test_session(&registry, "DupAlice");
-        let (tx, _rx) = mpsc::channel(8);
-
-        let dup_alice = profile("DupAlice");
-        let duplicate = registry.try_register(registration(&dup_alice, tx, 8));
-
-        assert!(matches!(
-            duplicate,
-            Err(SessionAdmissionError::DuplicateProfile { existing_session })
-                if existing_session == first_id
-        ));
-        let _ = registry.unregister(first_id);
-
-        let (tx, _rx) = mpsc::channel(8);
-        let dup_alice = profile("DupAlice");
-        assert!(
-            registry
-                .try_register(registration(&dup_alice, tx, 8))
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn same_chunk_pose_update_only_moves_existing_observers() {
-        let registry = SessionRegistry::new();
-        let (alice_tx, _alice_rx) = mpsc::channel(8);
-        let (alice, _) = registry.register(
-            &profile("MoveAlice"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0)]),
-            alice_tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        let (bob_tx, _bob_rx) = mpsc::channel(8);
-        let (bob, _) = registry.register(
-            &profile("MoveBob"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0)]),
-            bob_tx,
-            PlayerPose::new(1.5, 64.0, 0.5),
-        );
-        let _ = registry.mark_loaded(alice, (0, 0));
-        let _ = registry.mark_loaded(bob, (0, 0));
-
-        let dispatches = registry.update_pose(bob, PlayerPose::new(2.5, 64.0, 0.5));
-
-        assert_eq!(dispatches.len(), 1);
-        assert!(matches!(
-            &dispatches[0].command,
-            OutboundCommand::MovePlayer(PlayerEntitySnapshot { session_id, .. }) if *session_id == bob
-        ));
-    }
-
-    #[test]
-    fn chunk_crossing_pose_update_diffs_target_observers() {
-        let registry = SessionRegistry::new();
-        let (alice_tx, _alice_rx) = mpsc::channel(8);
-        let (alice, _) = registry.register(
-            &profile("CrossAlice"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0)]),
-            alice_tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        let (bob_tx, _bob_rx) = mpsc::channel(8);
-        let (bob, _) = registry.register(
-            &profile("CrossBob"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0), (1, 0)]),
-            bob_tx,
-            PlayerPose::new(1.5, 64.0, 0.5),
-        );
-        let (charlie_tx, _charlie_rx) = mpsc::channel(8);
-        let (charlie, _) = registry.register(
-            &profile("CrossCharlie"),
-            (1, 0),
-            2,
-            HashSet::from([(1, 0)]),
-            charlie_tx,
-            PlayerPose::new(16.5, 64.0, 0.5),
-        );
-        let _ = registry.mark_loaded(alice, (0, 0));
-        let _ = registry.mark_loaded(bob, (0, 0));
-        let _ = registry.mark_loaded(charlie, (1, 0));
-
-        let dispatches = registry.update_pose(bob, PlayerPose::new(16.5, 64.0, 0.5));
-
-        assert_eq!(dispatches.len(), 2);
-        assert!(dispatches.iter().any(|dispatch| matches!(
-            &dispatch.command,
-            OutboundCommand::DespawnPlayer(PlayerEntitySnapshot { session_id, .. })
-                if *session_id == bob && dispatch.recipient.id == alice
-        )));
-        assert!(dispatches.iter().any(|dispatch| matches!(
-            &dispatch.command,
-            OutboundCommand::SpawnPlayer(PlayerEntitySnapshot { session_id, .. })
-                if *session_id == bob && dispatch.recipient.id == charlie
-        )));
-    }
-
-    #[test]
-    fn item_pickup_claims_entity_once() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "PickupAlice");
-        let bob = register_test_session(&registry, "PickupBob");
-        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        assert!(
-            registry
-                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
-                .is_empty()
-        );
-
-        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
-        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
-
-        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
-        assert_eq!(claimed.stack, EntityItemStack::new(42, 3));
-        assert!(registry.claim_item_pickup(entity_id, bob, 3).is_none());
-        assert!(
-            registry
-                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn item_pickup_preserves_damage_on_partial_claim() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "DamagePickupAlice");
-        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-        registry.spawn_item_drop(
-            1,
-            Vec3::new(0.5, 64.0, 0.5),
-            EntityItemStack::new(42, 3).with_damage(17),
-        );
-        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
-        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
-        let before_pickup = registry.pressure_snapshot().entity_dispatches;
-
-        let claimed = registry.claim_item_pickup(entity_id, alice, 1).unwrap();
-        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0]
-            .item_stack
-            .unwrap();
-        let after_pickup = registry.pressure_snapshot().entity_dispatches;
-
-        assert_eq!(claimed.stack, EntityItemStack::new(42, 1).with_damage(17));
-        assert!(matches!(
-            claimed.dispatches.as_slice(),
-            [VisibilityDispatch {
-                command: OutboundCommand::UpdateEntityData(_),
-                ..
-            }]
-        ));
-        assert_eq!(remaining, EntityItemStack::new(42, 2).with_damage(17));
-        assert_eq!(after_pickup.data, before_pickup.data + 1);
-        assert_eq!(after_pickup.take, before_pickup.take);
-        assert_eq!(after_pickup.remove, before_pickup.remove);
-    }
-
-    #[test]
-    fn item_pickup_counts_take_and_remove_per_observer() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "PickupCounterAlice");
-        let bob = register_test_session(&registry, "PickupCounterBob");
-        let _ = registry.mark_loaded(alice, (0, 0));
-        let _ = registry.mark_loaded(bob, (0, 0));
-        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
-        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
-        let before_pickup = registry.pressure_snapshot().entity_dispatches;
-
-        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
-        let after_pickup = registry.pressure_snapshot().entity_dispatches;
-
-        assert_eq!(claimed.dispatches.len(), 4);
-        assert_eq!(after_pickup.take, before_pickup.take + 2);
-        assert_eq!(after_pickup.remove, before_pickup.remove + 2);
-    }
-
-    #[test]
-    fn item_drop_records_age_and_remaining_pickup_delay() {
-        let registry = SessionRegistry::new();
-        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        registry.advance_world_time(2);
-
-        let records = registry.persisted_entity_records();
-
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].age, 2);
-        assert_eq!(records[0].pickup_delay, 2);
-    }
-
-    #[test]
-    fn setting_world_time_does_not_age_item_lifecycle() {
-        let registry = SessionRegistry::new();
-        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        registry.advance_world_time(2);
-        registry.set_world_time(100_000);
-
-        let records = registry.persisted_entity_records();
-
-        assert_eq!(records[0].age, 2);
-        assert_eq!(records[0].pickup_delay, 2);
-    }
-
-    #[test]
-    fn restored_item_respects_remaining_pickup_delay() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "RestorePickupAlice");
-        let record = PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(77),
-                uuid: uuid::Uuid::nil(),
-                type_id: 1,
-                type_name: "minecraft:item".into(),
-                position: Vec3::new(0.5, 64.0, 0.5),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(EntityItemStack::new(42, 3)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::new(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-            },
-            age: 12,
-            pickup_delay: 3,
-        };
-        assert_eq!(registry.restore_persisted_entities([record]), 1);
-
-        assert!(
-            registry
-                .nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)
-                .is_empty()
-        );
-        registry.advance_world_time(3);
-        let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
-        assert!(registry.claim_item_pickup(entity_id, alice, 3).is_some());
-    }
-
-    #[test]
-    fn item_drop_despawns_after_lifetime() {
-        let registry = SessionRegistry::new();
-        registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        registry.advance_world_time(ITEM_DESPAWN_AGE_TICKS);
-
-        registry.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
-
-        assert!(registry.persisted_entity_records().is_empty());
-    }
-
-    #[test]
-    fn item_despawn_sweep_is_budgeted() {
-        let registry = SessionRegistry::new();
-        for index in 0..(ITEM_DESPAWN_SWEEP_BUDGET + 10) {
-            registry.spawn_item_drop(
-                1,
-                Vec3::new(index as f64, 64.0, 0.5),
-                EntityItemStack::new(42, 1),
-            );
-        }
-        registry.advance_world_time(ITEM_DESPAWN_AGE_TICKS);
-
-        registry.apply_entity_physics_and_dispatch(ITEM_DESPAWN_AGE_TICKS, &[]);
-
-        let remaining = registry.persisted_entity_records().len();
-        assert_eq!(remaining, 10);
-    }
-
-    #[test]
-    fn restored_arrow_age_controls_despawn_timer() {
-        let registry = SessionRegistry::new();
-        let record = PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(88),
-                uuid: uuid::Uuid::nil(),
-                type_id: 2,
-                type_name: "minecraft:arrow".into(),
-                position: Vec3::new(0.5, 64.0, 0.5),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: Vec3::ZERO,
-                on_ground: true,
-                item_stack: None,
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::new(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-            },
-            age: (ARROW_DESPAWN_AGE_TICKS - 1) as i32,
-            pickup_delay: 0,
-        };
-        assert_eq!(registry.restore_persisted_entities([record]), 1);
-        registry.advance_world_time(1);
-
-        registry.apply_entity_physics_and_dispatch(1, &[]);
-
-        assert!(registry.persisted_entity_records().is_empty());
-    }
-
-    #[test]
-    fn pressure_snapshot_counts_entity_spawn_move_and_pickup_dispatches() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "DispatchAlice");
-        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-
-        let start = registry.pressure_snapshot().entity_dispatches;
-        let spawn_dispatches =
-            registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
-        assert_eq!(spawn_dispatches.len(), 1);
-
-        let after_spawn = registry.pressure_snapshot().entity_dispatches;
-        assert_eq!(after_spawn.spawn, start.spawn + 1);
-        assert_eq!(after_spawn.move_relative, start.move_relative);
-        assert_eq!(after_spawn.take, start.take);
-        assert_eq!(after_spawn.remove, start.remove);
-
-        let entity_id = {
-            let inner = registry.inner.lock().expect("session registry poisoned");
-            inner
-                .entities
-                .snapshots()
-                .next()
-                .expect("spawned entity")
-                .id
-        };
-        registry.apply_entity_physics_and_dispatch(
-            1,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(0.75, 64.0, 0.5),
-                velocity: Vec3::ZERO,
-                on_ground: true,
-            }],
-        );
-
-        let after_move = registry.pressure_snapshot().entity_dispatches;
-        assert_eq!(after_move.move_relative, after_spawn.move_relative + 1);
-
-        registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
-        let claimed = registry.claim_item_pickup(entity_id, alice, 3).unwrap();
-        assert_eq!(claimed.dispatches.len(), 2);
-
-        let after_pickup = registry.pressure_snapshot().entity_dispatches;
-        assert_eq!(after_pickup.take, after_move.take + 1);
-        assert_eq!(after_pickup.remove, after_move.remove + 1);
-    }
-
-    #[test]
-    fn boundary_spawn_does_not_send_same_tick_relative_move_to_new_observer() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (alice, _) = registry.register(
-            &profile("BoundaryAlice"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(alice, (1, 0)).is_empty());
-        assert!(
-            registry
-                .spawn_command_entity(1, "minecraft:zombie".to_string(), Vec3::new(0.5, 64.0, 0.5))
-                .is_empty()
-        );
-        let entity_id = {
-            let inner = registry.inner.lock().expect("session registry poisoned");
-            inner
-                .entities
-                .snapshots()
-                .next()
-                .expect("spawned entity")
-                .id
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            ENTITY_MOVE_SEND_INTERVAL_TICKS,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(16.5, 64.0, 0.5),
-                velocity: Vec3::ZERO,
-                on_ground: true,
-            }],
-        );
-
-        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn moving_mobs_send_velocity_with_relative_move() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (alice, _) = registry.register(
-            &profile("VelocityAlice"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0)]),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-        let spawn_dispatches = registry.spawn_command_entity(
-            1,
-            "minecraft:zombie".to_string(),
-            Vec3::new(0.5, 64.0, 0.5),
-        );
-        dispatch_visibility_commands(spawn_dispatches);
-        let entity_id = {
-            let inner = registry.inner.lock().expect("session registry poisoned");
-            inner
-                .entities
-                .snapshots()
-                .next()
-                .expect("spawned entity")
-                .id
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            ENTITY_MOVE_SEND_INTERVAL_TICKS,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(0.5, 64.1, 0.5),
-                velocity: Vec3::new(0.0, 0.05, 0.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
-        let Ok(OutboundCommand::MoveEntityRelative(movement)) = rx.try_recv() else {
-            panic!("expected relative mob movement");
-        };
-        assert!(movement.send_velocity);
-    }
-
-    #[test]
-    fn item_drop_relative_move_does_not_emit_extra_velocity_packet() {
-        let registry = SessionRegistry::new();
-        let (tx, mut rx) = mpsc::channel(8);
-        let (alice, _) = registry.register(
-            &profile("ItemVelocityAlice"),
-            (0, 0),
-            2,
-            HashSet::from([(0, 0)]),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-        let spawn_dispatches =
-            registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 1));
-        dispatch_visibility_commands(spawn_dispatches);
-        let entity_id = {
-            let inner = registry.inner.lock().expect("session registry poisoned");
-            inner.entities.snapshots().next().expect("spawned item").id
-        };
-
-        registry.apply_entity_physics_and_dispatch(
-            ENTITY_MOVE_SEND_INTERVAL_TICKS,
-            &[EntityPhysicsStep {
-                id: entity_id,
-                position: Vec3::new(0.5, 64.1, 0.5),
-                velocity: Vec3::new(0.0, 0.05, 0.0),
-                on_ground: false,
-            }],
-        );
-
-        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
-        let Ok(OutboundCommand::MoveEntityRelative(movement)) = rx.try_recv() else {
-            panic!("expected relative item movement");
-        };
-        assert!(!movement.send_velocity);
-    }
-
-    #[test]
-    fn pressure_snapshot_counts_dropped_visibility_commands() {
-        let registry = SessionRegistry::new();
-        let start = registry.pressure_snapshot().visibility_command_drops;
-        let (tx, _rx) = mpsc::channel(1);
-        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
-            .expect("fill recipient queue");
-
-        dispatch_visibility_commands(vec![VisibilityDispatch {
-            recipient: SessionRecipient { id: 1, tx },
-            command: OutboundCommand::AnimatePlayer { entity_id: 2 },
-        }]);
-
-        assert!(registry.pressure_snapshot().visibility_command_drops > start);
-    }
-
-    #[tokio::test]
-    async fn reliable_visibility_commands_retry_when_channel_is_full() {
-        let _guard = pressure_counter_test_lock().await;
-        let registry = SessionRegistry::new();
-        let start = registry.pressure_snapshot().reliable_command_retries;
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
-            .expect("fill recipient queue");
-
-        dispatch_visibility_commands(vec![VisibilityDispatch {
-            recipient: SessionRecipient { id: 7, tx },
-            command: OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
-                session_id: 7,
-                entity_id: 7,
-                uuid: uuid::Uuid::nil(),
-                name: "RetryPlayer".to_string(),
-                pose: PlayerPose::new(0.5, 64.0, 0.5),
-            }),
-        }]);
-
-        let pressure = registry.pressure_snapshot();
-        assert_eq!(pressure.reliable_command_retries, start + 1);
-        assert!(pressure.reliable_command_retries_in_flight > 0);
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
-                session_id: 7,
-                ..
-            }))
-        ));
-        for _ in 0..8 {
-            if registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight
-                == 0
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight,
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn reliable_visibility_retries_are_bounded_per_slow_recipient() {
-        let _guard = pressure_counter_test_lock().await;
-        let registry = SessionRegistry::new();
-        let start = registry.pressure_snapshot();
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
-            .expect("fill recipient queue");
-
-        let recipient = SessionRecipient { id: 97, tx };
-        let dispatches = (0..16)
-            .map(|idx| VisibilityDispatch {
-                recipient: recipient.clone(),
-                command: OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
-                    session_id: 9_700 + idx,
-                    entity_id: 9_700 + i32::try_from(idx).unwrap(),
-                    uuid: uuid::Uuid::nil(),
-                    name: format!("SlowRetry{idx}"),
-                    pose: PlayerPose::new(0.5, 64.0, 0.5),
-                }),
-            })
-            .collect();
-
-        dispatch_visibility_commands(dispatches);
-        tokio::task::yield_now().await;
-
-        let pressure = registry.pressure_snapshot();
-        assert_eq!(
-            pressure.reliable_command_retries,
-            start.reliable_command_retries + 1,
-            "one slow recipient should have at most one reliable retry task in flight"
-        );
-        assert_eq!(
-            pressure.reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight + 1,
-            "one slow recipient should not accumulate unbounded pending retry tasks"
-        );
-        assert!(
-            pressure.max_reliable_command_retries_in_flight
-                <= start.max_reliable_command_retries_in_flight + 1,
-            "one slow recipient should not raise max pending reliable retry tasks by more than one"
-        );
-        assert!(
-            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
-            "extra reliable commands for an already-backpressured recipient should be counted as dropped pressure"
-        );
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::SpawnPlayer(PlayerEntitySnapshot {
-                session_id: 9_700,
-                ..
-            }))
-        ));
-        for _ in 0..8 {
-            if registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight
-                == start.reliable_command_retries_in_flight
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight
-        );
-    }
-
-    #[tokio::test]
-    async fn disconnect_player_retries_are_bounded_per_slow_recipient() {
-        let _guard = pressure_counter_test_lock().await;
-        let registry = SessionRegistry::new();
-        let start = registry.pressure_snapshot();
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
-            .expect("fill recipient queue");
-        let (session_id, _) = registry.register(
-            &profile("SlowDisconnectAlice"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-
-        for idx in 0..16 {
-            assert!(registry.disconnect_player(session_id, format!("duplicate disconnect {idx}")));
-        }
-
-        let pressure = registry.pressure_snapshot();
-        assert_eq!(
-            pressure.reliable_command_retries,
-            start.reliable_command_retries + 1,
-            "duplicate disconnects for one slow recipient should schedule one reliable retry"
-        );
-        assert_eq!(
-            pressure.reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight + 1,
-            "duplicate disconnects for one slow recipient should not accumulate retry tasks"
-        );
-        assert!(
-            pressure.max_reliable_command_retries_in_flight
-                <= start.max_reliable_command_retries_in_flight + 1,
-            "duplicate disconnects for one slow recipient should not raise max pending retries by more than one"
-        );
-        assert!(
-            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
-            "extra disconnects for an already-backpressured recipient should be counted as pressure drops"
-        );
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::DisconnectPlayer { reason })
-                if reason == "duplicate disconnect 0"
-        ));
-        for _ in 0..8 {
-            if registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight
-                == start.reliable_command_retries_in_flight
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight
-        );
-    }
-
-    #[tokio::test]
-    async fn custom_payload_retries_are_bounded_per_slow_recipient() {
-        let _guard = pressure_counter_test_lock().await;
-        let registry = SessionRegistry::new();
-        let start = registry.pressure_snapshot();
-        let (tx, mut rx) = mpsc::channel(1);
-        tx.try_send(OutboundCommand::AnimatePlayer { entity_id: 1 })
-            .expect("fill recipient queue");
-        let (session_id, _) = registry.register(
-            &profile("SlowPayloadAlice"),
-            (0, 0),
-            2,
-            HashSet::new(),
-            tx,
-            PlayerPose::new(0.5, 64.0, 0.5),
-        );
-        let channel = Identifier::parse("solaris:test").unwrap();
-
-        for idx in 0..16 {
-            assert!(registry.send_custom_payload(session_id, channel.clone(), vec![idx]));
-        }
-
-        let pressure = registry.pressure_snapshot();
-        assert_eq!(
-            pressure.reliable_command_retries,
-            start.reliable_command_retries + 1,
-            "duplicate custom payloads for one slow recipient should schedule one reliable retry"
-        );
-        assert_eq!(
-            pressure.reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight + 1,
-            "duplicate custom payloads for one slow recipient should not accumulate retry tasks"
-        );
-        assert!(
-            pressure.max_reliable_command_retries_in_flight
-                <= start.max_reliable_command_retries_in_flight + 1,
-            "duplicate custom payloads for one slow recipient should not raise max pending retries by more than one"
-        );
-        assert!(
-            pressure.visibility_command_drops >= start.visibility_command_drops + 15,
-            "extra custom payloads for an already-backpressured recipient should be counted as pressure drops"
-        );
-
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::AnimatePlayer { entity_id: 1 })
-        ));
-        assert!(matches!(
-            rx.recv().await,
-            Some(OutboundCommand::CustomPayload {
-                channel,
-                payload,
-            }) if channel.as_str() == "solaris:test" && payload == vec![0]
-        ));
-        for _ in 0..8 {
-            if registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight
-                == start.reliable_command_retries_in_flight
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(
-            registry
-                .pressure_snapshot()
-                .reliable_command_retries_in_flight,
-            start.reliable_command_retries_in_flight
-        );
-    }
-
-    #[test]
-    fn xp_pickup_removal_succeeds_once() {
-        let registry = SessionRegistry::new();
-        let alice = register_test_session(&registry, "XpAlice");
-        let bob = register_test_session(&registry, "XpBob");
-        registry.spawn_xp_orb(99, Vec3::new(1.0, 64.0, 1.0), 5);
-        let entity_id = registry.nearby_experience_entities(Vec3::new(1.0, 64.0, 1.0), 2.25)[0].id;
-
-        assert!(registry.remove_picked_item(entity_id, alice, 5).is_some());
-        assert!(registry.remove_picked_item(entity_id, bob, 5).is_none());
-    }
-
-    #[test]
-    fn damage_server_entity_respects_hurt_invulnerability_ticks() {
-        let registry = SessionRegistry::new();
-        let entity_id = {
-            let mut inner = registry.inner.lock().expect("session registry poisoned");
-            inner
-                .entities
-                .spawn(SpawnEntity::new(1, "minecraft:zombie", Vec3::ZERO))
-        };
-
-        let first = registry.damage_server_entity(entity_id, 5.0).unwrap();
-        assert_eq!(first.snapshot.health, 15.0);
-        assert!(registry.damage_server_entity(entity_id, 5.0).is_none());
-
-        registry.advance_world_time(ENTITY_HURT_INVULNERABLE_TICKS - 1);
-        assert!(registry.damage_server_entity(entity_id, 5.0).is_none());
-
-        registry.advance_world_time(1);
-        let second = registry.damage_server_entity(entity_id, 5.0).unwrap();
-        assert_eq!(second.snapshot.health, 10.0);
-    }
-
-    #[test]
-    fn xp_orbs_are_spawned_and_found_by_pickup_radius() {
-        let registry = SessionRegistry::new();
-
-        registry.spawn_xp_orb(99, Vec3::new(1.0, 64.0, 1.0), 5);
-
-        let nearby = registry.nearby_experience_entities(Vec3::new(1.5, 64.0, 1.0), 2.25);
-        assert_eq!(nearby.len(), 1);
-        assert_eq!(nearby[0].type_name, "minecraft:experience_orb");
-        assert_eq!(nearby[0].experience_value, Some(5));
-        assert!(
-            registry
-                .nearby_experience_entities(Vec3::new(10.0, 64.0, 10.0), 2.25)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn hostile_entities_are_filtered_by_kind_and_radius() {
-        let registry = SessionRegistry::new();
-        let observer = register_test_session(&registry, "HostileQueryAlice");
-        assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
-        let spawn_dispatches = registry.spawn_command_entity(
-            1,
-            "minecraft:zombie".to_owned(),
-            Vec3::new(1.0, 64.0, 1.0),
-        );
-        let zombie = match &spawn_dispatches[0].command {
-            OutboundCommand::SpawnEntity(entity) => entity.id,
-            other => panic!("expected zombie spawn dispatch, got {other:?}"),
-        };
-        registry.spawn_command_entity(2, "minecraft:cow".to_owned(), Vec3::new(1.5, 64.0, 1.0));
-        registry.spawn_command_entity(
-            1,
-            "minecraft:zombie".to_owned(),
-            Vec3::new(20.0, 64.0, 20.0),
-        );
-        assert_eq!(
-            registry.restore_persisted_entities([PersistedEntityRecord {
-                snapshot: mc_entity::EntitySnapshot {
-                    id: mc_entity::EntityId(777),
-                    uuid: uuid::Uuid::nil(),
-                    type_id: 1,
-                    type_name: "minecraft:zombie".into(),
-                    position: Vec3::new(1.25, 64.0, 1.0),
-                    rotation: mc_entity::Rotation::ZERO,
-                    velocity: Vec3::ZERO,
-                    on_ground: true,
-                    item_stack: Some(EntityItemStack::new(42, 1)),
-                    experience_value: None,
-                    block_state: None,
-                    lifecycle: mc_entity::EntityLifecycle::Alive,
-                    health: 20.0,
-                    attributes: mc_entity::AttributeSet::new(),
-                    goal: mc_entity::GoalState::Idle,
-                    vehicle: None,
-                },
-                age: 0,
-                pickup_delay: 0,
-            }]),
-            1
-        );
-
-        let nearby = registry.nearby_hostile_entities(Vec3::new(1.0, 64.0, 1.0), 2.25);
-
-        assert_eq!(nearby.len(), 1);
-        assert_eq!(nearby[0].id, zombie);
-        assert_eq!(nearby[0].type_name, "minecraft:zombie");
+fn add_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk: (i32, i32)) {
+    *inner.loaded_chunk_refcounts.entry(chunk).or_default() += 1;
+}
+
+fn remove_loaded_chunk_reference_locked(inner: &mut SessionRegistryInner, chunk: (i32, i32)) {
+    let Some(refcount) = inner.loaded_chunk_refcounts.get_mut(&chunk) else {
+        debug_assert!(false, "loaded chunk index is missing {chunk:?}");
+        return;
+    };
+    debug_assert!(*refcount > 0, "loaded chunk refcount is zero for {chunk:?}");
+    *refcount = refcount.saturating_sub(1);
+    if *refcount == 0 {
+        inner.loaded_chunk_refcounts.remove(&chunk);
     }
 }
+
+#[cfg(test)]
+mod tests;

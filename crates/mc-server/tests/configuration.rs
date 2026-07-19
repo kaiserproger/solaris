@@ -5,12 +5,13 @@
 //! asserts the server emits registry/tag data only after the client
 //! acknowledges the advertised built-in pack.
 
+use std::fs;
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
-use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, ProtocolPhase, QueueRecvError};
+use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, ProtocolPhase};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::TARGET_RELEASE;
 use mc_protocol::codec::Identifier;
@@ -25,6 +26,7 @@ use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, S
 use mc_protocol::packets::play::LoginPlay;
 use mc_protocol::packets::{ChatVisibility, ClientInformation, MainHand, ParticleStatus};
 use mc_protocol::packets::{CustomPayload, Packet};
+use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -33,12 +35,16 @@ const OVERSIZED_CUSTOM_PAYLOAD_BYTES: usize = DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES +
 const EXTENSION_CHANNEL: &str = "solaris:test";
 
 async fn start_server() -> SocketAddr {
+    start_server_with_data(std::sync::Arc::new(mc_data::testing::stub())).await
+}
+
+async fn start_server_with_data(data: std::sync::Arc<mc_data::VanillaData>) -> SocketAddr {
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.e config".into(),
         max_players: 8,
         view_distance: 10,
-        data: std::sync::Arc::new(mc_data::testing::stub()),
+        data,
         blocks: std::sync::Arc::new(
             mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
         ),
@@ -63,6 +69,37 @@ async fn start_server() -> SocketAddr {
         let _ = bound.serve().await;
     });
     addr
+}
+
+fn full_registry_sidecar() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let minecraft = dir.path().join("data/minecraft");
+    for (registry, fs_subpath) in mc_data::KNOWN_REGISTRIES {
+        let registry_dir = minecraft.join(fs_subpath);
+        fs::create_dir_all(&registry_dir).unwrap();
+        fs::write(
+            registry_dir.join("alpha.json"),
+            format!(r#"{{"registry":"minecraft:{registry}","enabled":true}}"#),
+        )
+        .unwrap();
+
+        let registry_id = Identifier::parse(format!("minecraft:{registry}")).unwrap();
+        let entry_id = Identifier::parse("minecraft:alpha").unwrap();
+        let mut payload = Vec::new();
+        mc_nbt::write_network(
+            &mut payload,
+            &mc_nbt::Tag::Compound(vec![(
+                "registry".into(),
+                mc_nbt::Tag::String(registry_id.to_string()),
+            )]),
+        )
+        .unwrap();
+        let payload_path =
+            mc_data::network_registry_payload_path(dir.path(), &registry_id, &entry_id);
+        fs::create_dir_all(payload_path.parent().unwrap()).unwrap();
+        fs::write(payload_path, payload).unwrap();
+    }
+    dir
 }
 
 async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEndpoint) {
@@ -111,20 +148,10 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression:
 }
 
 async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            match endpoint.try_recv_event() {
-                Ok(event) => return event,
-                Err(QueueRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(QueueRecvError::Closed) => panic!("extension event queue closed"),
-                Err(error) => panic!("unexpected extension queue error: {error:?}"),
-            }
-        }
-    })
-    .await
-    .expect("extension event was not delivered within 2s")
+    tokio::time::timeout(Duration::from_secs(2), endpoint.recv_event())
+        .await
+        .expect("extension event was not delivered within 2s")
+        .expect("extension event queue closed")
 }
 
 async fn read_one_frame(
@@ -374,6 +401,47 @@ async fn configuration_rejects_missing_known_pack_echo() {
         next.is_none(),
         "server must close before sending has_data=false Registry Data without a confirmed built-in pack"
     );
+}
+
+#[tokio::test]
+async fn configuration_sends_full_registry_data_without_known_pack_echo() {
+    let sidecar = full_registry_sidecar();
+    let data = std::sync::Arc::new(mc_data::load(sidecar.path()).unwrap());
+    assert!(data.has_full_registry_payloads());
+    let addr = start_server_with_data(data).await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(4096);
+    let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadClient").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    assert_eq!(known.packs.len(), 1);
+    write_frame(
+        &mut stream,
+        &ServerboundKnownPacks { packs: Vec::new() },
+        compression,
+    )
+    .await;
+
+    for _ in 0..mc_data::KNOWN_REGISTRIES.len() {
+        let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+        assert_eq!(frame.id, RegistryData::ID);
+        let registry = RegistryData::decode(&mut frame.body).unwrap();
+        assert_eq!(frame.body.remaining(), 0);
+        assert_eq!(registry.entries.len(), 1);
+        assert!(registry.entries[0].nbt_payload.is_some());
+    }
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, UpdateTags::ID);
+    let _ = UpdateTags::decode(&mut frame.body).unwrap();
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, FinishConfiguration::ID);
+    let _ = FinishConfiguration::decode(&mut frame.body).unwrap();
+
+    write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
+    let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(frame.id, LoginPlay::ID);
 }
 
 #[tokio::test]

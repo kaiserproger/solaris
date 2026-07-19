@@ -16,6 +16,7 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::status::{PingRequest, PongResponse, StatusRequest, StatusResponse};
 use mc_protocol::{PROTOCOL_VERSION, TARGET_RELEASE};
+use mc_test_harness::client::Client;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -24,16 +25,19 @@ use tokio::net::TcpStream;
 /// after the fact because it owns the listener internally; instead we
 /// peek the address before launching the server with the real config.
 async fn start_server(motd: &str) -> SocketAddr {
+    let blocks = std::sync::Arc::new(
+        mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+    );
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: motd.to_string(),
         max_players: 17,
         view_distance: 10,
         data: std::sync::Arc::new(mc_data::testing::stub()),
-        blocks: std::sync::Arc::new(
-            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
-        ),
-        world: None,
+        blocks: std::sync::Arc::clone(&blocks),
+        world: Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            mc_world::WorldStorage::in_memory(blocks),
+        ))),
         tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
         recipes: std::sync::Arc::new(Vec::new()),
         loot: std::sync::Arc::new(mc_data::loot::LootTables::default()),
@@ -73,13 +77,9 @@ async fn read_one_frame(stream: &mut TcpStream, buf: &mut BytesMut) -> mc_protoc
     }
 }
 
-#[tokio::test]
-async fn handshake_status_ping_round_trip() {
-    let addr = start_server("Hello from Solaris").await;
+async fn read_status_json(addr: SocketAddr, ping_payload: i64) -> serde_json::Value {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     let mut rbuf = BytesMut::with_capacity(4096);
-
-    // 1. Handshake (next_state = Status).
     write_frame(
         &mut stream,
         &Handshake {
@@ -90,43 +90,54 @@ async fn handshake_status_ping_round_trip() {
         },
     )
     .await;
-
-    // 2. Empty status request.
     write_frame(&mut stream, &StatusRequest).await;
 
-    // 3. Read status response, decode JSON.
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, StatusResponse::ID);
     let response = StatusResponse::decode(&mut frame.body).unwrap();
     assert!(frame.body.remaining() == 0);
-    let json: serde_json::Value = serde_json::from_str(&response.json).unwrap();
-    assert_eq!(json["version"]["protocol"], PROTOCOL_VERSION);
-    assert_eq!(json["version"]["name"], TARGET_RELEASE);
-    assert_eq!(json["description"]["text"], "Hello from Solaris");
-    assert_eq!(json["players"]["max"], 17);
-    assert_eq!(json["solaris"]["health"]["ready"], true);
-    assert_eq!(json["solaris"]["health"]["state"], "ready");
-    assert_eq!(
-        json["solaris"]["health"]["runtime_control"]["enabled"],
-        false
-    );
+    let json = serde_json::from_str(&response.json).unwrap();
 
-    // 4. Ping → Pong.
     write_frame(
         &mut stream,
         &PingRequest {
-            payload: 0xDEAD_BEEF,
+            payload: ping_payload,
         },
     )
     .await;
     let mut frame = read_one_frame(&mut stream, &mut rbuf).await;
     assert_eq!(frame.id, PongResponse::ID);
     let pong = PongResponse::decode(&mut frame.body).unwrap();
-    assert_eq!(pong.payload, 0xDEAD_BEEF);
-
-    // 5. Server should close the connection (read returns 0). Give it a
-    //    moment, then assert.
+    assert_eq!(pong.payload, ping_payload);
     let mut scratch = [0u8; 1];
-    let n = stream.read(&mut scratch).await.unwrap_or(0);
-    assert_eq!(n, 0, "expected the server to close after pong");
+    assert_eq!(stream.read(&mut scratch).await.unwrap_or(0), 0);
+    json
+}
+
+#[tokio::test]
+async fn handshake_status_ping_round_trip() {
+    let addr = start_server("Hello from Solaris").await;
+    let json = read_status_json(addr, 0xDEAD_BEEF).await;
+    assert_eq!(json["version"]["protocol"], PROTOCOL_VERSION);
+    assert_eq!(json["version"]["name"], TARGET_RELEASE);
+    assert_eq!(json["description"]["text"], "Hello from Solaris");
+    assert_eq!(json["players"]["max"], 17);
+    assert_eq!(json["solaris"]["health"]["ready"], true);
+    assert_eq!(json["solaris"]["health"]["state"], "ready");
+    assert!(json["solaris"]["health"].get("runtime_control").is_none());
+}
+
+#[tokio::test]
+async fn status_reports_registered_play_session_count() {
+    let addr = start_server("Player count").await;
+    let mut play_client = Client::connect(addr).await.unwrap();
+    let _ = play_client
+        .drive_login(addr, "CountedPlayer")
+        .await
+        .unwrap();
+    play_client.drive_configuration().await.unwrap();
+    let _ = play_client.read_play_login().await.unwrap();
+
+    let json = read_status_json(addr, 42).await;
+    assert_eq!(json["players"]["online"], 1);
 }

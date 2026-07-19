@@ -8,9 +8,8 @@ bind_address = "127.0.0.1"
 port = 25565
 
 [auth]
-# M89 scope: Solaris is offline-mode only. This is suitable for private/local
-# MVP testing, not production public authentication. Keep the example bound to
-# loopback unless you have an explicit external access plan.
+# Set true for Mojang session authentication and encrypted public play.
+# Keep offline mode bound to private/local addresses.
 online_mode = false
 whitelist_enabled = false
 whitelist = []
@@ -21,6 +20,10 @@ banned_players = []
 # allow_local_dev_operators = true only for throwaway local development.
 operators = []
 allow_local_dev_operators = false
+
+[plugins]
+# Each child directory may contain plugin.toml and main.lua.
+directory = "plugins"
 
 [data]
 world_dir = ".analysis/test-world"
@@ -40,23 +43,18 @@ seed = 0
 # Random block ticks per active chunk per game tick. Set to 0 to disable
 # random block simulation while keeping scheduled ticks enabled.
 random_tick_speed = 5
-# Maximum active/ticketed chunks sampled per game tick.
-random_tick_chunk_budget = 32
 # Autosave cadence in game ticks. The debug manual gate uses a longer cadence
 # because large restored entity sets are expensive to serialize every second.
 save_interval_ticks = 1200
 
 [chunk_pipeline]
-# Chunk stream / worker policy. Thread pools are configured as percentages
-# of available CPU cores and resolve to at least one thread each.
+# Chunk stream policy. Worker capacity is derived automatically from the
+# process CPU limit and is shared by chunk CPU work and entity physics.
 chunk_send_rate = 8
 chunk_load_rate = 16
 chunk_generate_rate = 16
 chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 8
-chunk_io_threads_percent = 25
-chunk_worker_threads_percent = 25
-entity_worker_threads_percent = 25
 chunk_result_queue_size = 64
 region_cache_size = 9
 # Optional zlib level for compressed protocol frames. Omit for flate2's
@@ -64,11 +62,9 @@ region_cache_size = 9
 # compression_level = 1
 
 [autoscale]
-# Runtime-control primitive. When enabled, live chunk streaming consumes
-# the bounded send-rate limit plus a prepare-dispatch cap derived from
-# load/generate limits. This is still not a full health/drain/load-shedding
-# autoscale gate.
-enabled = false
+# Runtime control owns chunk throughput plus random/scheduled work budgets
+# selected from the hardware profile and runtime p95 pressure.
+enabled = true
 profile = "balanced"
 # Optional overrides. Omit to use the profile defaults.
 # min_view_distance = 6

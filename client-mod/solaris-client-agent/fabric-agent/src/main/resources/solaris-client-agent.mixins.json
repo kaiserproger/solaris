@@ -1,8 +1,12 @@
 {
-  "required": false,
-  "package": "dev.solaris.agent.fabric.mixin",
-  "compatibilityLevel": "JAVA_25",
-  "client": [],
+  "required": true,
+  "minVersion": "0.8",
+  "package": "dev.solaris.agent.mixin",
+  "client": [
+    "ClientPacketListenerMixin",
+    "MinecraftBlockBreakMixin",
+    "PacketProcessorListenerAndPacketMixin"
+  ],
   "injectors": {
     "defaultRequire": 1
   }

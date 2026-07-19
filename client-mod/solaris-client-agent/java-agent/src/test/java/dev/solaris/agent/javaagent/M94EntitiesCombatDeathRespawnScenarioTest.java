@@ -86,7 +86,16 @@ final class M94EntitiesCombatDeathRespawnScenarioTest {
             Duration timeout
         ) {
             operations.add("summon:" + entityTypeId + ":" + offsetX + ":" + offsetY + ":" + offsetZ);
-            return new ScenarioEntityObservation(entityTypeId, 42, 1.5, 64.0, 4.5, entityDistanceSquared);
+            return new ScenarioEntityObservation(
+                entityTypeId,
+                42,
+                new java.util.UUID(0L, 42L),
+                1.5,
+                64.0,
+                4.5,
+                entityDistanceSquared,
+                null
+            );
         }
 
         @Override

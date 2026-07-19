@@ -4,14 +4,13 @@
   "quality_label": "stabilization",
   "minecraft_version": "26.1.2",
   "server_command": "cargo run --bin mc-server -- --config example.toml",
-  "client_requirement": "Normal vanilla 26.1.2 client launched directly or through PrismLauncher; protocol harnesses do not satisfy this gate.",
+  "client_requirement": "Normal vanilla 26.1.2 client launched through the repo-native Gradle runClient adapter; protocol harnesses do not satisfy this gate.",
   "artifact_root": ".analysis/real-client-runs",
   "automation_runner": {
     "script": "tools/run-real-client-regression.sh",
-    "command_env": "SOLARIS_REAL_CLIENT_COMMAND",
-    "legacy_command_env": "M94_CLIENT_COMMAND",
-    "kind_env": "SOLARIS_REAL_CLIENT_KIND",
-    "allowed_client_kinds": ["prism-launcher", "vanilla-launcher", "vanilla-client"],
+    "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "client_isolation": "Gradle runClient launches use per-run game directories and distinct offline usernames for primary/secondary clients.",
     "modes": ["--check", "--prepare", "--run", "--validate-run"],
     "agent_driver": "tools/real-client-agent-driver.py",
     "agent_bridge_url_env": "SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL",
@@ -20,7 +19,8 @@
     "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
     "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
     "agent_server_addr_env": "SOLARIS_REAL_CLIENT_SERVER_ADDR",
-    "second_command_env": "SOLARIS_REAL_CLIENT_SECOND_COMMAND",
+    "second_client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "second_client_adapter_source": "auto-gradle-runclient",
     "second_agent_secret_env": "SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET",
     "second_agent_port_env": "SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT",
     "prepared_status": "prepared-owner-run",
@@ -336,6 +336,26 @@
         "The historical water/frozen-world symptom is either reproduced, cleared by real-client observation, or left blocked.",
         "TPS/lock log capture is attached to the run artifacts.",
         "The scenario does not substitute protocol-harness metrics for real-client observations."
+      ]
+    },
+    {
+      "id": "m94-08-enchanting-efficiency",
+      "title": "Targeted enchanting table UI, XP debit, and item component",
+      "ledger_rows": ["G1"],
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "steps": [
+        "Start Solaris and connect the repo-native Gradle 26.1.2 client on a fresh local world.",
+        "Use local debug setup to place an enchanting table and prepare one stone pickaxe, one lapis lazuli, and seven total XP points.",
+        "Open the vanilla enchanting screen, quick-move both inputs, and click offer button zero through the real container protocol.",
+        "Require a server-confirmed container state advance, Efficiency I on the pickaxe, total XP preserved at seven, level reduced from one to zero, and the enchanted tool returned to inventory."
+      ],
+      "expected_observations": [
+        "The real client opens the vanilla EnchantmentScreen and receives a usable first offer.",
+        "The button click is accepted only after an applied server packet changes the active container state id.",
+        "Client-visible item components contain minecraft:efficiency level 1, one lapis is consumed, total XP remains seven, and one level is spent.",
+        "This targeted debug setup does not claim natural enchanting-table or lapis acquisition, bookshelf scaling, random offer parity, books, or anvils."
       ]
     }
   ]

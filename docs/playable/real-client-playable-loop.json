@@ -1,0 +1,1469 @@
+{
+  "schema_version": 1,
+  "pack_id": "playable-real-client-loop",
+  "quality_label": "playable-spike",
+  "server_command": "cargo run --bin mc-server -- --config playable.toml",
+  "client_requirement": "A vanilla 26.1.2 real client must connect to playable.toml through the repo-native Gradle runClient adapter; protocol harnesses do not satisfy this gate, and prepared artifacts are not passing evidence.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "debug commands",
+    "headless mock client"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "tools/run-playable-client-gate.sh",
+    "delegates_to": "tools/run-real-client-regression.sh",
+    "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "server_config_env": "SOLARIS_REAL_CLIENT_SERVER_CONFIG",
+    "server_config_value": "playable.toml",
+    "agent_driver": "tools/real-client-agent-driver.py",
+    "agent_bridge_url_env": "SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL",
+    "agent_secret_env": "SOLARIS_REAL_CLIENT_AGENT_SECRET",
+    "agent_jar_env": "SOLARIS_REAL_CLIENT_AGENT_JAR",
+    "agent_port_env": "SOLARIS_REAL_CLIENT_AGENT_PORT",
+    "agent_scenario_env": "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+    "default_agent_scenario": "playable-04-twenty-minute-survival-loop",
+    "timeout_env": "SOLARIS_REAL_CLIENT_TIMEOUT_SECONDS",
+    "default_timeout_seconds": 1500,
+    "passing_gate": "agent-run real-client",
+    "modes": [
+      "--check",
+      "--prepare",
+      "--run",
+      "--validate-run"
+    ]
+  },
+  "scenarios": [
+    {
+      "id": "playable-01-join-generated-spawn",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Start Solaris with playable.toml through the runner.",
+        "Connect one vanilla 26.1.2 client to 127.0.0.1:25565.",
+        "Wait until the client is in Play state on the generated seed-0 world.",
+        "Capture a screenshot after chunks and hotbar are visible."
+      ],
+      "expected_observations": [
+        "Client reaches Play state without disconnect.",
+        "Generated terrain and player HUD render in the screenshot.",
+        "observations.json records client_gate=agent-run-real-client."
+      ]
+    },
+    {
+      "id": "playable-02-natural-wood-to-tool",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "From generated spawn, walk to a naturally generated tree.",
+        "Break logs without debug commands or starter-kit injection.",
+        "Pick up drops, craft planks, sticks, a crafting table, and a wooden pickaxe.",
+        "Place and open the crafting table, then craft or verify a basic tool."
+      ],
+      "expected_observations": [
+        "Log break, item drop, pickup, inventory, hotbar, and recipe flow converge in the real client.",
+        "Crafting table placement/opening works without ghost blocks.",
+        "Screenshots show the survival state after tool crafting."
+      ]
+    },
+    {
+      "id": "playable-02a-natural-log-to-planks",
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Find a loaded natural oak log within survival reach.",
+        "Break the log, observe the drop, pick it up, and use the inventory recipe for oak planks.",
+        "Capture a screenshot after the planks recipe converges."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "A natural oak log becomes air, the item drop is visible, and pickup restores an oak log item.",
+        "The inventory recipe consumes one oak log and creates four oak planks."
+      ]
+    },
+    {
+      "id": "playable-02b-natural-crafting-table-open",
+      "status": "manual-pending",
+      "bounded_time_minutes": 7,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the natural log-to-planks subflow.",
+        "Use the embedded playable crafting-table recipe, select the earned table from hotbar, place it, and open the crafting screen.",
+        "Capture a screenshot after the crafting screen opens."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "The crafting-table recipe consumes four oak planks and creates one crafting table.",
+        "The earned crafting table is placed as a world block, opens the vanilla crafting screen, and closes cleanly."
+      ]
+    },
+    {
+      "id": "playable-03-save-restart-rejoin",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the playable-03 before phase through the real-client agent.",
+        "Collect natural oak logs, craft a wooden pickaxe, place the earned crafting table, and record the table marker.",
+        "Stop Solaris cleanly through the runner and restart with the same playable.toml world.",
+        "Run the playable-03 after phase, rejoin, and inspect the recorded table marker and saved wooden pickaxe inventory."
+      ],
+      "expected_observations": [
+        "The runner artifacts include separate before-restart and after-restart agent phases.",
+        "The placed crafting table persists after restart.",
+        "The crafted wooden pickaxe remains in player inventory after rejoin."
+      ]
+    },
+    {
+      "id": "playable-03-save-restart-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the before-restart phase through the real-client agent.",
+        "Collect natural logs, craft a wooden pickaxe, place the earned crafting table, and record the table marker.",
+        "Capture a screenshot before the runner stops Solaris."
+      ],
+      "expected_observations": [
+        "The before phase uses no debug give, teleport, or chat-command setup.",
+        "The earned crafting table is placed and marker coordinates are written.",
+        "The crafted wooden pickaxe exists before shutdown."
+      ]
+    },
+    {
+      "id": "playable-03-save-restart-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Restart Solaris on the same playable.toml world through the runner.",
+        "Reconnect the real client through the agent bridge.",
+        "Verify the recorded crafting-table marker and wooden pickaxe inventory, then capture a screenshot."
+      ],
+      "expected_observations": [
+        "The after phase uses the same world directory after a clean server restart.",
+        "The placed crafting table persists at the recorded marker coordinates.",
+        "The crafted wooden pickaxe remains in player inventory after rejoin."
+      ]
+    },
+    {
+      "id": "playable-04-twenty-minute-survival-loop",
+      "status": "manual-pending",
+      "bounded_time_minutes": 25,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the playable gate wrapper with the default Gradle runClient adapter.",
+        "Stay connected for a 20-minute survival session on playable.toml.",
+        "Walk, jump, collide, break/place common blocks, pick up drops, craft the wood-to-tool loop, and rejoin after a clean restart.",
+        "Capture screenshots for the join, crafting/tool state, and post-restart state."
+      ],
+      "expected_observations": [
+        "No server crash, client disconnect, catastrophic tick stalls, or unrecovered movement desync during the 20-minute window.",
+        "Break/place/drop/pickup/crafting-table actions are visible through the real client.",
+        "Save/restart/rejoin preserves the edited world and player inventory.",
+        "observations.json result is passed only for agent-run-real-client evidence."
+      ]
+    },
+    {
+      "id": "playable-05-stone-tool-progression",
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> wooden pickaxe path.",
+        "Select the earned wooden pickaxe, mine natural stone into cobblestone drops, pick up the cobblestone, reopen the earned crafting table, and craft a stone pickaxe.",
+        "Capture a screenshot after the stone pickaxe recipe converges."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "The earned wooden pickaxe can mine natural stone and produce cobblestone drops through the real client.",
+        "The active crafting table recipe consumes three cobblestone and two sticks and creates one stone pickaxe."
+      ]
+    },
+    {
+      "id": "playable-06-stone-tool-save-restart",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the no-debug natural wood -> wooden pickaxe -> stone pickaxe path through the real client.",
+        "Record the earned crafting table marker, cleanly stop Solaris, and restart on the same per-run playable world.",
+        "Reconnect the real client and verify the recorded crafting table marker plus the saved stone pickaxe inventory.",
+        "Capture before and after screenshots for the restarted stone-tool state."
+      ],
+      "expected_observations": [
+        "The before phase reaches the stone pickaxe using only normal survival actions.",
+        "The runner performs a real clean server restart on the same world directory.",
+        "The after phase observes the crafting table marker and stone_pickaxe_count >= 1 after rejoin."
+      ]
+    },
+    {
+      "id": "playable-06-stone-tool-save-restart-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the natural wood -> wooden pickaxe -> exposed stone -> stone pickaxe path.",
+        "Write the crafted-table marker for the runner-managed restart."
+      ],
+      "expected_observations": [
+        "stone pickaxe recipe passes before restart.",
+        "restart marker placement passes with the earned crafting table target."
+      ]
+    },
+    {
+      "id": "playable-06-stone-tool-save-restart-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Restart Solaris on the same playable world through the runner.",
+        "Reconnect the real client and run the after phase.",
+        "Verify the persisted crafting-table marker and stone pickaxe inventory."
+      ],
+      "expected_observations": [
+        "restart marker persistence passes after clean server restart.",
+        "stone inventory persistence passes with stone_pickaxe_count >= 1."
+      ]
+    },
+    {
+      "id": "playable-07-furnace-placement-open",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> wooden pickaxe path.",
+        "Mine eight natural stone blocks into cobblestone, reopen the earned crafting table, and craft a furnace.",
+        "Place the earned furnace as a world block, open the furnace screen, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "The furnace recipe consumes eight cobblestone and creates one furnace item.",
+        "The earned furnace is placed as a world block and opens the vanilla furnace screen."
+      ]
+    },
+    {
+      "id": "playable-08-furnace-charcoal-smelt",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> wooden pickaxe -> furnace placement path.",
+        "Collect one extra natural log from the detected generated log family.",
+                "Open the earned furnace, move the extra log into input slot 0, move earned planks into fuel slot 1, then clear leftover fuel from slot 1 after charcoal output appears.",
+        "Wait for charcoal in output slot 2, move it into inventory, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "The fallback playable data includes charcoal smelting from minecraft:logs_that_burn and generated wooden fuel.",
+        "The real client observes minecraft:charcoal in the furnace output slot and inventory after pickup."
+      ]
+    },
+    {
+      "id": "playable-09-torch-craft-place",
+      "status": "manual-pending",
+      "bounded_time_minutes": 16,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> wooden pickaxe -> furnace -> charcoal path.",
+        "Craft torches from the cooked charcoal and earned sticks using the inventory recipe.",
+        "Select the earned torches, place one on a dry block top face, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, teleport, or chat-command setup.",
+        "The torch recipe consumes one cooked charcoal and one earned stick, then creates four torches.",
+        "The earned torch item places a minecraft:torch world block through the real client."
+      ]
+    },
+    {
+      "id": "playable-10-passive-food-drop",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Scan the already loaded generated world for a natural passive food mob: cow, pig, or chicken.",
+        "Approach the natural mob through normal movement, attack it in survival, and wait for the configured food drop to enter inventory.",
+        "Capture a screenshot after the raw food item is visible in the player inventory."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "A natural passive entity is observed by entity type and approached through the real client.",
+        "Entity attack, mob removal, configured food drop, item pickup, and inventory count converge through the real client."
+      ]
+    },
+    {
+      "id": "playable-11-eat-passive-food",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural passive food mob drop path until the earned raw food item enters inventory.",
+        "Drain hunger through normal sprint movement without debug survival commands.",
+        "Select the earned food item, hold use until the server consumes it, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "Natural sprint movement lowers the client food level below full.",
+        "The earned food stack count decreases and the client food level increases through the real client use-item path."
+      ]
+    },
+    {
+      "id": "playable-12-earned-chest-storage",
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Collect natural generated logs and craft planks without debug setup.",
+        "Craft an earned chest from the planks.",
+        "Collect one earned passive food drop, place/open the chest near the current position, move the food item into chest slot 0, observe it there, close the screen, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "The fallback playable data includes the minecraft:chest recipe from minecraft:planks.",
+        "The real client observes the earned passive food item in chest storage slot 0 after a normal container transfer."
+      ]
+    },
+    {
+      "id": "playable-13-chest-storage-save-restart",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the earned chest storage path, write the chest marker, and let the runner stop Solaris cleanly.",
+        "Restart Solaris on the same world, rejoin, open the marked chest, verify slot 0 still contains the earned item, and capture before/after screenshots."
+      ],
+      "expected_observations": [
+        "The runner records one clean server restart between before and after phases.",
+        "The marked chest block persists after restart.",
+        "The real client observes the same earned item in chest storage slot 0 after rejoin."
+      ]
+    },
+    {
+      "id": "playable-13-chest-storage-save-restart-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Run the earned chest storage path.",
+        "Write the chest coordinates and stored item id to the runner artifact directory.",
+        "Capture a screenshot before the runner-managed clean server stop."
+      ],
+      "expected_observations": [
+        "The before phase uses no debug setup.",
+        "The earned item is observed in chest slot 0 before restart.",
+        "A chest marker file is written for the after phase."
+      ]
+    },
+    {
+      "id": "playable-13-chest-storage-save-restart-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Rejoin the same playable.toml world after the runner restarts Solaris.",
+        "Read the chest marker from the runner artifact directory.",
+        "Open the marked chest, verify slot 0 still contains the stored item, close the screen, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The marked chest block is still present after restart.",
+        "The chest opens as the vanilla container screen.",
+        "Chest slot 0 still contains the earned item recorded by the before phase."
+      ]
+    },
+    {
+      "id": "playable-14-earned-bed-sleep",
+      "status": "manual-pending",
+      "bounded_time_minutes": 18,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Collect natural generated logs and craft planks without debug setup.",
+        "Find natural sheep, collect white wool drops, craft a white bed from earned wool and planks, then place the bed.",
+        "Wait for the natural night window, use the bed, observe the client world time return to morning, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time-set, or chat-command setup.",
+        "The fallback playable data includes the appended white-bed recipe without shifting prior embedded recipe display ids.",
+        "The real client observes natural night and then morning after using the earned bed."
+      ]
+    },
+    {
+      "id": "playable-15-cooked-passive-food",
+      "status": "manual-pending",
+      "bounded_time_minutes": 18,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Find a natural passive food mob and collect its raw drop before stone mining and furnace placement move the client away from nearby animals.",
+        "Run the no-debug stone -> furnace -> charcoal path while carrying the earned raw food.",
+        "Reopen the earned furnace and place the raw food in input slot 0 with earned charcoal in fuel slot 1.",
+        "Wait for cooked food in output slot 2, move it into inventory, drain hunger through movement, eat the cooked food, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "The fallback playable data includes furnace smelting recipes for beef, porkchop, and chicken into their cooked food items.",
+        "The real client observes cooked food in furnace output slot 2 and then consumes the cooked meal from inventory."
+      ]
+    },
+    {
+      "id": "playable-16-earned-door-place-toggle",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Collect natural generated logs and craft matching planks without debug setup.",
+        "Craft and open an earned crafting table, then craft the matching wooden door recipe from earned planks.",
+        "Select the crafted door, place it on a dry target, use the placed door once to open it and once more to close it, then capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "The fallback playable data includes wooden door recipes for generated overworld plank families without shifting earlier recipe display ids.",
+        "The real client observes the crafted matching door as a world block and consumes normal use-item-on interactions for open and close toggles."
+      ]
+    },
+    {
+      "id": "playable-17-earned-sign-place-edit",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Collect natural generated logs and craft matching planks without debug setup.",
+        "Craft and open an earned crafting table, craft sticks, then craft the matching wooden sign recipe from earned planks and a stick.",
+        "Select the crafted sign, place it on a dry target, wait for the vanilla sign editor, write four sign lines, observe the edited block entity text, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "The fallback playable data includes wooden sign recipes for generated overworld plank families without shifting earlier recipe display ids.",
+        "The real client observes the placed matching sign, opens the vanilla sign editor, sends a sign text update packet, and reads the edited sign text back from the world."
+      ]
+    },
+    {
+      "id": "playable-18-earned-campfire-cooking",
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Collect a raw passive food drop, mine stone, craft and place a furnace, and smelt earned charcoal.",
+        "Collect three matching natural logs, reopen the earned crafting table, craft a campfire from earned logs, sticks, and charcoal, then place it on a dry target.",
+        "Use the raw passive food on the placed campfire, wait for cooked item output as a visible item entity, pick it up, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, or chat-command setup.",
+        "The fallback playable data includes a campfire recipe plus campfire-cooking recipes for beef, porkchop, and chicken without shifting earlier recipe display ids.",
+        "The real client observes the crafted campfire block, starts campfire cooking through normal use-item-on, sees cooked output, and picks up the cooked food item."
+      ]
+    },
+    {
+      "id": "playable-19-earned-campfire-death-respawn",
+      "status": "manual-pending",
+      "bounded_time_minutes": 22,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> furnace -> charcoal -> earned campfire path.",
+        "Use a raw passive food item on the placed campfire and collect the cooked output as visible item-entity evidence.",
+        "Move onto the same placed lit campfire, wait for normal contact damage to reach the vanilla death screen, send the vanilla respawn packet, and capture a screenshot after respawn."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, damage, or chat-command setup.",
+        "The real client reaches the death screen from standing on the earned lit campfire.",
+        "The real client respawns through ServerboundClientCommandPacket.Action.PERFORM_RESPAWN and returns to normal play with health above zero."
+      ]
+    },
+    {
+      "id": "playable-20-campfire-death-drop-recovery",
+      "status": "manual-pending",
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> furnace -> charcoal -> earned campfire path.",
+        "Stand on the placed lit campfire until normal contact damage reaches the vanilla death screen, then respawn.",
+        "Return to the death site through normal movement, observe the dropped earned wooden pickaxe, pick it up, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, damage, or chat-command setup.",
+        "The real client reaches the death screen from standing on the earned lit campfire and respawns through the vanilla respawn packet.",
+        "The real client returns to the campfire death site and restores the earned wooden pickaxe through visible item-entity pickup."
+      ]
+    },
+    {
+      "id": "playable-21-earned-tool-zombie-combat",
+      "status": "manual-pending",
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Wait for natural night without commands, scan loaded hostile entities for a naturally spawned zombie, and approach it through normal movement.",
+        "Select the earned wooden pickaxe, attack the zombie until it dies, collect the visible rotten flesh drop, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client reaches night through normal world time and finds a naturally loaded zombie.",
+        "The real client kills the zombie using the earned wooden pickaxe and restores at least one rotten flesh item through visible item-entity pickup."
+      ]
+    },
+    {
+      "id": "playable-22-stone-sword-zombie-combat",
+      "status": "manual-pending",
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Mine two natural stone blocks with the earned wooden pickaxe, reopen the earned crafting table, and craft a stone sword from earned cobblestone and sticks.",
+        "Wait for natural night without commands, scan loaded hostile entities for a naturally spawned zombie, and approach it through normal movement.",
+        "Select the earned stone sword, attack the zombie until it dies, collect the visible rotten flesh drop, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client crafts minecraft:stone_sword from earned cobblestone and sticks using embedded recipe display id 26.",
+        "The real client kills a naturally loaded zombie using the earned stone sword and restores at least one rotten flesh item through visible item-entity pickup."
+      ]
+    },
+    {
+      "id": "playable-23-iron-ingot-progression",
+      "status": "manual-pending",
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Mine eleven natural stone blocks with the earned wooden pickaxe, reopen the earned crafting table, and craft a stone pickaxe plus furnace from earned cobblestone and sticks.",
+        "Place/open the earned furnace, then mine a natural iron ore or deepslate iron ore block with the earned stone pickaxe and collect the visible raw iron drop.",
+        "Reopen the furnace, smelt earned raw iron with earned plank fuel into an iron ingot, move the ingot into inventory, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client crafts minecraft:stone_pickaxe and minecraft:furnace from earned cobblestone and sticks using embedded recipe display ids 24 and 13.",
+        "The real client breaks a naturally generated iron ore block into minecraft:raw_iron and smelts it into minecraft:iron_ingot through the furnace UI."
+      ]
+    },
+    {
+      "id": "playable-24-iron-sword-zombie-combat",
+      "status": "manual-pending",
+      "bounded_time_minutes": 30,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe path.",
+        "Mine eleven natural stone blocks with the earned wooden pickaxe, reopen the earned crafting table, and craft a stone pickaxe plus furnace from earned cobblestone and sticks.",
+        "Place/open the earned furnace, mine two natural iron ore or deepslate iron ore blocks with the earned stone pickaxe, and smelt two earned raw iron drops into two iron ingots with earned plank fuel.",
+        "Reopen the earned crafting table, craft sticks from earned planks when needed, craft an iron sword from earned iron ingots and a stick, then wait for natural night without commands.",
+        "Scan loaded hostile entities for a naturally spawned zombie, select the earned iron sword, attack until the zombie dies, collect the visible rotten flesh drop, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client crafts minecraft:iron_sword from two earned minecraft:iron_ingot items and an earned minecraft:stick using embedded recipe display id 57.",
+        "The real client kills a naturally loaded zombie using the earned iron sword and restores at least one rotten flesh item through visible item-entity pickup."
+      ]
+    },
+    {
+      "id": "playable-25-iron-sword-save-restart",
+      "status": "manual-pending",
+      "bounded_time_minutes": 30,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> stone pickaxe -> furnace path.",
+        "Mine and smelt two natural iron ore drops into two earned iron ingots, craft sticks from earned planks when needed, and craft an earned iron sword.",
+        "Stop Solaris with the runner-managed graceful restart path, restart the same world, reconnect the same real client, and capture screenshots for both phases.",
+        "Verify the crafted table marker persists and the earned iron sword remains in the player inventory after restart."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The before phase records iron sword recipe evidence and a runner-managed restart marker.",
+        "The after phase observes the persisted crafting table marker and at least one minecraft:iron_sword in inventory."
+      ]
+    },
+    {
+      "id": "playable-25-iron-sword-save-restart-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 24,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Craft an earned iron sword through natural wood, stone, furnace, iron ore, raw iron, ingot, stick, and crafting-table actions.",
+        "Write the crafted table restart marker for the runner-managed after phase and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The phase records iron sword recipe evidence using recipe display id 57.",
+        "The phase records runner-managed restart pending evidence and writes the restart marker."
+      ]
+    },
+    {
+      "id": "playable-25-iron-sword-save-restart-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 6,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Reconnect the same real vanilla client after the runner restarts Solaris against the same playable world.",
+        "Read the before-phase marker, verify the crafted table block is still present, verify the earned iron sword remains in inventory, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The after phase fails closed if the before-phase marker is absent.",
+        "The after phase records restart marker persistence and iron sword inventory persistence evidence."
+      ]
+    },
+    {
+      "id": "playable-26-earned-shield-zombie-block",
+      "status": "manual-pending",
+      "bounded_time_minutes": 30,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> stone pickaxe -> furnace path.",
+        "Mine and smelt one natural iron ore drop into one earned iron ingot, keep earned planks, and reopen the earned crafting table.",
+        "Craft a shield from earned planks and the earned iron ingot using embedded recipe display id 58.",
+        "Wait for natural night without commands, scan loaded hostile entities for a naturally spawned zombie, select the earned shield, hold use while facing the zombie until a shield-damage packet proves that an attack was blocked, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client crafts minecraft:shield from six earned planks and one earned minecraft:iron_ingot using embedded recipe display id 58.",
+        "The real client accepts the block only after selected-shield damage increases while health does not decrease; elapsed time or an absent zombie attack cannot satisfy the scenario."
+      ]
+    },
+    {
+      "id": "playable-27-earned-iron-chestplate-equip",
+      "status": "manual-pending",
+      "bounded_time_minutes": 30,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> stone pickaxe -> furnace path.",
+        "Collect extra natural logs for earned plank fuel, then mine and smelt eight natural iron ore drops into eight earned iron ingots.",
+        "Reopen the earned crafting table and craft an iron chestplate from the earned iron ingots using embedded recipe display id 59.",
+        "Select the earned iron chestplate, quick-move it into the chest armor slot through the normal inventory path, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The fallback playable data includes minecraft:iron_chestplate from eight earned minecraft:iron_ingot items using embedded recipe display id 59.",
+        "The real client observes the earned iron chestplate in the chest armor slot after the normal inventory quick-move path."
+      ]
+    },
+    {
+      "id": "playable-28-earned-iron-chestplate-zombie-mitigation",
+      "status": "manual-pending",
+      "bounded_time_minutes": 32,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> stone pickaxe -> furnace path.",
+        "Collect extra natural logs for earned plank fuel, then mine and smelt eight natural iron ore drops into eight earned iron ingots.",
+        "Craft and quick-equip the earned iron chestplate through the normal inventory path.",
+        "Wait for natural night without commands, scan loaded hostile entities for a naturally spawned zombie, approach it through normal movement, wait for a natural melee hit, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The real client observes the earned iron chestplate in the chest armor slot before hostile contact.",
+        "A naturally loaded zombie hit reduces player health by no more than the iron-chestplate mitigation threshold, proving armor affects survival damage instead of only rendering as equipped."
+      ]
+    },
+    {
+      "id": "playable-29-iron-chestplate-save-restart-mitigation",
+      "status": "manual-pending",
+      "bounded_time_minutes": 40,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Run the no-debug natural wood -> crafting table -> wooden pickaxe -> stone pickaxe -> furnace path.",
+        "Mine and smelt eight natural iron ore drops into eight earned iron ingots, craft and quick-equip an earned iron chestplate, then write the crafted table restart marker.",
+        "Stop Solaris with the runner-managed graceful restart path, restart the same world, reconnect the same real client, and capture screenshots for both phases.",
+        "Verify the crafted table marker persists, verify the earned iron chestplate remains in the chest armor slot, wait for natural night, and measure a natural zombie melee hit after restart."
+      ],
+      "expected_observations": [
+        "The client-agent scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The before phase records iron chestplate equip evidence and a runner-managed restart marker.",
+        "The after phase observes the persisted crafting table marker, the persisted chest armor slot, and a post-restart zombie hit below the iron-chestplate mitigation threshold."
+      ]
+    },
+    {
+      "id": "playable-29-iron-chestplate-save-restart-mitigation-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 32,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect a real vanilla client to playable.toml through the playable runner.",
+        "Craft an earned iron chestplate through natural wood, stone, furnace, iron ore, raw iron, ingot, and crafting-table actions.",
+        "Quick-equip the earned iron chestplate, write the crafted table restart marker for the runner-managed after phase, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The phase records iron chestplate recipe and equip evidence using recipe display id 59.",
+        "The phase records runner-managed restart pending evidence and writes the restart marker."
+      ]
+    },
+    {
+      "id": "playable-29-iron-chestplate-save-restart-mitigation-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Reconnect the same real vanilla client after the runner restarts Solaris against the same playable world.",
+        "Read the before-phase marker, verify the crafted table block is still present, verify minecraft:iron_chestplate remains in the chest armor slot, wait for natural night, scan and approach a naturally loaded zombie, wait for a natural melee hit, and capture a screenshot."
+      ],
+      "expected_observations": [
+        "The after phase fails closed if the before-phase marker is absent.",
+        "The after phase records restart marker persistence, iron chestplate armor persistence, and post-restart armor mitigation evidence."
+      ]
+    },
+    {
+      "id": "playable-30-two-client-shared-log-drop-pickup",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Primary finds and approaches a natural generated log, breaks it through normal survival block breaking, and leaves the visible log item drop in the world.",
+        "Secondary observes the same visible log item drop, primary collects it through normal movement pickup, secondary observes the item entity removal, and both clients capture screenshots."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary client's natural log item drop.",
+        "After primary pickup, the secondary real client observes the shared item entity removed from the world."
+      ]
+    },
+    {
+      "id": "playable-30-two-client-shared-log-drop-break",
+      "status": "manual-pending",
+      "bounded_time_minutes": 6,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary connects to playable.toml, finds a natural generated supported log, approaches it, breaks it, observes a visible matching item drop, and writes the shared drop marker."
+      ],
+      "expected_observations": [
+        "The phase records natural log approach and break/drop evidence without collecting the drop."
+      ]
+    },
+    {
+      "id": "playable-30-two-client-shared-log-drop-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary connects to the same live world, reads the shared drop marker, and waits for the matching log item entity near that marker."
+      ],
+      "expected_observations": [
+        "The phase records shared natural log drop visibility from the secondary client."
+      ]
+    },
+    {
+      "id": "playable-30-two-client-shared-log-pickup-collect",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary reads the shared drop marker and collects the matching log item entity through normal movement pickup."
+      ],
+      "expected_observations": [
+        "The phase records primary pickup convergence and inventory restoration for the natural log drop."
+      ]
+    },
+    {
+      "id": "playable-30-two-client-shared-log-pickup-gone-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the shared drop marker after primary pickup and waits until the matching log item entity is no longer visible."
+      ],
+      "expected_observations": [
+        "The phase records shared pickup removal visibility from the secondary client."
+      ]
+    },
+    {
+      "id": "playable-31-two-client-earned-shared-chest",
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Primary earns wood, crafts an earned chest, places the chest, deposits a leftover earned plank item, and writes the shared chest marker.",
+        "Secondary opens the same chest, observes the primary deposited item, withdraws it through the normal container quick-move path, and primary reopens the chest to observe the slot empty.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary client's deposited earned plank item in the shared chest.",
+        "After secondary withdraw, the primary real client observes the shared chest slot empty."
+      ]
+    },
+    {
+      "id": "playable-31-two-client-earned-shared-chest-deposit",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary connects to playable.toml, earns wood, crafts and places a chest, deposits a leftover earned plank into chest slot 0, and writes the shared chest marker."
+      ],
+      "expected_observations": [
+        "The phase records earned chest crafting, placement/opening, earned plank slot 0 deposit, and marker write evidence."
+      ]
+    },
+    {
+      "id": "playable-31-two-client-earned-shared-chest-withdraw",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary connects to the same live world, reads the shared chest marker, opens the chest, verifies slot 0 contains the primary deposited item, withdraws that item, and closes the screen."
+      ],
+      "expected_observations": [
+        "The phase records shared chest block visibility, slot 0 item visibility, secondary withdraw, empty slot confirmation, and screen close evidence."
+      ]
+    },
+    {
+      "id": "playable-31-two-client-earned-shared-chest-observe-empty",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary reads the shared chest marker after secondary withdraw, opens the same chest, and verifies slot 0 is empty."
+      ],
+      "expected_observations": [
+        "The phase fails closed if the marker is missing and records shared chest empty-slot visibility after secondary withdraw."
+      ]
+    },
+    {
+      "id": "playable-32-two-client-earned-torch-block-edit",
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Primary earns wood, stone, charcoal, sticks, and torches, places an earned torch block, and writes the shared block edit marker.",
+        "Secondary observes the primary placed torch block, primary breaks and collects that torch through the normal block edit path, and secondary observes the block become air.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary client's placed earned torch block.",
+        "After primary break, the secondary real client observes the shared torch block disappear."
+      ]
+    },
+    {
+      "id": "playable-32-two-client-earned-torch-place",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary connects to playable.toml, earns charcoal and sticks, crafts torches, places an earned torch block, and writes the shared block edit marker."
+      ],
+      "expected_observations": [
+        "The phase records earned torch crafting, placement, block convergence, and marker write evidence."
+      ]
+    },
+    {
+      "id": "playable-32-two-client-earned-torch-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary connects to the same live world, reads the shared block edit marker, approaches the marker, and waits for the primary placed torch block."
+      ],
+      "expected_observations": [
+        "The phase records shared torch block visibility from the secondary client and fails closed if the marker is missing."
+      ]
+    },
+    {
+      "id": "playable-32-two-client-earned-torch-break",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary reads the shared block edit marker, approaches the placed torch, breaks it through the normal block edit path, collects the torch drop, and waits for the marker block to become air."
+      ],
+      "expected_observations": [
+        "The phase records shared torch block break, drop visibility, pickup, and air convergence evidence."
+      ]
+    },
+    {
+      "id": "playable-32-two-client-earned-torch-gone-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the shared block edit marker after primary break, approaches the marker, and waits for the primary placed torch block to be air."
+      ],
+      "expected_observations": [
+        "The phase records shared block removal visibility from the secondary client."
+      ]
+    },
+    {
+      "id": "playable-33-two-client-player-visibility-movement",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Secondary observes the primary player as a client-visible player entity and writes the shared player visibility marker.",
+        "Primary moves through the normal client movement command, and secondary observes the primary player's client-visible position change.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary player's live entity.",
+        "After primary movement, the secondary real client observes the same player's position change."
+      ]
+    },
+    {
+      "id": "playable-33-two-client-player-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary connects to the same live world, waits for the primary player's client-visible entity, and writes the shared player visibility marker."
+      ],
+      "expected_observations": [
+        "The phase records primary player visibility from the secondary client."
+      ]
+    },
+    {
+      "id": "playable-33-two-client-player-moved-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the shared player visibility marker and waits for the primary player's client-visible position to move by a bounded horizontal delta."
+      ],
+      "expected_observations": [
+        "The phase records shared player movement visibility and fails closed if the marker is missing."
+      ]
+    },
+    {
+      "id": "playable-34-two-client-chat-message",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Primary sends a normal chat message through the vanilla client chat path.",
+        "Secondary waits for the primary player's formatted chat line in the real client chat history.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The primary real client sends normal chat, not a slash command.",
+        "The secondary real client observes the primary chat message."
+      ]
+    },
+    {
+      "id": "playable-34-two-client-chat-send",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary sends the P34 normal chat message through the vanilla client chat path."
+      ],
+      "expected_observations": [
+        "The phase records normal chat send evidence."
+      ]
+    },
+    {
+      "id": "playable-34-two-client-chat-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the primary player's formatted chat line in the real client chat history."
+      ],
+      "expected_observations": [
+        "The phase records primary chat visibility and fails if the message is not observed."
+      ]
+    },
+    {
+      "id": "playable-35-two-client-player-disconnect-removal",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Secondary observes the primary player as a client-visible player entity before disconnect.",
+        "Primary disconnects through the real client bridge.",
+        "Secondary waits until the primary player entity is no longer visible.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary player before disconnect.",
+        "After primary disconnect, the secondary real client observes the primary player entity removal."
+      ]
+    },
+    {
+      "id": "playable-35-two-client-player-disconnect-visible",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the primary player's client-visible entity before primary disconnect."
+      ],
+      "expected_observations": [
+        "The phase records primary player visibility before disconnect."
+      ]
+    },
+    {
+      "id": "playable-35-two-client-player-gone-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the primary player's client-visible entity to disappear after primary disconnect."
+      ],
+      "expected_observations": [
+        "The phase records primary player removal visibility."
+      ]
+    },
+    {
+      "id": "playable-36-two-client-player-reconnect-cleanup",
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Secondary records the primary player's client-visible entity before disconnect.",
+        "Primary disconnects through the real client bridge.",
+        "Secondary waits until the old primary player entity is gone.",
+        "Primary reconnects through the real client bridge.",
+        "Secondary waits for the primary player to become visible again with a new entity id.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary player before disconnect.",
+        "After primary disconnect, the secondary real client observes primary player entity removal.",
+        "After primary reconnect, the secondary real client observes a replacement primary player entity with a different entity id."
+      ]
+    },
+    {
+      "id": "playable-36-two-client-player-reconnect-visible",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the primary player's client-visible entity before primary reconnect cleanup."
+      ],
+      "expected_observations": [
+        "The phase records primary player visibility and writes the baseline entity marker before disconnect."
+      ]
+    },
+    {
+      "id": "playable-36-two-client-player-reconnect-gone-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the old primary player entity to disappear before primary reconnect."
+      ],
+      "expected_observations": [
+        "The phase records primary player removal visibility before reconnect."
+      ]
+    },
+    {
+      "id": "playable-36-two-client-player-reconnected-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the reconnected primary player's client-visible entity."
+      ],
+      "expected_observations": [
+        "The phase records old and new primary player entity ids and fails if the reconnected entity is missing or reuses the old entity id."
+      ]
+    },
+    {
+      "id": "playable-37-two-client-player-death-respawn-visibility",
+      "status": "manual-pending",
+      "bounded_time_minutes": 15,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Secondary records the primary player's client-visible entity before primary death.",
+        "Primary earns and places a campfire, stands on it until death, and performs vanilla respawn.",
+        "Primary moves through the normal real-client movement command after respawn.",
+        "Secondary waits for visible movement from the primary player after respawn.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The secondary real client observes the primary player before death.",
+        "The primary real client reaches death screen through natural campfire contact damage and performs respawn.",
+        "After primary respawn and movement, the secondary real client observes primary player movement instead of a stale ghost entity."
+      ]
+    },
+    {
+      "id": "playable-37-two-client-player-death-baseline",
+      "status": "manual-pending",
+      "bounded_time_minutes": 2,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary waits for the primary player's client-visible entity before primary death."
+      ],
+      "expected_observations": [
+        "The phase records pre-death primary player visibility and writes the baseline movement marker."
+      ]
+    },
+    {
+      "id": "playable-37-two-client-campfire-death-respawn",
+      "status": "manual-pending",
+      "bounded_time_minutes": 10,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary earns the campfire path, stands on the placed campfire until death, and performs vanilla respawn."
+      ],
+      "expected_observations": [
+        "The phase records natural campfire death and respawn evidence without debug setup."
+      ]
+    },
+    {
+      "id": "playable-37-two-client-player-post-respawn-moved-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the pre-death player visibility marker and waits for visible primary movement after respawn."
+      ],
+      "expected_observations": [
+        "The phase records post-respawn primary player movement visibility and fails closed if the marker is missing."
+      ]
+    },
+    {
+      "id": "playable-38-two-client-inventory-drop-handoff",
+      "status": "manual-pending",
+      "bounded_time_minutes": 14,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Primary mines and picks up a natural generated log, selects that earned log, and drops one item through the vanilla selected-item drop action.",
+        "Secondary observes the visible dropped item entity, collects it through normal movement pickup, and primary observes the item entity removal.",
+        "Capture screenshots from both real clients."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "The primary real client drops an earned inventory item through vanilla selected-item drop, not by block breaking or debug setup.",
+        "The secondary real client observes and collects the primary client's dropped inventory item, and the primary real client observes the item entity gone."
+      ]
+    },
+    {
+      "id": "playable-38-two-client-inventory-drop-primary",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary finds a natural generated log, breaks it, picks up the matching drop, selects the earned log item, drops one selected item, observes the visible dropped entity, and writes the inventory drop marker."
+      ],
+      "expected_observations": [
+        "The phase records natural log pickup plus selected-item drop visibility, and writes the shared marker for the observer client."
+      ]
+    },
+    {
+      "id": "playable-38-two-client-inventory-drop-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the inventory drop marker and waits for the primary client's matching dropped item entity near that marker."
+      ],
+      "expected_observations": [
+        "The phase records selected-item drop visibility from the secondary client and fails closed if the marker is missing."
+      ]
+    },
+    {
+      "id": "playable-38-two-client-inventory-drop-secondary-pickup",
+      "status": "manual-pending",
+      "bounded_time_minutes": 4,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Secondary reads the inventory drop marker and collects the matching item entity through normal movement pickup."
+      ],
+      "expected_observations": [
+        "The phase records secondary pickup convergence, drop removal, and inventory restoration for the selected-item drop."
+      ]
+    },
+    {
+      "id": "playable-38-two-client-inventory-drop-gone-observe",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Primary reads the inventory drop marker after secondary pickup and waits until the matching item entity is no longer visible."
+      ],
+      "expected_observations": [
+        "The phase records removal visibility after secondary pickup and fails closed if the marker is missing."
+      ]
+    },
+    {
+      "id": "playable-39-two-client-short-soak",
+      "status": "manual-pending",
+      "bounded_time_minutes": 5,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Keep both clients in Play state while each client performs six normal movement pulses through the bridge-level move_forward command.",
+        "Record each client's state after every movement pulse and capture screenshots from both clients before disconnecting."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "Both real clients remain in Play state through all movement/liveness pulses.",
+        "Both real clients report non-trivial horizontal movement and produce valid screenshots."
+      ]
+    },
+    {
+      "id": "playable-40-two-client-chunk-stream-crossing",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Keep both clients in Play state while each client performs twelve normal movement pulses through the bridge-level move_forward command.",
+        "Record each client's state after every movement pulse and require both clients to cross at least one chunk boundary before screenshots.",
+        "Capture screenshots from both clients before disconnecting."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "Both real clients remain in Play state while crossing chunk boundaries.",
+        "Both real clients report at least one chunk-coordinate crossing and produce valid screenshots."
+      ]
+    },
+    {
+      "id": "playable-41-two-client-chunk-prewarm-crossing",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Let the initial visible chunk window complete so Solaris can prewarm the next forward edge outside the visible view.",
+        "Keep both clients in Play state while each client performs twelve normal movement pulses through the bridge-level move_forward command.",
+        "Record each client's state after every movement pulse and require both clients to cross at least one chunk boundary before screenshots.",
+        "Inspect server.log for the crossed boundary window and require the forward prewarm path to avoid slow fetch/light work there."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "Both real clients remain in Play state while crossing chunk boundaries.",
+        "Both real clients report at least one chunk-coordinate crossing and produce valid screenshots.",
+        "The server log records prewarm-dispatched chunks before crossing and the crossed boundary window does not report slow fetch/light chunks."
+      ]
+    },
+    {
+      "id": "playable-42-two-client-opposite-chunk-crossing",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect two real vanilla clients to the same playable.toml Solaris server through the playable runner.",
+        "Keep both clients in Play state while the primary performs twelve move_forward pulses and the secondary performs twelve move_backward pulses through bridge-level movement commands.",
+        "Record each client's state after every movement pulse and require both clients to cross at least one chunk boundary before screenshots.",
+        "Capture screenshots from both clients before disconnecting."
+      ],
+      "expected_observations": [
+        "The two-client scenario uses no debug give, summon, teleport, time, damage, or chat-command setup.",
+        "Both real clients remain in Play state while crossing opposite chunk edges.",
+        "Both real clients report at least one chunk-coordinate crossing, record the forward/backward bridge commands used, and produce valid screenshots."
+      ]
+    },
+    {
+      "id": "playable-43-renewable-wheat-bread",
+      "status": "manual-pending",
+      "bounded_time_minutes": 30,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect one real vanilla client to the playable.toml Solaris server through the playable runner.",
+        "Gather natural logs, craft a crafting table, sticks, and a wooden hoe, then break natural short grass until three wheat seeds are collected.",
+        "Till three natural dirt or grass blocks, plant the earned seeds, and await the exact client block-state event showing age 7 for every crop.",
+        "Harvest all three mature crops and craft bread from the earned wheat without synthetic hunger-drain movement.",
+        "Capture a screenshot from the real client."
+      ],
+      "expected_observations": [
+        "The scenario uses no debug give, teleport, time, hunger, or crop-growth commands.",
+        "Each planted crop reaches age 7 through normal server random ticks and wakes the client scenario through block-state notifications.",
+        "Three harvested wheat craft one bread and leave it in the player's inventory while the client remains in Play state.",
+        "Food consumption remains covered by the dedicated real-client eating scenario instead of extending this crop gate with artificial movement."
+      ]
+    },
+    {
+      "id": "playable-44-passive-livestock-motion",
+      "status": "manual-pending",
+      "bounded_time_minutes": 6,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect one real vanilla client to the playable.toml Solaris server through the playable runner.",
+        "Find naturally spawned cows, sheep, and chickens already visible in the loaded client world.",
+        "For each species, block on applied entity packets until that exact entity has moved at least one block; require the cow to climb at least 0.8 blocks above an observed low point.",
+        "Measure the client entity velocity and yaw while it moves, then capture a screenshot from the real client."
+      ],
+      "expected_observations": [
+        "The scenario uses no debug give, summon, teleport, movement, or time commands.",
+        "A natural cow, sheep, and chicken each move at least one horizontal block while remaining visible to the real client.",
+        "The cow climbs a vanilla one-block terrain step instead of remaining stuck at the obstacle.",
+        "Every observed livestock speed is between 0.02 and 0.25 blocks per client tick and movement yaw differs by at most 15 degrees.",
+        "Entity packet application wakes every observation; the timeout can only fail a stalled probe."
+      ]
+    },
+    {
+      "id": "playable-45-two-client-shared-chest-save-restart",
+      "status": "manual-pending",
+      "bounded_time_minutes": 20,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Launch two repo-native Gradle real clients against one fresh playable.toml world.",
+        "Primary earns logs, crafts and places a chest, then deposits one earned plank while both clients are in Play.",
+        "Disconnect both clients, stop Solaris gracefully, and restart it on the same world directory.",
+        "Reconnect both clients; secondary opens the persisted chest and withdraws the primary item, then primary reopens it and observes slot 0 empty.",
+        "Capture both clients before and after the restart."
+      ],
+      "expected_observations": [
+        "No debug give, teleport, save, or container mutation command prepares the state.",
+        "Runner evidence records two Gradle clients, a graceful server stop, one restart, and successful before/after phase statuses.",
+        "The chest block and deposited earned item survive restart and are visible to the other player.",
+        "The secondary withdrawal is durable and the primary observes the same slot empty while both clients remain in Play."
+      ]
+    },
+    {
+      "id": "playable-45-two-client-shared-chest-save-restart-before",
+      "status": "manual-pending",
+      "bounded_time_minutes": 15,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect primary and secondary real clients to the same fresh playable world.",
+        "Primary follows the natural log-to-planks path, crafts and places an earned chest, and deposits one earned plank into slot 0.",
+        "Require both clients to remain in Play, capture both screens, and disconnect both cleanly before the runner stops Solaris."
+      ],
+      "expected_observations": [
+        "The primary deposit uses normal crafting, placement, and container-click paths.",
+        "The shared chest marker records the exact world target, item id, and count for the post-restart phase.",
+        "Both real clients are in Play immediately before the runner-managed restart."
+      ]
+    },
+    {
+      "id": "playable-45-two-client-shared-chest-save-restart-after",
+      "status": "manual-pending",
+      "bounded_time_minutes": 8,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "After the runner starts Solaris on the same world, reconnect both original real clients.",
+        "Secondary walks to the saved chest marker, opens the persisted chest, observes the deposited earned plank, and withdraws it normally.",
+        "Primary walks to the same chest, opens it, observes slot 0 empty, and both clients capture screenshots before disconnecting."
+      ],
+      "expected_observations": [
+        "The after phase is accepted only with matching before-phase and runner restart evidence.",
+        "Secondary receives exactly the item stored by primary before restart through the normal container path.",
+        "Primary observes the persisted shared slot empty after the secondary withdrawal, and both clients remain in Play."
+      ]
+    }
+  ]
+}

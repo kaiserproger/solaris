@@ -151,7 +151,16 @@ final class M94M40M41RouteScenarioTest {
             Duration timeout
         ) {
             operations.add("summon:" + entityTypeId + ":" + offsetX + ":" + offsetY + ":" + offsetZ);
-            return new ScenarioEntityObservation(entityTypeId, 42, 1.5, 64.0, 4.5, 16.0);
+            return new ScenarioEntityObservation(
+                entityTypeId,
+                42,
+                new java.util.UUID(0L, 42L),
+                1.5,
+                64.0,
+                4.5,
+                16.0,
+                null
+            );
         }
 
         @Override

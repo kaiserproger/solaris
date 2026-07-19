@@ -1288,14 +1288,14 @@ class AgentClient:
 
 
 def wait_play(client: AgentClient, timeout_seconds: float) -> dict:
-    deadline = time.monotonic() + timeout_seconds
-    last_state = {}
-    while time.monotonic() < deadline:
-        last_state = client.call("state", {})
-        if last_state.get("in_play"):
-            return last_state
-        time.sleep(0.25)
-    raise TimeoutError(f"client did not reach play; last_state={last_state}")
+    state = client.call(
+        "wait_play",
+        {"timeout_seconds": timeout_seconds},
+        timeout_seconds + 1.0,
+    )
+    if not state.get("in_play"):
+        raise RuntimeError(f"wait_play returned outside play: state={state}")
+    return state
 
 
 def write_observations(run_dir: Path, scenario_id: str, transcript: list[dict], result: str) -> None:
@@ -1543,14 +1543,13 @@ git commit -m "test: validate real-client agent scaffold"
 **Files:**
 - Local-only artifacts under `.analysis/real-client-runs/`
 
-- [ ] **Step 1: Prepare a run command**
+- [ ] **Step 1: Prepare the repo-native runClient adapter**
 
-Use a PrismLauncher/vanilla launch command from `SOLARIS_REAL_CLIENT_COMMAND`
-that loads the built `solaris-client-agent` jar. The command must pass these JVM
-properties:
+Use the Gradle `runClient` adapter selected by `tools/run-real-client-regression.sh`.
+The runner owns the JVM properties for the agent bridge:
 
 ```bash
--Dsolaris.clientAgent.port=39094
+-Dsolaris.clientAgent.port=$SOLARIS_REAL_CLIENT_AGENT_PORT
 -Dsolaris.clientAgent.secret=$SOLARIS_REAL_CLIENT_AGENT_SECRET
 -Dsolaris.clientAgent.runDir=$SOLARIS_REAL_CLIENT_RUN_DIR
 ```
@@ -1560,12 +1559,10 @@ properties:
 Run:
 
 ```bash
-export SOLARIS_REAL_CLIENT_COMMAND="${SOLARIS_REAL_CLIENT_COMMAND:?set real PrismLauncher command that loads the agent jar}"
 export SOLARIS_REAL_CLIENT_AGENT_SECRET="${SOLARIS_REAL_CLIENT_AGENT_SECRET:-$(openssl rand -hex 16)}"
-SOLARIS_REAL_CLIENT_KIND=prism-launcher \
+SOLARIS_REAL_CLIENT_KIND=fabric-runclient \
 SOLARIS_REAL_CLIENT_AGENT_PORT=39094 \
 SOLARIS_REAL_CLIENT_AGENT_SECRET="$SOLARIS_REAL_CLIENT_AGENT_SECRET" \
-SOLARIS_REAL_CLIENT_COMMAND="$SOLARIS_REAL_CLIENT_COMMAND" \
 bash tools/run-real-client-regression.sh --run
 ```
 

@@ -33,3 +33,6 @@
 # downloaded manifests, harness settings). Not part of the project.
 /.claude/
 /work/
+
+# Local CodeGraph index. Derived from source; regenerate with `codegraph init`.
+/.codegraph/

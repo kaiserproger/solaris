@@ -4,9 +4,10 @@ use std::path::Path;
 use bytes::Bytes;
 use flate2::read::GzDecoder;
 use mc_data::Identifier;
+use mc_data::items::ItemRegistry;
 use mc_data::worldgen_structures::StructureSetFacts;
 use mc_nbt::{ListTag, Tag};
-use mc_world::{BlockRegistry, BlockStateId};
+use mc_world::{BlockRegistry, BlockStateId, ChestBlockEntity, FurnaceSlot};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -31,12 +32,15 @@ pub enum StructureError {
     UnknownBlock { path: String, block: Identifier },
     #[error("structure template {path} references unresolved block state {block}")]
     UnknownState { path: String, block: Identifier },
+    #[error("Solaris playable ruin references missing item {item}")]
+    MissingPlayableRuinItem { item: Identifier },
 }
 
 #[derive(Debug, Clone)]
 pub struct StructureTemplate {
     size: [i32; 3],
     blocks: Vec<TemplateBlock>,
+    chests: Vec<TemplateChest>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,10 +49,26 @@ pub struct TemplateBlock {
     pub state: BlockStateId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TemplateChest {
+    pub pos: [i32; 3],
+    pub chest: ChestBlockEntity,
+}
+
 impl StructureTemplate {
     #[must_use]
     pub fn new(size: [i32; 3], blocks: Vec<TemplateBlock>) -> Self {
-        Self { size, blocks }
+        Self {
+            size,
+            blocks,
+            chests: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_chests(mut self, chests: Vec<TemplateChest>) -> Self {
+        self.chests = chests;
+        self
     }
 
     pub fn from_nbt_file(
@@ -92,12 +112,17 @@ impl StructureTemplate {
         &self.blocks
     }
 
+    #[must_use]
+    pub fn chests(&self) -> &[TemplateChest] {
+        &self.chests
+    }
+
     fn from_tag(path: &str, root: &Tag, registry: &BlockRegistry) -> Result<Self, StructureError> {
         let compound = expect_compound(path, root, "root")?;
         let size = expect_int_triplet(path, require(compound, path, "size")?, "size")?;
         let palette = parse_palette(path, require(compound, path, "palette")?, registry)?;
         let blocks = parse_blocks(path, require(compound, path, "blocks")?, &palette)?;
-        Ok(Self { size, blocks })
+        Ok(Self::new(size, blocks))
     }
 }
 
@@ -107,6 +132,7 @@ pub struct StructureRules {
     grid_chunks: i32,
     separation_chunks: i32,
     salt: u64,
+    fixed_center: Option<(i32, i32)>,
 }
 
 impl StructureRules {
@@ -117,6 +143,7 @@ impl StructureRules {
             grid_chunks: 34,
             separation_chunks: 8,
             salt: 0x9E37_8731_2B17,
+            fixed_center: None,
         }
     }
 
@@ -134,7 +161,62 @@ impl StructureRules {
             grid_chunks: 34,
             separation_chunks: 8,
             salt: 10_387_312,
+            fixed_center: None,
         }
+    }
+
+    /// A Solaris-owned reward ruin for the seed-zero playable loop.
+    ///
+    /// Its block states and item protocol ids are resolved from startup
+    /// registries; no protocol values are embedded here.
+    pub fn solaris_playable_ruin(
+        blocks: &BlockRegistry,
+        items: &ItemRegistry,
+    ) -> Result<Self, StructureError> {
+        let cobblestone = playable_ruin_block(blocks, "minecraft:cobblestone")?;
+        let chest_state = playable_ruin_block(blocks, "minecraft:chest")?;
+        let mut chest = ChestBlockEntity::default();
+        chest.slots[0] = playable_ruin_slot(items, "minecraft:diamond", 1)?;
+        chest.slots[1] = playable_ruin_slot(items, "minecraft:lapis_lazuli", 4)?;
+        chest.slots[2] = playable_ruin_slot(items, "minecraft:bread", 2)?;
+
+        let mut ruin_blocks = Vec::new();
+        for x in 0..5 {
+            for z in 0..5 {
+                ruin_blocks.push(TemplateBlock {
+                    pos: [x, 0, z],
+                    state: cobblestone,
+                });
+            }
+        }
+        for x in [0, 4] {
+            for z in [0, 4] {
+                for y in 1..4 {
+                    ruin_blocks.push(TemplateBlock {
+                        pos: [x, y, z],
+                        state: cobblestone,
+                    });
+                }
+            }
+        }
+        ruin_blocks.push(TemplateBlock {
+            pos: [2, 1, 2],
+            state: chest_state,
+        });
+
+        let template =
+            StructureTemplate::new([5, 4, 5], ruin_blocks).with_chests(vec![TemplateChest {
+                pos: [2, 1, 2],
+                chest,
+            }]);
+        Ok(Self {
+            templates: vec![template],
+            grid_chunks: 34,
+            separation_chunks: 8,
+            salt: 0x0053_4F4C_4152_4953,
+            // Chunk (4, 0): 4.5 chunks east of spawn, inside one generated chunk.
+            fixed_center: Some((72, 8)),
+        })
     }
 
     #[must_use]
@@ -189,6 +271,38 @@ impl StructureRules {
     pub fn salt(&self) -> u64 {
         self.salt
     }
+
+    pub(crate) fn fixed_center(&self) -> Option<(i32, i32)> {
+        self.fixed_center
+    }
+}
+
+fn playable_ruin_block(blocks: &BlockRegistry, name: &str) -> Result<BlockStateId, StructureError> {
+    let block = Identifier::parse(name).expect("static playable ruin block identifier");
+    blocks
+        .block(&block)
+        .map(|entry| entry.default)
+        .ok_or(StructureError::UnknownBlock {
+            path: "Solaris playable ruin".to_string(),
+            block,
+        })
+}
+
+fn playable_ruin_slot(
+    items: &ItemRegistry,
+    name: &str,
+    count: i32,
+) -> Result<FurnaceSlot, StructureError> {
+    let item = Identifier::parse(name).expect("static playable ruin item identifier");
+    let item_id = items
+        .id_of(&item)
+        .ok_or_else(|| StructureError::MissingPlayableRuinItem { item: item.clone() })?;
+    Ok(FurnaceSlot {
+        item_id,
+        count,
+        damage: None,
+        enchantments: Vec::new(),
+    })
 }
 
 impl Default for StructureRules {

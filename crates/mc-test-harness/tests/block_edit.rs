@@ -21,20 +21,24 @@ use std::time::Duration;
 
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, BlockChangedAck, BlockUpdate, ClientCommandAction, ClientboundBlockEntityData,
-    ClientboundContainerSetContent, ClientboundContainerSetData, ClientboundContainerSetSlot,
-    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundOpenSignEditor, ClientboundRespawn,
-    ClientboundSetEntityData, ClientboundSetHealth, ClientboundTakeItemEntity,
-    ConfirmTeleportation, ContainerInput, Direction, EntityAnimation, EntityAnimationAction,
-    EntityDataValue, GameEvent, HashedStack, HashedStackComponentHashes,
-    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, LevelChunkWithLight, LightUpdate,
-    MoveEntityPosRot, MovePlayerFlags, PlayerActionKind, PlayerInput, RemoveEntities,
-    SectionBlocksUpdate, ServerboundChatCommand, ServerboundClientCommand,
-    ServerboundContainerClick, ServerboundContainerClose, ServerboundKeepAlive,
-    ServerboundMovePlayerPosRot, ServerboundPlaceRecipe, ServerboundPlayerAction,
-    ServerboundPlayerInput, ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundUseItem,
-    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_block_pos, pack_section_pos, pack_section_relative_pos, unpack_block_pos,
+    AGEABLE_ENTITY_DATA_BABY_INDEX, AddEntity, BlockChangedAck, BlockUpdate, ClientCommandAction,
+    ClientboundBlockEntityData, ClientboundContainerSetContent, ClientboundContainerSetData,
+    ClientboundContainerSetSlot, ClientboundExplode, ClientboundKeepAlive, ClientboundOpenScreen,
+    ClientboundOpenSignEditor, ClientboundRespawn, ClientboundSetEntityData,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetTime, ClientboundSystemChat,
+    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction, EntityAnimation,
+    EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose, EntityVec3, GameEvent,
+    HashedStack, HashedStackComponentHashes, ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand,
+    LevelChunkWithLight, LevelEvent, LightUpdate, MoveEntityPosRot, MovePlayerFlags,
+    PlayerActionKind, PlayerCommandAction, PlayerInput, RemoveEntities,
+    SHEEP_ENTITY_DATA_WOOL_INDEX, SectionBlocksUpdate, ServerboundChatCommand,
+    ServerboundClientCommand, ServerboundContainerButtonClick, ServerboundContainerClick,
+    ServerboundContainerClose, ServerboundInteract, ServerboundKeepAlive,
+    ServerboundMovePlayerPosRot, ServerboundMovePlayerStatusOnly, ServerboundPlaceRecipe,
+    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
+    ServerboundSetCarriedItem, ServerboundSignUpdate, ServerboundUseItem, ServerboundUseItemOn,
+    SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition, pack_block_pos, pack_section_pos,
+    pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 
@@ -54,9 +58,16 @@ include!("block_edit/placement_rejection.rs");
 include!("block_edit/plant_harvest.rs");
 include!("block_edit/plant_lifecycle.rs");
 include!("block_edit/furnace_and_chests.rs");
+include!("block_edit/multiplayer_sleep.rs");
+include!("block_edit/pvp.rs");
 include!("block_edit/sapling_growth.rs");
 include!("block_edit/sign_edit.rs");
 include!("block_edit/survival_lifecycle.rs");
 include!("block_edit/toggle_blocks.rs");
 include!("block_edit/vertical_plant_growth.rs");
 include!("block_edit/wheat_harvest.rs");
+include!("block_edit/wheat_seed_source.rs");
+include!("block_edit/bucket_progression.rs");
+include!("block_edit/animal_breeding.rs");
+include!("block_edit/hostile_combat.rs");
+include!("block_edit/explosions.rs");

@@ -11,8 +11,8 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
 
 use thiserror::Error;
@@ -30,6 +30,8 @@ use crate::chunk::{
     BlockPos, ChestBlockEntity, Chunk, ChunkGenerator, ChunkPos, FurnaceBlockEntity,
     HopperBlockEntity, ScheduledBlockTick, ScheduledFluidTick,
 };
+use crate::light::ChunkLight;
+use crate::resident::{ResidentChunkStore, WorldMutationView};
 use crate::section::SECTION_DIM;
 
 const REGION_AXIS_CHUNKS: i32 = 32;
@@ -40,6 +42,8 @@ const DEFAULT_LRU_CAPACITY: usize = 16;
 /// pragmatic default that covers the M3.e view-distance ring around
 /// a single player without growing unboundedly.
 const DEFAULT_REGION_LRU_CAPACITY: usize = 4;
+const READ_VIEW_REGION_AXIS_CHUNKS: i32 = 8;
+const READ_VIEW_SHARD_COUNT: usize = 64;
 static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// A decoded region: per-chunk payload bytes ready for
@@ -68,8 +72,14 @@ pub struct WorldStorage {
     world_root: Option<PathBuf>,
     region_root: PathBuf,
     registry: Arc<BlockRegistry>,
-    /// LRU of fully decoded chunks, keyed by chunk position.
-    cache: HashMap<ChunkPos, ChunkSnapshot>,
+    /// Canonical resident chunks, partitioned into independently locked 8x8 regions.
+    resident: ResidentChunkStore,
+    /// Immutable block snapshots published for hot readers. Block mutations
+    /// replace the affected `Arc<Chunk>` before the writer operation returns.
+    read_view: WorldReadView,
+    /// Per-chunk scheduled-work hints published by queue mutations. The
+    /// simulation loop reads these without taking the world storage mutex.
+    scheduled_tick_view: ScheduledTickView,
     /// MRU at the back, LRU at the front. On `get_chunk` we move
     /// the accessed key to the back.
     lru: VecDeque<ChunkPos>,
@@ -89,6 +99,10 @@ pub struct WorldStorage {
     /// dirty so the M6 flush pipeline persists them; subsequent
     /// reads hit the region file, not the generator.
     generator: Option<Arc<dyn ChunkGenerator>>,
+    generator_available: Arc<AtomicBool>,
+    /// Keeps compatibility for APIs that return a borrow from `&mut self`.
+    /// This is one snapshot handle, not a second resident authority.
+    borrowed_chunk: Option<ChunkSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,6 +125,8 @@ pub struct DirtyFlushPlan {
     #[cfg(test)]
     payload_encode_count: Arc<AtomicU64>,
 }
+
+const DIRTY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 
 #[derive(Debug, Clone)]
 struct DirtyFlushRegionPlan {
@@ -161,6 +177,484 @@ struct CommittedChunkPayload {
 }
 
 pub type ChunkSnapshot = Arc<Chunk>;
+
+#[cfg(test)]
+struct TestChunkMutation {
+    resident: ResidentChunkStore,
+    position: ChunkPos,
+    chunk: ChunkSnapshot,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for TestChunkMutation {
+    type Target = Chunk;
+
+    fn deref(&self) -> &Self::Target {
+        &self.chunk
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for TestChunkMutation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        make_cached_chunk_mut(&mut self.chunk)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestChunkMutation {
+    fn drop(&mut self) {
+        self.resident
+            .replace_for_test(self.position, Arc::clone(&self.chunk));
+    }
+}
+type FurnaceSnapshotsByChunk = HashMap<ChunkPos, Arc<HashMap<BlockPos, FurnaceBlockEntity>>>;
+type PublishedChunkShard = RwLock<HashMap<ChunkPos, ChunkSnapshot>>;
+type FurnaceSnapshotShard = RwLock<FurnaceSnapshotsByChunk>;
+pub type DirtyHighWaterNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
+
+#[derive(Clone)]
+pub struct WorldReadView {
+    chunks: Arc<[PublishedChunkShard; READ_VIEW_SHARD_COUNT]>,
+    furnaces: Arc<[FurnaceSnapshotShard; READ_VIEW_SHARD_COUNT]>,
+    resident_chunks: Arc<AtomicUsize>,
+    dirty_chunks: Arc<AtomicUsize>,
+    capacity: usize,
+    dirty_saturated: Arc<AtomicBool>,
+    dirty_high_water_notifier: Arc<RwLock<Option<DirtyHighWaterNotifier>>>,
+}
+
+#[derive(Clone, Default)]
+pub struct WorldReadSnapshot {
+    chunks: HashMap<ChunkPos, ChunkSnapshot>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkPrepareSource {
+    Resident,
+    RegionFile,
+    Generator,
+    Absent,
+}
+
+#[derive(Clone)]
+pub struct ChunkSourceView {
+    resident: WorldReadView,
+    region_root: Arc<PathBuf>,
+    disk_backed: bool,
+    generator_available: Arc<AtomicBool>,
+}
+
+#[derive(Clone, Default)]
+pub struct ScheduledTickView {
+    chunks: Arc<RwLock<HashMap<ChunkPos, ScheduledTickHint>>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct ScheduledTickHint {
+    next_block_tick: Option<u64>,
+    next_fluid_tick: Option<u64>,
+    hopper_backfill_required: bool,
+}
+
+impl WorldReadView {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            chunks: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
+            furnaces: Arc::new(std::array::from_fn(|_| RwLock::new(HashMap::new()))),
+            resident_chunks: Arc::new(AtomicUsize::new(0)),
+            dirty_chunks: Arc::new(AtomicUsize::new(0)),
+            capacity: capacity.max(1),
+            dirty_saturated: Arc::new(AtomicBool::new(false)),
+            dirty_high_water_notifier: Arc::new(RwLock::new(None)),
+        }
+    }
+
+    #[must_use]
+    pub fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        let cpos = chunk_pos_of(pos);
+        let chunks = self.chunks[read_view_shard(cpos)]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chunk = chunks.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.get_block(local_x, pos.y, local_z)
+    }
+
+    #[must_use]
+    pub fn block_mutation_token(&self, pos: BlockPos) -> Option<crate::BlockMutationToken> {
+        let cpos = chunk_pos_of(pos);
+        let chunks = self.chunks[read_view_shard(cpos)]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chunk = chunks.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.block_mutation_token(local_x, pos.y, local_z)
+    }
+
+    #[must_use]
+    pub fn block_mutation_snapshot(
+        &self,
+        pos: BlockPos,
+    ) -> Option<(BlockStateId, crate::BlockMutationToken)> {
+        let cpos = chunk_pos_of(pos);
+        let chunks = self.chunks[read_view_shard(cpos)]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let chunk = chunks.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        Some((
+            chunk.get_block(local_x, pos.y, local_z)?,
+            chunk.block_mutation_token(local_x, pos.y, local_z)?,
+        ))
+    }
+
+    #[must_use]
+    pub fn snapshot_chunks(&self, positions: &[ChunkPos]) -> WorldReadSnapshot {
+        let mut snapshots = HashMap::with_capacity(positions.len());
+        for &position in positions {
+            let chunks = self.chunks[read_view_shard(position)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(chunk) = chunks.get(&position) {
+                snapshots
+                    .entry(position)
+                    .or_insert_with(|| Arc::clone(chunk));
+            }
+        }
+        WorldReadSnapshot { chunks: snapshots }
+    }
+
+    #[must_use]
+    pub fn furnace_snapshots(&self, positions: &[ChunkPos]) -> Vec<(BlockPos, FurnaceBlockEntity)> {
+        let mut snapshots = Vec::new();
+        for position in positions {
+            let furnaces = self.furnaces[read_view_shard(*position)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Some(chunk_furnaces) = furnaces.get(position) {
+                snapshots.extend(
+                    chunk_furnaces
+                        .iter()
+                        .map(|(&position, furnace)| (position, furnace.clone())),
+                );
+            }
+        }
+        snapshots
+    }
+
+    /// Report whether a new chunk can enter the cache without waiting for the
+    /// mutable storage owner. The final insert rechecks the same condition.
+    #[must_use]
+    pub fn can_cache_new_chunk(&self, position: ChunkPos) -> bool {
+        if !self.dirty_saturated.load(Ordering::Acquire) {
+            return true;
+        }
+        let chunks = self.chunks[read_view_shard(position)]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        chunks.contains_key(&position)
+    }
+
+    fn contains_chunk(&self, position: ChunkPos) -> bool {
+        self.chunks[read_view_shard(position)]
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(&position)
+    }
+
+    pub(crate) fn publish_chunk(&self, position: ChunkPos, chunk: ChunkSnapshot) {
+        {
+            let mut chunks = self.chunks[read_view_shard(position)]
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = chunks.insert(position, Arc::clone(&chunk));
+            self.record_replacement(previous.as_deref(), Some(&chunk));
+        }
+        self.publish_furnaces(position, &chunk);
+    }
+
+    pub(crate) fn update_chunk<R>(
+        &self,
+        position: ChunkPos,
+        chunk: &mut ChunkSnapshot,
+        update: impl FnOnce(&mut Chunk) -> R,
+    ) -> R {
+        self.update_chunk_snapshot(position, chunk, |chunk| {
+            update(make_cached_chunk_mut(chunk))
+        })
+    }
+
+    pub(crate) fn update_chunk_snapshot<R>(
+        &self,
+        position: ChunkPos,
+        chunk: &mut ChunkSnapshot,
+        update: impl FnOnce(&mut ChunkSnapshot) -> R,
+    ) -> R {
+        let mut published = self.chunks[read_view_shard(position)]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = published.remove(&position);
+        let previous_present = previous.is_some();
+        let previous_dirty = previous.as_ref().is_some_and(|chunk| chunk.dirty);
+        let previous_dirty_generation = previous
+            .as_ref()
+            .filter(|chunk| chunk.dirty)
+            .map(|chunk| chunk.dirty_generation);
+        drop(previous);
+        let result = update(chunk);
+        published.insert(position, Arc::clone(chunk));
+        self.record_replacement_state(
+            previous_present,
+            previous_dirty,
+            previous_dirty_generation,
+            Some(chunk),
+        );
+        result
+    }
+
+    pub(crate) fn remove_chunk(&self, position: ChunkPos) {
+        {
+            let mut chunks = self.chunks[read_view_shard(position)]
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = chunks.remove(&position);
+            self.record_replacement(previous.as_deref(), None);
+        }
+        self.remove_furnaces(position);
+    }
+
+    fn remove_furnaces(&self, position: ChunkPos) {
+        self.furnaces[read_view_shard(position)]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&position);
+    }
+
+    pub(crate) fn publish_furnaces(&self, position: ChunkPos, chunk: &Chunk) {
+        let mut furnaces = self.furnaces[read_view_shard(position)]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if chunk.furnaces.is_empty() {
+            furnaces.remove(&position);
+        } else {
+            furnaces.insert(position, Arc::new(chunk.furnaces.clone()));
+        }
+    }
+
+    pub(crate) fn resident_len(&self) -> usize {
+        self.resident_chunks.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn dirty_len(&self) -> usize {
+        self.dirty_chunks.load(Ordering::Acquire)
+    }
+
+    fn record_replacement(&self, previous: Option<&Chunk>, current: Option<&Chunk>) {
+        self.record_replacement_state(
+            previous.is_some(),
+            previous.is_some_and(|chunk| chunk.dirty),
+            previous
+                .filter(|chunk| chunk.dirty)
+                .map(|chunk| chunk.dirty_generation),
+            current,
+        );
+    }
+
+    fn record_replacement_state(
+        &self,
+        previous_present: bool,
+        previous_dirty: bool,
+        previous_dirty_generation: Option<u64>,
+        current: Option<&Chunk>,
+    ) {
+        match (previous_present, current.is_some()) {
+            (false, true) => {
+                self.resident_chunks.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                self.resident_chunks.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        match (previous_dirty, current.is_some_and(|chunk| chunk.dirty)) {
+            (false, true) => {
+                self.dirty_chunks.fetch_add(1, Ordering::AcqRel);
+            }
+            (true, false) => {
+                self.dirty_chunks.fetch_sub(1, Ordering::AcqRel);
+            }
+            _ => {}
+        }
+        let resident = self.resident_chunks.load(Ordering::Acquire);
+        let dirty_saturated =
+            resident >= self.capacity && self.dirty_chunks.load(Ordering::Acquire) == resident;
+        self.dirty_saturated
+            .store(dirty_saturated, Ordering::Release);
+        let dirty_state_changed = current.is_some_and(|chunk| {
+            chunk.dirty && previous_dirty_generation != Some(chunk.dirty_generation)
+        });
+        if dirty_saturated && dirty_state_changed {
+            self.notify_dirty_flush();
+        }
+    }
+
+    pub(crate) fn notify_dirty_flush(&self) {
+        let notify = self
+            .dirty_high_water_notifier
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if let Some(notify) = notify {
+            notify();
+        }
+    }
+
+    fn set_dirty_high_water_notifier(&self, notifier: DirtyHighWaterNotifier) {
+        *self
+            .dirty_high_water_notifier
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(notifier);
+    }
+
+    #[cfg(test)]
+    fn lock_chunk_shard_for_test(
+        &self,
+        position: ChunkPos,
+    ) -> std::sync::RwLockWriteGuard<'_, HashMap<ChunkPos, ChunkSnapshot>> {
+        self.chunks[read_view_shard(position)]
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn read_view_shard(position: ChunkPos) -> usize {
+    let region_x = position.x.div_euclid(READ_VIEW_REGION_AXIS_CHUNKS) as u32;
+    let region_z = position.z.div_euclid(READ_VIEW_REGION_AXIS_CHUNKS) as u32;
+    (region_x.wrapping_mul(31) ^ region_z) as usize & (READ_VIEW_SHARD_COUNT - 1)
+}
+
+impl Default for WorldReadView {
+    fn default() -> Self {
+        Self::with_capacity(1)
+    }
+}
+
+impl ChunkSourceView {
+    #[must_use]
+    pub fn source_for(&self, position: ChunkPos) -> ChunkPrepareSource {
+        if self.resident.contains_chunk(position) {
+            return ChunkPrepareSource::Resident;
+        }
+        let (rx, rz) = region_of(position);
+        if self.disk_backed && self.region_root.join(format!("r.{rx}.{rz}.mca")).is_file() {
+            return ChunkPrepareSource::RegionFile;
+        }
+        if self.generator_available.load(Ordering::Acquire) {
+            ChunkPrepareSource::Generator
+        } else {
+            ChunkPrepareSource::Absent
+        }
+    }
+}
+
+impl ScheduledTickView {
+    #[must_use]
+    pub fn block_due(&self, position: ChunkPos, world_tick: u64) -> bool {
+        self.chunks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&position)
+            .is_some_and(|hint| {
+                hint.hopper_backfill_required
+                    || hint
+                        .next_block_tick
+                        .is_some_and(|trigger_tick| trigger_tick <= world_tick)
+            })
+    }
+
+    #[must_use]
+    pub fn fluid_due(&self, position: ChunkPos, world_tick: u64) -> bool {
+        self.chunks
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&position)
+            .and_then(|hint| hint.next_fluid_tick)
+            .is_some_and(|trigger_tick| trigger_tick <= world_tick)
+    }
+
+    pub(crate) fn publish_chunk(
+        &self,
+        position: ChunkPos,
+        chunk: &Chunk,
+        registry: &BlockRegistry,
+    ) {
+        let hint = ScheduledTickHint {
+            next_block_tick: chunk
+                .scheduled_block_ticks()
+                .first()
+                .map(|tick| tick.trigger_tick),
+            next_fluid_tick: chunk
+                .scheduled_fluid_ticks()
+                .first()
+                .map(|tick| tick.trigger_tick),
+            hopper_backfill_required: chunk.hoppers.keys().copied().any(|pos| {
+                let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+                let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+                let Some(state_id) = chunk.get_block(local_x, pos.y, local_z) else {
+                    return false;
+                };
+                let Some(state) = registry.by_id(state_id) else {
+                    return false;
+                };
+                state.block.id.path() == "hopper"
+                    && !chunk
+                        .scheduled_block_ticks()
+                        .iter()
+                        .any(|tick| tick.pos == pos && tick.block == state.block.id)
+            }),
+        };
+        self.chunks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(position, hint);
+    }
+
+    pub(crate) fn remove_chunk(&self, position: ChunkPos) {
+        self.chunks
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&position);
+    }
+}
+
+impl WorldReadSnapshot {
+    #[must_use]
+    pub fn chunk(&self, position: ChunkPos) -> Option<ChunkSnapshot> {
+        self.chunks.get(&position).map(Arc::clone)
+    }
+
+    #[must_use]
+    pub fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
+        let cpos = chunk_pos_of(pos);
+        let chunk = self.chunks.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.get_block(local_x, pos.y, local_z)
+    }
+
+    #[must_use]
+    pub fn block_mutation_token(&self, pos: BlockPos) -> Option<crate::BlockMutationToken> {
+        let cpos = chunk_pos_of(pos);
+        let chunk = self.chunks.get(&cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.block_mutation_token(local_x, pos.y, local_z)
+    }
+}
 
 #[cfg(test)]
 type ChunkSnapshotToken = usize;
@@ -216,7 +710,7 @@ fn can_fast_clean_chunk(
         && Arc::ptr_eq(chunk, planned_snapshot)
 }
 
-fn make_cached_chunk_mut(chunk: &mut ChunkSnapshot) -> &mut Chunk {
+pub(crate) fn make_cached_chunk_mut(chunk: &mut ChunkSnapshot) -> &mut Chunk {
     let invalidate_planned_flush = chunk.dirty && Arc::strong_count(chunk) > 1;
     let chunk = Arc::make_mut(chunk);
     if invalidate_planned_flush {
@@ -561,18 +1055,30 @@ impl WorldStorage {
             return Err(WorldError::Missing(candidate_modern));
         };
 
+        let capacity = capacity.max(1);
+        let read_view = WorldReadView::with_capacity(capacity);
+        let scheduled_tick_view = ScheduledTickView::default();
+        let resident = ResidentChunkStore::new(
+            read_view.clone(),
+            scheduled_tick_view.clone(),
+            Arc::clone(&registry),
+        );
         Ok(Self {
             world_root: Some(dir.to_path_buf()),
             region_root,
             registry,
-            cache: HashMap::new(),
+            resident,
+            read_view,
+            scheduled_tick_view,
             lru: VecDeque::new(),
-            capacity: capacity.max(1),
+            capacity,
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: region_capacity.max(1),
             item_registry: None,
             generator: None,
+            generator_available: Arc::new(AtomicBool::new(false)),
+            borrowed_chunk: None,
         })
     }
 
@@ -586,18 +1092,30 @@ impl WorldStorage {
 
     #[must_use]
     pub fn in_memory_with_capacity(registry: Arc<BlockRegistry>, capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let read_view = WorldReadView::with_capacity(capacity);
+        let scheduled_tick_view = ScheduledTickView::default();
+        let resident = ResidentChunkStore::new(
+            read_view.clone(),
+            scheduled_tick_view.clone(),
+            Arc::clone(&registry),
+        );
         Self {
             world_root: None,
             region_root: PathBuf::new(),
             registry,
-            cache: HashMap::new(),
+            resident,
+            read_view,
+            scheduled_tick_view,
             lru: VecDeque::new(),
-            capacity: capacity.max(1),
+            capacity,
             regions: HashMap::new(),
             region_lru: VecDeque::new(),
             region_capacity: DEFAULT_REGION_LRU_CAPACITY,
             item_registry: None,
             generator: None,
+            generator_available: Arc::new(AtomicBool::new(false)),
+            borrowed_chunk: None,
         }
     }
 
@@ -613,6 +1131,7 @@ impl WorldStorage {
     /// flush path persists them before the cache evicts them.
     #[must_use]
     pub fn with_generator(mut self, generator: Arc<dyn ChunkGenerator>) -> Self {
+        self.generator_available.store(true, Ordering::Release);
         self.generator = Some(generator);
         self
     }
@@ -623,6 +1142,8 @@ impl WorldStorage {
         &mut self,
         generator: Option<Arc<dyn ChunkGenerator>>,
     ) -> Option<Arc<dyn ChunkGenerator>> {
+        self.generator_available
+            .store(generator.is_some(), Ordering::Release);
         std::mem::replace(&mut self.generator, generator)
     }
 
@@ -637,6 +1158,36 @@ impl WorldStorage {
     #[must_use]
     pub fn registry_arc(&self) -> Arc<BlockRegistry> {
         Arc::clone(&self.registry)
+    }
+
+    #[must_use]
+    pub fn read_view(&self) -> WorldReadView {
+        self.read_view.clone()
+    }
+
+    #[must_use]
+    pub fn mutation_view(&self) -> WorldMutationView {
+        self.resident.mutation_view()
+    }
+
+    /// Install the server-owned push boundary for dirty-cache high water.
+    pub fn set_dirty_high_water_notifier(&self, notifier: DirtyHighWaterNotifier) {
+        self.read_view.set_dirty_high_water_notifier(notifier)
+    }
+
+    #[must_use]
+    pub fn chunk_source_view(&self) -> ChunkSourceView {
+        ChunkSourceView {
+            resident: self.read_view(),
+            region_root: Arc::new(self.region_root.clone()),
+            disk_backed: self.world_root.is_some(),
+            generator_available: Arc::clone(&self.generator_available),
+        }
+    }
+
+    #[must_use]
+    pub fn scheduled_tick_view(&self) -> ScheduledTickView {
+        self.scheduled_tick_view.clone()
     }
 
     #[must_use]
@@ -663,15 +1214,25 @@ impl WorldStorage {
     /// sample collision without stalling the shared world lock.
     pub fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
         let cpos = chunk_pos_of(pos);
-        let chunk = self.cache.get(&cpos)?;
+        let chunk = self.resident.snapshot(cpos)?;
         let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
         let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
         chunk.get_block(local_x, pos.y, local_z)
     }
 
+    #[must_use]
+    pub fn block_mutation_token(&self, pos: BlockPos) -> Option<crate::BlockMutationToken> {
+        let cpos = chunk_pos_of(pos);
+        let chunk = self.resident.snapshot(cpos)?;
+        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+        chunk.block_mutation_token(local_x, pos.y, local_z)
+    }
+
     /// Borrow a cached chunk; loads its region on demand.
     pub fn get_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
-        self.ensure_chunk(cpos)
+        self.borrowed_chunk = self.ensure_chunk(cpos)?;
+        Ok(self.borrowed_chunk.as_deref())
     }
 
     /// Clone a chunk if it is already resident or present on disk, but do not
@@ -682,12 +1243,12 @@ impl WorldStorage {
         cpos: ChunkPos,
     ) -> Result<Option<ChunkSnapshot>, WorldError> {
         self.ensure_chunk_loaded(cpos, false)?;
-        Ok(self.cache.get(&cpos).cloned())
+        Ok(self.resident.snapshot(cpos))
     }
 
     pub fn plan_chunk_snapshot_without_generation(&self, cpos: ChunkPos) -> ChunkSnapshotPlan {
-        if let Some(chunk) = self.cache.get(&cpos) {
-            return ChunkSnapshotPlan::Cached(Arc::clone(chunk));
+        if let Some(chunk) = self.resident.snapshot(cpos) {
+            return ChunkSnapshotPlan::Cached(chunk);
         }
         let (rx, rz) = region_of(cpos);
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -761,16 +1322,42 @@ impl WorldStorage {
         cpos: ChunkPos,
         chunk: Chunk,
     ) -> Result<ChunkSnapshot, WorldError> {
-        if !self.cache.contains_key(&cpos) {
+        if !self.resident.contains(cpos) {
             self.insert_chunk(cpos, chunk)?;
         } else {
             self.touch(cpos);
         }
         Ok(self
-            .cache
-            .get(&cpos)
-            .expect("chunk snapshot commit leaves chunk cached")
-            .clone())
+            .resident
+            .snapshot(cpos)
+            .expect("chunk snapshot commit leaves chunk cached"))
+    }
+
+    pub fn replay_journal_chunk(&mut self, mut chunk: Chunk) -> Result<bool, WorldError> {
+        let position = chunk.pos;
+        let journal_lsn = chunk.world_journal_lsn();
+        if self
+            .ensure_chunk_loaded(position, false)?
+            .is_some_and(|current| current.world_journal_lsn() >= journal_lsn)
+        {
+            return Ok(false);
+        }
+        chunk.mark_dirty();
+        while !self.resident.contains(position)
+            && self.resident.len() >= self.capacity
+            && self.evict_clean_chunk()
+        {}
+        self.resident.replace(position, Arc::new(chunk));
+        self.lru.retain(|cached| *cached != position);
+        self.lru.push_back(position);
+        let region = (position.x.div_euclid(32), position.z.div_euclid(32));
+        self.regions.remove(&region);
+        self.region_lru.retain(|cached| *cached != region);
+        Ok(true)
+    }
+
+    pub fn restore_journal_chunk(&mut self, chunk: Chunk) -> Result<(), WorldError> {
+        self.replay_journal_chunk(chunk).map(|_| ())
     }
 
     pub fn try_commit_chunk_snapshot(
@@ -786,19 +1373,36 @@ impl WorldStorage {
 
     #[must_use]
     pub fn can_cache_new_chunk(&self, cpos: ChunkPos) -> bool {
-        self.cache.contains_key(&cpos) || !self.dirty_chunk_cache_saturated()
+        self.resident.contains(cpos) || !self.dirty_chunk_cache_saturated()
     }
 
     /// Clone a resident chunk without disk IO or generation.
     #[must_use]
     pub fn cached_chunk(&self, cpos: ChunkPos) -> Option<Chunk> {
-        self.cache.get(&cpos).map(|chunk| chunk.as_ref().clone())
+        self.resident
+            .snapshot(cpos)
+            .map(|chunk| chunk.as_ref().clone())
     }
 
     /// Return a resident chunk snapshot without disk IO, generation, or full chunk cloning.
     #[must_use]
     pub fn cached_chunk_snapshot(&self, cpos: ChunkPos) -> Option<ChunkSnapshot> {
-        self.cache.get(&cpos).cloned()
+        self.resident.snapshot(cpos)
+    }
+
+    /// Return every resident chunk snapshot without disk IO or LRU mutation.
+    #[must_use]
+    pub fn resident_chunk_snapshots(&self) -> Vec<(ChunkPos, ChunkSnapshot)> {
+        self.resident.snapshots()
+    }
+
+    pub fn stamp_cached_chunks_for_world_journal(
+        &self,
+        decision_id: u64,
+        positions: &[ChunkPos],
+    ) -> crate::JournalStampResult {
+        self.resident
+            .stamp_world_journal_conditionally(decision_id, positions)
     }
 
     #[must_use]
@@ -816,6 +1420,25 @@ impl WorldStorage {
         pos: BlockPos,
         state: BlockStateId,
     ) -> Result<Option<BlockStateId>, WorldError> {
+        self.set_block_at_inner(pos, state, true)
+    }
+
+    /// Apply a block mutation while retaining baked light. The caller must
+    /// prove that the old and new block states have identical light behavior.
+    pub fn set_block_at_preserving_light(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+    ) -> Result<Option<BlockStateId>, WorldError> {
+        self.set_block_at_inner(pos, state, false)
+    }
+
+    fn set_block_at_inner(
+        &mut self,
+        pos: BlockPos,
+        state: BlockStateId,
+        clear_baked_light: bool,
+    ) -> Result<Option<BlockStateId>, WorldError> {
         let cpos = chunk_pos_of(pos);
         let air = self
             .registry
@@ -825,13 +1448,26 @@ impl WorldStorage {
         let registry = Arc::clone(&self.registry);
         let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
         let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
-        let Some(chunk) = self.ensure_chunk_mut(cpos)? else {
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(None);
-        };
-        let prev = chunk.set_block_and_update(local_x, pos.y, local_z, state, air);
-        if prev.is_some_and(|prev| prev != state) {
-            prune_incompatible_block_entities(chunk, pos, &registry, state);
         }
+        let (prev, removed_furnace) = self
+            .resident
+            .mutate(cpos, |chunk| {
+                let prev = if clear_baked_light {
+                    chunk.set_block_and_update(local_x, pos.y, local_z, state, air)
+                } else {
+                    chunk.set_block_and_update_preserving_light(local_x, pos.y, local_z, state, air)
+                };
+                let removed_furnace = prev.is_some_and(|prev| prev != state)
+                    && prune_incompatible_block_entities(chunk, pos, &registry, state);
+                (prev, removed_furnace)
+            })
+            .expect("ensured chunk remains resident");
+        if removed_furnace {
+            self.refresh_furnace_snapshots(cpos);
+        }
+        self.refresh_scheduled_tick_hint(cpos);
         Ok(prev)
     }
 
@@ -843,19 +1479,48 @@ impl WorldStorage {
         let cpos = chunk_pos_of(pos);
         let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
         let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
-        let Some(chunk) = self.ensure_chunk_mut(cpos)? else {
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(());
-        };
-        chunk.update_highest_opaque_column(local_x, local_z, table);
+        }
+        self.resident
+            .mutate(cpos, |chunk| {
+                chunk.update_highest_opaque_column(local_x, local_z, table);
+            })
+            .expect("ensured chunk remains resident");
         Ok(())
     }
 
-    pub fn get_chunk_mut(&mut self, cpos: ChunkPos) -> Result<Option<&mut Chunk>, WorldError> {
+    /// Store baked light and publish the replacement chunk snapshot before returning.
+    pub fn set_baked_light(
+        &mut self,
+        cpos: ChunkPos,
+        light: &ChunkLight,
+    ) -> Result<bool, WorldError> {
+        if self.ensure_chunk(cpos)?.is_none() {
+            return Ok(false);
+        }
+        self.touch(cpos);
+        self.resident
+            .mutate(cpos, |chunk| chunk.set_baked_light(light))
+            .expect("ensured chunk remains resident");
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn get_chunk_mut(&mut self, cpos: ChunkPos) -> Result<Option<TestChunkMutation>, WorldError> {
         if self.ensure_chunk(cpos)?.is_none() {
             return Ok(None);
         }
         self.touch(cpos);
-        Ok(self.cache.get_mut(&cpos).map(make_cached_chunk_mut))
+        Ok(self.resident.snapshot(cpos).map(|mut chunk| {
+            make_cached_chunk_mut(&mut chunk);
+            self.resident.replace_for_test(cpos, Arc::clone(&chunk));
+            TestChunkMutation {
+                resident: self.resident.clone(),
+                position: cpos,
+                chunk,
+            }
+        }))
     }
 
     pub fn furnace_block_entity(
@@ -874,14 +1539,24 @@ impl WorldStorage {
         pos: BlockPos,
         furnace: FurnaceBlockEntity,
     ) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        if chunk.furnaces.get(&pos) == Some(&furnace) {
-            return Ok(true);
         }
-        chunk.furnaces.insert(pos, furnace);
-        chunk.mark_dirty();
+        let changed = self
+            .resident
+            .mutate(cpos, |chunk| {
+                if chunk.furnaces.get(&pos) == Some(&furnace) {
+                    return false;
+                }
+                chunk.furnaces.insert(pos, furnace);
+                chunk.mark_dirty();
+                true
+            })
+            .expect("ensured chunk remains resident");
+        if changed {
+            self.refresh_furnace_snapshots(cpos);
+        }
         Ok(true)
     }
 
@@ -901,14 +1576,18 @@ impl WorldStorage {
         pos: BlockPos,
         chest: ChestBlockEntity,
     ) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        if chunk.chests.get(&pos) == Some(&chest) {
-            return Ok(true);
         }
-        chunk.chests.insert(pos, chest);
-        chunk.mark_dirty();
+        self.resident
+            .mutate(cpos, |chunk| {
+                if chunk.chests.get(&pos) != Some(&chest) {
+                    chunk.chests.insert(pos, chest);
+                    chunk.mark_dirty();
+                }
+            })
+            .expect("ensured chunk remains resident");
         Ok(true)
     }
 
@@ -928,14 +1607,19 @@ impl WorldStorage {
         pos: BlockPos,
         hopper: HopperBlockEntity,
     ) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        if chunk.hoppers.get(&pos) == Some(&hopper) {
-            return Ok(true);
         }
-        chunk.hoppers.insert(pos, hopper);
-        chunk.mark_dirty();
+        self.resident
+            .mutate(cpos, |chunk| {
+                if chunk.hoppers.get(&pos) != Some(&hopper) {
+                    chunk.hoppers.insert(pos, hopper);
+                    chunk.mark_dirty();
+                }
+            })
+            .expect("ensured chunk remains resident");
+        self.refresh_scheduled_tick_hint(cpos);
         Ok(true)
     }
 
@@ -944,14 +1628,18 @@ impl WorldStorage {
         pos: BlockPos,
         bytes: Vec<u8>,
     ) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        if chunk.block_entities.get(&pos) == Some(&bytes) {
-            return Ok(true);
         }
-        chunk.block_entities.insert(pos, bytes);
-        chunk.mark_dirty();
+        self.resident
+            .mutate(cpos, |chunk| {
+                if chunk.block_entities.get(&pos) != Some(&bytes) {
+                    chunk.block_entities.insert(pos, bytes);
+                    chunk.mark_dirty();
+                }
+            })
+            .expect("ensured chunk remains resident");
         Ok(true)
     }
 
@@ -959,27 +1647,44 @@ impl WorldStorage {
         &mut self,
         cpos: ChunkPos,
     ) -> Result<Option<&[ScheduledBlockTick]>, WorldError> {
-        let Some(chunk) = self.ensure_chunk(cpos)? else {
+        self.borrowed_chunk = self.ensure_chunk(cpos)?;
+        let Some(chunk) = self.borrowed_chunk.as_deref() else {
             return Ok(None);
         };
         Ok(Some(chunk.scheduled_block_ticks()))
     }
 
     pub fn schedule_block_tick(&mut self, tick: ScheduledBlockTick) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(tick.pos)? else {
+        let cpos = chunk_pos_of(tick.pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        Ok(chunk.schedule_block_tick(tick))
+        }
+        let scheduled = self
+            .resident
+            .mutate(cpos, |chunk| chunk.schedule_block_tick(tick))
+            .expect("ensured chunk remains resident");
+        if scheduled {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(scheduled)
     }
 
     pub fn remove_scheduled_block_ticks_at(
         &mut self,
         pos: BlockPos,
     ) -> Result<Vec<ScheduledBlockTick>, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(Vec::new());
-        };
-        Ok(chunk.remove_scheduled_block_ticks_at(pos))
+        }
+        let removed = self
+            .resident
+            .mutate(cpos, |chunk| chunk.remove_scheduled_block_ticks_at(pos))
+            .expect("ensured chunk remains resident");
+        if !removed.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(removed)
     }
 
     pub fn drain_due_block_ticks(
@@ -988,10 +1693,19 @@ impl WorldStorage {
         world_tick: u64,
         max_ticks: usize,
     ) -> Result<Vec<ScheduledBlockTick>, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut(cpos)? else {
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(Vec::new());
-        };
-        Ok(chunk.drain_due_block_ticks(world_tick, max_ticks))
+        }
+        let due = self
+            .resident
+            .mutate(cpos, |chunk| {
+                chunk.drain_due_block_ticks(world_tick, max_ticks)
+            })
+            .expect("ensured chunk remains resident");
+        if !due.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(due)
     }
 
     pub fn drain_due_cached_block_ticks(
@@ -1000,7 +1714,7 @@ impl WorldStorage {
         world_tick: u64,
         max_ticks: usize,
     ) -> Vec<ScheduledBlockTick> {
-        let Some(chunk) = self.cache.get_mut(&cpos) else {
+        let Some(chunk) = self.resident.snapshot(cpos) else {
             return Vec::new();
         };
         if max_ticks == 0
@@ -1011,35 +1725,60 @@ impl WorldStorage {
         {
             return Vec::new();
         }
-        let chunk = make_cached_chunk_mut(chunk);
-        chunk.drain_due_block_ticks(world_tick, max_ticks)
+        let due = self
+            .resident
+            .mutate(cpos, |chunk| {
+                chunk.drain_due_block_ticks(world_tick, max_ticks)
+            })
+            .expect("snapshotted chunk remains resident");
+        if !due.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        due
     }
 
     pub fn scheduled_fluid_ticks(
         &mut self,
         cpos: ChunkPos,
     ) -> Result<Option<&[ScheduledFluidTick]>, WorldError> {
-        let Some(chunk) = self.ensure_chunk(cpos)? else {
+        self.borrowed_chunk = self.ensure_chunk(cpos)?;
+        let Some(chunk) = self.borrowed_chunk.as_deref() else {
             return Ok(None);
         };
         Ok(Some(chunk.scheduled_fluid_ticks()))
     }
 
     pub fn schedule_fluid_tick(&mut self, tick: ScheduledFluidTick) -> Result<bool, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(tick.pos)? else {
+        let cpos = chunk_pos_of(tick.pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(false);
-        };
-        Ok(chunk.schedule_fluid_tick(tick))
+        }
+        let scheduled = self
+            .resident
+            .mutate(cpos, |chunk| chunk.schedule_fluid_tick(tick))
+            .expect("ensured chunk remains resident");
+        if scheduled {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(scheduled)
     }
 
     pub fn remove_scheduled_fluid_ticks_at(
         &mut self,
         pos: BlockPos,
     ) -> Result<Vec<ScheduledFluidTick>, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut_at(pos)? else {
+        let cpos = chunk_pos_of(pos);
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(Vec::new());
-        };
-        Ok(chunk.remove_scheduled_fluid_ticks_at(pos))
+        }
+        let removed = self
+            .resident
+            .mutate(cpos, |chunk| chunk.remove_scheduled_fluid_ticks_at(pos))
+            .expect("ensured chunk remains resident");
+        if !removed.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(removed)
     }
 
     pub fn drain_due_fluid_ticks(
@@ -1048,10 +1787,19 @@ impl WorldStorage {
         world_tick: u64,
         max_ticks: usize,
     ) -> Result<Vec<ScheduledFluidTick>, WorldError> {
-        let Some(chunk) = self.ensure_chunk_mut(cpos)? else {
+        if self.ensure_chunk(cpos)?.is_none() {
             return Ok(Vec::new());
-        };
-        Ok(chunk.drain_due_fluid_ticks(world_tick, max_ticks))
+        }
+        let due = self
+            .resident
+            .mutate(cpos, |chunk| {
+                chunk.drain_due_fluid_ticks(world_tick, max_ticks)
+            })
+            .expect("ensured chunk remains resident");
+        if !due.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        Ok(due)
     }
 
     pub fn drain_due_cached_fluid_ticks(
@@ -1060,7 +1808,7 @@ impl WorldStorage {
         world_tick: u64,
         max_ticks: usize,
     ) -> Vec<ScheduledFluidTick> {
-        let Some(chunk) = self.cache.get_mut(&cpos) else {
+        let Some(chunk) = self.resident.snapshot(cpos) else {
             return Vec::new();
         };
         if max_ticks == 0
@@ -1071,8 +1819,16 @@ impl WorldStorage {
         {
             return Vec::new();
         }
-        let chunk = make_cached_chunk_mut(chunk);
-        chunk.drain_due_fluid_ticks(world_tick, max_ticks)
+        let due = self
+            .resident
+            .mutate(cpos, |chunk| {
+                chunk.drain_due_fluid_ticks(world_tick, max_ticks)
+            })
+            .expect("snapshotted chunk remains resident");
+        if !due.is_empty() {
+            self.refresh_scheduled_tick_hint(cpos);
+        }
+        due
     }
 
     /// Insert a freshly generated chunk through the same cache/LRU path
@@ -1099,29 +1855,18 @@ impl WorldStorage {
         Ok(true)
     }
 
-    fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<&Chunk>, WorldError> {
+    fn ensure_chunk(&mut self, cpos: ChunkPos) -> Result<Option<ChunkSnapshot>, WorldError> {
         self.ensure_chunk_loaded(cpos, true)
-    }
-
-    fn ensure_chunk_mut(&mut self, cpos: ChunkPos) -> Result<Option<&mut Chunk>, WorldError> {
-        if self.ensure_chunk(cpos)?.is_none() {
-            return Ok(None);
-        }
-        Ok(self.cache.get_mut(&cpos).map(make_cached_chunk_mut))
-    }
-
-    fn ensure_chunk_mut_at(&mut self, pos: BlockPos) -> Result<Option<&mut Chunk>, WorldError> {
-        self.ensure_chunk_mut(chunk_pos_of(pos))
     }
 
     fn ensure_chunk_loaded(
         &mut self,
         cpos: ChunkPos,
         allow_generation: bool,
-    ) -> Result<Option<&Chunk>, WorldError> {
-        if self.cache.contains_key(&cpos) {
+    ) -> Result<Option<ChunkSnapshot>, WorldError> {
+        if self.resident.contains(cpos) {
             self.touch(cpos);
-            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
+            return Ok(self.resident.snapshot(cpos));
         }
         let (rx, rz) = region_of(cpos);
         let local_x = cpos.x.rem_euclid(REGION_AXIS_CHUNKS) as u8;
@@ -1136,7 +1881,7 @@ impl WorldStorage {
             let chunk =
                 chunk_from_nbt_with_items(&root, &self.registry, self.item_registry.as_deref())?;
             self.insert_chunk(cpos, chunk)?;
-            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
+            return Ok(self.resident.snapshot(cpos));
         }
 
         // M7: no on-disk chunk → ask the generator (if any).
@@ -1144,7 +1889,7 @@ impl WorldStorage {
             let mut chunk = generator.generate(cpos);
             chunk.mark_dirty(); // belt-and-braces; generator already sets this
             self.insert_chunk(cpos, chunk)?;
-            return Ok(self.cache.get(&cpos).map(Arc::as_ref));
+            return Ok(self.resident.snapshot(cpos));
         }
         Ok(None)
     }
@@ -1197,7 +1942,7 @@ impl WorldStorage {
     }
 
     fn insert_chunk(&mut self, cpos: ChunkPos, chunk: Chunk) -> Result<(), WorldError> {
-        if self.cache.contains_key(&cpos) {
+        if self.resident.contains(cpos) {
             self.touch(cpos);
             return Ok(());
         }
@@ -1205,8 +1950,8 @@ impl WorldStorage {
         // region files while callers hold the shared world mutex. If every
         // resident chunk is dirty, the cache grows until the save pipeline
         // commits them clean.
-        while self.cache.len() >= self.capacity && self.evict_clean_chunk() {}
-        self.cache.insert(cpos, Arc::new(chunk));
+        while self.resident.len() >= self.capacity && self.evict_clean_chunk() {}
+        self.resident.insert_if_absent(cpos, chunk);
         self.lru.push_back(cpos);
         Ok(())
     }
@@ -1217,14 +1962,36 @@ impl WorldStorage {
             let Some(evict) = self.lru.pop_front() else {
                 return false;
             };
-            if self.cache.get(&evict).is_some_and(|chunk| chunk.dirty) {
+            if self
+                .resident
+                .snapshot(evict)
+                .is_some_and(|chunk| chunk.dirty)
+            {
                 self.lru.push_back(evict);
                 continue;
             }
-            self.cache.remove(&evict);
-            return true;
+            if self.resident.remove_if_clean(evict) {
+                return true;
+            }
         }
         false
+    }
+
+    fn refresh_scheduled_tick_hint(&self, cpos: ChunkPos) {
+        if let Some(chunk) = self.resident.snapshot(cpos) {
+            self.scheduled_tick_view
+                .publish_chunk(cpos, &chunk, &self.registry);
+        } else {
+            self.scheduled_tick_view.remove_chunk(cpos);
+        }
+    }
+
+    fn refresh_furnace_snapshots(&self, cpos: ChunkPos) {
+        if let Some(chunk) = self.resident.snapshot(cpos) {
+            self.read_view.publish_furnaces(cpos, &chunk);
+        } else {
+            self.read_view.remove_furnaces(cpos);
+        }
     }
 
     fn touch(&mut self, cpos: ChunkPos) {
@@ -1238,7 +2005,7 @@ impl WorldStorage {
     /// startup logging.
     #[must_use]
     pub fn cache_len(&self) -> usize {
-        self.cache.len()
+        self.resident.len()
     }
 
     /// How many decoded regions are currently resident. Tests and
@@ -1256,7 +2023,7 @@ impl WorldStorage {
     #[must_use]
     pub fn stats(&self) -> WorldStorageStats {
         WorldStorageStats {
-            chunk_cache_len: self.cache.len(),
+            chunk_cache_len: self.resident.len(),
             chunk_cache_capacity: self.capacity,
             region_cache_len: self.regions.len(),
             region_cache_capacity: self.region_capacity,
@@ -1267,7 +2034,7 @@ impl WorldStorage {
 
     #[must_use]
     pub fn dirty_chunk_cache_saturated(&self) -> bool {
-        self.cache.len() >= self.capacity && self.cache.values().all(|chunk| chunk.dirty)
+        self.resident.len() >= self.capacity && self.resident.dirty_count() == self.resident.len()
     }
 
     /// Build a dirty chunk flush plan. The plan owns dirty chunk snapshots and
@@ -1282,12 +2049,32 @@ impl WorldStorage {
         &self,
         current_tick: u64,
     ) -> Result<DirtyFlushPlan, WorldError> {
-        let dirty_positions: Vec<ChunkPos> = self
-            .cache
-            .iter()
-            .filter_map(|(pos, chunk)| chunk.dirty.then_some(*pos))
+        self.plan_dirty_flush_at_tick_bounded(current_tick, usize::MAX)
+    }
+
+    /// Build one bounded pressure-flush batch. This fast path caps the retained
+    /// plan and encoding/write work; full checkpoints use the unbounded planner.
+    pub fn plan_dirty_flush_at_tick_bounded(
+        &self,
+        current_tick: u64,
+        max_chunks: usize,
+    ) -> Result<DirtyFlushPlan, WorldError> {
+        let mut dirty_snapshots: Vec<(ChunkPos, ChunkSnapshot)> = self
+            .resident
+            .flushable_snapshots()
+            .into_iter()
+            .filter(|(_, chunk)| chunk.dirty)
             .collect();
-        if dirty_positions.is_empty() {
+        dirty_snapshots.sort_by_key(|(pos, _)| {
+            (
+                pos.x.div_euclid(REGION_AXIS_CHUNKS),
+                pos.z.div_euclid(REGION_AXIS_CHUNKS),
+                pos.z,
+                pos.x,
+            )
+        });
+        dirty_snapshots.truncate(max_chunks);
+        if dirty_snapshots.is_empty() {
             return Ok(DirtyFlushPlan {
                 regions: Vec::new(),
                 chunks: 0,
@@ -1298,9 +2085,12 @@ impl WorldStorage {
                 payload_encode_count: Arc::new(AtomicU64::new(0)),
             });
         }
-        let mut by_region: HashMap<(i32, i32), Vec<ChunkPos>> = HashMap::new();
-        for pos in dirty_positions {
-            by_region.entry(region_of(pos)).or_default().push(pos);
+        let mut by_region: HashMap<(i32, i32), Vec<(ChunkPos, ChunkSnapshot)>> = HashMap::new();
+        for (pos, chunk) in dirty_snapshots {
+            by_region
+                .entry(region_of(pos))
+                .or_default()
+                .push((pos, chunk));
         }
 
         let now = std::time::SystemTime::now()
@@ -1309,23 +2099,19 @@ impl WorldStorage {
             .unwrap_or(0);
         let mut regions = Vec::with_capacity(by_region.len());
         let mut chunks = 0usize;
-        for ((rx, rz), mut positions) in by_region {
-            positions.sort_by_key(|pos| (pos.z, pos.x));
+        for ((rx, rz), mut snapshots) in by_region {
+            snapshots.sort_by_key(|(pos, _)| (pos.z, pos.x));
             let region_path = self.region_root.join(format!("r.{rx}.{rz}.mca"));
             let expected_version = region_file_version(&region_path)?;
-            let mut dirty_payloads = Vec::with_capacity(positions.len());
-            for cpos in positions {
-                let chunk = self
-                    .cache
-                    .get(&cpos)
-                    .expect("dirty position must still be in cache");
+            let mut dirty_payloads = Vec::with_capacity(snapshots.len());
+            for (cpos, chunk) in snapshots {
                 dirty_payloads.push(PlannedChunkPayload {
                     pos: cpos,
                     current_tick,
                     dirty_generation: chunk.dirty_generation,
-                    snapshot: Arc::clone(chunk),
+                    snapshot: Arc::clone(&chunk),
                     #[cfg(test)]
-                    snapshot_token: chunk_snapshot_token(chunk),
+                    snapshot_token: chunk_snapshot_token(&chunk),
                 });
                 chunks += 1;
             }
@@ -1348,50 +2134,61 @@ impl WorldStorage {
         })
     }
 
+    #[must_use]
+    pub fn has_flushable_dirty_chunks(&self) -> bool {
+        self.resident.has_flushable_dirty()
+    }
+
     /// Commit a written flush plan. Chunks are marked clean only if their dirty
     /// generation still permits the comparison and the encoded payload still
     /// matches the payload that was written. Chunks changed after planning
     /// remain dirty.
     pub fn commit_dirty_flush(&mut self, commit: DirtyFlushCommit) -> Result<usize, WorldError> {
-        let mut clean = Vec::new();
+        let mut cleaned = 0usize;
         let mut written_regions = Vec::new();
         for region in commit.regions {
             written_regions.push(region.region);
             for planned in region.chunks {
-                let Some(chunk) = self.cache.get(&planned.pos) else {
-                    continue;
-                };
-                if !chunk.dirty {
-                    continue;
-                }
-                if planned.dirty_generation != 0
-                    && chunk.dirty_generation != planned.dirty_generation
-                {
-                    continue;
-                }
-                let clean_chunk =
-                    if can_fast_clean_chunk(chunk, planned.dirty_generation, &planned.snapshot) {
-                        true
-                    } else {
-                        let current = chunk_to_payload_with_items_at_tick(
-                            chunk,
-                            &self.registry,
-                            self.item_registry.as_deref(),
-                            0,
-                            planned.current_tick,
-                        )?;
-                        current.uncompressed_nbt == planned.uncompressed_nbt
-                    };
-                if clean_chunk {
-                    clean.push(planned.pos);
-                }
-            }
-        }
-
-        for cpos in &clean {
-            if let Some(chunk) = self.cache.get_mut(cpos) {
-                let chunk = Arc::make_mut(chunk);
-                chunk.dirty = false;
+                let CommittedChunkPayload {
+                    pos,
+                    current_tick,
+                    dirty_generation,
+                    snapshot,
+                    uncompressed_nbt,
+                    ..
+                } = planned;
+                let registry = Arc::clone(&self.registry);
+                let item_registry = self.item_registry.clone();
+                let cleaned_chunk = self
+                    .resident
+                    .mutate_snapshot(pos, move |chunk| {
+                        if !chunk.dirty {
+                            return Ok(false);
+                        }
+                        if dirty_generation != 0 && chunk.dirty_generation != dirty_generation {
+                            return Ok(false);
+                        }
+                        let matches = if can_fast_clean_chunk(chunk, dirty_generation, &snapshot) {
+                            true
+                        } else {
+                            let current = chunk_to_payload_with_items_at_tick(
+                                chunk,
+                                &registry,
+                                item_registry.as_deref(),
+                                0,
+                                current_tick,
+                            )?;
+                            current.uncompressed_nbt == uncompressed_nbt
+                        };
+                        if matches {
+                            drop(snapshot);
+                            make_cached_chunk_mut(chunk).dirty = false;
+                        }
+                        Ok::<_, WorldError>(matches)
+                    })
+                    .transpose()?
+                    .unwrap_or(false);
+                cleaned += usize::from(cleaned_chunk);
             }
         }
         for region in written_regions {
@@ -1399,7 +2196,7 @@ impl WorldStorage {
             self.region_lru.retain(|&k| k != region);
         }
 
-        Ok(clean.len())
+        Ok(cleaned)
     }
 
     /// M6.b: write every dirty chunk in the cache back to its
@@ -1411,28 +2208,47 @@ impl WorldStorage {
     }
 
     pub fn flush_dirty_at_tick(&mut self, current_tick: u64) -> Result<usize, WorldError> {
-        let plan = self.plan_dirty_flush_at_tick(current_tick)?;
-        if plan.is_empty() {
-            return Ok(0);
+        self.flush_dirty_at_tick_with_pre_write_hook(current_tick, |_| {})
+    }
+
+    fn flush_dirty_at_tick_with_pre_write_hook(
+        &mut self,
+        current_tick: u64,
+        mut pre_write: impl FnMut(&DirtyFlushPlan),
+    ) -> Result<usize, WorldError> {
+        let mut stale_retries = 0usize;
+        loop {
+            let plan = self.plan_dirty_flush_at_tick(current_tick)?;
+            if plan.is_empty() {
+                return Ok(0);
+            }
+            pre_write(&plan);
+            match plan.write() {
+                Ok(commit) => return self.commit_dirty_flush(commit),
+                Err(WorldError::StaleRegion(_))
+                    if stale_retries < DIRTY_FLUSH_STALE_REGION_RETRIES =>
+                {
+                    stale_retries += 1;
+                }
+                Err(err) => return Err(err),
+            }
         }
-        let commit = plan.write()?;
-        self.commit_dirty_flush(commit)
     }
 
     /// Number of dirty chunks currently in the cache. Used by tests
     /// and the Ctrl-C shutdown log.
     #[must_use]
     pub fn dirty_count(&self) -> usize {
-        self.cache.values().filter(|c| c.dirty).count()
+        self.resident.dirty_count()
     }
 }
 
-fn prune_incompatible_block_entities(
+pub(crate) fn prune_incompatible_block_entities(
     chunk: &mut Chunk,
     pos: BlockPos,
     registry: &BlockRegistry,
     state: BlockStateId,
-) {
+) -> bool {
     let path = registry.by_id(state).map(|state| state.block.id.path());
     let keeps_chest = path.is_some_and(|path| matches!(path, "chest" | "barrel"));
     let keeps_furnace =
@@ -1440,13 +2256,15 @@ fn prune_incompatible_block_entities(
     let keeps_hopper = path.is_some_and(|path| path == "hopper");
     let keeps_opaque = path.is_some_and(block_path_may_have_opaque_block_entity);
 
-    let removed = (!keeps_chest && chunk.chests.remove(&pos).is_some())
-        | (!keeps_furnace && chunk.furnaces.remove(&pos).is_some())
-        | (!keeps_hopper && chunk.hoppers.remove(&pos).is_some())
-        | (!keeps_opaque && chunk.block_entities.remove(&pos).is_some());
+    let removed_chest = !keeps_chest && chunk.chests.remove(&pos).is_some();
+    let removed_furnace = !keeps_furnace && chunk.furnaces.remove(&pos).is_some();
+    let removed_hopper = !keeps_hopper && chunk.hoppers.remove(&pos).is_some();
+    let removed_opaque = !keeps_opaque && chunk.block_entities.remove(&pos).is_some();
+    let removed = removed_chest | removed_furnace | removed_hopper | removed_opaque;
     if removed {
         chunk.mark_dirty();
     }
+    removed_furnace
 }
 
 fn block_path_may_have_opaque_block_entity(path: &str) -> bool {
@@ -1616,6 +2434,41 @@ mod tests {
         )
     }
 
+    fn air_stone_furnace_registry() -> Arc<BlockRegistry> {
+        Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:furnace").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        )
+    }
+
     fn air_stone_hopper_registry() -> Arc<BlockRegistry> {
         Arc::new(
             BlockRegistry::from_report(&[
@@ -1697,6 +2550,52 @@ mod tests {
     }
 
     #[test]
+    fn chunk_source_view_tracks_generator_and_resident_chunks() {
+        struct StubGenerator;
+
+        impl ChunkGenerator for StubGenerator {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                Chunk::empty(
+                    pos,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                )
+            }
+        }
+
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let source = world.chunk_source_view();
+        let position = ChunkPos { x: 2, z: -3 };
+        assert_eq!(source.source_for(position), ChunkPrepareSource::Absent);
+
+        world.set_generator(Some(Arc::new(StubGenerator)));
+        assert_eq!(source.source_for(position), ChunkPrepareSource::Generator);
+
+        world
+            .insert_generated_chunk(position, StubGenerator.generate(position))
+            .unwrap();
+        assert_eq!(source.source_for(position), ChunkPrepareSource::Resident);
+    }
+
+    #[test]
+    fn chunk_source_view_recognizes_region_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let region = tmp.path().join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(region.join("r.0.0.mca"), []).unwrap();
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = WorldStorage::open(tmp.path(), registry).unwrap();
+
+        assert_eq!(
+            world
+                .chunk_source_view()
+                .source_for(ChunkPos { x: 17, z: 4 }),
+            ChunkPrepareSource::RegionFile
+        );
+    }
+
+    #[test]
     fn storage_stats_report_cache_and_dirty_pressure() {
         let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
         let mut world = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 2);
@@ -1716,6 +2615,927 @@ mod tests {
         assert_eq!(stats.region_cache_capacity, 4);
         assert_eq!(stats.dirty_chunks, 1);
         assert!(!stats.dirty_chunk_cache_saturated);
+    }
+
+    #[test]
+    fn block_mutation_version_advances_on_changes_and_detects_aba() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(
+                ChunkPos { x: 0, z: 0 },
+                Chunk::empty(ChunkPos { x: 0, z: 0 }, BlockStateId(0), biome),
+            )
+            .unwrap();
+        let pos = BlockPos { x: 1, y: 0, z: 1 };
+
+        let initial = world.block_mutation_token(pos).expect("initial token");
+        assert_eq!(initial.version, 0);
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+        let first = world.block_mutation_token(pos).expect("first token");
+        assert_eq!(first.chunk_instance_id, initial.chunk_instance_id);
+        assert_eq!(first.version, 1);
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+        assert_eq!(world.block_mutation_token(pos), Some(first));
+        world.set_block_at(pos, BlockStateId(0)).unwrap();
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+        assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(1)));
+        assert_eq!(
+            world.block_mutation_token(pos).expect("ABA token").version,
+            3
+        );
+    }
+
+    #[test]
+    fn read_view_publishes_immutable_chunk_edits() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let read_view = world.read_view();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 0, z: 1 };
+        world
+            .insert_generated_chunk(
+                cpos,
+                Chunk::empty(
+                    cpos,
+                    BlockStateId(0),
+                    mc_data::Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+
+        let before = read_view.snapshot_chunks(&[cpos]);
+        assert_eq!(before.get_cached_block(pos), Some(BlockStateId(0)));
+        assert_eq!(read_view.get_cached_block(pos), Some(BlockStateId(0)));
+        let before_token = before.block_mutation_token(pos).unwrap();
+        let view_token = read_view.block_mutation_token(pos).unwrap();
+
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+        let after = read_view.snapshot_chunks(&[cpos]);
+        assert_eq!(after.get_cached_block(pos), Some(BlockStateId(1)));
+        assert_eq!(read_view.get_cached_block(pos), Some(BlockStateId(1)));
+        assert_eq!(before.get_cached_block(pos), Some(BlockStateId(0)));
+        assert_eq!(before_token.version, 0);
+        assert_eq!(view_token.version, 0);
+        assert_eq!(after.block_mutation_token(pos).unwrap().version, 1);
+        assert_eq!(read_view.block_mutation_token(pos).unwrap().version, 1);
+    }
+
+    #[test]
+    fn read_view_writer_does_not_block_an_independent_region() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = WorldStorage::in_memory(registry);
+        let read_view = world.read_view();
+        let held_region = ChunkPos { x: 0, z: 0 };
+        let independent_region = ChunkPos { x: 8, z: 0 };
+        let held = read_view.lock_chunk_shard_for_test(held_region);
+        let worker_view = read_view.clone();
+        let (completed, observed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let block = worker_view.get_cached_block(BlockPos {
+                x: independent_region.x * SECTION_DIM as i32,
+                y: 0,
+                z: independent_region.z * SECTION_DIM as i32,
+            });
+            completed.send(block).expect("reader completion");
+        });
+
+        let result = observed.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().expect("independent reader");
+
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn resident_mutation_is_canonical_and_independent_between_regions() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let held_region = ChunkPos { x: 0, z: 0 };
+        let target_chunk = ChunkPos { x: 8, z: 0 };
+        for position in [held_region, target_chunk] {
+            world
+                .insert_generated_chunk(
+                    position,
+                    Chunk::empty(position, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+        let target = BlockPos {
+            x: target_chunk.x * SECTION_DIM as i32,
+            y: 0,
+            z: target_chunk.z * SECTION_DIM as i32,
+        };
+        let expected_token = world.block_mutation_token(target).expect("target token");
+        let read_view = world.read_view();
+        let mutation = world.mutation_view();
+        let held = read_view.lock_chunk_shard_for_test(held_region);
+        let (completed, observed) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = mutation.set_block_if_current(
+                target,
+                BlockStateId(0),
+                expected_token,
+                BlockStateId(1),
+                false,
+            );
+            completed.send(result).expect("mutation completion");
+        });
+
+        let result = observed.recv_timeout(std::time::Duration::from_secs(1));
+        drop(held);
+        worker.join().expect("regional mutation worker");
+
+        assert_eq!(
+            result,
+            Ok(crate::ResidentBlockMutation::Applied(BlockStateId(0)))
+        );
+        assert_eq!(
+            world
+                .cached_chunk_snapshot(target_chunk)
+                .unwrap()
+                .get_block(0, 0, 0),
+            Some(BlockStateId(1))
+        );
+    }
+
+    #[test]
+    fn resident_batch_rejects_stale_precondition_without_partial_mutation() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let first = BlockPos { x: 1, y: 0, z: 1 };
+        let stale = BlockPos { x: 2, y: 0, z: 1 };
+        let first_token = world.block_mutation_token(first).unwrap();
+        let mut stale_token = world.block_mutation_token(stale).unwrap();
+        stale_token.version += 1;
+
+        let result = world.mutation_view().apply_block_edits_conditionally(
+            &[
+                crate::ResidentBlockEdit {
+                    pos: first,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                },
+                crate::ResidentBlockEdit {
+                    pos: stale,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                },
+            ],
+            &[
+                crate::ResidentBlockPrecondition {
+                    pos: first,
+                    expected_state: BlockStateId(0),
+                    expected_token: first_token,
+                },
+                crate::ResidentBlockPrecondition {
+                    pos: stale,
+                    expected_state: BlockStateId(0),
+                    expected_token: stale_token,
+                },
+            ],
+            &[],
+            None,
+            None,
+        );
+
+        assert_eq!(result, crate::ResidentBlockEditBatchResult::Stale);
+        assert_eq!(world.get_cached_block(first), Some(BlockStateId(0)));
+        assert_eq!(world.get_cached_block(stale), Some(BlockStateId(0)));
+        assert_eq!(world.block_mutation_token(first), Some(first_token));
+    }
+
+    #[test]
+    fn resident_fluid_tick_commit_consumes_edits_and_reschedules_atomically() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let source = BlockPos { x: 1, y: 0, z: 1 };
+        let target = BlockPos { x: 1, y: 1, z: 1 };
+        let water = Identifier::parse("minecraft:water").unwrap();
+        world.set_block_at(target, BlockStateId(1)).unwrap();
+        let due = ScheduledFluidTick::new(source, water.clone(), 10, 0);
+        world.schedule_fluid_tick(due.clone()).unwrap();
+        let target_token = world.block_mutation_token(target).unwrap();
+        let follow_up = ScheduledFluidTick::new(target, water, 15, 0);
+
+        let (result, touched) = world
+            .mutation_view()
+            .apply_fluid_tick_plan_conditionally_journaled(
+                7,
+                &crate::ResidentFluidTickPlan {
+                    consumed_ticks: &[due],
+                    edits: &[crate::ResidentBlockEdit {
+                        pos: target,
+                        new_state: BlockStateId(2),
+                        preserve_light: false,
+                    }],
+                    preconditions: &[crate::ResidentBlockPrecondition {
+                        pos: target,
+                        expected_state: BlockStateId(1),
+                        expected_token: target_token,
+                    }],
+                    scheduled_ticks: std::slice::from_ref(&follow_up),
+                    light_table: None,
+                    leaf_trigger_tick: None,
+                },
+            );
+
+        assert!(matches!(
+            result,
+            crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 1
+        ));
+        assert_eq!(touched, vec![chunk_pos]);
+        let chunk = world.cached_chunk_snapshot(chunk_pos).unwrap();
+        assert_eq!(chunk.get_block(1, 1, 1), Some(BlockStateId(2)));
+        let scheduled = chunk.scheduled_fluid_ticks();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, follow_up.pos);
+        assert_eq!(scheduled[0].fluid, follow_up.fluid);
+        assert_eq!(scheduled[0].trigger_tick, follow_up.trigger_tick);
+        assert_eq!(scheduled[0].priority, follow_up.priority);
+        assert_eq!(scheduled[0].sequence(), 1);
+        assert_eq!(chunk.world_journal_lsn(), 7);
+    }
+
+    #[test]
+    fn resident_fluid_tick_stale_plan_keeps_due_tick_and_block() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let source = BlockPos { x: 1, y: 0, z: 1 };
+        let target = BlockPos { x: 1, y: 1, z: 1 };
+        let due =
+            ScheduledFluidTick::new(source, Identifier::parse("minecraft:water").unwrap(), 10, 0);
+        world.schedule_fluid_tick(due.clone()).unwrap();
+        let mut stale_token = world.block_mutation_token(target).unwrap();
+        stale_token.version += 1;
+
+        let result = world.mutation_view().apply_fluid_tick_plan_conditionally(
+            &crate::ResidentFluidTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[crate::ResidentBlockEdit {
+                    pos: target,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                }],
+                preconditions: &[crate::ResidentBlockPrecondition {
+                    pos: target,
+                    expected_state: BlockStateId(0),
+                    expected_token: stale_token,
+                }],
+                scheduled_ticks: &[],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+
+        assert_eq!(result, crate::ResidentBlockEditBatchResult::Stale);
+        let chunk = world.cached_chunk_snapshot(chunk_pos).unwrap();
+        assert_eq!(chunk.get_block(1, 1, 1), Some(BlockStateId(0)));
+        assert_eq!(chunk.scheduled_fluid_ticks(), &[due]);
+    }
+
+    #[test]
+    fn resident_scheduled_block_tick_commit_consumes_and_edits_atomically() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let position = BlockPos { x: 1, y: 1, z: 1 };
+        world.set_block_at(position, BlockStateId(1)).unwrap();
+        let due = ScheduledBlockTick::new(
+            position,
+            Identifier::parse("minecraft:stone").unwrap(),
+            10,
+            0,
+        );
+        world.schedule_block_tick(due.clone()).unwrap();
+        let token = world.block_mutation_token(position).unwrap();
+
+        let (result, touched) = world
+            .mutation_view()
+            .apply_scheduled_block_tick_plan_conditionally_journaled(
+                8,
+                &crate::ResidentScheduledBlockTickPlan {
+                    consumed_ticks: &[due],
+                    edits: &[crate::ResidentBlockEdit {
+                        pos: position,
+                        new_state: BlockStateId(2),
+                        preserve_light: false,
+                    }],
+                    preconditions: &[crate::ResidentBlockPrecondition {
+                        pos: position,
+                        expected_state: BlockStateId(1),
+                        expected_token: token,
+                    }],
+                    light_table: None,
+                    leaf_trigger_tick: None,
+                },
+            );
+
+        assert!(matches!(
+            result,
+            crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 1
+        ));
+        assert_eq!(touched, vec![chunk_pos]);
+        let chunk = world.cached_chunk_snapshot(chunk_pos).unwrap();
+        assert_eq!(chunk.get_block(1, 1, 1), Some(BlockStateId(2)));
+        assert!(chunk.scheduled_block_ticks().is_empty());
+        assert_eq!(chunk.world_journal_lsn(), 8);
+    }
+
+    #[test]
+    fn resident_scheduled_block_tick_stale_plan_keeps_due_tick() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let position = BlockPos { x: 1, y: 1, z: 1 };
+        let due = ScheduledBlockTick::new(
+            position,
+            Identifier::parse("minecraft:stone").unwrap(),
+            10,
+            0,
+        );
+        world.schedule_block_tick(due.clone()).unwrap();
+        let mut stale_token = world.block_mutation_token(position).unwrap();
+        stale_token.version += 1;
+
+        let result = world
+            .mutation_view()
+            .apply_scheduled_block_tick_plan_conditionally(
+                &crate::ResidentScheduledBlockTickPlan {
+                    consumed_ticks: std::slice::from_ref(&due),
+                    edits: &[crate::ResidentBlockEdit {
+                        pos: position,
+                        new_state: BlockStateId(1),
+                        preserve_light: false,
+                    }],
+                    preconditions: &[crate::ResidentBlockPrecondition {
+                        pos: position,
+                        expected_state: BlockStateId(0),
+                        expected_token: stale_token,
+                    }],
+                    light_table: None,
+                    leaf_trigger_tick: None,
+                },
+            );
+
+        assert_eq!(result, crate::ResidentBlockEditBatchResult::Stale);
+        assert_eq!(
+            world
+                .cached_chunk_snapshot(chunk_pos)
+                .unwrap()
+                .scheduled_block_ticks(),
+            &[due]
+        );
+    }
+
+    #[test]
+    fn resident_hopper_tick_backfill_is_idempotent() {
+        let registry = air_stone_hopper_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let position = BlockPos { x: 1, y: 1, z: 1 };
+        world.set_block_at(position, BlockStateId(2)).unwrap();
+        world
+            .set_hopper_block_entity(position, HopperBlockEntity::default())
+            .unwrap();
+        let mutation = world.mutation_view();
+
+        assert_eq!(mutation.backfill_hopper_ticks(&[chunk_pos], 20), 1);
+        assert_eq!(mutation.backfill_hopper_ticks(&[chunk_pos], 20), 0);
+        let ticks = world
+            .cached_chunk_snapshot(chunk_pos)
+            .unwrap()
+            .scheduled_block_ticks()
+            .to_vec();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0].pos, position);
+        assert_eq!(ticks[0].block.as_str(), "minecraft:hopper");
+        assert_eq!(ticks[0].trigger_tick, 20);
+    }
+
+    #[test]
+    fn resident_batch_schedules_tick_only_for_applied_position() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let changed = BlockPos { x: 1, y: 0, z: 1 };
+        let unchanged = BlockPos { x: 2, y: 0, z: 1 };
+        let changed_token = world.block_mutation_token(changed).unwrap();
+        let unchanged_token = world.block_mutation_token(unchanged).unwrap();
+        let changed_tick =
+            ScheduledBlockTick::new(changed, Identifier::parse("minecraft:air").unwrap(), 20, 0);
+        let unchanged_tick = ScheduledBlockTick::new(
+            unchanged,
+            Identifier::parse("minecraft:air").unwrap(),
+            20,
+            0,
+        );
+
+        let result = world.mutation_view().apply_block_edits_conditionally(
+            &[
+                crate::ResidentBlockEdit {
+                    pos: changed,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                },
+                crate::ResidentBlockEdit {
+                    pos: unchanged,
+                    new_state: BlockStateId(0),
+                    preserve_light: false,
+                },
+            ],
+            &[
+                crate::ResidentBlockPrecondition {
+                    pos: changed,
+                    expected_state: BlockStateId(0),
+                    expected_token: changed_token,
+                },
+                crate::ResidentBlockPrecondition {
+                    pos: unchanged,
+                    expected_state: BlockStateId(0),
+                    expected_token: unchanged_token,
+                },
+            ],
+            &[changed_tick.clone(), unchanged_tick],
+            None,
+            None,
+        );
+
+        let crate::ResidentBlockEditBatchResult::Applied(applied) = result else {
+            panic!("resident batch did not commit");
+        };
+        assert_eq!(applied.len(), 1);
+        assert_eq!(applied[0].pos, changed);
+        assert_eq!(world.get_cached_block(changed), Some(BlockStateId(1)));
+        assert_eq!(
+            world.scheduled_block_ticks(chunk_pos).unwrap().unwrap(),
+            &[changed_tick]
+        );
+    }
+
+    #[test]
+    fn resident_batch_rejects_cross_region_before_mutation() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let first_chunk = ChunkPos { x: 0, z: 0 };
+        let other_chunk = ChunkPos { x: 8, z: 0 };
+        for chunk_pos in [first_chunk, other_chunk] {
+            world
+                .insert_generated_chunk(
+                    chunk_pos,
+                    Chunk::empty(chunk_pos, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+        let first = BlockPos { x: 1, y: 0, z: 1 };
+        let other = BlockPos {
+            x: other_chunk.x * SECTION_DIM as i32,
+            y: 0,
+            z: 1,
+        };
+
+        let result = world.mutation_view().apply_block_edits_conditionally(
+            &[
+                crate::ResidentBlockEdit {
+                    pos: first,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                },
+                crate::ResidentBlockEdit {
+                    pos: other,
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                },
+            ],
+            &[],
+            &[],
+            None,
+            None,
+        );
+
+        assert_eq!(result, crate::ResidentBlockEditBatchResult::CrossRegion);
+        assert_eq!(world.get_cached_block(first), Some(BlockStateId(0)));
+        assert_eq!(world.get_cached_block(other), Some(BlockStateId(0)));
+    }
+
+    #[test]
+    fn resident_batch_updates_highest_opaque_inside_commit() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        world
+            .set_baked_light(chunk_pos, &ChunkLight::filled(15, 0))
+            .unwrap();
+        let pos = BlockPos { x: 1, y: 0, z: 1 };
+        let token = world.block_mutation_token(pos).unwrap();
+        let light = BlockLightTable::from_arrays(
+            "resident batch test",
+            vec![0, 0],
+            vec![0, 15],
+            vec![true, false],
+        );
+
+        let result = world.mutation_view().apply_block_edits_conditionally(
+            &[crate::ResidentBlockEdit {
+                pos,
+                new_state: BlockStateId(1),
+                preserve_light: false,
+            }],
+            &[crate::ResidentBlockPrecondition {
+                pos,
+                expected_state: BlockStateId(0),
+                expected_token: token,
+            }],
+            &[],
+            Some(&light),
+            None,
+        );
+
+        let crate::ResidentBlockEditBatchResult::Applied(applied) = result else {
+            panic!("resident light-changing batch did not commit");
+        };
+        assert_eq!(applied.len(), 1);
+        assert!(applied[0].previous_light.is_some());
+        assert_eq!(
+            world
+                .cached_chunk_snapshot(chunk_pos)
+                .unwrap()
+                .highest_opaque_y(1, 1),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn resident_batch_schedules_adjacent_leaf_inside_commit() {
+        let registry = Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        );
+        let mut world = WorldStorage::in_memory(registry);
+        let chunk_pos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(chunk_pos, Chunk::empty(chunk_pos, BlockStateId(0), biome))
+            .unwrap();
+        let trunk = BlockPos { x: 1, y: 1, z: 1 };
+        let leaf = BlockPos { x: 2, y: 1, z: 1 };
+        world.set_block_at(trunk, BlockStateId(1)).unwrap();
+        world.set_block_at(leaf, BlockStateId(2)).unwrap();
+        let token = world.block_mutation_token(trunk).unwrap();
+
+        let result = world.mutation_view().apply_block_edits_conditionally(
+            &[crate::ResidentBlockEdit {
+                pos: trunk,
+                new_state: BlockStateId(0),
+                preserve_light: false,
+            }],
+            &[crate::ResidentBlockPrecondition {
+                pos: trunk,
+                expected_state: BlockStateId(1),
+                expected_token: token,
+            }],
+            &[],
+            None,
+            Some(12),
+        );
+
+        assert!(matches!(
+            result,
+            crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 1
+        ));
+        assert_eq!(
+            world.scheduled_block_ticks(chunk_pos).unwrap().unwrap(),
+            &[ScheduledBlockTick::new(
+                leaf,
+                Identifier::parse("minecraft:oak_leaves").unwrap(),
+                12,
+                0,
+            )]
+        );
+    }
+
+    #[test]
+    fn baked_light_replaces_published_chunk_snapshot() {
+        let registry = single_air_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let read_view = world.read_view();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let before = read_view.snapshot_chunks(&[cpos]);
+        assert!(
+            ChunkLight::from_section_lights(&before.chunk(cpos).unwrap().section_lights).is_none()
+        );
+
+        let baked = ChunkLight::filled(15, 0);
+        assert!(world.set_baked_light(cpos, &baked).unwrap());
+
+        let after = read_view.snapshot_chunks(&[cpos]);
+        assert!(
+            ChunkLight::from_section_lights(&after.chunk(cpos).unwrap().section_lights).is_some()
+        );
+        assert!(
+            ChunkLight::from_section_lights(&before.chunk(cpos).unwrap().section_lights).is_none(),
+            "an already-issued immutable snapshot must not change"
+        );
+    }
+
+    #[test]
+    fn stale_regional_baked_light_publish_is_all_or_nothing() {
+        let registry = single_air_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let read_view = world.read_view();
+        let mutation_view = world.mutation_view();
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos {
+            x: crate::resident::WORLD_REGION_AXIS_CHUNKS,
+            z: 0,
+        };
+        for position in [first, second] {
+            world
+                .insert_generated_chunk(
+                    position,
+                    Chunk::empty(position, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+        let expected = [first, second]
+            .into_iter()
+            .map(|position| {
+                let snapshot = read_view.snapshot_chunks(&[position]);
+                (position, snapshot.chunk(position))
+            })
+            .collect::<HashMap<_, _>>();
+
+        let newer_second_light = ChunkLight::filled(7, 3);
+        world.set_baked_light(second, &newer_second_light).unwrap();
+        let proposed = ChunkLight::filled(15, 0);
+
+        assert!(!mutation_view.publish_baked_light_conditionally(
+            &expected,
+            [(first, &proposed), (second, &proposed)],
+        ));
+        let after = read_view.snapshot_chunks(&[first, second]);
+        let first_after = after.chunk(first).unwrap();
+        let second_after = after.chunk(second).unwrap();
+        assert!(ChunkLight::from_section_lights(&first_after.section_lights).is_none());
+        assert_eq!(
+            ChunkLight::from_section_lights(&second_after.section_lights),
+            Some(newer_second_light)
+        );
+    }
+
+    #[test]
+    fn read_snapshot_returns_shared_chunk_by_position() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+
+        let snapshot = world.read_view().snapshot_chunks(&[cpos]);
+        let chunk = snapshot.chunk(cpos).expect("published chunk is present");
+
+        assert_eq!(chunk.pos, cpos);
+        assert!(Arc::ptr_eq(
+            &chunk,
+            &world.cached_chunk_snapshot(cpos).unwrap()
+        ));
+    }
+
+    #[test]
+    fn journal_restore_replaces_resident_chunk_and_publishes_scheduled_state() {
+        let registry = single_air_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 2, z: -3 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(position, BlockStateId(0), biome.clone()),
+            )
+            .unwrap();
+        let before = world.cached_chunk_snapshot(position).unwrap();
+        let tick_position = BlockPos {
+            x: position.x * 16,
+            y: 64,
+            z: position.z * 16,
+        };
+        let mut restored = Chunk::empty(position, BlockStateId(0), biome);
+        restored.schedule_block_tick(ScheduledBlockTick::new(
+            tick_position,
+            Identifier::parse("minecraft:air").unwrap(),
+            7,
+            0,
+        ));
+        restored.set_world_journal_lsn(1);
+
+        world.restore_journal_chunk(restored).unwrap();
+
+        let after = world.cached_chunk_snapshot(position).unwrap();
+        assert!(!Arc::ptr_eq(&before, &after));
+        assert!(after.dirty);
+        assert_eq!(
+            world.scheduled_block_ticks(position).unwrap().unwrap(),
+            &[ScheduledBlockTick::new(
+                tick_position,
+                Identifier::parse("minecraft:air").unwrap(),
+                7,
+                0,
+            )]
+        );
+        assert_eq!(world.stats().dirty_chunks, 1);
+    }
+
+    #[test]
+    fn read_view_removes_evicted_clean_chunks() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory_with_capacity(Arc::clone(&registry), 1);
+        let read_view = world.read_view();
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let first = ChunkPos { x: 0, z: 0 };
+        let second = ChunkPos { x: 1, z: 0 };
+        world
+            .commit_chunk_snapshot(first, Chunk::empty(first, BlockStateId(0), biome.clone()))
+            .unwrap();
+        assert_eq!(
+            read_view
+                .snapshot_chunks(&[first])
+                .get_cached_block(BlockPos { x: 0, y: 0, z: 0 }),
+            Some(BlockStateId(0))
+        );
+
+        world
+            .commit_chunk_snapshot(second, Chunk::empty(second, BlockStateId(0), biome))
+            .unwrap();
+
+        assert!(
+            read_view
+                .snapshot_chunks(&[first])
+                .get_cached_block(BlockPos { x: 0, y: 0, z: 0 })
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn saturated_dirty_state_changes_notify_without_a_new_high_water_edge() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory_with_capacity(registry, 1);
+        let position = ChunkPos { x: 0, z: 0 };
+        let block = BlockPos { x: 1, y: 64, z: 1 };
+        let notifications = Arc::new(AtomicUsize::new(0));
+        world.set_dirty_high_water_notifier({
+            let notifications = Arc::clone(&notifications);
+            Arc::new(move || {
+                notifications.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            world
+                .mutation_view()
+                .schedule_fluid_ticks(&[ScheduledFluidTick::new(
+                    block,
+                    Identifier::parse("minecraft:water").unwrap(),
+                    20,
+                    0,
+                )]),
+            1
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
+
+        assert_eq!(
+            world
+                .mutation_view()
+                .schedule_fluid_ticks(&[ScheduledFluidTick::new(
+                    block,
+                    Identifier::parse("minecraft:water").unwrap(),
+                    21,
+                    0,
+                ),]),
+            1
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn unchanged_resident_mutation_does_not_notify_flush_consumer() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let position = ChunkPos { x: 0, z: 0 };
+        let block = BlockPos { x: 1, y: 64, z: 1 };
+        let tick =
+            ScheduledFluidTick::new(block, Identifier::parse("minecraft:water").unwrap(), 20, 0);
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            world
+                .mutation_view()
+                .schedule_fluid_ticks(std::slice::from_ref(&tick)),
+            1
+        );
+        let notifications = Arc::new(AtomicUsize::new(0));
+        world.set_dirty_high_water_notifier({
+            let notifications = Arc::clone(&notifications);
+            Arc::new(move || {
+                notifications.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert_eq!(world.mutation_view().schedule_fluid_ticks(&[tick]), 0);
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -1831,6 +3651,7 @@ mod tests {
             count: 2,
             item_id: 42,
             damage: Some(7),
+            enchantments: Vec::new(),
         };
         furnace.cook_progress = 11;
 
@@ -1841,6 +3662,408 @@ mod tests {
         );
         assert_eq!(world.dirty_count(), 1);
         assert_eq!(world.furnace_block_entity(pos).unwrap(), Some(furnace));
+    }
+
+    #[test]
+    fn resident_double_chest_commit_preflights_before_any_write() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let positions = [BlockPos { x: 1, y: 2, z: 3 }, BlockPos { x: 2, y: 2, z: 3 }];
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let mut initial = [ChestBlockEntity::default(), ChestBlockEntity::default()];
+        initial[0].slots[0].item_id = 41;
+        initial[0].slots[0].count = 1;
+        initial[1].slots[0].item_id = 42;
+        initial[1].slots[0].count = 2;
+        for (&position, chest) in positions.iter().zip(&initial) {
+            world
+                .set_chest_block_entity(position, chest.clone())
+                .unwrap();
+        }
+        let mutation = world.mutation_view();
+        let mut updated = initial.clone();
+        updated[0].slots[0].count = 3;
+        updated[1].slots[0].count = 4;
+        let mut stale = initial.clone();
+        stale[1].slots[0].count = 99;
+
+        assert!(matches!(
+            mutation.commit_chests_conditionally(&positions, &stale, &updated),
+            crate::ResidentChestCommitResult::Rejected(authoritative)
+                if authoritative == initial
+        ));
+        for (&position, chest) in positions.iter().zip(&initial) {
+            assert_eq!(
+                world.chest_block_entity(position).unwrap(),
+                Some(chest.clone())
+            );
+        }
+
+        assert_eq!(
+            mutation.commit_chests_conditionally(&positions, &initial, &updated),
+            crate::ResidentChestCommitResult::Applied
+        );
+        for (&position, chest) in positions.iter().zip(&updated) {
+            assert_eq!(
+                world.chest_block_entity(position).unwrap(),
+                Some(chest.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn resident_furnace_commit_rejects_stale_before_write() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let position = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let mut initial = FurnaceBlockEntity::default();
+        initial.slots[0].item_id = 41;
+        initial.slots[0].count = 2;
+        world
+            .set_furnace_block_entity(position, initial.clone())
+            .unwrap();
+        let mutation = world.mutation_view();
+        let mut stale = initial.clone();
+        stale.slots[0].count = 99;
+        let mut updated = initial.clone();
+        updated.slots[0].count = 1;
+
+        assert!(matches!(
+            mutation.commit_furnace_conditionally(position, &stale, &updated),
+            crate::ResidentFurnaceCommitResult::Rejected(authoritative)
+                if authoritative == initial
+        ));
+        assert_eq!(
+            world.furnace_block_entity(position).unwrap(),
+            Some(initial.clone())
+        );
+
+        assert_eq!(
+            mutation.commit_furnace_conditionally(position, &initial, &updated),
+            crate::ResidentFurnaceCommitResult::Applied
+        );
+        assert_eq!(world.furnace_block_entity(position).unwrap(), Some(updated));
+    }
+
+    #[test]
+    fn resident_furnace_tick_commit_rejects_stale_burn_state() {
+        let registry = air_stone_furnace_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let position = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(position, BlockStateId(2)).unwrap();
+        let initial = FurnaceBlockEntity {
+            burn_remaining: 10,
+            burn_total: 10,
+            ..FurnaceBlockEntity::default()
+        };
+        world
+            .set_furnace_block_entity(position, initial.clone())
+            .unwrap();
+        let mutation = world.mutation_view();
+        let mut current = initial.clone();
+        current.burn_remaining = 9;
+        world
+            .set_furnace_block_entity(position, current.clone())
+            .unwrap();
+        let mut stale_update = initial.clone();
+        stale_update.burn_remaining = 8;
+
+        assert_eq!(
+            mutation.commit_furnace_tick_conditionally(
+                position,
+                BlockStateId(2),
+                &initial,
+                &stale_update,
+            ),
+            crate::ResidentFurnaceTickCommitResult::Stale
+        );
+        assert_eq!(
+            mutation.furnace_tick_snapshot(position),
+            Some((BlockStateId(2), current))
+        );
+    }
+
+    #[test]
+    fn resident_hopper_transfer_rejects_stale_endpoint_without_partial_write() {
+        let registry = air_stone_hopper_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let hopper_position = BlockPos { x: 1, y: 2, z: 3 };
+        let chest_position = BlockPos { x: 2, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world
+            .set_block_at(hopper_position, BlockStateId(2))
+            .unwrap();
+        world.set_block_at(chest_position, BlockStateId(1)).unwrap();
+        let mut hopper = HopperBlockEntity::default();
+        hopper.slots[0].item_id = 42;
+        hopper.slots[0].count = 1;
+        world
+            .set_hopper_block_entity(hopper_position, hopper.clone())
+            .unwrap();
+        let chest = ChestBlockEntity::default();
+        world
+            .set_chest_block_entity(chest_position, chest.clone())
+            .unwrap();
+        let mut updated_hopper = hopper.clone();
+        updated_hopper.slots[0] = crate::FurnaceSlot::EMPTY;
+        updated_hopper.transfer_cooldown = 8;
+        let mut updated_chest = chest.clone();
+        updated_chest.slots[0].item_id = 42;
+        updated_chest.slots[0].count = 1;
+        let next_tick = ScheduledBlockTick::new(
+            hopper_position,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            21,
+            0,
+        );
+        let plan = crate::ResidentHopperTransferPlan {
+            expected_states: vec![
+                (hopper_position, BlockStateId(2)),
+                (chest_position, BlockStateId(1)),
+            ],
+            hoppers: vec![crate::ResidentBlockEntityChange {
+                position: hopper_position,
+                expected: hopper.clone(),
+                updated: updated_hopper.clone(),
+            }],
+            chests: vec![crate::ResidentBlockEntityChange {
+                position: chest_position,
+                expected: chest.clone(),
+                updated: updated_chest.clone(),
+            }],
+            furnaces: Vec::new(),
+            scheduled_block_ticks: vec![next_tick.clone()],
+        };
+        let mutation = world.mutation_view();
+        let mut stale = plan.clone();
+        stale.chests[0].expected.slots[0].count = 99;
+
+        assert_eq!(
+            mutation.commit_hopper_transfer_conditionally(&stale),
+            crate::ResidentHopperTransferCommitResult::Stale
+        );
+        assert_eq!(
+            world.hopper_block_entity(hopper_position).unwrap(),
+            Some(hopper)
+        );
+        assert_eq!(
+            world.chest_block_entity(chest_position).unwrap(),
+            Some(chest)
+        );
+        assert!(
+            world
+                .scheduled_block_ticks(cpos)
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+
+        assert_eq!(
+            mutation.commit_hopper_transfer_conditionally(&plan),
+            crate::ResidentHopperTransferCommitResult::Applied
+        );
+        assert_eq!(
+            world.hopper_block_entity(hopper_position).unwrap(),
+            Some(updated_hopper)
+        );
+        assert_eq!(
+            world.chest_block_entity(chest_position).unwrap(),
+            Some(updated_chest)
+        );
+        assert_eq!(
+            world.scheduled_block_ticks(cpos).unwrap().unwrap(),
+            &[next_tick]
+        );
+    }
+
+    #[test]
+    fn resident_scheduled_hopper_transfer_consumes_due_tick_and_sets_journal_fence() {
+        let registry = air_stone_hopper_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let hopper_position = BlockPos { x: 1, y: 2, z: 3 };
+        let chest_position = BlockPos { x: 2, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world
+            .set_block_at(hopper_position, BlockStateId(2))
+            .unwrap();
+        world.set_block_at(chest_position, BlockStateId(1)).unwrap();
+        let mut hopper = HopperBlockEntity::default();
+        hopper.slots[0].item_id = 42;
+        hopper.slots[0].count = 1;
+        world
+            .set_hopper_block_entity(hopper_position, hopper.clone())
+            .unwrap();
+        let chest = ChestBlockEntity::default();
+        world
+            .set_chest_block_entity(chest_position, chest.clone())
+            .unwrap();
+        let due = ScheduledBlockTick::new(
+            hopper_position,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            20,
+            0,
+        );
+        world.schedule_block_tick(due.clone()).unwrap();
+        let mut updated_hopper = hopper;
+        updated_hopper.slots[0] = crate::FurnaceSlot::EMPTY;
+        updated_hopper.transfer_cooldown = 8;
+        let mut updated_chest = chest;
+        updated_chest.slots[0].item_id = 42;
+        updated_chest.slots[0].count = 1;
+        let next_tick = ScheduledBlockTick::new(
+            hopper_position,
+            Identifier::parse("minecraft:hopper").unwrap(),
+            21,
+            0,
+        );
+        let plan = crate::ResidentHopperTransferPlan {
+            expected_states: vec![
+                (hopper_position, BlockStateId(2)),
+                (chest_position, BlockStateId(1)),
+            ],
+            hoppers: vec![crate::ResidentBlockEntityChange {
+                position: hopper_position,
+                expected: world.hopper_block_entity(hopper_position).unwrap().unwrap(),
+                updated: updated_hopper.clone(),
+            }],
+            chests: vec![crate::ResidentBlockEntityChange {
+                position: chest_position,
+                expected: world.chest_block_entity(chest_position).unwrap().unwrap(),
+                updated: updated_chest.clone(),
+            }],
+            furnaces: Vec::new(),
+            scheduled_block_ticks: vec![next_tick.clone()],
+        };
+        let mutation = world.mutation_view();
+
+        let (result, touched) =
+            mutation.commit_scheduled_hopper_transfer_conditionally_journaled(7, &[due], &plan);
+
+        assert_eq!(result, crate::ResidentHopperTransferCommitResult::Applied);
+        assert_eq!(touched, vec![cpos]);
+        assert_eq!(
+            world.hopper_block_entity(hopper_position).unwrap(),
+            Some(updated_hopper)
+        );
+        assert_eq!(
+            world.chest_block_entity(chest_position).unwrap(),
+            Some(updated_chest)
+        );
+        let scheduled = world.scheduled_block_ticks(cpos).unwrap().unwrap();
+        assert_eq!(scheduled.len(), 1);
+        assert_eq!(scheduled[0].pos, next_tick.pos);
+        assert_eq!(scheduled[0].block, next_tick.block);
+        assert_eq!(scheduled[0].trigger_tick, next_tick.trigger_tick);
+        assert_eq!(scheduled[0].priority, next_tick.priority);
+        let snapshot = world.cached_chunk_snapshot(cpos).unwrap();
+        assert_eq!(snapshot.world_journal_lsn(), 7);
+        assert!(world.plan_dirty_flush().unwrap().is_empty());
+        assert_eq!(mutation.clear_journal_pending_conditionally(7, &[cpos]), 1);
+        assert_eq!(world.plan_dirty_flush().unwrap().regions.len(), 1);
+    }
+
+    #[test]
+    fn resident_opaque_block_entity_commit_rejects_stale_token() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(registry);
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let position = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(position, BlockStateId(1)).unwrap();
+        let stale_token = world.block_mutation_token(position).unwrap();
+        world.set_block_at(position, BlockStateId(0)).unwrap();
+        world.set_block_at(position, BlockStateId(1)).unwrap();
+        let current_token = world.block_mutation_token(position).unwrap();
+        let mutation = world.mutation_view();
+        let bytes = vec![10, 0, 0, 0];
+
+        assert_eq!(
+            mutation.commit_opaque_block_entity_conditionally(
+                position,
+                BlockStateId(1),
+                stale_token,
+                bytes.clone(),
+            ),
+            crate::ResidentOpaqueBlockEntityCommitResult::Stale
+        );
+        assert!(
+            !world
+                .cached_chunk(cpos)
+                .unwrap()
+                .block_entities
+                .contains_key(&position)
+        );
+
+        assert_eq!(
+            mutation.commit_opaque_block_entity_conditionally(
+                position,
+                BlockStateId(1),
+                current_token,
+                bytes.clone(),
+            ),
+            crate::ResidentOpaqueBlockEntityCommitResult::Applied
+        );
+        assert_eq!(
+            world
+                .cached_chunk(cpos)
+                .unwrap()
+                .block_entities
+                .get(&position),
+            Some(&bytes)
+        );
+    }
+
+    #[test]
+    fn read_view_tracks_furnace_set_and_block_replacement() {
+        let registry = air_stone_furnace_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let read_view = world.read_view();
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        let furnace = FurnaceBlockEntity {
+            burn_remaining: 10,
+            burn_total: 10,
+            ..FurnaceBlockEntity::default()
+        };
+        world
+            .set_furnace_block_entity(pos, furnace.clone())
+            .unwrap();
+
+        assert_eq!(read_view.furnace_snapshots(&[cpos]), vec![(pos, furnace)]);
+
+        world.set_block_at(pos, BlockStateId(1)).unwrap();
+
+        assert!(read_view.furnace_snapshots(&[cpos]).is_empty());
     }
 
     #[test]
@@ -1861,6 +4084,7 @@ mod tests {
             count: 2,
             item_id: 42,
             damage: Some(7),
+            enchantments: Vec::new(),
         };
 
         assert!(world.set_hopper_block_entity(pos, hopper.clone()).unwrap());
@@ -1921,6 +4145,83 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scheduled_tick_view_tracks_block_queue_changes() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let block = mc_data::Identifier::parse("minecraft:wheat").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let scheduled_ticks = world.scheduled_tick_view();
+
+        assert!(!scheduled_ticks.block_due(cpos, 20));
+        assert!(
+            world
+                .schedule_block_tick(ScheduledBlockTick::new(pos, block, 20, 0))
+                .unwrap()
+        );
+        assert!(!scheduled_ticks.block_due(cpos, 19));
+        assert!(scheduled_ticks.block_due(cpos, 20));
+
+        assert_eq!(
+            world
+                .drain_due_block_ticks(cpos, 20, usize::MAX)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(!scheduled_ticks.block_due(cpos, u64::MAX));
+    }
+
+    #[test]
+    fn scheduled_tick_view_flags_hopper_without_tick_for_backfill() {
+        let registry = air_stone_hopper_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let scheduled_ticks = world.scheduled_tick_view();
+
+        world.set_block_at(pos, BlockStateId(2)).unwrap();
+        world
+            .set_hopper_block_entity(pos, HopperBlockEntity::default())
+            .unwrap();
+
+        assert!(scheduled_ticks.block_due(cpos, 0));
+    }
+
+    #[test]
+    fn scheduled_tick_view_tracks_fluid_queue_changes() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let cpos = ChunkPos { x: 0, z: 0 };
+        let pos = BlockPos { x: 1, y: 2, z: 3 };
+        let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+        let fluid = mc_data::Identifier::parse("minecraft:water").unwrap();
+        world
+            .insert_generated_chunk(cpos, Chunk::empty(cpos, BlockStateId(0), biome))
+            .unwrap();
+        let scheduled_ticks = world.scheduled_tick_view();
+
+        assert!(
+            world
+                .schedule_fluid_tick(ScheduledFluidTick::new(pos, fluid, 30, 0))
+                .unwrap()
+        );
+        assert!(!scheduled_ticks.fluid_due(cpos, 29));
+        assert!(scheduled_ticks.fluid_due(cpos, 30));
+
+        assert_eq!(world.remove_scheduled_fluid_ticks_at(pos).unwrap().len(), 1);
+        assert!(!scheduled_ticks.fluid_due(cpos, u64::MAX));
     }
 
     #[test]
@@ -2001,7 +4302,7 @@ mod tests {
                 .unwrap()
         );
         let _shared = world.cached_chunk_snapshot(cpos).unwrap();
-        let before = world.cache.get(&cpos).unwrap().dirty_generation;
+        let before = world.resident.snapshot(cpos).unwrap().dirty_generation;
 
         assert!(
             world
@@ -2014,7 +4315,10 @@ mod tests {
                 .is_empty()
         );
 
-        assert_eq!(world.cache.get(&cpos).unwrap().dirty_generation, before);
+        assert_eq!(
+            world.resident.snapshot(cpos).unwrap().dirty_generation,
+            before
+        );
     }
 
     #[test]
@@ -2063,11 +4367,13 @@ mod tests {
             count: 1,
             item_id: 10,
             damage: None,
+            enchantments: Vec::new(),
         };
         furnace.slots[1] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
+            enchantments: Vec::new(),
         };
         world
             .set_furnace_block_entity(pos, furnace.clone())
@@ -2120,11 +4426,13 @@ mod tests {
             count: 64,
             item_id: 10,
             damage: None,
+            enchantments: Vec::new(),
         };
         chest.slots[26] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
+            enchantments: Vec::new(),
         };
         world.set_chest_block_entity(pos, chest.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
@@ -2170,11 +4478,13 @@ mod tests {
             count: 64,
             item_id: 10,
             damage: None,
+            enchantments: Vec::new(),
         };
         hopper.slots[4] = crate::chunk::FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
+            enchantments: Vec::new(),
         };
         world.set_hopper_block_entity(pos, hopper.clone()).unwrap();
         assert_eq!(world.flush_dirty().unwrap(), 1);
@@ -2201,12 +4511,13 @@ mod tests {
             count: 1,
             item_id: 10,
             damage: None,
+            enchantments: Vec::new(),
         };
         world.set_chest_block_entity(pos, chest).unwrap();
 
         world.set_block_at(pos, BlockStateId(1)).unwrap();
 
-        let chunk = world.cache.get(&cpos).unwrap();
+        let chunk = world.resident.snapshot(cpos).unwrap();
         assert!(!chunk.chests.contains_key(&pos));
     }
 
@@ -2226,12 +4537,13 @@ mod tests {
             count: 1,
             item_id: 10,
             damage: None,
+            enchantments: Vec::new(),
         };
         world.set_hopper_block_entity(pos, hopper).unwrap();
 
         world.set_block_at(pos, BlockStateId(1)).unwrap();
 
-        let chunk = world.cache.get(&cpos).unwrap();
+        let chunk = world.resident.snapshot(cpos).unwrap();
         assert!(!chunk.hoppers.contains_key(&pos));
     }
 
@@ -2534,6 +4846,423 @@ mod tests {
     }
 
     #[test]
+    fn world_journal_lsn_survives_anvil_flush_and_reopen() {
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let registry = single_air_registry();
+        let position = ChunkPos { x: -1, z: 2 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut chunk = Chunk::empty(position, BlockStateId(0), biome);
+        chunk.set_world_journal_lsn(73);
+
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        world.insert_chunk(position, chunk).unwrap();
+        assert_eq!(world.flush_dirty().unwrap(), 1);
+        drop(world);
+
+        let mut reopened = WorldStorage::open_with_capacity(tmp_world.path(), registry, 4).unwrap();
+        assert_eq!(
+            reopened
+                .get_chunk(position)
+                .unwrap()
+                .unwrap()
+                .world_journal_lsn(),
+            73
+        );
+    }
+
+    #[test]
+    fn journaled_resident_batch_stamps_complete_sorted_touched_footprint() {
+        let registry = Arc::new(
+            BlockRegistry::from_report(&[
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:air").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 0,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:stone").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 1,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+                mc_data::blocks::BlockReport {
+                    id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+                    properties: std::collections::BTreeMap::new(),
+                    states: vec![mc_data::blocks::BlockStateReport {
+                        id: 2,
+                        default: true,
+                        properties: std::collections::BTreeMap::new(),
+                    }],
+                },
+            ])
+            .unwrap(),
+        );
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        for x in 0..=2 {
+            let position = ChunkPos { x, z: 0 };
+            world
+                .insert_generated_chunk(
+                    position,
+                    Chunk::empty(position, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+        let direct = BlockPos { x: 1, y: 1, z: 1 };
+        let requested = BlockPos { x: 31, y: 1, z: 1 };
+        let leaf = BlockPos { x: 32, y: 1, z: 1 };
+        world.set_block_at(direct, BlockStateId(1)).unwrap();
+        world.set_block_at(requested, BlockStateId(1)).unwrap();
+        world.set_block_at(leaf, BlockStateId(2)).unwrap();
+        let direct_token = world.block_mutation_token(direct).unwrap();
+        let requested_token = world.block_mutation_token(requested).unwrap();
+
+        let (result, touched) = world
+            .mutation_view()
+            .apply_block_edits_conditionally_journaled(
+                91,
+                &[
+                    crate::ResidentBlockEdit {
+                        pos: direct,
+                        new_state: BlockStateId(0),
+                        preserve_light: false,
+                    },
+                    crate::ResidentBlockEdit {
+                        pos: requested,
+                        new_state: BlockStateId(0),
+                        preserve_light: false,
+                    },
+                ],
+                &[
+                    crate::ResidentBlockPrecondition {
+                        pos: direct,
+                        expected_state: BlockStateId(1),
+                        expected_token: direct_token,
+                    },
+                    crate::ResidentBlockPrecondition {
+                        pos: requested,
+                        expected_state: BlockStateId(1),
+                        expected_token: requested_token,
+                    },
+                ],
+                &[ScheduledBlockTick::new(
+                    requested,
+                    Identifier::parse("minecraft:air").unwrap(),
+                    20,
+                    0,
+                )],
+                None,
+                Some(12),
+            );
+
+        assert!(matches!(
+            result,
+            crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 2
+        ));
+        assert_eq!(
+            touched,
+            vec![
+                ChunkPos { x: 0, z: 0 },
+                ChunkPos { x: 1, z: 0 },
+                ChunkPos { x: 2, z: 0 },
+            ]
+        );
+        for position in touched {
+            assert_eq!(
+                world
+                    .cached_chunk_snapshot(position)
+                    .unwrap()
+                    .world_journal_lsn(),
+                91
+            );
+        }
+        assert_eq!(
+            world
+                .scheduled_block_ticks(ChunkPos { x: 1, z: 0 })
+                .unwrap()
+                .unwrap(),
+            &[ScheduledBlockTick::new(
+                requested,
+                Identifier::parse("minecraft:air").unwrap(),
+                20,
+                0,
+            )]
+        );
+        assert_eq!(
+            world
+                .scheduled_block_ticks(ChunkPos { x: 2, z: 0 })
+                .unwrap()
+                .unwrap(),
+            &[ScheduledBlockTick::new(
+                leaf,
+                Identifier::parse("minecraft:oak_leaves").unwrap(),
+                12,
+                0,
+            )]
+        );
+    }
+
+    #[test]
+    fn dirty_flush_plan_excludes_journal_pending_chunk() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+
+        let (result, touched) = world
+            .mutation_view()
+            .apply_block_edits_conditionally_journaled(
+                41,
+                &[crate::ResidentBlockEdit {
+                    pos: BlockPos { x: 1, y: 1, z: 1 },
+                    new_state: BlockStateId(1),
+                    preserve_light: false,
+                }],
+                &[],
+                &[],
+                None,
+                None,
+            );
+
+        assert!(matches!(
+            result,
+            crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 1
+        ));
+        assert_eq!(touched, vec![position]);
+        assert!(world.plan_dirty_flush().unwrap().is_empty());
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn clearing_journal_pending_chunk_makes_it_flushable() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mutation_view = world.mutation_view();
+        let (_, touched) = mutation_view.apply_block_edits_conditionally_journaled(
+            42,
+            &[crate::ResidentBlockEdit {
+                pos: BlockPos { x: 1, y: 1, z: 1 },
+                new_state: BlockStateId(1),
+                preserve_light: false,
+            }],
+            &[],
+            &[],
+            None,
+            None,
+        );
+        let notifications = Arc::new(AtomicUsize::new(0));
+        world.set_dirty_high_water_notifier({
+            let notifications = Arc::clone(&notifications);
+            Arc::new(move || {
+                notifications.fetch_add(1, Ordering::SeqCst);
+            })
+        });
+
+        assert!(world.plan_dirty_flush().unwrap().is_empty());
+        assert_eq!(
+            mutation_view.clear_journal_pending_conditionally(42, &touched),
+            1
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            mutation_view.clear_journal_pending_conditionally(41, &touched),
+            0
+        );
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        assert_eq!(world.plan_dirty_flush().unwrap().chunks, 1);
+        assert_eq!(world.dirty_count(), 1);
+    }
+
+    #[test]
+    fn stale_journal_completion_cannot_clear_newer_pending_lsn() {
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 0, z: 0 };
+        let block = BlockPos { x: 1, y: 1, z: 1 };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mutation_view = world.mutation_view();
+        let (_, first_touched) = mutation_view.apply_block_edits_conditionally_journaled(
+            50,
+            &[crate::ResidentBlockEdit {
+                pos: block,
+                new_state: BlockStateId(1),
+                preserve_light: false,
+            }],
+            &[],
+            &[],
+            None,
+            None,
+        );
+        let (_, second_touched) = mutation_view.apply_block_edits_conditionally_journaled(
+            51,
+            &[crate::ResidentBlockEdit {
+                pos: block,
+                new_state: BlockStateId(0),
+                preserve_light: false,
+            }],
+            &[],
+            &[],
+            None,
+            None,
+        );
+
+        assert_eq!(
+            mutation_view.clear_journal_pending_conditionally(50, &first_touched),
+            0
+        );
+        assert!(world.plan_dirty_flush().unwrap().is_empty());
+        assert_eq!(
+            mutation_view.clear_journal_pending_conditionally(51, &second_touched),
+            1
+        );
+        assert_eq!(world.plan_dirty_flush().unwrap().chunks, 1);
+    }
+
+    #[test]
+    fn coordinator_journal_stamp_fences_flush_until_exact_clear() {
+        let registry = single_air_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        let mutation = world.mutation_view();
+
+        let crate::JournalStampResult::Stamped(snapshots) =
+            world.stamp_cached_chunks_for_world_journal(7, &[position])
+        else {
+            panic!("cached chunk accepts coordinator journal stamp");
+        };
+
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].world_journal_lsn(), 7);
+        assert!(world.plan_dirty_flush().unwrap().is_empty());
+        assert_eq!(
+            mutation.clear_journal_pending_conditionally(7, &[position]),
+            1
+        );
+        assert_eq!(world.plan_dirty_flush().unwrap().chunks, 1);
+    }
+
+    #[test]
+    fn coordinator_journal_stamp_never_decreases_lsn() {
+        let registry = single_air_registry();
+        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+        let position = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(
+                    position,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            world.stamp_cached_chunks_for_world_journal(12, &[position]),
+            crate::JournalStampResult::Stamped(_)
+        ));
+
+        assert!(matches!(
+            world.stamp_cached_chunks_for_world_journal(11, &[position]),
+            crate::JournalStampResult::NewerDecision(12)
+        ));
+        assert_eq!(
+            world
+                .cached_chunk_snapshot(position)
+                .unwrap()
+                .world_journal_lsn(),
+            12
+        );
+    }
+
+    #[test]
+    fn journal_replay_applies_only_images_newer_than_disk_or_resident_chunk() {
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let registry = air_stone_registry();
+        let position = ChunkPos { x: 0, z: 0 };
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut durable = Chunk::empty(position, BlockStateId(0), biome.clone());
+        durable.set_block(1, 0, 1, BlockStateId(1));
+        durable.set_world_journal_lsn(10);
+
+        let mut initial =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        initial.insert_chunk(position, durable).unwrap();
+        assert_eq!(initial.flush_dirty().unwrap(), 1);
+        drop(initial);
+
+        let mut reopened =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
+        let mut equal = Chunk::empty(position, BlockStateId(0), biome.clone());
+        equal.set_world_journal_lsn(10);
+        assert!(!reopened.replay_journal_chunk(equal).unwrap());
+        assert_eq!(
+            reopened.get_block(BlockPos { x: 1, y: 0, z: 1 }).unwrap(),
+            Some(BlockStateId(1))
+        );
+
+        let mut older = Chunk::empty(position, BlockStateId(0), biome.clone());
+        older.set_world_journal_lsn(9);
+        assert!(!reopened.replay_journal_chunk(older).unwrap());
+
+        let mut newer = Chunk::empty(position, BlockStateId(0), biome);
+        newer.set_world_journal_lsn(11);
+        assert!(reopened.replay_journal_chunk(newer).unwrap());
+        let replayed = reopened.cached_chunk_snapshot(position).unwrap();
+        assert_eq!(replayed.world_journal_lsn(), 11);
+        assert_eq!(replayed.get_block(1, 0, 1), Some(BlockStateId(0)));
+        assert!(replayed.dirty);
+    }
+
+    #[test]
     fn visit_existing_chunks_without_generation_scans_disk_without_cache_mutation() {
         let tmp_world = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
@@ -2754,6 +5483,55 @@ mod tests {
         };
         assert_eq!(path, region_path);
         assert_eq!(stale.dirty_count(), 1);
+    }
+
+    #[test]
+    fn sync_dirty_flush_replans_when_competing_writer_creates_region() {
+        use crate::chunk::ChunkGenerator;
+
+        struct StubGen;
+
+        impl ChunkGenerator for StubGen {
+            fn generate(&self, pos: ChunkPos) -> Chunk {
+                let biome = Identifier::parse("minecraft:plains").unwrap();
+                let mut chunk = Chunk::empty(pos, BlockStateId(0), biome);
+                chunk.set_block(0, 0, 0, BlockStateId(1));
+                chunk.status = "minecraft:full".into();
+                chunk.mark_dirty();
+                chunk
+            }
+        }
+
+        let tmp_world = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
+        let registry = air_stone_registry();
+        let mut world =
+            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16)
+                .unwrap()
+                .with_generator(Arc::new(StubGen));
+
+        assert!(world.get_chunk(ChunkPos { x: 0, z: 0 }).unwrap().is_some());
+        assert_eq!(world.dirty_count(), 1);
+        let mut competing_plan = Some(world.plan_dirty_flush().unwrap());
+
+        let flushed = world
+            .flush_dirty_at_tick_with_pre_write_hook(0, |_| {
+                if let Some(plan) = competing_plan.take() {
+                    let commit = plan.write().unwrap();
+                    assert_eq!(commit.regions.len(), 1);
+                }
+            })
+            .unwrap();
+
+        assert_eq!(flushed, 1);
+        assert_eq!(world.dirty_count(), 0);
+
+        let mut reopened =
+            WorldStorage::open_with_capacity(tmp_world.path(), registry, 16).unwrap();
+        assert_eq!(
+            reopened.get_block(BlockPos { x: 0, y: 0, z: 0 }).unwrap(),
+            Some(BlockStateId(1))
+        );
     }
 
     #[test]
@@ -2996,10 +5774,43 @@ mod tests {
 
         let plan = world.plan_dirty_flush().unwrap();
         let planned = &plan.regions[0].dirty_payloads[0];
-        let snapshot = world.cache.get(&cpos).unwrap();
+        let snapshot = world.resident.snapshot(cpos).unwrap();
 
-        assert!(Arc::ptr_eq(&planned.snapshot, snapshot));
-        assert_eq!(planned.snapshot_token, chunk_snapshot_token(snapshot));
+        assert!(Arc::ptr_eq(&planned.snapshot, &snapshot));
+        assert_eq!(planned.snapshot_token, chunk_snapshot_token(&snapshot));
+    }
+
+    #[test]
+    fn bounded_dirty_flush_plan_commits_one_batch_and_leaves_remainder() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(temp.path().join("region")).unwrap();
+        let registry = air_stone_registry();
+        let mut world = WorldStorage::open_with_capacity(temp.path(), registry, 3).unwrap();
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        for x in 0..3 {
+            let position = ChunkPos { x, z: 0 };
+            world
+                .insert_generated_chunk(
+                    position,
+                    Chunk::empty(position, BlockStateId(0), biome.clone()),
+                )
+                .unwrap();
+        }
+
+        let plan = world.plan_dirty_flush_at_tick_bounded(17, 2).unwrap();
+        assert_eq!(plan.chunk_count(), 2);
+        assert_eq!(world.commit_dirty_flush(plan.write().unwrap()).unwrap(), 2);
+        assert_eq!(world.dirty_count(), 1);
+
+        let remainder = world.plan_dirty_flush_at_tick_bounded(18, 2).unwrap();
+        assert_eq!(remainder.chunk_count(), 1);
+        assert_eq!(
+            world
+                .commit_dirty_flush(remainder.write().unwrap())
+                .unwrap(),
+            1
+        );
+        assert_eq!(world.dirty_count(), 0);
     }
 
     #[test]
@@ -3111,16 +5922,16 @@ mod tests {
             .unwrap()
             .set_block(1, 0, 1, BlockStateId(1));
 
-        let live_snapshot = world.cache.get(&cpos).unwrap();
+        let live_snapshot = world.resident.snapshot(cpos).unwrap();
         assert!(live_snapshot.dirty_generation > planned_generation);
-        assert!(!Arc::ptr_eq(live_snapshot, &planned_snapshot));
+        assert!(!Arc::ptr_eq(&live_snapshot, &planned_snapshot));
         assert_eq!(
             planned_snapshot.get_block(1, 0, 1).unwrap(),
             BlockStateId(0)
         );
         assert_eq!(live_snapshot.get_block(1, 0, 1).unwrap(), BlockStateId(1));
         assert!(!can_fast_clean_chunk(
-            live_snapshot,
+            &live_snapshot,
             planned_generation,
             &planned_snapshot,
         ));
@@ -3144,7 +5955,7 @@ mod tests {
 
         let _chunk = world.get_chunk_mut(cpos).unwrap().unwrap();
         assert!(
-            world.cache.get(&cpos).unwrap().dirty_generation > planned_generation,
+            world.resident.snapshot(cpos).unwrap().dirty_generation > planned_generation,
             "mutable access after dirty flush planning must invalidate the planned generation"
         );
 
@@ -3175,7 +5986,7 @@ mod tests {
 
         assert_ne!(planned_generation, 0);
         assert!(can_fast_clean_chunk(
-            world.cache.get(&cpos).unwrap(),
+            &world.resident.snapshot(cpos).unwrap(),
             planned_generation,
             &planned_snapshot,
         ));
@@ -3197,14 +6008,14 @@ mod tests {
         world.insert_chunk(cpos, chunk).unwrap();
 
         let plan = world.plan_dirty_flush().unwrap();
-        let before_token = chunk_snapshot_token(world.cache.get(&cpos).unwrap());
+        let before_token = chunk_snapshot_token(&world.resident.snapshot(cpos).unwrap());
         let commit = plan.write().unwrap();
 
         assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
 
-        let live = world.cache.get(&cpos).unwrap();
+        let live = world.resident.snapshot(cpos).unwrap();
         assert!(!live.dirty);
-        assert_eq!(chunk_snapshot_token(live), before_token);
+        assert_eq!(chunk_snapshot_token(&live), before_token);
     }
 
     #[test]
@@ -3228,19 +6039,19 @@ mod tests {
         let planned_generation = planned.dirty_generation;
         let planned_snapshot = Arc::clone(&planned.snapshot);
 
-        let mut fork = (**world.cache.get(&cpos).unwrap()).clone();
+        let mut fork = (*world.resident.snapshot(cpos).unwrap()).clone();
         fork.update_highest_opaque_column(1, 1, &table);
-        world.cache.insert(cpos, Arc::new(fork));
+        world.resident.replace_for_test(cpos, Arc::new(fork));
 
-        let live_snapshot = world.cache.get(&cpos).unwrap();
+        let live_snapshot = world.resident.snapshot(cpos).unwrap();
         let commit = plan.write().unwrap();
 
         assert_eq!(live_snapshot.dirty_generation, planned_generation);
-        assert!(!Arc::ptr_eq(live_snapshot, &planned_snapshot));
+        assert!(!Arc::ptr_eq(&live_snapshot, &planned_snapshot));
         assert_eq!(planned_snapshot.highest_opaque_y(1, 1), None);
         assert_eq!(live_snapshot.highest_opaque_y(1, 1), Some(0));
         assert!(!can_fast_clean_chunk(
-            live_snapshot,
+            &live_snapshot,
             planned_generation,
             &planned_snapshot,
         ));
@@ -3268,16 +6079,16 @@ mod tests {
         let planned = &plan.regions[0].dirty_payloads[0];
         let planned_generation = planned.dirty_generation;
         let planned_snapshot = Arc::clone(&planned.snapshot);
-        let mut fork = (**world.cache.get(&cpos).unwrap()).clone();
+        let mut fork = (*world.resident.snapshot(cpos).unwrap()).clone();
         fork.update_highest_opaque_column(1, 1, &table);
-        world.cache.insert(cpos, Arc::new(fork));
-        let live_snapshot = world.cache.get(&cpos).unwrap();
+        world.resident.replace_for_test(cpos, Arc::new(fork));
+        let live_snapshot = world.resident.snapshot(cpos).unwrap();
         let mut commit = plan.write().unwrap();
         commit.regions[0].chunks[0].uncompressed_nbt.clear();
 
         assert_eq!(live_snapshot.dirty_generation, planned_generation);
         assert!(!can_fast_clean_chunk(
-            live_snapshot,
+            &live_snapshot,
             planned_generation,
             &planned_snapshot,
         ));
@@ -3299,13 +6110,13 @@ mod tests {
         world.insert_chunk(cpos, chunk).unwrap();
 
         let plan = world.plan_dirty_flush().unwrap();
-        let planned_generation = world.cache.get(&cpos).unwrap().dirty_generation;
+        let planned_generation = world.resident.snapshot(cpos).unwrap().dirty_generation;
         world
             .get_chunk_mut(cpos)
             .unwrap()
             .unwrap()
             .set_block(1, 0, 1, BlockStateId(1));
-        assert!(world.cache.get(&cpos).unwrap().dirty_generation > planned_generation);
+        assert!(world.resident.snapshot(cpos).unwrap().dirty_generation > planned_generation);
 
         let commit = plan.write().unwrap();
 
@@ -3333,7 +6144,7 @@ mod tests {
         let plan = world.plan_dirty_flush().unwrap();
         world.get_chunk_mut(cpos).unwrap().unwrap().mark_dirty();
         let matching_payload = crate::anvil::chunk_to_payload_with_items(
-            world.cache.get(&cpos).unwrap(),
+            &world.resident.snapshot(cpos).unwrap(),
             &registry,
             world.item_registry.as_deref(),
             0,
@@ -3362,7 +6173,7 @@ mod tests {
 
         let plan = world.plan_dirty_flush().unwrap();
         let matching_payload = crate::anvil::chunk_to_payload_with_items(
-            world.cache.get(&cpos).unwrap(),
+            &world.resident.snapshot(cpos).unwrap(),
             &registry,
             world.item_registry.as_deref(),
             0,

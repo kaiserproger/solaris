@@ -6,6 +6,7 @@
 
 pub mod client;
 pub mod parity;
+pub mod replay;
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

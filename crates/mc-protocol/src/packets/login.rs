@@ -14,8 +14,8 @@
 //! The packet itself is still plaintext; every following frame uses the
 //! compressed framing layout described in [`crate::frame`].
 //!
-//! Online-mode (`EncryptionRequest`/`EncryptionResponse`) is a deliberate
-//! follow-up milestone and lives outside M1.
+//! Online-mode uses [`EncryptionRequest`] and [`EncryptionResponse`] before
+//! login success.
 
 use bytes::{Buf, BufMut};
 use uuid::Uuid;
@@ -57,6 +57,36 @@ impl Packet for LoginStart {
     }
 }
 
+/// Encrypted shared secret and challenge returned by an online-mode client.
+///
+/// Vanilla 26.1.2 `ServerboundKeyPacket` reads two unbounded byte arrays.
+/// `FriendlyByteBuf::readByteArray()` bounds each declared length by the
+/// bytes remaining in that packet body before reading the array.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptionResponse {
+    pub encrypted_shared_secret: Vec<u8>,
+    pub encrypted_verify_token: Vec<u8>,
+}
+
+impl Packet for EncryptionResponse {
+    const ID: i32 = 0x01;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_byte_array(&self.encrypted_shared_secret);
+        buf.write_byte_array(&self.encrypted_verify_token);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let encrypted_shared_secret = buf.read_byte_array(buf.remaining())?;
+        let encrypted_verify_token = buf.read_byte_array(buf.remaining())?;
+        Ok(Self {
+            encrypted_shared_secret,
+            encrypted_verify_token,
+        })
+    }
+}
+
 /// Sent by the client after [`LoginSuccess`] to acknowledge the
 /// transition into the Configuration state. The body is empty.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -77,6 +107,44 @@ impl Packet for LoginAcknowledged {
 // -----------------------------------------------------------------------
 // Clientbound
 // -----------------------------------------------------------------------
+
+/// Requests online-mode encryption from the client.
+///
+/// Vanilla 26.1.2 `ClientboundHelloPacket` decodes the server ID with a
+/// 20 UTF-16-unit limit, followed by two byte arrays and one boolean.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptionRequest {
+    pub server_id: String,
+    pub public_key: Vec<u8>,
+    pub verify_token: Vec<u8>,
+    pub should_authenticate: bool,
+}
+
+impl Packet for EncryptionRequest {
+    const ID: i32 = 0x01;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        // Vanilla's writer uses writeUtf(String), whose default limit is 32,767.
+        buf.write_string(&self.server_id, 32_767)?;
+        buf.write_byte_array(&self.public_key);
+        buf.write_byte_array(&self.verify_token);
+        buf.write_bool(self.should_authenticate);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let server_id = buf.read_string(20)?;
+        let public_key = buf.read_byte_array(buf.remaining())?;
+        let verify_token = buf.read_byte_array(buf.remaining())?;
+        let should_authenticate = buf.read_bool()?;
+        Ok(Self {
+            server_id,
+            public_key,
+            verify_token,
+            should_authenticate,
+        })
+    }
+}
 
 /// A "go away politely" packet legal only in the Login state. The body is
 /// a JSON-encoded text component; in M1.d we send a plain `{"text":"…"}`.
@@ -233,6 +301,71 @@ mod tests {
     #[test]
     fn login_acknowledged_round_trip() {
         round_trip(LoginAcknowledged);
+    }
+
+    #[test]
+    fn encryption_packet_ids_match_vanilla_registration_order() {
+        assert_eq!(EncryptionRequest::ID, 0x01);
+        assert_eq!(EncryptionResponse::ID, 0x01);
+    }
+
+    #[test]
+    fn encryption_request_exact_body_layout() {
+        let packet = EncryptionRequest {
+            server_id: String::new(),
+            public_key: vec![0x30, 0x82],
+            verify_token: vec![0x01, 0x02, 0x03, 0x04],
+            should_authenticate: true,
+        };
+        let mut body = Vec::new();
+        packet.encode(&mut body).unwrap();
+
+        assert_eq!(
+            body,
+            vec![0x00, 0x02, 0x30, 0x82, 0x04, 0x01, 0x02, 0x03, 0x04, 0x01]
+        );
+    }
+
+    #[test]
+    fn encryption_request_round_trip() {
+        round_trip(EncryptionRequest {
+            server_id: String::new(),
+            public_key: vec![0x30, 0x82, 0x01, 0x0A],
+            verify_token: vec![0xDE, 0xAD, 0xBE, 0xEF],
+            should_authenticate: true,
+        });
+    }
+
+    #[test]
+    fn encryption_request_rejects_server_id_over_twenty_utf16_units() {
+        let mut body = Vec::new();
+        body.write_string("123456789012345678901", 32_767).unwrap();
+        body.write_byte_array(&[]);
+        body.write_byte_array(&[]);
+        body.write_bool(true);
+
+        let error = EncryptionRequest::decode(&mut body.as_slice()).unwrap_err();
+        assert_eq!(error, CodecError::StringTooLong { len: 21, max: 20 });
+    }
+
+    #[test]
+    fn encryption_response_exact_body_layout_and_round_trip() {
+        let packet = EncryptionResponse {
+            encrypted_shared_secret: vec![0xAA, 0xBB],
+            encrypted_verify_token: vec![0xCC],
+        };
+        let mut body = Vec::new();
+        packet.encode(&mut body).unwrap();
+        assert_eq!(body, vec![0x02, 0xAA, 0xBB, 0x01, 0xCC]);
+
+        round_trip(packet);
+    }
+
+    #[test]
+    fn encryption_response_rejects_array_length_larger_than_packet_remainder() {
+        let body = [0x04, 0xAA, 0xBB];
+        let error = EncryptionResponse::decode(&mut body.as_slice()).unwrap_err();
+        assert_eq!(error, CodecError::StringTooLong { len: 4, max: 3 });
     }
 
     #[test]

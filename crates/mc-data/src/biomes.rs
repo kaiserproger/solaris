@@ -9,6 +9,55 @@ use thiserror::Error;
 use crate::{Identifier, read_json_file, sorted_json_files, visit_json_files};
 
 const REQUIRED_BIOME_SPAWNS: &str = include_str!("../data/required_biome_spawns.json");
+const WARM_SHEEP_COLOR_BIOMES: &[&str] = &[
+    "minecraft:desert",
+    "minecraft:warm_ocean",
+    "minecraft:bamboo_jungle",
+    "minecraft:jungle",
+    "minecraft:sparse_jungle",
+    "minecraft:savanna",
+    "minecraft:savanna_plateau",
+    "minecraft:windswept_savanna",
+    "minecraft:nether_wastes",
+    "minecraft:soul_sand_valley",
+    "minecraft:crimson_forest",
+    "minecraft:warped_forest",
+    "minecraft:basalt_deltas",
+    "minecraft:badlands",
+    "minecraft:eroded_badlands",
+    "minecraft:wooded_badlands",
+    "minecraft:mangrove_swamp",
+    "minecraft:deep_lukewarm_ocean",
+    "minecraft:lukewarm_ocean",
+];
+const COLD_SHEEP_COLOR_BIOMES: &[&str] = &[
+    "minecraft:snowy_plains",
+    "minecraft:ice_spikes",
+    "minecraft:frozen_peaks",
+    "minecraft:jagged_peaks",
+    "minecraft:snowy_slopes",
+    "minecraft:frozen_ocean",
+    "minecraft:deep_frozen_ocean",
+    "minecraft:grove",
+    "minecraft:deep_dark",
+    "minecraft:frozen_river",
+    "minecraft:snowy_taiga",
+    "minecraft:snowy_beach",
+    "minecraft:the_end",
+    "minecraft:end_highlands",
+    "minecraft:end_midlands",
+    "minecraft:small_end_islands",
+    "minecraft:end_barrens",
+    "minecraft:cold_ocean",
+    "minecraft:deep_cold_ocean",
+    "minecraft:old_growth_pine_taiga",
+    "minecraft:old_growth_spruce_taiga",
+    "minecraft:taiga",
+    "minecraft:windswept_forest",
+    "minecraft:windswept_gravelly_hills",
+    "minecraft:windswept_hills",
+    "minecraft:stony_peaks",
+];
 
 #[derive(Debug, Error)]
 pub enum BiomeDataError {
@@ -86,9 +135,21 @@ pub struct BiomeSpawnEntry {
     pub weight: u32,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SheepColorClimate {
+    #[default]
+    Temperate,
+    Warm,
+    Cold,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct BiomeSpawnRules {
     by_biome: BTreeMap<Identifier, BTreeMap<String, Vec<BiomeSpawnEntry>>>,
+    default_land_biome: Option<Identifier>,
+    default_water_biome: Option<Identifier>,
+    warm_sheep_color_biomes: BTreeSet<Identifier>,
+    cold_sheep_color_biomes: BTreeSet<Identifier>,
 }
 
 impl BiomeSpawnRules {
@@ -96,13 +157,36 @@ impl BiomeSpawnRules {
     pub fn from_entries(
         entries: BTreeMap<Identifier, BTreeMap<String, Vec<BiomeSpawnEntry>>>,
     ) -> Self {
-        Self { by_biome: entries }
+        Self::from_entries_with_sheep_color_climates(entries, BTreeSet::new(), BTreeSet::new())
+    }
+
+    #[must_use]
+    pub fn from_entries_with_sheep_color_climates(
+        entries: BTreeMap<Identifier, BTreeMap<String, Vec<BiomeSpawnEntry>>>,
+        warm_sheep_color_biomes: BTreeSet<Identifier>,
+        cold_sheep_color_biomes: BTreeSet<Identifier>,
+    ) -> Self {
+        Self {
+            by_biome: entries,
+            default_land_biome: None,
+            default_water_biome: None,
+            warm_sheep_color_biomes,
+            cold_sheep_color_biomes,
+        }
     }
 
     #[must_use]
     pub fn entries(&self, biome: &Identifier, group: &str) -> &[BiomeSpawnEntry] {
-        self.by_biome
+        if let Some(entries) = self
+            .by_biome
             .get(biome)
+            .and_then(|groups| groups.get(group))
+            .map(Vec::as_slice)
+        {
+            return entries;
+        }
+        self.default_biome_for(biome, group)
+            .and_then(|fallback| self.by_biome.get(fallback))
             .and_then(|groups| groups.get(group))
             .map(Vec::as_slice)
             .unwrap_or(&[])
@@ -116,6 +200,36 @@ impl BiomeSpawnRules {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.by_biome.is_empty()
+    }
+
+    #[must_use]
+    pub fn sheep_color_climate(&self, biome: &Identifier) -> SheepColorClimate {
+        if self.warm_sheep_color_biomes.contains(biome) {
+            SheepColorClimate::Warm
+        } else if self.cold_sheep_color_biomes.contains(biome) {
+            SheepColorClimate::Cold
+        } else {
+            SheepColorClimate::Temperate
+        }
+    }
+
+    #[must_use]
+    fn with_default_biomes(mut self, land: Option<Identifier>, water: Option<Identifier>) -> Self {
+        self.default_land_biome = land;
+        self.default_water_biome = water;
+        self
+    }
+
+    fn default_biome_for(&self, biome: &Identifier, group: &str) -> Option<&Identifier> {
+        let water_group = matches!(group, "water_ambient" | "water_creature");
+        if water_group && water_biome_name(biome.path()) {
+            return self.default_water_biome.as_ref();
+        }
+        let land_group = matches!(group, "creature" | "monster");
+        if land_group && !water_biome_name(biome.path()) {
+            return self.default_land_biome.as_ref();
+        }
+        None
     }
 }
 
@@ -148,7 +262,26 @@ pub fn solaris_required_biome_spawn_rules() -> BiomeSpawnRules {
             parsed_groups,
         );
     }
-    BiomeSpawnRules::from_entries(by_biome)
+    BiomeSpawnRules::from_entries_with_sheep_color_climates(
+        by_biome,
+        parse_biome_set(WARM_SHEEP_COLOR_BIOMES),
+        parse_biome_set(COLD_SHEEP_COLOR_BIOMES),
+    )
+    .with_default_biomes(
+        Some(Identifier::parse("minecraft:plains").expect("embedded plains id is valid")),
+        Some(Identifier::parse("minecraft:ocean").expect("embedded ocean id is valid")),
+    )
+}
+
+fn parse_biome_set(names: &[&str]) -> BTreeSet<Identifier> {
+    names
+        .iter()
+        .map(|name| Identifier::parse(*name).expect("embedded biome id is valid"))
+        .collect()
+}
+
+fn water_biome_name(path: &str) -> bool {
+    path.contains("ocean") || path.contains("river")
 }
 
 pub fn load_biome_spawn_rules(path: impl AsRef<Path>) -> Result<BiomeSpawnRules, BiomeDataError> {
@@ -193,7 +326,23 @@ pub fn load_biome_spawn_rules(path: impl AsRef<Path>) -> Result<BiomeSpawnRules,
             .collect::<Result<BTreeMap<_, _>, BiomeDataError>>()?;
         entries.insert(biome, groups);
     }
-    Ok(BiomeSpawnRules::from_entries(entries))
+    let tags_dir = path
+        .parent()
+        .and_then(Path::parent)
+        .map(|minecraft_dir| minecraft_dir.join("tags/worldgen/biome"));
+    let tags = match tags_dir {
+        Some(tags_dir) => load_biome_tags(&tags_dir)?,
+        None => BTreeMap::new(),
+    };
+    let warm_tag = Identifier::parse("minecraft:spawns_warm_variant_farm_animals")
+        .expect("static warm farm animal biome tag is valid");
+    let cold_tag = Identifier::parse("minecraft:spawns_cold_variant_farm_animals")
+        .expect("static cold farm animal biome tag is valid");
+    let warm = tags.get(&warm_tag).into_iter().flatten().cloned().collect();
+    let cold = tags.get(&cold_tag).into_iter().flatten().cloned().collect();
+    Ok(BiomeSpawnRules::from_entries_with_sheep_color_climates(
+        entries, warm, cold,
+    ))
 }
 
 pub fn load_biome_worldgen_data(
@@ -398,6 +547,160 @@ mod tests {
                 .iter()
                 .any(|entry| entry.entity_type.as_str() == "minecraft:cow")
         );
+    }
+
+    #[test]
+    fn required_spawn_rules_fall_back_to_embedded_land_and_water_defaults() {
+        let rules = solaris_required_biome_spawn_rules();
+        let forest = Identifier::parse("minecraft:forest").unwrap();
+        let deep_ocean = Identifier::parse("minecraft:deep_ocean").unwrap();
+
+        let forest_creatures = rules.entries(&forest, "creature");
+        assert!(
+            forest_creatures
+                .iter()
+                .any(|entry| entry.entity_type.as_str() == "minecraft:cow")
+        );
+        assert!(
+            rules
+                .entries(&forest, "monster")
+                .iter()
+                .any(|entry| entry.entity_type.as_str() == "minecraft:zombie")
+        );
+        assert!(
+            rules
+                .entries(&deep_ocean, "water_ambient")
+                .iter()
+                .any(|entry| entry.entity_type.as_str() == "minecraft:cod")
+        );
+        assert!(
+            rules.entries(&deep_ocean, "creature").is_empty(),
+            "water biomes must not inherit land creature spawns"
+        );
+        assert!(
+            rules.entries(&forest, "water_ambient").is_empty(),
+            "land biomes must not inherit aquatic spawns"
+        );
+    }
+
+    #[test]
+    fn custom_spawn_rules_do_not_get_implicit_defaults() {
+        let plains = Identifier::parse("minecraft:plains").unwrap();
+        let forest = Identifier::parse("minecraft:forest").unwrap();
+        let pig = Identifier::parse("minecraft:pig").unwrap();
+        let rules = BiomeSpawnRules::from_entries(BTreeMap::from([(
+            plains,
+            BTreeMap::from([(
+                "creature".to_string(),
+                vec![BiomeSpawnEntry {
+                    entity_type: pig,
+                    min_count: 1,
+                    max_count: 1,
+                    weight: 1,
+                }],
+            )]),
+        )]));
+
+        assert!(rules.entries(&forest, "creature").is_empty());
+    }
+
+    #[test]
+    fn embedded_sheep_color_climates_follow_vanilla_variant_tags() {
+        let rules = solaris_required_biome_spawn_rules();
+
+        for biome in [
+            "minecraft:desert",
+            "minecraft:mangrove_swamp",
+            "minecraft:jungle",
+            "minecraft:savanna",
+            "minecraft:badlands",
+            "minecraft:nether_wastes",
+        ] {
+            assert_eq!(
+                rules.sheep_color_climate(&Identifier::parse(biome).unwrap()),
+                SheepColorClimate::Warm,
+                "{biome}"
+            );
+        }
+        for biome in [
+            "minecraft:snowy_plains",
+            "minecraft:taiga",
+            "minecraft:cold_ocean",
+            "minecraft:stony_peaks",
+            "minecraft:the_end",
+        ] {
+            assert_eq!(
+                rules.sheep_color_climate(&Identifier::parse(biome).unwrap()),
+                SheepColorClimate::Cold,
+                "{biome}"
+            );
+        }
+        assert_eq!(
+            rules.sheep_color_climate(&Identifier::parse("minecraft:plains").unwrap()),
+            SheepColorClimate::Temperate
+        );
+    }
+
+    #[test]
+    fn real_sidecar_sheep_color_climates_match_resolved_variant_tags_when_present() {
+        let data_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join("data/vanilla/data/minecraft");
+        let biome_dir = data_root.join("worldgen/biome");
+        let tags_dir = data_root.join("tags/worldgen/biome");
+        if !biome_dir.is_dir() || !tags_dir.is_dir() {
+            eprintln!("skipping: local vanilla biome data missing");
+            return;
+        }
+
+        let rules = load_biome_spawn_rules(&biome_dir).unwrap();
+        let embedded = solaris_required_biome_spawn_rules();
+        let worldgen = load_biome_worldgen_data(&biome_dir, &tags_dir).unwrap();
+        let warm = Identifier::parse("minecraft:spawns_warm_variant_farm_animals").unwrap();
+        let cold = Identifier::parse("minecraft:spawns_cold_variant_farm_animals").unwrap();
+
+        assert!(!worldgen.tag(&warm).is_empty());
+        assert!(!worldgen.tag(&cold).is_empty());
+        for biome in worldgen.tag(&warm) {
+            assert_eq!(
+                rules.sheep_color_climate(biome),
+                SheepColorClimate::Warm,
+                "{biome}"
+            );
+            assert_eq!(
+                embedded.sheep_color_climate(biome),
+                SheepColorClimate::Warm,
+                "embedded {biome}"
+            );
+        }
+        for biome in worldgen.tag(&cold) {
+            assert_eq!(
+                rules.sheep_color_climate(biome),
+                SheepColorClimate::Cold,
+                "{biome}"
+            );
+            assert_eq!(
+                embedded.sheep_color_climate(biome),
+                SheepColorClimate::Cold,
+                "embedded {biome}"
+            );
+        }
+        for biome in worldgen.biomes() {
+            let expected = if worldgen.tag(&warm).contains(biome) {
+                SheepColorClimate::Warm
+            } else if worldgen.tag(&cold).contains(biome) {
+                SheepColorClimate::Cold
+            } else {
+                SheepColorClimate::Temperate
+            };
+            assert_eq!(
+                embedded.sheep_color_climate(biome),
+                expected,
+                "embedded {biome}"
+            );
+        }
     }
 
     #[test]

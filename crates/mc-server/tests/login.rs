@@ -11,6 +11,7 @@
 //! - the listener stays up for parallel clients.
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::{Buf, BytesMut};
@@ -21,9 +22,12 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::ClientboundKnownPacks;
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{
-    LoginAcknowledged, LoginDisconnect, LoginStart, LoginSuccess, SetCompression,
+    EncryptionRequest, EncryptionResponse, GameProfileProperty, LoginAcknowledged, LoginDisconnect,
+    LoginStart, LoginSuccess, SetCompression,
 };
 use mc_protocol::packets::status::{StatusRequest, StatusResponse};
+use rsa::pkcs8::DecodePublicKey;
+use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -74,6 +78,13 @@ async fn start_server_with_policy_and_permissions(
         let _ = bound.serve().await;
     });
     addr
+}
+
+async fn start_server_with_login_access(login_access: mc_net::LoginAccessConfig) -> SocketAddr {
+    let permissions = mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true)
+        .with_login_access(login_access);
+    start_server_with_policy_and_permissions(mc_net::ChunkPipelinePolicy::default(), permissions)
+        .await
 }
 
 fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
@@ -181,6 +192,56 @@ async fn read_one_frame(
         }
         let read = stream.read_buf(buf).await.unwrap();
         assert!(read > 0, "server closed before sending a complete frame");
+    }
+}
+
+async fn read_one_encrypted_frame(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    cipher: &mut mc_net::encryption::MinecraftCipher,
+    compression: Compression,
+) -> mc_protocol::RawFrame {
+    loop {
+        if let Some(frame) = try_decode_frame(buf, compression).unwrap() {
+            return frame;
+        }
+
+        let mut encrypted = [0_u8; 4096];
+        let read = stream.read(&mut encrypted).await.unwrap();
+        assert!(
+            read > 0,
+            "server closed before sending a complete encrypted frame"
+        );
+        cipher.decrypt_in_place(&mut encrypted[..read]);
+        buf.extend_from_slice(&encrypted[..read]);
+    }
+}
+
+async fn write_encrypted_frame<P: Packet>(
+    stream: &mut TcpStream,
+    packet: &P,
+    compression: Compression,
+    cipher: &mut mc_net::encryption::MinecraftCipher,
+) {
+    let mut body = BytesMut::new();
+    packet.encode(&mut body).unwrap();
+    let mut framed = encode_frame(P::ID, &body, compression).unwrap().to_vec();
+    cipher.encrypt_in_place(&mut framed);
+    stream.write_all(&framed).await.unwrap();
+}
+
+#[derive(Debug)]
+struct RecordingSessionVerifier {
+    request: Mutex<Option<mc_net::VerifySession>>,
+    response: mc_net::VerifiedSession,
+}
+
+impl mc_net::SessionVerifier for RecordingSessionVerifier {
+    fn verify(&self, request: mc_net::VerifySession) -> mc_net::SessionVerifierFuture<'_> {
+        Box::pin(async move {
+            *self.request.lock().unwrap() = Some(request);
+            Ok(self.response.clone())
+        })
     }
 }
 
@@ -383,7 +444,7 @@ async fn login_whitelist_rejects_before_compression() {
 }
 
 #[tokio::test]
-async fn login_toml_online_mode_rejects_before_compression() {
+async fn login_toml_online_mode_starts_encryption_before_compression() {
     let addr = start_server_from_toml(
         r#"
             [server]
@@ -402,13 +463,117 @@ async fn login_toml_online_mode_rejects_before_compression() {
     let (mut stream, mut rbuf) = send_login_start(addr, "Notch").await;
 
     let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
-    assert_eq!(frame.id, LoginDisconnect::ID);
-    let disconnect = LoginDisconnect::decode(&mut frame.body).unwrap();
-    assert!(
-        disconnect
-            .reason_json
-            .contains("only supports offline-mode")
+    assert_eq!(frame.id, EncryptionRequest::ID);
+    let request = EncryptionRequest::decode(&mut frame.body).unwrap();
+    assert_eq!(request.server_id, "");
+    assert!(!request.public_key.is_empty());
+    assert_eq!(request.verify_token.len(), 4);
+    assert!(request.should_authenticate);
+}
+
+#[tokio::test]
+async fn online_mode_completes_encrypted_login_with_fake_session_verifier() {
+    const SHARED_SECRET: [u8; 16] = *b"0123456789abcdef";
+    let verified_uuid = Uuid::parse_str("12345678-1234-5678-9abc-def012345678").unwrap();
+    let properties = vec![GameProfileProperty {
+        name: "textures".to_owned(),
+        value: "signed-texture-value".to_owned(),
+        signature: Some("texture-signature".to_owned()),
+    }];
+    let verifier = Arc::new(RecordingSessionVerifier {
+        request: Mutex::new(None),
+        response: mc_net::VerifiedSession {
+            uuid: verified_uuid,
+            properties: properties.clone(),
+        },
+    });
+    let login_access = mc_net::LoginAccessConfig::normalized(
+        true,
+        false,
+        std::iter::empty::<&str>(),
+        std::iter::empty::<&str>(),
+    )
+    .with_session_verifier(verifier.clone());
+    let addr = start_server_with_login_access(login_access).await;
+    let (mut stream, mut rbuf) = send_login_start(addr, "OnlinePlayer").await;
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, Compression::Disabled).await;
+    assert_eq!(frame.id, EncryptionRequest::ID);
+    let request = EncryptionRequest::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    assert_eq!(request.server_id, "");
+    assert_eq!(request.verify_token.len(), 4);
+    assert!(request.should_authenticate);
+
+    let public_key = RsaPublicKey::from_public_key_der(&request.public_key).unwrap();
+    let mut rng = rsa::rand_core::OsRng;
+    let encrypted_shared_secret = public_key
+        .encrypt(&mut rng, Pkcs1v15Encrypt, &SHARED_SECRET)
+        .unwrap();
+    let encrypted_verify_token = public_key
+        .encrypt(&mut rng, Pkcs1v15Encrypt, &request.verify_token)
+        .unwrap();
+    write_frame(
+        &mut stream,
+        &EncryptionResponse {
+            encrypted_shared_secret,
+            encrypted_verify_token,
+        },
+        Compression::Disabled,
+    )
+    .await;
+
+    let mut clientbound_cipher = mc_net::encryption::MinecraftCipher::new(&SHARED_SECRET);
+    let mut serverbound_cipher = mc_net::encryption::MinecraftCipher::new(&SHARED_SECRET);
+
+    let mut frame = read_one_encrypted_frame(
+        &mut stream,
+        &mut rbuf,
+        &mut clientbound_cipher,
+        Compression::Disabled,
+    )
+    .await;
+    assert_eq!(frame.id, SetCompression::ID);
+    let set_compression = SetCompression::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    let compression = Compression::Threshold(set_compression.threshold as usize);
+
+    let mut frame =
+        read_one_encrypted_frame(&mut stream, &mut rbuf, &mut clientbound_cipher, compression)
+            .await;
+    assert_eq!(frame.id, LoginSuccess::ID);
+    let success = LoginSuccess::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    assert_eq!(success.name, "OnlinePlayer");
+    assert_eq!(success.uuid, verified_uuid);
+    assert_eq!(success.properties, properties);
+
+    write_encrypted_frame(
+        &mut stream,
+        &LoginAcknowledged,
+        compression,
+        &mut serverbound_cipher,
+    )
+    .await;
+    let mut frame =
+        read_one_encrypted_frame(&mut stream, &mut rbuf, &mut clientbound_cipher, compression)
+            .await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+
+    let verification = verifier
+        .request
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("login success proves that the verifier was called");
+    assert_eq!(verification.username, "OnlinePlayer");
+    assert_eq!(
+        verification.server_id_hash,
+        mc_net::minecraft_server_hash(b"", &SHARED_SECRET, &request.public_key)
     );
+    assert_eq!(verification.client_ip, None);
 }
 
 #[tokio::test]

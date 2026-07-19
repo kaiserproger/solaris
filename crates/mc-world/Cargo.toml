@@ -17,6 +17,8 @@ mc-nbt = { path = "../mc-nbt" }
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }
 thiserror = { workspace = true }
+bytemuck = { workspace = true }
+wide = { workspace = true }
 
 [dev-dependencies]
 criterion = "0.5"

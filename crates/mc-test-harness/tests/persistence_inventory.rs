@@ -13,8 +13,8 @@
 //!    Assert the resulting `BlockUpdate` carries the dirt block-state
 //!    id (not stone, the M5 fallback) and a `ContainerSetSlot` ships
 //!    with the slot 36-not-actually-touched-but-37-decremented update.
-//! 3. Lock the shared `WorldStorage` handle and call `flush_dirty()`.
-//!    Drop the world, re-open it from the same path, and assert the
+//! 3. Stop the live server through its production save/drain path, await
+//!    exact server task completion, re-open the same path, and assert the
 //!    placed dirt block is visible at (0, -60, 0) — proves the edit
 //!    landed on disk, not just in the LRU.
 //!
@@ -99,6 +99,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item id");
 
+    let shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M6.g persistence + inventory".into(),
@@ -119,13 +120,11 @@ async fn place_dirt_persists_through_flush_to_disk() {
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-        shutdown: mc_net::ShutdownHandle::default(),
+        shutdown: shutdown.clone(),
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    tokio::spawn(async move {
-        let _ = bound.serve().await;
-    });
+    let server = tokio::spawn(async move { bound.serve().await });
 
     let mut client = Client::connect(addr).await.expect("client connect");
     let _ = client
@@ -199,12 +198,6 @@ async fn place_dirt_persists_through_flush_to_disk() {
         }
     }
 
-    client
-        .write_packet(&ServerboundChatCommand {
-            command: "gamemode creative".into(),
-        })
-        .await
-        .expect("switch to creative");
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:dirt 64 1".into(),
@@ -302,14 +295,21 @@ async fn place_dirt_persists_through_flush_to_disk() {
         // Ignore stray frames (light updates, keepalive, …).
     }
 
-    // 3. Flush the world to disk and re-open from scratch. The placed
-    //    dirt block must survive the round-trip.
-    {
-        let mut guard = world_handle.lock().await;
-        let n = guard.flush_dirty().expect("flush_dirty");
-        assert!(n >= 1, "at least one dirty chunk should have been flushed");
-    }
+    // 3. Use the production listener drain and final save. Directly calling
+    //    flush_dirty while the live server owns the world races a region plan
+    //    already being written by the server save coordinator.
+    shutdown.request();
     drop(client);
+    let serve_result = tokio::time::timeout(Duration::from_secs(30), server)
+        .await
+        .expect("server should stop after the shutdown request")
+        .expect("server task should join");
+    serve_result.expect("server should save and stop cleanly");
+    assert_eq!(
+        world_handle.lock().await.dirty_count(),
+        0,
+        "production shutdown must leave no dirty chunks"
+    );
 
     let mut fresh =
         mc_world::WorldStorage::open(tmp_world.path(), Arc::clone(&blocks)).expect("reopen");

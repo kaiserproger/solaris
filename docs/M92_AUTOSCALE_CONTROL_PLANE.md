@@ -4,13 +4,16 @@ Quality label: `draft`.
 
 M92 added a bounded, local runtime-control primitive. It exposes three
 profiles (`low_end`, `balanced`, `high_end`), deterministic limits, and
-observable decisions for chunk/view throughput. As of the M100 stabilization
-slices, enabled autoscale is wired into the live chunk-stream hot path for
-chunk send-rate, runtime view-distance limits, and separately metered
-prepare-dispatch caps for classified load/generate work. It does not implement
-or claim transparent shared-world horizontal sharding, a production
-load-balancer readiness/drain contract, broad slow-client shedding, or
-profile-matrix soak.
+observable decisions for chunk/view throughput and simulation work. As of the
+M100 stabilization slices, enabled autoscale is wired into the live chunk-stream
+hot path for chunk send-rate, runtime view-distance limits, separately metered
+prepare-dispatch caps for classified load/generate work, bounded ECS
+pathfinding/physics work, and bounded random and scheduled tick budgets. Every
+100 simulation ticks, the existing runtime p95 window rebalances those budgets.
+A saturated scheduled queue keeps its quota while random ticks yield first. It
+does not implement or claim transparent
+shared-world horizontal sharding, a production load-balancer readiness/drain
+contract, broad slow-client shedding, or profile-matrix soak.
 
 ## Operator Surface
 
@@ -37,6 +40,13 @@ All override fields are optional, and unknown `[autoscale]` fields are rejected.
 Invalid or zero bounds normalize to at least one unit of work and a minimum
 view distance of two.
 
+The old `[simulation].random_tick_chunk_budget` and
+`[simulation].scheduled_fluid_tick_budget` settings were removed and are now
+rejected as unknown fields. With autoscale enabled, the selected profile and
+runtime p95 observations own those budgets. With autoscale disabled, fixed
+internal defaults are used. `random_tick_speed` remains configurable because it
+is a gameplay rule, not a worker allocation knob.
+
 ## Decision Inputs
 
 `mc_net::RuntimeControlPlane::observe` accepts a snapshot with:
@@ -52,11 +62,23 @@ saturation, memory, or first-chunk SLA. The returned
 `AutoscaleDecision` includes action, pressure source, bounded limits, and
 a reason string suitable for logs/status output.
 
+`RuntimeControlPlane::observe_work` accepts tick, entity-goal, entity-physics,
+entity-dispatch, random-tick, block-tick, and fluid-tick signals plus
+scheduled-budget exhaustion. Percentile calculation stays off the tick path;
+when the worker finishes an exact source window, it pushes that window directly
+to the ticker and the controller applies it once. There is no boundary poll of
+a potentially stale snapshot. Scheduled-budget exhaustion accumulates until a
+window is accepted by the worker queue. Dispatch contributes to entity
+pressure. The decision exposes the selected work class and bounded entity,
+random, and scheduled budgets through runtime status JSON.
+
 ## Hysteresis And Bounds
 
 Pressure must persist for `scale_down_after_ticks` before limits are
 reduced. Healthy observations must persist for `scale_up_after_ticks`
-before throughput is restored. Scaling is clamped by the selected profile
+before throughput is restored. Work-budget recovery adds half the remaining
+distance to its ceiling per healthy decision instead of jumping directly to
+the maximum. Scaling is clamped by the selected profile
 and explicit config overrides, so low-end degradation reduces
 view/throughput rather than changing correctness semantics.
 
@@ -66,11 +88,17 @@ subsequent observations in an observable drain state.
 ## Known Draft Gaps
 
 - Live runtime control has focused coverage for chunk send-rate, runtime
-  view-distance replanning, and separately metered load-vs-generate prepare
-  dispatch. It does not yet have profile-matrix soak or a production
+  view-distance replanning, separately metered load-vs-generate prepare
+  dispatch, ECS pathfinding/physics work, and random/scheduled simulation
+  budgets. Lighting, persistence, compression, and prewarm budgets are not yet
+  owned by this controller. It also lacks profile-matrix soak and a production
   load-balancer readiness/drain contract.
-- Authenticated `/status` and unauthenticated server-list `solaris.health`
-  expose bounded runtime snapshots, but they are not a full readiness model.
+- Authenticated `/status` exposes the runtime-control snapshot. Unauthenticated
+  server-list `solaris.health` exposes only `ready` and `state`; readiness
+  requires a serving lifecycle, supported authentication, an available world,
+  and player capacity. Autoscale limits, pressure, counters, and reasons stay
+  on the authenticated operator path. Startup/serve failure and external
+  load-balancer behavior still need broader lifecycle coverage.
 - Focused slow-client timeout and pre-timeout queue-pressure shedding paths
   exist, but broad slow-client recovery/rejoin policy and safe config reload are
   not implemented.

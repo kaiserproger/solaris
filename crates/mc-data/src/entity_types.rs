@@ -183,10 +183,39 @@ pub fn solaris_required_entity_types() -> EntityTypeRegistry {
 }
 
 #[must_use]
+pub fn fallback_entity_category(id: &str) -> EntityCategory {
+    match id {
+        "minecraft:chicken" | "minecraft:pig" | "minecraft:sheep" | "minecraft:cow" => {
+            EntityCategory::Passive
+        }
+        "minecraft:zombie" | "minecraft:skeleton" | "minecraft:spider" => EntityCategory::Hostile,
+        "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => EntityCategory::Water,
+        "minecraft:item" => EntityCategory::Item,
+        "minecraft:experience_orb" | "minecraft:xp_orb" => EntityCategory::Experience,
+        _ => EntityCategory::Other,
+    }
+}
+
+#[must_use]
+pub fn fallback_entity_dimensions(id: &str, is_baby: bool) -> Option<EntityDimensions> {
+    match (id, is_baby) {
+        ("minecraft:chicken", false) => Some(EntityDimensions::new(0.4, 0.7, Some(0.644))),
+        ("minecraft:chicken", true) => Some(EntityDimensions::new(0.3, 0.4, Some(0.28))),
+        ("minecraft:cow", false) => Some(EntityDimensions::new(0.9, 1.4, Some(1.3))),
+        ("minecraft:cow", true) => Some(EntityDimensions::new(0.45, 0.7, Some(0.665))),
+        ("minecraft:pig", false) => Some(EntityDimensions::new(0.9, 0.9, Some(0.765))),
+        ("minecraft:pig", true) => Some(EntityDimensions::new(0.45, 0.45, Some(0.3825))),
+        ("minecraft:sheep", false) => Some(EntityDimensions::new(0.9, 1.3, Some(1.235))),
+        ("minecraft:sheep", true) => Some(EntityDimensions::new(0.45, 0.65, Some(0.6175))),
+        _ => None,
+    }
+}
+
+#[must_use]
 pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTypeFacts {
-    let (category, dimensions, tracking_range, attributes, loot_table) = match id.as_str() {
+    let category = fallback_entity_category(id.as_str());
+    let (dimensions, tracking_range, attributes, loot_table) = match id.as_str() {
         "minecraft:chicken" => (
-            EntityCategory::Passive,
             EntityDimensions::new(0.4, 0.7, Some(0.644)),
             Some(10),
             EntityAttributeFacts {
@@ -198,8 +227,7 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/chicken"),
         ),
         "minecraft:pig" => (
-            EntityCategory::Passive,
-            EntityDimensions::new(0.9, 0.9, Some(0.818)),
+            EntityDimensions::new(0.9, 0.9, Some(0.765)),
             Some(10),
             EntityAttributeFacts {
                 max_health: Some(10.0),
@@ -210,8 +238,7 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/pig"),
         ),
         "minecraft:sheep" => (
-            EntityCategory::Passive,
-            EntityDimensions::new(0.9, 0.9, Some(0.818)),
+            EntityDimensions::new(0.9, 1.3, Some(1.235)),
             Some(10),
             EntityAttributeFacts {
                 max_health: Some(8.0),
@@ -222,7 +249,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/sheep"),
         ),
         "minecraft:cow" => (
-            EntityCategory::Passive,
             EntityDimensions::new(0.9, 1.4, Some(1.3)),
             Some(10),
             EntityAttributeFacts {
@@ -234,7 +260,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/cow"),
         ),
         "minecraft:zombie" => (
-            EntityCategory::Hostile,
             EntityDimensions::new(0.6, 1.95, Some(1.74)),
             Some(8),
             EntityAttributeFacts {
@@ -246,7 +271,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/zombie"),
         ),
         "minecraft:skeleton" => (
-            EntityCategory::Hostile,
             EntityDimensions::new(0.6, 1.99, Some(1.74)),
             Some(8),
             EntityAttributeFacts {
@@ -258,7 +282,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/skeleton"),
         ),
         "minecraft:spider" => (
-            EntityCategory::Hostile,
             EntityDimensions::new(1.4, 0.9, Some(0.65)),
             Some(8),
             EntityAttributeFacts {
@@ -270,7 +293,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/spider"),
         ),
         "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => (
-            EntityCategory::Water,
             EntityDimensions::new(0.5, 0.3, Some(0.195)),
             Some(4),
             EntityAttributeFacts {
@@ -282,35 +304,30 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id(&format!("minecraft:entities/{}", id.path())),
         ),
         "minecraft:item" => (
-            EntityCategory::Item,
             EntityDimensions::new(0.25, 0.25, None),
             Some(6),
             EntityAttributeFacts::default(),
             None,
         ),
         "minecraft:experience_orb" | "minecraft:xp_orb" => (
-            EntityCategory::Experience,
             EntityDimensions::new(0.5, 0.5, None),
             Some(6),
             EntityAttributeFacts::default(),
             None,
         ),
         "minecraft:falling_block" => (
-            EntityCategory::Other,
             EntityDimensions::new(0.98, 0.98, None),
             Some(10),
             EntityAttributeFacts::default(),
             None,
         ),
         "minecraft:arrow" | "minecraft:spectral_arrow" | "minecraft:tipped_arrow" => (
-            EntityCategory::Other,
             EntityDimensions::new(0.5, 0.5, None),
             Some(4),
             EntityAttributeFacts::default(),
             None,
         ),
         _ => (
-            EntityCategory::Other,
             EntityDimensions::new(0.9, 1.4, Some(1.3)),
             None,
             EntityAttributeFacts {
@@ -416,5 +433,81 @@ mod tests {
             .unwrap();
         assert_eq!(item.category, EntityCategory::Item);
         assert_eq!(item.dimensions.height, 0.25);
+    }
+
+    #[test]
+    fn fallback_category_matches_full_facts_without_identifier_input() {
+        for name in [
+            "minecraft:cow",
+            "minecraft:zombie",
+            "minecraft:skeleton",
+            "minecraft:spider",
+            "minecraft:cod",
+            "minecraft:item",
+            "minecraft:experience_orb",
+            "minecraft:arrow",
+            "minecraft:unknown",
+        ] {
+            let facts = fallback_entity_type_facts(Identifier::parse(name).unwrap(), 0);
+            assert_eq!(fallback_entity_category(name), facts.category, "{name}");
+        }
+    }
+
+    #[test]
+    fn livestock_dimensions_match_vanilla_for_adults_and_babies() {
+        let cases = [
+            (
+                "minecraft:chicken",
+                false,
+                EntityDimensions::new(0.4, 0.7, Some(0.644)),
+            ),
+            (
+                "minecraft:chicken",
+                true,
+                EntityDimensions::new(0.3, 0.4, Some(0.28)),
+            ),
+            (
+                "minecraft:cow",
+                false,
+                EntityDimensions::new(0.9, 1.4, Some(1.3)),
+            ),
+            (
+                "minecraft:cow",
+                true,
+                EntityDimensions::new(0.45, 0.7, Some(0.665)),
+            ),
+            (
+                "minecraft:pig",
+                false,
+                EntityDimensions::new(0.9, 0.9, Some(0.765)),
+            ),
+            (
+                "minecraft:pig",
+                true,
+                EntityDimensions::new(0.45, 0.45, Some(0.3825)),
+            ),
+            (
+                "minecraft:sheep",
+                false,
+                EntityDimensions::new(0.9, 1.3, Some(1.235)),
+            ),
+            (
+                "minecraft:sheep",
+                true,
+                EntityDimensions::new(0.45, 0.65, Some(0.6175)),
+            ),
+        ];
+
+        for (id, is_baby, expected) in cases {
+            assert_eq!(
+                fallback_entity_dimensions(id, is_baby),
+                Some(expected),
+                "{id}"
+            );
+            if !is_baby {
+                let facts = fallback_entity_type_facts(Identifier::parse(id).unwrap(), 0);
+                assert_eq!(facts.dimensions, expected, "adult facts for {id}");
+            }
+        }
     }
 }

@@ -9,11 +9,12 @@
 
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use mc_protocol::packets::Packet;
@@ -308,7 +309,6 @@ seed = 0
 
 [simulation]
 random_tick_speed = 0
-random_tick_chunk_budget = 32
 save_interval_ticks = 1200
 
 [chunk_pipeline]
@@ -317,9 +317,6 @@ chunk_load_rate = 16
 chunk_generate_rate = 16
 chunk_prepare_budget_ms = 0
 chunk_prepare_batch_size = 8
-chunk_io_threads_percent = 25
-chunk_worker_threads_percent = 25
-entity_worker_threads_percent = 25
 chunk_result_queue_size = 64
 region_cache_size = 9
 
@@ -388,52 +385,111 @@ fn spawn_view_positions(view_distance: i32) -> Vec<mc_world::ChunkPos> {
     positions
 }
 
-fn spawn_server(config: &Path, log: &Path) -> Child {
-    let log_file = File::create(log).expect("create server log");
-    let stderr = log_file.try_clone().expect("clone server log");
-    Command::new(assert_cmd::cargo::cargo_bin("mc-server"))
-        .arg("--config")
-        .arg(config)
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("spawn mc-server")
+enum RawServerOutput {
+    Line(String),
+    Closed,
 }
 
-fn spawn_server_with_stdin(config: &Path, log: &Path) -> Child {
-    let log_file = File::create(log).expect("create server log");
-    let stderr = log_file.try_clone().expect("clone server log");
-    Command::new(assert_cmd::cargo::cargo_bin("mc-server"))
-        .arg("--config")
-        .arg(config)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr))
-        .spawn()
-        .expect("spawn mc-server")
+enum ServerEvent {
+    LogChanged,
+    OutputClosed,
 }
 
-async fn connect_when_ready(addr: SocketAddr, child: &mut Child, log: &Path) -> Client {
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        if let Some(status) = child.try_wait().expect("poll server process") {
-            panic!(
-                "server exited before listener became reachable: status={status}; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-        }
-        match Client::connect(addr).await {
-            Ok(client) => return client,
-            Err(err) => {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out waiting for {addr}: {err}; log:\n{}",
-                    std::fs::read_to_string(log).unwrap_or_default()
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
+struct ServerProcess {
+    child: Child,
+    events: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+}
+
+fn spawn_server(config: &Path, log: &Path) -> ServerProcess {
+    spawn_server_process(config, log, false)
+}
+
+fn spawn_server_with_stdin(config: &Path, log: &Path) -> ServerProcess {
+    spawn_server_process(config, log, true)
+}
+
+fn spawn_server_process(config: &Path, log: &Path, pipe_stdin: bool) -> ServerProcess {
+    File::create(log).expect("create server log");
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin("mc-server"));
+    command
+        .arg("--config")
+        .arg(config)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if pipe_stdin {
+        command.stdin(Stdio::piped());
+    }
+    let mut child = command.spawn().expect("spawn mc-server");
+
+    let (raw_tx, raw_rx) = mpsc::channel();
+    forward_server_output(
+        child.stdout.take().expect("server stdout is piped"),
+        raw_tx.clone(),
+    );
+    forward_server_output(child.stderr.take().expect("server stderr is piped"), raw_tx);
+
+    let (event_tx, events) = tokio::sync::mpsc::unbounded_channel();
+    let log = log.to_owned();
+    thread::spawn(move || {
+        let mut log_file = File::create(log).expect("open forwarded server log");
+        let mut closed_streams = 0;
+        while closed_streams < 2 {
+            match raw_rx
+                .recv()
+                .expect("server output forwarders stay connected")
+            {
+                RawServerOutput::Line(line) => {
+                    log_file
+                        .write_all(line.as_bytes())
+                        .and_then(|()| log_file.flush())
+                        .expect("write forwarded server log");
+                    let _ = event_tx.send(ServerEvent::LogChanged);
+                }
+                RawServerOutput::Closed => closed_streams += 1,
             }
         }
-    }
+        let _ = event_tx.send(ServerEvent::OutputClosed);
+    });
+
+    ServerProcess { child, events }
+}
+
+fn forward_server_output<R>(output: R, tx: mpsc::Sender<RawServerOutput>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = BufReader::new(output);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line).expect("read server output");
+            if read == 0 {
+                break;
+            }
+            if tx.send(RawServerOutput::Line(line.clone())).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(RawServerOutput::Closed);
+    });
+}
+
+async fn connect_when_ready(addr: SocketAddr, server: &mut ServerProcess, log: &Path) -> Client {
+    wait_for_log_state(
+        server,
+        log,
+        Duration::from_secs(90),
+        "listener readiness",
+        |log_text| log_text.contains("Solaris is listening"),
+    )
+    .await;
+    Client::connect(addr).await.unwrap_or_else(|err| {
+        panic!(
+            "server reported listener readiness but {addr} rejected the client: {err}; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        )
+    })
 }
 
 async fn drive_to_play(client: &mut Client, addr: SocketAddr, name: &str) {
@@ -580,64 +636,52 @@ async fn drain_unique_chunks(client: &mut Client, expected: usize) -> HashSet<(i
     seen
 }
 
-async fn stop_server(client: &mut Client, child: &mut Child, log: &Path) {
+async fn stop_server(client: &mut Client, server: &mut ServerProcess, log: &Path) {
     client
         .write_packet(&ServerboundChatCommand {
             command: "stop".to_string(),
         })
         .await
         .expect("send stop command");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().expect("poll server process") {
-            assert!(
-                status.success(),
-                "server exited non-zero: {status}; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!(
-                "server did not stop after command; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+    wait_for_server_exit(server, log, Duration::from_secs(30)).await;
 }
 
-fn write_console_stop(child: &mut Child) {
-    let stdin = child.stdin.as_mut().expect("console stdin is piped");
+fn write_console_stop(server: &mut ServerProcess) {
+    let stdin = server.child.stdin.as_mut().expect("console stdin is piped");
     stdin.write_all(b"stop\n").expect("write console stop");
     stdin.flush().expect("flush console stop");
 }
 
-async fn wait_for_server_exit(child: &mut Child, log: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
+async fn wait_for_server_exit(server: &mut ServerProcess, log: &Path, timeout: Duration) {
+    if tokio::time::timeout(timeout, wait_for_output_close(server))
+        .await
+        .is_err()
+    {
+        let _ = server.child.kill();
+        panic!(
+            "server did not stop after command; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
+    }
+    let status = server.child.wait().expect("wait for stopped server");
+    assert!(
+        status.success(),
+        "server exited non-zero: {status}; log:\n{}",
+        std::fs::read_to_string(log).unwrap_or_default()
+    );
+}
+
+async fn wait_for_output_close(server: &mut ServerProcess) {
     loop {
-        if let Some(status) = child.try_wait().expect("poll server process") {
-            assert!(
-                status.success(),
-                "server exited non-zero: {status}; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-            return;
+        match server.events.recv().await {
+            Some(ServerEvent::LogChanged) => {}
+            Some(ServerEvent::OutputClosed) | None => return,
         }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!(
-                "server did not stop after console command; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 async fn wait_for_log_state<F>(
-    child: &mut Child,
+    server: &mut ServerProcess,
     log: &Path,
     timeout: Duration,
     label: &str,
@@ -646,33 +690,36 @@ async fn wait_for_log_state<F>(
 where
     F: Fn(&str) -> bool,
 {
-    let deadline = Instant::now() + timeout;
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let log_text = std::fs::read_to_string(log).unwrap_or_default();
         if matches(&log_text) {
             return log_text;
         }
-        if let Some(status) = child.try_wait().expect("poll server process") {
-            panic!(
-                "{label}: server exited before expected log line: status={status}; log:\n{log_text}"
-            );
+        match tokio::time::timeout_at(deadline, server.events.recv()).await {
+            Ok(Some(ServerEvent::LogChanged)) => {}
+            Ok(Some(ServerEvent::OutputClosed)) | Ok(None) => {
+                let status = server.child.wait().expect("wait for exited server");
+                panic!(
+                    "{label}: server exited before expected log line: status={status}; log:\n{log_text}"
+                );
+            }
+            Err(_) => {
+                let _ = kill_server_without_stop_and_wait(server, log, label).await;
+                panic!("{label}: timed out waiting for expected log line; log:\n{log_text}");
+            }
         }
-        if Instant::now() >= deadline {
-            let _ = kill_server_without_stop_and_wait(child, log, label).await;
-            panic!("{label}: timed out waiting for expected log line; log:\n{log_text}");
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
 async fn wait_for_startup_dirty_checkpoint(
-    child: &mut Child,
+    server: &mut ServerProcess,
     log: &Path,
     timeout: Duration,
     expected_chunks: usize,
 ) {
     let log_text = wait_for_log_state(
-        child,
+        server,
         log,
         timeout,
         "startup dirty checkpoint",
@@ -682,8 +729,8 @@ async fn wait_for_startup_dirty_checkpoint(
     assert_startup_dirty_checkpoint_drained(&log_text, "startup dirty checkpoint", expected_chunks);
 }
 
-async fn kill_server_without_stop_and_assert_exit(child: &mut Child, log: &Path) {
-    let status = kill_server_without_stop_and_wait(child, log, "kill-without-stop").await;
+async fn kill_server_without_stop_and_assert_exit(server: &mut ServerProcess, log: &Path) {
+    let status = kill_server_without_stop_and_wait(server, log, "kill-without-stop").await;
     assert!(
         !status.success(),
         "kill-without-stop should not look like a graceful successful stop; status={status}"
@@ -691,31 +738,33 @@ async fn kill_server_without_stop_and_assert_exit(child: &mut Child, log: &Path)
 }
 
 async fn kill_server_without_stop_and_wait(
-    child: &mut Child,
+    server: &mut ServerProcess,
     log: &Path,
     label: &str,
 ) -> std::process::ExitStatus {
     assert!(
-        child.try_wait().expect("poll server before kill").is_none(),
+        server
+            .child
+            .try_wait()
+            .expect("check server before kill")
+            .is_none(),
         "{label}: server exited before kill; log:\n{}",
         std::fs::read_to_string(log).unwrap_or_default()
     );
-    child
+    server
+        .child
         .kill()
         .unwrap_or_else(|err| panic!("{label}: kill server without stop: {err}"));
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if let Some(status) = child.try_wait().expect("poll killed server process") {
-            return status;
-        }
-        if Instant::now() >= deadline {
-            panic!(
-                "{label}: server did not exit after kill; log:\n{}",
-                std::fs::read_to_string(log).unwrap_or_default()
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+    if tokio::time::timeout(Duration::from_secs(10), wait_for_output_close(server))
+        .await
+        .is_err()
+    {
+        panic!(
+            "{label}: server did not exit after kill; log:\n{}",
+            std::fs::read_to_string(log).unwrap_or_default()
+        );
     }
+    server.child.wait().expect("wait for killed server")
 }
 
 fn assert_chunk_stream_summary(log: &str, label: &str) {

@@ -23,7 +23,9 @@ use mc_data::Identifier;
 use mc_data::biomes::BiomeWorldgenData;
 use mc_data::worldgen_features::{FeatureCount, WorldgenFeatureFacts};
 use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
-use mc_world::chunk::{Chunk, ChunkPos, Heightmap, MAX_Y, MIN_Y};
+use mc_world::chunk::{
+    Chunk, ChunkGeometry, ChunkPos, Heightmap, MAX_Y, MIN_Y, OVERWORLD_GEOMETRY,
+};
 use mc_world::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockRegistry, BlockStateId, ChunkGenerator,
     PackedBitArray,
@@ -77,8 +79,32 @@ const TELLUS_MOUNTAIN_MASK_SCALE: f64 = 24_000.0;
 const TELLUS_MOUNTAIN_DETAIL_SCALE: f64 = 3_200.0;
 /// Number of dirt cells between grass cap and stone.
 const DIRT_DEPTH: i32 = 3;
-const CAVE_MIN_Y: i32 = MIN_Y + 8;
+// Candidate cells preserve the old per-block density without scanning every
+// world voxel. The hard caps fence malformed sidecars and keep work and stack
+// storage bounded per generated chunk.
+const ORE_ANCHOR_CELL_EDGE: i32 = 4;
+const ORE_ANCHOR_CELL_VOLUME: u64 = 64;
+const MAX_ORE_ANCHORS_PER_CELL: usize = 16;
+const MAX_ORE_VEIN_SIZE: usize = 64;
+/// Maximum number of sidecar ore features admitted into chunk generation.
+pub const MAX_ORE_RULES: usize = 64;
+/// Maximum estimated ore scan and vein-cell work for one generated chunk.
+pub const MAX_ORE_WORK_UNITS_PER_CHUNK: u64 = 2_000_000;
+const ORE_CHUNK_HALO_CELLS_PER_LAYER: u64 = 36;
+const ORE_VEIN_RADIUS: i32 = 4;
+const ORE_GROWTH_ATTEMPTS: usize = 12;
+const ORE_DIRECTIONS: [[i8; 3]; 6] = [
+    [-1, 0, 0],
+    [1, 0, 0],
+    [0, -1, 0],
+    [0, 1, 0],
+    [0, 0, -1],
+    [0, 0, 1],
+];
 const CAVE_SURFACE_CLEARANCE: i32 = 24;
+const CAVE_MOUTH_GRID: i32 = 128;
+const CAVE_MOUTH_RADIUS: i32 = CAVE_SURFACE_CLEARANCE;
+const CAVE_MOUTH_SPAWN_SAFE_RADIUS: i32 = 24;
 const CAVE_FREQUENCY: f64 = 1.0 / 34.0;
 const CAVE_THRESHOLD: f64 = 0.24;
 const CAVE_BRANCH_FREQUENCY: f64 = 1.0 / 58.0;
@@ -253,6 +279,7 @@ pub const GENERATION_STAGE_ORDER: &[&str] = &[
 /// `Chunk::empty` it returns.
 pub struct TerrainGenerator {
     seed: i64,
+    geometry: ChunkGeometry,
     air: BlockStateId,
     bedrock: BlockStateId,
     stone: BlockStateId,
@@ -264,6 +291,7 @@ pub struct TerrainGenerator {
     podzol: BlockStateId,
     snow_block: BlockStateId,
     deepslate: BlockStateId,
+    iron_ore: BlockStateId,
     water: BlockStateId,
     biomes: BiomeRules,
     ores: OreRules,
@@ -318,19 +346,19 @@ impl DecorationBlocks {
     fn new(registry: &BlockRegistry) -> Self {
         Self {
             oak_log: optional_block(registry, "minecraft:oak_log"),
-            oak_leaves: optional_block(registry, "minecraft:oak_leaves"),
+            oak_leaves: optional_generated_leaves(registry, "minecraft:oak_leaves"),
             forest_log: optional_block(registry, "minecraft:birch_log")
                 .or_else(|| optional_block(registry, "minecraft:oak_log")),
-            forest_leaves: optional_block(registry, "minecraft:birch_leaves")
-                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
+            forest_leaves: optional_generated_leaves(registry, "minecraft:birch_leaves")
+                .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
             cold_log: optional_block(registry, "minecraft:spruce_log")
                 .or_else(|| optional_block(registry, "minecraft:oak_log")),
-            cold_leaves: optional_block(registry, "minecraft:spruce_leaves")
-                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
+            cold_leaves: optional_generated_leaves(registry, "minecraft:spruce_leaves")
+                .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
             jungle_log: optional_block(registry, "minecraft:jungle_log")
                 .or_else(|| optional_block(registry, "minecraft:oak_log")),
-            jungle_leaves: optional_block(registry, "minecraft:jungle_leaves")
-                .or_else(|| optional_block(registry, "minecraft:oak_leaves")),
+            jungle_leaves: optional_generated_leaves(registry, "minecraft:jungle_leaves")
+                .or_else(|| optional_generated_leaves(registry, "minecraft:oak_leaves")),
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
@@ -398,8 +426,7 @@ impl DecorationBlocks {
             let placed = feature.placed_feature.as_str();
             if placed.contains("trees") || placed.contains("tree") {
                 let log = first_resolved_block_with_suffix(registry, &feature.block_states, "_log");
-                let leaves =
-                    first_resolved_block_with_suffix(registry, &feature.block_states, "_leaves");
+                let leaves = first_resolved_generated_leaves(registry, &feature.block_states);
                 if placed.contains("jungle") {
                     blocks.jungle_log = log.or(blocks.jungle_log);
                     blocks.jungle_leaves = leaves.or(blocks.jungle_leaves);
@@ -419,15 +446,37 @@ impl DecorationBlocks {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct OreRules {
     rules: Vec<OreRule>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum OreRulesError {
+    #[error("ore rules contain {provided} entries; maximum is {max}")]
+    TooManyRules { provided: usize, max: usize },
+    #[error("ore rules require {required} chunk-work units; maximum is {max}")]
+    ChunkWorkBudgetExceeded { required: u64, max: u64 },
+}
+
 impl OreRules {
-    #[must_use]
-    pub fn new(rules: Vec<OreRule>) -> Self {
-        Self { rules }
+    pub fn new(rules: Vec<OreRule>) -> Result<Self, OreRulesError> {
+        if rules.len() > MAX_ORE_RULES {
+            return Err(OreRulesError::TooManyRules {
+                provided: rules.len(),
+                max: MAX_ORE_RULES,
+            });
+        }
+        let required = rules.iter().fold(0_u64, |total, rule| {
+            total.saturating_add(ore_rule_chunk_work(rule))
+        });
+        if required > MAX_ORE_WORK_UNITS_PER_CHUNK {
+            return Err(OreRulesError::ChunkWorkBudgetExceeded {
+                required,
+                max: MAX_ORE_WORK_UNITS_PER_CHUNK,
+            });
+        }
+        Ok(Self { rules })
     }
 
     #[must_use]
@@ -437,6 +486,8 @@ impl OreRules {
         fallback: BlockStateId,
     ) -> Self {
         let state = |name: &str| resolve_block_or(registry, name, fallback);
+        // Coarse family sizes for embedded operation; this is not Mojang's
+        // placement algorithm and does not imply vanilla worldgen parity.
         Self::new(vec![
             OreRule {
                 normal: state("minecraft:emerald_ore"),
@@ -444,6 +495,8 @@ impl OreRules {
                 y: YRange::new(EMERALD_MIN_Y, EMERALD_MAX_Y),
                 spacing: OreSpacing::peaked(224, 130, 260),
                 biomes: BiomeScope::only(biomes.mountain.clone()),
+                size: 3,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:gold_ore"),
@@ -451,6 +504,8 @@ impl OreRules {
                 y: YRange::new(GOLD_MIN_Y, 112),
                 spacing: OreSpacing::Fixed(58),
                 biomes: BiomeScope::only(biomes.hot_dry.clone()),
+                size: 9,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:diamond_ore"),
@@ -458,6 +513,8 @@ impl OreRules {
                 y: YRange::new(DIAMOND_MIN_Y, DIAMOND_MAX_Y),
                 spacing: OreSpacing::peaked(-56, 210, 380),
                 biomes: BiomeScope::Any,
+                size: 8,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:redstone_ore"),
@@ -465,6 +522,8 @@ impl OreRules {
                 y: YRange::new(REDSTONE_MIN_Y, REDSTONE_MAX_Y),
                 spacing: OreSpacing::peaked(-48, 95, 115),
                 biomes: BiomeScope::Any,
+                size: 8,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:lapis_ore"),
@@ -472,6 +531,8 @@ impl OreRules {
                 y: YRange::new(LAPIS_MIN_Y, LAPIS_MAX_Y),
                 spacing: OreSpacing::peaked(0, 150, 210),
                 biomes: BiomeScope::Any,
+                size: 7,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:gold_ore"),
@@ -479,6 +540,8 @@ impl OreRules {
                 y: YRange::new(GOLD_MIN_Y, GOLD_MAX_Y),
                 spacing: OreSpacing::peaked(-16, 105, 160),
                 biomes: BiomeScope::Any,
+                size: 9,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:iron_ore"),
@@ -486,6 +549,8 @@ impl OreRules {
                 y: YRange::new(IRON_MIN_Y, IRON_MAX_Y),
                 spacing: OreSpacing::peaked(16, 97, 140),
                 biomes: BiomeScope::Any,
+                size: 9,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:copper_ore"),
@@ -493,6 +558,8 @@ impl OreRules {
                 y: YRange::new(COPPER_MIN_Y, COPPER_MAX_Y),
                 spacing: OreSpacing::peaked(48, 89, 130),
                 biomes: BiomeScope::Any,
+                size: 10,
+                discard_chance_on_air_exposure: 0.0,
             },
             OreRule {
                 normal: state("minecraft:coal_ore"),
@@ -500,18 +567,30 @@ impl OreRules {
                 y: YRange::new(COAL_MIN_Y, COAL_MAX_Y),
                 spacing: OreSpacing::peaked(96, 83, 120),
                 biomes: BiomeScope::Any,
+                size: 17,
+                discard_chance_on_air_exposure: 0.0,
             },
         ])
+        .expect("embedded ore rules fit the admission budget")
     }
 
-    #[must_use]
+    /// Converts sidecar features into bounded generation rules.
+    ///
+    /// The complete input is rejected when it exceeds an admission limit;
+    /// rules are never silently truncated.
     pub fn from_features(
         registry: &BlockRegistry,
         biomes: &BiomeRules,
         features: &[OreFeature],
         biome_data: Option<&BiomeWorldgenData>,
-    ) -> Option<Self> {
-        let mut rules = Vec::new();
+    ) -> Result<Option<Self>, OreRulesError> {
+        if features.len() > MAX_ORE_RULES {
+            return Err(OreRulesError::TooManyRules {
+                provided: features.len(),
+                max: MAX_ORE_RULES,
+            });
+        }
+        let mut rules = Vec::with_capacity(features.len());
         for feature in features {
             let Some((normal, deepslate)) = ore_targets(registry, &feature.targets) else {
                 continue;
@@ -541,9 +620,15 @@ impl OreRules {
                 y,
                 spacing,
                 biomes: biome_scope,
+                size: feature.size,
+                discard_chance_on_air_exposure: feature.discard_chance_on_air_exposure,
             });
         }
-        (!rules.is_empty()).then(|| Self::new(rules))
+        if rules.is_empty() {
+            Ok(None)
+        } else {
+            Self::new(rules).map(Some)
+        }
     }
 
     #[must_use]
@@ -552,13 +637,33 @@ impl OreRules {
     }
 }
 
-#[derive(Clone)]
+fn ore_rule_chunk_work(rule: &OreRule) -> u64 {
+    if rule.y.min > rule.y.max {
+        return 0;
+    }
+    let min_cell_y = i64::from(rule.y.min).div_euclid(i64::from(ORE_ANCHOR_CELL_EDGE));
+    let max_cell_y = i64::from(rule.y.max).div_euclid(i64::from(ORE_ANCHOR_CELL_EDGE));
+    let y_cell_count = u64::try_from(max_cell_y - min_cell_y + 1).unwrap_or(u64::MAX);
+    let vein_size = u64::from(rule.size.clamp(1, MAX_ORE_VEIN_SIZE as u32));
+    let denominator = rule.spacing.minimum().max(1).saturating_mul(vein_size);
+    let anchors_per_cell = ORE_ANCHOR_CELL_VOLUME
+        .div_ceil(denominator)
+        .min(MAX_ORE_ANCHORS_PER_CELL as u64);
+    let work_per_cell = 1_u64.saturating_add(anchors_per_cell.saturating_mul(vein_size));
+    y_cell_count
+        .saturating_mul(ORE_CHUNK_HALO_CELLS_PER_LAYER)
+        .saturating_mul(work_per_cell)
+}
+
+#[derive(Debug, Clone)]
 pub struct OreRule {
     pub normal: BlockStateId,
     pub deepslate: BlockStateId,
     pub y: YRange,
     pub spacing: OreSpacing,
     pub biomes: BiomeScope,
+    pub size: u32,
+    pub discard_chance_on_air_exposure: f64,
 }
 
 impl OreRule {
@@ -570,7 +675,7 @@ impl OreRule {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct YRange {
     pub min: i32,
     pub max: i32,
@@ -583,7 +688,7 @@ impl YRange {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub enum OreSpacing {
     Fixed(u64),
     Peaked {
@@ -613,9 +718,16 @@ impl OreSpacing {
             } => peaked_spacing(y, range.min, range.max, peak_y, min_spacing, spacing_range),
         }
     }
+
+    const fn minimum(self) -> u64 {
+        match self {
+            Self::Fixed(spacing) => spacing,
+            Self::Peaked { min_spacing, .. } => min_spacing,
+        }
+    }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum BiomeScope {
     Any,
     Only(Vec<Identifier>),
@@ -656,6 +768,24 @@ fn optional_block(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> 
     registry.block(&id).map(|b| b.default)
 }
 
+fn optional_generated_leaves(registry: &BlockRegistry, name: &str) -> Option<BlockStateId> {
+    let id = Identifier::parse(name).expect("static identifier");
+    generated_leaf_state(registry, &id)
+}
+
+fn generated_leaf_state(registry: &BlockRegistry, id: &Identifier) -> Option<BlockStateId> {
+    registry
+        .by_name_and_props(
+            id,
+            &[
+                ("distance".to_string(), "1".to_string()),
+                ("persistent".to_string(), "false".to_string()),
+                ("waterlogged".to_string(), "false".to_string()),
+            ],
+        )
+        .or_else(|| registry.block(id).map(|block| block.default))
+}
+
 fn first_resolved_block(registry: &BlockRegistry, ids: &[Identifier]) -> Option<BlockStateId> {
     ids.iter()
         .find_map(|id| registry.block(id).map(|block| block.default))
@@ -669,6 +799,15 @@ fn first_resolved_block_with_suffix(
     ids.iter()
         .filter(|id| id.path().ends_with(suffix))
         .find_map(|id| registry.block(id).map(|block| block.default))
+}
+
+fn first_resolved_generated_leaves(
+    registry: &BlockRegistry,
+    ids: &[Identifier],
+) -> Option<BlockStateId> {
+    ids.iter()
+        .filter(|id| id.path().ends_with("_leaves"))
+        .find_map(|id| generated_leaf_state(registry, id))
 }
 
 fn resolve_blocks(registry: &BlockRegistry, ids: &[Identifier]) -> Vec<BlockStateId> {
@@ -1059,7 +1198,8 @@ impl TerrainGenerator {
     ///
     /// Returns [`TerrainGeneratorError::MissingRequiredBlock`] when the block
     /// registry is missing `minecraft:air`, `minecraft:bedrock`,
-    /// `minecraft:stone`, `minecraft:dirt`, or `minecraft:grass_block`.
+    /// `minecraft:stone`, `minecraft:dirt`, `minecraft:grass_block`, or
+    /// `minecraft:iron_ore`.
     pub fn try_with_rules(
         seed: i64,
         registry: Arc<BlockRegistry>,
@@ -1070,6 +1210,7 @@ impl TerrainGenerator {
         let stone = try_resolve_block(registry.as_ref(), "minecraft:stone")?;
         Ok(Self {
             seed,
+            geometry: OVERWORLD_GEOMETRY,
             air,
             bedrock: try_resolve_block(registry.as_ref(), "minecraft:bedrock")?,
             stone,
@@ -1081,6 +1222,7 @@ impl TerrainGenerator {
             podzol: resolve_block_or(registry.as_ref(), "minecraft:podzol", stone),
             snow_block: resolve_block_or(registry.as_ref(), "minecraft:snow_block", stone),
             deepslate: resolve_block_or(registry.as_ref(), "minecraft:deepslate", stone),
+            iron_ore: try_resolve_block(registry.as_ref(), "minecraft:iron_ore")?,
             water: resolve_block_or(registry.as_ref(), "minecraft:water", air),
             biomes,
             ores,
@@ -1094,6 +1236,12 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_structures(mut self, structures: StructureRules) -> Self {
         self.structures = structures;
+        self
+    }
+
+    #[must_use]
+    pub fn with_geometry(mut self, geometry: ChunkGeometry) -> Self {
+        self.geometry = geometry;
         self
     }
 
@@ -1114,6 +1262,12 @@ impl TerrainGenerator {
                 self.tellus_surface_height(world_x, world_z, settings)
             }
         }
+    }
+
+    fn clamp_surface_height(&self, raw: f64) -> i32 {
+        let min = self.geometry.min_y() + 2;
+        let max = (self.geometry.max_y() - 2).min(250).max(min);
+        raw.round().clamp(min as f64, max as f64) as i32
     }
 
     fn vanilla_surface_height(&self, world_x: i32, world_z: i32) -> i32 {
@@ -1140,7 +1294,7 @@ impl TerrainGenerator {
         let smooth = smoothstep01(coast_t);
         let raw = ocean * (1.0 - smooth) + land * smooth;
         // Guard against extreme outputs even though fbm_2d is bounded.
-        raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
+        self.clamp_surface_height(raw)
     }
 
     fn tellus_surface_height(
@@ -1178,7 +1332,7 @@ impl TerrainGenerator {
             - ((-land_mask).max(0.0) * 42.0 + hills.abs() * 4.0)
                 * settings.oceanic_height_scale.max(0.0);
         let raw = oceanic * (1.0 - shore) + terrestrial * shore;
-        raw.round().clamp(MIN_Y as f64 + 2.0, 250.0) as i32
+        self.clamp_surface_height(raw)
     }
 
     fn tellus_land_mask(
@@ -1489,13 +1643,18 @@ impl TerrainGenerator {
         let wz = pos.z * 16 + lz as i32;
         let height = self.surface_height(wx, wz);
         let biome = self.biome_for(wx, wz, height);
-        let (surface, fill) = self.surface_materials(&biome);
+        let (mut surface, fill) = self.surface_materials(&biome);
+        if self.is_spawn_iron_outcrop(wx, height, wz) {
+            surface = self.iron_ore;
+        } else if self.is_spawn_stone_outcrop(wx, height, wz) {
+            surface = self.stone;
+        }
         let (sea_level, water_enabled) = match self.worldgen_mode {
             WorldgenMode::VanillaLike => (SEA_LEVEL, true),
             WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
         };
         let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
-            sea_level
+            sea_level.clamp(height, self.geometry.max_y() - 1)
         } else {
             height
         };
@@ -1506,7 +1665,7 @@ impl TerrainGenerator {
             wz,
             height,
             top_non_air,
-            dirt_start: (height - DIRT_DEPTH).max(MIN_Y + 1),
+            dirt_start: (height - DIRT_DEPTH).max(self.geometry.min_y() + 1),
             biome,
             surface,
             fill,
@@ -1514,9 +1673,22 @@ impl TerrainGenerator {
         }
     }
 
+    fn is_spawn_stone_outcrop(&self, wx: i32, height: i32, wz: i32) -> bool {
+        height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
+            && (8..=11).contains(&wx)
+            && (4..=8).contains(&wz)
+    }
+
+    fn is_spawn_iron_outcrop(&self, wx: i32, height: i32, wz: i32) -> bool {
+        height > SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA
+            && (12..=13).contains(&wx)
+            && (4..=8).contains(&wz)
+    }
+
     fn fill_column(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
-        let _ = chunk.set_block(plan.lx, MIN_Y, plan.lz, self.bedrock);
-        for y in (MIN_Y + 1)..plan.dirt_start {
+        let min_y = self.geometry.min_y();
+        let _ = chunk.set_block(plan.lx, min_y, plan.lz, self.bedrock);
+        for y in (min_y + 1)..plan.dirt_start {
             let _ = chunk.set_block(
                 plan.lx,
                 y,
@@ -1555,16 +1727,7 @@ impl TerrainGenerator {
         if self.biomes.jungle.contains(biome) {
             return (self.grass_block, self.dirt);
         }
-        if matches!(
-            path,
-            "birch_forest"
-                | "old_growth_birch_forest"
-                | "dark_forest"
-                | "pale_garden"
-                | "old_growth_pine_taiga"
-                | "old_growth_spruce_taiga"
-        ) || path.contains("taiga")
-        {
+        if path.contains("taiga") {
             return (self.podzol, self.dirt);
         }
         (self.grass_block, self.dirt)
@@ -1580,7 +1743,7 @@ impl TerrainGenerator {
                         let lx = cx * 4 + 2;
                         let lz = cz * 4 + 2;
                         let column = &columns[lz * 16 + lx];
-                        let y = MIN_Y + section_idx as i32 * 16 + cy as i32 * 4 + 2;
+                        let y = self.geometry.min_y() + section_idx as i32 * 16 + cy as i32 * 4 + 2;
                         let biome = self.biome_for_cell(column.wx, y, column.wz, column.height);
                         let palette_idx = palette
                             .iter()
@@ -1603,19 +1766,22 @@ impl TerrainGenerator {
     }
 
     fn apply_features(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
-        if plan.dirt_start <= MIN_Y + 1 {
+        if plan.dirt_start <= self.geometry.min_y() + 1 {
             return;
         }
-        self.apply_caves(chunk, plan);
-        self.apply_ores(chunk, plan);
+        let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(plan);
+        self.apply_caves(chunk, plan, cave_mouth_depth);
+        self.apply_surface_cave_mouth(chunk, plan, cave_mouth_depth);
     }
 
-    fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
-        let cave_max_y = (plan.height - CAVE_SURFACE_CLEARANCE).min(plan.dirt_start - 1);
-        if cave_max_y < CAVE_MIN_Y {
+    fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan, cave_mouth_depth: i32) {
+        let surface_clearance = CAVE_SURFACE_CLEARANCE - cave_mouth_depth;
+        let cave_max_y = (plan.height - surface_clearance).min(plan.dirt_start - 1);
+        let cave_min_y = self.geometry.min_y() + 8;
+        if cave_max_y < cave_min_y {
             return;
         }
-        let mut y = CAVE_MIN_Y;
+        let mut y = cave_min_y;
         while y <= cave_max_y {
             if self.is_cave_cell(plan.wx, y, plan.wz) {
                 let end = (y + 1).min(cave_max_y);
@@ -1627,35 +1793,286 @@ impl TerrainGenerator {
         }
     }
 
-    fn apply_ores(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
-        let ore_max_y = plan.dirt_start - 1;
-        if ore_max_y <= MIN_Y {
+    fn apply_surface_cave_mouth(
+        &self,
+        chunk: &mut Chunk,
+        plan: &ColumnPlan,
+        cave_mouth_depth: i32,
+    ) {
+        if cave_mouth_depth == 0 {
             return;
         }
-        for rule in self.ores.rules() {
-            if !rule.biomes.matches(&plan.biome) {
-                continue;
-            }
-            let min_y = rule.y.min.max(MIN_Y + 1);
-            let max_y = rule.y.max.min(ore_max_y);
+        let floor = (plan.height - cave_mouth_depth).max(self.geometry.min_y() + 8);
+        for y in (floor + 1)..=plan.height {
+            let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
+        }
+    }
+
+    fn surface_cave_mouth_depth_for_plan(&self, plan: &ColumnPlan) -> i32 {
+        if plan.top_non_air != plan.height || self.biomes.is_surface_water(&plan.biome) {
+            0
+        } else {
+            self.surface_cave_mouth_depth(plan.wx, plan.wz)
+        }
+    }
+
+    fn apply_ores(&self, chunk: &mut Chunk) {
+        let chunk_min_x = i64::from(chunk.pos.x) * 16;
+        let chunk_min_z = i64::from(chunk.pos.z) * 16;
+        // Re-evaluate nearby anchors so a vein crossing a chunk edge is derived
+        // identically no matter which side is generated first.
+        let radius = i64::from(ORE_VEIN_RADIUS);
+        let cell_edge = i64::from(ORE_ANCHOR_CELL_EDGE);
+        let min_cell_x = (chunk_min_x - radius).div_euclid(cell_edge);
+        let max_cell_x = (chunk_min_x + 15 + radius).div_euclid(cell_edge);
+        let min_cell_z = (chunk_min_z - radius).div_euclid(cell_edge);
+        let max_cell_z = (chunk_min_z + 15 + radius).div_euclid(cell_edge);
+
+        for (rule_index, rule) in self.ores.rules().iter().enumerate() {
+            let min_y = rule.y.min.max(self.geometry.min_y() + 1);
+            let max_y = rule.y.max.min(self.geometry.max_y() - 1);
             if min_y > max_y {
                 continue;
             }
-            for y in min_y..=max_y {
-                let h = feature_hash(self.seed, plan.wx, y, plan.wz, 0x0A_E0);
-                if !h.is_multiple_of(rule.spacing.at_y(y, rule.y)) {
-                    continue;
+            let vein_size = usize::try_from(rule.size)
+                .unwrap_or(MAX_ORE_VEIN_SIZE)
+                .clamp(1, MAX_ORE_VEIN_SIZE);
+            let min_cell_y = min_y.div_euclid(ORE_ANCHOR_CELL_EDGE);
+            let max_cell_y = max_y.div_euclid(ORE_ANCHOR_CELL_EDGE);
+            let rule_salt = 0x0AE0_0000_u64 ^ rule_index as u64;
+
+            for cell_y in min_cell_y..=max_cell_y {
+                let sample_y = cell_y * ORE_ANCHOR_CELL_EDGE + ORE_ANCHOR_CELL_EDGE / 2;
+                let spacing = rule.spacing.at_y(sample_y, rule.y).max(1);
+                let denominator = spacing.saturating_mul(vein_size as u64).max(1);
+                for cell_z in min_cell_z..=max_cell_z {
+                    for cell_x in min_cell_x..=max_cell_x {
+                        let cell_x_i32 =
+                            i32::try_from(cell_x).expect("valid chunk halo cell x fits i32");
+                        let cell_z_i32 =
+                            i32::try_from(cell_z).expect("valid chunk halo cell z fits i32");
+                        let cell_hash =
+                            feature_hash(self.seed, cell_x_i32, cell_y, cell_z_i32, rule_salt);
+                        let guaranteed = ORE_ANCHOR_CELL_VOLUME / denominator;
+                        let remainder = ORE_ANCHOR_CELL_VOLUME % denominator;
+                        let extra = usize::from(
+                            remainder != 0 && cell_hash.rotate_left(29) % denominator < remainder,
+                        );
+                        let anchor_count = usize::try_from(guaranteed)
+                            .unwrap_or(MAX_ORE_ANCHORS_PER_CELL)
+                            .saturating_add(extra)
+                            .min(MAX_ORE_ANCHORS_PER_CELL);
+                        if anchor_count == 0 {
+                            continue;
+                        }
+
+                        let start = (cell_hash & 63) as usize;
+                        let step = (((cell_hash >> 6) & 31) as usize) * 2 + 1;
+                        for slot in 0..anchor_count {
+                            let cell_index = (start + slot * step) & 63;
+                            let anchor_x = cell_x * cell_edge + (cell_index & 3) as i64;
+                            let anchor_z = cell_z * cell_edge + ((cell_index >> 2) & 3) as i64;
+                            let anchor_y =
+                                i64::from(cell_y) * cell_edge + ((cell_index >> 4) & 3) as i64;
+                            let (Ok(anchor_x), Ok(anchor_y), Ok(anchor_z)) = (
+                                i32::try_from(anchor_x),
+                                i32::try_from(anchor_y),
+                                i32::try_from(anchor_z),
+                            ) else {
+                                continue;
+                            };
+                            if !(min_y..=max_y).contains(&anchor_y) {
+                                continue;
+                            }
+                            let surface_y = self.surface_height(anchor_x, anchor_z);
+                            let biome = self.biome_for(anchor_x, anchor_z, surface_y);
+                            if !rule.biomes.matches(&biome) {
+                                continue;
+                            }
+                            let vein_hash = feature_hash(
+                                self.seed,
+                                anchor_x,
+                                anchor_y,
+                                anchor_z,
+                                rule_salt ^ slot as u64,
+                            );
+                            self.place_ore_vein(
+                                chunk,
+                                rule,
+                                [anchor_x, anchor_y, anchor_z],
+                                vein_hash,
+                                vein_size,
+                            );
+                        }
+                    }
                 }
-                let Some(base) = chunk.get_block(plan.lx, y, plan.lz) else {
-                    continue;
-                };
-                if base != self.stone && base != self.deepslate {
-                    continue;
-                }
-                let ore = self.ore_variant(base, rule.normal, rule.deepslate);
-                let _ = chunk.set_block(plan.lx, y, plan.lz, ore);
             }
         }
+    }
+
+    fn place_ore_vein(
+        &self,
+        chunk: &mut Chunk,
+        rule: &OreRule,
+        anchor: [i32; 3],
+        vein_hash: u64,
+        vein_size: usize,
+    ) {
+        let mut offsets = [[0_i8; 3]; MAX_ORE_VEIN_SIZE];
+        let offset_count = connected_ore_offsets(
+            &mut offsets,
+            vein_hash,
+            anchor[1],
+            vein_size,
+            |offset, cell_hash| self.ore_cell_can_generate(rule, anchor, offset, cell_hash),
+        );
+        for &offset in &offsets[..offset_count] {
+            self.place_ore_cell(chunk, rule, anchor, offset);
+        }
+    }
+
+    fn ore_cell_can_generate(
+        &self,
+        rule: &OreRule,
+        anchor: [i32; 3],
+        offset: [i8; 3],
+        cell_hash: u64,
+    ) -> bool {
+        let Some(world_x) = anchor[0].checked_add(i32::from(offset[0])) else {
+            return false;
+        };
+        let Some(world_y) = anchor[1].checked_add(i32::from(offset[1])) else {
+            return false;
+        };
+        let Some(world_z) = anchor[2].checked_add(i32::from(offset[2])) else {
+            return false;
+        };
+        if !(rule.y.min..=rule.y.max).contains(&world_y) {
+            return false;
+        }
+        let Some(base) = self.generated_cell_before_ores(world_x, world_y, world_z) else {
+            return false;
+        };
+        if base != self.stone && base != self.deepslate {
+            return false;
+        }
+        !self.should_discard_exposed_ore(world_x, world_y, world_z, rule, cell_hash)
+    }
+
+    fn place_ore_cell(&self, chunk: &mut Chunk, rule: &OreRule, anchor: [i32; 3], offset: [i8; 3]) {
+        let world_x = i64::from(anchor[0]) + i64::from(offset[0]);
+        let world_y = anchor[1] + i32::from(offset[1]);
+        let world_z = i64::from(anchor[2]) + i64::from(offset[2]);
+        let chunk_min_x = i64::from(chunk.pos.x) * 16;
+        let chunk_min_z = i64::from(chunk.pos.z) * 16;
+        if !(chunk_min_x..chunk_min_x + 16).contains(&world_x)
+            || !(chunk_min_z..chunk_min_z + 16).contains(&world_z)
+        {
+            return;
+        }
+        let lx = (world_x - chunk_min_x) as u8;
+        let lz = (world_z - chunk_min_z) as u8;
+        let Some(base) = chunk.get_block(lx, world_y, lz) else {
+            return;
+        };
+        if base != self.stone && base != self.deepslate {
+            return;
+        }
+        let ore = self.ore_variant(base, rule.normal, rule.deepslate);
+        let _ = chunk.set_block(lx, world_y, lz, ore);
+    }
+
+    fn should_discard_exposed_ore(
+        &self,
+        world_x: i32,
+        y: i32,
+        world_z: i32,
+        rule: &OreRule,
+        hash: u64,
+    ) -> bool {
+        let chance = rule.discard_chance_on_air_exposure;
+        if !chance.is_finite()
+            || chance <= 0.0
+            || !self.generated_cell_touches_air(world_x, y, world_z)
+        {
+            return false;
+        }
+        if chance >= 1.0 {
+            return true;
+        }
+        let sample = (hash >> 11) as f64 * (1.0 / ((1_u64 << 53) as f64));
+        sample < chance
+    }
+
+    fn generated_cell_touches_air(&self, world_x: i32, y: i32, world_z: i32) -> bool {
+        ORE_DIRECTIONS.iter().any(|direction| {
+            let neighbour = world_x
+                .checked_add(i32::from(direction[0]))
+                .zip(y.checked_add(i32::from(direction[1])))
+                .zip(world_z.checked_add(i32::from(direction[2])));
+            let Some(((nx, ny), nz)) = neighbour else {
+                return true;
+            };
+            self.generated_cell_before_ores(nx, ny, nz) == Some(self.air)
+        })
+    }
+
+    fn generated_cell_before_ores(
+        &self,
+        world_x: i32,
+        y: i32,
+        world_z: i32,
+    ) -> Option<BlockStateId> {
+        if y < self.geometry.min_y() || y >= self.geometry.max_y() {
+            return None;
+        }
+        let pos = ChunkPos {
+            x: world_x.div_euclid(16),
+            z: world_z.div_euclid(16),
+        };
+        let plan = self.plan_column(
+            pos,
+            world_x.rem_euclid(16) as u8,
+            world_z.rem_euclid(16) as u8,
+        );
+        if y > plan.top_non_air {
+            return Some(self.air);
+        }
+        if y > plan.height {
+            return Some(self.water);
+        }
+        if y == self.geometry.min_y() {
+            return Some(self.bedrock);
+        }
+
+        let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(&plan);
+        if cave_mouth_depth != 0 {
+            let floor = (plan.height - cave_mouth_depth).max(self.geometry.min_y() + 8);
+            if y > floor {
+                return Some(self.air);
+            }
+        }
+        let cave_min_y = self.geometry.min_y() + 8;
+        let surface_clearance = CAVE_SURFACE_CLEARANCE - cave_mouth_depth;
+        let cave_max_y = (plan.height - surface_clearance).min(plan.dirt_start - 1);
+        if (cave_min_y..=cave_max_y).contains(&y) {
+            let sample_y = cave_min_y + (y - cave_min_y).div_euclid(2) * 2;
+            if self.is_cave_cell(world_x, sample_y, world_z) {
+                return Some(self.air);
+            }
+        }
+        if y < plan.dirt_start {
+            return Some(self.base_stone_for_y(
+                world_x.rem_euclid(16) as u8,
+                y,
+                world_z.rem_euclid(16) as u8,
+                pos,
+            ));
+        }
+        if y < plan.height {
+            return Some(plan.fill);
+        }
+        Some(plan.surface)
     }
 
     fn apply_structures(&self, chunk: &mut Chunk) {
@@ -1688,13 +2105,16 @@ impl TerrainGenerator {
                 let idx = lz as usize * 16 + lx as usize;
                 let plan = &columns[idx];
                 let height = plan.height;
-                if height <= MIN_Y || height + 8 >= MAX_Y {
+                if height <= self.geometry.min_y() || height + 8 >= self.geometry.max_y() {
                     continue;
                 }
                 let biome = &plan.biome;
                 let surface = plan.surface;
                 let h = plan.hash;
 
+                if self.is_spawn_stone_outcrop(plan.wx, height, plan.wz) {
+                    continue;
+                }
                 if (self.biomes.temperate_forest.contains(biome)
                     || self.biomes.cold.contains(biome)
                     || self.biomes.jungle.contains(biome))
@@ -1778,7 +2198,8 @@ impl TerrainGenerator {
         let (Some(log), Some(leaves)) = blocks else {
             return false;
         };
-        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || base_y + 5 >= MAX_Y {
+        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || base_y + 5 >= self.geometry.max_y()
+        {
             return false;
         }
         for y in base_y..=(base_y + 5) {
@@ -1937,9 +2358,9 @@ impl TerrainGenerator {
         let current = chunk
             .heightmaps
             .get("MOTION_BLOCKING")
-            .map(|heightmap| heightmap.get(lx, lz) as i32 + MIN_Y - 1)
-            .unwrap_or(MIN_Y);
-        let value = (top.max(current) + 1 - MIN_Y) as u32;
+            .map(|heightmap| heightmap.get(lx, lz) as i32 + self.geometry.min_y() - 1)
+            .unwrap_or(self.geometry.min_y());
+        let value = (top.max(current) + 1 - self.geometry.min_y()) as u32;
         if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
             mb.set(lx, lz, value);
         }
@@ -1960,12 +2381,14 @@ impl TerrainGenerator {
             return;
         };
         let center_height = self.surface_height(center_x, center_z);
-        if center_height <= SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA {
-            return;
-        }
-        let biome = self.biome_for(center_x, center_z, center_height);
-        if !self.biomes.grassland.contains(&biome) {
-            return;
+        if self.structures.fixed_center().is_none() {
+            if center_height <= SEA_LEVEL + BEACH_HEIGHT_ABOVE_SEA {
+                return;
+            }
+            let biome = self.biome_for(center_x, center_z, center_height);
+            if !self.biomes.grassland.contains(&biome) {
+                return;
+            }
         }
 
         let size = template.size();
@@ -1980,6 +2403,9 @@ impl TerrainGenerator {
         if templates.is_empty() {
             return None;
         }
+        if let Some((center_x, center_z)) = self.structures.fixed_center() {
+            return (grid_x == 0 && grid_z == 0).then_some((&templates[0], center_x, center_z));
+        }
         let spacing = self.structures.grid_chunks();
         let separation = self.structures.separation_chunks();
         let usable = (spacing - separation * 2).max(1);
@@ -1993,15 +2419,15 @@ impl TerrainGenerator {
     }
 
     fn refresh_structure_column(&self, chunk: &mut Chunk, lx: u8, lz: u8) {
-        let top = (MIN_Y..MAX_Y)
+        let top = (self.geometry.min_y()..self.geometry.max_y())
             .rev()
             .find(|&y| {
                 chunk
                     .get_block(lx, y, lz)
                     .is_some_and(|state| state != self.air)
             })
-            .unwrap_or(MIN_Y);
-        let value = (top + 1 - MIN_Y) as u32;
+            .unwrap_or(self.geometry.min_y());
+        let value = (top + 1 - self.geometry.min_y()) as u32;
         if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
             mb.set(lx, lz, value);
         }
@@ -2052,6 +2478,30 @@ impl TerrainGenerator {
         )
         .is_multiple_of(211);
         n > CAVE_THRESHOLD || branch > CAVE_BRANCH_THRESHOLD || room
+    }
+
+    fn surface_cave_mouth_depth(&self, x: i32, z: i32) -> i32 {
+        let grid_x = x.div_euclid(CAVE_MOUTH_GRID);
+        let grid_z = z.div_euclid(CAVE_MOUTH_GRID);
+        let hash = feature_hash(self.seed, grid_x, 0, grid_z, 0xC4A7_E001);
+        let offset_span = CAVE_MOUTH_GRID - CAVE_MOUTH_RADIUS * 2;
+        let center_x = grid_x * CAVE_MOUTH_GRID
+            + CAVE_MOUTH_RADIUS
+            + i32::try_from(hash % offset_span as u64).expect("cave mouth x offset fits i32");
+        let center_z = grid_z * CAVE_MOUTH_GRID
+            + CAVE_MOUTH_RADIUS
+            + i32::try_from((hash >> 16) % offset_span as u64)
+                .expect("cave mouth z offset fits i32");
+        let spawn_clearance = CAVE_MOUTH_SPAWN_SAFE_RADIUS + CAVE_MOUTH_RADIUS;
+        let center_distance_squared =
+            i64::from(center_x) * i64::from(center_x) + i64::from(center_z) * i64::from(center_z);
+        if center_distance_squared <= i64::from(spawn_clearance) * i64::from(spawn_clearance) {
+            return 0;
+        }
+        let dx = i64::from(x - center_x);
+        let dz = i64::from(z - center_z);
+        let distance = ((dx * dx + dz * dz) as f64).sqrt().ceil() as i32;
+        (CAVE_MOUTH_RADIUS - distance).max(0)
     }
 
     #[cfg(test)]
@@ -2130,6 +2580,90 @@ fn feature_hash(seed: i64, x: i32, y: i32, z: i32, salt: u64) -> u64 {
     h.wrapping_mul(0x94D0_49BB_1331_11EB) ^ (h >> 31)
 }
 
+fn ore_offset_is_available(existing: &[[i8; 3]], candidate: [i8; 3]) -> bool {
+    candidate
+        .iter()
+        .all(|coordinate| i32::from(*coordinate).abs() <= ORE_VEIN_RADIUS)
+        && !existing.contains(&candidate)
+}
+
+fn connected_ore_offsets(
+    offsets: &mut [[i8; 3]; MAX_ORE_VEIN_SIZE],
+    vein_hash: u64,
+    anchor_y: i32,
+    vein_size: usize,
+    mut can_place: impl FnMut([i8; 3], u64) -> bool,
+) -> usize {
+    let vein_size = vein_size.min(MAX_ORE_VEIN_SIZE);
+    if vein_size == 0 {
+        return 0;
+    }
+
+    let mut candidates = [[0_i8; 3]; MAX_ORE_VEIN_SIZE];
+    let mut parents = [0_usize; MAX_ORE_VEIN_SIZE];
+    for candidate_index in 1..vein_size {
+        let mut next = None;
+        for attempt in 0..ORE_GROWTH_ATTEMPTS {
+            let hash = feature_hash(
+                vein_hash as i64,
+                candidate_index as i32,
+                attempt as i32,
+                anchor_y,
+                0x0AE0_600D,
+            );
+            let parent_index = usize::try_from(hash % candidate_index as u64)
+                .expect("bounded ore parent index fits usize");
+            let parent = candidates[parent_index];
+            let direction = ORE_DIRECTIONS[((hash >> 16) % 6) as usize];
+            let candidate = [
+                parent[0] + direction[0],
+                parent[1] + direction[1],
+                parent[2] + direction[2],
+            ];
+            if ore_offset_is_available(&candidates[..candidate_index], candidate) {
+                next = Some((candidate, parent_index));
+                break;
+            }
+        }
+        let (candidate, parent_index) = next.unwrap_or_else(|| {
+            first_available_ore_offset(&candidates[..candidate_index])
+                .expect("bounded ore vein cube has room")
+        });
+        candidates[candidate_index] = candidate;
+        parents[candidate_index] = parent_index;
+    }
+
+    let mut accepted = [false; MAX_ORE_VEIN_SIZE];
+    accepted[0] = can_place(candidates[0], vein_hash);
+    let mut accepted_count = usize::from(accepted[0]);
+    for candidate_index in 1..vein_size {
+        let cell_hash = vein_hash ^ candidate_index as u64;
+        accepted[candidate_index] =
+            accepted[parents[candidate_index]] && can_place(candidates[candidate_index], cell_hash);
+        if accepted[candidate_index] {
+            offsets[accepted_count] = candidates[candidate_index];
+            accepted_count += 1;
+        }
+    }
+    accepted_count
+}
+
+fn first_available_ore_offset(existing: &[[i8; 3]]) -> Option<([i8; 3], usize)> {
+    for (parent_index, parent) in existing.iter().enumerate() {
+        for direction in ORE_DIRECTIONS {
+            let candidate = [
+                parent[0] + direction[0],
+                parent[1] + direction[1],
+                parent[2] + direction[2],
+            ];
+            if ore_offset_is_available(existing, candidate) {
+                return Some((candidate, parent_index));
+            }
+        }
+    }
+    None
+}
+
 fn paste_template(
     chunk: &mut Chunk,
     template: &StructureTemplate,
@@ -2153,11 +2687,36 @@ fn paste_template(
             touched[lz as usize * 16 + lx as usize] = true;
         }
     }
+    for template_chest in template.chests() {
+        let x = origin_x + template_chest.pos[0];
+        let y = origin_y + template_chest.pos[1];
+        let z = origin_z + template_chest.pos[2];
+        if x < min_x || x >= min_x + 16 || z < min_z || z >= min_z + 16 {
+            continue;
+        }
+        let Some(expected_state) = template
+            .blocks()
+            .iter()
+            .find(|block| block.pos == template_chest.pos)
+            .map(|block| block.state)
+        else {
+            continue;
+        };
+        let lx = (x - min_x) as u8;
+        let lz = (z - min_z) as u8;
+        if chunk.get_block(lx, y, lz) != Some(expected_state) {
+            continue;
+        }
+        chunk
+            .chests
+            .insert(mc_world::BlockPos { x, y, z }, template_chest.chest.clone());
+    }
 }
 
 impl ChunkGenerator for TerrainGenerator {
     fn generate(&self, pos: ChunkPos) -> Chunk {
-        let mut chunk = Chunk::empty(pos, self.air, self.biomes.default.clone());
+        let mut chunk =
+            Chunk::empty_with_geometry(pos, self.air, self.biomes.default.clone(), self.geometry);
         chunk
             .heightmaps
             .insert("MOTION_BLOCKING".into(), Heightmap::zeroed());
@@ -2174,9 +2733,9 @@ impl ChunkGenerator for TerrainGenerator {
             self.fill_column(&mut chunk, plan);
             self.apply_features(&mut chunk, plan);
             // Heightmap value: Y of the first air cell above the
-            // top non-air block, expressed as `(top + 1) - MIN_Y`.
-            let world_surface = (plan.top_non_air + 1 - MIN_Y) as u32;
-            let motion_blocking = (plan.height + 1 - MIN_Y) as u32;
+            // Heightmaps store offsets from this dimension's minimum Y.
+            let world_surface = (plan.top_non_air + 1 - self.geometry.min_y()) as u32;
+            let motion_blocking = (plan.height + 1 - self.geometry.min_y()) as u32;
             if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
                 mb.set(plan.lx, plan.lz, motion_blocking);
             }
@@ -2185,6 +2744,7 @@ impl ChunkGenerator for TerrainGenerator {
             }
             chunk.highest_opaque.set(plan.lx, plan.lz, motion_blocking);
         }
+        self.apply_ores(&mut chunk);
         self.assign_biomes(&mut chunk, &columns);
         self.apply_decorations(&mut chunk, &columns);
         self.apply_structures(&mut chunk);
@@ -2601,6 +3161,7 @@ mod tests {
             "minecraft:stone",
             "minecraft:dirt",
             "minecraft:grass_block",
+            "minecraft:iron_ore",
         ];
         let report = names
             .into_iter()
@@ -2648,12 +3209,61 @@ mod tests {
     }
 
     #[test]
+    fn generated_leaf_state_is_connected_but_not_persistent() {
+        use mc_data::blocks::{BlockReport, BlockStateReport};
+
+        let properties = BTreeMap::from([
+            (
+                "distance".to_string(),
+                (1..=7).map(|value| value.to_string()).collect(),
+            ),
+            (
+                "persistent".to_string(),
+                vec!["true".to_string(), "false".to_string()],
+            ),
+            (
+                "waterlogged".to_string(),
+                vec!["true".to_string(), "false".to_string()],
+            ),
+        ]);
+        let leaf_properties = |distance: &str| {
+            BTreeMap::from([
+                ("distance".to_string(), distance.to_string()),
+                ("persistent".to_string(), "false".to_string()),
+                ("waterlogged".to_string(), "false".to_string()),
+            ])
+        };
+        let registry = BlockRegistry::from_report(&[BlockReport {
+            id: Identifier::parse("minecraft:oak_leaves").unwrap(),
+            properties,
+            states: vec![
+                BlockStateReport {
+                    id: 0,
+                    default: true,
+                    properties: leaf_properties("7"),
+                },
+                BlockStateReport {
+                    id: 1,
+                    default: false,
+                    properties: leaf_properties("1"),
+                },
+            ],
+        }])
+        .unwrap();
+
+        assert_eq!(
+            optional_generated_leaves(&registry, "minecraft:oak_leaves"),
+            Some(BlockStateId(1))
+        );
+    }
+
+    #[test]
     fn try_with_rules_reports_missing_required_block() {
         let err = match TerrainGenerator::try_with_rules(
             42,
             registry_without_block("minecraft:grass_block"),
             BiomeRules::vanilla_overworld(),
-            OreRules::new(Vec::new()),
+            OreRules::new(Vec::new()).expect("empty ore rules fit the admission budget"),
         ) {
             Ok(_) => panic!("missing required terrain block must fail"),
             Err(err) => err,
@@ -2672,15 +3282,19 @@ mod tests {
     }
 
     #[test]
-    fn try_with_rules_allows_missing_optional_blocks_with_fallbacks() {
+    fn try_with_rules_allows_missing_optional_blocks_when_required_resources_exist() {
+        let registry = required_only_registry();
+        let iron_ore = try_resolve_block(registry.as_ref(), "minecraft:iron_ore")
+            .expect("required-only registry should include iron ore");
         let generator = TerrainGenerator::try_with_rules(
             42,
-            required_only_registry(),
+            registry,
             BiomeRules::vanilla_overworld(),
-            OreRules::new(Vec::new()),
+            OreRules::new(Vec::new()).expect("empty ore rules fit the admission budget"),
         )
         .expect("optional terrain blocks should use fallbacks");
 
+        assert_eq!(generator.iron_ore, iron_ore);
         assert_eq!(generator.sand, generator.stone);
         assert_eq!(generator.red_sand, generator.stone);
         assert_eq!(generator.gravel, generator.stone);
@@ -2944,6 +3558,38 @@ mod tests {
 
         // Dirty flag set so M6 flush picks it up.
         assert!(chunk.dirty);
+    }
+
+    #[test]
+    fn generated_chunk_uses_explicit_geometry() {
+        let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
+        let generator = TerrainGenerator::new(42, tiny_registry()).with_geometry(geometry);
+
+        let chunk = generator.generate(ChunkPos { x: 0, z: 0 });
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(chunk.sections.len(), 16);
+        assert_eq!(chunk.get_block(8, 0, 8), Some(generator.bedrock));
+        let surface = generator.surface_height(8, 8);
+        assert_eq!(
+            chunk.heightmaps["MOTION_BLOCKING"].get(8, 8),
+            (surface + 1) as u32
+        );
+    }
+
+    #[test]
+    fn generated_chunk_handles_geometry_above_vanilla_surface_band() {
+        let geometry = mc_world::ChunkGeometry::new(256, 256).unwrap();
+        let generator = TerrainGenerator::new(42, tiny_registry()).with_geometry(geometry);
+
+        let chunk = generator.generate(ChunkPos { x: 0, z: 0 });
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(
+            chunk.get_block(8, geometry.min_y(), 8),
+            Some(generator.bedrock)
+        );
+        assert!(generator.surface_height(8, 8) >= geometry.min_y());
     }
 
     #[test]
@@ -3507,7 +4153,7 @@ mod tests {
         let g = TerrainGenerator::new(42, tiny_registry());
         let cases = [
             ("minecraft:plains", BlockStateId(4), BlockStateId(3)),
-            ("minecraft:birch_forest", BlockStateId(36), BlockStateId(3)),
+            ("minecraft:birch_forest", BlockStateId(4), BlockStateId(3)),
             ("minecraft:badlands", BlockStateId(34), BlockStateId(34)),
             ("minecraft:desert", BlockStateId(14), BlockStateId(14)),
             ("minecraft:jagged_peaks", BlockStateId(35), BlockStateId(2)),
@@ -3777,6 +4423,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn seed_zero_playable_ruin_chest_stays_empty_after_flush_and_reopen() {
+        let registry = Arc::new(
+            BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+                .expect("embedded block registry"),
+        );
+        let items = Arc::new(mc_data::items::solaris_required_items());
+        let generator = Arc::new(
+            TerrainGenerator::new(0, Arc::clone(&registry)).with_structures(
+                StructureRules::solaris_playable_ruin(&registry, &items)
+                    .expect("playable ruin resolves embedded data"),
+            ),
+        );
+        let root = unique_temp_world_dir();
+        std::fs::create_dir_all(root.join("region")).unwrap();
+        let ruin_chunk = ChunkPos { x: 4, z: 0 };
+
+        let mut storage = mc_world::WorldStorage::open(&root, Arc::clone(&registry))
+            .unwrap()
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(Arc::clone(&generator) as Arc<dyn ChunkGenerator>);
+        let chest_pos = storage
+            .get_chunk(ruin_chunk)
+            .unwrap()
+            .expect("generated ruin chunk")
+            .chests
+            .keys()
+            .next()
+            .copied()
+            .expect("generated ruin chest");
+        assert!(
+            storage
+                .chest_block_entity(chest_pos)
+                .unwrap()
+                .expect("generated chest entity")
+                .slots
+                .iter()
+                .any(|slot| !slot.is_empty())
+        );
+
+        storage
+            .set_chest_block_entity(chest_pos, mc_world::ChestBlockEntity::default())
+            .expect("empty chest after loot");
+        assert!(storage.flush_dirty().unwrap() >= 1);
+        drop(storage);
+
+        let mut reopened = mc_world::WorldStorage::open(&root, registry)
+            .unwrap()
+            .with_item_registry(items);
+        let chest = reopened
+            .chest_block_entity(chest_pos)
+            .unwrap()
+            .expect("persisted chest entity");
+        assert!(chest.slots.iter().all(mc_world::FurnaceSlot::is_empty));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn playable_ruin_does_not_insert_chest_entity_above_chunk_geometry() {
+        let registry = Arc::new(
+            BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+                .expect("embedded block registry"),
+        );
+        let items = mc_data::items::solaris_required_items();
+        let geometry = mc_world::ChunkGeometry::new(0, 16).expect("single-section geometry");
+        let generator = TerrainGenerator::new(0, Arc::clone(&registry))
+            .with_geometry(geometry)
+            .with_structures(
+                StructureRules::solaris_playable_ruin(&registry, &items)
+                    .expect("playable ruin resolves embedded data"),
+            );
+
+        let chunk = generator.generate(ChunkPos { x: 4, z: 0 });
+
+        assert!(chunk.chests.is_empty());
+    }
+
     fn unique_temp_world_dir() -> std::path::PathBuf {
         let suffix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3965,6 +4689,93 @@ mod tests {
     }
 
     #[test]
+    fn ore_rules_reject_more_than_the_admission_limit() {
+        let rule = ore_feature(
+            "minecraft:ore_iron",
+            "minecraft:iron_ore",
+            "minecraft:deepslate_iron_ore",
+            -32,
+            32,
+            4,
+        );
+        let registry = tiny_registry();
+        let biomes = BiomeRules::vanilla_overworld();
+        let features = vec![rule; MAX_ORE_RULES + 1];
+
+        let error = OreRules::from_features(registry.as_ref(), &biomes, &features, None)
+            .expect_err("oversized sidecar must be rejected instead of truncated");
+
+        assert_eq!(
+            error,
+            OreRulesError::TooManyRules {
+                provided: MAX_ORE_RULES + 1,
+                max: MAX_ORE_RULES,
+            }
+        );
+    }
+
+    #[test]
+    fn ore_rules_reject_excessive_total_chunk_work() {
+        let expensive_rule = OreRule {
+            normal: BlockStateId(8),
+            deepslate: BlockStateId(13),
+            y: YRange::new(MIN_Y, MAX_Y - 1),
+            spacing: OreSpacing::Fixed(1),
+            biomes: BiomeScope::Any,
+            size: MAX_ORE_VEIN_SIZE as u32,
+            discard_chance_on_air_exposure: 0.0,
+        };
+
+        let error = OreRules::new(vec![expensive_rule; MAX_ORE_RULES])
+            .expect_err("rules over the chunk-work budget must be rejected");
+
+        assert!(matches!(
+            error,
+            OreRulesError::ChunkWorkBudgetExceeded { max, .. }
+                if max == MAX_ORE_WORK_UNITS_PER_CHUNK
+        ));
+    }
+
+    #[test]
+    fn ore_rules_admit_an_ordinary_bounded_set() {
+        let ordinary_rule = OreRule {
+            normal: BlockStateId(8),
+            deepslate: BlockStateId(13),
+            y: YRange::new(-32, 32),
+            spacing: OreSpacing::Fixed(32),
+            biomes: BiomeScope::Any,
+            size: 8,
+            discard_chance_on_air_exposure: 0.0,
+        };
+
+        let rules = OreRules::new(vec![ordinary_rule; 16])
+            .expect("ordinary ore rules must remain admitted");
+
+        assert_eq!(rules.rules().len(), 16);
+    }
+
+    #[test]
+    fn ore_growth_never_uses_a_rejected_cell_as_a_bridge() {
+        let mut offsets = [[0_i8; 3]; MAX_ORE_VEIN_SIZE];
+        let offset_count = connected_ore_offsets(&mut offsets, 0x51, 0, 4, |offset, _hash| {
+            offset != [1, 0, 0]
+        });
+        let offsets = &offsets[..offset_count];
+
+        assert!(!offsets.contains(&[1, 0, 0]));
+        assert!(offsets.iter().all(|offset| {
+            *offset == [0, 0, 0]
+                || ORE_DIRECTIONS.iter().any(|direction| {
+                    offsets.contains(&[
+                        offset[0] - direction[0],
+                        offset[1] - direction[1],
+                        offset[2] - direction[2],
+                    ])
+                })
+        }));
+    }
+
+    #[test]
     fn expanded_ore_families_are_reachable_and_biome_scoped() {
         let g = TerrainGenerator::new(42, tiny_registry());
         let plains = Identifier::parse("minecraft:plains").unwrap();
@@ -4050,6 +4861,7 @@ mod tests {
         ];
         let ores =
             OreRules::from_features(registry.as_ref(), &biomes, &features, Some(&biome_data))
+                .expect("sidecar ore features should fit the admission budget")
                 .expect("sidecar ore features should become rules");
         let g = TerrainGenerator::with_rules(42, registry, biomes, ores);
 
@@ -4180,6 +4992,109 @@ mod tests {
             saw_deepslate,
             "expected deepslate below the transition band"
         );
+    }
+
+    #[test]
+    fn playable_seed_has_a_dry_surface_cave_mouth_outside_spawn() {
+        const SPAWN_SAFE_RADIUS: i32 = 24;
+        const REQUIRED_OPEN_DEPTH: i32 = CAVE_SURFACE_CLEARANCE + 2;
+        const SEARCH_RADIUS: i32 = 8 * 16;
+
+        let g = TerrainGenerator::new(0, tiny_registry());
+        let mut cave_mouth = None;
+        'search: for wx in -SEARCH_RADIUS..=SEARCH_RADIUS {
+            for wz in -SEARCH_RADIUS..=SEARCH_RADIUS {
+                if wx * wx + wz * wz <= SPAWN_SAFE_RADIUS * SPAWN_SAFE_RADIUS
+                    || g.surface_cave_mouth_depth(wx, wz) != CAVE_MOUTH_RADIUS
+                {
+                    continue;
+                }
+                let top = g.surface_height(wx, wz);
+                let biome = g.biome_for(wx, wz, top);
+                if g.biomes.is_surface_water(&biome) {
+                    continue;
+                }
+                let chunk = g.generate(ChunkPos {
+                    x: wx.div_euclid(16),
+                    z: wz.div_euclid(16),
+                });
+                let lx = wx.rem_euclid(16) as u8;
+                let lz = wz.rem_euclid(16) as u8;
+                let open_depth = (0..REQUIRED_OPEN_DEPTH)
+                    .take_while(|depth| chunk.get_block(lx, top - depth, lz) == Some(g.air))
+                    .count() as i32;
+                if open_depth == REQUIRED_OPEN_DEPTH {
+                    cave_mouth = Some((wx, top, wz));
+                    break 'search;
+                }
+            }
+        }
+        let (wx, top, wz) = cave_mouth.expect(
+            "playable seed should connect a dry surface mouth to cave carving within eight chunks",
+        );
+        let mouth_chunk = g.generate(ChunkPos {
+            x: wx.div_euclid(16),
+            z: wz.div_euclid(16),
+        });
+        let lx = wx.rem_euclid(16) as u8;
+        let lz = wz.rem_euclid(16) as u8;
+        for depth in 0..REQUIRED_OPEN_DEPTH {
+            assert_eq!(
+                mouth_chunk.get_block(lx, top - depth, lz),
+                Some(g.air),
+                "surface cave mouth closed at {wx},{},{wz}",
+                top - depth
+            );
+        }
+
+        for chunk_x in -2..=1 {
+            for chunk_z in -2..=1 {
+                let chunk = g.generate(ChunkPos {
+                    x: chunk_x,
+                    z: chunk_z,
+                });
+                for lx in 0..16u8 {
+                    for lz in 0..16u8 {
+                        let wx = chunk_x * 16 + i32::from(lx);
+                        let wz = chunk_z * 16 + i32::from(lz);
+                        if wx * wx + wz * wz > SPAWN_SAFE_RADIUS * SPAWN_SAFE_RADIUS {
+                            continue;
+                        }
+                        let top = g.surface_height(wx, wz);
+                        assert_ne!(
+                            chunk.get_block(lx, top, lz),
+                            Some(g.air),
+                            "surface cave opened inside spawn safe zone at {wx},{top},{wz}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cave_mouth_mask_has_a_one_block_gradient_and_keeps_spawn_clear() {
+        let g = TerrainGenerator::new(0, tiny_registry());
+        let mut deepest = 0;
+        for x in -128..=128 {
+            for z in -128..=128 {
+                let depth = g.surface_cave_mouth_depth(x, z);
+                deepest = deepest.max(depth);
+                assert!((0..=CAVE_MOUTH_RADIUS).contains(&depth));
+                assert!(
+                    (depth - g.surface_cave_mouth_depth(x + 1, z)).abs() <= 1,
+                    "cave mouth x gradient jumped at {x},{z}"
+                );
+                assert!(
+                    (depth - g.surface_cave_mouth_depth(x, z + 1)).abs() <= 1,
+                    "cave mouth z gradient jumped at {x},{z}"
+                );
+                if x * x + z * z <= CAVE_MOUTH_SPAWN_SAFE_RADIUS * CAVE_MOUTH_SPAWN_SAFE_RADIUS {
+                    assert_eq!(depth, 0, "cave mouth mask reached spawn at {x},{z}");
+                }
+            }
+        }
+        assert_eq!(deepest, CAVE_MOUTH_RADIUS);
     }
 
     #[test]

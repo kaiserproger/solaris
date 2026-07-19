@@ -2,22 +2,23 @@
 
 This directory tracks reproducible real-client scenarios for M94+ evidence.
 These manifests are not protocol harnesses and do not count as client evidence
-until a normal vanilla 26.1.2 client or PrismLauncher-launched client executes
-them and the required artifacts are recorded.
+until the repo-native Gradle `runClient` adapter launches a normal vanilla
+26.1.2 client and the required artifacts are recorded.
 
 Artifacts from a run stay local under `.analysis/real-client-runs/<run_id>/`:
 
 - `manifest.json` copied from the tracked scenario manifest.
 - `client.log` from the real client.
-- `server.log` from `cargo run --bin mc-server -- --config <config>`; the
-  runner defaults to `example.toml`.
+- `server.log` from `cargo run --bin mc-server -- --config <config>`; `--run`
+  uses a per-run `server.toml` copied from the selected source config, defaulting
+  to `example.toml`.
 - `observations.json` with structured pass/fail notes for each step.
 - `screenshots/` containing at least one screenshot for every scenario whose
   manifest entry has `screenshots_required: true`.
 - `git.txt` with commit id and `git status --short --branch`.
 - `toolchain.txt` with the autonomous preflight output.
-- `automation-driver.txt` with the approved client kind, launch command, and
-  forbidden-client guard outcome.
+- `automation-driver.txt` with the auto-selected Gradle `runClient` adapter
+  metadata and forbidden-client guard outcome.
 
 Protocol bots, `wire-probe`, and `mc_test_harness::client::Client` runs may be
 linked as supporting harness evidence, but they must not be recorded as the
@@ -28,24 +29,25 @@ linked as supporting harness evidence, but they must not be recorded as the
 The approved local entrypoint is `tools/run-real-client-regression.sh`:
 
 ```sh
-SOLARIS_REAL_CLIENT_KIND=prism-launcher \
-SOLARIS_REAL_CLIENT_COMMAND='<real PrismLauncher or vanilla client command>' \
-  bash tools/run-real-client-regression.sh --check
+bash tools/run-real-client-regression.sh --check
 
 bash tools/run-real-client-regression.sh --prepare
 
-SOLARIS_REAL_CLIENT_KIND=prism-launcher \
-SOLARIS_REAL_CLIENT_COMMAND='<real PrismLauncher or vanilla client command>' \
-  bash tools/run-real-client-regression.sh --run
+bash tools/run-real-client-regression.sh --run
 ```
 
 Set `SOLARIS_REAL_CLIENT_SERVER_CONFIG=<path>` to use an explicit local config,
 for example a copy of `example.toml` with `data.vanilla_data_dir` enabled.
+During `--run`, the runner writes an effective `server.toml` into the artifact
+directory and grants operator access to the Gradle-launched offline usernames
+(`SolarisPrimary` and `SolarisSecondary`) so the local debug scenarios can use
+`/debug give` without changing the tracked example config.
 
-`--run` starts Solaris, executes the configured real-client command, and writes
-the local artifact directory. It does not mark scenarios passed. After a real
-client executes the pack, fill `observations.json` with `client_gate` set to
-`agent-run-real-client`, attach screenshots/logs, and run:
+`--run` starts Solaris, executes the `:fabric-agent:runClientAgent` task under
+`client-mod/solaris-client-agent` with `--no-configuration-cache`, and writes
+the local artifact directory. It does not mark scenarios passed unless the
+in-client agent driver records executed observations. After a real client
+executes the pack, validate the artifact:
 
 ```sh
 bash tools/run-real-client-regression.sh --validate-run .analysis/real-client-runs/<run_id>
@@ -70,41 +72,34 @@ The invasive real-client path uses a Solaris-owned client agent that exposes a
 loopback-only JSON bridge from inside the actual Minecraft client process. The
 approved external driver is `tools/real-client-agent-driver.py`.
 
-Agent-driver mode is opt-in:
+Agent-driver mode is the normal automated path. The runner generates a per-run
+secret for the primary Gradle client when one is not provided:
 
 ```sh
-SOLARIS_REAL_CLIENT_KIND=prism-launcher \
-SOLARIS_REAL_CLIENT_COMMAND='<real PrismLauncher or vanilla client command>' \
-SOLARIS_REAL_CLIENT_AGENT_SECRET='<per-run secret>' \
-  bash tools/run-real-client-regression.sh --run
+bash tools/run-real-client-regression.sh --run
 ```
 
-Before using the default in-client Java agent, build its jar:
+The primary and secondary client bridges are loaded by the Solaris client-agent
+NeoForge mod in `client-mod/solaris-client-agent/fabric-agent`. The runner starts
+both clients with the repo-native Gradle adapter:
 
 ```sh
-client-mod/solaris-client-agent/gradlew \
-  -p client-mod/solaris-client-agent :java-agent:jar --no-daemon
+client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent
 ```
 
-By default the runner injects
-`client-mod/solaris-client-agent/java-agent/build/libs/java-agent-0.1.0.jar`
-through `JDK_JAVA_OPTIONS` and uses `http://127.0.0.1:39094/rpc`. Override
-the jar with `SOLARIS_REAL_CLIENT_AGENT_JAR`, the port with
-`SOLARIS_REAL_CLIENT_AGENT_PORT`, or the full bridge URL with
-`SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL`. The per-run bridge secret is passed to
-the Java agent through `SOLARIS_CLIENT_AGENT_SECRET`, not on the
-JVM options command line. The runner also adds `--add-modules jdk.httpserver`
-because the loopback bridge uses the JDK HTTP server module.
+The runner picks a free per-run bridge port unless
+`SOLARIS_REAL_CLIENT_AGENT_PORT` or `SOLARIS_REAL_CLIENT_AGENT_BRIDGE_URL` is set
+explicitly. The per-run bridge secret is passed through
+`SOLARIS_CLIENT_AGENT_SECRET` and the Gradle property
+`-Psolaris.clientAgent.secret`, not on a free-form shell command.
 
-Two-client agent gates additionally require
-`SOLARIS_REAL_CLIENT_SECOND_COMMAND` and
-`SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET`; `SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT`
-defaults to `39095`, and `SOLARIS_REAL_CLIENT_SECOND_AGENT_BRIDGE_URL` defaults
-from that port when the second secret is set. When using PrismLauncher for both
-clients, launch the second client from a separate Prism application root such as
-`--dir /home/kaiserroman/solaris/.analysis/prism-second`; otherwise
-PrismLauncher can route the second command to the existing launcher process and
-the second Java agent bridge never starts.
+Two-client agent gates require `SOLARIS_REAL_CLIENT_SECOND_AGENT_SECRET`;
+`SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT` or
+`SOLARIS_REAL_CLIENT_SECOND_AGENT_BRIDGE_URL` can pin the second bridge.
+Otherwise the runner selects a second free loopback port when the second secret
+is set. Primary and secondary Gradle launches use separate per-run game
+directories under the artifact directory and distinct offline usernames
+(`SolarisPrimary` and `SolarisSecondary`).
 
 Set `SOLARIS_REAL_CLIENT_SERVER_ADDR=<host:port>` when the in-client driver
 should connect to a different loopback Solaris address than `127.0.0.1:25565`;
@@ -201,10 +196,10 @@ route. It intentionally returns `blocked`, not `passed`, until swim feel, sugar
 cane support/cascade/drop, the owner frozen-world route, and full TPS/lock
 performance evidence have dedicated real-client or manual gates.
 
-Run them against a local test config whose `[admin]` section allows
-the launched profile to use debug commands, for example by setting
-`allow_local_dev_operators = true` on a loopback-only bind or by listing the
-profile in `operators`.
+The approved runner grants its own launched profiles debug-command access in
+the per-run config. Manual runs outside the runner still need a local test
+config whose `[admin]` section allows the launched profile, for example by
+listing that profile in `operators`.
 
 This path remains non-green until a real client bridge writes
 `observations.json` with `"client_gate": "agent-run-real-client"` and

@@ -2,14 +2,22 @@
   "entities": {
     "minecraft:chicken": "minecraft:chicken",
     "minecraft:cod": "minecraft:cod",
-    "minecraft:cow": "minecraft:beef",
+    "minecraft:cow": [
+      "minecraft:leather",
+      "minecraft:beef"
+    ],
     "minecraft:goat": "minecraft:mutton",
     "minecraft:hoglin": "minecraft:porkchop",
     "minecraft:mooshroom": "minecraft:beef",
     "minecraft:pig": "minecraft:porkchop",
     "minecraft:rabbit": "minecraft:rabbit",
     "minecraft:salmon": "minecraft:salmon",
-    "minecraft:sheep": "minecraft:mutton",
+    "minecraft:sheep": [
+      "minecraft:white_wool",
+      "minecraft:mutton"
+    ],
+    "minecraft:skeleton": "minecraft:bone",
+    "minecraft:spider": "minecraft:string",
     "minecraft:tropical_fish": "minecraft:tropical_fish",
     "minecraft:zombie": "minecraft:rotten_flesh"
   },
@@ -40,6 +48,7 @@
     "minecraft:oak_log": "minecraft:oak_log",
     "minecraft:podzol": "minecraft:dirt",
     "minecraft:redstone_ore": "minecraft:redstone",
+    "minecraft:short_grass": "minecraft:wheat_seeds",
     "minecraft:spruce_log": "minecraft:spruce_log",
     "minecraft:stone": "minecraft:cobblestone"
   }

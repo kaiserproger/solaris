@@ -1,0 +1,26 @@
+modLoader="javafml"
+loaderVersion="[1,)"
+license="All Rights Reserved"
+
+[[mods]]
+modId="solaris_client_agent"
+version="0.1.0"
+displayName="Solaris Client Agent"
+description='''Loopback-only automation bridge for Solaris real-client validation.'''
+
+[[mixins]]
+config="solaris-client-agent.mixins.json"
+
+[[dependencies.solaris_client_agent]]
+modId="neoforge"
+type="required"
+versionRange="[26.1.2.76,)"
+ordering="NONE"
+side="CLIENT"
+
+[[dependencies.solaris_client_agent]]
+modId="minecraft"
+type="required"
+versionRange="[26.1.2]"
+ordering="NONE"
+side="CLIENT"

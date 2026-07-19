@@ -1,6 +1,7 @@
 //! `mc-server` binary entry point.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,6 +16,16 @@ use mc_server::ServerConfig;
 
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(6);
 const STARTUP_LIGHT_BAKE_WORKER_CAP: usize = 16;
+const STARTUP_GENERATION_QUEUE_BATCHES: usize = 8;
+const WORLD_GEOMETRY_CONTRACT_VERSION: u32 = 1;
+const WORLD_GEOMETRY_CONTRACT_FILE: &str = "world-geometry.json";
+
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct PersistedWorldGeometry {
+    version: u32,
+    min_y: i32,
+    height: i32,
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -39,6 +50,217 @@ fn load_config(path: &Path) -> Result<ServerConfig> {
     toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))
 }
 
+fn required_world_dir(config: &ServerConfig) -> Result<&Path> {
+    let Some(world_dir) = config.data.world_dir.as_deref() else {
+        bail!("data.world_dir is required to start a playable persistent server");
+    };
+    match std::fs::metadata(world_dir) {
+        Ok(metadata) if !metadata.is_dir() => {
+            bail!("data.world_dir is not a directory: {}", world_dir.display());
+        }
+        Ok(_) if world_region_root_is_blocked(world_dir) => {
+            bail!(
+                "data.world_dir region path is not a directory: {}",
+                world_dir.join("region").display()
+            );
+        }
+        Ok(_) => {}
+        Err(_) if has_non_directory_ancestor(world_dir) => {
+            bail!(
+                "data.world_dir has a non-directory parent: {}",
+                world_dir.display()
+            );
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading data.world_dir metadata for {}",
+                    world_dir.display()
+                )
+            });
+        }
+    }
+    Ok(world_dir)
+}
+
+fn validate_runtime_config(config: &ServerConfig) -> Result<()> {
+    required_world_dir(config)?;
+    config.data.chunk_geometry().map_err(anyhow::Error::msg)?;
+    if !(mc_net::MIN_VIEW_DISTANCE..=mc_net::MAX_VIEW_DISTANCE)
+        .contains(&config.server.view_distance)
+    {
+        bail!(
+            "server.view_distance must be between {} and {} (inclusive)",
+            mc_net::MIN_VIEW_DISTANCE,
+            mc_net::MAX_VIEW_DISTANCE,
+        );
+    }
+    if !(mc_net::MIN_VIEW_DISTANCE..=mc_net::MAX_VIEW_DISTANCE)
+        .contains(&config.server.simulation_distance)
+    {
+        bail!(
+            "server.simulation_distance must be between {} and {} (inclusive)",
+            mc_net::MIN_VIEW_DISTANCE,
+            mc_net::MAX_VIEW_DISTANCE,
+        );
+    }
+    if config.simulation.save_interval_ticks == 0 {
+        bail!("simulation.save_interval_ticks must be greater than 0");
+    }
+    if let Some(vanilla_data_dir) = config.data.vanilla_data_dir.as_deref() {
+        validate_vanilla_sidecar_version(vanilla_data_dir)?;
+    }
+    Ok(())
+}
+
+fn world_geometry_contract_path(world_dir: &Path) -> PathBuf {
+    world_dir.join("solaris").join(WORLD_GEOMETRY_CONTRACT_FILE)
+}
+
+fn ensure_world_geometry_contract(
+    world_dir: &Path,
+    configured: mc_world::ChunkGeometry,
+) -> Result<()> {
+    let path = world_geometry_contract_path(world_dir);
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let persisted: PersistedWorldGeometry = serde_json::from_slice(&bytes)
+                .with_context(|| format!("reading persisted world geometry {}", path.display()))?;
+            if persisted.version != WORLD_GEOMETRY_CONTRACT_VERSION {
+                bail!(
+                    "unsupported persisted world geometry version {} in {}; expected {}",
+                    persisted.version,
+                    path.display(),
+                    WORLD_GEOMETRY_CONTRACT_VERSION,
+                );
+            }
+            let stored = mc_world::ChunkGeometry::new(persisted.min_y, persisted.height)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid persisted world geometry min_y={} height={} in {}",
+                        persisted.min_y,
+                        persisted.height,
+                        path.display(),
+                    )
+                })?;
+            if stored != configured {
+                bail!(
+                    "persisted world geometry {}..{} in {} does not match configured geometry {}..{}",
+                    stored.min_y(),
+                    stored.max_y(),
+                    path.display(),
+                    configured.min_y(),
+                    configured.max_y(),
+                );
+            }
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if configured != mc_world::OVERWORLD_GEOMETRY && world_contains_anvil_data(world_dir)? {
+                bail!(
+                    "missing persisted world geometry {} for custom geometry {}..{} with existing Anvil data; restore the original geometry contract or migrate the world explicitly",
+                    path.display(),
+                    configured.min_y(),
+                    configured.max_y(),
+                );
+            }
+            write_world_geometry_contract(&path, configured)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("reading persisted world geometry {}", path.display())),
+    }
+}
+
+fn world_contains_anvil_data(world_dir: &Path) -> Result<bool> {
+    for region_dir in [
+        world_dir.join("dimensions/minecraft/overworld/region"),
+        world_dir.join("region"),
+    ] {
+        let entries = match std::fs::read_dir(&region_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("checking existing Anvil data in {}", region_dir.display())
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("checking existing Anvil data in {}", region_dir.display())
+            })?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("checking Anvil entry {}", entry.path().display()))?;
+            if file_type.is_file()
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("mca"))
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn write_world_geometry_contract(path: &Path, geometry: mc_world::ChunkGeometry) -> Result<()> {
+    let parent = path
+        .parent()
+        .expect("world geometry contract path has a parent");
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating Solaris metadata directory {}", parent.display()))?;
+    let metadata = PersistedWorldGeometry {
+        version: WORLD_GEOMETRY_CONTRACT_VERSION,
+        min_y: geometry.min_y(),
+        height: geometry.height(),
+    };
+    let bytes =
+        serde_json::to_vec_pretty(&metadata).context("encoding persisted world geometry")?;
+    let temporary = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .with_context(|| {
+            format!(
+                "creating temporary world geometry contract {}",
+                temporary.display()
+            )
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.write_all(b"\n"))
+        .and_then(|()| file.sync_all())
+        .with_context(|| {
+            format!(
+                "writing temporary world geometry contract {}",
+                temporary.display()
+            )
+        })?;
+    std::fs::rename(&temporary, path).with_context(|| {
+        format!(
+            "installing persisted world geometry {} from {}",
+            path.display(),
+            temporary.display()
+        )
+    })?;
+    sync_metadata_directory(parent)
+}
+
+#[cfg(unix)]
+fn sync_metadata_directory(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("syncing Solaris metadata directory {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_metadata_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn check_config(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
     let _ip: IpAddr = cfg.network.bind_address.parse().with_context(|| {
@@ -47,6 +269,7 @@ fn check_config(path: &Path) -> Result<()> {
             cfg.network.bind_address
         )
     })?;
+    validate_runtime_config(&cfg)?;
     let effective = EffectiveConfig::from(&cfg);
     let rendered = serde_json::to_string_pretty(&effective).context("rendering config as JSON")?;
     println!("{rendered}");
@@ -88,6 +311,51 @@ struct VanillaVersionMetadata {
     protocol_version: i32,
 }
 
+fn validate_vanilla_sidecar_version(vanilla_data_dir: &Path) -> Result<()> {
+    let metadata = std::fs::metadata(vanilla_data_dir).with_context(|| {
+        format!(
+            "reading vanilla sidecar directory metadata for {}",
+            vanilla_data_dir.display()
+        )
+    })?;
+    if !metadata.is_dir() {
+        bail!(
+            "data.vanilla_data_dir is not a directory: {}",
+            vanilla_data_dir.display()
+        );
+    }
+
+    let path = vanilla_data_dir.join("version.json");
+    let raw = std::fs::read(&path)
+        .with_context(|| format!("reading vanilla sidecar version from {}", path.display()))?;
+    let version = serde_json::from_slice::<VanillaVersionMetadata>(&raw)
+        .with_context(|| format!("parsing vanilla sidecar version from {}", path.display()))?;
+
+    if version.id != mc_protocol::TARGET_RELEASE {
+        bail!(
+            "vanilla sidecar release id {:?} does not match Solaris target {:?}",
+            version.id,
+            mc_protocol::TARGET_RELEASE
+        );
+    }
+    if version.world_version != mc_protocol::WORLD_VERSION {
+        bail!(
+            "vanilla sidecar world_version {} does not match Solaris world version {}",
+            version.world_version,
+            mc_protocol::WORLD_VERSION
+        );
+    }
+    if version.protocol_version != mc_protocol::PROTOCOL_VERSION {
+        bail!(
+            "vanilla sidecar protocol_version {} does not match Solaris protocol version {}",
+            version.protocol_version,
+            mc_protocol::PROTOCOL_VERSION
+        );
+    }
+
+    Ok(())
+}
+
 fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
     let mut warnings = Vec::new();
     match &config.data.world_dir {
@@ -97,19 +365,19 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                     if !metadata.is_dir() {
                         warnings.push(OperatorWarning {
                             code: "world_dir_not_directory",
-                            message: "[data].world_dir exists but is not a directory; serve will start without usable world storage",
+                            message: "[data].world_dir exists but is not a directory; check and serve reject this configuration",
                         });
                     } else if world_region_root_is_blocked(world_dir) {
                         warnings.push(OperatorWarning {
                             code: "world_region_not_directory",
-                            message: "[data].world_dir/region exists but is not a directory, and no modern overworld region directory exists; serve will start without usable world storage",
+                            message: "[data].world_dir/region exists but is not a directory, and no modern overworld region directory exists; check and serve reject this configuration",
                         });
                     }
                 }
                 Err(_) if has_non_directory_ancestor(world_dir) => {
                     warnings.push(OperatorWarning {
                         code: "world_dir_parent_not_directory",
-                        message: "[data].world_dir has a non-directory parent path; serve cannot create usable world storage",
+                        message: "[data].world_dir has a non-directory parent path; check and serve reject this configuration",
                     });
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -120,14 +388,14 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
                 }
                 Err(_) => warnings.push(OperatorWarning {
                     code: "world_dir_metadata_unavailable",
-                    message: "[data].world_dir metadata is unavailable; serve may fail to open persistent world storage",
+                    message: "[data].world_dir metadata is unavailable; check and serve reject this configuration",
                 }),
             }
         }
         None => {
             warnings.push(OperatorWarning {
                 code: "missing_world_dir",
-                message: "no [data].world_dir configured; serve will start without persistent chunk streaming",
+                message: "no [data].world_dir configured; check and serve reject this configuration",
             });
         }
     }
@@ -234,13 +502,6 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         }
     }
 
-    if config.simulation.save_interval_ticks == 0 {
-        warnings.push(OperatorWarning {
-            code: "simulation_save_interval_ticks_zero",
-            message: "simulation.save_interval_ticks is 0; serve will clamp it to 1 tick, causing continuous save pressure",
-        });
-    }
-
     if config
         .admin
         .operators
@@ -276,13 +537,6 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
         });
     }
 
-    if config.auth.online_mode {
-        warnings.push(OperatorWarning {
-            code: "online_mode_unsupported",
-            message: "auth.online_mode is configured, but Solaris does not implement Mojang online-mode authentication; serve will reject logins",
-        });
-    }
-
     let Some(ip) = config.network.bind_address.parse::<IpAddr>().ok() else {
         return warnings;
     };
@@ -296,12 +550,7 @@ fn operator_warnings(config: &ServerConfig) -> Vec<OperatorWarning> {
             message: "allow_local_dev_operators cannot be enabled on a public bind address; serve will fail",
         });
     }
-    if config.auth.online_mode {
-        warnings.push(OperatorWarning {
-            code: "public_bind_online_mode",
-            message: "online-mode authentication is not implemented on public bind addresses; serve will fail",
-        });
-    } else {
+    if !config.auth.online_mode {
         warnings.push(OperatorWarning {
             code: "public_bind_offline_mode",
             message: "offline-mode Solaris authentication cannot be used on a public bind address; serve will fail",
@@ -351,7 +600,8 @@ fn vanilla_tags_are_usable(vanilla_data_dir: &Path) -> bool {
         return false;
     };
     let items = mc_data::items::solaris_required_items();
-    load_effective_tags(Some(vanilla_data_dir), &protocol_data.data, &items).is_ok()
+    let blocks = mc_data::blocks::solaris_required_blocks_report();
+    load_effective_tags(Some(vanilla_data_dir), &protocol_data.data, &items, &blocks).is_ok()
 }
 
 fn vanilla_recipes_are_usable(vanilla_data_dir: &Path) -> bool {
@@ -398,7 +648,6 @@ fn is_public_bind_ip(ip: IpAddr) -> bool {
 struct EffectiveChunkPipeline {
     chunk_io_threads: usize,
     chunk_worker_threads: usize,
-    entity_worker_threads: usize,
 }
 
 impl From<mc_net::ChunkPipelinePolicy> for EffectiveChunkPipeline {
@@ -406,7 +655,6 @@ impl From<mc_net::ChunkPipelinePolicy> for EffectiveChunkPipeline {
         Self {
             chunk_io_threads: policy.chunk_io_threads,
             chunk_worker_threads: policy.chunk_worker_threads,
-            entity_worker_threads: policy.entity_worker_threads,
         }
     }
 }
@@ -425,7 +673,7 @@ impl From<&ServerConfig> for EffectiveAutoscale {
         Self {
             enabled: config.autoscale.enabled,
             runtime_mode: if config.autoscale.enabled {
-                "live_chunk_send_rate"
+                "live_adaptive_work_budgets"
             } else {
                 "disabled"
             },
@@ -474,7 +722,6 @@ struct EffectiveAutoscalePolicy {
     target_tick_ms: u64,
     target_first_chunk_ms: u64,
     queue_pressure_percent: u8,
-    worker_pressure_percent: u8,
     memory_pressure_percent: u8,
     scale_down_after_ticks: u32,
     scale_up_after_ticks: u32,
@@ -494,7 +741,6 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
             target_tick_ms: policy.target_tick_ms,
             target_first_chunk_ms: policy.target_first_chunk_ms,
             queue_pressure_percent: policy.queue_pressure_percent,
-            worker_pressure_percent: policy.worker_pressure_percent,
             memory_pressure_percent: policy.memory_pressure_percent,
             scale_down_after_ticks: policy.scale_down_after_ticks,
             scale_up_after_ticks: policy.scale_up_after_ticks,
@@ -504,6 +750,10 @@ impl From<mc_net::AutoscalePolicy> for EffectiveAutoscalePolicy {
 
 async fn serve(path: &Path) -> Result<()> {
     let cfg = load_config(path)?;
+    validate_runtime_config(&cfg)?;
+    let configured_geometry = cfg.data.chunk_geometry().map_err(anyhow::Error::msg)?;
+    let world_dir = required_world_dir(&cfg)?;
+    ensure_world_geometry_contract(world_dir, configured_geometry)?;
 
     let protocol_data = load_effective_protocol_data(cfg.data.vanilla_data_dir.as_deref())?;
     let data = protocol_data.data;
@@ -534,20 +784,44 @@ async fn serve(path: &Path) -> Result<()> {
         source = block_light_source.source,
         "block-light table loaded",
     );
-    let structure_rules = mc_worldgen::StructureRules::none();
+    let block_mining_source =
+        load_effective_block_mining(cfg.data.vanilla_data_dir.as_deref(), &blocks_report)?;
+    tracing::info!(
+        states = block_mining_source
+            .table
+            .as_ref()
+            .map_or(0, |table| table.len()),
+        source = block_mining_source.source,
+        "block-mining table loaded",
+    );
+    let block_explosion_source =
+        load_effective_block_explosion(cfg.data.vanilla_data_dir.as_deref())?;
+    tracing::info!(
+        states = block_explosion_source
+            .table
+            .as_ref()
+            .map_or(0, |table| table.len()),
+        source = block_explosion_source.source,
+        "block-explosion table loaded",
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    tracing::info!(entries = items.len(), "embedded item registry loaded");
+    let structure_rules =
+        structure_rules_for_startup(cfg.data.seed, cfg.data.worldgen_mode, &blocks, &items)?;
     let chunk_pipeline = cfg.chunk_pipeline.to_network();
     let terrain_generator = build_terrain_generator(
         cfg.data.seed,
         cfg.data.worldgen_mode.to_worldgen(),
+        configured_geometry,
         Arc::clone(&blocks),
         structure_rules,
     )?;
-    let items = Arc::new(mc_data::items::solaris_required_items());
-    tracing::info!(entries = items.len(), "embedded item registry loaded");
-    let item_facts = Arc::new(mc_data::item_components::solaris_required_item_facts());
+    let item_facts_source = load_effective_item_facts(cfg.data.vanilla_data_dir.as_deref())?;
+    let item_facts = Arc::new(item_facts_source.table);
     tracing::info!(
         entries = item_facts.len(),
-        "embedded item component facts loaded"
+        source = item_facts_source.source,
+        "item component facts loaded"
     );
 
     let world: Option<mc_net::WorldHandle> = if let Some(world_dir) = &cfg.data.world_dir {
@@ -621,23 +895,22 @@ async fn serve(path: &Path) -> Result<()> {
                 Some(Arc::new(tokio::sync::Mutex::new(storage)))
             }
             Err(err) => {
-                tracing::warn!(
-                    path = %world_dir.display(),
-                    error = %err,
-                    "world directory not usable; starting without world (chunk queries will return None)",
-                );
-                None
+                return Err(err).with_context(|| {
+                    format!("opening configured world directory {}", world_dir.display())
+                });
             }
         }
     } else {
-        tracing::warn!(
-            "no [data].world_dir configured; chunks will not stream until one is wired up",
-        );
-        None
+        bail!("data.world_dir is required to start a playable persistent server");
     };
 
     let data = Arc::new(data);
-    let tag_source = load_effective_tags(cfg.data.vanilla_data_dir.as_deref(), &data, &items)?;
+    let tag_source = load_effective_tags(
+        cfg.data.vanilla_data_dir.as_deref(),
+        &data,
+        &items,
+        &blocks_report,
+    )?;
     let tags = Arc::new(tag_source.tags);
     tracing::info!(
         tags = tags.total_tags(),
@@ -660,9 +933,14 @@ async fn serve(path: &Path) -> Result<()> {
         "survival loot tables loaded"
     );
 
-    let block_facts = Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+    let mut block_facts = mc_data::block_facts::BlockFactsTable::from_blocks_report_with_mining(
         &blocks_report,
-    ));
+        block_mining_source.table.as_ref(),
+    );
+    if let Some(table) = block_explosion_source.table {
+        block_facts = block_facts.with_explosion_table(table);
+    }
+    let block_facts = Arc::new(block_facts);
     tracing::info!(
         states = block_facts.len(),
         random_tick_states = block_facts.eligible_states(),
@@ -703,11 +981,38 @@ async fn serve(path: &Path) -> Result<()> {
         "Solaris starting",
     );
 
-    // M29.f: race the network listener against a Ctrl-C signal. On
-    // signal, request shutdown before the final save so gameplay tasks
-    // stop mutating state first.
     let shutdown_handle = net.shutdown.clone();
-    let bound = mc_net::bind(net).await.context("network bind")?;
+    let (bound, lua_host) = if let Some(directory) = cfg.plugins.directory.as_deref() {
+        let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(directory))
+            .with_context(|| format!("starting Lua plugins from {}", directory.display()))?;
+        tracing::info!(
+            directory = %directory.display(),
+            loaded = host.loaded_plugins(),
+            "Lua plugin host started"
+        );
+        match mc_net::bind_with_scripts(net, boundary).await {
+            Ok(bound) => (bound, Some(host)),
+            Err(error) => {
+                join_lua_host(host).await?;
+                return Err(error).context("network bind");
+            }
+        }
+    } else {
+        (mc_net::bind(net).await.context("network bind")?, None)
+    };
+    let result = run_bound_server(bound, shutdown_handle).await;
+    if let Some(host) = lua_host {
+        join_lua_host(host).await?;
+    }
+    result
+}
+
+async fn run_bound_server(
+    bound: mc_net::BoundServer,
+    shutdown_handle: mc_net::ShutdownHandle,
+) -> Result<()> {
+    // Race the listener against Ctrl-C. A signal requests runtime drain before
+    // the final save, so gameplay tasks stop mutating state first.
     let save_handle = bound.save_handle();
     let runtime_control = bound.runtime_control_handle();
     let mut run_fut = std::pin::pin!(bound.serve());
@@ -728,7 +1033,7 @@ async fn serve(path: &Path) -> Result<()> {
                 &shutdown_handle,
                 runtime_control.as_ref(),
                 run_fut.as_mut(),
-                save_handle.save_all(),
+                save_handle.save_all_after_drain(),
             ).await;
             match drain_result {
                 Ok(Ok(())) => tracing::info!("shutdown: runtime tasks drained"),
@@ -754,6 +1059,16 @@ async fn serve(path: &Path) -> Result<()> {
     }
 }
 
+async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
+    let result = tokio::task::spawn_blocking(move || host.join())
+        .await
+        .context("joining Lua host task")?;
+    if result.is_err() {
+        bail!("Lua host thread panicked");
+    }
+    Ok(())
+}
+
 async fn request_shutdown_drain_then_save<D, S, SR>(
     shutdown: &mc_net::ShutdownHandle,
     runtime_control: Option<&mc_net::RuntimeControlHandle>,
@@ -776,6 +1091,7 @@ where
 fn build_terrain_generator(
     seed: i64,
     worldgen_mode: mc_worldgen::WorldgenMode,
+    geometry: mc_world::ChunkGeometry,
     blocks: Arc<mc_world::BlockRegistry>,
     structure_rules: mc_worldgen::StructureRules,
 ) -> Result<Arc<mc_worldgen::TerrainGenerator>> {
@@ -784,13 +1100,33 @@ fn build_terrain_generator(
     Ok(Arc::new(
         mc_worldgen::TerrainGenerator::try_with_biome_rules(seed, blocks, biomes)
             .context("building terrain generator")?
+            .with_geometry(geometry)
             .with_mode(worldgen_mode)
             .with_structures(structure_rules),
     ))
 }
 
+fn structure_rules_for_startup(
+    seed: i64,
+    worldgen_mode: mc_server::WorldgenMode,
+    blocks: &mc_world::BlockRegistry,
+    items: &mc_data::items::ItemRegistry,
+) -> Result<mc_worldgen::StructureRules> {
+    if seed == 0 && worldgen_mode == mc_server::WorldgenMode::VanillaLike {
+        return mc_worldgen::StructureRules::solaris_playable_ruin(blocks, items)
+            .context("resolving Solaris playable ruin");
+    }
+    Ok(mc_worldgen::StructureRules::none())
+}
+
 fn chunk_cache_size_for_view_distance(view_distance: i32) -> usize {
-    let width = view_distance.max(0) as usize * 2 + 3;
+    let view_distance = view_distance.max(0) as usize;
+    let radius = if view_distance == 0 {
+        1
+    } else {
+        view_distance + 2
+    };
+    let width = radius * 2 + 1;
     width * width
 }
 
@@ -832,67 +1168,99 @@ fn generate_spawn_window(
 
     let positions = Arc::new(positions);
     let next = Arc::new(AtomicUsize::new(0));
-    let (tx, rx) = std::sync::mpsc::channel();
+    let queue_batches = workers.clamp(1, STARTUP_GENERATION_QUEUE_BATCHES);
+    let (tx, rx) = std::sync::mpsc::sync_channel(queue_batches);
     let batch_size = 8usize.min(total);
-    for _ in 0..workers {
-        let positions = Arc::clone(&positions);
-        let next = Arc::clone(&next);
-        let tx = tx.clone();
-        let generator = Arc::clone(&generator);
-        std::thread::spawn(move || {
-            let mut batch = Vec::with_capacity(batch_size);
-            loop {
-                let idx = next.fetch_add(1, Ordering::Relaxed);
-                let Some(&pos) = positions.get(idx) else {
-                    break;
-                };
-                let chunk = generator.generate(pos);
-                batch.push((pos, chunk));
-                if batch.len() >= batch_size && tx.send(std::mem::take(&mut batch)).is_err() {
-                    break;
-                }
-            }
-            if !batch.is_empty() {
-                let _ = tx.send(batch);
-            }
-        });
-    }
-    drop(tx);
-
     let started = Instant::now();
-    let mut last_log = Instant::now();
     let log_every = (total / 20).max(64);
-    let mut generated = 0usize;
-    for batch in rx {
-        for (pos, chunk) in batch {
-            if storage.stats().dirty_chunk_cache_saturated {
-                storage.flush_dirty().with_context(|| {
-                    format!(
-                        "flushing dirty chunks before pre-generating spawn chunk ({}, {})",
-                        pos.x, pos.z
-                    )
-                })?;
+    let generated = std::thread::scope(|scope| -> Result<usize> {
+        let mut handles = Vec::with_capacity(workers);
+        for worker_index in 0..workers {
+            let positions = Arc::clone(&positions);
+            let next = Arc::clone(&next);
+            let tx = tx.clone();
+            let generator = Arc::clone(&generator);
+            let handle = std::thread::Builder::new()
+                .name(format!("solaris-spawn-gen-{worker_index}"))
+                .spawn_scoped(scope, move || {
+                    let mut batch = Vec::with_capacity(batch_size);
+                    loop {
+                        let idx = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&pos) = positions.get(idx) else {
+                            break;
+                        };
+                        let chunk = generator.generate(pos);
+                        batch.push((pos, chunk));
+                        if batch.len() >= batch_size && tx.send(std::mem::take(&mut batch)).is_err()
+                        {
+                            break;
+                        }
+                    }
+                    if !batch.is_empty() {
+                        let _ = tx.send(batch);
+                    }
+                })
+                .with_context(|| format!("spawning worldgen worker {worker_index}"))?;
+            handles.push(handle);
+        }
+        drop(tx);
+
+        let mut generated = 0usize;
+        let mut last_log = Instant::now();
+        let mut consumer_error = None;
+        'receive: while let Ok(batch) = rx.recv() {
+            for (pos, chunk) in batch {
+                if storage.stats().dirty_chunk_cache_saturated
+                    && let Err(error) = storage.flush_dirty().with_context(|| {
+                        format!(
+                            "flushing dirty chunks before pre-generating spawn chunk ({}, {})",
+                            pos.x, pos.z
+                        )
+                    })
+                {
+                    consumer_error = Some(error);
+                    break 'receive;
+                }
+                if let Err(error) = storage
+                    .insert_generated_chunk(pos, chunk)
+                    .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))
+                {
+                    consumer_error = Some(error);
+                    break 'receive;
+                }
+                generated += 1;
             }
-            storage
-                .insert_generated_chunk(pos, chunk)
-                .with_context(|| format!("pre-generating spawn chunk ({}, {})", pos.x, pos.z))?;
-            generated += 1;
+            if generated == total
+                || generated.is_multiple_of(log_every)
+                || last_log.elapsed() >= Duration::from_secs(2)
+            {
+                let percent = (generated * 90 / total).min(90);
+                tracing::info!("Preparing world... {percent}%");
+                tracing::info!(
+                    generated,
+                    total,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "empty world pre-generation progress",
+                );
+                last_log = Instant::now();
+            }
         }
-        if generated == total
-            || generated.is_multiple_of(log_every)
-            || last_log.elapsed() >= Duration::from_secs(2)
-        {
-            let percent = (generated * 90 / total).min(90);
-            tracing::info!("Preparing world... {percent}%");
-            tracing::info!(
-                generated,
-                total,
-                elapsed_ms = started.elapsed().as_millis(),
-                "empty world pre-generation progress",
-            );
-            last_log = Instant::now();
+        drop(rx);
+
+        let worker_panicked = handles
+            .into_iter()
+            .fold(false, |panicked, handle| handle.join().is_err() || panicked);
+        if let Some(error) = consumer_error {
+            return Err(error);
         }
-    }
+        if worker_panicked {
+            bail!("spawn pre-generation worker panicked");
+        }
+        if generated != total {
+            bail!("spawn pre-generation incomplete: generated {generated} of {total} chunks");
+        }
+        Ok(generated)
+    })?;
 
     let elapsed = started.elapsed();
     let chunks_per_second = generated as f64 / elapsed.as_secs_f64().max(0.001);
@@ -991,7 +1359,7 @@ fn bake_missing_spawn_window_light(
                 pos.z
             );
         };
-        if mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights).is_none() {
+        if mc_world::light::ChunkLight::from_chunk(&chunk).is_none() {
             missing.push(pos);
         }
     }
@@ -1091,14 +1459,13 @@ fn bake_spawn_window_light_for_positions(
         drop(tx);
         for batch in rx {
             for (pos, light) in batch? {
-                let Some(chunk) = storage.get_chunk_mut(pos)? else {
+                if !storage.set_baked_light(pos, &light)? {
                     bail!(
                         "missing generated chunk ({}, {}) while storing baked spawn light",
                         pos.x,
                         pos.z
                     );
-                };
-                chunk.set_baked_light(&light);
+                }
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -1163,6 +1530,7 @@ struct EffectiveProtocolData {
 
 fn load_effective_protocol_data(vanilla_data_dir: Option<&Path>) -> Result<EffectiveProtocolData> {
     if let Some(vanilla_data_dir) = vanilla_data_dir {
+        validate_vanilla_sidecar_version(vanilla_data_dir)?;
         let data = mc_data::load(vanilla_data_dir).with_context(|| {
             format!(
                 "loading vanilla registry data from {}",
@@ -1190,6 +1558,7 @@ fn load_effective_tags(
     vanilla_data_dir: Option<&Path>,
     data: &mc_data::VanillaData,
     items: &mc_data::items::ItemRegistry,
+    blocks: &[mc_data::blocks::BlockReport],
 ) -> Result<EffectiveTags> {
     if let Some(vanilla_data_dir) = vanilla_data_dir {
         let tags = mc_data::tags::load(vanilla_data_dir, data)
@@ -1220,7 +1589,7 @@ fn load_effective_tags(
     }
 
     Ok(EffectiveTags {
-        tags: mc_data::tags::solaris_required_item_tags(items),
+        tags: mc_data::tags::solaris_required_client_tags(items, blocks),
         source: "embedded_solaris_fallback",
     })
 }
@@ -1231,12 +1600,14 @@ fn load_effective_loot(vanilla_data_dir: Option<&Path>) -> Result<EffectiveLootT
             .join("data")
             .join("minecraft")
             .join("loot_table");
-        let tables = mc_data::loot::load_vanilla_subset(&root)
+        let mut tables = mc_data::loot::load_vanilla_subset(&root)
             .with_context(|| format!("loading vanilla loot tables from {}", root.display()))?;
         if tables.total_drops() > 0 {
+            tables.fill_missing_from(mc_data::loot::builtin());
+            tables.fill_missing_entity_items_from(mc_data::loot::builtin());
             return Ok(EffectiveLootTables {
                 tables,
-                source: "vanilla_sidecar_simple_subset",
+                source: "vanilla_sidecar_simple_subset+embedded_fallback",
             });
         }
         bail!(
@@ -1262,12 +1633,23 @@ fn load_effective_recipes(vanilla_data_dir: Option<&Path>) -> Result<EffectiveRe
             .join("data")
             .join("minecraft")
             .join("recipe");
-        let recipes = mc_data::recipes::load_recipes(&root)
+        let sidecar_recipes = mc_data::recipes::load_recipes(&root)
             .with_context(|| format!("loading vanilla recipes from {}", root.display()))?;
-        if !recipes.is_empty() {
+        if !sidecar_recipes.is_empty() {
+            let mut sidecar_by_id: BTreeMap<_, _> = sidecar_recipes
+                .into_iter()
+                .map(|recipe| (recipe.id.clone(), recipe))
+                .collect();
+            let embedded = mc_data::recipes::solaris_required_recipes();
+            let mut recipes = Vec::with_capacity(embedded.len() + sidecar_by_id.len());
+            for fallback in embedded {
+                let recipe = sidecar_by_id.remove(&fallback.id).unwrap_or(fallback);
+                recipes.push(recipe);
+            }
+            recipes.extend(sidecar_by_id.into_values());
             return Ok(EffectiveRecipes {
                 recipes,
-                source: "vanilla_sidecar",
+                source: "vanilla_sidecar+stable_embedded_prefix",
             });
         }
         bail!(
@@ -1285,6 +1667,119 @@ fn load_effective_recipes(vanilla_data_dir: Option<&Path>) -> Result<EffectiveRe
 struct EffectiveBlockLight {
     table: mc_data::block_light::BlockLightTable,
     source: &'static str,
+}
+
+struct EffectiveItemFacts {
+    table: mc_data::item_components::ItemFactsTable,
+    source: &'static str,
+}
+
+struct EffectiveBlockMining {
+    table: Option<mc_data::block_mining::BlockMiningTable>,
+    source: &'static str,
+}
+
+struct EffectiveBlockExplosion {
+    table: Option<mc_data::block_explosion::BlockExplosionTable>,
+    source: &'static str,
+}
+
+fn load_effective_block_explosion(
+    vanilla_data_dir: Option<&Path>,
+) -> Result<EffectiveBlockExplosion> {
+    let Some(vanilla_data_dir) = vanilla_data_dir else {
+        return Ok(EffectiveBlockExplosion {
+            table: None,
+            source: "embedded_solaris_fallback",
+        });
+    };
+
+    let path = vanilla_data_dir
+        .join("reports")
+        .join("block_explosion.json");
+    let table =
+        mc_data::block_explosion::load_block_explosion_report(&path).with_context(|| {
+            format!(
+                "loading vanilla block-explosion table from {}",
+                path.display()
+            )
+        })?;
+    Ok(EffectiveBlockExplosion {
+        table: Some(table),
+        source: "vanilla_sidecar",
+    })
+}
+
+fn load_effective_block_mining(
+    vanilla_data_dir: Option<&Path>,
+    blocks_report: &[mc_data::blocks::BlockReport],
+) -> Result<EffectiveBlockMining> {
+    let Some(vanilla_data_dir) = vanilla_data_dir else {
+        return Ok(EffectiveBlockMining {
+            table: None,
+            source: "embedded_solaris_fallback",
+        });
+    };
+
+    let path = vanilla_data_dir.join("reports").join("block_mining.json");
+    let table = mc_data::block_mining::load(&path)
+        .with_context(|| format!("loading vanilla block-mining table from {}", path.display()))?;
+    if let Some(max_state_id) = blocks_report
+        .iter()
+        .flat_map(|block| block.states.iter().map(|state| state.id as usize))
+        .max()
+        && table.len() <= max_state_id
+    {
+        bail!(
+            "vanilla block-mining table from {} has {} states but blocks report requires state id {max_state_id}",
+            path.display(),
+            table.len()
+        );
+    }
+    if table.version != mc_protocol::TARGET_RELEASE {
+        bail!(
+            "vanilla block-mining table from {} targets {} but Solaris targets {}",
+            path.display(),
+            table.version,
+            mc_protocol::TARGET_RELEASE
+        );
+    }
+
+    Ok(EffectiveBlockMining {
+        table: Some(table),
+        source: "vanilla_sidecar",
+    })
+}
+
+fn load_effective_item_facts(vanilla_data_dir: Option<&Path>) -> Result<EffectiveItemFacts> {
+    if let Some(vanilla_data_dir) = vanilla_data_dir {
+        let path = vanilla_data_dir
+            .join("reports")
+            .join("minecraft")
+            .join("components")
+            .join("item");
+        let table = mc_data::item_components::load_item_facts(&path).with_context(|| {
+            format!(
+                "loading vanilla item component facts from {}",
+                path.display()
+            )
+        })?;
+        if table.is_empty() {
+            bail!(
+                "vanilla item component facts from {} were empty; rerun tools/extract-vanilla-data.sh",
+                path.display()
+            );
+        }
+        return Ok(EffectiveItemFacts {
+            table,
+            source: "vanilla_sidecar",
+        });
+    }
+
+    Ok(EffectiveItemFacts {
+        table: mc_data::item_components::solaris_required_item_facts(),
+        source: "embedded_solaris_fallback",
+    })
 }
 
 fn load_effective_block_light(
@@ -1450,8 +1945,94 @@ mod tests {
     #[test]
     fn chunk_cache_size_covers_view_plus_light_border() {
         assert_eq!(chunk_cache_size_for_view_distance(0), 9);
-        assert_eq!(chunk_cache_size_for_view_distance(10), 529);
+        assert_eq!(chunk_cache_size_for_view_distance(4), 169);
+        assert_eq!(chunk_cache_size_for_view_distance(10), 625);
         assert_eq!(chunk_cache_size_for_view_distance(-1), 9);
+    }
+
+    #[test]
+    fn runtime_config_rejects_invalid_chunk_geometry() {
+        let world = tempfile::tempdir().unwrap();
+        let toml_src = format!(
+            r#"
+                [server]
+                name = "S"
+                motd = "M"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+
+                [data]
+                world_dir = "{}"
+                min_y = 1
+                height = 255
+            "#,
+            world.path().display()
+        );
+        let config: ServerConfig = toml::from_str(&toml_src).unwrap();
+
+        let error = validate_runtime_config(&config).unwrap_err();
+
+        assert!(error.to_string().contains("data.min_y (1)"), "{error:#}");
+        assert!(error.to_string().contains("data.height (255)"), "{error:#}");
+    }
+
+    #[test]
+    fn world_geometry_contract_rejects_mismatched_restart_before_world_open() {
+        let world = tempfile::tempdir().unwrap();
+        let original = mc_world::ChunkGeometry::new(0, 256).unwrap();
+        let changed = mc_world::ChunkGeometry::new(-64, 384).unwrap();
+
+        ensure_world_geometry_contract(world.path(), original).unwrap();
+        let bytes = std::fs::read(world_geometry_contract_path(world.path())).unwrap();
+        let persisted: PersistedWorldGeometry = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(persisted.version, WORLD_GEOMETRY_CONTRACT_VERSION);
+        assert_eq!(persisted.min_y, 0);
+        assert_eq!(persisted.height, 256);
+
+        let error = ensure_world_geometry_contract(world.path(), changed).unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("persisted world geometry"), "{message}");
+        assert!(message.contains("0..256"), "{message}");
+        assert!(message.contains("-64..320"), "{message}");
+    }
+
+    #[test]
+    fn world_geometry_contract_rejects_legacy_custom_world_with_anvil_data() {
+        let world = tempfile::tempdir().unwrap();
+        let region = world.path().join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(
+            region.join("r.12.-7.mca"),
+            b"not read during metadata preflight",
+        )
+        .unwrap();
+
+        let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
+        let error = ensure_world_geometry_contract(world.path(), geometry).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("missing persisted world geometry"),
+            "{message}"
+        );
+        assert!(message.contains("existing Anvil data"), "{message}");
+        assert!(!world_geometry_contract_path(world.path()).exists());
+    }
+
+    #[test]
+    fn world_geometry_contract_migrates_legacy_overworld_without_reading_chunks() {
+        let world = tempfile::tempdir().unwrap();
+        let region = world.path().join("region");
+        std::fs::create_dir_all(&region).unwrap();
+        std::fs::write(region.join("r.0.0.mca"), b"migration must not decode this").unwrap();
+
+        ensure_world_geometry_contract(world.path(), mc_world::OVERWORLD_GEOMETRY).unwrap();
+        ensure_world_geometry_contract(world.path(), mc_world::OVERWORLD_GEOMETRY).unwrap();
+
+        assert!(world_geometry_contract_path(world.path()).is_file());
     }
 
     #[test]
@@ -1480,6 +2061,7 @@ mod tests {
         let err = match build_terrain_generator(
             42,
             mc_worldgen::WorldgenMode::VanillaLike,
+            mc_world::OVERWORLD_GEOMETRY,
             blocks,
             mc_worldgen::StructureRules::none(),
         ) {
@@ -1499,6 +2081,60 @@ mod tests {
     }
 
     #[test]
+    fn build_terrain_generator_propagates_chunk_geometry() {
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let geometry = mc_world::ChunkGeometry::new(0, 256).unwrap();
+        let generator = build_terrain_generator(
+            42,
+            mc_worldgen::WorldgenMode::VanillaLike,
+            geometry,
+            blocks,
+            mc_worldgen::StructureRules::none(),
+        )
+        .unwrap();
+
+        let chunk = mc_world::ChunkGenerator::generate(
+            generator.as_ref(),
+            mc_world::ChunkPos { x: 0, z: 0 },
+        );
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(chunk.sections.len(), 16);
+    }
+
+    #[test]
+    fn playable_ruin_rules_require_seed_zero_vanilla_like_profile() {
+        let blocks =
+            Arc::new(
+                mc_world::BlockRegistry::from_report(
+                    &mc_data::blocks::solaris_required_blocks_report(),
+                )
+                .unwrap(),
+            );
+        let items = mc_data::items::solaris_required_items();
+
+        let playable =
+            structure_rules_for_startup(0, mc_server::WorldgenMode::VanillaLike, &blocks, &items)
+                .unwrap();
+        let unrelated_seed =
+            structure_rules_for_startup(7, mc_server::WorldgenMode::VanillaLike, &blocks, &items)
+                .unwrap();
+        let unrelated_mode =
+            structure_rules_for_startup(0, mc_server::WorldgenMode::TellusLike, &blocks, &items)
+                .unwrap();
+
+        assert!(!playable.is_empty());
+        assert!(unrelated_seed.is_empty());
+        assert!(unrelated_mode.is_empty());
+    }
+
+    #[test]
     fn effective_protocol_data_rejects_missing_sidecar_root() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("missing-vanilla");
@@ -1508,7 +2144,34 @@ mod tests {
             Err(err) => err,
         };
 
-        assert!(err.to_string().contains("loading vanilla registry data"));
+        assert!(
+            err.to_string()
+                .contains("reading vanilla sidecar directory metadata")
+        );
+    }
+
+    #[test]
+    fn effective_protocol_data_rejects_mismatched_sidecar_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("version.json"),
+            format!(
+                r#"{{"id":"{}","world_version":{},"protocol_version":999999}}"#,
+                mc_protocol::TARGET_RELEASE,
+                mc_protocol::WORLD_VERSION,
+            ),
+        )
+        .unwrap();
+
+        let err = match load_effective_protocol_data(Some(tmp.path())) {
+            Ok(_) => panic!("mismatched sidecar version must fail before registry loading"),
+            Err(err) => err,
+        };
+
+        assert!(
+            format!("{err:#}").contains("protocol_version 999999 does not match"),
+            "{err:#}"
+        );
     }
 
     #[test]
@@ -1520,7 +2183,7 @@ mod tests {
         let data = mc_data::VanillaData::from_registries("", vec![]);
         let items = mc_data::items::ItemRegistry::default();
 
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
             Ok(_) => panic!("empty vanilla tag sidecar must fail"),
             Err(err) => err,
         };
@@ -1560,7 +2223,7 @@ mod tests {
         let data = mc_data::VanillaData::from_registries("", vec![]);
         let items = mc_data::items::ItemRegistry::default();
 
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
             Ok(_) => panic!("partial vanilla tag sidecar must fail"),
             Err(err) => err,
         };
@@ -1599,7 +2262,7 @@ mod tests {
         let data = mc_data::VanillaData::from_registries("", vec![]);
         let items = mc_data::items::ItemRegistry::default();
 
-        let err = match load_effective_tags(Some(tmp.path()), &data, &items) {
+        let err = match load_effective_tags(Some(tmp.path()), &data, &items, &[]) {
             Ok(_) => panic!("unresolved required tag registries must fail"),
             Err(err) => err,
         };
@@ -1636,13 +2299,129 @@ mod tests {
     }
 
     #[test]
+    fn effective_item_facts_reject_missing_sidecar_report() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let error = match load_effective_item_facts(Some(tmp.path())) {
+            Ok(_) => panic!("missing item component report must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("were empty"));
+        assert!(error.to_string().contains("components/item"));
+    }
+
+    #[test]
+    fn effective_block_mining_requires_sidecar_file_when_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:air").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        }];
+
+        let error = match load_effective_block_mining(Some(tmp.path()), &report) {
+            Ok(_) => panic!("missing block_mining.json must fail"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("block-mining table"));
+        assert!(error.to_string().contains("block_mining.json"));
+    }
+
+    #[test]
+    fn effective_block_mining_loads_matching_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let reports = tmp.path().join("reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(
+            reports.join("block_mining.json"),
+            format!(
+                r#"{{"version":"{}","max_state_id":1,"entries":[[0.0,0],[1.5,1]]}}"#,
+                mc_protocol::TARGET_RELEASE
+            ),
+        )
+        .unwrap();
+        let report = [mc_data::blocks::BlockReport {
+            id: Identifier::parse("minecraft:stone").unwrap(),
+            properties: BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 1,
+                default: true,
+                properties: BTreeMap::new(),
+            }],
+        }];
+
+        let effective = load_effective_block_mining(Some(tmp.path()), &report).unwrap();
+
+        assert_eq!(effective.source, "vanilla_sidecar");
+        assert_eq!(
+            effective.table.as_ref().and_then(|table| table.facts(1)),
+            Some(mc_data::block_mining::BlockMiningFacts {
+                destroy_speed: 1.5,
+                requires_correct_tool_for_drops: true,
+            })
+        );
+    }
+
+    #[test]
+    fn effective_item_facts_load_sidecar_tool_rules() {
+        let tmp = tempfile::tempdir().unwrap();
+        let items = tmp
+            .path()
+            .join("reports")
+            .join("minecraft")
+            .join("components")
+            .join("item");
+        std::fs::create_dir_all(&items).unwrap();
+        std::fs::write(
+            items.join("wooden_pickaxe.json"),
+            r##"{
+                "components": {
+                    "minecraft:tool": {
+                        "rules": [{
+                            "blocks": "#minecraft:mineable/pickaxe",
+                            "speed": 2.0,
+                            "correct_for_drops": true
+                        }]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+
+        let effective = load_effective_item_facts(Some(tmp.path())).unwrap();
+
+        assert_eq!(effective.source, "vanilla_sidecar");
+        let tool = effective
+            .table
+            .get(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
+            .and_then(|facts| facts.tool.as_ref())
+            .expect("tool facts");
+        assert_eq!(tool.rules.len(), 1);
+        assert_eq!(tool.rules[0].speed, Some(2.0));
+    }
+
+    #[test]
+    fn effective_item_facts_use_embedded_fallback_without_sidecar() {
+        let effective = load_effective_item_facts(None).unwrap();
+
+        assert_eq!(effective.source, "embedded_solaris_fallback");
+        assert!(!effective.table.is_empty());
+    }
+
+    #[test]
     fn effective_block_light_rejects_sidecar_that_does_not_cover_blocks_report() {
         let tmp = tempfile::tempdir().unwrap();
         let reports = tmp.path().join("reports");
         std::fs::create_dir_all(&reports).unwrap();
         std::fs::write(
             reports.join("block_light.json"),
-            r#"{"version":"26.1.2-test","max_state_id":0,"entries":[[0,0,1]]}"#,
+            r#"{"version":"26.1.2-test","max_state_id":0,"entries":[[0,0,1,0]]}"#,
         )
         .unwrap();
         let report = [mc_data::blocks::BlockReport {
@@ -1670,7 +2449,7 @@ mod tests {
         std::fs::create_dir_all(&reports).unwrap();
         std::fs::write(
             reports.join("block_light.json"),
-            r#"{"version":"not-the-target","max_state_id":0,"entries":[[0,0,1]]}"#,
+            r#"{"version":"not-the-target","max_state_id":0,"entries":[[0,0,1,0]]}"#,
         )
         .unwrap();
         let report = [mc_data::blocks::BlockReport {
@@ -1739,7 +2518,7 @@ mod tests {
               "pools": [{
                 "entries": [{
                   "type": "minecraft:item",
-                  "name": "minecraft:cobblestone"
+                  "name": "minecraft:diamond"
                 }]
               }]
             }"#,
@@ -1748,12 +2527,79 @@ mod tests {
 
         let loot = load_effective_loot(Some(tmp.path())).unwrap();
 
-        assert_eq!(loot.source, "vanilla_sidecar_simple_subset");
-        assert_eq!(loot.tables.total_drops(), 1);
+        assert_eq!(
+            loot.tables.total_drops(),
+            mc_data::loot::builtin().total_drops()
+        );
         assert_eq!(
             loot.tables
                 .block_drop(&Identifier::parse("minecraft:stone").unwrap()),
-            Some(&Identifier::parse("minecraft:cobblestone").unwrap())
+            Some(&Identifier::parse("minecraft:diamond").unwrap())
+        );
+        assert_eq!(
+            loot.tables
+                .entity_drop_stacks(&Identifier::parse("minecraft:cow").unwrap())
+                .map(|drops| drops.iter().map(|drop| &drop.item).collect::<Vec<_>>()),
+            Some(vec![
+                &Identifier::parse("minecraft:leather").unwrap(),
+                &Identifier::parse("minecraft:beef").unwrap(),
+            ])
+        );
+        assert_eq!(
+            loot.source,
+            "vanilla_sidecar_simple_subset+embedded_fallback"
+        );
+    }
+
+    #[test]
+    fn effective_loot_completes_partial_entity_table_from_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entities = tmp
+            .path()
+            .join("data")
+            .join("minecraft")
+            .join("loot_table")
+            .join("entities");
+        std::fs::create_dir_all(&entities).unwrap();
+        std::fs::write(
+            entities.join("sheep.json"),
+            r#"{
+              "pools": [
+                {
+                  "entries": [{
+                    "type": "minecraft:item",
+                    "functions": [{
+                      "function": "minecraft:set_count",
+                      "count": {
+                        "type": "minecraft:uniform",
+                        "min": 1.0,
+                        "max": 2.0
+                      }
+                    }],
+                    "name": "minecraft:mutton"
+                  }]
+                },
+                {
+                  "entries": [{
+                    "type": "minecraft:loot_table",
+                    "value": "minecraft:entities/sheep/white"
+                  }]
+                }
+              ]
+            }"#,
+        )
+        .unwrap();
+
+        let loot = load_effective_loot(Some(tmp.path())).unwrap();
+
+        assert_eq!(
+            loot.tables
+                .entity_drop_stacks(&Identifier::parse("minecraft:sheep").unwrap())
+                .map(|drops| drops.iter().map(|drop| &drop.item).collect::<Vec<_>>()),
+            Some(vec![
+                &Identifier::parse("minecraft:mutton").unwrap(),
+                &Identifier::parse("minecraft:white_wool").unwrap(),
+            ])
         );
     }
 
@@ -1771,7 +2617,7 @@ mod tests {
     }
 
     #[test]
-    fn effective_recipes_use_vanilla_sidecar_when_present() {
+    fn effective_recipes_keep_embedded_display_ids_when_sidecar_is_present() {
         let tmp = tempfile::tempdir().unwrap();
         let recipes = tmp.path().join("data").join("minecraft").join("recipe");
         std::fs::create_dir_all(&recipes).unwrap();
@@ -1783,18 +2629,46 @@ mod tests {
               "ingredients": [{ "tag": "minecraft:oak_logs" }],
               "result": {
                 "id": "minecraft:oak_planks",
-                "count": 4
+                "count": 5
+              }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            recipes.join("zz_sidecar_only.json"),
+            r#"{
+              "type": "minecraft:crafting_shapeless",
+              "category": "misc",
+              "ingredients": [{ "item": "minecraft:stick" }],
+              "result": {
+                "id": "minecraft:stick",
+                "count": 1
               }
             }"#,
         )
         .unwrap();
 
         let recipes = load_effective_recipes(Some(tmp.path())).unwrap();
+        let embedded = mc_data::recipes::solaris_required_recipes();
+        let oak_planks_index = embedded
+            .iter()
+            .position(|recipe| recipe.id.as_str() == "minecraft:oak_planks")
+            .unwrap();
 
-        assert_eq!(recipes.source, "vanilla_sidecar");
-        assert_eq!(recipes.recipes.len(), 1);
-        assert_eq!(recipes.recipes[0].id.as_str(), "minecraft:oak_planks");
-        assert_eq!(recipes.recipes[0].result.count, 4);
+        assert_eq!(recipes.source, "vanilla_sidecar+stable_embedded_prefix");
+        assert_eq!(recipes.recipes.len(), embedded.len() + 1);
+        assert_eq!(
+            recipes.recipes[..embedded.len()]
+                .iter()
+                .map(|recipe| &recipe.id)
+                .collect::<Vec<_>>(),
+            embedded.iter().map(|recipe| &recipe.id).collect::<Vec<_>>()
+        );
+        assert_eq!(recipes.recipes[oak_planks_index].result.count, 5);
+        assert_eq!(
+            recipes.recipes.last().unwrap().id.as_str(),
+            "minecraft:zz_sidecar_only"
+        );
     }
 
     #[test]
@@ -1886,13 +2760,17 @@ mod tests {
         struct StubGen {
             active: Arc<AtomicUsize>,
             max_active: Arc<AtomicUsize>,
+            first_workers_ready: Arc<std::sync::Barrier>,
+            calls: AtomicUsize,
         }
 
         impl mc_world::ChunkGenerator for StubGen {
             fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
                 let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_active.fetch_max(active, Ordering::SeqCst);
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                if self.calls.fetch_add(1, Ordering::SeqCst) < 4 {
+                    self.first_workers_ready.wait();
+                }
                 let air = mc_world::BlockStateId(0);
                 let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
                 let mut chunk = mc_world::Chunk::empty(pos, air, biome);
@@ -1919,6 +2797,8 @@ mod tests {
         let generator = Arc::new(StubGen {
             active,
             max_active: Arc::clone(&max_active),
+            first_workers_ready: Arc::new(std::sync::Barrier::new(4)),
+            calls: AtomicUsize::new(0),
         });
 
         assert_eq!(
@@ -1931,6 +2811,43 @@ mod tests {
             max_active.load(Ordering::SeqCst) > 1,
             "startup pre-generation should use worker threads"
         );
+    }
+
+    #[test]
+    fn generate_spawn_window_rejects_worker_panic() {
+        struct PanicGen;
+
+        impl mc_world::ChunkGenerator for PanicGen {
+            fn generate(&self, pos: mc_world::ChunkPos) -> mc_world::Chunk {
+                assert_ne!(pos, mc_world::ChunkPos { x: 0, z: 0 }, "worker failure");
+                let air = mc_world::BlockStateId(0);
+                let biome = mc_data::Identifier::parse("minecraft:plains").unwrap();
+                mc_world::Chunk::empty(pos, air, biome)
+            }
+        }
+
+        let report = [mc_data::blocks::BlockReport {
+            id: mc_data::Identifier::parse("minecraft:air").unwrap(),
+            properties: std::collections::BTreeMap::new(),
+            states: vec![mc_data::blocks::BlockStateReport {
+                id: 0,
+                default: true,
+                properties: std::collections::BTreeMap::new(),
+            }],
+        }];
+        let registry = Arc::new(mc_world::BlockRegistry::from_report(&report).unwrap());
+        let mut storage = mc_world::WorldStorage::in_memory_with_capacity(registry, 32);
+
+        let error = generate_spawn_window(&mut storage, Arc::new(PanicGen), 1, 4, 4, None)
+            .expect_err("partial generation must fail startup");
+
+        assert!(
+            error
+                .to_string()
+                .contains("spawn pre-generation worker panicked"),
+            "{error:#}"
+        );
+        assert!(storage.cache_len() < 25);
     }
 
     #[test]
@@ -2062,6 +2979,7 @@ mod tests {
         );
 
         assert_eq!(warm_spawn_window(&mut reopened, 1).unwrap(), 25);
+        let read_view = reopened.read_view();
         assert_eq!(
             bake_missing_spawn_window_light(&mut reopened, &table, 1, 4).unwrap(),
             9
@@ -2074,6 +2992,17 @@ mod tests {
             assert!(
                 mc_world::light::ChunkLight::from_section_lights(&chunk.section_lights).is_some(),
                 "view-square chunk ({}, {}) should be backfilled with baked light",
+                pos.x,
+                pos.z
+            );
+            let published = read_view
+                .snapshot_chunks(&[pos])
+                .chunk(pos)
+                .expect("view-square chunk should remain published");
+            assert!(
+                mc_world::light::ChunkLight::from_section_lights(&published.section_lights)
+                    .is_some(),
+                "view-square chunk ({}, {}) should publish baked light",
                 pos.x,
                 pos.z
             );
@@ -2179,7 +3108,7 @@ mod tests {
         let policy = &autoscale["policy"];
 
         assert_eq!(autoscale["enabled"], Value::Bool(true));
-        assert_eq!(autoscale["runtime_mode"], "live_chunk_send_rate");
+        assert_eq!(autoscale["runtime_mode"], "live_adaptive_work_budgets");
         assert_eq!(policy["min_view_distance"], 2);
         assert_eq!(policy["max_view_distance"], 2);
         assert_eq!(policy["min_chunk_send_rate"], 3);
@@ -2190,5 +3119,6 @@ mod tests {
         assert_eq!(policy["max_chunk_generate_rate"], 32);
         assert_eq!(policy["scale_down_after_ticks"], 1);
         assert_eq!(policy["scale_up_after_ticks"], 1);
+        assert!(policy.get("worker_pressure_percent").is_none());
     }
 }

@@ -32,13 +32,15 @@ use crate::SECTION_DIM;
 use crate::anvil::ChunkPayload;
 use crate::block::{BlockRegistry, BlockStateId};
 use crate::chunk::{
-    BIOME_VOLUME, BiomeSection, BlockPos, ChestBlockEntity, Chunk, ChunkPos, FurnaceBlockEntity,
-    FurnaceSlot, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES, MIN_SECTION_Y, SECTION_COUNT,
+    BIOME_VOLUME, BiomeSection, BlockPos, ChestBlockEntity, Chunk, ChunkGeometry, ChunkPos,
+    FurnaceBlockEntity, FurnaceSlot, Heightmap, HopperBlockEntity, LIGHT_LAYER_BYTES,
     ScheduledBlockTick, ScheduledFluidTick, SectionLight,
 };
 use crate::section::{ChunkSection, PackedBitArray, SECTION_VOLUME};
 
 const REGION_AXIS_CHUNKS: i32 = 32;
+const DAMAGE_COMPONENT: &str = "minecraft:damage";
+const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
 
 /// Serialise a chunk to a [`ChunkPayload`] ready for
 /// [`write_region`](crate::anvil::write_region). Used by the M6.b
@@ -106,8 +108,16 @@ pub enum ChunkNbtError {
     },
     #[error("item {0} not in registry")]
     UnknownItem(String),
-    #[error("section Y={0} is outside the {SECTION_COUNT}-section range")]
+    #[error("invalid enchantment component {0:?}")]
+    InvalidEnchantment(String),
+    #[error("section Y={0} is outside the chunk geometry declared by yPos and sections")]
     SectionOutOfRange(i32),
+    #[error("section Y={0} is duplicated or leaves a gap in the chunk geometry")]
+    InvalidSectionShape(i32),
+    #[error("yPos={y_pos} and {section_count} sections do not define a supported chunk geometry")]
+    InvalidChunkGeometry { y_pos: i32, section_count: usize },
+    #[error("section Y={0} does not fit the vanilla byte field")]
+    SectionYOutOfByteRange(i32),
     #[error("packed bit-array length mismatch: expected {expected} words, got {got}")]
     PackedWordMismatch { expected: usize, got: usize },
     #[error("{field} has wrong byte length: expected {expected}, got {got}")]
@@ -147,23 +157,57 @@ pub fn chunk_from_nbt_with_items(
         .unwrap_or(BlockStateId(0));
     let default_biome = id("minecraft:plains");
 
-    let mut chunk = Chunk::empty(ChunkPos { x, z }, air, default_biome);
+    let y_pos = get_int(root, "yPos")?;
+    let sections = get_list(root, "sections")?;
+    let section_count = sections.elements.len();
+    let min_y =
+        y_pos
+            .checked_mul(SECTION_DIM as i32)
+            .ok_or(ChunkNbtError::InvalidChunkGeometry {
+                y_pos,
+                section_count,
+            })?;
+    let height = i32::try_from(section_count)
+        .ok()
+        .and_then(|count| count.checked_mul(SECTION_DIM as i32))
+        .ok_or(ChunkNbtError::InvalidChunkGeometry {
+            y_pos,
+            section_count,
+        })?;
+    let geometry =
+        ChunkGeometry::new(min_y, height).ok_or(ChunkNbtError::InvalidChunkGeometry {
+            y_pos,
+            section_count,
+        })?;
+
+    let mut chunk = Chunk::empty_with_geometry(ChunkPos { x, z }, air, default_biome, geometry);
     chunk.status = status;
 
-    if let Some(sections) = get_optional_list(root, "sections")? {
-        for s in &sections.elements {
-            let cmp = expect_compound(s, "sections[]")?;
-            let y = get_byte(cmp, "Y")? as i32;
-            let idx = (y - MIN_SECTION_Y) as usize;
-            if idx >= SECTION_COUNT {
-                return Err(ChunkNbtError::SectionOutOfRange(y));
-            }
-            let bs = get_compound(cmp, "block_states")?;
-            chunk.sections[idx] = decode_block_section(bs, registry, air)?;
-            let bi = get_compound(cmp, "biomes")?;
-            chunk.biomes[idx] = decode_biome_section(bi)?;
-            chunk.section_lights[idx] = decode_section_light(cmp)?;
+    let mut seen_sections = vec![false; section_count];
+    for s in &sections.elements {
+        let cmp = expect_compound(s, "sections[]")?;
+        let y = get_byte(cmp, "Y")? as i32;
+        let Some(idx) = y
+            .checked_sub(y_pos)
+            .and_then(|idx| usize::try_from(idx).ok())
+            .filter(|idx| *idx < section_count)
+        else {
+            return Err(ChunkNbtError::SectionOutOfRange(y));
+        };
+        if seen_sections[idx] {
+            return Err(ChunkNbtError::InvalidSectionShape(y));
         }
+        seen_sections[idx] = true;
+        let bs = get_compound(cmp, "block_states")?;
+        chunk.sections[idx] = decode_block_section(bs, registry, air)?;
+        let bi = get_compound(cmp, "biomes")?;
+        chunk.biomes[idx] = decode_biome_section(bi)?;
+        chunk.section_lights[idx] = decode_section_light(cmp)?;
+    }
+    if let Some(missing_idx) = seen_sections.iter().position(|seen| !seen) {
+        return Err(ChunkNbtError::InvalidSectionShape(
+            y_pos + missing_idx as i32,
+        ));
     }
 
     if let Some(hms) = get_optional_compound(root, "Heightmaps")? {
@@ -529,13 +573,16 @@ pub fn chunk_to_nbt_with_items_at_tick(
     let mut root: Vec<(String, Tag)> = Vec::with_capacity(8);
     root.push(("xPos".into(), Tag::Int(chunk.pos.x)));
     root.push(("zPos".into(), Tag::Int(chunk.pos.z)));
-    root.push(("yPos".into(), Tag::Int(MIN_SECTION_Y)));
+    let min_section_y = chunk.geometry().min_y() / SECTION_DIM as i32;
+    root.push(("yPos".into(), Tag::Int(min_section_y)));
     root.push(("Status".into(), Tag::String(chunk.status.clone())));
 
     // sections
-    let mut sections = Vec::with_capacity(SECTION_COUNT);
+    let mut sections = Vec::with_capacity(chunk.sections.len());
     for (i, sec) in chunk.sections.iter().enumerate() {
-        let y = (i as i32 + MIN_SECTION_Y) as i8;
+        let section_y = min_section_y + i as i32;
+        let y = i8::try_from(section_y)
+            .map_err(|_| ChunkNbtError::SectionYOutOfByteRange(section_y))?;
         let mut s_cmp = vec![
             ("Y".into(), Tag::Byte(y)),
             ("block_states".into(), encode_block_section(sec, registry)?),
@@ -840,17 +887,25 @@ fn decode_furnace(
             if !(0..=2).contains(&slot) {
                 continue;
             }
-            let item_name = get_string(item, "id")?;
-            let parsed = Identifier::parse(item_name.clone())
-                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
-            let item_id = items
-                .id_of(&parsed)
-                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
-            furnace.slots[slot as usize] = FurnaceSlot {
-                count: get_int(item, "count")?,
-                item_id,
-                damage: None,
+            furnace.slots[slot as usize] = decode_container_stack(item, items)?;
+        }
+    }
+    if let Some(recipes_used) = get_optional_compound(cmp, "RecipesUsed")? {
+        for (recipe_id, count) in recipes_used {
+            let parsed = Identifier::parse(recipe_id.clone())
+                .map_err(|_| ChunkNbtError::InvalidIdentifier(recipe_id.clone()))?;
+            let Tag::Int(count) = count else {
+                return Err(ChunkNbtError::WrongType {
+                    field: "RecipesUsed.*",
+                    expected: "Int",
+                    got: count.type_id(),
+                });
             };
+            if *count > 0 {
+                furnace
+                    .recipes_used
+                    .insert(parsed.as_str().to_string(), *count);
+            }
         }
     }
     Ok(furnace)
@@ -868,17 +923,7 @@ fn decode_chest(
             if !(0..=26).contains(&slot) {
                 continue;
             }
-            let item_name = get_string(item, "id")?;
-            let parsed = Identifier::parse(item_name.clone())
-                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
-            let item_id = items
-                .id_of(&parsed)
-                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
-            chest.slots[slot as usize] = FurnaceSlot {
-                count: get_int(item, "count")?,
-                item_id,
-                damage: None,
-            };
+            chest.slots[slot as usize] = decode_container_stack(item, items)?;
         }
     }
     Ok(chest)
@@ -899,17 +944,7 @@ fn decode_hopper(
             if !(0..=4).contains(&slot) {
                 continue;
             }
-            let item_name = get_string(item, "id")?;
-            let parsed = Identifier::parse(item_name.clone())
-                .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
-            let item_id = items
-                .id_of(&parsed)
-                .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
-            hopper.slots[slot as usize] = FurnaceSlot {
-                count: get_int(item, "count")?,
-                item_id,
-                damage: None,
-            };
+            hopper.slots[slot as usize] = decode_container_stack(item, items)?;
         }
     }
     Ok(hopper)
@@ -933,14 +968,7 @@ fn encode_furnace(
         if stack.is_empty() {
             continue;
         }
-        let name = items
-            .name_of(stack.item_id)
-            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
-        item_tags.push(Tag::Compound(vec![
-            ("Slot".into(), Tag::Int(slot as i32)),
-            ("id".into(), Tag::String(name.as_str().to_string())),
-            ("count".into(), Tag::Int(stack.count)),
-        ]));
+        item_tags.push(encode_container_stack(slot, stack, items)?);
     }
     compound.push((
         "Items".into(),
@@ -963,6 +991,17 @@ fn encode_furnace(
         Tag::Short(furnace.cook_progress),
     ));
     compound.push(("cooking_total_time".into(), Tag::Short(furnace.cook_total)));
+    compound.push((
+        "RecipesUsed".into(),
+        Tag::Compound(
+            furnace
+                .recipes_used
+                .iter()
+                .filter(|(_, count)| **count > 0)
+                .map(|(recipe_id, count)| (recipe_id.clone(), Tag::Int(*count)))
+                .collect(),
+        ),
+    ));
     Ok(Tag::Compound(compound))
 }
 
@@ -1011,14 +1050,7 @@ fn encode_chest(
         if stack.is_empty() {
             continue;
         }
-        let name = items
-            .name_of(stack.item_id)
-            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
-        item_tags.push(Tag::Compound(vec![
-            ("Slot".into(), Tag::Int(slot as i32)),
-            ("id".into(), Tag::String(name.as_str().to_string())),
-            ("count".into(), Tag::Int(stack.count)),
-        ]));
+        item_tags.push(encode_container_stack(slot, stack, items)?);
     }
     compound.push((
         "Items".into(),
@@ -1059,14 +1091,7 @@ fn encode_hopper(
         if stack.is_empty() {
             continue;
         }
-        let name = items
-            .name_of(stack.item_id)
-            .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
-        item_tags.push(Tag::Compound(vec![
-            ("Slot".into(), Tag::Int(slot as i32)),
-            ("id".into(), Tag::String(name.as_str().to_string())),
-            ("count".into(), Tag::Int(stack.count)),
-        ]));
+        item_tags.push(encode_container_stack(slot, stack, items)?);
     }
     compound.push((
         "Items".into(),
@@ -1084,6 +1109,92 @@ fn encode_hopper(
 
 fn is_hopper_block_entity_id(id: &str) -> bool {
     id == "minecraft:hopper"
+}
+
+fn decode_container_stack(
+    item: &[(String, Tag)],
+    items: &ItemRegistry,
+) -> Result<FurnaceSlot, ChunkNbtError> {
+    let item_name = get_string(item, "id")?;
+    let parsed = Identifier::parse(item_name.clone())
+        .map_err(|_| ChunkNbtError::InvalidIdentifier(item_name.clone()))?;
+    let item_id = items
+        .id_of(&parsed)
+        .ok_or_else(|| ChunkNbtError::UnknownItem(item_name.clone()))?;
+    let components = get_optional_compound(item, "components")?;
+    let damage = components
+        .map(|components| get_optional_int(components, DAMAGE_COMPONENT))
+        .transpose()?
+        .flatten();
+    let mut enchantments = Vec::new();
+    if let Some(components) = components
+        && let Some(values) = get_optional_compound(components, ENCHANTMENTS_COMPONENT)?
+    {
+        enchantments.reserve(values.len());
+        for (id, level) in values {
+            let Tag::Int(level) = level else {
+                return Err(ChunkNbtError::InvalidEnchantment(id.clone()));
+            };
+            let parsed = Identifier::parse(id.clone())
+                .map_err(|_| ChunkNbtError::InvalidEnchantment(id.clone()))?;
+            if !(1..=255).contains(level)
+                || mc_data::required_registry_entry_id("enchantment", &parsed).is_none()
+            {
+                return Err(ChunkNbtError::InvalidEnchantment(id.clone()));
+            }
+            enchantments.push(mc_data::ItemEnchantment {
+                id: parsed,
+                level: *level,
+            });
+        }
+        enchantments.sort_unstable_by(|left, right| left.id.cmp(&right.id));
+    }
+    Ok(FurnaceSlot {
+        count: get_int(item, "count")?,
+        item_id,
+        damage,
+        enchantments,
+    })
+}
+
+fn encode_container_stack(
+    slot: usize,
+    stack: &FurnaceSlot,
+    items: &ItemRegistry,
+) -> Result<Tag, ChunkNbtError> {
+    let name = items
+        .name_of(stack.item_id)
+        .ok_or_else(|| ChunkNbtError::UnknownItem(stack.item_id.to_string()))?;
+    let mut fields = vec![
+        ("Slot".into(), Tag::Int(slot as i32)),
+        ("id".into(), Tag::String(name.as_str().to_string())),
+        ("count".into(), Tag::Int(stack.count)),
+    ];
+    let mut components = Vec::new();
+    if let Some(damage) = stack.damage {
+        components.push((DAMAGE_COMPONENT.into(), Tag::Int(damage)));
+    }
+    if !stack.enchantments.is_empty() {
+        components.push((
+            ENCHANTMENTS_COMPONENT.into(),
+            Tag::Compound(
+                stack
+                    .enchantments
+                    .iter()
+                    .map(|enchantment| {
+                        (
+                            enchantment.id.as_str().to_string(),
+                            Tag::Int(enchantment.level),
+                        )
+                    })
+                    .collect(),
+            ),
+        ));
+    }
+    if !components.is_empty() {
+        fields.push(("components".into(), Tag::Compound(components)));
+    }
+    Ok(Tag::Compound(fields))
 }
 
 fn chest_storage_block_entity_id_for_block(
@@ -1297,7 +1408,7 @@ fn leak_field_name(s: &str) -> &'static str {
 mod tests {
     use super::*;
     use crate::anvil::region;
-    use crate::chunk::{MAX_Y, MIN_Y};
+    use crate::chunk::{MAX_Y, MIN_SECTION_Y, MIN_Y};
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
 
@@ -1360,7 +1471,11 @@ mod tests {
             chunk
                 .set_block(pos.x as u8, pos.y, pos.z as u8, state)
                 .unwrap();
-            chunk.furnaces.insert(pos, FurnaceBlockEntity::default());
+            let mut furnace = FurnaceBlockEntity::default();
+            furnace
+                .recipes_used
+                .insert("minecraft:test_smelting".to_string(), 3);
+            chunk.furnaces.insert(pos, furnace);
         }
 
         let root = chunk_to_nbt_with_items(&chunk, &registry, Some(&items)).unwrap();
@@ -1392,7 +1507,12 @@ mod tests {
 
         let decoded = chunk_from_nbt_with_items(&root, &registry, Some(&items)).unwrap();
         for &(pos, _, _) in &entries {
-            assert!(decoded.furnaces.contains_key(&pos));
+            assert_eq!(
+                decoded.furnaces[&pos]
+                    .recipes_used
+                    .get("minecraft:test_smelting"),
+                Some(&3)
+            );
         }
     }
 
@@ -1511,12 +1631,17 @@ mod tests {
         hopper.slots[0] = FurnaceSlot {
             count: 64,
             item_id: 10,
-            damage: None,
+            damage: Some(7),
+            enchantments: vec![mc_data::ItemEnchantment {
+                id: Identifier::parse("minecraft:efficiency").unwrap(),
+                level: 1,
+            }],
         };
         hopper.slots[4] = FurnaceSlot {
             count: 3,
             item_id: 11,
             damage: None,
+            enchantments: Vec::new(),
         };
         chunk.hoppers.insert(pos, hopper.clone());
 
@@ -1674,9 +1799,14 @@ mod tests {
             let mut cur = Cursor::new(&payload.uncompressed_nbt[..]);
             let (_, root) = mc_nbt::read_named(&mut cur).unwrap();
             let chunk = chunk_from_nbt(&root, &registry).unwrap();
-            if !chunk.extras.is_empty() {
+            let vanilla_extras = chunk
+                .extras
+                .iter()
+                .filter(|(key, _)| key != "SolarisJournalLsn")
+                .collect::<Vec<_>>();
+            if !vanilla_extras.is_empty() {
                 chunks_with_extras += 1;
-                for (k, _) in &chunk.extras {
+                for (k, _) in vanilla_extras {
                     seen_keys.insert(k.clone());
                 }
             }
@@ -1829,11 +1959,26 @@ mod tests {
         Tag::Compound(s)
     }
 
-    fn build_chunk_root_with_sections(sections: Vec<Tag>) -> Tag {
+    fn build_chunk_root_with_geometry(
+        y_pos: i32,
+        section_count: usize,
+        section_overrides: Vec<Tag>,
+    ) -> Tag {
+        let mut sections = (0..section_count)
+            .map(|index| {
+                build_section_with_light(i8::try_from(y_pos + index as i32).unwrap(), None, None)
+            })
+            .collect::<Vec<_>>();
+        for section in section_overrides {
+            let compound = expect_compound(&section, "section override").unwrap();
+            let section_y = get_byte(compound, "Y").unwrap() as i32;
+            let index = usize::try_from(section_y - y_pos).unwrap();
+            sections[index] = section;
+        }
         Tag::Compound(vec![
             ("xPos".into(), Tag::Int(0)),
             ("zPos".into(), Tag::Int(0)),
-            ("yPos".into(), Tag::Int(MIN_SECTION_Y)),
+            ("yPos".into(), Tag::Int(y_pos)),
             ("Status".into(), Tag::String("minecraft:full".into())),
             (
                 "sections".into(),
@@ -1843,6 +1988,14 @@ mod tests {
                 }),
             ),
         ])
+    }
+
+    fn build_chunk_root_with_sections(section_overrides: Vec<Tag>) -> Tag {
+        build_chunk_root_with_geometry(
+            MIN_SECTION_Y,
+            (MAX_Y - MIN_Y) as usize / SECTION_DIM,
+            section_overrides,
+        )
     }
 
     fn tiny_registry() -> BlockRegistry {
@@ -1907,6 +2060,65 @@ mod tests {
             },
             elements,
         })
+    }
+
+    #[test]
+    fn round_trips_non_overworld_geometry_from_y_pos_and_sections() {
+        let root = build_chunk_root_with_geometry(0, 16, Vec::new());
+
+        let registry = tiny_registry();
+        let chunk = chunk_from_nbt(&root, &registry).expect("decode custom geometry");
+        assert_eq!(chunk.geometry().min_y(), 0);
+        assert_eq!(chunk.geometry().max_y(), 256);
+
+        let encoded = chunk_to_nbt(&chunk, &registry).expect("encode custom geometry");
+        let encoded_root = expect_compound(&encoded, "root").unwrap();
+        assert_eq!(get_int(encoded_root, "yPos").unwrap(), 0);
+
+        let decoded = chunk_from_nbt(&encoded, &registry).expect("decode round-trip");
+        assert_eq!(decoded.geometry(), chunk.geometry());
+    }
+
+    #[test]
+    fn rejects_geometry_when_sections_do_not_define_a_height() {
+        let root = build_chunk_root_with_geometry(0, 0, Vec::new());
+
+        assert!(matches!(
+            chunk_from_nbt(&root, &tiny_registry()),
+            Err(ChunkNbtError::InvalidChunkGeometry {
+                y_pos: 0,
+                section_count: 0
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_duplicate_section_y_in_inferred_geometry() {
+        let mut root = build_chunk_root_with_geometry(0, 16, Vec::new());
+        let Tag::Compound(fields) = &mut root else {
+            unreachable!();
+        };
+        let Tag::List(sections) = &mut fields
+            .iter_mut()
+            .find(|(name, _)| name == "sections")
+            .expect("synthetic chunk has sections")
+            .1
+        else {
+            unreachable!();
+        };
+        let Tag::Compound(last_section) = sections.elements.last_mut().unwrap() else {
+            unreachable!();
+        };
+        let y = last_section
+            .iter_mut()
+            .find(|(name, _)| name == "Y")
+            .expect("synthetic section has Y");
+        y.1 = Tag::Byte(14);
+
+        assert!(matches!(
+            chunk_from_nbt(&root, &tiny_registry()),
+            Err(ChunkNbtError::InvalidSectionShape(14))
+        ));
     }
 
     #[test]

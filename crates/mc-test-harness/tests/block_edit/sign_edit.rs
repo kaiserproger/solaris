@@ -100,7 +100,20 @@ async fn survival_places_sign_and_updates_plain_text() {
         })
         .await
         .expect("send mismatched sign update");
-    assert_no_sign_block_entity_data(&mut client, mismatched_pos, Duration::from_millis(250)).await;
+    assert_no_sign_block_entity_data(&mut client, mismatched_pos).await;
+
+    client
+        .write_packet(&ServerboundSignUpdate {
+            position: packed_sign_pos,
+            lines: ["bad", "side", "must", "skip"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            is_front_text: false,
+        })
+        .await
+        .expect("send wrong-side sign update");
+    assert_no_sign_block_entity_data(&mut client, packed_sign_pos).await;
 
     let lines = ["Solaris", "M74", "plain", "text"];
     client
@@ -115,6 +128,84 @@ async fn survival_places_sign_and_updates_plain_text() {
     let update = wait_for_sign_block_entity_data(&mut client, packed_sign_pos).await;
     assert_plain_sign_text(&update.nbt, "front_text", &lines);
     assert_plain_sign_text(&update.nbt, "back_text", &["", "", "", ""]);
+}
+
+#[tokio::test]
+async fn stale_sign_editor_cannot_edit_replaced_sign() {
+    let data = embedded_play_data();
+    let air_state = embedded_block_state(&data, "minecraft:air");
+    let oak_sign_id = embedded_item_id(&data, "minecraft:oak_sign");
+    let mut storage = embedded_world(&data);
+    let support_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn column terrain");
+    let mut cfg = embedded_playable_config(&data, storage, "stale sign editor fencing");
+    let world = Arc::clone(cfg.world.as_ref().expect("embedded world"));
+    cfg.command_permissions = mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true);
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, _) = connect_to_play(addr, "StaleSignEditor").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:oak_sign 1 0".into(),
+        })
+        .await
+        .expect("give sign");
+    wait_for_slot_stack(&mut client, oak_sign_id, 1).await;
+
+    let sign_pos = mc_world::BlockPos {
+        x: 0,
+        y: support_y + 1,
+        z: 0,
+    };
+    let packed_sign_pos = pack_block_pos(sign_pos.x, sign_pos.y, sign_pos.z);
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(0, support_y, 0),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 175,
+        })
+        .await
+        .expect("place original sign");
+    wait_for_open_sign_editor(&mut client, packed_sign_pos).await;
+
+    {
+        let mut storage = world.lock().await;
+        let sign_state = storage
+            .get_block(sign_pos)
+            .expect("read original sign")
+            .expect("original sign exists");
+        storage
+            .set_block_at(sign_pos, air_state)
+            .expect("break original sign")
+            .expect("original sign was present");
+        storage
+            .set_block_at(sign_pos, sign_state)
+            .expect("place replacement sign")
+            .expect("air was present");
+    }
+
+    client
+        .write_packet(&ServerboundSignUpdate {
+            position: packed_sign_pos,
+            lines: ["stale", "editor", "must", "fail"]
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            is_front_text: true,
+        })
+        .await
+        .expect("send stale sign update");
+    assert_no_sign_block_entity_data(&mut client, packed_sign_pos).await;
 }
 
 #[tokio::test]
@@ -328,21 +419,30 @@ async fn wait_for_sign_block_entity_data(
     }
 }
 
-async fn assert_no_sign_block_entity_data(client: &mut Client, position: i64, duration: Duration) {
-    let deadline = tokio::time::Instant::now() + duration;
+async fn assert_no_sign_block_entity_data(client: &mut Client, position: i64) {
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "time set 1000".into(),
+        })
+        .await
+        .expect("send rejected sign packet fence");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        let frame = match client.read_frame_with_timeout(remaining).await {
-            Ok(frame) => frame,
-            Err(_) => return,
-        };
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("rejected sign packet fence");
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == ClientboundBlockEntityData::ID {
+        if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let _time = ClientboundSetTime::decode(&mut body)
+                .expect("decode rejected sign packet fence");
+            return;
+        } else if frame.id == ClientboundBlockEntityData::ID {
             let mut body = frame.body;
             let pkt = ClientboundBlockEntityData::decode(&mut body)
                 .expect("decode rejected BlockEntityData");

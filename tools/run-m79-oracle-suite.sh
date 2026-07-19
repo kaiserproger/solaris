@@ -65,6 +65,9 @@ run_scenario() {
     cargo-ignored-test:configuration-phase)
       (cd "$ROOT" && cargo test -p mc-test-harness --test parity_oracle vanilla_and_solaris_configuration_phase_can_be_diffed -- --ignored --exact --nocapture)
       ;;
+    cargo-ignored-test:core-actions-seed-81)
+      (cd "$ROOT" && cargo test -p mc-test-harness --test parity_oracle checked_manifest_vanilla_and_solaris_protocol_observations_can_be_diffed -- --ignored --exact --nocapture)
+      ;;
     cargo-ignored-test:spawn-smoke)
       (cd "$ROOT" && cargo test -p mc-test-harness --test parity_oracle vanilla_and_solaris_spawn_smoke_can_be_diffed -- --ignored --exact --nocapture)
       ;;

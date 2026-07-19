@@ -232,6 +232,7 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
         air_state_id,
         item_entity_type,
         724,
+        Some(vanilla_stop_destroy_ticks(0.2, 1.0, true)),
         "mature cocoa",
         &mut cocoa_drops,
     )

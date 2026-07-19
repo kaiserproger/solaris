@@ -28,22 +28,32 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
 
     let sand = crop_test_state(&blocks, "minecraft:sand", &[]);
     let water = crop_test_state(&blocks, "minecraft:water", &[]);
+    let bamboo_states = blocks
+        .block(&mc_data::Identifier::parse("minecraft:bamboo").unwrap())
+        .expect("bamboo block")
+        .states
+        .iter()
+        .map(|state| state.0 as i32)
+        .collect::<Vec<_>>();
     let cases = [
         (
             "sugar_cane",
             crop_test_state(&blocks, "minecraft:sugar_cane", &[]),
+            Vec::new(),
             true,
             false,
         ),
         (
             "cactus",
             crop_test_state(&blocks, "minecraft:cactus", &[]),
+            Vec::new(),
             false,
             true,
         ),
         (
             "bamboo",
             crop_test_state(&blocks, "minecraft:bamboo", &[]),
+            bamboo_states,
             false,
             false,
         ),
@@ -52,7 +62,10 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
         &report,
     ));
 
-    for (name, plant, needs_water, needs_spacing) in cases {
+    for (name, plant, mut growth_states, needs_water, needs_spacing) in cases {
+        if growth_states.is_empty() {
+            growth_states.push(plant.0 as i32);
+        }
         let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
         let storage = mc_world::WorldStorage::in_memory_with_capacity(
             Arc::clone(&blocks),
@@ -114,7 +127,7 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
             }
         }
 
-        wait_for_any_vertical_growth_delta(&mut client, name, growth_y, plant.0 as i32).await;
+        wait_for_any_vertical_growth_delta(&mut client, name, growth_y, &growth_states).await;
     }
 }
 
@@ -122,7 +135,7 @@ async fn wait_for_any_vertical_growth_delta(
     client: &mut Client,
     case_name: &str,
     y: i32,
-    state_id: i32,
+    state_ids: &[i32],
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
@@ -138,7 +151,7 @@ async fn wait_for_any_vertical_growth_delta(
         if frame.id == BlockUpdate::ID {
             let mut body = frame.body;
             let pkt = BlockUpdate::decode(&mut body).expect("decode vertical plant BlockUpdate");
-            if unpack_block_pos(pkt.position).1 == y && pkt.state_id == state_id {
+            if unpack_block_pos(pkt.position).1 == y && state_ids.contains(&pkt.state_id) {
                 return;
             }
             continue;
@@ -147,14 +160,14 @@ async fn wait_for_any_vertical_growth_delta(
             let mut body = frame.body;
             let pkt = SectionBlocksUpdate::decode(&mut body)
                 .expect("decode vertical plant SectionBlocksUpdate");
-            if section_update_contains_y_state(&pkt, y, state_id) {
+            if section_update_contains_y_state(&pkt, y, state_ids) {
                 return;
             }
         }
     }
 }
 
-fn section_update_contains_y_state(pkt: &SectionBlocksUpdate, y: i32, state_id: i32) -> bool {
+fn section_update_contains_y_state(pkt: &SectionBlocksUpdate, y: i32, state_ids: &[i32]) -> bool {
     let section_y = y.div_euclid(16);
     let relative_y = (y as u16) & 15;
     let section_y_mask = pkt.section_pos & 0xF_FFFF;
@@ -163,6 +176,6 @@ fn section_update_contains_y_state(pkt: &SectionBlocksUpdate, y: i32, state_id: 
     }
     pkt.changes.iter().any(|change| {
         let change_y = change.relative_pos & 15;
-        change_y == relative_y && change.state_id == state_id
+        change_y == relative_y && state_ids.contains(&change.state_id)
     })
 }

@@ -22,7 +22,6 @@ use std::time::Duration;
 use bytes::{Buf, BytesMut};
 use mc_extension::{
     DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, OutboundCommand, PlayerId, ProtocolPhase,
-    QueueRecvError,
 };
 use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
@@ -35,14 +34,17 @@ use mc_protocol::packets::configuration::{
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
 use mc_protocol::packets::play::{
-    ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
-    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundKeepAlive,
-    ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
-    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, PlayDisconnect,
-    ServerboundChatCommand, ServerboundCustomPayload, ServerboundKeepAlive, SetCenterChunk,
-    SetDefaultSpawnPosition, SynchronizePlayerPosition, unpack_block_pos,
+    AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundCustomPayload, ClientboundInitializeBorder, ClientboundPlayerAbilities,
+    ClientboundRecipeBookAdd, ClientboundRecipeBookSettings, ClientboundSetHealth,
+    ClientboundSetHeldSlot, ClientboundSetTime, ClientboundSystemChat, ClientboundUpdateRecipes,
+    ConfirmTeleportation, EntityEvent, GameEvent, LevelChunkWithLight, LoginPlay, MovePlayerFlags,
+    PlayDisconnect, ServerboundChat, ServerboundChatCommand, ServerboundCustomPayload,
+    ServerboundKeepAlive, ServerboundMovePlayerPos, SetCenterChunk, SetDefaultSpawnPosition,
+    SynchronizePlayerPosition, unpack_block_pos,
 };
 use mc_protocol::packets::{CustomPayload, Packet};
+use mc_script::{ScriptCommand, ScriptEvent, ScriptEventKind, ScriptHostEndpoint, ScriptPlayerId};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use uuid::Uuid;
@@ -55,6 +57,10 @@ async fn start_server() -> SocketAddr {
 }
 
 async fn start_server_with_max(max_players: u32) -> SocketAddr {
+    let random_tick = mc_net::RandomTickPolicy {
+        simulation_distance: 5,
+        ..mc_net::RandomTickPolicy::default()
+    };
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "M1.g play".into(),
@@ -75,7 +81,7 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
         entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-        random_tick: mc_net::RandomTickPolicy::default(),
+        random_tick,
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
         shutdown: mc_net::ShutdownHandle::default(),
     };
@@ -125,6 +131,49 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
     (addr, endpoint)
 }
 
+async fn start_server_with_scripts() -> (SocketAddr, ScriptHostEndpoint) {
+    let cfg = script_server_config(mc_net::ShutdownHandle::default());
+    let (boundary, endpoint) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(32).unwrap(),
+        NonZeroUsize::new(8).unwrap(),
+    );
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+    (addr, endpoint)
+}
+
+fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfig {
+    mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua plugin integration".into(),
+        max_players: 8,
+        view_distance: 10,
+        data: std::sync::Arc::new(mc_data::testing::stub()),
+        blocks: std::sync::Arc::new(
+            mc_world::BlockRegistry::from_report(&[]).expect("empty registry builds"),
+        ),
+        world: None,
+        tags: std::sync::Arc::new(mc_data::tags::TagsData::default()),
+        recipes: std::sync::Arc::new(Vec::new()),
+        loot: std::sync::Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown,
+    }
+}
+
 async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression: Compression) {
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
@@ -133,20 +182,29 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression:
 }
 
 async fn recv_extension_event(endpoint: &mc_extension::ExtensionEndpoint) -> InboundEvent {
+    tokio::time::timeout(Duration::from_secs(2), endpoint.recv_event())
+        .await
+        .expect("extension event was not delivered within 2s")
+        .expect("extension event queue closed")
+}
+
+async fn recv_script_event(
+    endpoint: &mut ScriptHostEndpoint,
+    matches: impl Fn(&ScriptEvent) -> bool,
+) -> ScriptEvent {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            match endpoint.try_recv_event() {
-                Ok(event) => return event,
-                Err(QueueRecvError::Empty) => {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                }
-                Err(QueueRecvError::Closed) => panic!("extension event queue closed"),
-                Err(error) => panic!("unexpected extension queue error: {error:?}"),
+            let event = endpoint
+                .recv_event()
+                .await
+                .expect("script event queue closed");
+            if matches(&event) {
+                return event;
             }
         }
     })
     .await
-    .expect("extension event was not delivered within 2s")
+    .expect("script event was not delivered within 2s")
 }
 
 async fn read_one_frame(
@@ -232,16 +290,41 @@ async fn assert_damage_command_still_processed(
     )
     .await;
 
-    let mut frame = read_one_frame(stream, buf, compression).await;
-    for _ in 0..64 {
-        if frame.id == ClientboundSetHealth::ID {
-            break;
+    let health = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id != ClientboundSetHealth::ID {
+                continue;
+            }
+            let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
+            if health.health == 12.5 {
+                return health;
+            }
         }
-        frame = read_one_frame(stream, buf, compression).await;
-    }
-    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
-    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
+    })
+    .await
+    .expect("damage Set Health was not delivered within 2s");
     assert_eq!(health.health, 12.5);
+    assert_eq!(health.food, 20);
+    assert_eq!(health.saturation, 5.0);
+}
+
+async fn drain_initial_play_burst(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) {
+    let health = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == ClientboundSetHealth::ID {
+                return ClientboundSetHealth::decode(&mut frame.body).unwrap();
+            }
+        }
+    })
+    .await
+    .expect("initial Set Health was not delivered within 2s");
+    assert_eq!(health.health, 20.0);
     assert_eq!(health.food, 20);
     assert_eq!(health.saturation, 5.0);
 }
@@ -256,6 +339,96 @@ fn disconnect_text(disconnect: &PlayDisconnect) -> String {
         panic!("disconnect reason should include a string text field");
     };
     text
+}
+
+fn system_chat_text(chat: &ClientboundSystemChat) -> String {
+    let mut cursor: &[u8] = &chat.content_nbt;
+    let tag = mc_nbt::read_network(&mut cursor).expect("system chat NBT decodes");
+    let Tag::Compound(fields) = tag else {
+        panic!("system chat should be an NBT compound");
+    };
+    let Some((_, Tag::String(text))) = fields.into_iter().find(|(name, _)| name == "text") else {
+        panic!("system chat should include a string text field");
+    };
+    text
+}
+
+async fn read_matching_system_chat(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+    expected: &str,
+) -> ClientboundSystemChat {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id != ClientboundSystemChat::ID {
+                continue;
+            }
+            let chat = ClientboundSystemChat::decode(&mut frame.body).unwrap();
+            if system_chat_text(&chat) == expected {
+                return chat;
+            }
+        }
+    })
+    .await
+    .expect("matching system chat was not delivered within 2s")
+}
+
+async fn confirm_initial_player_position(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) {
+    let teleport_id = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == SynchronizePlayerPosition::ID {
+                return SynchronizePlayerPosition::decode(&mut frame.body)
+                    .unwrap()
+                    .teleport_id;
+            }
+        }
+    })
+    .await
+    .expect("initial player position was not delivered within 2s");
+    write_frame(stream, &ConfirmTeleportation { teleport_id }, compression).await;
+}
+
+async fn read_initial_position_and_matching_system_chat(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+    expected: &str,
+) -> ClientboundSystemChat {
+    let (teleport_id, chat) = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut teleport_id = None;
+        let mut chat = None;
+        loop {
+            let mut frame = read_one_frame(stream, buf, compression).await;
+            if frame.id == SynchronizePlayerPosition::ID {
+                teleport_id = Some(
+                    SynchronizePlayerPosition::decode(&mut frame.body)
+                        .unwrap()
+                        .teleport_id,
+                );
+            } else if frame.id == ClientboundSystemChat::ID {
+                let candidate = ClientboundSystemChat::decode(&mut frame.body).unwrap();
+                if system_chat_text(&candidate) == expected {
+                    chat = Some(candidate);
+                }
+            }
+            if let Some(teleport_id) = teleport_id
+                && let Some(chat) = chat.take()
+            {
+                return (teleport_id, chat);
+            }
+        }
+    })
+    .await
+    .expect("initial player position and matching system chat were not delivered within 2s");
+    write_frame(stream, &ConfirmTeleportation { teleport_id }, compression).await;
+    chat
 }
 
 /// Walk the full protocol up to and including
@@ -347,6 +520,8 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!(login.dimension_type_id, 0);
     assert_eq!(login.dimension_name.as_str(), "minecraft:alpha");
     assert_eq!(login.game_mode, 0); // survival
+    assert_eq!(login.view_distance, 10);
+    assert_eq!(login.simulation_distance, 5);
     assert!(
         !login.is_flat,
         "generated terrain is no longer a flat world"
@@ -473,6 +648,35 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
     assert_eq!(
         frame.id,
+        ClientboundUpdateRecipes::ID,
+        "expected Update Recipes"
+    );
+    let recipes = ClientboundUpdateRecipes::decode(&mut frame.body).unwrap();
+    assert!(recipes.item_sets.is_empty());
+    assert!(recipes.stonecutter_recipes.is_empty());
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundRecipeBookSettings::ID,
+        "expected Recipe Book Settings"
+    );
+    let settings = ClientboundRecipeBookSettings::decode(&mut frame.body).unwrap();
+    assert_eq!(settings, ClientboundRecipeBookSettings::default());
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
+        ClientboundRecipeBookAdd::ID,
+        "expected initial Recipe Book Add"
+    );
+    let recipe_book = ClientboundRecipeBookAdd::decode(&mut frame.body).unwrap();
+    assert!(recipe_book.replace);
+    assert!(recipe_book.entries.is_empty());
+
+    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+    assert_eq!(
+        frame.id,
         ClientboundContainerSetContent::ID,
         "expected Container Set Content"
     );
@@ -481,18 +685,7 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     assert_eq!(inventory.state_id, 1);
     assert_eq!(inventory.items.len(), 46);
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    for _ in 0..64 {
-        if frame.id == ClientboundSetHealth::ID {
-            break;
-        }
-        frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
-    assert_eq!(frame.id, ClientboundSetHealth::ID, "expected Set Health");
-    let health = ClientboundSetHealth::decode(&mut frame.body).unwrap();
-    assert_eq!(health.health, 20.0);
-    assert_eq!(health.food, 20);
-    assert_eq!(health.saturation, 5.0);
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     // Be polite: ack the teleport.
     write_frame(
@@ -504,21 +697,8 @@ async fn play_state_entry_sends_login_and_spawn_burst() {
     )
     .await;
 
-    // Closing here: the keepalive loop runs on a 15-second tick, which
-    // is way too long for a unit test. Asserting "no keepalive yet" or
-    // waiting for one would either flake or stall, so we just confirm
-    // the server stays connected for a beat and then close ourselves —
-    // server.rs will surface EOF cleanly.
-    let mut scratch = [0u8; 1];
-    let early_close =
-        tokio::time::timeout(Duration::from_millis(250), stream.read(&mut scratch)).await;
-    assert!(
-        early_close.is_err(),
-        "server should NOT close the connection in the first quarter-second \
-         after the spawn burst — keepalive loop is running"
-    );
+    assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
 
-    // Now drop the client; the server task will see EOF and exit.
     drop(stream);
 }
 
@@ -579,14 +759,7 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "Spurious").await;
 
-    // Drain Play entry burst. With world = None the chunk packet itself
-    // is intentionally not emitted (LoginPlay, ChangeDifficulty,
-    // PlayerAbilities, SetHeldSlot, permission EntityEvent, Commands,
-    // SyncPos, InitializeBorder, SetTime, SetDefaultSpawn, GameEvent,
-    // SetCenterChunk, 3 visibility/dispatch bursts = 15 frames).
-    for _ in 0..15 {
-        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -595,20 +768,8 @@ async fn play_state_handles_serverbound_keepalive_echo() {
     )
     .await;
 
-    // Confirm the connection is still alive — the server should log a
-    // mismatch warning but not close.
-    let mut scratch = [0u8; 1];
-    let close = tokio::time::timeout(Duration::from_millis(250), stream.read(&mut scratch)).await;
-    assert!(
-        close.is_err(),
-        "server should not close on a spurious keepalive id"
-    );
+    assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
     drop(stream);
-
-    // Hush the unused-import lint for `ClientboundKeepAlive`. It is
-    // referenced by docstrings only — the test wire format uses the
-    // serverbound counterpart.
-    let _ = std::mem::size_of::<ClientboundKeepAlive>();
 }
 
 #[tokio::test]
@@ -618,9 +779,7 @@ async fn play_state_ignores_unknown_custom_payload() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayPayload").await;
 
-    for _ in 0..15 {
-        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -645,9 +804,7 @@ async fn play_state_ignores_oversized_custom_payload() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PlayPayloadBig").await;
 
-    for _ in 0..15 {
-        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -683,9 +840,7 @@ async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
     assert_eq!(player_id, PlayerId::new(1));
     assert_eq!(username, "ExtPlayer");
 
-    for _ in 0..15 {
-        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -733,6 +888,481 @@ async fn play_extension_boundary_receives_join_payload_brand_and_leave() {
             reason: "disconnected".to_owned(),
         }
     );
+}
+
+#[tokio::test]
+async fn play_script_boundary_carries_lifecycle_chat_tick_and_targeted_reply() {
+    let (addr, mut endpoint) = start_server_with_scripts().await;
+    let started = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::ServerStarted)
+    })
+    .await;
+    assert_eq!(started, ScriptEvent::server_started());
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "ScriptPlayer").await;
+    let joined = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
+    })
+    .await;
+    assert!(matches!(
+        joined.kind(),
+        ScriptEventKind::PlayerJoined {
+            player_id, username, ..
+        } if *player_id == ScriptPlayerId::new(1) && username == "ScriptPlayer"
+    ));
+
+    write_frame(
+        &mut stream,
+        &ServerboundChat {
+            message: "hello plugin".to_owned(),
+            timestamp_millis: 0,
+            salt: 0,
+            signature: None,
+            last_seen_offset: 0,
+            last_seen_acknowledged: [0; 3],
+            last_seen_checksum: 0,
+        },
+        compression,
+    )
+    .await;
+    let chat = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerChat { .. })
+    })
+    .await;
+    assert!(matches!(
+        chat.kind(),
+        ScriptEventKind::PlayerChat {
+            player_id, message, ..
+        } if *player_id == ScriptPlayerId::new(1) && message == "hello plugin"
+    ));
+
+    let tick = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::ServerTick { .. })
+    })
+    .await;
+    assert!(matches!(
+        tick.kind(),
+        ScriptEventKind::ServerTick { tick } if *tick > 0
+    ));
+
+    endpoint
+        .try_submit_command(ScriptCommand::SendChatMessage {
+            player_id: ScriptPlayerId::new(1),
+            message: "plugin reply".to_owned(),
+        })
+        .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id == ClientboundSystemChat::ID {
+                let chat = ClientboundSystemChat::decode(&mut frame.body).unwrap();
+                if system_chat_text(&chat) == "plugin reply" {
+                    return chat;
+                }
+            }
+        }
+    })
+    .await
+    .expect("script chat reply was not delivered within 2s");
+    assert!(!reply.overlay);
+
+    drop(stream);
+    let left = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerLeft { .. })
+    })
+    .await;
+    assert_eq!(
+        left,
+        ScriptEvent::player_left(ScriptPlayerId::new(1), "disconnected")
+    );
+}
+
+#[tokio::test]
+async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("welcome");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "welcome"
+            name = "Welcome"
+            version = "0.1.0"
+            api = "0.2.0"
+            events = ["player.joined", "player.chat"]
+            console_commands = ["time"]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            local function context(event)
+                return tostring(event.context_verified) .. ":" .. event.uuid .. ":" ..
+                    event.username .. ":" .. tostring(event.operator) .. ":" ..
+                    event.x .. ":" .. event.y .. ":" .. event.z
+            end
+
+            function on_player_joined(event)
+                solaris.send_message(event.player_id, "joined:" .. context(event))
+            end
+
+            function on_player_chat(event)
+                if event.message == "ping" then
+                    solaris.send_message(event.player_id, "chat:" .. context(event))
+                elseif event.message == "day" then
+                    solaris.run_console("time set day")
+                end
+            end
+        "#,
+    )
+    .unwrap();
+    let (boundary, host) =
+        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut config = script_server_config(shutdown.clone());
+    config.command_permissions = mc_net::CommandPermissionConfig::new(["LuaPlayer"], false);
+    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "LuaPlayer").await;
+    let joined = read_initial_position_and_matching_system_chat(
+        &mut stream,
+        &mut rbuf,
+        compression,
+        &format!(
+            "joined:true:{}:LuaPlayer:true:0.5:-59.0:0.5",
+            mc_net::offline_uuid("LuaPlayer")
+        ),
+    )
+    .await;
+    assert!(!joined.overlay);
+
+    write_frame(
+        &mut stream,
+        &ServerboundMovePlayerPos {
+            x: 12.25,
+            y: 70.0,
+            z: -4.5,
+            flags: MovePlayerFlags::new(true, false),
+        },
+        compression,
+    )
+    .await;
+
+    write_frame(
+        &mut stream,
+        &ServerboundChat {
+            message: "ping".to_owned(),
+            timestamp_millis: 0,
+            salt: 0,
+            signature: None,
+            last_seen_offset: 0,
+            last_seen_acknowledged: [0; 3],
+            last_seen_checksum: 0,
+        },
+        compression,
+    )
+    .await;
+    let chat = read_matching_system_chat(
+        &mut stream,
+        &mut rbuf,
+        compression,
+        &format!(
+            "chat:true:{}:LuaPlayer:true:12.25:70.0:-4.5",
+            mc_net::offline_uuid("LuaPlayer")
+        ),
+    )
+    .await;
+    assert!(!chat.overlay);
+
+    write_frame(
+        &mut stream,
+        &ServerboundChat {
+            message: "day".to_owned(),
+            timestamp_millis: 0,
+            salt: 0,
+            signature: None,
+            last_seen_offset: 0,
+            last_seen_acknowledged: [0; 3],
+            last_seen_checksum: 0,
+        },
+        compression,
+    )
+    .await;
+    let time = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id == ClientboundSetTime::ID {
+                let time = ClientboundSetTime::decode(&mut frame.body).unwrap();
+                if time.game_time == 1_000 {
+                    return time;
+                }
+            }
+        }
+    })
+    .await
+    .expect("script time command did not publish game time within 2s");
+    assert_eq!(time.game_time, 1_000);
+
+    drop(stream);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not stop within 2s")
+        .expect("server task failed")
+        .expect("server returned an error");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task failed")
+        .expect("Lua host thread panicked");
+}
+
+#[tokio::test]
+async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("pet");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "pet"
+            name = "Pet"
+            version = "0.1.0"
+            api = "0.5.0"
+            player_commands = ["pet"]
+            spawn_entities = ["minecraft:pig"]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_command(event)
+                solaris.spawn_entity(
+                    event.player_id,
+                    "minecraft:pig",
+                    event.x + 2,
+                    event.y,
+                    event.z
+                )
+            end
+        "#,
+    )
+    .unwrap();
+    let (boundary, host) =
+        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut config = script_server_config(shutdown.clone());
+    config.data = std::sync::Arc::new(mc_data::solaris_required_data());
+    let mut world = mc_world::WorldStorage::in_memory(std::sync::Arc::clone(&config.blocks));
+    let chunk = mc_world::ChunkPos { x: 0, z: 0 };
+    world
+        .insert_generated_chunk(
+            chunk,
+            mc_world::Chunk::empty(
+                chunk,
+                mc_world::BlockStateId(0),
+                mc_data::Identifier::parse("minecraft:plains").unwrap(),
+            ),
+        )
+        .unwrap();
+    config.world = Some(std::sync::Arc::new(tokio::sync::Mutex::new(world)));
+    config.entity_types =
+        std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
+            mc_data::entity_types::EntityTypeReport {
+                id: mc_data::Identifier::parse("minecraft:item").unwrap(),
+                protocol_id: 2,
+            },
+            mc_data::entity_types::EntityTypeReport {
+                id: mc_data::Identifier::parse("minecraft:pig").unwrap(),
+                protocol_id: 90,
+            },
+        ]));
+    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "PetPlayer").await;
+    confirm_initial_player_position(&mut stream, &mut rbuf, compression).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id == LevelChunkWithLight::ID {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("initial chunk was not delivered within 2s");
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: "pet".to_owned(),
+        },
+        compression,
+    )
+    .await;
+
+    let entity = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
+            if frame.id == AddEntity::ID {
+                let entity = AddEntity::decode(&mut frame.body).unwrap();
+                if entity.entity_type_id == 90 {
+                    return entity;
+                }
+            }
+        }
+    })
+    .await
+    .expect("allow-listed Lua entity spawn was not delivered within 2s");
+    assert_eq!(entity.entity_type_id, 90);
+    assert_eq!((entity.x, entity.y, entity.z), (2.5, -59.0, 0.5));
+
+    drop(stream);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not stop within 2s")
+        .expect("server task failed")
+        .expect("server returned an error");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task failed")
+        .expect("Lua host thread panicked");
+}
+
+#[tokio::test]
+async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_and_position() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("context");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "context"
+            name = "Context"
+            version = "0.1.0"
+            api = "0.4.0"
+            player_commands = ["who"]
+        "#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_command(event)
+                local role = event.operator and "operator" or "member"
+                solaris.send_message(
+                    event.player_id,
+                    role .. ":" .. tostring(event.operator) .. ":" ..
+                    event.uuid .. ":" .. event.username .. ":" ..
+                    event.x .. ":" .. event.y .. ":" .. event.z
+                )
+            end
+        "#,
+    )
+    .unwrap();
+    let (boundary, host) =
+        mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path())).unwrap();
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let mut config = script_server_config(shutdown.clone());
+    config.command_permissions = mc_net::CommandPermissionConfig::new(["OpPlayer"], false);
+    let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
+    let addr = bound.local_addr().unwrap();
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut member = TcpStream::connect(addr).await.unwrap();
+    let mut member_buf = BytesMut::with_capacity(8192);
+    let member_compression = drive_to_play(&mut member, &mut member_buf, addr, "Player").await;
+    confirm_initial_player_position(&mut member, &mut member_buf, member_compression).await;
+    write_frame(
+        &mut member,
+        &ServerboundMovePlayerPos {
+            x: 12.25,
+            y: 70.0,
+            z: -4.5,
+            flags: MovePlayerFlags::new(true, false),
+        },
+        member_compression,
+    )
+    .await;
+    write_frame(
+        &mut member,
+        &ServerboundChatCommand {
+            command: "who".to_owned(),
+        },
+        member_compression,
+    )
+    .await;
+    let member_reply = read_matching_system_chat(
+        &mut member,
+        &mut member_buf,
+        member_compression,
+        "member:false:a01e3843-e521-3998-958a-f459800e4d11:Player:12.25:70.0:-4.5",
+    )
+    .await;
+    assert!(!member_reply.overlay);
+
+    let mut operator = TcpStream::connect(addr).await.unwrap();
+    let mut operator_buf = BytesMut::with_capacity(8192);
+    let operator_compression =
+        drive_to_play(&mut operator, &mut operator_buf, addr, "OpPlayer").await;
+    confirm_initial_player_position(&mut operator, &mut operator_buf, operator_compression).await;
+    write_frame(
+        &mut operator,
+        &ServerboundMovePlayerPos {
+            x: -8.0,
+            y: 65.5,
+            z: 21.75,
+            flags: MovePlayerFlags::new(true, false),
+        },
+        operator_compression,
+    )
+    .await;
+    write_frame(
+        &mut operator,
+        &ServerboundChatCommand {
+            command: "who".to_owned(),
+        },
+        operator_compression,
+    )
+    .await;
+    let operator_reply = read_matching_system_chat(
+        &mut operator,
+        &mut operator_buf,
+        operator_compression,
+        "operator:true:0c2d537c-394b-30e2-a44a-1c42856286cb:OpPlayer:-8.0:65.5:21.75",
+    )
+    .await;
+    assert!(!operator_reply.overlay);
+
+    drop(member);
+    drop(operator);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server did not stop within 2s")
+        .expect("server task failed")
+        .expect("server returned an error");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task failed")
+        .expect("Lua host thread panicked");
 }
 
 #[tokio::test]
@@ -842,9 +1472,7 @@ async fn play_state_survival_damage_command_updates_health() {
     let mut rbuf = BytesMut::with_capacity(8192);
     let compression = drive_to_play(&mut stream, &mut rbuf, addr, "DamageCmd").await;
 
-    for _ in 0..15 {
-        let _ = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    }
+    drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
     assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
 

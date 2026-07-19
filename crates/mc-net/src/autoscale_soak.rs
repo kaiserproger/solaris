@@ -79,7 +79,8 @@ impl AutoscaleSoakReport {
                 .chunk_stop_reasons
                 .contains(&ChunkPipelineStopReason::QueueFull);
         let slow_client_pressure_observed = slow_client_attempted
-            && (snapshot.outbound_pressure.visibility_command_drops > 0
+            && (snapshot.outbound_pressure.best_effort_animation_drops > 0
+                || snapshot.outbound_pressure.reliable_command_drops > 0
                 || snapshot.outbound_pressure.reliable_command_retries > 0
                 || snapshot
                     .outbound_pressure
@@ -159,14 +160,30 @@ impl AutoscaleSoakReport {
                     reason: "no runtime-control pressure/action decision was observed in this bounded slice",
                 }
             },
-            bounded_chunk_queue: if snapshot.chunk_policy.chunk_result_queue_size > 0 {
-                AutoscalePrimitiveStatus::Present
-            } else {
+            bounded_chunk_queue: if snapshot.chunk_policy.chunk_result_queue_size == 0 {
                 AutoscalePrimitiveStatus::Degraded {
                     reason: "chunk result queue bound is zero after policy construction",
                 }
+            } else if snapshot.chunk_resources.max_result_queue_depth == 0 {
+                AutoscalePrimitiveStatus::Degraded {
+                    reason: "chunk result queue was not exercised in this bounded slice",
+                }
+            } else if snapshot.chunk_resources.max_result_queue_depth
+                <= snapshot.chunk_policy.chunk_result_queue_size
+            {
+                AutoscalePrimitiveStatus::Present
+            } else {
+                AutoscalePrimitiveStatus::Degraded {
+                    reason: "observed chunk result queue depth exceeded configured bound",
+                }
             },
-            worker_backpressure: if snapshot.chunk_resources.max_io_active
+            worker_backpressure: if snapshot.chunk_resources.max_io_active == 0
+                || snapshot.chunk_resources.max_cpu_active == 0
+            {
+                AutoscalePrimitiveStatus::Degraded {
+                    reason: "worker limits were not exercised in this bounded slice",
+                }
+            } else if snapshot.chunk_resources.max_io_active
                 <= snapshot.chunk_policy.chunk_io_threads
                 && snapshot.chunk_resources.max_cpu_active
                     <= snapshot.chunk_policy.chunk_worker_threads
@@ -191,14 +208,14 @@ impl AutoscaleSoakReport {
                     reason: "no memory-pressure work shedding was observed in this bounded slice",
                 }
             },
-            save_recovery_visibility: if save_during_shutdown_attempted
-                && snapshot.save_all.is_some()
-            {
-                AutoscalePrimitiveStatus::Present
-            } else {
-                AutoscalePrimitiveStatus::Degraded {
+            save_recovery_visibility: match (save_during_shutdown_attempted, snapshot.save_all) {
+                (true, Some(report)) if report.is_ok() => AutoscalePrimitiveStatus::Present,
+                (true, Some(_)) => AutoscalePrimitiveStatus::Degraded {
+                    reason: "save-all recovery report contained errors",
+                },
+                (false, _) | (true, None) => AutoscalePrimitiveStatus::Degraded {
                     reason: "save-all recovery report was not captured",
-                }
+                },
             },
             queue_saturation_observed,
             slow_client_pressure_observed,
@@ -244,7 +261,6 @@ mod tests {
             chunk_prepare_batch_size: 1,
             chunk_io_threads: 1,
             chunk_worker_threads: 1,
-            entity_worker_threads: 1,
             chunk_result_queue_size: 1,
             region_cache_size: 1,
             compression_threshold: 256,
@@ -281,10 +297,12 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
             outbound_pressure: OutboundPressureSnapshot {
-                visibility_command_drops: 3,
+                best_effort_animation_drops: 3,
+                reliable_command_drops: 0,
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 0,
                 max_reliable_command_retries_in_flight: 1,
@@ -346,8 +364,6 @@ mod tests {
             tick_ms: 35,
             queued_chunks: 64,
             queue_capacity: 64,
-            active_workers: 1,
-            worker_capacity: 4,
             memory_used_mb: 512,
             memory_limit_mb: 4096,
             first_chunk_ms: Some(500),
@@ -365,6 +381,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
             outbound_pressure: OutboundPressureSnapshot::default(),
@@ -405,6 +422,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
             outbound_pressure: OutboundPressureSnapshot::default(),
@@ -455,6 +473,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
             outbound_pressure: OutboundPressureSnapshot::default(),
@@ -487,6 +506,7 @@ mod tests {
                 max_io_active: 2,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::LoadBudget],
             outbound_pressure: OutboundPressureSnapshot::default(),
@@ -539,6 +559,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 0,
             },
             chunk_stop_reasons: &[],
             outbound_pressure: OutboundPressureSnapshot {
@@ -569,6 +590,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 0,
             },
             chunk_stop_reasons: &[],
             outbound_pressure: OutboundPressureSnapshot {
@@ -598,6 +620,7 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::MemoryPressure],
             outbound_pressure: OutboundPressureSnapshot::default(),
@@ -644,10 +667,12 @@ mod tests {
                 max_io_active: 1,
                 active_cpu: 0,
                 max_cpu_active: 1,
+                max_result_queue_depth: 1,
             },
             chunk_stop_reasons: &[ChunkPipelineStopReason::QueueFull],
             outbound_pressure: OutboundPressureSnapshot {
-                visibility_command_drops: 3,
+                best_effort_animation_drops: 3,
+                reliable_command_drops: 0,
                 reliable_command_retries: 1,
                 reliable_command_retries_in_flight: 1,
                 max_reliable_command_retries_in_flight: 1,
@@ -673,5 +698,54 @@ mod tests {
                 reason: "save-all recovery report was not captured"
             }
         );
+    }
+
+    #[test]
+    fn bounded_soak_report_rejects_unexercised_workers_and_failed_save() {
+        let save = SaveAllReport {
+            players_saved: 0,
+            entities_saved: 0,
+            chunks_flushed: 0,
+            world_metadata_saved: false,
+            timings: SaveAllTimings::default(),
+            errors: vec!["disk write failed".to_string()],
+        };
+        let report = AutoscaleSoakReport::from_snapshot(AutoscaleSoakSnapshot {
+            profile: AutoscaleSoakProfile::Balanced,
+            scenarios: &[AutoscaleSoakScenario::SaveDuringShutdown],
+            chunk_policy: policy(),
+            chunk_resources: ChunkPipelineResourceSnapshot {
+                active_io: 0,
+                max_io_active: 0,
+                active_cpu: 0,
+                max_cpu_active: 0,
+                max_result_queue_depth: 0,
+            },
+            chunk_stop_reasons: &[],
+            outbound_pressure: OutboundPressureSnapshot::default(),
+            save_all: Some(&save),
+            memory_pressure_shed_chunks: 0,
+            runtime_control: None,
+        });
+
+        assert_eq!(
+            report.bounded_chunk_queue,
+            AutoscalePrimitiveStatus::Degraded {
+                reason: "chunk result queue was not exercised in this bounded slice"
+            }
+        );
+        assert_eq!(
+            report.worker_backpressure,
+            AutoscalePrimitiveStatus::Degraded {
+                reason: "worker limits were not exercised in this bounded slice"
+            }
+        );
+        assert_eq!(
+            report.save_recovery_visibility,
+            AutoscalePrimitiveStatus::Degraded {
+                reason: "save-all recovery report contained errors"
+            }
+        );
+        assert_eq!(report.save_errors_observed, 1);
     }
 }

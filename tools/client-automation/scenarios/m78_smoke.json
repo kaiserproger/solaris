@@ -33,9 +33,10 @@
   },
   "client": {
     "version": "26.1.2",
-    "launcher": "PrismLauncher or vanilla launcher",
-    "offline_user": "SolarisM78",
-    "command_env": "M78_CLIENT_COMMAND"
+    "launcher": "repo-native Gradle runClient adapter",
+    "offline_user": "SolarisPrimary",
+    "adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "adapter_source": "auto-gradle-runclient"
   },
   "evidence": {
     "root": ".analysis/client-automation/runs/<timestamp>-m78_smoke",

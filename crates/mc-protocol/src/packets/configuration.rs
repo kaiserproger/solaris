@@ -17,11 +17,39 @@
 //! the full deferral list. The handler in `mc-net` reads but does not
 //! act on any other clientbound-in-Conf packets the client may send.
 
+use std::sync::Arc;
+
 use bytes::{Buf, BufMut};
 
 use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
+
+const MAX_KNOWN_PACKS: usize = 1_024;
+const MAX_REGISTRY_ENTRIES: usize = 65_536;
+const MAX_TAG_REGISTRIES: usize = 1_024;
+const MAX_TAGS_PER_REGISTRY: usize = 65_536;
+const MAX_TAG_ENTRIES: usize = 1_048_576;
+
+fn read_count<B: Buf>(buf: &mut B, max: usize) -> Result<usize, CodecError> {
+    let count = buf.read_varint()?;
+    if count < 0 {
+        return Err(CodecError::NegativeLength(count));
+    }
+    let count = count as usize;
+    if count > max {
+        return Err(CodecError::StringTooLong { len: count, max });
+    }
+    Ok(count)
+}
+
+fn write_count<B: BufMut>(buf: &mut B, count: usize, max: usize) -> Result<(), CodecError> {
+    if count > max {
+        return Err(CodecError::StringTooLong { len: count, max });
+    }
+    buf.write_varint(count as i32);
+    Ok(())
+}
 
 // -----------------------------------------------------------------------
 // Known Packs — both directions share the same struct.
@@ -40,12 +68,7 @@ fn write_known_pack_array<B: BufMut>(
     buf: &mut B,
     entries: &[KnownPackEntry],
 ) -> Result<(), CodecError> {
-    buf.write_varint(
-        i32::try_from(entries.len()).map_err(|_| CodecError::StringTooLong {
-            len: entries.len(),
-            max: i32::MAX as usize,
-        })?,
-    );
+    write_count(buf, entries.len(), MAX_KNOWN_PACKS)?;
     for entry in entries {
         buf.write_string(&entry.namespace, 32_767)?;
         buf.write_string(&entry.id, 32_767)?;
@@ -55,11 +78,8 @@ fn write_known_pack_array<B: BufMut>(
 }
 
 fn read_known_pack_array<B: Buf>(buf: &mut B) -> Result<Vec<KnownPackEntry>, CodecError> {
-    let count = buf.read_varint()?;
-    if count < 0 {
-        return Err(CodecError::NegativeLength(count));
-    }
-    let mut entries = Vec::with_capacity(count as usize);
+    let count = read_count(buf, MAX_KNOWN_PACKS)?;
+    let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let namespace = buf.read_string(32_767)?;
         let id = buf.read_string(32_767)?;
@@ -243,22 +263,19 @@ impl Packet for AcknowledgeFinishConfiguration {
 }
 
 // -----------------------------------------------------------------------
-// Registry Data (0x07 CB). Solaris currently emits entries that rely on
-// client built-in data (`has_data=false`); encoding full NBT payloads is
-// still deferred.
+// Registry Data (0x07 CB).
 // -----------------------------------------------------------------------
 
 /// One registry entry. If `has_data` is `false` the client uses its
 /// built-in data for this entry (matched via the Known Packs handshake).
 ///
-/// The `nbt_payload` field is intentionally `Vec<u8>`-typed and assumed
-/// to be a pre-serialised, root-less Network-NBT blob. We do not have a
-/// typed NBT codec yet; current Configuration handling emits
-/// `has_data = false` entries and never inspects this field.
+/// The `nbt_payload` field contains a pre-serialised, root-less Network-NBT
+/// compound. Keeping the encoded bytes avoids rebuilding immutable registry
+/// payloads for every connection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEntry {
     pub name: Identifier,
-    pub nbt_payload: Option<Vec<u8>>,
+    pub nbt_payload: Option<Arc<[u8]>>,
 }
 
 /// Clientbound 0x07 — one packet per registry, sent between Known Packs
@@ -273,15 +290,10 @@ impl Packet for RegistryData {
     const ID: i32 = 0x07;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        buf.write_identifier(&self.registry_id);
-        buf.write_varint(i32::try_from(self.entries.len()).map_err(|_| {
-            CodecError::StringTooLong {
-                len: self.entries.len(),
-                max: i32::MAX as usize,
-            }
-        })?);
+        buf.write_identifier(&self.registry_id)?;
+        write_count(buf, self.entries.len(), MAX_REGISTRY_ENTRIES)?;
         for entry in &self.entries {
-            buf.write_identifier(&entry.name);
+            buf.write_identifier(&entry.name)?;
             match &entry.nbt_payload {
                 Some(payload) => {
                     buf.write_bool(true);
@@ -293,31 +305,22 @@ impl Packet for RegistryData {
         Ok(())
     }
 
-    /// Decoding `RegistryData` with payload entries requires a real NBT
-    /// parser (the payload is self-delimiting, not length-prefixed). We
-    /// only need decoding for tests that confirm we can round-trip the
-    /// "no payloads" shape we actually send.
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let registry_id = buf.read_identifier()?;
-        let count = buf.read_varint()?;
-        if count < 0 {
-            return Err(CodecError::NegativeLength(count));
-        }
-        let mut entries = Vec::with_capacity(count as usize);
+        let count = read_count(buf, MAX_REGISTRY_ENTRIES)?;
+        let mut entries = Vec::with_capacity(count);
         for _ in 0..count {
             let name = buf.read_identifier()?;
             let has_data = buf.read_bool()?;
-            if has_data {
-                return Err(CodecError::InvalidIdentifier(
-                    "RegistryData entries with NBT payloads cannot be decoded \
-                     without a Network-NBT parser (deferred to M1.f)"
-                        .to_string(),
-                ));
-            }
-            entries.push(RegistryEntry {
-                name,
-                nbt_payload: None,
-            });
+            let nbt_payload = if has_data {
+                let root = mc_nbt::read_network(buf)?;
+                let mut payload = Vec::new();
+                mc_nbt::write_network(&mut payload, &root)?;
+                Some(payload.into())
+            } else {
+                None
+            };
+            entries.push(RegistryEntry { name, nbt_payload });
         }
         Ok(Self {
             registry_id,
@@ -382,28 +385,13 @@ impl Packet for UpdateTags {
     const ID: i32 = 0x0D;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        buf.write_varint(i32::try_from(self.registries.len()).map_err(|_| {
-            CodecError::StringTooLong {
-                len: self.registries.len(),
-                max: i32::MAX as usize,
-            }
-        })?);
+        write_count(buf, self.registries.len(), MAX_TAG_REGISTRIES)?;
         for reg in &self.registries {
-            buf.write_identifier(&reg.registry);
-            buf.write_varint(i32::try_from(reg.tags.len()).map_err(|_| {
-                CodecError::StringTooLong {
-                    len: reg.tags.len(),
-                    max: i32::MAX as usize,
-                }
-            })?);
+            buf.write_identifier(&reg.registry)?;
+            write_count(buf, reg.tags.len(), MAX_TAGS_PER_REGISTRY)?;
             for tag in &reg.tags {
-                buf.write_identifier(&tag.tag);
-                buf.write_varint(i32::try_from(tag.entries.len()).map_err(|_| {
-                    CodecError::StringTooLong {
-                        len: tag.entries.len(),
-                        max: i32::MAX as usize,
-                    }
-                })?);
+                buf.write_identifier(&tag.tag)?;
+                write_count(buf, tag.entries.len(), MAX_TAG_ENTRIES)?;
                 for &id in &tag.entries {
                     buf.write_varint(id);
                 }
@@ -413,25 +401,16 @@ impl Packet for UpdateTags {
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
-        let reg_count = buf.read_varint()?;
-        if reg_count < 0 {
-            return Err(CodecError::NegativeLength(reg_count));
-        }
-        let mut registries = Vec::with_capacity(reg_count as usize);
+        let reg_count = read_count(buf, MAX_TAG_REGISTRIES)?;
+        let mut registries = Vec::with_capacity(reg_count);
         for _ in 0..reg_count {
             let registry = buf.read_identifier()?;
-            let tag_count = buf.read_varint()?;
-            if tag_count < 0 {
-                return Err(CodecError::NegativeLength(tag_count));
-            }
-            let mut tags = Vec::with_capacity(tag_count as usize);
+            let tag_count = read_count(buf, MAX_TAGS_PER_REGISTRY)?;
+            let mut tags = Vec::with_capacity(tag_count);
             for _ in 0..tag_count {
                 let tag = buf.read_identifier()?;
-                let entry_count = buf.read_varint()?;
-                if entry_count < 0 {
-                    return Err(CodecError::NegativeLength(entry_count));
-                }
-                let mut entries = Vec::with_capacity(entry_count as usize);
+                let entry_count = read_count(buf, MAX_TAG_ENTRIES)?;
+                let mut entries = Vec::with_capacity(entry_count);
                 for _ in 0..entry_count {
                     entries.push(buf.read_varint()?);
                 }
@@ -503,6 +482,20 @@ mod tests {
         round_trip(ServerboundKnownPacks {
             packs: vec![sample_pack(), sample_pack()],
         });
+    }
+
+    #[test]
+    fn known_packs_rejects_oversized_count_before_allocation() {
+        let mut buf = Vec::new();
+        buf.write_varint(1_025);
+        let error = ServerboundKnownPacks::decode(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(
+            error,
+            CodecError::StringTooLong {
+                len: 1_025,
+                max: 1_024,
+            }
+        );
     }
 
     fn sample_client_information() -> ClientInformation {
@@ -634,6 +627,22 @@ mod tests {
     }
 
     #[test]
+    fn registry_data_rejects_oversized_entry_count_before_allocation() {
+        let mut buf = Vec::new();
+        buf.write_identifier(&Identifier::parse("minecraft:test").unwrap())
+            .unwrap();
+        buf.write_varint(65_537);
+        let error = RegistryData::decode(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(
+            error,
+            CodecError::StringTooLong {
+                len: 65_537,
+                max: 65_536,
+            }
+        );
+    }
+
+    #[test]
     fn update_tags_id_matches_javap() {
         assert_eq!(UpdateTags::ID, 0x0D);
     }
@@ -680,16 +689,66 @@ mod tests {
     }
 
     #[test]
-    fn registry_data_decode_refuses_inline_nbt() {
-        // Manually build a wire layout with has_data=true to confirm we
-        // surface the limitation rather than silently mis-parsing.
-        let mut buf = Vec::new();
-        buf.write_identifier(&Identifier::parse("minecraft:foo").unwrap());
-        buf.write_varint(1);
-        buf.write_identifier(&Identifier::parse("minecraft:bar").unwrap());
-        buf.write_bool(true);
-        let mut cursor: &[u8] = &buf;
-        let err = RegistryData::decode(&mut cursor).unwrap_err();
-        assert!(matches!(err, CodecError::InvalidIdentifier(_)));
+    fn update_tags_rejects_oversized_nested_counts_before_allocation() {
+        let mut registries = Vec::new();
+        registries.write_varint(1_025);
+        assert_eq!(
+            UpdateTags::decode(&mut registries.as_slice()).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 1_025,
+                max: 1_024,
+            }
+        );
+
+        let mut tags = Vec::new();
+        tags.write_varint(1);
+        tags.write_identifier(&Identifier::parse("minecraft:item").unwrap())
+            .unwrap();
+        tags.write_varint(65_537);
+        assert_eq!(
+            UpdateTags::decode(&mut tags.as_slice()).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 65_537,
+                max: 65_536,
+            }
+        );
+
+        let mut entries = Vec::new();
+        entries.write_varint(1);
+        entries
+            .write_identifier(&Identifier::parse("minecraft:item").unwrap())
+            .unwrap();
+        entries.write_varint(1);
+        entries
+            .write_identifier(&Identifier::parse("minecraft:test").unwrap())
+            .unwrap();
+        entries.write_varint(1_048_577);
+        assert_eq!(
+            UpdateTags::decode(&mut entries.as_slice()).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 1_048_577,
+                max: 1_048_576,
+            }
+        );
+    }
+
+    #[test]
+    fn registry_data_entries_with_network_nbt_round_trip() {
+        let mut payload = Vec::new();
+        mc_nbt::write_network(
+            &mut payload,
+            &mc_nbt::Tag::Compound(vec![
+                ("message_id".into(), mc_nbt::Tag::String("test.foo".into())),
+                ("exhaustion".into(), mc_nbt::Tag::Float(0.1)),
+            ]),
+        )
+        .unwrap();
+        round_trip(RegistryData {
+            registry_id: Identifier::parse("minecraft:damage_type").unwrap(),
+            entries: vec![RegistryEntry {
+                name: Identifier::parse("minecraft:test").unwrap(),
+                nbt_payload: Some(payload.into()),
+            }],
+        });
     }
 }

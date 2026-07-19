@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "pack_id": "core-replay-seed-81-real-client",
+  "quality_label": "stabilization",
+  "minecraft_version": "26.1.2",
+  "server_command": "cargo run --bin mc-server -- --config example.toml",
+  "core_replay_manifest": "tools/core-replay-scenarios/core-actions-seed-81.json",
+  "client_requirement": "A real vanilla 26.1.2 client must execute the copied checked replay manifest through the fixed repo-native Gradle runClient adapter.",
+  "forbidden_client_evidence": [
+    "wire-probe",
+    "mc_test_harness::client::Client",
+    "protocol-only bot",
+    "headless mock client"
+  ],
+  "required_artifacts": [
+    "manifest.json",
+    "core-replay-manifest.json",
+    "core-replay-result.json",
+    "client.log",
+    "server.log",
+    "observations.json",
+    "screenshots/",
+    "git.txt",
+    "toolchain.txt",
+    "automation-driver.txt"
+  ],
+  "automation_runner": {
+    "script": "tools/run-core-replay-client-gate.sh",
+    "delegates_to": "tools/run-real-client-regression.sh",
+    "client_adapter": "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent",
+    "client_adapter_source": "auto-gradle-runclient",
+    "default_agent_scenario": "core-actions-seed-81",
+    "passing_gate": "agent-run real-client"
+  },
+  "scenarios": [
+    {
+      "id": "core-actions-seed-81",
+      "status": "manual-pending",
+      "bounded_time_minutes": 3,
+      "screenshots_required": true,
+      "steps": [
+        "Launch a fresh per-run Solaris world and the real 26.1.2 client through the approved Gradle runner.",
+        "Execute the copied wait, move, look, and wait actions in exact manifest order.",
+        "Capture final client state, screenshot, and the versioned replay result."
+      ],
+      "expected_observations": [
+        "All four checked actions execute in order.",
+        "The client remains in Play and the requested movement converges within five centimetres.",
+        "The copied manifest and result pass the Rust replay validator."
+      ]
+    }
+  ]
+}

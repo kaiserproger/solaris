@@ -106,6 +106,9 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let mut simulation_ticks = bound
+        .runtime_telemetry_handle()
+        .subscribe_simulation_ticks();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -118,7 +121,7 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
         "spawn should expose seeded water test cells"
     );
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    wait_for_world_ticks(&mut client, 8).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:water_bucket 1 0".into(),
@@ -128,6 +131,7 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
     wait_for_slot_stack(&mut client, water_bucket_item_id, 1).await;
 
     let sequence = 6301;
+    let early_spread_tick = (*simulation_ticks.borrow()).saturating_add(4);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -159,9 +163,15 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
         if frame.id == BlockUpdate::ID {
             let mut body = frame.body;
             let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
-            if unpack_block_pos(pkt.position) == (source.x, source.y, source.z) {
+            let position = unpack_block_pos(pkt.position);
+            if position == (source.x, source.y, source.z) {
                 assert!(is_water_state(&block_facts, pkt.state_id));
                 saw_source = true;
+            } else {
+                assert!(
+                    !is_water_state(&block_facts, pkt.state_id),
+                    "water spread update arrived before placement acknowledgement at {position:?}"
+                );
             }
         } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
@@ -172,7 +182,14 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
         }
     }
 
-    assert_no_early_water_spread(&mut client, &block_facts, (source.x, source.y, source.z)).await;
+    assert_no_early_water_spread(
+        &mut client,
+        &block_facts,
+        (source.x, source.y, source.z),
+        &mut simulation_ticks,
+        early_spread_tick,
+    )
+    .await;
     wait_for_delayed_water_spread(&mut client, &block_facts, (source.x, source.y, source.z)).await;
 }
 
@@ -346,29 +363,35 @@ async fn assert_no_early_water_spread(
     client: &mut Client,
     block_facts: &mc_data::block_facts::BlockFactsTable,
     source: (i32, i32, i32),
+    simulation_ticks: &mut tokio::sync::watch::Receiver<u64>,
+    target_tick: u64,
 ) {
-    let deadline = tokio::time::Instant::now() + Duration::from_millis(150);
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *simulation_ticks.borrow_and_update() < target_tick {
+            tokio::select! {
+                changed = simulation_ticks.changed() => {
+                    changed.expect("simulation tick publisher remains active");
+                }
+                frame = client.read_frame() => {
+                    let frame = frame.expect("read pre-spread fluid frame");
+                    if handle_keepalive(client, frame.id, &frame.body).await {
+                        continue;
+                    }
+                    if frame.id == BlockUpdate::ID {
+                        let mut body = frame.body;
+                        let pkt = BlockUpdate::decode(&mut body).expect("decode early BlockUpdate");
+                        let pos = unpack_block_pos(pkt.position);
+                        assert!(
+                            !(pos != source && is_water_state(block_facts, pkt.state_id)),
+                            "water spread update arrived before the scheduled fluid delay at {pos:?}"
+                        );
+                    }
+                }
+            }
         }
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            return;
-        };
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == BlockUpdate::ID {
-            let mut body = frame.body;
-            let pkt = BlockUpdate::decode(&mut body).expect("decode early BlockUpdate");
-            let pos = unpack_block_pos(pkt.position);
-            assert!(
-                !(pos != source && is_water_state(block_facts, pkt.state_id)),
-                "water spread update arrived before the scheduled fluid delay at {pos:?}"
-            );
-        }
-    }
+    })
+    .await
+    .expect("simulation reached the pre-spread fluid tick fence");
 }
 
 async fn wait_for_delayed_water_spread(

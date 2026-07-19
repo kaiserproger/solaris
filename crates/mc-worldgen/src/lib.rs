@@ -10,9 +10,11 @@ pub mod noise;
 pub mod structures;
 pub mod terrain;
 
-pub use structures::{StructureError, StructureRules, StructureTemplate, TemplateBlock};
+pub use structures::{
+    StructureError, StructureRules, StructureTemplate, TemplateBlock, TemplateChest,
+};
 pub use terrain::{
-    BiomeRules, BiomeScope, OreRule, OreRules, OreSpacing, TellusWorldgenSettings,
+    BiomeRules, BiomeScope, OreRule, OreRules, OreRulesError, OreSpacing, TellusWorldgenSettings,
     TerrainGenerator, TerrainGeneratorError, WorldgenMode, YRange,
 };
 

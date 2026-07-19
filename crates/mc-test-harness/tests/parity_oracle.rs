@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use mc_nbt::{ListTag, Tag};
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
@@ -12,10 +14,10 @@ use mc_protocol::packets::play::{
     AddEntity, ClientboundChangeDifficulty, ClientboundCommands, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundInitializeBorder, ClientboundKeepAlive,
     ClientboundPlayerAbilities, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSetTime,
-    ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay, MovePlayerFlags, RemoveEntities,
-    ServerboundChatCommand, ServerboundKeepAlive, ServerboundMovePlayerPos,
-    ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded, ServerboundSetCarriedItem,
-    SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
+    ClientboundSystemChat, ConfirmTeleportation, EntityEvent, GameEvent, LoginPlay,
+    MovePlayerFlags, RemoveEntities, ServerboundChatCommand, ServerboundKeepAlive,
+    ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerLoaded,
+    ServerboundSetCarriedItem, SetCenterChunk, SetDefaultSpawnPosition, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::Client;
 use mc_test_harness::parity::{
@@ -23,6 +25,11 @@ use mc_test_harness::parity::{
     OracleAvailability, ParityScenario, ScenarioContext, ScenarioFuture, ServerKind,
     VanillaServerProcess, diff_observations, read_packet_id_skipping_startup_noise,
     read_typed_skipping_startup_noise, vanilla_oracle_availability,
+};
+use mc_test_harness::replay::{
+    REPLAY_RESULT_SCHEMA, ReplayCheckStatus, ReplayDriver, ReplayEvidenceKind, ReplayGateResult,
+    ReplayHardwareProvenance, ReplayInvariantResult, ReplayOutcome, ReplayProvenance,
+    ReplayRunResult, ReplayScenarioManifest, run_protocol_replay,
 };
 
 struct SpawnSmokeScenario;
@@ -208,6 +215,97 @@ async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<Observation
     }
 }
 
+type RegistrySnapshot = BTreeMap<String, BTreeMap<String, Tag>>;
+
+async fn collect_full_registry_snapshot(
+    addr: std::net::SocketAddr,
+    subject: &str,
+) -> Result<RegistrySnapshot> {
+    let mut client = Client::connect(addr).await?;
+    let _login = client.drive_login(addr, subject).await?;
+
+    loop {
+        let frame = client.read_frame().await?;
+        if frame.id == ClientboundKnownPacks::ID {
+            let _ = ClientboundKnownPacks::decode(&mut frame.body.clone())?;
+            break;
+        }
+    }
+    client
+        .write_packet(&ServerboundKnownPacks { packs: Vec::new() })
+        .await?;
+
+    let mut snapshot = RegistrySnapshot::new();
+    loop {
+        let frame = client.read_frame().await?;
+        if frame.id == RegistryData::ID {
+            let registry = RegistryData::decode(&mut frame.body.clone())?;
+            let mut entries = BTreeMap::new();
+            for entry in registry.entries {
+                let payload = entry.nbt_payload.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "{subject} omitted fallback payload for {} in {}",
+                        entry.name,
+                        registry.registry_id
+                    )
+                })?;
+                let mut payload = payload.as_ref();
+                let tag = mc_nbt::read_network(&mut payload)?;
+                anyhow::ensure!(payload.is_empty(), "registry payload has trailing bytes");
+                let previous = entries.insert(entry.name.to_string(), canonical_registry_tag(tag));
+                anyhow::ensure!(
+                    previous.is_none(),
+                    "duplicate registry entry {}",
+                    entry.name
+                );
+            }
+            let previous = snapshot.insert(registry.registry_id.to_string(), entries);
+            anyhow::ensure!(
+                previous.is_none(),
+                "duplicate registry packet {}",
+                registry.registry_id
+            );
+            continue;
+        }
+        if frame.id == UpdateTags::ID {
+            let _ = UpdateTags::decode(&mut frame.body.clone())?;
+            continue;
+        }
+        if frame.id == FinishConfiguration::ID {
+            let _ = FinishConfiguration::decode(&mut frame.body.clone())?;
+            client.write_packet(&AcknowledgeFinishConfiguration).await?;
+            return Ok(snapshot);
+        }
+        anyhow::bail!(
+            "unexpected configuration frame id=0x{:02X} body_len={}",
+            frame.id,
+            frame.body.len()
+        );
+    }
+}
+
+fn canonical_registry_tag(tag: Tag) -> Tag {
+    match tag {
+        Tag::List(list) => Tag::List(ListTag {
+            element_type: list.element_type,
+            elements: list
+                .elements
+                .into_iter()
+                .map(canonical_registry_tag)
+                .collect(),
+        }),
+        Tag::Compound(entries) => {
+            let mut entries = entries
+                .into_iter()
+                .map(|(name, tag)| (name, canonical_registry_tag(tag)))
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(&right.0));
+            Tag::Compound(entries)
+        }
+        tag => tag,
+    }
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
@@ -258,7 +356,6 @@ async fn spawn_solaris() -> Result<(mc_net::BoundServer, std::net::SocketAddr)> 
             chunk_prepare_batch_size: 8,
             chunk_io_threads: 1,
             chunk_worker_threads: 2,
-            entity_worker_threads: 1,
             chunk_result_queue_size: 64,
             region_cache_size: 4,
             compression_threshold: 256,
@@ -328,7 +425,6 @@ async fn spawn_solaris_with_local_vanilla_data()
             chunk_prepare_batch_size: 8,
             chunk_io_threads: 1,
             chunk_worker_threads: 2,
-            entity_worker_threads: 1,
             chunk_result_queue_size: 64,
             region_cache_size: 4,
             compression_threshold: 256,
@@ -458,6 +554,59 @@ async fn vanilla_and_solaris_configuration_phase_can_be_diffed() {
 }
 
 #[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn vanilla_and_solaris_full_registry_fallback_match() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let vanilla_snapshot = collect_full_registry_snapshot(vanilla.addr(), "VanillaFallback")
+        .await
+        .expect("vanilla full registry fallback");
+
+    let (solaris, solaris_addr) = spawn_solaris_with_local_vanilla_data()
+        .await
+        .expect("spawn Solaris with local vanilla sidecar");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+    let solaris_snapshot = collect_full_registry_snapshot(solaris_addr, "SolarisFallback")
+        .await
+        .expect("Solaris full registry fallback");
+
+    assert_eq!(
+        vanilla_snapshot.keys().collect::<Vec<_>>(),
+        solaris_snapshot.keys().collect::<Vec<_>>(),
+        "fallback registry set differs"
+    );
+    for (registry, vanilla_entries) in &vanilla_snapshot {
+        let solaris_entries = &solaris_snapshot[registry];
+        assert_eq!(
+            vanilla_entries.keys().collect::<Vec<_>>(),
+            solaris_entries.keys().collect::<Vec<_>>(),
+            "fallback entry set differs for {registry}"
+        );
+        for (entry, vanilla_tag) in vanilla_entries {
+            assert_eq!(
+                vanilla_tag, &solaris_entries[entry],
+                "fallback payload differs for {registry}/{entry}"
+            );
+        }
+    }
+
+    println!(
+        "FULL_REGISTRY_FALLBACK_ORACLE_OK registries={} entries={}",
+        vanilla_snapshot.len(),
+        vanilla_snapshot.values().map(BTreeMap::len).sum::<usize>()
+    );
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
+#[tokio::test]
 async fn solaris_core_action_sequence_samples_inventory_after_actions() {
     let (bound, addr) = spawn_solaris().await.expect("spawn Solaris");
     let task = tokio::spawn(async move { bound.serve().await });
@@ -518,6 +667,158 @@ async fn solaris_core_action_sequence_samples_inventory_after_actions() {
     )));
 
     task.abort();
+}
+
+#[tokio::test]
+async fn checked_manifest_replays_deterministically_on_two_fresh_solaris_servers() {
+    let manifest = ReplayScenarioManifest::from_json(include_str!(
+        "../../../tools/core-replay-scenarios/core-actions-seed-81.json"
+    ))
+    .expect("checked core replay manifest");
+
+    let (first_server, first_addr) = spawn_solaris().await.expect("spawn first Solaris");
+    let first_task = tokio::spawn(async move { first_server.serve().await });
+    let first = run_protocol_replay(
+        &manifest,
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: first_addr,
+        },
+    )
+    .await
+    .expect("first manifest replay");
+    first_task.abort();
+
+    let (second_server, second_addr) = spawn_solaris().await.expect("spawn second Solaris");
+    let second_task = tokio::spawn(async move { second_server.serve().await });
+    let second = run_protocol_replay(
+        &manifest,
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: second_addr,
+        },
+    )
+    .await
+    .expect("second manifest replay");
+    second_task.abort();
+
+    assert_eq!(
+        first, second,
+        "fresh Solaris replay state must be deterministic"
+    );
+    assert!(first.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "actions_executed" && value == "4"
+    )));
+    assert!(first.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::Note { key, value }
+            if key == "post_action_liveness" && value == "clientbound_frame"
+    )));
+    assert!(first.facts().iter().any(|fact| matches!(
+        fact,
+        ObservationFact::InventoryContent {
+            container_id: 0,
+            slots: 46,
+            ..
+        }
+    )));
+    for (index, action) in manifest.actions.iter().enumerate() {
+        let key = format!("action.{index}");
+        let value = action.summary();
+        assert!(first.facts().iter().any(|fact| matches!(
+            fact,
+            ObservationFact::Note { key: actual_key, value: actual_value }
+                if actual_key.as_str() == key.as_str()
+                    && actual_value.as_str() == value.as_str()
+        )));
+    }
+
+    let result = ReplayRunResult {
+        schema: REPLAY_RESULT_SCHEMA.into(),
+        scenario_id: manifest.id.clone(),
+        seed: manifest.seed,
+        driver: ReplayDriver::SolarisProtocol,
+        outcome: ReplayOutcome::Passed,
+        actions: manifest.actions.clone(),
+        concurrent_groups: Vec::new(),
+        state_observations: Vec::new(),
+        provenance: ReplayProvenance {
+            git_commit: "0000000000000000000000000000000000000000".into(),
+            config_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            build_profile: "cargo-test-debug".into(),
+            sidecar_version: "embedded:26.1.2".into(),
+            hardware: ReplayHardwareProvenance {
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+                cpu_model: "integration-test-provenance-not-profile-evidence".into(),
+                logical_cpus: std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1),
+                memory_mib: 1,
+            },
+        },
+        gates: vec![ReplayGateResult {
+            id: "protocol-session".into(),
+            evidence_kind: ReplayEvidenceKind::Harness,
+            status: ReplayCheckStatus::Passed,
+            reason: None,
+            artifacts: vec!["crates/mc-test-harness/tests/parity_oracle.rs".into()],
+        }],
+        invariants: vec![
+            ReplayInvariantResult {
+                id: "post-action-liveness".into(),
+                status: ReplayCheckStatus::Passed,
+                reason: None,
+            },
+            ReplayInvariantResult {
+                id: "deterministic-normalized-state".into(),
+                status: ReplayCheckStatus::Passed,
+                reason: None,
+            },
+        ],
+        observations: vec![first],
+    };
+    result
+        .validate_against(&manifest)
+        .expect("protocol replay result matches manifest");
+    let encoded = result.to_pretty_json().expect("encode replay result");
+    let decoded = ReplayRunResult::from_json(&encoded).expect("decode replay result");
+    decoded
+        .validate_against(&manifest)
+        .expect("decoded protocol replay result matches manifest");
+
+    let mut without_solaris_lane = manifest.clone();
+    without_solaris_lane
+        .lanes
+        .retain(|lane| lane.driver != ReplayDriver::SolarisProtocol);
+    let err = run_protocol_replay(
+        &without_solaris_lane,
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: "127.0.0.1:9".parse().expect("loopback discard address"),
+        },
+    )
+    .await
+    .expect_err("missing Solaris lane must fail before connecting");
+    assert!(err.to_string().contains("solaris protocol lane"));
+
+    let mut unsupported_reconnect = manifest.clone();
+    unsupported_reconnect
+        .actions
+        .push(mc_test_harness::parity::CoreAction::Reconnect);
+    let err = run_protocol_replay(
+        &unsupported_reconnect,
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: "127.0.0.1:9".parse().expect("loopback discard address"),
+        },
+    )
+    .await
+    .expect_err("unsupported reconnect must fail before connecting");
+    assert!(err.to_string().contains("does not support reconnect"));
 }
 
 #[tokio::test]
@@ -617,6 +918,83 @@ async fn vanilla_and_solaris_seeded_core_actions_can_be_diffed() {
     solaris_task.abort();
 }
 
+#[tokio::test]
+#[ignore = "requires local .analysis/server.jar vanilla oracle and Java"]
+async fn checked_manifest_vanilla_and_solaris_protocol_observations_can_be_diffed() {
+    let availability = vanilla_oracle_availability(repo_root());
+    let OracleAvailability::Available { jar } = availability else {
+        eprintln!("{}", availability.skip_message().expect("skip message"));
+        return;
+    };
+    let manifest = ReplayScenarioManifest::from_json(include_str!(
+        "../../../tools/core-replay-scenarios/core-actions-seed-81.json"
+    ))
+    .expect("checked core replay manifest");
+
+    let vanilla_dir = tempfile::tempdir().expect("vanilla tempdir");
+    let vanilla = VanillaServerProcess::launch(&jar, vanilla_dir.path(), Duration::from_secs(90))
+        .expect("vanilla starts");
+    let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
+    let solaris_task = tokio::spawn(async move { solaris.serve().await });
+
+    let vanilla_observations = run_protocol_replay(
+        &manifest,
+        ScenarioContext {
+            kind: ServerKind::Vanilla,
+            addr: vanilla.addr(),
+        },
+    )
+    .await
+    .expect("vanilla checked-manifest replay");
+    let solaris_observations = run_protocol_replay(
+        &manifest,
+        ScenarioContext {
+            kind: ServerKind::Solaris,
+            addr: solaris_addr,
+        },
+    )
+    .await
+    .expect("Solaris checked-manifest replay");
+
+    for observations in [&vanilla_observations, &solaris_observations] {
+        assert!(observations.facts().iter().any(|fact| matches!(
+            fact,
+            ObservationFact::InventoryContent {
+                container_id: 0,
+                slots: 46,
+                ..
+            }
+        )));
+        assert!(observations.facts().iter().any(|fact| matches!(
+            fact,
+            ObservationFact::Note { key, value }
+                if key == "actions_executed" && value == "4"
+        )));
+        assert!(observations.facts().iter().any(|fact| matches!(
+            fact,
+            ObservationFact::Note { key, value }
+                if key == "post_action_liveness" && value == "clientbound_frame"
+        )));
+        for (index, action) in manifest.actions.iter().enumerate() {
+            let key = format!("action.{index}");
+            let value = action.summary();
+            assert!(observations.facts().iter().any(|fact| matches!(
+                fact,
+                ObservationFact::Note { key: actual_key, value: actual_value }
+                    if actual_key.as_str() == key.as_str()
+                        && actual_value.as_str() == value.as_str()
+            )));
+        }
+    }
+
+    let diff = diff_observations(&vanilla_observations, &solaris_observations);
+    assert!(diff.is_empty(), "{diff}");
+    println!("M79_CORE_REPLAY_COMPARISON_OK core-actions-seed-81");
+
+    vanilla.stop().expect("vanilla stops");
+    solaris_task.abort();
+}
+
 // ---------------------------------------------------------------------------
 // M53.b scenario 1: container held-slot lifecycle
 // ---------------------------------------------------------------------------
@@ -699,30 +1077,23 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
         .await?;
     client.write_packet(&ServerboundPlayerLoaded).await?;
 
-    // Drain initial frames to capture held slot and inventory snapshot.
-    let mut saw_held_slot = true;
+    // Read until the authoritative inventory snapshot arrives.
+    let saw_held_slot = true;
     let mut saw_inventory = false;
-    for index in 0..64 {
-        let timeout = if index == 0 {
-            Duration::from_secs(5)
-        } else {
-            Duration::from_millis(250)
-        };
-        let frame = match client.read_frame_with_timeout(timeout).await {
-            Ok(frame) => frame,
-            Err(_err) if saw_inventory => break,
-            Err(_err) if saw_held_slot => {
-                continue;
-            }
-            Err(err) => return Err(err).context("wait for post-login frames"),
-        };
+    let inventory_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !saw_inventory {
+        let frame = client
+            .read_frame_with_timeout(
+                inventory_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("wait for authoritative post-login inventory")?;
 
         match frame.id {
             id if id == ClientboundSetHeldSlot::ID => {
                 let mut body = frame.body.clone();
                 let held = ClientboundSetHeldSlot::decode(&mut body)?;
                 observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-                saw_held_slot = true;
             }
             id if id == ClientboundContainerSetContent::ID => {
                 let mut body = frame.body.clone();
@@ -763,9 +1134,6 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
             }
             _ => {}
         }
-        if saw_inventory {
-            break;
-        }
     }
 
     observations.push(ObservationFact::Note {
@@ -786,31 +1154,7 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
         value: "sent".into(),
     });
 
-    // Observe the server's echoed held-slot change.
-    let mut saw_echo = false;
-    for _ in 0..32 {
-        let frame = match client
-            .read_frame_with_timeout(Duration::from_millis(250))
-            .await
-        {
-            Ok(frame) => frame,
-            Err(_) => break,
-        };
-        if frame.id == ClientboundSetHeldSlot::ID {
-            let mut body = frame.body.clone();
-            let held = ClientboundSetHeldSlot::decode(&mut body)?;
-            observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-            saw_echo = true;
-            break;
-        }
-        if frame.id == ClientboundKeepAlive::ID {
-            let mut body = frame.body.clone();
-            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-            client
-                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-                .await?;
-        }
-    }
+    let saw_echo = observe_held_slot_until_command_fence(&mut client, &mut observations).await?;
 
     observations.push(ObservationFact::Note {
         key: "held_slot_echo_observed".into(),
@@ -826,31 +1170,8 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
         value: "sent".into(),
     });
 
-    // Observe the second echo.
-    let mut saw_second_echo = false;
-    for _ in 0..32 {
-        let frame = match client
-            .read_frame_with_timeout(Duration::from_millis(250))
-            .await
-        {
-            Ok(frame) => frame,
-            Err(_) => break,
-        };
-        if frame.id == ClientboundSetHeldSlot::ID {
-            let mut body = frame.body.clone();
-            let held = ClientboundSetHeldSlot::decode(&mut body)?;
-            observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
-            saw_second_echo = true;
-            break;
-        }
-        if frame.id == ClientboundKeepAlive::ID {
-            let mut body = frame.body.clone();
-            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-            client
-                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-                .await?;
-        }
-    }
+    let saw_second_echo =
+        observe_held_slot_until_command_fence(&mut client, &mut observations).await?;
 
     observations.push(ObservationFact::Note {
         key: "second_held_slot_echo_observed".into(),
@@ -858,6 +1179,43 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
     });
 
     Ok(observations.normalized())
+}
+
+async fn observe_held_slot_until_command_fence(
+    client: &mut Client,
+    observations: &mut ObservationSet,
+) -> Result<bool> {
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "list".to_string(),
+        })
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_echo = false;
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .context("held-slot command fence did not produce system chat")?;
+        if frame.id == ClientboundSetHeldSlot::ID {
+            let mut body = frame.body.clone();
+            let held = ClientboundSetHeldSlot::decode(&mut body)?;
+            observations.push(ObservationFact::HeldSlotChanged { slot: held.slot });
+            saw_echo = true;
+        } else if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body.clone();
+            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+        } else if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body.clone();
+            let _feedback = ClientboundSystemChat::decode(&mut body)?;
+            return Ok(saw_echo);
+        }
+    }
 }
 
 #[tokio::test]
@@ -1015,18 +1373,8 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         .await?;
     client.write_packet(&ServerboundPlayerLoaded).await?;
 
-    // Ignore natural spawn noise from vanilla's generated world, then exercise a
-    // deterministic command-spawned entity on both servers.
-    drain_entity_lifecycle_frames(
-        &mut client,
-        &mut observations,
-        sync.x,
-        sync.y,
-        sync.z,
-        false,
-        None,
-    )
-    .await?;
+    // Match only the deterministic command-spawned entity. Natural spawn packets
+    // are ignored by type and position instead of being drained for a guessed time.
     let summon_x = sync.x.floor() as i32 + 2;
     let summon_y = sync.y.floor() as i32;
     let summon_z = sync.z.floor() as i32;
@@ -1042,16 +1390,12 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
     let entity_count = drain_entity_lifecycle_frames(
         &mut client,
         &mut observations,
-        sync.x,
-        sync.y,
-        sync.z,
-        true,
-        Some((
+        (
             zombie_type_id,
             f64::from(summon_x),
             f64::from(summon_y),
             f64::from(summon_z),
-        )),
+        ),
     )
     .await?;
     if entity_count == 0 {
@@ -1073,107 +1417,91 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
 async fn drain_entity_lifecycle_frames(
     client: &mut Client,
     observations: &mut ObservationSet,
-    x: f64,
-    y: f64,
-    z: f64,
-    record_entities: bool,
-    expected_entity: Option<(i32, f64, f64, f64)>,
+    expected_entity: (i32, f64, f64, f64),
 ) -> Result<u32> {
     let flags = MovePlayerFlags::new(false, false);
-    let mut entity_count = 0u32;
-    let cycles = if record_entities { 40 } else { 8 };
-    for _cycle in 0..cycles {
-        client
-            .write_packet(&ServerboundMovePlayerStatusOnly { flags })
-            .await?;
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly { flags })
+        .await?;
 
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
-        while tokio::time::Instant::now() < deadline {
-            let remaining = deadline - tokio::time::Instant::now();
-            let frame = match client.read_frame_with_timeout(remaining).await {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
-            match frame.id {
-                id if id == ClientboundKeepAlive::ID => {
-                    let mut body = frame.body.clone();
-                    let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-                    client
-                        .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-                        .await?;
-                }
-                id if id == AddEntity::ID => {
-                    let mut body = frame.body.clone();
-                    let add = AddEntity::decode(&mut body)?;
-                    if record_entities
-                        && expected_entity.is_none_or(|(entity_type_id, ex, ey, ez)| {
-                            add.entity_type_id == entity_type_id
-                                && (add.x - ex).abs() <= 1.5
-                                && (add.y - ey).abs() <= 2.0
-                                && (add.z - ez).abs() <= 1.5
-                        })
-                    {
-                        observations.push(ObservationFact::Note {
-                            key: "entity_spawn_packet_seen".into(),
-                            value: "true".into(),
-                        });
-                        entity_count += 1;
-                        return Ok(entity_count);
-                    }
-                }
-                id if id == RemoveEntities::ID => {
-                    let mut body = frame.body.clone();
-                    let _removed = RemoveEntities::decode(&mut body)?;
-                }
-                id if id == EntityEvent::ID => {
-                    let mut body = frame.body.clone();
-                    let _event = EntityEvent::decode(&mut body)?;
-                }
-                id if id == ClientboundSetHealth::ID => {
-                    let mut body = frame.body.clone();
-                    let _health = ClientboundSetHealth::decode(&mut body)?;
-                }
-                id if id == ClientboundContainerSetContent::ID => {
-                    let mut body = frame.body.clone();
-                    let inventory = ClientboundContainerSetContent::decode(&mut body)?;
-                    let slots = u16::try_from(inventory.items.len())
-                        .context("inventory slot count exceeds observation range")?;
-                    let non_empty_slots = u16::try_from(
-                        inventory
-                            .items
-                            .iter()
-                            .filter(|item| !item.is_empty())
-                            .count(),
-                    )
-                    .context("non-empty inventory slot count exceeds observation range")?;
-                    observations.push(ObservationFact::InventoryContent {
-                        container_id: inventory.container_id,
-                        state_id: inventory.state_id,
-                        slots,
-                        non_empty_slots,
-                        carried_count: inventory.carried_item.count,
-                    });
-                }
-                id if id == ClientboundContainerSetSlot::ID => {
-                    let mut body = frame.body.clone();
-                    let slot = ClientboundContainerSetSlot::decode(&mut body)?;
-                    observations.push(ObservationFact::ContainerSlotContent {
-                        container_id: slot.container_id,
-                        state_id: slot.state_id,
-                        slot: slot.slot,
-                        item_id: slot.item_stack.item_id,
-                        count: slot.item_stack.count,
-                    });
-                }
-                _ => {}
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .context("timed out waiting for command-spawned entity packet")?;
+        match frame.id {
+            id if id == ClientboundKeepAlive::ID => {
+                let mut body = frame.body.clone();
+                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+                client
+                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                    .await?;
             }
+            id if id == AddEntity::ID => {
+                let mut body = frame.body.clone();
+                let add = AddEntity::decode(&mut body)?;
+                let (entity_type_id, ex, ey, ez) = expected_entity;
+                if add.entity_type_id == entity_type_id
+                    && (add.x - ex).abs() <= 1.5
+                    && (add.y - ey).abs() <= 2.0
+                    && (add.z - ez).abs() <= 1.5
+                {
+                    observations.push(ObservationFact::Note {
+                        key: "entity_spawn_packet_seen".into(),
+                        value: "true".into(),
+                    });
+                    return Ok(1);
+                }
+            }
+            id if id == RemoveEntities::ID => {
+                let mut body = frame.body.clone();
+                let _removed = RemoveEntities::decode(&mut body)?;
+            }
+            id if id == EntityEvent::ID => {
+                let mut body = frame.body.clone();
+                let _event = EntityEvent::decode(&mut body)?;
+            }
+            id if id == ClientboundSetHealth::ID => {
+                let mut body = frame.body.clone();
+                let _health = ClientboundSetHealth::decode(&mut body)?;
+            }
+            id if id == ClientboundContainerSetContent::ID => {
+                let mut body = frame.body.clone();
+                let inventory = ClientboundContainerSetContent::decode(&mut body)?;
+                let slots = u16::try_from(inventory.items.len())
+                    .context("inventory slot count exceeds observation range")?;
+                let non_empty_slots = u16::try_from(
+                    inventory
+                        .items
+                        .iter()
+                        .filter(|item| !item.is_empty())
+                        .count(),
+                )
+                .context("non-empty inventory slot count exceeds observation range")?;
+                observations.push(ObservationFact::InventoryContent {
+                    container_id: inventory.container_id,
+                    state_id: inventory.state_id,
+                    slots,
+                    non_empty_slots,
+                    carried_count: inventory.carried_item.count,
+                });
+            }
+            id if id == ClientboundContainerSetSlot::ID => {
+                let mut body = frame.body.clone();
+                let slot = ClientboundContainerSetSlot::decode(&mut body)?;
+                observations.push(ObservationFact::ContainerSlotContent {
+                    container_id: slot.container_id,
+                    state_id: slot.state_id,
+                    slot: slot.slot,
+                    item_id: slot.item_stack.item_id,
+                    count: slot.item_stack.count,
+                });
+            }
+            _ => {}
         }
-
-        client
-            .write_packet(&ServerboundMovePlayerPos { x, y, z, flags })
-            .await?;
     }
-    Ok(entity_count)
 }
 
 #[tokio::test]
@@ -1222,7 +1550,11 @@ async fn vanilla_and_solaris_entity_lifecycle_can_be_diffed() {
     vanilla
         .send_command("op vanilla")
         .expect("op vanilla oracle client");
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    vanilla
+        .wait_for_log(Duration::from_secs(10), |line| {
+            line.contains("vanilla") && (line.contains("server operator") || line.contains("Opped"))
+        })
+        .expect("vanilla operator command completes");
     let (solaris, solaris_addr) = spawn_solaris().await.expect("spawn Solaris");
     let solaris_task = tokio::spawn(async move { solaris.serve().await });
 
@@ -1339,26 +1671,6 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
             .write_packet(&ServerboundMovePlayerStatusOnly { flags })
             .await?;
 
-        let end = tokio::time::Instant::now() + Duration::from_millis(500);
-        while tokio::time::Instant::now() < end {
-            let remaining = end - tokio::time::Instant::now();
-            if remaining.is_zero() {
-                break;
-            }
-            let frame = match client.read_frame_with_timeout(remaining).await {
-                Ok(frame) => frame,
-                Err(_) => break,
-            };
-            if frame.id == ClientboundKeepAlive::ID {
-                let mut body = frame.body.clone();
-                let keepalive = ClientboundKeepAlive::decode(&mut body)?;
-                client
-                    .write_packet(&ServerboundKeepAlive { id: keepalive.id })
-                    .await?;
-                keepalive_count += 1;
-            }
-        }
-
         client
             .write_packet(&ServerboundMovePlayerPos {
                 x: sync.x,
@@ -1367,6 +1679,35 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
                 flags,
             })
             .await?;
+    }
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "list".to_string(),
+        })
+        .await?;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .context("timed action command fence did not produce system chat")?;
+        if frame.id == ClientboundKeepAlive::ID {
+            let mut body = frame.body.clone();
+            let keepalive = ClientboundKeepAlive::decode(&mut body)?;
+            client
+                .write_packet(&ServerboundKeepAlive { id: keepalive.id })
+                .await?;
+            keepalive_count += 1;
+        } else if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body.clone();
+            let _feedback = ClientboundSystemChat::decode(&mut body)?;
+            observations.push(ObservationFact::PacketSeen {
+                id: ClientboundSystemChat::ID,
+            });
+            break;
+        }
     }
 
     observations.push(ObservationFact::Note {
@@ -1379,7 +1720,7 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
     });
     observations.push(ObservationFact::Note {
         key: "post_action_liveness".into(),
-        value: "clientbound_frame".into(),
+        value: "command_response".into(),
     });
 
     Ok(observations.normalized())

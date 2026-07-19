@@ -28,6 +28,12 @@ pub(super) async fn connect_to_play(
         })
         .await
         .expect("ack teleport");
+    client
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("report grounded spawn pose");
     (client, sync)
 }
 
@@ -64,6 +70,40 @@ pub(super) async fn handle_keepalive(client: &mut Client, id: i32, body: &bytes:
         .await
         .expect("echo KeepAlive");
     true
+}
+
+pub(super) async fn wait_for_world_ticks(client: &mut Client, ticks: i64) {
+    let mut baseline = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("wait for simulation ticks");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id != ClientboundSetTime::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let packet = ClientboundSetTime::decode(&mut body).expect("decode SetTime");
+        let start = *baseline.get_or_insert(packet.game_time);
+        if packet.game_time.saturating_sub(start) >= ticks {
+            return;
+        }
+    }
+}
+
+pub(super) fn vanilla_stop_destroy_ticks(
+    destroy_speed: f64,
+    item_speed: f64,
+    correct_tool_for_drops: bool,
+) -> i64 {
+    let divisor = if correct_tool_for_drops { 30.0 } else { 100.0 };
+    (0.7 * destroy_speed * divisor / item_speed).ceil() as i64
 }
 
 pub(super) async fn read_ack_without_target_update(
@@ -139,6 +179,31 @@ pub(super) async fn wait_for_food_level(client: &mut Client, food: i32) {
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
             if pkt.food == food {
                 return;
+            }
+        }
+    }
+}
+
+pub(super) async fn wait_for_experience(
+    client: &mut Client,
+    predicate: impl Fn(&ClientboundSetExperience) -> bool,
+) -> ClientboundSetExperience {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("experience update");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetExperience::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetExperience::decode(&mut body).expect("decode SetExperience");
+            if predicate(&packet) {
+                return packet;
             }
         }
     }
@@ -258,21 +323,20 @@ pub(super) async fn read_ack_without_food_or_slot_change(
     }
 }
 
-pub(super) async fn assert_no_food_or_slot_change(
+pub(super) async fn assert_no_food_or_slot_change_until_world_ticks(
     client: &mut Client,
     item_id: u32,
-    duration: Duration,
+    ticks: i64,
 ) {
-    let deadline = tokio::time::Instant::now() + duration;
+    let mut baseline = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        let frame = match client.read_frame_with_timeout(remaining).await {
-            Ok(frame) => frame,
-            Err(_) => return,
-        };
+        assert!(!remaining.is_zero(), "timed out waiting for world ticks");
+        let frame = client
+            .read_frame_with_timeout(remaining)
+            .await
+            .expect("wait for canceled-use world ticks");
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -287,6 +351,13 @@ pub(super) async fn assert_no_food_or_slot_change(
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode SetHealth");
             assert_ne!(pkt.food, 20, "canceled use item must not restore food");
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetTime::decode(&mut body).expect("decode SetTime");
+            let start = *baseline.get_or_insert(packet.game_time);
+            if packet.game_time.saturating_sub(start) >= ticks {
+                return;
+            }
         }
     }
 }
@@ -316,36 +387,6 @@ pub(super) async fn wait_for_slot_stack_update(
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
             if pkt.item_stack.item_id == item_id && pkt.item_stack.count == count {
                 return pkt;
-            }
-        }
-    }
-}
-
-pub(super) async fn wait_for_slot_damage(
-    client: &mut Client,
-    slot: i16,
-    item_id: u32,
-    damage: i32,
-) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        let frame = client
-            .read_frame_with_timeout(
-                deadline.saturating_duration_since(tokio::time::Instant::now()),
-            )
-            .await
-            .expect("slot damage update");
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == ClientboundContainerSetSlot::ID {
-            let mut body = frame.body;
-            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
-            if pkt.slot == slot
-                && pkt.item_stack.item_id == item_id
-                && pkt.item_stack.damage == Some(damage)
-            {
-                return;
             }
         }
     }

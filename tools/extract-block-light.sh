@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Per ADR 0001: dump per-block-state light metadata (emission,
-# dampening/opacity, sky propagation) out of the vanilla 26.1.x server
+# dampening/opacity, sky propagation, suffocation) out of the vanilla 26.1.x server
 # jar so Solaris's lighting engine has its block table. Mojang's
 # `--reports` mode doesn't expose these fields, so we run a custom
 # main class against the staged classpath. Output is data, not source.

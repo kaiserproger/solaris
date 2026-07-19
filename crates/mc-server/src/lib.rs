@@ -5,10 +5,10 @@
 //! Part of the Solaris engine.
 
 use std::net::{IpAddr, SocketAddr};
-use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::{Context, bail};
 use mc_data::VanillaData;
 use mc_data::biomes::BiomeSpawnRules;
 use mc_data::block_facts::BlockFactsTable;
@@ -43,6 +43,8 @@ pub struct ServerConfig {
     pub auth: AuthSection,
     #[serde(default)]
     pub autoscale: AutoscaleSection,
+    #[serde(default)]
+    pub plugins: PluginSection,
 }
 
 /// Identity-level server settings.
@@ -68,11 +70,9 @@ pub struct NetworkSection {
 }
 
 /// `world_dir` is the on-disk world save the server reads chunks from
-/// at runtime. `None` (or the default) means "no world wired up yet";
-/// the server will start and log a warning, and chunk queries will
-/// resolve to `None` everywhere. Plumbing the world into the network
-/// layer happens in M3.
-#[derive(Debug, Default, Serialize, Deserialize)]
+/// at runtime. The library keeps it optional for synthetic network tests,
+/// but the `mc-server` binary requires it for both `--check` and `serve`.
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DataSection {
     #[serde(default)]
@@ -91,6 +91,42 @@ pub struct DataSection {
     pub seed: i64,
     #[serde(default)]
     pub worldgen_mode: WorldgenMode,
+    /// Lowest generated world Y, inclusive.
+    #[serde(default = "default_dimension_min_y")]
+    pub min_y: i32,
+    /// Generated world height in blocks.
+    #[serde(default = "default_dimension_height")]
+    pub height: i32,
+}
+
+impl Default for DataSection {
+    fn default() -> Self {
+        Self {
+            world_dir: None,
+            vanilla_data_dir: None,
+            seed: 0,
+            worldgen_mode: WorldgenMode::default(),
+            min_y: default_dimension_min_y(),
+            height: default_dimension_height(),
+        }
+    }
+}
+
+impl DataSection {
+    /// Validate the configured vertical range against the chunk format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the range is not section-aligned, is empty,
+    /// overflows, or cannot be represented by the current heightmap format.
+    pub fn chunk_geometry(&self) -> Result<mc_world::ChunkGeometry, String> {
+        mc_world::ChunkGeometry::new(self.min_y, self.height).ok_or_else(|| {
+            format!(
+                "data.min_y ({}) and data.height ({}) must define a positive, 16-block-aligned range supported by the chunk heightmap format",
+                self.min_y, self.height
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -117,6 +153,7 @@ impl WorldgenMode {
 /// of the Play socket task in stages; these settings are the stable
 /// operator-facing surface for that pipeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkPipelineSection {
     #[serde(default = "default_chunk_send_rate")]
     pub chunk_send_rate: u32,
@@ -128,12 +165,6 @@ pub struct ChunkPipelineSection {
     pub chunk_prepare_budget_ms: u64,
     #[serde(default = "default_chunk_prepare_batch_size")]
     pub chunk_prepare_batch_size: usize,
-    #[serde(default = "default_chunk_io_threads_percent")]
-    pub chunk_io_threads_percent: u32,
-    #[serde(default = "default_chunk_worker_threads_percent")]
-    pub chunk_worker_threads_percent: u32,
-    #[serde(default = "default_entity_worker_threads_percent")]
-    pub entity_worker_threads_percent: u32,
     #[serde(default = "default_chunk_result_queue_size")]
     pub chunk_result_queue_size: usize,
     #[serde(default = "default_region_cache_size")]
@@ -145,15 +176,20 @@ pub struct ChunkPipelineSection {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SimulationSection {
     #[serde(default = "default_random_tick_speed")]
     pub random_tick_speed: u32,
-    #[serde(default = "default_random_tick_chunk_budget")]
-    pub random_tick_chunk_budget: usize,
-    #[serde(default = "default_scheduled_fluid_tick_budget")]
-    pub scheduled_fluid_tick_budget: usize,
     #[serde(default = "default_save_interval_ticks")]
     pub save_interval_ticks: u64,
+}
+
+/// Optional directory containing server-side Lua plugins.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginSection {
+    #[serde(default)]
+    pub directory: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,7 +258,7 @@ pub struct AutoscaleSection {
 impl Default for AutoscaleSection {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             profile: AutoscaleProfile::Balanced,
             min_view_distance: None,
             max_view_distance: None,
@@ -308,8 +344,6 @@ impl Default for SimulationSection {
         let policy = mc_net::RandomTickPolicy::default();
         Self {
             random_tick_speed: policy.random_tick_speed,
-            random_tick_chunk_budget: policy.chunk_budget,
-            scheduled_fluid_tick_budget: policy.fluid_tick_budget,
             save_interval_ticks: policy.save_interval_ticks,
         }
     }
@@ -317,11 +351,14 @@ impl Default for SimulationSection {
 
 impl SimulationSection {
     #[must_use]
-    pub fn to_network(&self, seed: i64) -> mc_net::RandomTickPolicy {
+    pub fn to_network(&self, seed: i64, simulation_distance: i32) -> mc_net::RandomTickPolicy {
+        let defaults = mc_net::RandomTickPolicy::default();
         mc_net::RandomTickPolicy {
+            simulation_distance: simulation_distance
+                .clamp(mc_net::MIN_VIEW_DISTANCE, mc_net::MAX_VIEW_DISTANCE),
             random_tick_speed: self.random_tick_speed,
-            chunk_budget: self.random_tick_chunk_budget.max(1),
-            fluid_tick_budget: self.scheduled_fluid_tick_budget.max(1),
+            chunk_budget: defaults.chunk_budget,
+            fluid_tick_budget: defaults.fluid_tick_budget,
             save_interval_ticks: self.save_interval_ticks.max(1),
             seed: seed as u64,
         }
@@ -337,9 +374,6 @@ impl Default for ChunkPipelineSection {
             chunk_generate_rate: policy.chunk_generate_rate,
             chunk_prepare_budget_ms: policy.chunk_prepare_budget_ms,
             chunk_prepare_batch_size: policy.chunk_prepare_batch_size,
-            chunk_io_threads_percent: default_chunk_io_threads_percent(),
-            chunk_worker_threads_percent: default_chunk_worker_threads_percent(),
-            entity_worker_threads_percent: default_entity_worker_threads_percent(),
             chunk_result_queue_size: policy.chunk_result_queue_size,
             region_cache_size: policy.region_cache_size,
             compression_threshold: policy.compression_threshold,
@@ -351,16 +385,15 @@ impl Default for ChunkPipelineSection {
 impl ChunkPipelineSection {
     #[must_use]
     pub fn to_network(&self) -> mc_net::ChunkPipelinePolicy {
-        let cores = available_parallelism();
+        let worker_defaults = mc_net::ChunkPipelinePolicy::default();
         mc_net::ChunkPipelinePolicy {
             chunk_send_rate: self.chunk_send_rate.max(1),
             chunk_load_rate: self.chunk_load_rate.max(1),
             chunk_generate_rate: self.chunk_generate_rate.max(1),
             chunk_prepare_budget_ms: self.chunk_prepare_budget_ms,
             chunk_prepare_batch_size: self.chunk_prepare_batch_size.max(1),
-            chunk_io_threads: threads_from_percent(cores, self.chunk_io_threads_percent),
-            chunk_worker_threads: threads_from_percent(cores, self.chunk_worker_threads_percent),
-            entity_worker_threads: threads_from_percent(cores, self.entity_worker_threads_percent),
+            chunk_io_threads: worker_defaults.chunk_io_threads,
+            chunk_worker_threads: worker_defaults.chunk_worker_threads,
             chunk_result_queue_size: self.chunk_result_queue_size.max(1),
             region_cache_size: self.region_cache_size.max(1),
             compression_threshold: self.compression_threshold.max(0),
@@ -370,24 +403,20 @@ impl ChunkPipelineSection {
     }
 }
 
-fn available_parallelism() -> usize {
-    std::thread::available_parallelism()
-        .map(NonZeroUsize::get)
-        .unwrap_or(1)
-}
-
-fn threads_from_percent(cores: usize, percent: u32) -> usize {
-    let cores = cores.max(1);
-    let scaled = cores.saturating_mul(percent as usize).div_ceil(100);
-    scaled.max(1)
-}
-
 fn default_max_players() -> u32 {
     20
 }
 
 fn default_view_distance() -> i32 {
     mc_net::DEFAULT_VIEW_DISTANCE
+}
+
+fn default_dimension_min_y() -> i32 {
+    mc_world::MIN_Y
+}
+
+fn default_dimension_height() -> i32 {
+    mc_world::MAX_Y - mc_world::MIN_Y
 }
 
 fn default_chunk_send_rate() -> u32 {
@@ -406,18 +435,6 @@ fn default_chunk_prepare_batch_size() -> usize {
     mc_net::ChunkPipelinePolicy::default().chunk_prepare_batch_size
 }
 
-fn default_chunk_io_threads_percent() -> u32 {
-    25
-}
-
-fn default_chunk_worker_threads_percent() -> u32 {
-    50
-}
-
-fn default_entity_worker_threads_percent() -> u32 {
-    25
-}
-
 fn default_chunk_result_queue_size() -> usize {
     mc_net::ChunkPipelinePolicy::default().chunk_result_queue_size
 }
@@ -432,14 +449,6 @@ fn default_compression_threshold() -> i32 {
 
 fn default_random_tick_speed() -> u32 {
     mc_net::RandomTickPolicy::default().random_tick_speed
-}
-
-fn default_random_tick_chunk_budget() -> usize {
-    mc_net::RandomTickPolicy::default().chunk_budget
-}
-
-fn default_scheduled_fluid_tick_budget() -> usize {
-    mc_net::RandomTickPolicy::default().fluid_tick_budget
 }
 
 fn default_save_interval_ticks() -> u64 {
@@ -469,8 +478,15 @@ impl ServerConfig {
         block_facts: Arc<BlockFactsTable>,
         entity_types: Arc<EntityTypeRegistry>,
         biome_spawns: Arc<BiomeSpawnRules>,
-    ) -> Result<mc_net::ServerConfig, std::net::AddrParseError> {
-        let ip: IpAddr = self.network.bind_address.parse()?;
+    ) -> anyhow::Result<mc_net::ServerConfig> {
+        let geometry = self.data.chunk_geometry().map_err(anyhow::Error::msg)?;
+        validate_loaded_chunk_geometry(world.as_ref(), geometry)?;
+        let ip: IpAddr = self.network.bind_address.parse().with_context(|| {
+            format!(
+                "invalid network.bind_address {:?}",
+                self.network.bind_address
+            )
+        })?;
         let mut chunk_pipeline = self.chunk_pipeline.to_network();
         if self.autoscale.enabled {
             chunk_pipeline.runtime_control = Some(mc_net::RuntimeControlConfig {
@@ -484,7 +500,10 @@ impl ServerConfig {
             bind_address: SocketAddr::new(ip, self.network.port),
             motd: self.server.motd.clone(),
             max_players: self.server.max_players,
-            view_distance: self.server.view_distance.max(0),
+            view_distance: self
+                .server
+                .view_distance
+                .clamp(mc_net::MIN_VIEW_DISTANCE, mc_net::MAX_VIEW_DISTANCE),
             data,
             blocks,
             world,
@@ -498,7 +517,9 @@ impl ServerConfig {
             entity_types,
             biome_spawns,
             chunk_pipeline,
-            random_tick: self.simulation.to_network(self.data.seed),
+            random_tick: self
+                .simulation
+                .to_network(self.data.seed, self.server.simulation_distance),
             command_permissions: mc_net::CommandPermissionConfig::new(
                 self.admin.operators.clone(),
                 self.admin.allow_local_dev_operators,
@@ -514,9 +535,78 @@ impl ServerConfig {
     }
 }
 
+fn validate_loaded_chunk_geometry(
+    world: Option<&WorldHandle>,
+    configured: mc_world::ChunkGeometry,
+) -> anyhow::Result<()> {
+    let Some(world) = world else {
+        return Ok(());
+    };
+    let storage = world.try_lock().map_err(|_| {
+        anyhow::anyhow!("cannot validate loaded chunk geometry: world storage is busy")
+    })?;
+    for (position, chunk) in storage.resident_chunk_snapshots() {
+        let loaded = chunk.geometry();
+        if loaded != configured {
+            bail!(
+                "loaded chunk ({}, {}) has geometry {}..{}, but data config requires {}..{}",
+                position.x,
+                position.z,
+                loaded.min_y(),
+                loaded.max_y(),
+                configured.min_y(),
+                configured.max_y(),
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_playable_profile_as_loopback_survival_spike() {
+        let cfg: ServerConfig =
+            toml::from_str(include_str!("../../../playable.toml")).expect("parse playable.toml");
+
+        assert_eq!(cfg.server.name, "solaris-playable");
+        assert_eq!(cfg.server.motd, "Solaris playable spike");
+        assert_eq!(cfg.server.view_distance, 4);
+        assert_eq!(cfg.server.simulation_distance, 4);
+        assert_eq!(cfg.network.bind_address, "127.0.0.1");
+        assert_eq!(cfg.network.port, 25565);
+        assert_eq!(
+            cfg.data.world_dir,
+            Some(std::path::PathBuf::from(".analysis/test-world"))
+        );
+        assert_eq!(
+            cfg.data.vanilla_data_dir,
+            Some(std::path::PathBuf::from("data/vanilla"))
+        );
+        assert_eq!(cfg.data.seed, 0);
+        assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+        assert!(!cfg.auth.online_mode);
+        assert!(!cfg.auth.whitelist_enabled);
+        assert!(cfg.auth.whitelist.is_empty());
+        assert!(cfg.auth.banned_players.is_empty());
+        assert!(cfg.admin.operators.is_empty());
+        assert!(!cfg.admin.allow_local_dev_operators);
+        assert_eq!(cfg.simulation.random_tick_speed, 5);
+        assert_eq!(cfg.simulation.save_interval_ticks, 1200);
+        assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 8);
+        assert_eq!(cfg.chunk_pipeline.chunk_load_rate, 16);
+        assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 16);
+        assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 64);
+        assert_eq!(cfg.chunk_pipeline.region_cache_size, 9);
+        assert!(cfg.autoscale.enabled);
+        assert_eq!(cfg.autoscale.min_view_distance, Some(4));
+        assert_eq!(cfg.autoscale.max_view_distance, Some(4));
+        let autoscale_policy = cfg.autoscale.to_policy(&cfg.chunk_pipeline);
+        assert_eq!(autoscale_policy.min_view_distance, 4);
+        assert_eq!(autoscale_policy.max_view_distance, 4);
+    }
 
     #[test]
     fn parses_example_config_shape() {
@@ -536,20 +626,74 @@ mod tests {
         assert_eq!(cfg.server.simulation_distance, 10);
         assert_eq!(cfg.network.port, 25565);
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 8);
-        assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
-        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 50);
-        assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 25);
         assert_eq!(cfg.simulation.random_tick_speed, 3);
-        assert_eq!(cfg.simulation.random_tick_chunk_budget, 64);
-        assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 256);
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
         assert!(cfg.data.vanilla_data_dir.is_none());
         assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
+        assert_eq!(
+            cfg.data.chunk_geometry().unwrap(),
+            mc_world::OVERWORLD_GEOMETRY
+        );
         assert!(!cfg.admin.allow_local_dev_operators);
         assert!(!cfg.auth.online_mode);
         assert!(!cfg.auth.whitelist_enabled);
-        assert!(!cfg.autoscale.enabled);
+        assert!(cfg.autoscale.enabled);
         assert_eq!(cfg.autoscale.profile, AutoscaleProfile::Balanced);
+    }
+
+    #[test]
+    fn parses_explicit_chunk_geometry_and_rejects_invalid_ranges() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [data]
+            min_y = 0
+            height = 256
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+        let geometry = cfg.data.chunk_geometry().expect("valid geometry");
+        assert_eq!(geometry.min_y(), 0);
+        assert_eq!(geometry.height(), 256);
+
+        let invalid = DataSection {
+            min_y: 1,
+            height: 255,
+            ..DataSection::default()
+        };
+        assert!(invalid.chunk_geometry().is_err());
+    }
+
+    #[test]
+    fn parses_plugin_directory_without_exposing_runtime_tuning() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [plugins]
+            directory = "plugins"
+        "#;
+        let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
+
+        assert_eq!(cfg.plugins.directory, Some(PathBuf::from("plugins")));
+    }
+
+    #[test]
+    fn example_config_enables_live_autoscale() {
+        let cfg: ServerConfig =
+            toml::from_str(include_str!("../../../example.toml")).expect("parse example.toml");
+
+        assert!(cfg.autoscale.enabled);
     }
 
     #[test]
@@ -674,6 +818,28 @@ mod tests {
     }
 
     #[test]
+    fn chunk_pipeline_rejects_removed_worker_percentages() {
+        let toml_src = r#"
+            [server]
+            name = "S"
+            motd = "M"
+
+            [network]
+            bind_address = "127.0.0.1"
+            port = 25565
+
+            [chunk_pipeline]
+            chunk_worker_threads_percent = 75
+        "#;
+
+        let err = toml::from_str::<ServerConfig>(toml_src).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("unknown field `chunk_worker_threads_percent`")
+        );
+    }
+
+    #[test]
     fn admin_section_rejects_unknown_fields() {
         let toml_src = r#"
             [server]
@@ -730,9 +896,6 @@ mod tests {
             chunk_generate_rate = 4
             chunk_prepare_budget_ms = 3
             chunk_prepare_batch_size = 2
-            chunk_io_threads_percent = 25
-            chunk_worker_threads_percent = 75
-            entity_worker_threads_percent = 30
             chunk_result_queue_size = 9
             region_cache_size = 7
             compression_threshold = 128
@@ -744,9 +907,6 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 4);
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_budget_ms, 3);
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 2);
-        assert_eq!(cfg.chunk_pipeline.chunk_io_threads_percent, 25);
-        assert_eq!(cfg.chunk_pipeline.chunk_worker_threads_percent, 75);
-        assert_eq!(cfg.chunk_pipeline.entity_worker_threads_percent, 30);
         assert_eq!(cfg.chunk_pipeline.chunk_result_queue_size, 9);
         assert_eq!(cfg.chunk_pipeline.region_cache_size, 7);
         assert_eq!(cfg.chunk_pipeline.compression_threshold, 128);
@@ -761,9 +921,6 @@ mod tests {
             chunk_generate_rate: 0,
             chunk_prepare_budget_ms: 0,
             chunk_prepare_batch_size: 0,
-            chunk_io_threads_percent: 0,
-            chunk_worker_threads_percent: 0,
-            entity_worker_threads_percent: 0,
             chunk_result_queue_size: 0,
             region_cache_size: 0,
             compression_threshold: -1,
@@ -774,9 +931,9 @@ mod tests {
         assert_eq!(policy.chunk_load_rate, 1);
         assert_eq!(policy.chunk_generate_rate, 1);
         assert_eq!(policy.chunk_prepare_batch_size, 1);
-        assert_eq!(policy.chunk_io_threads, 1);
-        assert_eq!(policy.chunk_worker_threads, 1);
-        assert_eq!(policy.entity_worker_threads, 1);
+        let defaults = mc_net::ChunkPipelinePolicy::default();
+        assert_eq!(policy.chunk_io_threads, defaults.chunk_io_threads);
+        assert_eq!(policy.chunk_worker_threads, defaults.chunk_worker_threads);
         assert_eq!(policy.chunk_result_queue_size, 1);
         assert_eq!(policy.region_cache_size, 1);
         assert_eq!(policy.compression_threshold, 0);
@@ -796,15 +953,11 @@ mod tests {
 
             [simulation]
             random_tick_speed = 7
-            random_tick_chunk_budget = 11
-            scheduled_fluid_tick_budget = 13
             save_interval_ticks = 40
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
         assert_eq!(cfg.simulation.random_tick_speed, 7);
-        assert_eq!(cfg.simulation.random_tick_chunk_budget, 11);
-        assert_eq!(cfg.simulation.scheduled_fluid_tick_budget, 13);
         assert_eq!(cfg.simulation.save_interval_ticks, 40);
     }
 
@@ -902,26 +1055,34 @@ mod tests {
     fn simulation_normalizes_runtime_budget() {
         let section = SimulationSection {
             random_tick_speed: 0,
-            random_tick_chunk_budget: 0,
-            scheduled_fluid_tick_budget: 0,
             save_interval_ticks: 0,
         };
-        let policy = section.to_network(42);
+        let policy = section.to_network(42, 5);
 
+        assert_eq!(policy.simulation_distance, 5);
         assert_eq!(policy.random_tick_speed, 0);
-        assert_eq!(policy.chunk_budget, 1);
-        assert_eq!(policy.fluid_tick_budget, 1);
+        assert_eq!(policy.chunk_budget, 64);
+        assert_eq!(policy.fluid_tick_budget, 256);
         assert_eq!(policy.save_interval_ticks, 1);
         assert_eq!(policy.seed, 42);
     }
 
     #[test]
-    fn chunk_pool_percentages_scale_from_available_cores() {
-        assert_eq!(threads_from_percent(3, 25), 1);
-        assert_eq!(threads_from_percent(3, 50), 2);
-        assert_eq!(threads_from_percent(8, 25), 2);
-        assert_eq!(threads_from_percent(8, 50), 4);
-        assert_eq!(threads_from_percent(8, 0), 1);
+    fn simulation_rejects_removed_manual_work_budgets() {
+        let error = toml::from_str::<ServerConfig>(
+            r#"
+                [simulation]
+                random_tick_chunk_budget = 11
+                scheduled_fluid_tick_budget = 13
+            "#,
+        )
+        .expect_err("runtime work budgets must belong to autoscale");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("random_tick_chunk_budget")
+                || message.contains("scheduled_fluid_tick_budget")
+        );
     }
 
     fn stub_blocks() -> Arc<BlockRegistry> {
@@ -970,11 +1131,15 @@ mod tests {
         assert_eq!(net.motd, "Howdy");
         assert_eq!(net.max_players, 50);
         assert_eq!(net.view_distance, 7);
-        assert_eq!(cfg.server.simulation_distance, 5);
+        assert_eq!(net.random_tick.simulation_distance, 5);
         assert_eq!(net.bind_address.port(), 25000);
         assert!(net.world.is_none());
         assert_eq!(net.chunk_pipeline.region_cache_size, 4);
-        assert!(net.chunk_pipeline.runtime_control.is_none());
+        let runtime = net
+            .chunk_pipeline
+            .runtime_control
+            .expect("default config wires runtime autoscale");
+        assert_eq!(runtime.initial_limits.view_distance, 7);
         assert_eq!(cfg.data.world_dir, Some(PathBuf::from("/tmp/world")));
     }
 

@@ -82,10 +82,18 @@ pub enum UseAction {
     Other,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolFacts {
     pub default_mining_speed: Option<f32>,
     pub damage_per_block: Option<u32>,
+    pub rules: Vec<ToolRuleFacts>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolRuleFacts {
+    pub blocks: Vec<String>,
+    pub speed: Option<f32>,
+    pub correct_for_drops: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,10 +247,7 @@ impl RawItemComponents {
             }),
             use_duration_ticks,
             use_action,
-            tool: tool.map(|raw| ToolFacts {
-                default_mining_speed: raw.default_mining_speed,
-                damage_per_block: raw.damage_per_block,
-            }),
+            tool: tool.map(RawTool::into_facts),
             equippable_slot: equippable.map(|raw| raw.slot),
             weapon: weapon.is_some(),
             weapon_damage_per_attack: weapon.map(|raw| raw.item_damage_per_attack.unwrap_or(1)),
@@ -270,6 +275,7 @@ struct RawEmbeddedItemFacts {
     weapon_damage_per_attack: Option<u32>,
     attack_damage_modifier: Option<f32>,
     attack_speed_modifier: Option<f32>,
+    tool: Option<RawTool>,
 }
 
 impl RawEmbeddedItemFacts {
@@ -280,7 +286,7 @@ impl RawEmbeddedItemFacts {
             food: self.food,
             use_duration_ticks: self.use_duration_ticks,
             use_action: self.use_action.map(RawEmbeddedUseAction::into_use_action),
-            tool: None,
+            tool: self.tool.map(RawTool::into_facts),
             equippable_slot: None,
             weapon: self.weapon.unwrap_or(false),
             weapon_damage_per_attack: self.weapon_damage_per_attack,
@@ -319,6 +325,49 @@ struct RawConsumable {
 struct RawTool {
     default_mining_speed: Option<f32>,
     damage_per_block: Option<u32>,
+    #[serde(default)]
+    rules: Vec<RawToolRule>,
+}
+
+impl RawTool {
+    fn into_facts(self) -> ToolFacts {
+        ToolFacts {
+            default_mining_speed: self.default_mining_speed,
+            damage_per_block: self.damage_per_block,
+            rules: self
+                .rules
+                .into_iter()
+                .map(|rule| ToolRuleFacts {
+                    blocks: rule.blocks.into_vec(),
+                    speed: rule.speed,
+                    correct_for_drops: rule.correct_for_drops,
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct RawToolRule {
+    blocks: RawToolBlocks,
+    speed: Option<f32>,
+    correct_for_drops: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RawToolBlocks {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawToolBlocks {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(block) => vec![block],
+            Self::Many(blocks) => blocks,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -448,6 +497,28 @@ mod tests {
             }"#,
         )
         .unwrap();
+        fs::write(
+            tmp.path().join("wooden_pickaxe.json"),
+            r##"{
+              "components": {
+                "minecraft:max_damage": 59,
+                "minecraft:tool": {
+                  "rules": [
+                    {
+                      "blocks": "#minecraft:incorrect_for_wooden_tool",
+                      "correct_for_drops": false
+                    },
+                    {
+                      "blocks": ["minecraft:stone", "minecraft:cobblestone"],
+                      "speed": 2.0,
+                      "correct_for_drops": true
+                    }
+                  ]
+                }
+              }
+            }"##,
+        )
+        .unwrap();
 
         let facts = load_item_facts(tmp.path()).unwrap();
 
@@ -494,6 +565,32 @@ mod tests {
                 toughness: 0.0,
             })
         );
+
+        let pickaxe = facts
+            .get(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
+            .and_then(|facts| facts.tool.as_ref())
+            .expect("wooden pickaxe tool facts");
+        assert_eq!(pickaxe.default_mining_speed, None);
+        assert_eq!(pickaxe.rules.len(), 2);
+        assert_eq!(
+            pickaxe.rules[0],
+            ToolRuleFacts {
+                blocks: vec!["#minecraft:incorrect_for_wooden_tool".to_string()],
+                speed: None,
+                correct_for_drops: Some(false),
+            }
+        );
+        assert_eq!(
+            pickaxe.rules[1],
+            ToolRuleFacts {
+                blocks: vec![
+                    "minecraft:stone".to_string(),
+                    "minecraft:cobblestone".to_string(),
+                ],
+                speed: Some(2.0),
+                correct_for_drops: Some(true),
+            }
+        );
     }
 
     #[test]
@@ -501,6 +598,54 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let facts = load_item_facts(tmp.path().join("missing")).unwrap();
         assert!(facts.is_empty());
+    }
+
+    #[test]
+    fn embedded_required_item_facts_cover_basic_wood_and_stone_tools() {
+        let facts = solaris_required_item_facts();
+        for (id, max_damage) in [
+            ("minecraft:wooden_pickaxe", 59),
+            ("minecraft:wooden_axe", 59),
+            ("minecraft:wooden_shovel", 59),
+            ("minecraft:wooden_sword", 59),
+            ("minecraft:wooden_hoe", 59),
+            ("minecraft:stone_pickaxe", 131),
+            ("minecraft:stone_axe", 131),
+            ("minecraft:stone_shovel", 131),
+            ("minecraft:stone_sword", 131),
+            ("minecraft:stone_hoe", 131),
+        ] {
+            let item = Identifier::parse(id).unwrap();
+            let fact = facts.get(&item).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(fact.max_damage, Some(max_damage), "{id}");
+            assert!(fact.attack_damage_modifier.is_some(), "{id}");
+        }
+    }
+
+    #[test]
+    fn embedded_required_item_facts_cover_playable_cooked_food() {
+        let facts = solaris_required_item_facts();
+        for (id, food, saturation) in [
+            ("minecraft:cooked_beef", 8, 12.8),
+            ("minecraft:cooked_porkchop", 8, 12.8),
+            ("minecraft:cooked_chicken", 6, 7.2),
+        ] {
+            let item = Identifier::parse(id).unwrap();
+            let fact = facts.get(&item).unwrap_or_else(|| panic!("missing {id}"));
+            assert_eq!(fact.food, Some(FoodEntry { food, saturation }), "{id}");
+            assert_eq!(fact.use_duration_ticks, Some(32), "{id}");
+            assert_eq!(fact.use_action, Some(UseAction::Eat), "{id}");
+        }
+    }
+
+    #[test]
+    fn embedded_required_item_facts_cover_shears_durability() {
+        let facts = solaris_required_item_facts();
+        let shears = facts
+            .get(&Identifier::parse("minecraft:shears").unwrap())
+            .expect("embedded shears facts");
+        assert_eq!(shears.max_damage, Some(238));
+        assert_eq!(shears.max_stack_size, Some(1));
     }
 
     #[test]
@@ -593,5 +738,31 @@ mod tests {
             .and_then(Path::parent)
             .unwrap()
             .join(rel)
+    }
+
+    #[test]
+    fn loads_real_ordered_tool_rules_when_present() {
+        let path = workspace_path("data/vanilla/reports/minecraft/components/item");
+        if !path.is_dir() {
+            eprintln!("skipping: {} not present", path.display());
+            return;
+        }
+
+        let facts = load_item_facts(path).unwrap();
+        let pickaxe = facts
+            .get(&Identifier::parse("minecraft:wooden_pickaxe").unwrap())
+            .and_then(|facts| facts.tool.as_ref())
+            .expect("wooden pickaxe tool facts");
+        assert_eq!(pickaxe.default_mining_speed, None);
+        assert_eq!(pickaxe.damage_per_block, None);
+        assert_eq!(pickaxe.rules.len(), 2);
+        assert_eq!(
+            pickaxe.rules[0].blocks,
+            ["#minecraft:incorrect_for_wooden_tool"]
+        );
+        assert_eq!(pickaxe.rules[0].correct_for_drops, Some(false));
+        assert_eq!(pickaxe.rules[1].blocks, ["#minecraft:mineable/pickaxe"]);
+        assert_eq!(pickaxe.rules[1].speed, Some(2.0));
+        assert_eq!(pickaxe.rules[1].correct_for_drops, Some(true));
     }
 }

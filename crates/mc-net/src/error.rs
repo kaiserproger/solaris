@@ -46,11 +46,33 @@ pub enum ConnectionError {
     #[error("timed out after {timeout:?} waiting for a packet in state {state:?}")]
     ReadTimeout { state: State, timeout: Duration },
 
+    #[error("outbound socket write remained blocked for {timeout:?}")]
+    WriteTimeout { timeout: Duration },
+
     #[error("ignored more than {max} non-target packet(s) in state {state:?}")]
     IgnoredPacketBudgetExceeded { state: State, max: usize },
 
+    #[error("online-mode authentication failed: {0}")]
+    OnlineAuthentication(&'static str),
+
+    #[error("runtime unavailable while {operation}")]
+    RuntimeUnavailable { operation: &'static str },
+
+    #[error("invalid non-finite player movement")]
+    InvalidPlayerMovement,
+
+    #[error("chunk preparation failed at ({chunk_x},{chunk_z}): {reason}")]
+    ChunkPreparation {
+        chunk_x: i32,
+        chunk_z: i32,
+        reason: String,
+    },
+
     #[error(
-        "client did not acknowledge required known pack {advertised}; full RegistryData payloads are not implemented"
+        "client did not acknowledge required known pack {advertised} and full sidecar RegistryData payloads are unavailable"
     )]
     MissingKnownPack { advertised: String },
+
+    #[error("full RegistryData payload index is missing {entry} from {registry}")]
+    MissingRegistryPayload { registry: String, entry: String },
 }

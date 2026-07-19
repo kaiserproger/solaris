@@ -10,14 +10,14 @@ use std::time::Duration;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     AddEntity, BlockChangedAck, BlockUpdate, ClientboundContainerSetSlot, ClientboundKeepAlive,
-    ClientboundSetEntityData, ClientboundSetHealth, ConfirmTeleportation, Direction, GameEvent,
-    GameMode, InteractionHand, LevelChunkWithLight, LightUpdate, LoginPlay, MovePlayerFlags,
-    PlayerActionKind, PlayerCommandAction, PlayerInput, RemoveEntities, SectionBlocksUpdate,
-    ServerboundChangeGameMode, ServerboundChatCommand, ServerboundClientTickEnd,
-    ServerboundKeepAlive, ServerboundMovePlayerPosRot, ServerboundPlayerAction,
-    ServerboundPlayerCommand, ServerboundPlayerInput, ServerboundPlayerLoaded,
-    ServerboundUseItemOn, SetCenterChunk, SetEntityMotion, SynchronizePlayerPosition,
-    pack_block_pos, pack_section_relative_pos, unpack_block_pos,
+    ClientboundSetEntityData, ClientboundSetHealth, ClientboundSetTime, ClientboundSystemChat,
+    ConfirmTeleportation, Direction, GameEvent, GameMode, InteractionHand, LevelChunkWithLight,
+    LightUpdate, LoginPlay, MovePlayerFlags, PlayerActionKind, PlayerCommandAction, PlayerInput,
+    RemoveEntities, SectionBlocksUpdate, ServerboundChangeGameMode, ServerboundChatCommand,
+    ServerboundClientTickEnd, ServerboundKeepAlive, ServerboundMovePlayerPosRot,
+    ServerboundPlayerAction, ServerboundPlayerCommand, ServerboundPlayerInput,
+    ServerboundPlayerLoaded, ServerboundUseItemOn, SetCenterChunk, SetEntityMotion,
+    SynchronizePlayerPosition, pack_block_pos, pack_section_relative_pos, unpack_block_pos,
 };
 use mc_test_harness::client::Client;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldStorage};
@@ -168,12 +168,7 @@ async fn shallow_water_entry_keeps_self_motion_client_predicted() {
         .await
         .expect("send swim input");
 
-    assert_no_self_authoritative_water_frames(
-        &mut client,
-        login.entity_id,
-        Duration::from_millis(750),
-    )
-    .await;
+    assert_no_self_authoritative_water_frames(&mut client, login.entity_id).await;
 }
 
 #[tokio::test]
@@ -228,12 +223,7 @@ async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
         .await
         .expect("swim upward in deep water");
 
-    assert_no_self_authoritative_water_frames(
-        &mut client,
-        login.entity_id,
-        Duration::from_millis(750),
-    )
-    .await;
+    assert_no_self_authoritative_water_frames(&mut client, login.entity_id).await;
 
     client
         .write_packet(&ServerboundMovePlayerPosRot {
@@ -247,12 +237,7 @@ async fn deep_water_swim_and_exit_keep_self_motion_client_predicted() {
         .await
         .expect("leave water onto land");
 
-    assert_no_self_authoritative_water_frames(
-        &mut client,
-        login.entity_id,
-        Duration::from_millis(750),
-    )
-    .await;
+    assert_no_self_authoritative_water_frames(&mut client, login.entity_id).await;
 }
 
 #[tokio::test]
@@ -275,7 +260,7 @@ async fn flat_ground_move_does_not_emit_position_correction() {
         .await
         .expect("move across flat ground");
 
-    assert_no_position_correction(&mut client, Duration::from_millis(500)).await;
+    assert_no_position_correction(&mut client).await;
 }
 
 #[tokio::test]
@@ -297,7 +282,7 @@ async fn wall_collision_corrects_player_to_last_accepted_position() {
         })
         .await
         .expect("move near wall");
-    assert_no_position_correction(&mut client, Duration::from_millis(250)).await;
+    assert_no_position_correction(&mut client).await;
 
     client
         .write_packet(&ServerboundMovePlayerPosRot {
@@ -334,7 +319,7 @@ async fn full_block_non_step_attempt_corrects_player() {
         })
         .await
         .expect("move beside full block");
-    assert_no_position_correction(&mut client, Duration::from_millis(250)).await;
+    assert_no_position_correction(&mut client).await;
 
     client
         .write_packet(&ServerboundMovePlayerPosRot {
@@ -366,7 +351,7 @@ async fn landing_fall_damage_uses_accumulated_descent() {
         })
         .await
         .expect("switch to survival");
-    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+    clientbound_frames_until_fence(&mut client, "survival mode change").await;
 
     for (y, on_ground) in [
         (69.0, false),
@@ -406,7 +391,7 @@ async fn water_entry_suppresses_fall_damage() {
         })
         .await
         .expect("switch to survival");
-    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+    clientbound_frames_until_fence(&mut client, "survival mode change").await;
 
     for y in [69.0, 68.0, 67.0, 66.0, 65.0, 64.0] {
         client
@@ -422,7 +407,7 @@ async fn water_entry_suppresses_fall_damage() {
             .expect("send water-entry movement");
     }
 
-    assert_no_health_below(&mut client, 20.0, Duration::from_millis(750)).await;
+    assert_no_health_below(&mut client, 20.0).await;
 }
 
 #[tokio::test]
@@ -468,6 +453,7 @@ async fn sugar_cane_support_break_emits_real_block_edit_observation() {
         &mut client,
         43,
         &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+        BlockActionCompletion::BlockUpdates,
     )
     .await;
     assert_eq!(
@@ -533,7 +519,7 @@ async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
         })
         .await
         .expect("start breaking sugar cane support");
-    tokio::time::sleep(Duration::from_millis(1_600)).await;
+    wait_for_world_ticks(&mut client, 32).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -548,6 +534,10 @@ async fn survival_sugar_cane_support_break_drops_cascaded_cane() {
         &mut client,
         144,
         &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+        BlockActionCompletion::SlotStack {
+            item_id: sugar_cane_item,
+            count: 3,
+        },
     )
     .await;
     assert_eq!(
@@ -615,9 +605,18 @@ async fn falling_blocks_start_when_support_breaks() {
             })
             .await
             .expect("break falling-block support");
-        let observation =
-            wait_for_block_action_observation(&mut client, sequence, &[(x, 66, 2), (x, 67, 2)])
-                .await;
+        let observation = wait_for_block_action_observation(
+            &mut client,
+            sequence,
+            &[(x, 66, 2), (x, 67, 2)],
+            BlockActionCompletion::FallingBlock {
+                state_id: falling_state.0 as i32,
+                x: f64::from(x) + 0.5,
+                y: 67.0,
+                z: 2.5,
+            },
+        )
+        .await;
         assert_eq!(
             observation.last_state_at((x, 66, 2)),
             Some(states.air.0 as i32),
@@ -640,6 +639,79 @@ async fn falling_blocks_start_when_support_breaks() {
         assert!(
             observation.saw_ack,
             "falling-block support edit should acknowledge sequence"
+        );
+    }
+}
+
+#[tokio::test]
+async fn stacked_falling_blocks_all_start_when_support_breaks() {
+    let Some(blocks) = load_block_registry() else {
+        return;
+    };
+    let states = FixtureStates::resolve(&blocks);
+    let Some(addr) = start_physics_server().await else {
+        return;
+    };
+
+    let (mut client, _) = connect_to_play(addr, "M47FallStack").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    client
+        .write_packet(&ServerboundChangeGameMode {
+            mode: GameMode::Creative,
+        })
+        .await
+        .expect("switch to creative");
+    client
+        .write_packet(&ServerboundMovePlayerPosRot {
+            x: 9.5,
+            y: 67.0,
+            z: 4.5,
+            yaw: 180.0,
+            pitch: 35.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("move within stacked falling-block reach");
+    client
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(9, 66, 2),
+            direction: Direction::Up,
+            sequence: 150,
+        })
+        .await
+        .expect("break stacked falling-block support");
+
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        150,
+        &[(9, 66, 2), (9, 67, 2), (9, 68, 2)],
+        BlockActionCompletion::FallingBlock {
+            state_id: states.sand.0 as i32,
+            x: 9.5,
+            y: 68.0,
+            z: 2.5,
+        },
+    )
+    .await;
+    assert_eq!(
+        observation.last_state_at((9, 67, 2)),
+        Some(states.air.0 as i32)
+    );
+    assert_eq!(
+        observation.last_state_at((9, 68, 2)),
+        Some(states.air.0 as i32),
+        "upper sand must not remain suspended after lower sand starts falling"
+    );
+    for y in [67.0, 68.0] {
+        assert!(
+            observation.add_entities.iter().any(|entity| {
+                entity.data == states.sand.0 as i32
+                    && (entity.x - 9.5).abs() < 0.01
+                    && (entity.y - y).abs() < 0.01
+                    && (entity.z - 2.5).abs() < 0.01
+            }),
+            "sand at y={y} must spawn its own falling-block entity"
         );
     }
 }
@@ -683,8 +755,18 @@ async fn falling_block_lands_as_block_and_despawns_entity() {
         })
         .await
         .expect("break sand support");
-    let observation =
-        wait_for_block_action_observation(&mut client, 150, &[(10, 66, 2), (10, 67, 2)]).await;
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        150,
+        &[(10, 66, 2), (10, 67, 2)],
+        BlockActionCompletion::FallingBlock {
+            state_id: states.sand.0 as i32,
+            x: 10.5,
+            y: 67.0,
+            z: 2.5,
+        },
+    )
+    .await;
     let falling_entity_id = observation
         .add_entities
         .iter()
@@ -764,13 +846,18 @@ async fn cactus_dirt_side_neighbor_placement_cascades_visible_column_removal() {
         .await
         .expect("place dirt beside cactus");
 
-    let observation =
-        wait_for_block_action_observation(&mut client, 182, &[(7, 64, 6), (6, 64, 6), (6, 65, 6)])
-            .await;
+    let observation = wait_for_block_action_observation(
+        &mut client,
+        182,
+        &[(7, 64, 6), (6, 64, 6), (6, 65, 6)],
+        BlockActionCompletion::BlockUpdates,
+    )
+    .await;
     assert_eq!(
         observation.last_target_state(),
         Some(states.dirt.0 as i32),
-        "placed side-neighbor should remain visible"
+        "placed side-neighbor should remain visible; updates={:?}",
+        observation.updates
     );
     for y in 64..=65 {
         assert_eq!(
@@ -814,7 +901,7 @@ async fn external_vanilla_sugar_cane_support_break_oracle() {
         .write_packet(&ServerboundClientTickEnd)
         .await
         .expect("send pre-break client tick end");
-    drain_external_setup_frames(&mut client, Duration::from_millis(150)).await;
+    clientbound_frames_until_fence(&mut client, "pre-break movement").await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StartDestroyBlock,
@@ -833,6 +920,7 @@ async fn external_vanilla_sugar_cane_support_break_oracle() {
         &mut client,
         43,
         &[(8, 63, 0), (8, 64, 0), (8, 65, 0), (8, 66, 0)],
+        BlockActionCompletion::BlockUpdates,
     )
     .await;
     assert_eq!(
@@ -994,6 +1082,9 @@ fn physics_fixture_world(blocks: Arc<BlockRegistry>) -> (WorldStorage, FixtureSt
     set(&mut world, 11, 67, 2, states.gravel);
     set(&mut world, 12, 66, 2, states.stone);
     set(&mut world, 12, 67, 2, states.anvil);
+    set(&mut world, 9, 66, 2, states.stone);
+    set(&mut world, 9, 67, 2, states.sand);
+    set(&mut world, 9, 68, 2, states.sand);
     set(&mut world, 6, 63, 4, states.farmland);
     set(&mut world, 6, 63, 6, states.sand);
     set(&mut world, 6, 64, 6, states.cactus);
@@ -1140,31 +1231,8 @@ async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
     }
 }
 
-async fn assert_no_self_authoritative_water_frames(
-    client: &mut Client,
-    player_entity_id: i32,
-    duration: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + duration;
-    let mut saw_liveness = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            if !saw_liveness {
-                prove_clientbound_liveness(client, "negative water-movement assertion").await;
-            }
-            return;
-        }
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            if !saw_liveness {
-                prove_clientbound_liveness(client, "negative water-movement assertion").await;
-            }
-            return;
-        };
-        saw_liveness = true;
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
+async fn assert_no_self_authoritative_water_frames(client: &mut Client, player_entity_id: i32) {
+    for frame in clientbound_frames_until_fence(client, "negative water-movement assertion").await {
         if frame.id == SetEntityMotion::ID {
             let mut body = frame.body;
             let motion = SetEntityMotion::decode(&mut body).expect("decode SetEntityMotion");
@@ -1185,37 +1253,8 @@ async fn assert_no_self_authoritative_water_frames(
     }
 }
 
-async fn assert_no_position_correction(client: &mut Client, duration: Duration) {
-    let deadline = tokio::time::Instant::now() + duration;
-    let mut saw_liveness = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            if !saw_liveness {
-                let id = prove_clientbound_liveness(client, "negative correction assertion").await;
-                assert_ne!(
-                    id,
-                    SynchronizePlayerPosition::ID,
-                    "movement window should not require correction after liveness probe"
-                );
-            }
-            return;
-        }
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            if !saw_liveness {
-                let id = prove_clientbound_liveness(client, "negative correction assertion").await;
-                assert_ne!(
-                    id,
-                    SynchronizePlayerPosition::ID,
-                    "movement window should not require correction after liveness probe"
-                );
-            }
-            return;
-        };
-        saw_liveness = true;
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
+async fn assert_no_position_correction(client: &mut Client) {
+    for frame in clientbound_frames_until_fence(client, "negative correction assertion").await {
         if frame.id == SynchronizePlayerPosition::ID {
             let mut body = frame.body;
             let pkt = SynchronizePlayerPosition::decode(&mut body).expect("decode SyncPlayerPos");
@@ -1323,27 +1362,33 @@ async fn wait_for_slot_stack(client: &mut Client, item_id: u32, count: i32) {
     }
 }
 
-async fn assert_no_health_below(client: &mut Client, health: f32, duration: Duration) {
-    let deadline = tokio::time::Instant::now() + duration;
-    let mut saw_liveness = false;
+async fn wait_for_world_ticks(client: &mut Client, ticks: i64) {
+    let mut baseline = None;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            if !saw_liveness {
-                prove_clientbound_liveness(client, "negative health assertion").await;
-            }
-            return;
-        }
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            if !saw_liveness {
-                prove_clientbound_liveness(client, "negative health assertion").await;
-            }
-            return;
-        };
-        saw_liveness = true;
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("wait for simulation ticks");
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
+        if frame.id != ClientboundSetTime::ID {
+            continue;
+        }
+        let mut body = frame.body;
+        let packet = ClientboundSetTime::decode(&mut body).expect("decode SetTime");
+        let start = *baseline.get_or_insert(packet.game_time);
+        if packet.game_time.saturating_sub(start) >= ticks {
+            return;
+        }
+    }
+}
+
+async fn assert_no_health_below(client: &mut Client, health: f32) {
+    for frame in clientbound_frames_until_fence(client, "negative health assertion").await {
         if frame.id == ClientboundSetHealth::ID {
             let mut body = frame.body;
             let pkt = ClientboundSetHealth::decode(&mut body).expect("decode set health");
@@ -1356,7 +1401,10 @@ async fn assert_no_health_below(client: &mut Client, health: f32, duration: Dura
     }
 }
 
-async fn prove_clientbound_liveness(client: &mut Client, reason: &str) -> i32 {
+async fn clientbound_frames_until_fence(
+    client: &mut Client,
+    reason: &str,
+) -> Vec<mc_protocol::RawFrame> {
     client
         .write_packet(&ServerboundChatCommand {
             command: "list".into(),
@@ -1364,7 +1412,12 @@ async fn prove_clientbound_liveness(client: &mut Client, reason: &str) -> i32 {
         .await
         .expect("send liveness probe command");
 
+    read_until_system_chat(client, reason).await
+}
+
+async fn read_until_system_chat(client: &mut Client, reason: &str) -> Vec<mc_protocol::RawFrame> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut frames = Vec::new();
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         assert!(
@@ -1378,7 +1431,13 @@ async fn prove_clientbound_liveness(client: &mut Client, reason: &str) -> i32 {
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        return frame.id;
+        if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body;
+            let _response =
+                ClientboundSystemChat::decode(&mut body).expect("decode liveness probe response");
+            return frames;
+        }
+        frames.push(frame);
     }
 }
 
@@ -1388,6 +1447,21 @@ struct BlockActionObservation {
     slot_updates: Vec<(u32, i32)>,
     primary_target: (i32, i32, i32),
     saw_ack: bool,
+}
+
+#[derive(Clone, Copy)]
+enum BlockActionCompletion {
+    BlockUpdates,
+    SlotStack {
+        item_id: u32,
+        count: i32,
+    },
+    FallingBlock {
+        state_id: i32,
+        x: f64,
+        y: f64,
+        z: f64,
+    },
 }
 
 impl BlockActionObservation {
@@ -1407,38 +1481,23 @@ async fn wait_for_block_action_observation(
     client: &mut Client,
     sequence: i32,
     targets: &[(i32, i32, i32)],
+    completion: BlockActionCompletion,
 ) -> BlockActionObservation {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let primary_target = targets[0];
     let mut updates = Vec::new();
     let mut add_entities = Vec::new();
     let mut slot_updates = Vec::new();
     let mut saw_ack = false;
-    let mut post_ack_deadline = None;
     loop {
         let now = tokio::time::Instant::now();
-        let read_deadline = if saw_ack && !updates.is_empty() {
-            post_ack_deadline.unwrap_or(deadline)
-        } else {
-            deadline
-        };
-        if now >= read_deadline {
-            if saw_ack && !updates.is_empty() {
-                break;
-            }
+        if now >= deadline {
             panic!("timed out waiting for block action observation");
         }
-        let frame = match client
-            .read_frame_with_timeout(read_deadline.saturating_duration_since(now))
+        let frame = client
+            .read_frame_with_timeout(deadline.saturating_duration_since(now))
             .await
-        {
-            Ok(frame) => frame,
-            Err(err) if saw_ack && !updates.is_empty() => {
-                let _ = err;
-                break;
-            }
-            Err(err) => panic!("wait for block action observation: {err}"),
-        };
+            .unwrap_or_else(|err| panic!("wait for block action observation: {err}"));
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
@@ -1467,7 +1526,6 @@ async fn wait_for_block_action_observation(
             let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
             if pkt.sequence == sequence {
                 saw_ack = true;
-                post_ack_deadline = Some(tokio::time::Instant::now() + Duration::from_millis(400));
             }
         } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
@@ -1476,6 +1534,27 @@ async fn wait_for_block_action_observation(
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
             slot_updates.push((pkt.item_stack.item_id, pkt.item_stack.count));
+        }
+
+        let saw_all_targets = targets
+            .iter()
+            .all(|target| updates.iter().any(|(position, _)| position == target));
+        let saw_completion = match completion {
+            BlockActionCompletion::BlockUpdates => true,
+            BlockActionCompletion::SlotStack { item_id, count } => {
+                slot_updates.contains(&(item_id, count))
+            }
+            BlockActionCompletion::FallingBlock { state_id, x, y, z } => {
+                add_entities.iter().any(|entity| {
+                    entity.data == state_id
+                        && (entity.x - x).abs() < 0.01
+                        && (entity.y - y).abs() < 0.01
+                        && (entity.z - z).abs() < 0.01
+                })
+            }
+        };
+        if saw_ack && saw_all_targets && saw_completion {
+            break;
         }
     }
     BlockActionObservation {
@@ -1632,33 +1711,7 @@ async fn setup_vanilla_sugar_cane_fixture(client: &mut Client) {
             .write_packet(&ServerboundClientTickEnd)
             .await
             .expect("send setup client tick end");
-        drain_external_setup_frames(client, Duration::from_millis(150)).await;
-    }
-}
-
-async fn drain_external_setup_frames(client: &mut Client, duration: Duration) {
-    let deadline = tokio::time::Instant::now() + duration;
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return;
-        }
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            return;
-        };
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
-        }
-        if frame.id == SynchronizePlayerPosition::ID {
-            let mut body = frame.body;
-            let pkt = SynchronizePlayerPosition::decode(&mut body).expect("decode setup sync");
-            client
-                .write_packet(&ConfirmTeleportation {
-                    teleport_id: pkt.teleport_id,
-                })
-                .await
-                .expect("ack setup teleport");
-        }
+        read_until_system_chat(client, "vanilla setup command").await;
     }
 }
 

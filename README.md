@@ -32,9 +32,9 @@ embedded into the server binary. No external vanilla data sidecar is required
 to start the server. If `data.vanilla_data_dir` points at a local extracted
 vanilla sidecar, that sidecar is treated as authoritative: registries, tags,
 `reports/block_light.json`, and supported simple loot must be present. Generate
-it with `tools/extract-vanilla-data.sh`; `--check` warns when the sidecar root
-is missing/unusable or when `version.json` is missing, invalid, or targets a
-release id, world version, or protocol that does not match Solaris. Without
+it with `tools/extract-vanilla-data.sh`. Both `--check` and `serve` reject a
+missing/unusable sidecar root or a `version.json` that is missing, invalid, or
+targets a different release id, world version, or protocol. Without
 `data.vanilla_data_dir`, Solaris uses embedded repo-owned fallback data.
 
 ## Run
@@ -54,6 +54,14 @@ unusable `[data].world_dir` or stale `data.vanilla_data_dir` means chunk
 streaming, persistence, or data/protocol readiness is not ready.
 
 Then connect a vanilla 26.1.2 PrismLauncher client to the configured address.
+
+Server-side Lua plugins are loaded from the configured `[plugins].directory`.
+See [`docs/PLUGINS.md`](docs/PLUGINS.md) for the package format and API.
+
+For agent-driven real-client checks, the reusable NeoForge client mod embeds a
+loopback MCP server with structured world observation and input controls. See
+[`client-mod/solaris-client-agent/README.md`](client-mod/solaris-client-agent/README.md)
+and start it with `tools/run-minecraft-client-mcp.sh`.
 
 ## Test
 
@@ -76,7 +84,7 @@ crates/
 ├── mc-net/          connection management, session lifecycle
 ├── mc-data/         data pack loader, registries, recipes
 ├── mc-extension/    custom protocol extension (for the client mod)
-├── mc-script/       plugin/script API (Lua/WASM)
+├── mc-script/       plugin API and sandboxed Lua host
 ├── mc-server/       main binary
 └── mc-test-harness/ diff testing infrastructure
 ```

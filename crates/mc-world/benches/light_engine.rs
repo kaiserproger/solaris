@@ -4,7 +4,8 @@ use mc_data::block_light::BlockLightTable;
 use mc_world::block::BlockStateId;
 use mc_world::chunk::{Chunk, ChunkPos, MAX_Y, MIN_Y};
 use mc_world::light::{
-    LightCache, LightWorkspace, apply_block_change_to_light, compute_chunk_light_in,
+    LightCache, LightKernelBackend, LightWorkspace, apply_block_change_to_light,
+    benchmark_extract_centre, compute_chunk_light_in,
 };
 use mc_world::section::SECTION_DIM;
 
@@ -13,6 +14,7 @@ const STONE: BlockStateId = BlockStateId(1);
 const DIRT: BlockStateId = BlockStateId(2);
 const GRASS: BlockStateId = BlockStateId(3);
 const GLOWSTONE: BlockStateId = BlockStateId(4);
+const LIGHT_GRID_LEN: usize = SECTION_DIM * 3 * (MAX_Y - MIN_Y) as usize * SECTION_DIM * 3;
 
 fn light_table() -> BlockLightTable {
     BlockLightTable::from_arrays(
@@ -55,6 +57,16 @@ fn noisy_chunk(pos: ChunkPos) -> Chunk {
         let n = ((wx * 73 + wz * 151) ^ (wx * wz * 17)).rem_euclid(17);
         64 + n - 8
     })
+}
+
+fn emissive_chunk(pos: ChunkPos) -> Chunk {
+    let mut chunk = noisy_chunk(pos);
+    for y in (MIN_Y + 8..MAX_Y - 8).step_by(32) {
+        let x = (y - MIN_Y).rem_euclid(SECTION_DIM as i32) as u8;
+        let z = (y * 7 - MIN_Y).rem_euclid(SECTION_DIM as i32) as u8;
+        let _ = chunk.set_block(x, y, z, GLOWSTONE);
+    }
+    chunk
 }
 
 fn neighbourhood(build: impl Fn(ChunkPos) -> Chunk) -> [[Option<Chunk>; 3]; 3] {
@@ -141,6 +153,7 @@ fn bench_full_recompute(c: &mut Criterion) {
     let table = light_table();
     let flat = neighbourhood(flat_chunk);
     let noisy = neighbourhood(noisy_chunk);
+    let emissive = neighbourhood(emissive_chunk);
 
     c.bench_function("light/full_recompute/flat", |b| {
         let mut ws = LightWorkspace::new();
@@ -156,6 +169,24 @@ fn bench_full_recompute(c: &mut Criterion) {
         b.iter(|| {
             let light =
                 compute_chunk_light_in(&mut ws, borrow(black_box(&noisy)), black_box(&table));
+            black_box(light);
+        });
+    });
+
+    c.bench_function("light/full_recompute/emissive_scalar", |b| {
+        let mut ws = LightWorkspace::with_backend(LightKernelBackend::Scalar);
+        b.iter(|| {
+            let light =
+                compute_chunk_light_in(&mut ws, borrow(black_box(&emissive)), black_box(&table));
+            black_box(light);
+        });
+    });
+
+    c.bench_function("light/full_recompute/emissive_portable_simd", |b| {
+        let mut ws = LightWorkspace::with_backend(LightKernelBackend::PortableSimd);
+        b.iter(|| {
+            let light =
+                compute_chunk_light_in(&mut ws, borrow(black_box(&emissive)), black_box(&table));
             black_box(light);
         });
     });
@@ -185,5 +216,39 @@ fn bench_incremental(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_full_recompute, bench_incremental);
+fn bench_extract_centre(c: &mut Criterion) {
+    let sky = (0..LIGHT_GRID_LEN)
+        .map(|index| (index as u8) & 0x0f)
+        .collect::<Vec<_>>();
+    let block = (0..LIGHT_GRID_LEN)
+        .map(|index| ((index * 7) as u8) & 0x0f)
+        .collect::<Vec<_>>();
+
+    c.bench_function("light/extract_centre/scalar", |b| {
+        b.iter(|| {
+            black_box(benchmark_extract_centre(
+                black_box(&sky),
+                black_box(&block),
+                LightKernelBackend::Scalar,
+            ));
+        });
+    });
+
+    c.bench_function("light/extract_centre/portable_simd", |b| {
+        b.iter(|| {
+            black_box(benchmark_extract_centre(
+                black_box(&sky),
+                black_box(&block),
+                LightKernelBackend::PortableSimd,
+            ));
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_full_recompute,
+    bench_incremental,
+    bench_extract_centre
+);
 criterion_main!(benches);

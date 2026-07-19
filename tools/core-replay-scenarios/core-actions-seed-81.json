@@ -1,0 +1,64 @@
+{
+  "schema": "solaris.core_replay.scenario.v1",
+  "id": "core-actions-seed-81",
+  "seed": 81,
+  "actions": [
+    {
+      "type": "wait_ticks",
+      "ticks": 2
+    },
+    {
+      "type": "move_by",
+      "dx_cm": 100,
+      "dz_cm": -50
+    },
+    {
+      "type": "look",
+      "yaw_deg": 90,
+      "pitch_deg": 0
+    },
+    {
+      "type": "wait_ticks",
+      "ticks": 4
+    }
+  ],
+  "lanes": [
+    {
+      "driver": "solaris_protocol",
+      "required_gates": [
+        {
+          "id": "protocol-session",
+          "evidence_kind": "harness"
+        }
+      ]
+    },
+    {
+      "driver": "vanilla_oracle",
+      "required_gates": [
+        {
+          "id": "oracle-comparison",
+          "evidence_kind": "oracle"
+        }
+      ]
+    },
+    {
+      "driver": "real_client",
+      "required_gates": [
+        {
+          "id": "real-client-observation",
+          "evidence_kind": "real_client"
+        }
+      ]
+    }
+  ],
+  "expected_invariants": [
+    {
+      "id": "post-action-liveness",
+      "description": "The client remains responsive after the ordered actions."
+    },
+    {
+      "id": "deterministic-normalized-state",
+      "description": "Repeated Solaris runs produce the same normalized observations."
+    }
+  ]
+}

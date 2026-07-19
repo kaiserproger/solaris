@@ -241,4 +241,26 @@ mod tests {
             Some("minecraft:stick")
         );
     }
+
+    #[test]
+    fn solaris_required_items_cover_crop_harvest_baseline() {
+        let reg = solaris_required_items();
+
+        for item in [
+            "minecraft:wheat",
+            "minecraft:wheat_seeds",
+            "minecraft:carrot",
+            "minecraft:potato",
+            "minecraft:beetroot",
+            "minecraft:beetroot_seeds",
+            "minecraft:nether_wart",
+            "minecraft:cocoa_beans",
+        ] {
+            let item = Identifier::parse(item).unwrap();
+            assert!(
+                reg.id_of(&item).is_some(),
+                "missing required crop item {item}"
+            );
+        }
+    }
 }

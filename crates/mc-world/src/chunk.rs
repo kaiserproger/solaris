@@ -1,12 +1,10 @@
-//! Chunk: a 16×384×16 column at a fixed (x, z) coordinate, made of 24
+//! Chunk: a 16×height×16 column at a fixed (x, z) coordinate, made of
 //! stacked sections plus per-chunk side data (heightmaps, biomes,
 //! block entities, generation status).
 //!
-//! Y range is hard-coded to the vanilla Overworld layout (Y=-64..320)
-//! for M2. Dimensions that ship a different range — the Nether and
-//! the End in vanilla, or a custom dimension type from a data pack —
-//! aren't supported yet; this widens in M5 when dimensions become a
-//! thing. (TODO(M5): replace MIN_Y/MAX_Y with per-dimension data.)
+//! `Chunk::empty` keeps the vanilla Overworld layout (Y=-64..320).
+//! `Chunk::empty_with_geometry` supports another section-aligned block
+//! storage range. Anvil, wire, and light geometry are migrated separately.
 //!
 //! For M2.d the chunk is mostly *storage*: a constructor that
 //! produces an air-filled column, `get_block` / `set_block` that
@@ -14,7 +12,8 @@
 //! codec to populate (`heightmaps`, `biomes`, `block_entities`,
 //! `status`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use mc_data::Identifier;
 use mc_data::block_light::BlockLightTable;
@@ -37,12 +36,73 @@ pub const MIN_SECTION_Y: i32 = MIN_Y / SECTION_DIM as i32;
 pub const HEIGHTMAP_BITS: u8 = 9;
 /// One heightmap entry per (x, z) cell in the 16×16 chunk footprint.
 pub const HEIGHTMAP_LEN: usize = SECTION_DIM * SECTION_DIM;
+const WORLD_JOURNAL_LSN_KEY: &str = "SolarisJournalLsn";
 /// One biome cell per 4×4×4 sub-cube; vanilla packs biomes at 1/4 the
 /// block resolution.
 pub const BIOME_DIM: usize = 4;
 pub const BIOME_VOLUME: usize = BIOME_DIM * BIOME_DIM * BIOME_DIM;
 /// Bytes per per-section light layer: `16³` cells × 4 bits per cell.
 pub const LIGHT_LAYER_BYTES: usize = SECTION_DIM * SECTION_DIM * SECTION_DIM / 2;
+static NEXT_CHUNK_RUNTIME_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkGeometry {
+    min_y: i32,
+    max_y: i32,
+}
+
+impl ChunkGeometry {
+    /// Returns `None` unless the range is section-aligned and fits the
+    /// current 9-bit heightmap representation.
+    #[must_use]
+    pub fn new(min_y: i32, height: i32) -> Option<Self> {
+        if min_y.rem_euclid(SECTION_DIM as i32) != 0
+            || height <= 0
+            || height > (1_i32 << HEIGHTMAP_BITS) - 1
+            || height.rem_euclid(SECTION_DIM as i32) != 0
+        {
+            return None;
+        }
+        let max_y = min_y.checked_add(height)?;
+        Some(Self { min_y, max_y })
+    }
+
+    #[must_use]
+    pub const fn min_y(self) -> i32 {
+        self.min_y
+    }
+
+    #[must_use]
+    pub const fn max_y(self) -> i32 {
+        self.max_y
+    }
+
+    #[must_use]
+    pub const fn height(self) -> i32 {
+        self.max_y - self.min_y
+    }
+
+    #[must_use]
+    pub const fn section_count(self) -> usize {
+        (self.height() / SECTION_DIM as i32) as usize
+    }
+
+    fn world_y_to_section(self, y: i32) -> Option<(usize, u8)> {
+        if !(self.min_y..self.max_y).contains(&y) {
+            return None;
+        }
+        let local = y - self.min_y;
+        Some((
+            (local / SECTION_DIM as i32) as usize,
+            (local % SECTION_DIM as i32) as u8,
+        ))
+    }
+}
+
+pub const OVERWORLD_GEOMETRY: ChunkGeometry = ChunkGeometry {
+    min_y: MIN_Y,
+    max_y: MAX_Y,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ChunkPos {
@@ -55,6 +115,18 @@ pub struct BlockPos {
     pub x: i32,
     pub y: i32,
     pub z: i32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BlockMutationToken {
+    pub chunk_instance_id: u64,
+    pub version: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkLightSourceToken {
+    chunk_instance_id: u64,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -170,6 +242,7 @@ pub struct FurnaceSlot {
     pub count: i32,
     pub item_id: u32,
     pub damage: Option<i32>,
+    pub enchantments: Vec<mc_data::ItemEnchantment>,
 }
 
 impl FurnaceSlot {
@@ -177,6 +250,7 @@ impl FurnaceSlot {
         count: 0,
         item_id: 0,
         damage: None,
+        enchantments: Vec::new(),
     };
 
     #[must_use]
@@ -192,6 +266,7 @@ pub struct FurnaceBlockEntity {
     pub burn_total: i16,
     pub cook_progress: i16,
     pub cook_total: i16,
+    pub recipes_used: BTreeMap<String, i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +305,7 @@ impl Default for FurnaceBlockEntity {
             burn_total: 1600,
             cook_progress: 0,
             cook_total: 200,
+            recipes_used: BTreeMap::new(),
         }
     }
 }
@@ -356,10 +432,11 @@ pub struct SectionLight {
     pub sky: Option<Vec<u8>>,
 }
 
-/// A 16×384×16 column.
+/// A 16×height×16 column.
 #[derive(Debug, Clone)]
 pub struct Chunk {
     pub pos: ChunkPos,
+    geometry: ChunkGeometry,
     pub sections: Vec<ChunkSection>,
     pub biomes: Vec<BiomeSection>,
     /// Named heightmaps as Anvil stores them: `MOTION_BLOCKING`,
@@ -418,6 +495,9 @@ pub struct Chunk {
     /// Dirty flush commit can compare this token instead of re-encoding under
     /// the world lock when no post-plan mutation happened.
     pub dirty_generation: u64,
+    runtime_instance_id: u64,
+    light_source_generation: u64,
+    block_mutation_versions: HashMap<u32, u64>,
 }
 
 /// M7: production interface every chunk generator implements. Lives
@@ -442,12 +522,24 @@ impl Chunk {
     /// block entities, no heightmaps, status `"full"`.
     #[must_use]
     pub fn empty(pos: ChunkPos, air: BlockStateId, biome: Identifier) -> Self {
+        Self::empty_with_geometry(pos, air, biome, OVERWORLD_GEOMETRY)
+    }
+
+    #[must_use]
+    pub fn empty_with_geometry(
+        pos: ChunkPos,
+        air: BlockStateId,
+        biome: Identifier,
+        geometry: ChunkGeometry,
+    ) -> Self {
+        let section_count = geometry.section_count();
         Self {
             pos,
-            sections: (0..SECTION_COUNT)
+            geometry,
+            sections: (0..section_count)
                 .map(|_| ChunkSection::filled(air, air))
                 .collect(),
-            biomes: (0..SECTION_COUNT)
+            biomes: (0..section_count)
                 .map(|_| BiomeSection::filled(biome.clone()))
                 .collect(),
             heightmaps: HashMap::new(),
@@ -461,16 +553,68 @@ impl Chunk {
             scheduled_fluid_ticks: Vec::new(),
             next_scheduled_fluid_tick_sequence: 0,
             status: "full".to_string(),
-            section_lights: vec![SectionLight::default(); SECTION_COUNT],
+            section_lights: vec![SectionLight::default(); section_count],
             extras: Vec::new(),
             dirty: false,
             dirty_generation: 0,
+            runtime_instance_id: next_chunk_runtime_instance_id(),
+            light_source_generation: 0,
+            block_mutation_versions: HashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub const fn geometry(&self) -> ChunkGeometry {
+        self.geometry
+    }
+
+    #[must_use]
+    pub fn block_mutation_token(&self, x: u8, y: i32, z: u8) -> Option<BlockMutationToken> {
+        let key = block_mutation_key(self.geometry, x, y, z)?;
+        Some(BlockMutationToken {
+            chunk_instance_id: self.runtime_instance_id,
+            version: self.block_mutation_versions.get(&key).copied().unwrap_or(0),
+        })
+    }
+
+    #[must_use]
+    pub fn light_source_token(&self) -> ChunkLightSourceToken {
+        ChunkLightSourceToken {
+            chunk_instance_id: self.runtime_instance_id,
+            generation: self.light_source_generation,
         }
     }
 
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
         self.dirty_generation = self.dirty_generation.wrapping_add(1).max(1);
+    }
+
+    #[must_use]
+    pub fn world_journal_lsn(&self) -> u64 {
+        self.extras
+            .iter()
+            .find_map(|(key, value)| (key == WORLD_JOURNAL_LSN_KEY).then_some(value))
+            .and_then(|value| match value {
+                Tag::Long(value) if *value >= 0 => Some(*value as u64),
+                _ => None,
+            })
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_world_journal_lsn(&mut self, lsn: u64) {
+        let value = i64::try_from(lsn).expect("world journal LSN must fit a nonnegative NBT long");
+        if self
+            .extras
+            .iter()
+            .any(|(key, tag)| key == WORLD_JOURNAL_LSN_KEY && *tag == Tag::Long(value))
+        {
+            return;
+        }
+        self.extras.retain(|(key, _)| key != WORLD_JOURNAL_LSN_KEY);
+        self.extras
+            .push((WORLD_JOURNAL_LSN_KEY.to_string(), Tag::Long(value)));
+        self.mark_dirty();
     }
 
     pub fn set_baked_light(&mut self, light: &ChunkLight) {
@@ -485,18 +629,43 @@ impl Chunk {
     }
 
     /// Look up a block by chunk-local (x, z) and absolute world y.
-    /// `None` when `y` is outside `MIN_Y..MAX_Y`.
+    /// `None` when `y` is outside this chunk's geometry.
     #[must_use]
     pub fn get_block(&self, x: u8, y: i32, z: u8) -> Option<BlockStateId> {
-        let (idx, sy) = world_y_to_section(y)?;
+        let (idx, sy) = self.geometry.world_y_to_section(y)?;
         Some(self.sections[idx].get(x, sy, z))
     }
 
     /// Set a block; returns the previous state, or `None` if `y` is
     /// outside the chunk.
     pub fn set_block(&mut self, x: u8, y: i32, z: u8, state: BlockStateId) -> Option<BlockStateId> {
-        let (idx, sy) = world_y_to_section(y)?;
-        Some(self.sections[idx].set(x, sy, z, state))
+        self.set_block_inner(x, y, z, state, true)
+    }
+
+    fn set_block_preserving_light_source(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+    ) -> Option<BlockStateId> {
+        self.set_block_inner(x, y, z, state, false)
+    }
+
+    fn set_block_inner(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+        changes_light_source: bool,
+    ) -> Option<BlockStateId> {
+        let (idx, sy) = self.geometry.world_y_to_section(y)?;
+        let previous = self.sections[idx].set(x, sy, z, state);
+        if previous != state && changes_light_source {
+            self.light_source_generation = self.light_source_generation.wrapping_add(1).max(1);
+        }
+        Some(previous)
     }
 
     /// Set a block *and* refresh every heightmap currently attached
@@ -520,12 +689,48 @@ impl Chunk {
         state: BlockStateId,
         air: BlockStateId,
     ) -> Option<BlockStateId> {
-        let prev = self.set_block(x, y, z, state)?;
+        self.set_block_and_update_inner(x, y, z, state, air, true)
+    }
+
+    /// Mutate a block without discarding baked light. The caller must prove
+    /// that old and new states have identical light behavior.
+    pub fn set_block_and_update_preserving_light(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+        air: BlockStateId,
+    ) -> Option<BlockStateId> {
+        self.set_block_and_update_inner(x, y, z, state, air, false)
+    }
+
+    fn set_block_and_update_inner(
+        &mut self,
+        x: u8,
+        y: i32,
+        z: u8,
+        state: BlockStateId,
+        air: BlockStateId,
+        clear_baked_light: bool,
+    ) -> Option<BlockStateId> {
+        let prev = if clear_baked_light {
+            self.set_block(x, y, z, state)?
+        } else {
+            self.set_block_preserving_light_source(x, y, z, state)?
+        };
         if prev == state {
             return Some(prev);
         }
+        let key = block_mutation_key(self.geometry, x, y, z).expect("validated block coordinates");
+        let version = self.block_mutation_versions.entry(key).or_default();
+        *version = version
+            .checked_add(1)
+            .expect("block mutation version exhausted");
         self.mark_dirty();
-        self.clear_baked_light();
+        if clear_baked_light {
+            self.clear_baked_light();
+        }
         // Heightmap entries store `height + 1`-style values (the Y of
         // the first air cell above the column), matching vanilla's
         // on-disk packing. Recompute the column for every present
@@ -555,7 +760,7 @@ impl Chunk {
 
     #[must_use]
     pub fn highest_opaque_y(&self, x: u8, z: u8) -> Option<i32> {
-        heightmap_value_to_world_y(self.highest_opaque.get(x, z))
+        heightmap_value_to_world_y_at(self.geometry.min_y(), self.highest_opaque.get(x, z))
     }
 
     #[must_use]
@@ -628,6 +833,18 @@ impl Chunk {
         self.scheduled_block_ticks.drain(0..due_count).collect()
     }
 
+    pub(crate) fn drain_scheduled_block_tick_prefix(
+        &mut self,
+        expected: &[ScheduledBlockTick],
+    ) -> bool {
+        if expected.is_empty() || !self.scheduled_block_ticks.starts_with(expected) {
+            return false;
+        }
+        self.scheduled_block_ticks.drain(0..expected.len());
+        self.mark_dirty();
+        true
+    }
+
     #[must_use]
     pub fn scheduled_fluid_ticks(&self) -> &[ScheduledFluidTick] {
         &self.scheduled_fluid_ticks
@@ -698,13 +915,44 @@ impl Chunk {
         self.scheduled_fluid_ticks.drain(0..due_count).collect()
     }
 
+    pub(crate) fn drain_scheduled_fluid_tick_prefix(
+        &mut self,
+        expected: &[ScheduledFluidTick],
+    ) -> bool {
+        if expected.is_empty() || !self.scheduled_fluid_ticks.starts_with(expected) {
+            return false;
+        }
+        self.scheduled_fluid_ticks.drain(0..expected.len());
+        self.mark_dirty();
+        true
+    }
+
     #[must_use]
     pub fn contains_block_pos(&self, pos: BlockPos) -> bool {
-        pos.y >= MIN_Y
-            && pos.y < MAX_Y
+        pos.y >= self.geometry.min_y()
+            && pos.y < self.geometry.max_y()
             && pos.x.div_euclid(SECTION_DIM as i32) == self.pos.x
             && pos.z.div_euclid(SECTION_DIM as i32) == self.pos.z
     }
+}
+
+fn next_chunk_runtime_instance_id() -> u64 {
+    NEXT_CHUNK_RUNTIME_INSTANCE_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .expect("chunk runtime instance id exhausted")
+}
+
+fn block_mutation_key(geometry: ChunkGeometry, x: u8, y: i32, z: u8) -> Option<u32> {
+    if usize::from(x) >= SECTION_DIM
+        || usize::from(z) >= SECTION_DIM
+        || !(geometry.min_y()..geometry.max_y()).contains(&y)
+    {
+        return None;
+    }
+    let y = u32::try_from(y - geometry.min_y()).ok()?;
+    Some((y * SECTION_DIM as u32 + u32::from(z)) * SECTION_DIM as u32 + u32::from(x))
 }
 
 /// Walk column `(x, z)` from `MAX_Y - 1` down to `MIN_Y` and return
@@ -714,26 +962,28 @@ impl Chunk {
 /// column the value is `0`, matching vanilla's "empty column"
 /// convention.
 fn top_non_air_column(chunk: &Chunk, x: u8, z: u8, air: BlockStateId) -> u32 {
-    for y in (MIN_Y..MAX_Y).rev() {
+    let geometry = chunk.geometry();
+    for y in (geometry.min_y()..geometry.max_y()).rev() {
         if chunk.get_block(x, y, z) != Some(air) {
             // vanilla packs heightmap values as `height - MIN_Y + 1`
             // so a top block at world Y=64 stores as `64 - (-64) + 1`
             // = 129. The +1 makes "the lowest cell above the top
             // block" the value, matching the meaning vanilla uses
             // for chunk-spawning and skylight shortcuts.
-            return (y - MIN_Y + 1) as u32;
+            return (y - geometry.min_y() + 1) as u32;
         }
     }
     0
 }
 
 pub fn top_opaque_column(chunk: &Chunk, x: u8, z: u8, table: &BlockLightTable) -> u32 {
-    for y in (MIN_Y..MAX_Y).rev() {
+    let geometry = chunk.geometry();
+    for y in (geometry.min_y()..geometry.max_y()).rev() {
         let Some(state) = chunk.get_block(x, y, z) else {
             continue;
         };
         if !table.propagates_sky(state.0).unwrap_or(true) {
-            return (y - MIN_Y + 1) as u32;
+            return (y - geometry.min_y() + 1) as u32;
         }
     }
     0
@@ -741,19 +991,20 @@ pub fn top_opaque_column(chunk: &Chunk, x: u8, z: u8, table: &BlockLightTable) -
 
 #[must_use]
 pub fn heightmap_value_to_world_y(value: u32) -> Option<i32> {
+    heightmap_value_to_world_y_at(MIN_Y, value)
+}
+
+fn heightmap_value_to_world_y_at(min_y: i32, value: u32) -> Option<i32> {
     if value == 0 {
         None
     } else {
-        Some(MIN_Y + value as i32 - 1)
+        Some(min_y + value as i32 - 1)
     }
 }
 
+#[cfg(test)]
 fn world_y_to_section(y: i32) -> Option<(usize, u8)> {
-    if !(MIN_Y..MAX_Y).contains(&y) {
-        return None;
-    }
-    let local = y - MIN_Y;
-    Some(((local / SECTION_DIM as i32) as usize, (local % 16) as u8))
+    OVERWORLD_GEOMETRY.world_y_to_section(y)
 }
 
 #[cfg(test)]
@@ -797,6 +1048,47 @@ mod tests {
     }
 
     #[test]
+    fn custom_geometry_controls_chunk_sections_and_block_bounds() {
+        assert!(ChunkGeometry::new(0, 512).is_none());
+        let geometry = ChunkGeometry::new(0, 256).unwrap();
+        let mut chunk =
+            Chunk::empty_with_geometry(ChunkPos { x: 2, z: -3 }, air(), plains(), geometry);
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(chunk.sections.len(), 16);
+        assert_eq!(chunk.biomes.len(), 16);
+        assert_eq!(chunk.get_block(0, 0, 0), Some(air()));
+        assert_eq!(chunk.set_block(15, 255, 15, stone()), Some(air()));
+        assert_eq!(chunk.get_block(15, 255, 15), Some(stone()));
+        assert_eq!(chunk.get_block(0, -1, 0), None);
+        assert_eq!(chunk.get_block(0, 256, 0), None);
+
+        chunk
+            .heightmaps
+            .insert("WORLD_SURFACE".into(), Heightmap::zeroed());
+        assert_eq!(
+            chunk.set_block_and_update(3, 200, 7, stone(), air()),
+            Some(air())
+        );
+        assert_eq!(chunk.heightmaps["WORLD_SURFACE"].get(3, 7), 201);
+        chunk.highest_opaque.set(3, 7, 201);
+        assert_eq!(chunk.highest_opaque_y(3, 7), Some(200));
+
+        assert!(chunk.contains_block_pos(BlockPos {
+            x: 32,
+            y: 0,
+            z: -48,
+        }));
+        assert!(!chunk.contains_block_pos(BlockPos {
+            x: 32,
+            y: -1,
+            z: -48,
+        }));
+        assert!(chunk.block_mutation_token(15, 255, 15).is_some());
+        assert!(chunk.block_mutation_token(15, 256, 15).is_none());
+    }
+
+    #[test]
     fn set_block_round_trips_across_sections() {
         let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
         // Set at the bottom, the build-height boundary, and the top.
@@ -808,6 +1100,54 @@ mod tests {
         }
         // Non-probed columns still air.
         assert_eq!(c.get_block(0, 0, 0), Some(air()));
+    }
+
+    #[test]
+    fn light_source_token_tracks_blocks_but_not_baked_light() {
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let initial = chunk.light_source_token();
+
+        chunk.set_baked_light(&crate::light::ChunkLight::filled(15, 0));
+        assert_eq!(chunk.light_source_token(), initial);
+        assert_eq!(chunk.set_block(3, 64, 7, air()), Some(air()));
+        assert_eq!(chunk.light_source_token(), initial);
+
+        assert_eq!(chunk.set_block(3, 64, 7, stone()), Some(air()));
+        let edited = chunk.light_source_token();
+        assert_ne!(edited, initial);
+        assert_eq!(chunk.clone().light_source_token(), edited);
+        assert_ne!(
+            Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains()).light_source_token(),
+            edited
+        );
+    }
+
+    #[test]
+    fn runtime_block_mutation_tokens_are_sparse_clone_stable_and_chunk_scoped() {
+        let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        let initial = chunk.block_mutation_token(3, 64, 7).expect("initial token");
+        assert_eq!(initial.version, 0);
+
+        chunk
+            .set_block(3, 64, 7, stone())
+            .expect("worldgen-style set");
+        assert_eq!(
+            chunk.block_mutation_token(3, 64, 7),
+            Some(initial),
+            "raw construction writes must not populate runtime mutation history"
+        );
+        chunk
+            .set_block_and_update(3, 64, 7, air(), air())
+            .expect("runtime edit");
+        let edited = chunk.block_mutation_token(3, 64, 7).expect("edited token");
+        assert_eq!(edited.version, 1);
+        assert_eq!(chunk.clone().block_mutation_token(3, 64, 7), Some(edited));
+
+        let reloaded = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains())
+            .block_mutation_token(3, 64, 7)
+            .expect("reloaded token");
+        assert_ne!(reloaded.chunk_instance_id, edited.chunk_instance_id);
+        assert_eq!(reloaded.version, 0);
     }
 
     #[test]
@@ -910,6 +1250,24 @@ mod tests {
                 .all(|section| section.sky.is_none() && section.block.is_none()),
             "block mutation must invalidate baked light arrays before they can be reused"
         );
+    }
+
+    #[test]
+    fn proven_light_inert_block_update_preserves_baked_light_layers() {
+        let mut c = Chunk::empty(ChunkPos { x: 0, z: 0 }, air(), plains());
+        c.section_lights[0].sky = Some(vec![0xFF; LIGHT_LAYER_BYTES]);
+        c.section_lights[0].block = Some(vec![0x11; LIGHT_LAYER_BYTES]);
+        c.section_lights[3].sky = Some(vec![0x22; LIGHT_LAYER_BYTES]);
+        let expected = c.section_lights.clone();
+        let light_source = c.light_source_token();
+
+        let prev = c
+            .set_block_and_update_preserving_light(0, 0, 0, stone(), air())
+            .unwrap();
+
+        assert_eq!(prev, air());
+        assert_eq!(c.section_lights, expected);
+        assert_eq!(c.light_source_token(), light_source);
     }
 
     #[test]

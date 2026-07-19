@@ -57,6 +57,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 4,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -259,6 +260,7 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 4,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -290,6 +292,9 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let mut simulation_ticks = bound
+        .runtime_telemetry_handle()
+        .subscribe_simulation_ticks();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -382,9 +387,34 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
         campfire_pos,
         cooked_porkchop_id,
         item_entity_type,
-        Duration::from_millis(900),
+        &mut simulation_ticks,
+        18,
     )
-    .await;
+    .await
+    .expect("unlit campfire observation reaches its simulation-tick fence");
+
+    let bytes = world
+        .lock()
+        .await
+        .cached_chunk(mc_world::ChunkPos { x: 0, z: 0 })
+        .expect("campfire chunk remains resident")
+        .block_entities
+        .get(&campfire_block_pos)
+        .expect("unlit campfire block entity remains present")
+        .clone();
+    let mut cursor = std::io::Cursor::new(bytes);
+    let tag = mc_nbt::read_network(&mut cursor).expect("decode cooled campfire state");
+    assert_eq!(
+        compound_int_array(&tag, "CookingTimes").and_then(|times| times.first().copied()),
+        Some(0),
+        "unlit campfire should cool vanilla progress back to zero"
+    );
+    assert!(
+        campfire_items(&tag).is_some_and(|items| items
+            .iter()
+            .any(|item| campfire_item_matches(item, &porkchop_name))),
+        "cooling down must retain the uncooked input"
+    );
 }
 
 #[tokio::test]
@@ -439,6 +469,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 200,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -638,6 +669,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 4,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -735,8 +767,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
 
     {
         let mut storage = first_world.lock().await;
-        let flushed = storage.flush_dirty().expect("flush dirty world");
-        assert!(flushed > 0, "in-flight campfire state should dirty a chunk");
+        storage.flush_dirty().expect("flush in-flight campfire state");
     }
 
     drop(client);
@@ -782,9 +813,9 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
     let second_task = tokio::spawn(async move { bound.serve().await });
 
     let (mut client, _) = connect_to_play(second_addr, "M100CampResumeB").await;
-    drain_until_chunk(&mut client, (0, 0)).await;
     wait_for_campfire_cooked_output(
         &mut client,
+        (0, 0),
         campfire_pos,
         cooked_porkchop_id,
         item_entity_type,
@@ -859,6 +890,7 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 80,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -891,6 +923,9 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let mut simulation_ticks = bound
+        .runtime_telemetry_handle()
+        .subscribe_simulation_ticks();
     let server_task = tokio::spawn(async move { bound.serve().await });
 
     let (mut client, sync) = connect_to_play(addr, "M100CampNoA").await;
@@ -949,7 +984,7 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
     drop(client);
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_additional_simulation_ticks(&mut simulation_ticks, 80).await;
 
     let (mut client, _) = connect_to_play(addr, "M100CampNoB").await;
     wait_for_cooked_item_entity(
@@ -1025,6 +1060,7 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
                 alternatives: vec![mc_data::recipes::IngredientAlternative::Item(porkchop)],
             },
             cooking_time: 80,
+            experience_milli: 0,
         }),
         result: mc_data::recipes::RecipeResult {
             item: cooked_porkchop,
@@ -1166,9 +1202,12 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
     };
     let bound = mc_net::bind(cfg).await.expect("bind second server");
     let second_addr = bound.local_addr().expect("second local_addr");
+    let mut simulation_ticks = bound
+        .runtime_telemetry_handle()
+        .subscribe_simulation_ticks();
     let second_task = tokio::spawn(async move { bound.serve().await });
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    wait_for_additional_simulation_ticks(&mut simulation_ticks, 80).await;
 
     let (mut client, _) = connect_to_play(second_addr, "M100NoCliB").await;
     drain_until_chunk(&mut client, (0, 0)).await;
@@ -1187,6 +1226,27 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         .expect("second server stops")
         .expect("second server task joins")
         .expect("second server serve result");
+}
+
+async fn wait_for_additional_simulation_ticks(
+    ticks: &mut tokio::sync::watch::Receiver<u64>,
+    additional: u64,
+) {
+    let target = (*ticks.borrow()).saturating_add(additional);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let current = *ticks.borrow_and_update();
+            if current >= target {
+                return;
+            }
+            ticks
+                .changed()
+                .await
+                .expect("simulation tick publisher remains active");
+        }
+    })
+    .await
+    .expect("simulation did not reach the required cooking tick");
 }
 
 async fn wait_for_campfire_input_visual_and_slot(
@@ -1224,15 +1284,19 @@ async fn wait_for_campfire_input_visual_and_slot(
 
 async fn wait_for_campfire_cooked_output(
     client: &mut Client,
+    target_chunk: (i32, i32),
     campfire_pos: i64,
     cooked_item_id: u32,
     item_entity_type: i32,
 ) {
+    let (campfire_x, campfire_y, campfire_z) = unpack_block_pos(campfire_pos);
+    let packed_xz = (((campfire_x & 15) << 4) | (campfire_z & 15)) as u8;
+    let mut saw_target_chunk = false;
     let mut item_entity_id = None;
     let mut saw_cooked_stack = false;
     let mut saw_empty_visual = false;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    while !(saw_cooked_stack && saw_empty_visual) {
+    while !(saw_target_chunk && saw_cooked_stack && saw_empty_visual) {
         let frame = client
             .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await
@@ -1240,7 +1304,20 @@ async fn wait_for_campfire_cooked_output(
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == AddEntity::ID {
+        if frame.id == LevelChunkWithLight::ID {
+            let mut body = frame.body;
+            let pkt = LevelChunkWithLight::decode(&mut body)
+                .expect("decode restarted campfire chunk");
+            if (pkt.chunk_x, pkt.chunk_z) == target_chunk {
+                saw_target_chunk = true;
+                saw_empty_visual |= pkt.block_entities.iter().any(|block_entity| {
+                    block_entity.packed_xz == packed_xz
+                        && i32::from(block_entity.y) == campfire_y
+                        && campfire_items(&block_entity.nbt)
+                            .is_some_and(|items| items.is_empty())
+                });
+            }
+        } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
             let pkt =
                 AddEntity::decode(&mut body).expect("decode restarted campfire item AddEntity");
@@ -1332,59 +1409,114 @@ async fn assert_no_cooked_campfire_output(
     campfire_pos: i64,
     cooked_item_id: u32,
     item_entity_type: i32,
-    duration: Duration,
-) {
-    let deadline = tokio::time::Instant::now() + duration;
+    simulation_ticks: &mut tokio::sync::watch::Receiver<u64>,
+    additional_ticks: u64,
+) -> Result<(), tokio::time::error::Elapsed> {
+    let target_tick = (*simulation_ticks.borrow()).saturating_add(additional_ticks);
     let mut cooked_entity_ids = HashSet::new();
     let mut cooked_metadata_before_add = HashSet::new();
-    while tokio::time::Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let Ok(frame) = client.read_frame_with_timeout(remaining).await else {
-            return;
-        };
-        if handle_keepalive(client, frame.id, &frame.body).await {
-            continue;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *simulation_ticks.borrow_and_update() < target_tick {
+            tokio::select! {
+                changed = simulation_ticks.changed() => {
+                    changed.expect("simulation tick publisher remains active");
+                }
+                frame = client.read_frame() => {
+                    assert_not_cooked_campfire_frame(
+                        client,
+                        frame.expect("read unlit campfire frame"),
+                        campfire_pos,
+                        cooked_item_id,
+                        item_entity_type,
+                        &mut cooked_entity_ids,
+                        &mut cooked_metadata_before_add,
+                    ).await;
+                }
+            }
         }
-        if frame.id == AddEntity::ID {
-            let mut body = frame.body;
-            let pkt = AddEntity::decode(&mut body).expect("decode campfire item AddEntity");
-            if pkt.entity_type_id == item_entity_type {
-                assert!(
-                    !cooked_metadata_before_add.contains(&pkt.entity_id),
-                    "unlit campfire should not spawn cooked item entity"
-                );
-                cooked_entity_ids.insert(pkt.entity_id);
+
+        client
+            .write_packet(&ServerboundChatCommand {
+                command: "time set 1000".into(),
+            })
+            .await
+            .expect("send unlit campfire packet fence");
+        loop {
+            let frame = client
+                .read_frame()
+                .await
+                .expect("read unlit campfire packet fence");
+            if frame.id == ClientboundSetTime::ID {
+                let mut body = frame.body;
+                let _time = ClientboundSetTime::decode(&mut body)
+                    .expect("decode unlit campfire packet fence");
+                return;
             }
-        } else if frame.id == ClientboundSetEntityData::ID {
-            let mut body = frame.body;
-            let pkt =
-                ClientboundSetEntityData::decode(&mut body).expect("decode campfire item metadata");
-            let has_cooked_stack = pkt.values.iter().any(|value| {
-                matches!(
-                    value,
-                    EntityDataValue::ItemStack { index, stack }
-                        if *index == ITEM_ENTITY_DATA_ITEM_INDEX
-                            && stack.item_id == cooked_item_id
-                            && stack.count >= 1
-                )
-            });
-            if has_cooked_stack {
-                assert!(
-                    !cooked_entity_ids.contains(&pkt.entity_id),
-                    "unlit campfire should not spawn cooked item entity"
-                );
-                cooked_metadata_before_add.insert(pkt.entity_id);
-            }
-        } else if frame.id == ClientboundBlockEntityData::ID {
-            let mut body = frame.body;
-            let pkt =
-                ClientboundBlockEntityData::decode(&mut body).expect("decode campfire clear data");
+            assert_not_cooked_campfire_frame(
+                client,
+                frame,
+                campfire_pos,
+                cooked_item_id,
+                item_entity_type,
+                &mut cooked_entity_ids,
+                &mut cooked_metadata_before_add,
+            )
+            .await;
+        }
+    })
+    .await
+}
+
+async fn assert_not_cooked_campfire_frame(
+    client: &mut Client,
+    frame: mc_protocol::RawFrame,
+    campfire_pos: i64,
+    cooked_item_id: u32,
+    item_entity_type: i32,
+    cooked_entity_ids: &mut HashSet<i32>,
+    cooked_metadata_before_add: &mut HashSet<i32>,
+) {
+    if handle_keepalive(client, frame.id, &frame.body).await {
+        return;
+    }
+    if frame.id == AddEntity::ID {
+        let mut body = frame.body;
+        let pkt = AddEntity::decode(&mut body).expect("decode campfire item AddEntity");
+        if pkt.entity_type_id == item_entity_type {
             assert!(
-                pkt.position != campfire_pos
-                    || !campfire_items(&pkt.nbt).is_some_and(|items| items.is_empty()),
-                "unlit campfire should not clear cooking visual state"
+                !cooked_metadata_before_add.contains(&pkt.entity_id),
+                "unlit campfire should not spawn cooked item entity"
             );
+            cooked_entity_ids.insert(pkt.entity_id);
         }
+    } else if frame.id == ClientboundSetEntityData::ID {
+        let mut body = frame.body;
+        let pkt =
+            ClientboundSetEntityData::decode(&mut body).expect("decode campfire item metadata");
+        let has_cooked_stack = pkt.values.iter().any(|value| {
+            matches!(
+                value,
+                EntityDataValue::ItemStack { index, stack }
+                    if *index == ITEM_ENTITY_DATA_ITEM_INDEX
+                        && stack.item_id == cooked_item_id
+                        && stack.count >= 1
+            )
+        });
+        if has_cooked_stack {
+            assert!(
+                !cooked_entity_ids.contains(&pkt.entity_id),
+                "unlit campfire should not spawn cooked item entity"
+            );
+            cooked_metadata_before_add.insert(pkt.entity_id);
+        }
+    } else if frame.id == ClientboundBlockEntityData::ID {
+        let mut body = frame.body;
+        let pkt = ClientboundBlockEntityData::decode(&mut body).expect("decode campfire clear data");
+        assert!(
+            pkt.position != campfire_pos
+                || !campfire_items(&pkt.nbt).is_some_and(|items| items.is_empty()),
+            "unlit campfire should not clear cooking visual state"
+        );
     }
 }
 

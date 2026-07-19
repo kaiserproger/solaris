@@ -17,12 +17,23 @@ fn m78_real_client_scenario_names_required_evidence() {
         Some("solaris.real_client_scenario.v1"),
         "M78 scenario schema drifted"
     );
+    assert!(
+        manifest.pointer("/client/command_env").is_none(),
+        "M78 scenario must not expose a free-form real-client command env hook"
+    );
+    assert_eq!(
+        manifest.pointer("/client/adapter").and_then(Value::as_str),
+        Some(
+            "client-mod/solaris-client-agent/gradlew --no-configuration-cache :fabric-agent:runClientAgent"
+        ),
+        "M78 scenario must name the repo-native Gradle runClient adapter"
+    );
     assert_eq!(
         manifest
-            .pointer("/client/command_env")
+            .pointer("/client/adapter_source")
             .and_then(Value::as_str),
-        Some("M78_CLIENT_COMMAND"),
-        "M78 scenario must name the real-client command env hook"
+        Some("auto-gradle-runclient"),
+        "M78 scenario must use the auto-selected Gradle runClient adapter source"
     );
 
     assert_str_contains(
@@ -192,6 +203,20 @@ fn m78_real_client_scenario_names_required_evidence() {
         client_requirement.contains("real vanilla 26.1.2 client")
             || client_requirement.contains("PrismLauncher-launched"),
         "M78 scenario must require a real vanilla or PrismLauncher client"
+    );
+
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let prepare_script =
+        fs::read_to_string(repo_root.join("tools/prepare-real-client-scenario.sh"))
+            .expect("read M78 real-client prepare script");
+    let legacy_command_env = ["M78", "_CLIENT", "_COMMAND"].concat();
+    let legacy_manifest_key = ["client", "_command="].concat();
+    assert!(
+        prepare_script.contains(":fabric-agent:runClientAgent")
+            && prepare_script.contains("auto-gradle-runclient")
+            && !prepare_script.contains(&legacy_command_env)
+            && !prepare_script.contains(&legacy_manifest_key),
+        "M78 prepare script must use the Gradle runClient adapter, not a command env hook"
     );
 }
 

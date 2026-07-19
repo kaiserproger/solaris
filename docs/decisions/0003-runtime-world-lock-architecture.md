@@ -1,7 +1,7 @@
 # ADR 0003 - Runtime world lock architecture
 
 **Date:** 2026-06-01
-**Status:** Accepted
+**Status:** Accepted for legacy paths; staged supersession by ADR 0004
 **Context:** M68.d architecture drift note
 
 ## Context
@@ -61,6 +61,11 @@ Future milestones may replace `WorldHandle` with a simulation actor or command
 queue, but that is a separate concurrency redesign. Until then, cleanup should
 make lock spans smaller and more obvious rather than pretending the final model
 already exists.
+
+ADR 0004 starts that redesign. Its typed simulation commands supersede this
+ADR only for domains explicitly migrated behind `SimulationHandle`; all other
+world, session, container, and entity paths remain governed by ADR 0003 until a
+later slice transfers their authority.
 
 ## Consequences
 

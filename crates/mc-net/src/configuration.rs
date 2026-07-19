@@ -5,9 +5,9 @@
 //! ```text
 //! S → C  Clientbound Known Packs   (advertise `minecraft:core:<version>`)
 //! C → S  Serverbound Known Packs   (the subset the client also has)
-//! S → C  Registry Data × N         (one per built-in registry; all entries
-//!                                   are `has_data = false` — client reads
-//!                                   built-in data via the matched pack)
+//! S → C  Registry Data × N         (one per built-in registry; entries use
+//!                                   the matched client pack or full sidecar
+//!                                   Network-NBT payloads)
 //! S → C  Finish Configuration
 //! C → S  Acknowledge Finish Configuration
 //!        → state transitions to Play
@@ -18,10 +18,13 @@
 //! blocking the handshake — robust to optional `Client Information` and
 //! `Plugin Message` traffic the client may emit at any point.
 
+use std::sync::Arc;
+
 use bytes::{Buf, Bytes, BytesMut};
 use mc_data::VanillaData;
 use mc_data::tags::TagsData;
 use mc_extension::{CustomPayloadPolicy, DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES};
+use mc_nbt::Tag;
 use mc_protocol::codec::{DEFAULT_MAX_STRING_LEN, ReadMc};
 use mc_protocol::frame::Compression;
 use mc_protocol::packets::CustomPayload;
@@ -32,7 +35,8 @@ use mc_protocol::packets::configuration::{
     ServerboundKnownPacks, ServerboundResourcePack, UpdateTags, UpdateTagsEntry,
     UpdateTagsRegistry,
 };
-use mc_protocol::{State, TARGET_RELEASE};
+use mc_protocol::{CodecError, State, TARGET_RELEASE};
+use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info, warn};
 
@@ -41,6 +45,78 @@ use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
 
 const MAX_IGNORED_CONFIGURATION_PACKETS: usize = 32;
+
+fn override_overworld_dimension_geometry(
+    payload: Arc<[u8]>,
+    geometry: ChunkGeometry,
+) -> Result<Arc<[u8]>, ConnectionError> {
+    if geometry == OVERWORLD_GEOMETRY {
+        return Ok(payload);
+    }
+
+    let mut cursor = payload.as_ref();
+    let mut root = mc_nbt::read_network(&mut cursor).map_err(CodecError::from)?;
+    if !cursor.is_empty() {
+        return Err(
+            CodecError::NotSupported("overworld dimension payload has trailing NBT bytes").into(),
+        );
+    }
+    let Tag::Compound(fields) = &mut root else {
+        unreachable!("read_network only returns a compound root");
+    };
+    replace_dimension_int(fields.as_mut_slice(), "min_y", geometry.min_y())?;
+    replace_dimension_int(fields.as_mut_slice(), "height", geometry.height())?;
+    replace_dimension_int(fields.as_mut_slice(), "logical_height", geometry.height())?;
+
+    let mut encoded = Vec::with_capacity(payload.len());
+    mc_nbt::write_network(&mut encoded, &root).map_err(CodecError::from)?;
+    Ok(encoded.into())
+}
+
+fn replace_dimension_int(
+    fields: &mut [(String, Tag)],
+    name: &'static str,
+    value: i32,
+) -> Result<(), ConnectionError> {
+    let Some((_, field)) = fields.iter_mut().find(|(field, _)| field == name) else {
+        return Err(CodecError::NotSupported(
+            "overworld dimension payload is missing a geometry field",
+        )
+        .into());
+    };
+    let Tag::Int(field) = field else {
+        return Err(
+            CodecError::NotSupported("overworld dimension geometry field is not an int").into(),
+        );
+    };
+    *field = value;
+    Ok(())
+}
+
+fn prepare_registry_entry_payload(
+    payload: Option<Arc<[u8]>>,
+    registry: &str,
+    entry: &str,
+    send_full_registry_data: bool,
+    chunk_geometry: ChunkGeometry,
+) -> Result<Option<Arc<[u8]>>, ConnectionError> {
+    let override_overworld = chunk_geometry != OVERWORLD_GEOMETRY
+        && registry == "minecraft:dimension_type"
+        && entry == "minecraft:overworld";
+    if !send_full_registry_data && !override_overworld {
+        return Ok(None);
+    }
+
+    let payload = payload.ok_or_else(|| ConnectionError::MissingRegistryPayload {
+        registry: registry.to_string(),
+        entry: entry.to_string(),
+    })?;
+    if override_overworld {
+        override_overworld_dimension_geometry(payload, chunk_geometry).map(Some)
+    } else {
+        Ok(Some(payload))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigurationCustomPayload {
@@ -51,6 +127,7 @@ pub(crate) struct ConfigurationCustomPayload {
 pub(crate) struct ConfigurationContext<'a> {
     pub(crate) data: &'a VanillaData,
     pub(crate) tags: &'a TagsData,
+    pub(crate) chunk_geometry: ChunkGeometry,
     pub(crate) custom_payload_policy: Option<&'a CustomPayloadPolicy>,
 }
 
@@ -158,39 +235,55 @@ where
         );
     };
 
-    // If the client did not echo back our pack the `has_data = false`
-    // shortcut is unsound: they have no confirmed built-in data to fall
-    // back on and Solaris cannot yet send full registry NBT payloads.
+    // A matching pack lets the client use its built-in definitions. Otherwise
+    // every definition must come from the pre-encoded sidecar index.
     let client_has_our_pack = client_packs.iter().any(|p| {
         p.namespace == our_pack.namespace && p.id == our_pack.id && p.version == our_pack.version
     });
-    if !client_has_our_pack {
-        let advertised_pack = format!(
-            "{}:{}:{}",
-            our_pack.namespace, our_pack.id, our_pack.version
-        );
+    let advertised_pack = format!(
+        "{}:{}:{}",
+        our_pack.namespace, our_pack.id, our_pack.version
+    );
+    let send_full_registry_data = !client_has_our_pack;
+    if send_full_registry_data && !context.data.has_full_registry_payloads() {
         warn!(
             player = %profile.name,
             advertised = %advertised_pack,
             client_packs = ?client_packs,
-            "client did not acknowledge our core pack; closing before unsound Registry Data"
+            "client did not acknowledge our core pack and no full sidecar registry payloads exist"
         );
         return Err(ConnectionError::MissingKnownPack {
             advertised: advertised_pack,
         });
     }
+    if send_full_registry_data {
+        info!(
+            player = %profile.name,
+            advertised = %advertised_pack,
+            "client did not acknowledge our core pack; sending full Registry Data"
+        );
+    }
 
-    // Step 3: send a Registry Data packet for every built-in registry,
-    // with every entry having `has_data = false` (== use built-in).
+    // Step 3: send every registry in the same ordering used by tags and play
+    // packets. Full payloads are cheap Arc clones of startup-built bytes.
     for registry in context.data.registries() {
         let entries = registry
             .entries
             .iter()
-            .map(|name| RegistryEntry {
-                name: name.clone(),
-                nbt_payload: None,
+            .map(|name| {
+                let nbt_payload = prepare_registry_entry_payload(
+                    context.data.registry_entry_payload(&registry.id, name),
+                    registry.id.as_str(),
+                    name.as_str(),
+                    send_full_registry_data,
+                    context.chunk_geometry,
+                )?;
+                Ok(RegistryEntry {
+                    name: name.clone(),
+                    nbt_payload,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ConnectionError>>()?;
         write_packet(
             writer,
             &RegistryData {
@@ -204,6 +297,7 @@ where
     debug!(
         registries = context.data.registry_count(),
         entries = context.data.entry_count(),
+        full_payloads = send_full_registry_data,
         "sent Registry Data"
     );
 
@@ -374,4 +468,87 @@ fn handle_configuration_custom_payload(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dimension_payload(min_y: i32, height: i32, logical_height: i32) -> Arc<[u8]> {
+        let root = Tag::Compound(vec![
+            ("min_y".into(), Tag::Int(min_y)),
+            ("height".into(), Tag::Int(height)),
+            ("logical_height".into(), Tag::Int(logical_height)),
+            ("has_skylight".into(), Tag::Byte(1)),
+        ]);
+        let mut payload = Vec::new();
+        mc_nbt::write_network(&mut payload, &root).unwrap();
+        payload.into()
+    }
+
+    fn int_field(tag: &Tag, name: &str) -> Option<i32> {
+        let Tag::Compound(fields) = tag else {
+            return None;
+        };
+        fields.iter().find_map(|(field, value)| {
+            (field == name)
+                .then_some(value)
+                .and_then(|value| match value {
+                    Tag::Int(value) => Some(*value),
+                    _ => None,
+                })
+        })
+    }
+
+    #[test]
+    fn custom_geometry_overrides_decoded_overworld_dimension_fields() {
+        let vanilla = dimension_payload(-64, 384, 384);
+        let geometry = ChunkGeometry::new(0, 256).unwrap();
+
+        let patched = prepare_registry_entry_payload(
+            Some(vanilla),
+            "minecraft:dimension_type",
+            "minecraft:overworld",
+            false,
+            geometry,
+        )
+        .unwrap()
+        .expect("custom overworld must carry data even for a known pack");
+        let mut bytes = patched.as_ref();
+        let decoded = mc_nbt::read_network(&mut bytes).unwrap();
+
+        assert_eq!(int_field(&decoded, "min_y"), Some(0));
+        assert_eq!(int_field(&decoded, "height"), Some(256));
+        assert_eq!(int_field(&decoded, "logical_height"), Some(256));
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn vanilla_geometry_preserves_captured_payload_bytes() {
+        let vanilla = dimension_payload(-64, 384, 384);
+
+        let unchanged =
+            override_overworld_dimension_geometry(Arc::clone(&vanilla), OVERWORLD_GEOMETRY)
+                .unwrap();
+
+        assert!(Arc::ptr_eq(&unchanged, &vanilla));
+    }
+
+    #[test]
+    fn custom_geometry_without_captured_overworld_payload_fails_closed() {
+        let error = prepare_registry_entry_payload(
+            None,
+            "minecraft:dimension_type",
+            "minecraft:overworld",
+            false,
+            ChunkGeometry::new(0, 256).unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ConnectionError::MissingRegistryPayload { registry, entry }
+                if registry == "minecraft:dimension_type" && entry == "minecraft:overworld"
+        ));
+    }
 }

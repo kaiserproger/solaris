@@ -6,6 +6,7 @@
 //! of any wire concern. `mc-protocol` re-exports the type so existing
 //! `mc_protocol::codec::Identifier` paths keep working.
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A validated `namespace:path` identifier.
@@ -13,7 +14,7 @@ use thiserror::Error;
 /// Stored as a single owned string and an index pointing at the colon.
 /// We don't intern here; if interning turns out to matter for the
 /// data-pack loader we'll revisit (PROJECT_SPEC §3.2 leaves room).
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Identifier {
     full: String,
     colon: usize,
