@@ -50,6 +50,7 @@ pub(super) fn placement_snapshot_positions(
     Some(positions)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_block_placement(
     blocks: &BlockRegistry,
     placed_state: BlockStateId,
@@ -57,6 +58,7 @@ pub(super) fn plan_block_placement(
     pos: BlockPos,
     player_pose: PlayerPose,
     direction: Direction,
+    target_relative_hit_y: f32,
     air: BlockStateId,
 ) -> Option<PlannedBlockPlacement> {
     let placed = blocks.by_id(placed_state)?;
@@ -66,6 +68,15 @@ pub(super) fn plan_block_placement(
             additional_preconditions: Vec::new(),
         });
     }
+    let placed_state = oriented_stair_or_slab_state(
+        blocks,
+        placed_state,
+        placed,
+        player_pose,
+        direction,
+        target_relative_hit_y,
+    );
+    let placed = blocks.by_id(placed_state)?;
 
     let snapshot = snapshot?;
     if !placed.block.id.path().ends_with("_door") {
@@ -124,6 +135,50 @@ pub(super) fn plan_block_placement(
             expected_token: upper_token,
         }],
     })
+}
+
+fn oriented_stair_or_slab_state(
+    blocks: &BlockRegistry,
+    placed_state: BlockStateId,
+    state: &BlockState,
+    player_pose: PlayerPose,
+    direction: Direction,
+    target_relative_hit_y: f32,
+) -> BlockStateId {
+    let path = state.block.id.path();
+    let mut properties = state.properties.clone();
+    if path.ends_with("_stairs") {
+        set_prop_if_present(
+            &mut properties,
+            "facing",
+            horizontal_facing_from_yaw(player_pose.yaw),
+        );
+        set_prop_if_present(
+            &mut properties,
+            "half",
+            stair_or_slab_half(direction, target_relative_hit_y),
+        );
+    } else if path.ends_with("_slab") {
+        set_prop_if_present(
+            &mut properties,
+            "type",
+            stair_or_slab_half(direction, target_relative_hit_y),
+        );
+    } else {
+        return placed_state;
+    }
+
+    blocks
+        .by_name_and_props(&state.block.id, &properties)
+        .unwrap_or(placed_state)
+}
+
+fn stair_or_slab_half(direction: Direction, target_relative_hit_y: f32) -> &'static str {
+    if direction == Direction::Down || (direction != Direction::Up && target_relative_hit_y > 0.5) {
+        "top"
+    } else {
+        "bottom"
+    }
 }
 
 pub(super) fn append_cactus_side_neighbor_cascades(

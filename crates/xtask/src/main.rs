@@ -1324,6 +1324,22 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
         definition_anchor: "fn build_herd_spawn_candidates",
     },
     OwnershipRule {
+        name: "simulation queue snapshot",
+        module_file: "crates/mc-net/src/play/simulation/queue.rs",
+        parent_file: "crates/mc-net/src/play/simulation.rs",
+        mod_declaration: "mod queue;",
+        definition_file: "crates/mc-net/src/play/simulation/queue.rs",
+        definition_anchor: "pub(crate) struct SimulationQueueSnapshot",
+    },
+    OwnershipRule {
+        name: "simulation queue shutdown",
+        module_file: "crates/mc-net/src/play/simulation/queue.rs",
+        parent_file: "crates/mc-net/src/play/simulation.rs",
+        mod_declaration: "mod queue;",
+        definition_file: "crates/mc-net/src/play/simulation/queue.rs",
+        definition_anchor: "pub(crate) fn shutdown(&mut self)",
+    },
+    OwnershipRule {
         name: "connection driver",
         module_file: "crates/mc-net/src/connection_driver.rs",
         parent_file: "crates/mc-net/src/lib.rs",

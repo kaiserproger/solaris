@@ -457,6 +457,19 @@ transaction boundary.
   Login/Transfer -> Configuration -> Play socket sequence. `server.rs` retains
   listener supervision and service construction. This is orchestration only;
   it does not create a service trait layer or move gameplay authority.
+- `play::simulation::queue` owns bounded command admission, queue envelopes and
+  metrics, herd enqueue coalescing, push-driven owner wakeup, ready-batch
+  draining, shutdown rejection, and channel construction. `simulation.rs`
+  retains command/response types, handle/owner storage, regional authority,
+  gameplay processing, and publication. The split preserves permit ordering,
+  the background herd cap, exact depth/dequeue accounting, and distinct
+  explicit-shutdown versus owner-drop errors; it adds no task, lock, config, or
+  passive wait.
+
+The existing `play::block_placement` boundary also selects stair facing and
+stair/slab top or bottom state from the player yaw and target-relative hit Y.
+The rule is pinned to the local 26.1.2 `StairBlock`/`SlabBlock` oracle. Slab
+merging and stair neighbour-shape selection remain explicit follow-up work.
 
 Entity physics prefetches its versioned owner input before reacquiring the
 session registry lock. After commit, publication still checks the current

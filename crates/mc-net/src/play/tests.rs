@@ -1,4 +1,6 @@
+use super::block_placement::plan_block_placement;
 use super::falling_blocks::{FallingBlockStart, LandedFallingBlock, plan_falling_block_starts};
+use super::use_item_on_adapter::cursor_y_relative_to_target;
 use super::*;
 use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
@@ -2923,6 +2925,7 @@ async fn block_placement_planning_does_not_wait_for_world_writer() {
         BlockStateId(1),
         PlayerPose::new(1.5, 64.0, 1.5),
         Direction::Up,
+        0.5,
     ));
     std::future::poll_fn(
         |cx| match std::future::Future::poll(planning.as_mut(), cx) {
@@ -4780,6 +4783,7 @@ async fn cactus_placement_path_cascades_when_solid_side_neighbor_is_placed() {
         BlockStateId(1),
         PlayerPose::new(0.5, 64.0, 0.5),
         Direction::Up,
+        0.5,
     )
     .await;
 
@@ -4836,6 +4840,7 @@ async fn cactus_placement_path_does_not_cascade_for_non_solid_side_neighbor() {
         BlockStateId(20),
         PlayerPose::new(0.5, 64.0, 0.5),
         Direction::Up,
+        0.5,
     )
     .await;
 
@@ -4879,11 +4884,91 @@ async fn vertical_plant_placement_rejects_stone_support() {
                 plant,
                 PlayerPose::new(0.5, 64.0, 0.5),
                 Direction::Up,
+                0.5,
             )
             .await,
             None
         );
     }
+}
+
+#[tokio::test]
+async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventory() {
+    let blocks = Arc::new(fluid_test_registry());
+    let cactus = Identifier::parse("minecraft:cactus").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: cactus,
+        protocol_id: 42,
+    }]));
+    let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
+    state.items = Arc::clone(&items);
+    state.item_to_block = ItemToBlockTable::build(&items, &blocks);
+    *state.inventory.held_mut(0) = ItemStack::new(42, 1);
+    insert_fluid_test_chunk(&state).await;
+
+    let clicked = mc_world::BlockPos { x: 3, y: 64, z: 4 };
+    let target = mc_world::BlockPos { y: 65, ..clicked };
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(clicked, BlockStateId(1))
+        .unwrap();
+    let action = test_use_item_on(pack_block_pos(clicked.x, clicked.y, clicked.z));
+    let mut writer = Vec::new();
+
+    handle_block_item_placement(
+        &mut state,
+        &mut writer,
+        GameMode::Survival,
+        PlayerPose::new(3.5, 64.0, 4.5),
+        clicked,
+        &action,
+        (clicked.x, clicked.y, clicked.z),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(state.inventory.held(0), &ItemStack::new(42, 1));
+    assert_eq!(
+        state.world.lock().await.get_cached_block(target),
+        Some(BlockStateId(0))
+    );
+
+    let mut frames = bytes::BytesMut::from(writer.as_slice());
+    let mut updates = Vec::new();
+    let mut saw_ack = false;
+    while let Some(mut frame) =
+        mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled).unwrap()
+    {
+        if frame.id == BlockUpdate::ID {
+            updates.push(BlockUpdate::decode(&mut frame.body).unwrap());
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            panic!("invalid support placement must not debit or resync the held cactus slot");
+        } else if frame.id == BlockChangedAck::ID {
+            assert!(!updates.is_empty(), "ack must follow block resyncs");
+            assert_eq!(
+                BlockChangedAck::decode(&mut frame.body).unwrap().sequence,
+                action.sequence
+            );
+            saw_ack = true;
+        } else {
+            panic!("unexpected packet during invalid support placement rejection");
+        }
+    }
+
+    assert!(
+        saw_ack,
+        "invalid support placement must acknowledge the action"
+    );
+    assert_eq!(updates.len(), 2);
+    assert!(updates.iter().any(|update| {
+        unpack_block_pos(update.position) == (clicked.x, clicked.y, clicked.z)
+            && update.state_id == 1
+    }));
+    assert!(updates.iter().any(|update| {
+        unpack_block_pos(update.position) == (target.x, target.y, target.z) && update.state_id == 0
+    }));
 }
 
 #[tokio::test]
@@ -4904,6 +4989,7 @@ async fn cactus_placement_path_rejects_adjacent_cactus() {
         BlockStateId(19),
         PlayerPose::new(0.5, 64.0, 0.5),
         Direction::Up,
+        0.5,
     )
     .await;
 
@@ -11680,6 +11766,202 @@ fn door_half_state_builds_two_block_placement_states() {
         Some(mc_world::BlockStateId(4))
     );
     assert_eq!(horizontal_facing_from_yaw(180.0), "north");
+}
+
+fn oriented_placement_test_registry() -> Arc<mc_world::BlockRegistry> {
+    Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_stairs").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north", "south", "east", "west"]),
+                    ("half", &["bottom", "top"]),
+                    ("shape", &["straight"]),
+                ]),
+                states: vec![
+                    state(
+                        1,
+                        true,
+                        &[
+                            ("facing", "north"),
+                            ("half", "bottom"),
+                            ("shape", "straight"),
+                        ],
+                    ),
+                    state(
+                        2,
+                        false,
+                        &[("facing", "north"), ("half", "top"), ("shape", "straight")],
+                    ),
+                    state(
+                        3,
+                        false,
+                        &[
+                            ("facing", "south"),
+                            ("half", "bottom"),
+                            ("shape", "straight"),
+                        ],
+                    ),
+                    state(
+                        4,
+                        false,
+                        &[("facing", "south"), ("half", "top"), ("shape", "straight")],
+                    ),
+                    state(
+                        5,
+                        false,
+                        &[
+                            ("facing", "east"),
+                            ("half", "bottom"),
+                            ("shape", "straight"),
+                        ],
+                    ),
+                    state(
+                        6,
+                        false,
+                        &[("facing", "east"), ("half", "top"), ("shape", "straight")],
+                    ),
+                    state(
+                        7,
+                        false,
+                        &[
+                            ("facing", "west"),
+                            ("half", "bottom"),
+                            ("shape", "straight"),
+                        ],
+                    ),
+                    state(
+                        8,
+                        false,
+                        &[("facing", "west"), ("half", "top"), ("shape", "straight")],
+                    ),
+                ],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_slab").unwrap(),
+                properties: prop_schema(&[("type", &["bottom", "top"])]),
+                states: vec![
+                    state(9, true, &[("type", "bottom")]),
+                    state(10, false, &[("type", "top")]),
+                ],
+            },
+            BlockReport {
+                id: Identifier::parse("minecraft:incomplete_stairs").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north", "south"]),
+                    ("half", &["bottom", "top"]),
+                ]),
+                states: vec![state(11, true, &[("facing", "north"), ("half", "bottom")])],
+            },
+        ])
+        .unwrap(),
+    )
+}
+
+fn plan_oriented_test_placement(
+    blocks: Arc<mc_world::BlockRegistry>,
+    placed_state: mc_world::BlockStateId,
+    yaw: f32,
+    direction: mc_protocol::packets::play::Direction,
+    target_relative_hit_y: f32,
+) -> mc_world::BlockStateId {
+    let world = in_memory_button_world(Arc::clone(&blocks));
+    let snapshot = world
+        .read_view()
+        .snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
+    let mut pose = PlayerPose::new(0.5, 64.0, 0.5);
+    pose.yaw = yaw;
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+
+    plan_block_placement(
+        &blocks,
+        placed_state,
+        Some(&snapshot),
+        pos,
+        pose,
+        direction,
+        target_relative_hit_y,
+        mc_world::BlockStateId(0),
+    )
+    .expect("ordinary oriented block placement plans")
+    .edits[0]
+        .new_state
+}
+
+#[test]
+fn stair_placement_uses_yaw_and_cursor_height_for_all_facings_and_halves() {
+    let blocks = oriented_placement_test_registry();
+
+    for (yaw, bottom, top) in [(0.0, 3, 4), (90.0, 7, 8), (180.0, 1, 2), (270.0, 5, 6)] {
+        assert_eq!(
+            plan_oriented_test_placement(
+                Arc::clone(&blocks),
+                mc_world::BlockStateId(1),
+                yaw,
+                mc_protocol::packets::play::Direction::East,
+                0.25,
+            ),
+            mc_world::BlockStateId(bottom),
+        );
+        assert_eq!(
+            plan_oriented_test_placement(
+                Arc::clone(&blocks),
+                mc_world::BlockStateId(1),
+                yaw,
+                mc_protocol::packets::play::Direction::East,
+                0.75,
+            ),
+            mc_world::BlockStateId(top),
+        );
+    }
+}
+
+#[test]
+fn slab_placement_uses_clicked_face_and_cursor_height() {
+    let blocks = oriented_placement_test_registry();
+
+    for (direction, cursor_y, expected) in [
+        (mc_protocol::packets::play::Direction::Up, 0.75, 9),
+        (mc_protocol::packets::play::Direction::Down, 0.25, 10),
+        (mc_protocol::packets::play::Direction::East, 0.25, 9),
+        (mc_protocol::packets::play::Direction::East, 0.5, 9),
+        (mc_protocol::packets::play::Direction::East, 0.75, 10),
+    ] {
+        assert_eq!(
+            plan_oriented_test_placement(
+                Arc::clone(&blocks),
+                mc_world::BlockStateId(9),
+                0.0,
+                direction,
+                cursor_y,
+            ),
+            mc_world::BlockStateId(expected),
+        );
+    }
+}
+
+#[test]
+fn placement_cursor_height_is_relative_to_the_placed_target() {
+    assert_eq!(cursor_y_relative_to_target(64, 64, 0.5), 0.5);
+    assert_eq!(cursor_y_relative_to_target(64, 65, 1.0), 0.0);
+    assert_eq!(cursor_y_relative_to_target(64, 63, 0.0), 1.0);
+}
+
+#[test]
+fn oriented_placement_falls_back_to_the_resolved_default_state_when_family_is_incomplete() {
+    let blocks = oriented_placement_test_registry();
+
+    assert_eq!(
+        plan_oriented_test_placement(
+            blocks,
+            mc_world::BlockStateId(11),
+            0.0,
+            mc_protocol::packets::play::Direction::East,
+            0.75,
+        ),
+        mc_world::BlockStateId(11),
+    );
 }
 
 #[test]

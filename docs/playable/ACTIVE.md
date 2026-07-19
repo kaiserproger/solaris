@@ -4309,6 +4309,15 @@ Current evidence:
   the current three-wire-test coverage, without a vanilla shape-parity claim.
 - The `wide` SIMD experiment remains non-promoted: `7.86%` kernel-median and
   `0.72%` full-median gains are below the 10% promotion gate.
+- Stair placement now selects all four horizontal facings plus vanilla top or
+  bottom half, and slab placement selects top/bottom from the clicked face and
+  world hit Y relative to the placed cell. The rule comes from the local
+  26.1.2 `StairBlock`/`SlabBlock` source; exactly `0.5` remains bottom.
+  Registry-backed planner tests cover every facing, face overrides, the height
+  boundary and incomplete-family fallback. Rejected support and occupied
+  target paths preserve world/inventory state and resync before acknowledgement.
+  Slab merging/double state, stair neighbour shapes and a real-client building
+  gate remain open.
 
 Likely code paths:
 

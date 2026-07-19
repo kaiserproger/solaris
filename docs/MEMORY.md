@@ -425,6 +425,19 @@ changes.
   only a fail-only code-health command. Performance, soak and an actual
   real-client run did not run for Wave 21; ignored oracle/load rows remain
   degraded exactly as reported by the workspace suite.
+- Wave 22 moved bounded simulation admission, metrics, herd coalescing,
+  batching, wakeup, shutdown and channel construction into the 663-line
+  `play/simulation/queue.rs`; `simulation.rs` fell from 17,104 to 16,622 lines.
+  Permit ordering, queue accounting, background herd admission and pushed
+  wakeups are unchanged, and behavioral tests cover blocked sender closure,
+  owner drop, zero budget and shutdown across prefetched/deferred/receiver
+  storage. Wave 23 adds local-26.1.2-oracle stair facing/half and slab top/bottom
+  placement with target-relative cursor Y; rejection tests preserve no-debit,
+  resync and acknowledgement order. Independent reviews approved both slices.
+  Full workspace tests, workspace all-target strict Clippy, fmt, code-health and
+  diff-check pass; ignored oracle/load/benchmark rows remain explicit. Slab
+  merging, stair neighbour shapes, real-client, performance and soak gates are
+  not claimed.
 
 ## Task Routes
 

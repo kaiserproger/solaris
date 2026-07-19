@@ -933,6 +933,7 @@ where
         placed_state,
         player_pose,
         action.direction,
+        cursor_y_relative_to_target(clicked_pos.y, ty, action.cursor_y),
     )
     .await
     else {
@@ -1323,6 +1324,7 @@ pub(super) async fn plan_place_block_edits(
     placed_state: mc_world::BlockStateId,
     player_pose: PlayerPose,
     direction: Direction,
+    target_relative_hit_y: f32,
 ) -> Option<PlannedBlockPlacement> {
     let snapshot_positions = placement_snapshot_positions(&state.blocks, placed_state, pos)?;
     let snapshot =
@@ -1334,8 +1336,13 @@ pub(super) async fn plan_place_block_edits(
         pos,
         player_pose,
         direction,
+        target_relative_hit_y,
         air_state_id(&state.blocks),
     )
+}
+
+pub(super) fn cursor_y_relative_to_target(clicked_y: i32, target_y: i32, cursor_y: f32) -> f32 {
+    cursor_y + (clicked_y - target_y) as f32
 }
 
 pub(super) async fn handle_sign_update<W>(

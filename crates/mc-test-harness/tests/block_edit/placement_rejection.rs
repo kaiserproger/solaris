@@ -777,6 +777,13 @@ async fn read_rejected_place_resync_before_ack(
                 assert_eq!(pkt.state_id, dirt_state_id);
                 saw_target_resync = true;
             }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let pkt = ClientboundContainerSetSlot::decode(&mut body).expect("decode SetSlot");
+            assert!(
+                pkt.container_id != 0 || pkt.slot != 36,
+                "rejected placement must not debit or resync the held dirt slot before ack"
+            );
         } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
             let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
