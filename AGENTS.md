@@ -45,31 +45,34 @@ owner explicitly asks.
 
 ## Context Routing
 
-- Long-goal continuation or recovery after compaction: read `docs/MEMORY.md`,
-  then follow only the route for the active task.
-- Fresh session with no specific prompt: read `docs/NEXT_SESSION.md`.
-- Milestone plan, closeout, or readiness claim: read
-  `docs/DEFINITION_OF_DONE.md` and the relevant `docs/milestones/MX.md`.
-- Roadmap or target-shape questions: read `docs/PROJECT_SPEC.md` and, for
-  M77-M100 work, `docs/CORE_M77_M100_ROADMAP.md`.
-- Core performance, regional ownership, ECS, or autoscale work outside
-  Playable Spike Mode: read the matching route in `docs/MEMORY.md`, the
-  relevant M90-M93 milestone, and ADR 0004/0005. Use
-  `docs/M52_OPERATOR_PERFORMANCE_NOTES.md` only for metric definitions.
+Start from the prompt, `git status`, and `rg`. Read one primary document below;
+follow its links only when the task needs them.
+
+- Long-goal recovery after compaction: `docs/MEMORY.md`.
+- No specific owner prompt: `docs/NEXT_SESSION.md`.
+- Playable or 20-minute-loop work: `docs/playable/README.md`, then the current
+  queue in `docs/playable/ACTIVE.md`.
+- Milestone implementation: only the file matching the active milestone
+  (currently `docs/milestones/M100.md`).
+- Closeout or readiness claim: `docs/DEFINITION_OF_DONE.md`, the relevant
+  milestone, and `docs/VALIDATION_LEDGER.md`.
+- Roadmap or target shape: the relevant `docs/PROJECT_SPEC.md` section. Use
+  `docs/CORE_M77_M100_ROADMAP.md` only for M77-M100 sequencing.
+- Architecture, ownership, threading, or policy: `docs/decisions/README.md`,
+  then the exact ADR. Update that ADR in the same slice.
+- Performance, regional ownership, ECS, or autoscale: the exact active
+  milestone plus ADR 0004/0005. Use `docs/M52_OPERATOR_PERFORMANCE_NOTES.md`
+  only for metric definitions.
 - Minecraft client MCP or agent-tool wiring: read `docs/AGENT_TOOLING.md` and
   `client-mod/solaris-client-agent/README.md`.
-- Server Lua plugin/API work: read `docs/PLUGINS.md` and the ownership ADR
-  linked from `docs/MEMORY.md`.
-- Architecture, ownership, threading, or policy changes: read the relevant
-  ADR and affected `docs/PROJECT_SPEC.md` section. Update the ADR in the same
-  slice; record staged scope or supersession explicitly instead of silently
-  drifting from the documented decision.
+- Server Lua plugin/API work: `docs/PLUGINS.md` and the exact ownership ADR.
 - Protocol or packet work: read ADR 0002, use
   `.analysis/protocol-dump.txt`, `tools/dump-vanilla-protocol.sh`, and
   `crates/mc-test-harness/src/bin/wire_probe.rs` as needed.
 - Build/run questions: read `README.md` and `example.toml`.
-- Tooling questions: read `docs/AGENT_TOOLING.md` only when the local tool
-  itself is relevant.
+
+Never read milestone ranges or `docs/archive/` as startup context. Archives are
+for targeted evidence lookup only.
 
 Prefer `rg`/`rg --files` for discovery. Use Serena or other symbol tools
 when they are already useful, not as mandatory startup work.
