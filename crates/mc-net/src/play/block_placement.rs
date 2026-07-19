@@ -1,3 +1,4 @@
+use mc_data::Identifier;
 use mc_nbt::{ListTag, Tag};
 use mc_protocol::packets::play::Direction;
 use mc_world::{BlockPos, BlockRegistry, BlockState, BlockStateId, WorldReadSnapshot};
@@ -79,6 +80,13 @@ pub(super) fn plan_block_placement(
     let placed = blocks.by_id(placed_state)?;
 
     let snapshot = snapshot?;
+    if placed.block.id.path() == "torch" {
+        let new_state = torch_placement_state(blocks, placed_state, snapshot, pos, direction)?;
+        return Some(PlannedBlockPlacement {
+            edits: vec![BlockEdit { pos, new_state }],
+            additional_preconditions: Vec::new(),
+        });
+    }
     if !placed.block.id.path().ends_with("_door") {
         if !vertical_plant_can_survive_at(blocks, snapshot, pos, placed_state) {
             return None;
@@ -135,6 +143,97 @@ pub(super) fn plan_block_placement(
             expected_token: upper_token,
         }],
     })
+}
+
+fn torch_placement_state(
+    blocks: &BlockRegistry,
+    standing_state: BlockStateId,
+    snapshot: &WorldReadSnapshot,
+    pos: BlockPos,
+    direction: Direction,
+) -> Option<BlockStateId> {
+    let (new_state, support) = match direction {
+        Direction::Up => (
+            standing_state,
+            BlockPos {
+                y: pos.y - 1,
+                ..pos
+            },
+        ),
+        Direction::North | Direction::South | Direction::West | Direction::East => {
+            let facing = direction_to_horizontal_facing(direction)?;
+            let wall_torch = Identifier::parse("minecraft:wall_torch").expect("static identifier");
+            let new_state = blocks
+                .by_name_and_props(&wall_torch, &[("facing".to_string(), facing.to_string())])?;
+            let support = match direction {
+                Direction::North => BlockPos {
+                    z: pos.z + 1,
+                    ..pos
+                },
+                Direction::South => BlockPos {
+                    z: pos.z - 1,
+                    ..pos
+                },
+                Direction::West => BlockPos {
+                    x: pos.x + 1,
+                    ..pos
+                },
+                Direction::East => BlockPos {
+                    x: pos.x - 1,
+                    ..pos
+                },
+                Direction::Down | Direction::Up => {
+                    unreachable!("horizontal direction matched above")
+                }
+            };
+            (new_state, support)
+        }
+        Direction::Down => return None,
+    };
+    let support_state = snapshot.get_cached_block(support)?;
+    has_full_sturdy_face(blocks, support_state).then_some(new_state)
+}
+
+fn has_full_sturdy_face(blocks: &BlockRegistry, state_id: BlockStateId) -> bool {
+    let Some(state) = blocks.by_id(state_id) else {
+        return false;
+    };
+
+    let shapes = mc_data::collision_shapes::vanilla_collision_shapes();
+    if let Some(boxes) = shapes.get(state_id.0) {
+        // The pinned oracle has exact boxes for Pareto partial families. A wall torch needs a
+        // full face, so a covered state is usable only when its collision is one full cube.
+        return boxes
+            == [mc_data::collision_shapes::CollisionBox::new(
+                0, 0, 0, 16, 16, 16,
+            )];
+    }
+
+    // The shape oracle does not cover every vanilla state. This intentionally small fallback
+    // admits common full cubes only; it is not a complete vanilla isFaceSturdy implementation.
+    let path = state.block.id.path();
+    matches!(
+        path,
+        "stone"
+            | "cobblestone"
+            | "deepslate"
+            | "cobbled_deepslate"
+            | "dirt"
+            | "grass_block"
+            | "sand"
+            | "red_sand"
+            | "gravel"
+            | "netherrack"
+            | "end_stone"
+            | "obsidian"
+            | "bedrock"
+    ) || path.ends_with("_planks")
+        || path.ends_with("_log")
+        || path.ends_with("_wood")
+        || path.ends_with("_stem")
+        || path.ends_with("_hyphae")
+        || path.ends_with("_concrete")
+        || path.ends_with("_terracotta")
 }
 
 fn oriented_stair_or_slab_state(

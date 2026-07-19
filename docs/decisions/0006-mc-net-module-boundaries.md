@@ -465,11 +465,24 @@ transaction boundary.
   the background herd cap, exact depth/dequeue accounting, and distinct
   explicit-shutdown versus owner-drop errors; it adds no task, lock, config, or
   passive wait.
+- `play::simulation::regional_mutation` owns preparation and execution of the
+  existing regional block/container mutation lane and its test probe. It uses
+  explicit imports from the parent coordinator and preserves sorted lane
+  admission, leases, mutation-token checks, WAL decision order, atomic failure,
+  response order, and post-commit publication. Command classification,
+  batching, world access, lighting/publication helpers, and `SimulationOwner`
+  remain in `simulation.rs`; this extraction does not claim the regional or ECS
+  migration complete and adds no task, lock, config, sleep, or polling.
 
 The existing `play::block_placement` boundary also selects stair facing and
 stair/slab top or bottom state from the player yaw and target-relative hit Y.
 The rule is pinned to the local 26.1.2 `StairBlock`/`SlabBlock` oracle. Slab
-merging and stair neighbour-shape selection remain explicit follow-up work.
+merging and stair neighbour-shape selection remain explicit follow-up work. An
+ordinary torch placed against a horizontal full-cube support selects the exact
+wall-torch facing, while `UP` retains the standing state and `DOWN` is rejected.
+The support predicate is deliberately conservative; irregular sturdy faces,
+redstone/soul/copper torches, neighbour break cascades, and complete
+`isFaceSturdy` parity remain outside this slice.
 
 Entity physics prefetches its versioned owner input before reacquiring the
 session registry lock. After commit, publication still checks the current

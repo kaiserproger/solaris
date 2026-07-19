@@ -1037,3 +1037,80 @@ async fn read_rejected_bucket_resync_before_ack(
         }
     }
 }
+
+#[tokio::test]
+async fn rejected_wall_torch_on_fence_resyncs_before_ack_without_debit() {
+    let Some(WallTorchWireFixture {
+        mut client,
+        clicked,
+        target,
+        air_state,
+        support_state: fence_state,
+        torch_item,
+        ..
+    }) = start_wall_torch_wire_fixture("WallTorchReject", "minecraft:oak_fence").await
+    else {
+        return;
+    };
+
+    let sequence = 2502;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(clicked.x, clicked.y, clicked.z),
+            direction: Direction::East,
+            cursor_x: 1.0,
+            cursor_y: 0.5,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence,
+        })
+        .await
+        .expect("attempt wall torch placement");
+
+    let mut saw_clicked_resync = false;
+    let mut saw_target_resync = false;
+    let mut saw_held_slot_resync = false;
+    loop {
+        let frame = client
+            .read_frame_with_timeout(Duration::from_secs(30))
+            .await
+            .expect("rejected wall torch response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode torch resync");
+            let pos = unpack_block_pos(packet.position);
+            if pos == (clicked.x, clicked.y, clicked.z) {
+                assert_eq!(packet.state_id, fence_state.0 as i32);
+                saw_clicked_resync = true;
+            } else if pos == (target.x, target.y, target.z) {
+                assert_eq!(packet.state_id, air_state.0 as i32);
+                saw_target_resync = true;
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body).expect("decode torch slot");
+            if packet.container_id == 0 && packet.slot == 36 {
+                assert_eq!(packet.item_stack.item_id, torch_item);
+                assert_eq!(packet.item_stack.count, 1);
+                saw_held_slot_resync = true;
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode torch rejection ack");
+            if packet.sequence == sequence {
+                assert!(saw_clicked_resync, "clicked resync precedes rejected torch ack");
+                assert!(saw_target_resync, "target resync precedes rejected torch ack");
+                assert!(
+                    saw_held_slot_resync,
+                    "held torch stack resync precedes rejected torch ack"
+                );
+                return;
+            }
+        }
+    }
+}

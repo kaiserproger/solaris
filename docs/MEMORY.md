@@ -438,6 +438,19 @@ changes.
   diff-check pass; ignored oracle/load/benchmark rows remain explicit. Slab
   merging, stair neighbour shapes, real-client, performance and soak gates are
   not claimed.
+- Wave 24 moved the regional block/container mutation lane into the 1,159-line
+  explicit-import `play/simulation/regional_mutation.rs`; `simulation.rs` fell
+  from 16,622 to 15,488 lines. The parent still owns classification, batching,
+  world access, lighting/publication helpers and `SimulationOwner`; regional
+  or ECS migration is not claimed complete. Wave 25 adds ordinary wall-torch
+  facing on horizontal conservative full-cube supports, standing placement on
+  `UP`, and rejection on `DOWN` or partial support. Accepted wire coverage
+  proves exact state, update-before-ack and one debit; rejected coverage proves
+  both block resyncs plus unchanged held stack before ack and no debit. Full
+  workspace tests, workspace all-target strict Clippy, fmt, code-health and
+  diff-check pass, and both independent reviews approve. Irregular sturdy-face
+  parity, torch neighbour cascades, real-client, performance and soak remain
+  unclaimed.
 
 ## Task Routes
 

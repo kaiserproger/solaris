@@ -1340,6 +1340,22 @@ const MC_NET_OWNERSHIP: &[OwnershipRule] = &[
         definition_anchor: "pub(crate) fn shutdown(&mut self)",
     },
     OwnershipRule {
+        name: "regional block edit job",
+        module_file: "crates/mc-net/src/play/simulation/regional_mutation.rs",
+        parent_file: "crates/mc-net/src/play/simulation.rs",
+        mod_declaration: "mod regional_mutation;",
+        definition_file: "crates/mc-net/src/play/simulation/regional_mutation.rs",
+        definition_anchor: "struct RegionalBlockEditJob",
+    },
+    OwnershipRule {
+        name: "regional block edit execution",
+        module_file: "crates/mc-net/src/play/simulation/regional_mutation.rs",
+        parent_file: "crates/mc-net/src/play/simulation.rs",
+        mod_declaration: "mod regional_mutation;",
+        definition_file: "crates/mc-net/src/play/simulation/regional_mutation.rs",
+        definition_anchor: "async fn process_regional_block_edit_run",
+    },
+    OwnershipRule {
         name: "connection driver",
         module_file: "crates/mc-net/src/connection_driver.rs",
         parent_file: "crates/mc-net/src/lib.rs",

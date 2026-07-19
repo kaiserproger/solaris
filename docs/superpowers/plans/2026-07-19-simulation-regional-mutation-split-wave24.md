@@ -28,9 +28,9 @@
 - Consumes: parent regional routing DTOs, command envelopes, world access, journal transactions, lighting/publication helpers, and existing authority handles.
 - Produces: the existing `SimulationOwner::process_regional_block_edit_run` behavior and test-only regional probe through parent-visible methods/types.
 
-- [ ] Move regional job/probe/result types and `process_regional_block_edit_run` into the child module with the narrowest visibility that compiles.
-- [ ] Retain accepted, stale-token, requester-loss, cross-region, journal-failure, closed-response, and partial-failure behavioral coverage.
-- [ ] Run focused regional mutation tests, full `mc-net`, strict scoped Clippy, fmt, code-health, and diff-check.
+- [x] Move regional job/probe/result types and `process_regional_block_edit_run` into the child module with the narrowest visibility that compiles.
+- [x] Retain accepted, stale-token, requester-loss, cross-region, journal-failure, closed-response, and partial-failure behavioral coverage.
+- [x] Run focused regional mutation tests, full `mc-net`, strict scoped Clippy, fmt, code-health, and diff-check.
 
 ### Task 2: Review And Checkpoint
 
@@ -40,5 +40,5 @@
 - Modify: `docs/playable/ACTIVE.md`
 - Append only: `.analysis/junior-readonly-wal.md`
 
-- [ ] Review authority, journal, ordering, visibility, and negative-code boundaries; fix all important findings.
-- [ ] Record exact line reduction and validation evidence, then commit the independently revertible slice.
+- [x] Review authority, journal, ordering, visibility, and negative-code boundaries; fix all important findings.
+- [x] Record exact line reduction and validation evidence, then commit the independently revertible slice.

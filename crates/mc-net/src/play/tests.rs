@@ -4937,6 +4937,7 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
 
     let mut frames = bytes::BytesMut::from(writer.as_slice());
     let mut updates = Vec::new();
+    let mut saw_held_resync = false;
     let mut saw_ack = false;
     while let Some(mut frame) =
         mc_protocol::frame::try_decode_frame(&mut frames, Compression::Disabled).unwrap()
@@ -4944,9 +4945,17 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
         if frame.id == BlockUpdate::ID {
             updates.push(BlockUpdate::decode(&mut frame.body).unwrap());
         } else if frame.id == ClientboundContainerSetSlot::ID {
-            panic!("invalid support placement must not debit or resync the held cactus slot");
+            let packet = ClientboundContainerSetSlot::decode(&mut frame.body).unwrap();
+            assert_eq!(packet.container_id, 0);
+            assert_eq!(packet.slot, PlayerInventory::HOTBAR_BASE as i16);
+            assert_eq!(packet.item_stack, ItemStack::new(42, 1));
+            saw_held_resync = true;
         } else if frame.id == BlockChangedAck::ID {
             assert!(!updates.is_empty(), "ack must follow block resyncs");
+            assert!(
+                saw_held_resync,
+                "ack must follow the unchanged held-stack resync"
+            );
             assert_eq!(
                 BlockChangedAck::decode(&mut frame.body).unwrap().sequence,
                 action.sequence
@@ -4960,6 +4969,10 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
     assert!(
         saw_ack,
         "invalid support placement must acknowledge the action"
+    );
+    assert!(
+        saw_held_resync,
+        "invalid support placement must resync the unchanged held stack"
     );
     assert_eq!(updates.len(), 2);
     assert!(updates.iter().any(|update| {
@@ -11859,6 +11872,104 @@ fn oriented_placement_test_registry() -> Arc<mc_world::BlockRegistry> {
     )
 }
 
+fn torch_placement_test_registry() -> Arc<mc_world::BlockRegistry> {
+    Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            simple_block(1, "minecraft:stone"),
+            BlockReport {
+                id: Identifier::parse("minecraft:oak_fence").unwrap(),
+                properties: prop_schema(&[
+                    ("east", &["false"]),
+                    ("north", &["false"]),
+                    ("south", &["false"]),
+                    ("west", &["false"]),
+                    ("waterlogged", &["false"]),
+                ]),
+                states: vec![state(
+                    2,
+                    true,
+                    &[
+                        ("east", "false"),
+                        ("north", "false"),
+                        ("south", "false"),
+                        ("west", "false"),
+                        ("waterlogged", "false"),
+                    ],
+                )],
+            },
+            simple_block(3, "minecraft:torch"),
+            BlockReport {
+                id: Identifier::parse("minecraft:wall_torch").unwrap(),
+                properties: prop_schema(&[("facing", &["north", "south", "west", "east"])]),
+                states: vec![
+                    state(4, true, &[("facing", "north")]),
+                    state(5, false, &[("facing", "south")]),
+                    state(6, false, &[("facing", "west")]),
+                    state(7, false, &[("facing", "east")]),
+                ],
+            },
+        ])
+        .unwrap(),
+    )
+}
+
+fn torch_support_pos(pos: mc_world::BlockPos, direction: Direction) -> mc_world::BlockPos {
+    match direction {
+        Direction::North => mc_world::BlockPos {
+            z: pos.z + 1,
+            ..pos
+        },
+        Direction::South => mc_world::BlockPos {
+            z: pos.z - 1,
+            ..pos
+        },
+        Direction::West => mc_world::BlockPos {
+            x: pos.x + 1,
+            ..pos
+        },
+        Direction::East => mc_world::BlockPos {
+            x: pos.x - 1,
+            ..pos
+        },
+        Direction::Up => mc_world::BlockPos {
+            y: pos.y - 1,
+            ..pos
+        },
+        Direction::Down => mc_world::BlockPos {
+            y: pos.y + 1,
+            ..pos
+        },
+    }
+}
+
+fn plan_torch_placement(
+    blocks: Arc<mc_world::BlockRegistry>,
+    support_state: mc_world::BlockStateId,
+    direction: Direction,
+) -> Option<super::block_placement::PlannedBlockPlacement> {
+    let mut world = in_memory_button_world(Arc::clone(&blocks));
+    let pos = mc_world::BlockPos { x: 1, y: 64, z: 1 };
+    world
+        .set_block_at(torch_support_pos(pos, direction), support_state)
+        .expect("set torch support")
+        .expect("replace torch support");
+    let snapshot = world
+        .read_view()
+        .snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
+
+    plan_block_placement(
+        &blocks,
+        mc_world::BlockStateId(3),
+        Some(&snapshot),
+        pos,
+        PlayerPose::new(0.5, 64.0, 0.5),
+        direction,
+        0.5,
+        mc_world::BlockStateId(0),
+    )
+}
+
 fn plan_oriented_test_placement(
     blocks: Arc<mc_world::BlockRegistry>,
     placed_state: mc_world::BlockStateId,
@@ -11939,6 +12050,58 @@ fn slab_placement_uses_clicked_face_and_cursor_height() {
             mc_world::BlockStateId(expected),
         );
     }
+}
+
+#[test]
+fn torch_placement_uses_the_clicked_horizontal_face_for_wall_facing() {
+    let blocks = torch_placement_test_registry();
+
+    for (direction, expected_state) in [
+        (Direction::North, 4),
+        (Direction::South, 5),
+        (Direction::West, 6),
+        (Direction::East, 7),
+    ] {
+        let plan = plan_torch_placement(Arc::clone(&blocks), mc_world::BlockStateId(1), direction)
+            .expect("full sturdy support permits wall torch placement");
+        assert_eq!(plan.edits.len(), 1);
+        assert_eq!(
+            plan.edits[0].new_state,
+            mc_world::BlockStateId(expected_state)
+        );
+    }
+}
+
+#[test]
+fn torch_placement_on_top_uses_the_standing_state() {
+    let plan = plan_torch_placement(
+        torch_placement_test_registry(),
+        mc_world::BlockStateId(1),
+        Direction::Up,
+    )
+    .expect("full sturdy top support permits standing torch placement");
+
+    assert_eq!(plan.edits.len(), 1);
+    assert_eq!(plan.edits[0].new_state, mc_world::BlockStateId(3));
+}
+
+#[test]
+fn torch_placement_rejects_non_full_support_faces() {
+    let blocks = torch_placement_test_registry();
+
+    assert!(plan_torch_placement(blocks, mc_world::BlockStateId(2), Direction::East).is_none());
+}
+
+#[test]
+fn torch_placement_rejects_downward_faces() {
+    assert!(
+        plan_torch_placement(
+            torch_placement_test_registry(),
+            mc_world::BlockStateId(1),
+            Direction::Down,
+        )
+        .is_none()
+    );
 }
 
 #[test]

@@ -37,6 +37,128 @@ pub(super) async fn connect_to_play(
     (client, sync)
 }
 
+pub(super) struct WallTorchWireFixture {
+    pub(super) client: Client,
+    pub(super) clicked: mc_world::BlockPos,
+    pub(super) target: mc_world::BlockPos,
+    pub(super) air_state: mc_world::BlockStateId,
+    pub(super) support_state: mc_world::BlockStateId,
+    pub(super) wall_torch_east: mc_world::BlockStateId,
+    pub(super) torch_item: u32,
+}
+
+pub(super) async fn start_wall_torch_wire_fixture(
+    client_name: &str,
+    support_block: &str,
+) -> Option<WallTorchWireFixture> {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let vanilla_dir = manifest.join("../../data/vanilla");
+    let blocks_json = vanilla_dir.join("reports/blocks.json");
+    let registries_json = vanilla_dir.join("reports/registries.json");
+    if !blocks_json.exists() || !registries_json.exists() {
+        eprintln!(
+            "skipping: missing {} or {}",
+            blocks_json.display(),
+            registries_json.display()
+        );
+        return None;
+    }
+
+    let data = Arc::new(mc_data::load(&vanilla_dir).expect("vanilla data loads"));
+    let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
+    let blocks =
+        Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .expect("air block")
+        .default;
+    let support_state = blocks
+        .block(&mc_data::Identifier::parse(support_block).expect("valid support block identifier"))
+        .unwrap_or_else(|| panic!("missing support block {support_block}"))
+        .default;
+    let wall_torch_east = blocks
+        .by_name_and_props(
+            &mc_data::Identifier::parse("minecraft:wall_torch").unwrap(),
+            &[("facing".to_string(), "east".to_string())],
+        )
+        .expect("wall_torch east state");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let surface_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn terrain");
+    let clicked = mc_world::BlockPos {
+        x: 0,
+        y: surface_y,
+        z: 0,
+    };
+    let target = mc_world::BlockPos { x: 1, ..clicked };
+    storage
+        .set_block_at(clicked, support_state)
+        .expect("seed wall torch support");
+    storage
+        .set_block_at(target, air_state)
+        .expect("clear wall torch target");
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
+    let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
+    let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
+    let torch_item = items
+        .id_of(&mc_data::Identifier::parse("minecraft:torch").unwrap())
+        .expect("torch item");
+
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "wall torch wire fixture".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world,
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: mc_net::ShutdownHandle::default(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut client, sync) = connect_to_play(addr, client_name).await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+    assert_eq!(surface_y, sync.y.floor() as i32 - 2, "seeded spawn support");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:torch 1 0".into(),
+        })
+        .await
+        .expect("give torch");
+    wait_for_slot_stack(&mut client, torch_item, 1).await;
+
+    Some(WallTorchWireFixture {
+        client,
+        clicked,
+        target,
+        air_state,
+        support_state,
+        wall_torch_east,
+        torch_item,
+    })
+}
+
 pub(super) async fn drain_until_chunk(client: &mut Client, target: (i32, i32)) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {

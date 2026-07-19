@@ -43,4 +43,4 @@
 
 - [x] Review the extraction for visibility leaks, duplicate queue logic, ordering changes, passive waiting, and unrelated churn.
 - [x] Run full `mc-net`, workspace tests, workspace all-target strict Clippy, format check, code-health, and diff-check with bounded build resources.
-- [ ] Record exact evidence, line-count reduction, skipped real-client/performance/soak gates, and commit the independently revertible slice.
+- [x] Record exact evidence, line-count reduction, skipped real-client/performance/soak gates, and commit the independently revertible slice (`8250f9d`).

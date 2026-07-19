@@ -5471,3 +5471,71 @@ async fn read_station_noop_ack(
         }
     }
 }
+
+#[tokio::test]
+async fn placing_torch_on_a_wall_publishes_exact_state_then_ack_then_one_debit() {
+    let Some(WallTorchWireFixture {
+        mut client,
+        clicked,
+        target,
+        wall_torch_east,
+        ..
+    }) = start_wall_torch_wire_fixture("WallTorchPlace", "minecraft:dirt").await
+    else {
+        return;
+    };
+
+    let sequence = 2501;
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(clicked.x, clicked.y, clicked.z),
+            direction: Direction::East,
+            cursor_x: 1.0,
+            cursor_y: 0.5,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence,
+        })
+        .await
+        .expect("place wall torch");
+
+    let mut target_updates = 0;
+    let mut saw_ack = false;
+    let mut debits = 0;
+    while !(target_updates == 1 && saw_ack && debits == 1) {
+        let frame = client
+            .read_frame_with_timeout(Duration::from_secs(30))
+            .await
+            .expect("wall torch placement response");
+        if handle_keepalive(&mut client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode torch BlockUpdate");
+            if unpack_block_pos(packet.position) == (target.x, target.y, target.z) {
+                assert_eq!(packet.state_id, wall_torch_east.0 as i32);
+                target_updates += 1;
+                assert_eq!(target_updates, 1, "torch placement publishes one target update");
+            }
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let packet = BlockChangedAck::decode(&mut body).expect("decode torch ack");
+            if packet.sequence == sequence {
+                assert_eq!(target_updates, 1, "target update precedes torch ack");
+                assert_eq!(debits, 0, "torch debit follows its acknowledgement");
+                saw_ack = true;
+            }
+        } else if frame.id == ClientboundContainerSetSlot::ID {
+            let mut body = frame.body;
+            let packet = ClientboundContainerSetSlot::decode(&mut body).expect("decode torch debit");
+            if packet.container_id == 0 && packet.slot == 36 && packet.item_stack.is_empty() {
+                assert!(saw_ack, "torch debit follows acknowledgement");
+                debits += 1;
+                assert_eq!(debits, 1, "torch placement debits exactly once");
+            }
+        }
+    }
+}

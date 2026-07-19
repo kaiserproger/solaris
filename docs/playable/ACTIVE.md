@@ -4318,6 +4318,16 @@ Current evidence:
   target paths preserve world/inventory state and resync before acknowledgement.
   Slab merging/double state, stair neighbour shapes and a real-client building
   gate remain open.
+- Ordinary torches now place as the exact wall-torch facing on horizontal
+  conservative full-cube supports, remain standing on `UP`, and reject `DOWN`
+  or known partial supports. Raw TCP proves accepted update-before-ack with one
+  debit and rejected clicked/target plus unchanged-held-stack resync before ack
+  with no debit. Complete irregular-face support parity, neighbour break
+  cascades and a real-client building check remain open.
+- The regional block/container mutation worker now lives behind an
+  explicit-import child module and ownership tripwire. This is a coordinator
+  cleanup only; it does not itself prove more throughput, regional completion,
+  ECS completion, or client-visible behavior.
 
 Likely code paths:
 

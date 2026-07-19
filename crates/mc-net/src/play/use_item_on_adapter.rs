@@ -948,7 +948,7 @@ where
                 z: tz,
             },
             UseItemOnNoOpReason::PlacementPlanRejected,
-            UseItemOnResyncOptions::WITH_BUCKET,
+            UseItemOnResyncOptions::WITH_HELD_ITEM,
         )
         .await;
     };
