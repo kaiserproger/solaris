@@ -128,6 +128,9 @@ mod scheduled_blocks;
 // contract available without creating a second ingress path here.
 #[allow(dead_code)]
 mod script_inventory_transaction;
+pub(crate) use script_inventory_transaction::{
+    ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+};
 #[cfg(test)]
 mod script_inventory_transaction_tests;
 mod session;
@@ -11833,6 +11836,16 @@ where
                     Some(OutboundCommand::CloseScriptMenu(request)) => {
                         if let Some(state) = interaction.as_deref_mut() {
                             close_script_menu(state, writer, request).await?;
+                        }
+                    }
+                    Some(OutboundCommand::AuthoritativeInventory {
+                        inventory,
+                        carried_item,
+                    }) => {
+                        if let Some(state) = interaction.as_deref_mut() {
+                            state.inventory = *inventory;
+                            state.carried_item = carried_item;
+                            write_inventory_content(state, writer).await?;
                         }
                     }
                     Some(OutboundCommand::Explosion(mut packet)) => {

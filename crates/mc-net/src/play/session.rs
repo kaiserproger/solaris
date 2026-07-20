@@ -44,6 +44,9 @@ mod player_state_adapter;
 mod position_sync_tests;
 mod prepared_chunks;
 mod projectiles;
+mod script_inventory_transaction_endpoint;
+#[cfg(test)]
+mod script_inventory_transaction_endpoint_tests;
 mod script_menu_endpoint;
 #[cfg(test)]
 mod script_menu_endpoint_tests;
@@ -270,6 +273,7 @@ struct PlaySession {
     tx: mpsc::Sender<OutboundCommand>,
     pressure: Arc<OutboundPressureMetrics>,
     ordered_dispatch: Arc<OrderedDispatchState>,
+    script_transaction_active: Arc<Mutex<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -411,6 +415,8 @@ pub(crate) struct SessionRegistry {
     sheep_grazing_owner_read_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
     entity_save_owner_probe: Mutex<Option<EntityApplyReleaseProbe>>,
+    #[cfg(test)]
+    script_transaction_capture_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
     hostile_scan_probe: Mutex<Option<HostileScanProbe>>,
     #[cfg(test)]
@@ -675,6 +681,8 @@ impl SessionRegistry {
             sheep_grazing_owner_read_probe: Mutex::new(None),
             #[cfg(test)]
             entity_save_owner_probe: Mutex::new(None),
+            #[cfg(test)]
+            script_transaction_capture_probe: Mutex::new(None),
             #[cfg(test)]
             hostile_scan_probe: Mutex::new(None),
             #[cfg(test)]

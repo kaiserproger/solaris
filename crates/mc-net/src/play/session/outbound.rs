@@ -16,6 +16,7 @@ use tracing::{debug, warn};
 use crate::play::PlayerPose;
 use crate::play::block_wire::BlockDelta;
 use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
+use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
 use crate::play::session::{ScriptMenuCloseRequest, ScriptMenuOpenRequest};
 use crate::play::wire_entities::ServerEntityWireMove;
@@ -135,6 +136,10 @@ pub(in crate::play) enum OutboundCommand {
     },
     OpenScriptMenu(ScriptMenuOpenRequest),
     CloseScriptMenu(ScriptMenuCloseRequest),
+    AuthoritativeInventory {
+        inventory: Box<PlayerInventory>,
+        carried_item: ItemStack,
+    },
     Explosion(ClientboundExplode),
 }
 
@@ -213,6 +218,7 @@ impl OutboundCommand {
             | Self::DisconnectPlayer { .. }
             | Self::OpenScriptMenu(_)
             | Self::CloseScriptMenu(_)
+            | Self::AuthoritativeInventory { .. }
             | Self::Explosion(_) => OutboundLane::Reliable,
         }
     }

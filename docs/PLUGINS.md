@@ -4,9 +4,9 @@ Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
 other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
-`mc-net` provides the `0.6.0` plugin-storage, zone, and inventory-menu adapters.
-Inventory/storage transaction, colony, and villager adapters do not exist yet.
-The examples remain fail-closed where one of those adapters is required.
+`mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu, and
+inventory/storage transaction adapters. Colony and villager adapters do not
+exist yet. Their example remains fail-closed.
 
 ## Package And Manifest
 
@@ -133,15 +133,15 @@ outbox.
 Storage is durable below `world/solaris/plugin-storage-v1`, isolated by the
 host-attached plugin id, and has no legacy schema. The single storage actor has
 a 256-command queue; it permits at most 4,096 live records per plugin, 64 MiB
-of live values total, and a 128 MiB CRC-framed journal. Each successful mutation
-frame contains the admitted plugin id, request id, request fingerprint,
-transaction revision, state transition, and targeted result identity. The frame
-is appended and `sync_all`ed before memory changes. Result publication is then
-followed by a separately synced delivery-ack frame. Until that ack is replayed,
-the result remains in the durable outbox and is delivered again on startup.
-Reusing the same plugin/request identity with identical content reuses the
-original transaction and version without repeating the mutation; substituted
-content is rejected.
+of live values total, and a 128 MiB CRC-framed journal. Each successful
+standalone mutation frame contains the admitted plugin id, request id, request
+fingerprint, transaction revision, state transition, and targeted result
+identity. The frame is appended and `sync_all`ed before memory changes. Result
+publication is then followed by a separately synced delivery-ack frame. Until
+that ack is replayed, the standalone result remains in the durable outbox and
+is delivered again on startup. Reusing the same plugin/request identity with
+identical content reuses the original transaction and version without repeating
+the mutation; substituted content is rejected.
 Malformed, oversized, and checksum-invalid journals fail closed. An incomplete
 final frame is truncated only back to the verified frame prefix and synced;
 compaction writes a synced temporary journal, renames it atomically, then syncs
@@ -183,11 +183,13 @@ covers Lua admission, exact title/item/count content, stale-state rejection, a
 normal predicted client click, targeted Lua delivery, a second subscribed
 plugin proving non-delivery, and the owning plugin response.
 
-A future transaction adapter will treat each inventory/storage request as one
+The transaction adapter treats each inventory/storage request as one runtime
 commit. Positive inventory `delta` grants a resource and negative `delta`
 removes one; a delta cannot be zero or exceed 64 in magnitude. Each side must
-be non-empty and have at most 16 unique resources or storage keys. The adapter
-will commit all mutations or none.
+be non-empty and have at most 16 unique resources or storage keys. Only main
+inventory and hotbar slots participate. Unknown resources, insufficient items,
+full output inventory, a disconnected player, stale storage versions, and
+storage quota failures reject the whole request without changing either side.
 
 ```lua
 solaris.inventory_storage_transaction(player_id, request_id,
@@ -197,7 +199,23 @@ solaris.inventory_storage_transaction(player_id, request_id,
 ```
 
 Storage mutations use `operation = "cas"` or `operation = "delete"`; both use
-the same expected-version semantics as the standalone commands.
+the same expected-version semantics as the standalone commands. The storage
+actor prepares every key first, holds the canonical player-state lock while it
+appends and syncs one CRC-framed storage batch, then replaces the inventory and
+publishes one ordered reliable authoritative snapshot. Concurrent inventory
+operations therefore cannot observe or interleave half of a successful runtime
+transaction. A per-session lifetime gate makes disconnect either reject a
+captured-but-not-started request or wait for an already-started commit before
+the disconnected player state becomes saveable. Every storage record changed
+by the batch receives the same revision.
+
+The storage journal and vanilla playerdata are not yet one crash-recovery log.
+If the process dies, or `sync_all` returns an unknown outcome after a complete
+batch append, startup can replay the storage half while the last playerdata save
+still contains the old inventory. The actor fail-stops on that uncertainty and
+does not publish a guessed result. This is a documented crash-atomicity gap, not
+a runtime atomicity claim; closing it requires a player-inventory recovery intent
+in the durable transaction record.
 
 Zones are axis-aligned definitions, scoped by the host-attached plugin id:
 

@@ -18,9 +18,14 @@ pub(crate) trait ScriptStorageTransactionPrepare {
         &mut self,
         plugin_id: &str,
         mutations: &[ScriptStorageMutation],
-    ) -> Result<Self::Prepared, Self::Error>;
+    ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error>;
 
     fn commit(&mut self, prepared: Self::Prepared) -> Result<(), Self::Error>;
+}
+
+pub(crate) enum ScriptStoragePrepareOutcome<T> {
+    Prepared(T),
+    Rejected,
 }
 
 #[derive(Debug, Clone)]

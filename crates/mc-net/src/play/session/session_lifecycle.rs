@@ -17,11 +17,11 @@ use crate::login::LoggedInProfile;
 #[cfg(test)]
 use crate::play::PlayerPose;
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use tokio::sync::mpsc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 impl SessionRegistry {
     pub(crate) fn subscribe_active_sessions(&self) -> tokio::sync::watch::Receiver<usize> {
@@ -94,6 +94,7 @@ impl SessionRegistry {
                 tx: registration.tx,
                 pressure,
                 ordered_dispatch: Arc::new(OrderedDispatchState::default()),
+                script_transaction_active: Arc::new(Mutex::new(true)),
             },
         );
         {
@@ -213,11 +214,28 @@ impl SessionRegistry {
         id: SessionId,
         preserve_player_state: bool,
     ) -> Vec<VisibilityDispatch> {
+        let script_transaction_active = {
+            let inner = self.lock_inner("capture unregister script transaction gate");
+            let Some(session) = inner.sessions.get(&id) else {
+                return Vec::new();
+            };
+            Arc::clone(&session.script_transaction_active)
+        };
+        let mut script_transaction_active =
+            script_transaction_active.lock().unwrap_or_else(|poisoned| {
+                warn!(
+                    session_id = id,
+                    "script transaction gate was poisoned during unregister; recovering state"
+                );
+                poisoned.into_inner()
+            });
         let (snapshot, recipients, completed_sleep, player_save_requested) = {
             let mut inner = self.lock_inner("unregister play session");
             let Some(session) = inner.sessions.remove(&id) else {
                 return Vec::new();
             };
+            *script_transaction_active = false;
+            drop(script_transaction_active);
             inner.sleeping_sessions.remove(&id);
             inner.spectator_sessions.remove(&id);
             inner.player_hurt_resistance.remove(&id);

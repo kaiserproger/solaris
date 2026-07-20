@@ -5,17 +5,21 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundContainerSetContent, ClientboundOpenScreen, ClientboundSetTime,
-    ClientboundSystemChat, CommandNodeKind, ConfirmTeleportation, ContainerInput, GameEvent,
-    GameMode, HashedStack, HashedStackComponentHashes, MovePlayerFlags, ServerboundChat,
-    ServerboundChatCommand, ServerboundContainerClick, ServerboundMovePlayerPos, SetCenterChunk,
-    SynchronizePlayerPosition,
+    ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
+    ClientboundOpenScreen, ClientboundSetTime, ClientboundSystemChat, CommandNodeKind,
+    ConfirmTeleportation, ContainerInput, GameEvent, GameMode, HashedStack,
+    HashedStackComponentHashes, MovePlayerFlags, ServerboundChat, ServerboundChatCommand,
+    ServerboundContainerClick, ServerboundMovePlayerPos, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
 const LATENCY_SENSITIVE_FRAME_WAIT_LIMITS: FrameWaitLimits = FrameWaitLimits {
     max_skipped_frames: Some(128),
     max_skipped_bytes: Some(128 * 1024),
+};
+const LUA_TRANSACTION_FRAME_WAIT_LIMITS: FrameWaitLimits = FrameWaitLimits {
+    max_skipped_frames: Some(4096),
+    max_skipped_bytes: Some(32 * 1024 * 1024),
 };
 
 async fn start_server() -> SocketAddr {
@@ -663,6 +667,316 @@ async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() 
 }
 
 #[tokio::test]
+async fn lua_inventory_storage_transaction_commits_and_rejects_stale_storage_atomically() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("currency-shop");
+    std::fs::create_dir(&plugin).expect("create currency plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "currency-shop"
+            name = "Currency Shop"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined", "plugin.storage.cas_result", "inventory.storage_transaction.result"]
+            capabilities = ["storage", "inventory_storage_transactions"]
+            player_commands = ["purchase"]
+        "#,
+    )
+    .expect("write currency plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            player_id = nil
+            currency_key = nil
+
+            function on_player_joined(event)
+                player_id = event.player_id
+                currency_key = "currency:" .. event.player_id
+            end
+
+            function on_plugin_storage_cas_result(event)
+                if event.request_id == "seed" then
+                    solaris.inventory_storage_transaction(
+                        player_id,
+                        "purchase",
+                        {
+                            { resource = "minecraft:gold_nugget", delta = -1 },
+                            { resource = "minecraft:apple", delta = 1 }
+                        },
+                        {
+                            { operation = "cas", key = currency_key, expected_version = event.version, value = "1" }
+                        }
+                    )
+                end
+            end
+
+            function on_player_command(event)
+                if event.root == "purchase" then
+                    player_id = event.player_id
+                    currency_key = "currency:" .. event.player_id
+                    solaris.send_message(event.player_id, "purchase-received")
+                    solaris.storage_cas("seed", currency_key, nil, "2")
+                end
+            end
+
+            function on_inventory_storage_transaction_result(event)
+                solaris.send_message(
+                    player_id,
+                    "tx-result:" .. event.request_id .. ":" .. tostring(event.committed)
+                )
+                if event.request_id == "purchase" then
+                    solaris.inventory_storage_transaction(
+                        player_id,
+                        "stale",
+                        {
+                            { resource = "minecraft:gold_nugget", delta = -1 },
+                            { resource = "minecraft:apple", delta = 1 }
+                        },
+                        {
+                            { operation = "cas", key = currency_key, expected_version = 1, value = "0" }
+                        }
+                    )
+                end
+            end
+        "#,
+    )
+    .expect("write currency plugin source");
+
+    let observer = plugins.path().join("transaction-observer");
+    std::fs::create_dir(&observer).expect("create transaction observer directory");
+    std::fs::write(
+        observer.join("plugin.toml"),
+        r#"
+            id = "transaction-observer"
+            name = "Transaction Observer"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["inventory.storage_transaction.result"]
+            player_commands = ["transaction-fence"]
+        "#,
+    )
+    .expect("write transaction observer manifest");
+    std::fs::write(
+        observer.join("main.lua"),
+        r#"
+            function on_inventory_storage_transaction_result(event)
+                solaris.send_message(1, "leaked-result:" .. event.request_id)
+            end
+
+            function on_player_command(event)
+                if event.root == "transaction-fence" then
+                    solaris.send_message(event.player_id, "transaction-fence")
+                end
+            end
+        "#,
+    )
+    .expect("write transaction observer source");
+
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let gold_nugget_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:gold_nugget").unwrap())
+        .expect("embedded gold nugget item");
+    let apple_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
+        .expect("embedded apple item");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua inventory storage transaction wire test".into(),
+        max_players: 1,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "CurrencyPlayer")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let commands: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let roots = commands.nodes[commands.root_index as usize]
+        .children
+        .iter()
+        .filter_map(|index| match &commands.nodes[*index as usize].kind {
+            CommandNodeKind::Literal(root) => Some(root.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(roots.contains(&"give"));
+    assert!(roots.contains(&"purchase"));
+    assert!(roots.contains(&"transaction-fence"));
+
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    let initial = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundContainerSetContent::ID,
+            Duration::from_secs(5),
+            LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("initial inventory content frame");
+    let initial = ClientboundContainerSetContent::decode(&mut initial.frame.body.clone())
+        .expect("decode initial inventory content");
+    assert_eq!(initial.container_id, 0);
+    assert_eq!(initial.state_id, 1);
+    assert_eq!(initial.items.len(), 46);
+    assert!(initial.items.iter().all(|stack| stack.is_empty()));
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "give minecraft:gold_nugget 2".to_owned(),
+        })
+        .await
+        .expect("give currency through server command");
+    let given = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundContainerSetSlot::ID,
+            Duration::from_secs(5),
+            LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("give inventory slot frame");
+    let given = ClientboundContainerSetSlot::decode(&mut given.frame.body.clone())
+        .expect("decode give inventory slot");
+    assert_eq!(given.container_id, 0);
+    assert_eq!(given.slot, 9);
+    assert_eq!(given.state_id, 2);
+    assert_eq!(given.item_stack.item_id, gold_nugget_id);
+    assert_eq!(given.item_stack.count, 2);
+
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "purchase".to_owned(),
+        })
+        .await
+        .expect("issue purchase transaction command");
+    wait_for_lua_transaction_result(&mut client, "purchase-received").await;
+    let committed = wait_for_lua_transaction_inventory_snapshot(&mut client).await;
+    wait_for_lua_transaction_result(&mut client, "tx-result:purchase:true").await;
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "transaction-fence".to_owned(),
+        })
+        .await
+        .expect("fence targeted purchase result");
+    let purchase_fence_messages = wait_for_lua_transaction_fence(&mut client).await;
+    let stale_result_already_seen = purchase_fence_messages
+        .iter()
+        .any(|message| message == "tx-result:stale:false");
+    assert_eq!(committed.container_id, 0);
+    assert_eq!(committed.state_id, given.state_id.wrapping_add(1));
+    assert_eq!(committed.items[9].item_id, gold_nugget_id);
+    assert_eq!(committed.items[9].count, 1);
+    assert_eq!(committed.items[10].item_id, apple_id);
+    assert_eq!(committed.items[10].count, 1);
+    assert!(committed.items[11..45].iter().all(|stack| stack.is_empty()));
+    assert!(committed.items[0..9].iter().all(|stack| stack.is_empty()));
+    assert!(committed.items[45].is_empty());
+
+    if !stale_result_already_seen {
+        wait_for_lua_transaction_result(&mut client, "tx-result:stale:false").await;
+    }
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "transaction-fence".to_owned(),
+        })
+        .await
+        .expect("fence targeted stale result");
+    wait_for_lua_transaction_fence(&mut client).await;
+    let rejected = request_player_inventory_resync(&mut client, committed.state_id).await;
+    assert_eq!(rejected.container_id, 0);
+    assert_eq!(rejected.state_id, committed.state_id);
+    assert_eq!(rejected.items, committed.items);
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+async fn request_player_inventory_resync(
+    client: &mut Client,
+    state_id: i32,
+) -> ClientboundContainerSetContent {
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: 0,
+            state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(0, HashedStack::empty())],
+            carried_item: HashedStack::empty(),
+        })
+        .await
+        .expect("request player inventory resync");
+    let outcome = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundContainerSetContent::ID,
+            Duration::from_secs(5),
+            LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("player inventory resync frame");
+    ClientboundContainerSetContent::decode(&mut outcome.frame.body.clone())
+        .expect("decode player inventory resync")
+}
+
+#[tokio::test]
 async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operators() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("admin-day");
@@ -975,11 +1289,74 @@ async fn client_receives_continuing_world_time_updates() {
 }
 
 async fn next_system_chat_text(client: &mut Client) -> String {
+    next_system_chat_text_with_limits(client, LATENCY_SENSITIVE_FRAME_WAIT_LIMITS).await
+}
+
+async fn next_lua_transaction_system_chat_text(client: &mut Client) -> String {
+    next_system_chat_text_with_limits(client, LUA_TRANSACTION_FRAME_WAIT_LIMITS).await
+}
+
+async fn wait_for_lua_transaction_result(client: &mut Client, expected: &str) {
+    loop {
+        let message = next_lua_transaction_system_chat_text(client).await;
+        assert_no_lua_transaction_leak(&message);
+        if message == expected {
+            return;
+        }
+    }
+}
+
+async fn wait_for_lua_transaction_inventory_snapshot(
+    client: &mut Client,
+) -> ClientboundContainerSetContent {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let mut frame = client.read_frame().await.expect("transaction wire frame");
+            if frame.id == ClientboundContainerSetContent::ID {
+                return ClientboundContainerSetContent::decode(&mut frame.body)
+                    .expect("decode transaction inventory snapshot");
+            }
+            if frame.id == ClientboundSystemChat::ID {
+                let packet = ClientboundSystemChat::decode(&mut frame.body)
+                    .expect("decode transaction system chat");
+                let message = text_component_text(&packet);
+                assert_no_lua_transaction_leak(&message);
+                assert_ne!(
+                    message, "tx-result:purchase:true",
+                    "transaction result reached the client before its authoritative inventory snapshot"
+                );
+            }
+        }
+    })
+    .await
+    .expect("authoritative transaction inventory snapshot timeout")
+}
+
+async fn wait_for_lua_transaction_fence(client: &mut Client) -> Vec<String> {
+    let mut messages = Vec::new();
+    loop {
+        let message = next_lua_transaction_system_chat_text(client).await;
+        assert_no_lua_transaction_leak(&message);
+        if message == "transaction-fence" {
+            return messages;
+        }
+        messages.push(message);
+    }
+}
+
+fn assert_no_lua_transaction_leak(message: &str) {
+    assert!(
+        !message.starts_with("leaked-result:"),
+        "targeted inventory transaction result leaked to observer plugin: {message}"
+    );
+}
+
+async fn next_system_chat_text_with_limits(client: &mut Client, limits: FrameWaitLimits) -> String {
     let outcome = client
         .wait_for_frame_id_with_timeout_and_limits(
             ClientboundSystemChat::ID,
             Duration::from_secs(5),
-            LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+            limits,
         )
         .await
         .expect("system chat frame");

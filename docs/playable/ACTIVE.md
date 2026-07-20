@@ -112,7 +112,14 @@ replacement-readiness claims.
   content, stale-state rejection, a normal predicted primary click, and the
   plugin's response. A second subscribed plugin plus a later targeted command
   fence proves `inventory.menu.clicked` did not leak beyond the menu owner.
-  Atomic inventory/storage transactions remain the next production slice.
+  Atomic inventory/storage transactions now route through the storage actor.
+  A disk-backed wire test gives a player currency, commits a purchase and one
+  ledger CAS, observes the authoritative inventory, then proves a stale CAS
+  rejects without another inventory mutation or leaking its targeted result.
+  Storage unit coverage proves multi-key restart replay, one batch revision,
+  stale/quota rejection, definite write failure, and unknown-sync replay. The
+  runtime transaction excludes concurrent player inventory mutation, but the
+  plugin WAL and vanilla playerdata are not yet one crash-recovery log.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 

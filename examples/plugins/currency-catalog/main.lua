@@ -1,9 +1,7 @@
 -- Script API 0.6 acceptance fixture.
 --
--- FAIL-CLOSED PRODUCTION GAP: mc-net currently has no adapter for the atomic
--- InventoryStorageTransaction or inventory.storage_transaction.result. Menu
--- and zone commands/events are live. The fixture will not mutate its ledger
--- without an exact targeted transaction result.
+-- The catalog mutates currency, purchased items, and its ledger only after the
+-- server accepts one inventory/storage transaction.
 
 local config = {
     shop_id = "market",

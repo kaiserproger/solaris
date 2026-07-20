@@ -1,4 +1,4 @@
-use mc_script::{LuaHostConfig, ScriptCommand, ScriptEvent, start_lua_host};
+use mc_script::{LuaHostConfig, ScriptCommand, ScriptEvent, ScriptStorageMutation, start_lua_host};
 
 use super::storage::{PluginStorage, StorageFaultPoint, run_storage_actor_for_test};
 use super::{ScriptRouter, ScriptRouterExit};
@@ -62,6 +62,147 @@ fn storage_rejects_absent_stale_and_cross_plugin_mutations() {
     assert_eq!(
         storage.get("shop", "balance"),
         Some(("1".to_owned(), version))
+    );
+}
+
+#[test]
+fn storage_batch_commits_every_key_at_one_revision_and_restarts() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(temp.path()).unwrap();
+    let first = storage
+        .compare_and_swap("shop", "first", None, "old-first")
+        .unwrap()
+        .unwrap();
+    let second = storage
+        .compare_and_swap("shop", "second", None, "old-second")
+        .unwrap()
+        .unwrap();
+    let mutations = vec![
+        ScriptStorageMutation::compare_and_swap("first", Some(first), "new-first").unwrap(),
+        ScriptStorageMutation::delete("second", Some(second)).unwrap(),
+        ScriptStorageMutation::compare_and_swap("third", None, "new-third").unwrap(),
+    ];
+
+    assert!(storage.storage_batch_for_test("shop", &mutations).unwrap());
+    assert_eq!(
+        storage.get("shop", "first"),
+        Some(("new-first".to_owned(), 3))
+    );
+    assert_eq!(storage.get("shop", "second"), None);
+    assert_eq!(
+        storage.get("shop", "third"),
+        Some(("new-third".to_owned(), 3))
+    );
+    drop(storage);
+
+    let storage = PluginStorage::open(temp.path()).unwrap();
+    assert_eq!(
+        storage.get("shop", "first"),
+        Some(("new-first".to_owned(), 3))
+    );
+    assert_eq!(storage.get("shop", "second"), None);
+    assert_eq!(
+        storage.get("shop", "third"),
+        Some(("new-third".to_owned(), 3))
+    );
+}
+
+#[test]
+fn storage_batch_rejects_stale_or_over_quota_without_partial_mutation() {
+    let absent_delete = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(absent_delete.path()).unwrap();
+    let mutations = vec![
+        ScriptStorageMutation::compare_and_swap("would-create", None, "new").unwrap(),
+        ScriptStorageMutation::delete("absent", None).unwrap(),
+    ];
+    assert!(!storage.storage_batch_for_test("shop", &mutations).unwrap());
+    assert_eq!(storage.get("shop", "would-create"), None);
+
+    let stale = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(stale.path()).unwrap();
+    let first = storage
+        .compare_and_swap("shop", "first", None, "old-first")
+        .unwrap()
+        .unwrap();
+    let second = storage
+        .compare_and_swap("shop", "second", None, "old-second")
+        .unwrap()
+        .unwrap();
+    let mutations = vec![
+        ScriptStorageMutation::compare_and_swap("first", Some(first), "new-first").unwrap(),
+        ScriptStorageMutation::delete("second", Some(second + 1)).unwrap(),
+    ];
+    assert!(!storage.storage_batch_for_test("shop", &mutations).unwrap());
+    assert_eq!(
+        storage.get("shop", "first"),
+        Some(("old-first".to_owned(), first))
+    );
+    assert_eq!(
+        storage.get("shop", "second"),
+        Some(("old-second".to_owned(), second))
+    );
+
+    let quota = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(quota.path()).unwrap();
+    storage.fill_plugin_record_quota_for_test("shop");
+    let mutations = vec![
+        ScriptStorageMutation::compare_and_swap("existing-0", Some(1), "changed").unwrap(),
+        ScriptStorageMutation::compare_and_swap("one-too-many", None, "new").unwrap(),
+    ];
+    assert!(storage.storage_batch_for_test("shop", &mutations).is_err());
+    assert_eq!(storage.get("shop", "existing-0"), Some(("x".to_owned(), 1)));
+    assert_eq!(storage.get("shop", "one-too-many"), None);
+}
+
+#[test]
+fn storage_batch_write_failure_keeps_memory_and_disk_unchanged() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(temp.path()).unwrap();
+    let version = storage
+        .compare_and_swap("shop", "balance", None, "old")
+        .unwrap()
+        .unwrap();
+    storage.inject_fault_for_test(StorageFaultPoint::Write);
+    let mutations =
+        vec![ScriptStorageMutation::compare_and_swap("balance", Some(version), "new").unwrap()];
+
+    assert!(storage.storage_batch_for_test("shop", &mutations).is_err());
+    assert_eq!(
+        storage.get("shop", "balance"),
+        Some(("old".to_owned(), version))
+    );
+    drop(storage);
+
+    let storage = PluginStorage::open(temp.path()).unwrap();
+    assert_eq!(
+        storage.get("shop", "balance"),
+        Some(("old".to_owned(), version))
+    );
+}
+
+#[test]
+fn storage_batch_sync_unknown_replays_only_the_complete_crc_frame() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut storage = PluginStorage::open(temp.path()).unwrap();
+    let version = storage
+        .compare_and_swap("shop", "balance", None, "old")
+        .unwrap()
+        .unwrap();
+    storage.inject_fault_for_test(StorageFaultPoint::Sync);
+    let mutations =
+        vec![ScriptStorageMutation::compare_and_swap("balance", Some(version), "new").unwrap()];
+
+    assert!(storage.storage_batch_for_test("shop", &mutations).is_err());
+    assert_eq!(
+        storage.get("shop", "balance"),
+        Some(("old".to_owned(), version))
+    );
+    drop(storage);
+
+    let storage = PluginStorage::open(temp.path()).unwrap();
+    assert_eq!(
+        storage.get("shop", "balance"),
+        Some(("new".to_owned(), version + 1))
     );
 }
 
@@ -548,6 +689,69 @@ end
     assert!(matches!(
         admitted.request(),
         ScriptCommand::BroadcastChatMessage { message } if message == "read:unavailable"
+    ));
+
+    drop(router);
+    drop(boundary);
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn router_rejects_inventory_transaction_without_persistent_storage() {
+    let plugins = tempfile::tempdir().unwrap();
+    let plugin = plugins.path().join("no-world-transaction");
+    std::fs::create_dir(&plugin).unwrap();
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"id = "no-world-transaction"
+name = "No World Transaction"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started", "inventory.storage_transaction.result"]
+capabilities = ["inventory_storage_transactions"]
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+function on_server_started(_event)
+    solaris.inventory_storage_transaction(
+        1,
+        "purchase",
+        { { resource = "minecraft:apple", delta = 1 } },
+        { { operation = "cas", key = "balance", expected_version = nil, value = "1" } }
+    )
+end
+
+function on_inventory_storage_transaction_result(event)
+    solaris.broadcast(event.request_id .. ":" .. tostring(event.committed))
+end
+"#,
+    )
+    .unwrap();
+    let (boundary, host) = start_lua_host(LuaHostConfig::new(plugins.path())).unwrap();
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .unwrap();
+    let command = boundary.recv_command().await.unwrap();
+    let admitted = boundary.accept_host_command(command).unwrap();
+    let router = ScriptRouter::new(ScriptEventSink::new(boundary.clone()), None);
+
+    assert_eq!(
+        router
+            .route_storage_admitted(admitted, &ShutdownHandle::default())
+            .await,
+        ScriptRouterExit::Continue
+    );
+    let command = boundary.recv_command().await.unwrap();
+    let admitted = boundary.accept_host_command(command).unwrap();
+    assert!(matches!(
+        admitted.request(),
+        ScriptCommand::BroadcastChatMessage { message } if message == "purchase:false"
     ));
 
     drop(router);

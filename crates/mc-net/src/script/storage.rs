@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use mc_script::{
     AdmittedScriptCommand, ScriptCommand, ScriptEvent, ScriptPluginStorageCompareAndSwapRequest,
-    ScriptPluginStorageDeleteRequest, ScriptPluginStorageFailure,
+    ScriptPluginStorageDeleteRequest, ScriptPluginStorageFailure, ScriptStorageMutation,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use super::events::{
     TargetedEventDelivery, deliver_required_targeted_event, deliver_targeted_event,
 };
+use crate::play::{ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare, SessionRegistry};
 use crate::server::{ScriptEventSink, ShutdownHandle};
 
 const STORAGE_DIRECTORY: &str = "solaris/plugin-storage-v1";
@@ -27,12 +28,14 @@ const MAX_RECORDS_PER_PLUGIN: usize = 4_096;
 const MAX_LIVE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_JOURNAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 8 * 1024;
+const MAX_TRANSACTION_FRAME_BYTES: usize = 80 * 1024;
 const OP_SNAPSHOT_RESET: u8 = 3;
 const OP_SNAPSHOT_SET: u8 = 4;
 const OP_DURABLE_CAS: u8 = 5;
 const OP_DURABLE_DELETE: u8 = 6;
 const OP_RESULT_DELIVERED: u8 = 7;
 const OP_SNAPSHOT_RESULT: u8 = 8;
+const OP_STORAGE_BATCH: u8 = 9;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -88,6 +91,47 @@ struct DurableMutationResult {
     key: String,
     mutation: DurableMutationKind,
     delivered: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum DurableStorageBatchMutation {
+    CompareAndSwap {
+        key: String,
+        expected_version: Option<u64>,
+        value: String,
+    },
+    Delete {
+        key: String,
+        expected_version: Option<u64>,
+    },
+}
+
+impl DurableStorageBatchMutation {
+    fn key(&self) -> &str {
+        match self {
+            Self::CompareAndSwap { key, .. } | Self::Delete { key, .. } => key,
+        }
+    }
+
+    const fn expected_version(&self) -> Option<u64> {
+        match self {
+            Self::CompareAndSwap {
+                expected_version, ..
+            }
+            | Self::Delete {
+                expected_version, ..
+            } => *expected_version,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedStorageBatch {
+    transaction_id: u64,
+    plugin_id: String,
+    mutations: Vec<DurableStorageBatchMutation>,
 }
 
 impl DurableMutationResult {
@@ -273,6 +317,21 @@ impl PluginStorage {
     }
 
     #[cfg(test)]
+    pub(super) fn storage_batch_for_test(
+        &mut self,
+        plugin_id: &str,
+        mutations: &[ScriptStorageMutation],
+    ) -> Result<bool, PluginStorageMutationError> {
+        match self.prepare_batch(plugin_id, mutations)? {
+            ScriptStoragePrepareOutcome::Prepared(batch) => {
+                self.commit_batch(batch)?;
+                Ok(true)
+            }
+            ScriptStoragePrepareOutcome::Rejected => Ok(false),
+        }
+    }
+
+    #[cfg(test)]
     pub(super) fn inject_fault_for_test(&mut self, fault: StorageFaultPoint) {
         self.fault = Some(fault);
     }
@@ -372,6 +431,170 @@ impl PluginStorage {
         self.install_durable_mutation(result.clone())
             .expect("validated durable delete must install");
         Ok(DurableMutationCommit::Committed(result))
+    }
+
+    fn prepare_batch(
+        &mut self,
+        plugin_id: &str,
+        mutations: &[ScriptStorageMutation],
+    ) -> Result<ScriptStoragePrepareOutcome<PreparedStorageBatch>, PluginStorageMutationError> {
+        let transaction_id = self
+            .revision
+            .checked_add(1)
+            .ok_or(PluginStorageMutationError::RevisionOverflow)?;
+        let mutations = mutations
+            .iter()
+            .map(|mutation| match mutation {
+                ScriptStorageMutation::CompareAndSwap {
+                    key,
+                    expected_version,
+                    value,
+                } => DurableStorageBatchMutation::CompareAndSwap {
+                    key: key.clone(),
+                    expected_version: *expected_version,
+                    value: value.clone(),
+                },
+                ScriptStorageMutation::Delete {
+                    key,
+                    expected_version,
+                } => DurableStorageBatchMutation::Delete {
+                    key: key.clone(),
+                    expected_version: *expected_version,
+                },
+                _ => unreachable!("validated storage mutation variant"),
+            })
+            .collect::<Vec<_>>();
+        let batch = PreparedStorageBatch {
+            transaction_id,
+            plugin_id: plugin_id.to_owned(),
+            mutations,
+        };
+        if !self.batch_preconditions_match(&batch) {
+            return Ok(ScriptStoragePrepareOutcome::Rejected);
+        }
+        self.ensure_batch_quota(&batch)?;
+        let payload = encode_storage_batch(&batch)?;
+        let frame = frame(&payload);
+        self.compact_before_append_if_needed(frame.len())?;
+        Ok(ScriptStoragePrepareOutcome::Prepared(batch))
+    }
+
+    fn commit_batch(
+        &mut self,
+        batch: PreparedStorageBatch,
+    ) -> Result<(), PluginStorageMutationError> {
+        let payload = encode_storage_batch(&batch)?;
+        self.append_frame(&frame(&payload), false)?;
+        self.install_storage_batch(batch)
+            .expect("prepared storage batch must install after durable append");
+        Ok(())
+    }
+
+    fn batch_preconditions_match(&self, batch: &PreparedStorageBatch) -> bool {
+        batch.mutations.iter().all(|mutation| {
+            let current_version = self
+                .records
+                .get(&(batch.plugin_id.clone(), mutation.key().to_owned()))
+                .map(|record| record.version);
+            match mutation {
+                DurableStorageBatchMutation::CompareAndSwap { .. } => {
+                    current_version == mutation.expected_version()
+                }
+                DurableStorageBatchMutation::Delete { .. } => {
+                    current_version.is_some() && current_version == mutation.expected_version()
+                }
+            }
+        })
+    }
+
+    fn ensure_batch_quota(
+        &self,
+        batch: &PreparedStorageBatch,
+    ) -> Result<(), PluginStorageMutationError> {
+        let mut record_count = self
+            .records
+            .keys()
+            .filter(|(owner, _)| owner == &batch.plugin_id)
+            .count();
+        let mut live_bytes = self.live_bytes;
+        for mutation in &batch.mutations {
+            let entry = (batch.plugin_id.clone(), mutation.key().to_owned());
+            let old_value_bytes = self
+                .records
+                .get(&entry)
+                .map_or(0, |record| record.value.len());
+            match mutation {
+                DurableStorageBatchMutation::CompareAndSwap { value, .. } => {
+                    if !self.records.contains_key(&entry) {
+                        record_count = record_count
+                            .checked_add(1)
+                            .ok_or(PluginStorageMutationError::QuotaExceeded)?;
+                    }
+                    live_bytes = live_bytes
+                        .checked_sub(old_value_bytes)
+                        .and_then(|bytes| bytes.checked_add(value.len()))
+                        .ok_or(PluginStorageMutationError::QuotaExceeded)?;
+                }
+                DurableStorageBatchMutation::Delete { .. } => {
+                    record_count = record_count
+                        .checked_sub(1)
+                        .ok_or(PluginStorageMutationError::QuotaExceeded)?;
+                    live_bytes = live_bytes
+                        .checked_sub(old_value_bytes)
+                        .ok_or(PluginStorageMutationError::QuotaExceeded)?;
+                }
+            }
+        }
+        if record_count > MAX_RECORDS_PER_PLUGIN || live_bytes > MAX_LIVE_BYTES {
+            return Err(PluginStorageMutationError::QuotaExceeded);
+        }
+        Ok(())
+    }
+
+    fn install_storage_batch(
+        &mut self,
+        batch: PreparedStorageBatch,
+    ) -> Result<(), PluginStorageStartError> {
+        validate_storage_batch(&batch)?;
+        if batch.transaction_id
+            != self
+                .revision
+                .checked_add(1)
+                .ok_or(PluginStorageStartError::Malformed("revision overflow"))?
+            || !self.batch_preconditions_match(&batch)
+        {
+            return Err(PluginStorageStartError::Malformed("stale storage batch"));
+        }
+        self.ensure_batch_quota(&batch)
+            .map_err(|_| PluginStorageStartError::LiveQuotaExceeded)?;
+        for mutation in batch.mutations {
+            let entry = (batch.plugin_id.clone(), mutation.key().to_owned());
+            match mutation {
+                DurableStorageBatchMutation::CompareAndSwap { value, .. } => {
+                    let old_value_bytes = self
+                        .records
+                        .get(&entry)
+                        .map_or(0, |record| record.value.len());
+                    self.live_bytes = self.live_bytes - old_value_bytes + value.len();
+                    self.records.insert(
+                        entry,
+                        StoredRecord {
+                            value,
+                            version: batch.transaction_id,
+                        },
+                    );
+                }
+                DurableStorageBatchMutation::Delete { .. } => {
+                    let removed = self
+                        .records
+                        .remove(&entry)
+                        .expect("batch delete was validated");
+                    self.live_bytes -= removed.value.len();
+                }
+            }
+        }
+        self.revision = batch.transaction_id;
+        Ok(())
     }
 
     fn existing_result(
@@ -496,7 +719,11 @@ impl PluginStorage {
             let length = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
             let length = usize::try_from(length)
                 .map_err(|_| PluginStorageStartError::Malformed("frame length"))?;
-            if length == 0 || length > MAX_FRAME_BYTES {
+            if length == 0
+                || length > MAX_TRANSACTION_FRAME_BYTES
+                || (length > MAX_FRAME_BYTES
+                    && bytes.get(offset + 4).copied() != Some(OP_STORAGE_BATCH))
+            {
                 return Err(PluginStorageStartError::Malformed("frame length"));
             }
             let frame_end = offset
@@ -613,6 +840,11 @@ impl PluginStorage {
                     ));
                 }
                 Ok(true)
+            }
+            OP_STORAGE_BATCH => {
+                let batch = decode_storage_batch(rest)?;
+                self.install_storage_batch(batch)?;
+                Ok(false)
             }
             _ => Err(PluginStorageStartError::Malformed("frame operation")),
         }
@@ -826,6 +1058,69 @@ impl PluginStorage {
     }
 }
 
+impl ScriptStorageTransactionPrepare for PluginStorage {
+    type Prepared = PreparedStorageBatch;
+    type Error = PluginStorageMutationError;
+
+    fn prepare(
+        &mut self,
+        plugin_id: &str,
+        mutations: &[ScriptStorageMutation],
+    ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error> {
+        self.prepare_batch(plugin_id, mutations)
+    }
+
+    fn commit(&mut self, prepared: Self::Prepared) -> Result<(), Self::Error> {
+        self.commit_batch(prepared)
+    }
+}
+
+fn encode_storage_batch(
+    batch: &PreparedStorageBatch,
+) -> Result<Vec<u8>, PluginStorageMutationError> {
+    validate_storage_batch(batch).map_err(|_| PluginStorageMutationError::QuotaExceeded)?;
+    let mut payload = vec![OP_STORAGE_BATCH];
+    payload.extend_from_slice(
+        &serde_json::to_vec(batch)
+            .map_err(|error| PluginStorageMutationError::Io(std::io::Error::other(error)))?,
+    );
+    if payload.len() > MAX_TRANSACTION_FRAME_BYTES {
+        return Err(PluginStorageMutationError::QuotaExceeded);
+    }
+    Ok(payload)
+}
+
+fn decode_storage_batch(payload: &[u8]) -> Result<PreparedStorageBatch, PluginStorageStartError> {
+    let batch = serde_json::from_slice(payload)
+        .map_err(|_| PluginStorageStartError::Malformed("storage batch"))?;
+    validate_storage_batch(&batch)?;
+    Ok(batch)
+}
+
+fn validate_storage_batch(batch: &PreparedStorageBatch) -> Result<(), PluginStorageStartError> {
+    validate_delete_fields(&batch.plugin_id, "batch")?;
+    if batch.transaction_id == 0 || batch.mutations.is_empty() || batch.mutations.len() > 16 {
+        return Err(PluginStorageStartError::Malformed("storage batch identity"));
+    }
+    let mut keys = std::collections::BTreeSet::new();
+    for mutation in &batch.mutations {
+        if !keys.insert(mutation.key()) {
+            return Err(PluginStorageStartError::Malformed(
+                "duplicate storage batch key",
+            ));
+        }
+        match mutation {
+            DurableStorageBatchMutation::CompareAndSwap { key, value, .. } => {
+                validate_record_fields(&batch.plugin_id, key, value)?;
+            }
+            DurableStorageBatchMutation::Delete { key, .. } => {
+                validate_delete_fields(&batch.plugin_id, key)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn decode_durable_result(payload: &[u8]) -> Result<DurableMutationResult, PluginStorageStartError> {
     let result = serde_json::from_slice(payload)
         .map_err(|_| PluginStorageStartError::Malformed("durable result"))?;
@@ -983,11 +1278,23 @@ impl Drop for StorageActorStopGuard {
     }
 }
 
+struct StorageActorContext {
+    events: ScriptEventSink,
+    shutdown: ShutdownHandle,
+    sessions: Arc<SessionRegistry>,
+    items: Arc<mc_data::items::ItemRegistry>,
+    item_facts: Arc<mc_data::item_components::ItemFactsTable>,
+    stopped: Arc<StorageActorStop>,
+}
+
 impl PluginStorageHandle {
     pub(crate) fn start(
         world_root: &Path,
         events: ScriptEventSink,
         shutdown: ShutdownHandle,
+        sessions: Arc<SessionRegistry>,
+        items: Arc<mc_data::items::ItemRegistry>,
+        item_facts: Arc<mc_data::item_components::ItemFactsTable>,
     ) -> Result<Self, PluginStorageStartError> {
         let storage = PluginStorage::open(world_root)?;
         let (commands, receiver) = mpsc::channel(STORAGE_QUEUE_CAPACITY);
@@ -999,9 +1306,14 @@ impl PluginStorageHandle {
         tokio::spawn(run_storage_actor(
             storage,
             receiver,
-            events,
-            shutdown,
-            Arc::clone(&stopped),
+            StorageActorContext {
+                events,
+                shutdown,
+                sessions,
+                items,
+                item_facts,
+                stopped: Arc::clone(&stopped),
+            },
         ));
         Ok(Self { commands, stopped })
     }
@@ -1047,10 +1359,16 @@ impl PluginStorageHandle {
 async fn run_storage_actor(
     mut storage: PluginStorage,
     mut commands: mpsc::Receiver<AdmittedScriptCommand>,
-    events: ScriptEventSink,
-    shutdown: ShutdownHandle,
-    stopped: Arc<StorageActorStop>,
+    context: StorageActorContext,
 ) {
+    let StorageActorContext {
+        events,
+        shutdown,
+        sessions,
+        items,
+        item_facts,
+        stopped,
+    } = context;
     let _stopped = StorageActorStopGuard(Arc::clone(&stopped));
     if !replay_pending_results(&mut storage, &events, &shutdown).await {
         stopped.mark_failed();
@@ -1221,6 +1539,53 @@ async fn run_storage_actor(
                 }
                 TargetedEventDelivery::Delivered
             }
+            ScriptCommand::InventoryStorageTransaction { transaction } => {
+                let outcome = sessions.commit_script_inventory_storage_transaction(
+                    command.plugin_id(),
+                    transaction,
+                    &items,
+                    &item_facts,
+                    &mut storage,
+                );
+                let event = match outcome {
+                    Ok(committed) => command.inventory_storage_transaction_result(committed),
+                    Err(
+                        error @ (PluginStorageMutationError::RevisionOverflow
+                        | PluginStorageMutationError::QuotaExceeded
+                        | PluginStorageMutationError::RequestIdentityConflict),
+                    ) => {
+                        debug!(?error, "script inventory-storage transaction rejected");
+                        command.inventory_storage_transaction_result(false)
+                    }
+                    Err(error @ PluginStorageMutationError::Io(_)) => {
+                        warn!(
+                            ?error,
+                            "script transaction durability failed; stopping storage actor"
+                        );
+                        fail_storage_actor(command, &mut commands, &events, &stopped).await;
+                        return;
+                    }
+                    Err(error @ PluginStorageMutationError::DurabilityUnknown(_)) => {
+                        warn!(
+                            ?error,
+                            "script transaction durability outcome is unknown; stopping storage actor"
+                        );
+                        stopped.mark_failed();
+                        fail_queued_storage_commands(&mut commands, &events).await;
+                        return;
+                    }
+                };
+                match event {
+                    Ok(event) => deliver_targeted_event(&events, event, &shutdown).await,
+                    Err(error) => {
+                        warn!(
+                            ?error,
+                            "script inventory-storage result construction rejected"
+                        );
+                        return;
+                    }
+                }
+            }
             _ => {
                 debug!("non-storage admitted command reached plugin storage actor");
                 return;
@@ -1273,18 +1638,17 @@ async fn fail_storage_actor(
 
     let mut delivery_open = deliver_storage_failure(events, failed_command).await;
     while let Some(command) = commands.recv().await {
-        let event = match command
-            .plugin_storage_failure_result(ScriptPluginStorageFailure::DurabilityFailed)
-        {
-            Ok(event) => event,
-            Err(error) => {
-                warn!(
-                    ?error,
-                    "admitted storage failure result construction rejected"
-                );
-                continue;
-            }
-        };
+        let event =
+            match storage_failure_event(command, ScriptPluginStorageFailure::DurabilityFailed) {
+                Ok(event) => event,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "admitted storage failure result construction rejected"
+                    );
+                    continue;
+                }
+            };
         if delivery_open {
             delivery_open = matches!(
                 deliver_required_targeted_event(events, event).await,
@@ -1301,18 +1665,17 @@ async fn fail_queued_storage_commands(
     commands.close();
     let mut delivery_open = true;
     while let Some(command) = commands.recv().await {
-        let event = match command
-            .plugin_storage_failure_result(ScriptPluginStorageFailure::DurabilityFailed)
-        {
-            Ok(event) => event,
-            Err(error) => {
-                warn!(
-                    ?error,
-                    "admitted storage failure result construction rejected"
-                );
-                continue;
-            }
-        };
+        let event =
+            match storage_failure_event(command, ScriptPluginStorageFailure::DurabilityFailed) {
+                Ok(event) => event,
+                Err(error) => {
+                    warn!(
+                        ?error,
+                        "admitted storage failure result construction rejected"
+                    );
+                    continue;
+                }
+            };
         if delivery_open {
             delivery_open = matches!(
                 deliver_required_targeted_event(events, event).await,
@@ -1323,21 +1686,34 @@ async fn fail_queued_storage_commands(
 }
 
 async fn deliver_storage_failure(events: &ScriptEventSink, command: AdmittedScriptCommand) -> bool {
-    let event =
-        match command.plugin_storage_failure_result(ScriptPluginStorageFailure::DurabilityFailed) {
-            Ok(event) => event,
-            Err(error) => {
-                warn!(
-                    ?error,
-                    "admitted storage failure result construction rejected"
-                );
-                return false;
-            }
-        };
+    let event = match storage_failure_event(command, ScriptPluginStorageFailure::DurabilityFailed) {
+        Ok(event) => event,
+        Err(error) => {
+            warn!(
+                ?error,
+                "admitted storage failure result construction rejected"
+            );
+            return false;
+        }
+    };
     matches!(
         deliver_required_targeted_event(events, event).await,
         TargetedEventDelivery::Delivered
     )
+}
+
+pub(super) fn storage_failure_event(
+    command: AdmittedScriptCommand,
+    failure: ScriptPluginStorageFailure,
+) -> Result<ScriptEvent, mc_script::ScriptDtoError> {
+    if matches!(
+        command.request(),
+        ScriptCommand::InventoryStorageTransaction { .. }
+    ) {
+        command.inventory_storage_transaction_result(false)
+    } else {
+        command.plugin_storage_failure_result(failure)
+    }
 }
 
 #[cfg(test)]
@@ -1359,5 +1735,17 @@ pub(super) async fn run_storage_actor_for_test(
         stopped: AtomicBool::new(false),
         notify: tokio::sync::Notify::new(),
     });
-    run_storage_actor(storage, receiver, events, shutdown, stopped).await;
+    run_storage_actor(
+        storage,
+        receiver,
+        StorageActorContext {
+            events,
+            shutdown,
+            sessions: Arc::new(SessionRegistry::new()),
+            items: Arc::new(mc_data::items::ItemRegistry::default()),
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            stopped,
+        },
+    )
+    .await;
 }

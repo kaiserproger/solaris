@@ -7,9 +7,11 @@ use mc_script::{
     ScriptStorageMutation,
 };
 
+use super::SessionRegistry;
 use super::inventory::PlayerInventory;
 use super::script_inventory_transaction::{
-    ScriptInventoryPlanError, plan_script_inventory_transaction,
+    ScriptInventoryPlanError, ScriptStoragePrepareOutcome, ScriptStorageTransactionPrepare,
+    plan_script_inventory_transaction,
 };
 
 fn transaction(deltas: Vec<ScriptInventoryResourceDelta>) -> ScriptInventoryStorageTransaction {
@@ -20,6 +22,25 @@ fn transaction(deltas: Vec<ScriptInventoryResourceDelta>) -> ScriptInventoryStor
         vec![ScriptStorageMutation::compare_and_swap("coins:7", Some(1), "2").unwrap()],
     )
     .unwrap()
+}
+
+struct StorageMustNotRun;
+
+impl ScriptStorageTransactionPrepare for StorageMustNotRun {
+    type Prepared = ();
+    type Error = std::convert::Infallible;
+
+    fn prepare(
+        &mut self,
+        _plugin_id: &str,
+        _mutations: &[ScriptStorageMutation],
+    ) -> Result<ScriptStoragePrepareOutcome<Self::Prepared>, Self::Error> {
+        panic!("storage prepare must not run for a disconnected player")
+    }
+
+    fn commit(&mut self, _prepared: Self::Prepared) -> Result<(), Self::Error> {
+        panic!("storage commit must not run for a disconnected player")
+    }
 }
 
 #[test]
@@ -94,4 +115,29 @@ fn transaction_rejects_insufficient_full_and_unknown_resources_without_a_plan() 
         ),
         Err(ScriptInventoryPlanError::InventoryFull(_))
     ));
+}
+
+#[test]
+fn transaction_rejects_disconnected_player_before_touching_storage() {
+    let items = solaris_required_items();
+    let facts = solaris_required_item_facts();
+    let transaction = ScriptInventoryStorageTransaction::try_new(
+        "missing-player",
+        ScriptPlayerId::new(7),
+        vec![ScriptInventoryResourceDelta::try_new("minecraft:apple", 1).unwrap()],
+        vec![ScriptStorageMutation::compare_and_swap("balance", None, "1").unwrap()],
+    )
+    .unwrap();
+
+    let committed = SessionRegistry::new()
+        .commit_script_inventory_storage_transaction(
+            "shop",
+            &transaction,
+            &items,
+            &facts,
+            &mut StorageMustNotRun,
+        )
+        .unwrap();
+
+    assert!(!committed);
 }

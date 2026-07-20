@@ -425,6 +425,20 @@ Other accepted concrete boundaries in this staged migration are:
   window in the connection-owned interaction state. Rejected or stale clicks
   only resync content; accepted clicks publish a typed event to the retained
   plugin owner. The wire harness covers the full Lua-to-client-to-Lua path.
+- `script::storage` owns plugin record versions, quota checks, CRC-framed batch
+  durability, and transaction command serialization. `play::script_inventory_transaction`
+  owns resource resolution and inventory planning;
+  `play::session::script_inventory_transaction_endpoint` holds the canonical
+  player-state lock across the storage commit and inventory replacement, then
+  publishes one reliable authoritative inventory snapshot.
+  This deliberately permits a cold-path storage `sync_all` under one player
+  lock so concurrent inventory operations cannot interleave the two runtime
+  mutations. A per-session lifetime gate orders this owner turn against
+  unregister; unregister waits on the gate without retaining the registry lock.
+  The transaction path likewise releases the registry lock before I/O. This
+  adds no task, polling loop, operator setting, or hot tick work. Plugin WAL and
+  vanilla playerdata crash recovery remain separate and must not be described
+  as crash-atomic.
 - `play::player_damage_adapter` owns fall/contact/general player damage
   orchestration, publication projection, melee-knockback conversion and its
   concrete request/result DTOs. Damage and shield rules remain in `combat`;

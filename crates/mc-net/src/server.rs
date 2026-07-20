@@ -3684,13 +3684,6 @@ async fn bind_internal(
     } else {
         None
     };
-    let script_storage = match (scripts.as_ref(), entity_world_root.as_deref()) {
-        (Some(scripts), Some(root)) => Some(
-            PluginStorageHandle::start(root, scripts.clone(), config.shutdown.clone())
-                .map_err(plugin_storage_bind_error)?,
-        ),
-        _ => None,
-    };
     let script_zones = scripts
         .as_ref()
         .map(|scripts| PluginZoneAdapter::new(scripts.clone()));
@@ -3711,6 +3704,20 @@ async fn bind_internal(
             )),
             Vec::new(),
         )
+    };
+    let script_storage = match (scripts.as_ref(), entity_world_root.as_deref()) {
+        (Some(scripts), Some(root)) => Some(
+            PluginStorageHandle::start(
+                root,
+                scripts.clone(),
+                config.shutdown.clone(),
+                Arc::clone(&sessions),
+                Arc::clone(&config.items),
+                Arc::clone(&config.item_facts),
+            )
+            .map_err(plugin_storage_bind_error)?,
+        ),
+        _ => None,
     };
     if let (Some(root), Some(world)) = (entity_world_root.as_deref(), config.world.as_ref()) {
         let (journal, pending) = play::world_journal::WorldChunkJournal::open(

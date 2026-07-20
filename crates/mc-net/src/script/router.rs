@@ -2,7 +2,7 @@ use mc_script::{AdmittedScriptCommand, ScriptCommand, ScriptPluginStorageFailure
 use tracing::{debug, warn};
 
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
-use super::storage::PluginStorageHandle;
+use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::zone::PluginZoneAdapter;
 use crate::RuntimeControlHandle;
 use crate::chunk_pipeline::ChunkPipelineResources;
@@ -139,6 +139,7 @@ impl ScriptRouter {
             ScriptCommand::PluginStorageGet { .. }
                 | ScriptCommand::PluginStorageCompareAndSwap { .. }
                 | ScriptCommand::PluginStorageDelete { .. }
+                | ScriptCommand::InventoryStorageTransaction { .. }
         ) {
             return self
                 .route_storage_admitted(admitted, context.shutdown)
@@ -214,16 +215,15 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
-            ScriptCommand::InventoryStorageTransaction { .. }
-            | ScriptCommand::UpsertColony { .. }
-            | ScriptCommand::RequestVillagerBinding { .. } => {
+            ScriptCommand::UpsertColony { .. } | ScriptCommand::RequestVillagerBinding { .. } => {
                 debug!("admitted script command has no production adapter in slice A");
                 ScriptRouterExit::Continue
             }
             ScriptCommand::HostAttached { .. }
             | ScriptCommand::PluginStorageGet { .. }
             | ScriptCommand::PluginStorageCompareAndSwap { .. }
-            | ScriptCommand::PluginStorageDelete { .. } => {
+            | ScriptCommand::PluginStorageDelete { .. }
+            | ScriptCommand::InventoryStorageTransaction { .. } => {
                 debug!("invalid admitted script command rejected");
                 ScriptRouterExit::Continue
             }
@@ -264,7 +264,7 @@ impl ScriptRouter {
         admitted: AdmittedScriptCommand,
         failure: ScriptPluginStorageFailure,
     ) -> ScriptRouterExit {
-        let event = match admitted.plugin_storage_failure_result(failure) {
+        let event = match storage_failure_event(admitted, failure) {
             Ok(event) => event,
             Err(error) => {
                 debug!(
