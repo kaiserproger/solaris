@@ -148,11 +148,6 @@ impl StructureRules {
     }
 
     #[must_use]
-    pub fn single_plains_village_marker(template: StructureTemplate) -> Self {
-        Self::plains_village_markers(vec![template])
-    }
-
-    #[must_use]
     pub fn plains_village_markers(templates: Vec<StructureTemplate>) -> Self {
         Self {
             templates,
@@ -237,13 +232,6 @@ impl StructureRules {
         if let Some(salt) = villages.salt {
             self.salt = salt;
         }
-        self
-    }
-
-    #[must_use]
-    pub fn with_spacing_for_tests(mut self, grid_chunks: i32, separation_chunks: i32) -> Self {
-        self.grid_chunks = grid_chunks.max(1);
-        self.separation_chunks = separation_chunks.max(0).min(self.grid_chunks - 1);
         self
     }
 

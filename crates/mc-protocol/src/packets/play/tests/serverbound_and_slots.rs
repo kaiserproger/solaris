@@ -188,7 +188,10 @@ fn serverbound_client_information_id_and_layout_match_local_decompiled_sources()
         ]
     );
     let mut cursor: &[u8] = &buf;
-    assert_eq!(ServerboundClientInformation::decode(&mut cursor).unwrap(), packet);
+    assert_eq!(
+        ServerboundClientInformation::decode(&mut cursor).unwrap(),
+        packet
+    );
     assert!(cursor.is_empty());
 }
 
@@ -208,8 +211,27 @@ fn serverbound_custom_payload_brand_id_and_layout_match_local_decompiled_sources
         ]
     );
     let mut cursor: &[u8] = &buf;
-    assert_eq!(ServerboundCustomPayload::decode(&mut cursor).unwrap(), packet);
+    assert_eq!(
+        ServerboundCustomPayload::decode(&mut cursor).unwrap(),
+        packet
+    );
     assert!(cursor.is_empty());
+}
+
+#[test]
+fn play_serverbound_custom_payload_rejects_oversized_unknown_body() {
+    let mut buf = Vec::new();
+    buf.write_identifier(&Identifier::parse("solaris:test").unwrap())
+        .unwrap();
+    buf.resize(buf.len() + 32_768, 0xEF);
+
+    assert_eq!(
+        ServerboundCustomPayload::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::StringTooLong {
+            len: 32_768,
+            max: 32_767,
+        }
+    );
 }
 
 #[test]
@@ -480,6 +502,32 @@ fn item_stack_enchantments_component_matches_vanilla_stream_codec() {
 }
 
 #[test]
+fn item_stack_custom_name_component_matches_26_1_2_component_stream_codec() {
+    let named = ItemStack::new(5, 1).with_custom_name("Catalog Apple");
+
+    let mut buf = Vec::new();
+    named.encode(&mut buf).unwrap();
+
+    // `minecraft:custom_name` is DataComponents registry id 6 in the local
+    // 26.1.2 registry report. Its component payload is a network NBT text
+    // component, as confirmed by DataComponents.CUSTOM_NAME's Component
+    // STREAM_CODEC through javap.
+    assert_eq!(
+        buf,
+        vec![
+            0x01, 0x05, 0x01, 0x00, 0x06, // stack patch header and component id
+            0x0a, // network-NBT root compound (the component codec has no root name)
+            0x08, 0x00, 0x04, b't', b'e', b'x', b't',
+            0x00, 0x0d, b'C', b'a', b't', b'a', b'l', b'o', b'g', b' ', b'A', b'p', b'p', b'l', b'e',
+            0x00,
+        ]
+    );
+    let mut cur: &[u8] = &buf;
+    assert_eq!(ItemStack::decode(&mut cur).unwrap(), named);
+    assert!(cur.is_empty());
+}
+
+#[test]
 fn item_stack_decoder_refuses_unsupported_component_patches() {
     // count=1, item_id=1, n_add=1, n_remove=0, unsupported component id=4.
     let bytes: Vec<u8> = vec![0x01, 0x01, 0x01, 0x00, 0x04];
@@ -560,8 +608,8 @@ fn clientbound_open_screen_layout_matches_local_vanilla() {
     assert_eq!(ClientboundOpenScreen::ID, 0x3B);
     // Minimal network NBT component: Compound { text: "Furnace" }.
     let title_nbt = vec![
-        0x0A, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x07, b'F', b'u', b'r', b'n',
-        b'a', b'c', b'e', 0x00,
+        0x0A, 0x08, 0x00, 0x04, b't', b'e', b'x', b't', 0x00, 0x07, b'F', b'u', b'r', b'n', b'a',
+        b'c', b'e', 0x00,
     ];
     let packet = ClientboundOpenScreen {
         container_id: 1,
@@ -627,13 +675,12 @@ fn clientbound_explode_matches_vanilla_tnt_fixture() {
         ],
     };
     let expected: [u8; 81] = [
-        0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x50, 0x04, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x40, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x3f, 0xd0, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0xbf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xba, 0x05,
-        0x02, 0x3b, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01, 0x3e,
-        0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01,
+        0x3f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x50, 0x04, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0xc0, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x80, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x3f, 0xd0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0xbf, 0xe8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x16, 0xba, 0x05,
+        0x02, 0x3b, 0x3f, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01, 0x3e, 0x3f, 0x80, 0x00,
+        0x00, 0x3f, 0x80, 0x00, 0x00, 0x01,
     ];
 
     assert_eq!(ClientboundExplode::ID, 0x24);
@@ -643,7 +690,10 @@ fn clientbound_explode_matches_vanilla_tnt_fixture() {
 
     let mut cursor: &[u8] = &expected;
     assert_eq!(ClientboundExplode::decode(&mut cursor).unwrap(), packet);
-    assert!(cursor.is_empty(), "decoder must consume the exact packet body");
+    assert!(
+        cursor.is_empty(),
+        "decoder must consume the exact packet body"
+    );
 }
 
 #[test]
@@ -667,10 +717,7 @@ fn simple_explode_packet() -> ClientboundExplode {
     }
 }
 
-fn explode_body_through_sound_holder(
-    explosion_particle_id: i32,
-    sound_holder: i32,
-) -> Vec<u8> {
+fn explode_body_through_sound_holder(explosion_particle_id: i32, sound_holder: i32) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.write_f64(0.0);
     bytes.write_f64(0.0);
@@ -876,6 +923,395 @@ fn serverbound_container_click_rejects_invalid_input_and_hashed_count() {
     ));
 }
 
+fn container_click_with_hashed_components(added: usize, removed: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.write_varint(0); // container id
+    buf.write_varint(1); // state id
+    buf.write_i16(36); // slot
+    buf.write_i8(0); // button
+    buf.write_varint(ContainerInput::Pickup.as_wire());
+    buf.write_varint(0); // changed slots
+    buf.write_bool(true); // carried item present
+    buf.write_varint(7); // item id
+    buf.write_varint(1); // item count
+    buf.write_varint(added as i32);
+    for component_id in 0..added {
+        buf.write_varint(component_id as i32);
+        buf.write_i32(component_id as i32);
+    }
+    buf.write_varint(removed as i32);
+    for component_id in 0..removed {
+        buf.write_varint(component_id as i32);
+    }
+    buf
+}
+
+fn hashed_stack_with_components(added: usize, removed: usize) -> HashedStack {
+    HashedStack::Actual {
+        item_id: 7,
+        count: 1,
+        components: HashedStackComponentHashes {
+            added: (0..added).map(|id| (id as i32, id as i32)).collect(),
+            removed: (0..removed).map(|id| id as i32).collect(),
+        },
+    }
+}
+
+fn raw_container_click_with_stacks(
+    changed_slots: &[(i16, HashedStack)],
+    carried_item: &HashedStack,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.write_varint(0);
+    buf.write_varint(1);
+    buf.write_i16(36);
+    buf.write_i8(0);
+    buf.write_varint(ContainerInput::Pickup.as_wire());
+    buf.write_varint(changed_slots.len() as i32);
+    for (slot, stack) in changed_slots {
+        buf.write_i16(*slot);
+        stack.encode(&mut buf).unwrap();
+    }
+    carried_item.encode(&mut buf).unwrap();
+    buf
+}
+
+fn container_click_packet(
+    changed_slots: Vec<(i16, HashedStack)>,
+    carried_item: HashedStack,
+) -> ServerboundContainerClick {
+    ServerboundContainerClick {
+        container_id: 0,
+        state_id: 1,
+        slot_num: 36,
+        button_num: 0,
+        container_input: ContainerInput::Pickup,
+        changed_slots,
+        carried_item,
+    }
+}
+
+#[test]
+fn serverbound_container_click_accepts_zero_and_exact_changed_slot_ceiling() {
+    for changed_len in [0, 128] {
+        let packet = container_click_packet(
+            (0..changed_len)
+                .map(|slot| (slot as i16, HashedStack::empty()))
+                .collect(),
+            HashedStack::empty(),
+        );
+        let mut encoded = Vec::new();
+
+        packet.encode(&mut encoded).unwrap();
+        assert_eq!(
+            ServerboundContainerClick::decode(&mut encoded.as_slice()).unwrap(),
+            packet
+        );
+    }
+}
+
+#[test]
+fn serverbound_container_click_encode_rejects_changed_slot_overflow_without_writing() {
+    let packet = container_click_packet(
+        (0..129).map(|slot| (slot, HashedStack::empty())).collect(),
+        HashedStack::empty(),
+    );
+    let mut encoded = vec![0xA5, 0x5A];
+
+    assert_eq!(
+        packet.encode(&mut encoded).unwrap_err(),
+        CodecError::StringTooLong { len: 129, max: 128 }
+    );
+    assert_eq!(encoded, [0xA5, 0x5A]);
+}
+
+#[test]
+fn serverbound_container_click_decode_accepts_exact_aggregate_component_hash_budget() {
+    let changed_slots: Vec<_> = (0..8)
+        .map(|slot| (slot, hashed_stack_with_components(256, 256)))
+        .collect();
+    let packet = container_click_packet(changed_slots, HashedStack::empty());
+    let mut buf = Vec::new();
+    packet.encode(&mut buf).unwrap();
+
+    let decoded = ServerboundContainerClick::decode(&mut buf.as_slice()).unwrap();
+    assert_eq!(decoded, packet);
+}
+
+#[test]
+fn serverbound_container_click_decode_rejects_aggregate_component_hash_overflow() {
+    let changed_slots: Vec<_> = (0..8)
+        .map(|slot| (slot, hashed_stack_with_components(256, 256)))
+        .collect();
+    let carried = hashed_stack_with_components(1, 0);
+    let buf = raw_container_click_with_stacks(&changed_slots, &carried);
+
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::StringTooLong {
+            len: 4097,
+            max: 4096,
+        }
+    );
+}
+
+#[test]
+fn serverbound_container_click_encode_preflights_nested_and_aggregate_limits() {
+    let cases = [
+        (
+            container_click_packet(
+                vec![(0, hashed_stack_with_components(257, 0))],
+                HashedStack::empty(),
+            ),
+            CodecError::StringTooLong { len: 257, max: 256 },
+        ),
+        (
+            container_click_packet(
+                vec![(0, hashed_stack_with_components(0, 257))],
+                HashedStack::empty(),
+            ),
+            CodecError::StringTooLong { len: 257, max: 256 },
+        ),
+        (
+            container_click_packet(
+                (0..8)
+                    .map(|slot| (slot, hashed_stack_with_components(256, 256)))
+                    .collect(),
+                hashed_stack_with_components(1, 0),
+            ),
+            CodecError::StringTooLong {
+                len: 4097,
+                max: 4096,
+            },
+        ),
+        (
+            container_click_packet(
+                Vec::new(),
+                HashedStack::Actual {
+                    item_id: 7,
+                    count: 0,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            ),
+            CodecError::NotSupported("HashedStack actual item with non-positive count"),
+        ),
+        (
+            container_click_packet(
+                Vec::new(),
+                HashedStack::Actual {
+                    item_id: i32::MAX as u32 + 1,
+                    count: 1,
+                    components: HashedStackComponentHashes::empty(),
+                },
+            ),
+            CodecError::NotSupported("hashed stack item id exceeds VarInt range"),
+        ),
+    ];
+
+    for (packet, expected) in cases {
+        let mut encoded = vec![0xA5, 0x5A];
+        assert_eq!(packet.encode(&mut encoded).unwrap_err(), expected);
+        assert_eq!(encoded, [0xA5, 0x5A]);
+    }
+}
+
+#[test]
+fn serverbound_container_click_decode_rejects_malformed_changed_slot_counts() {
+    fn header() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_varint(0);
+        buf.write_varint(1);
+        buf.write_i16(36);
+        buf.write_i8(0);
+        buf.write_varint(ContainerInput::Pickup.as_wire());
+        buf
+    }
+
+    let mut negative = header();
+    negative.write_varint(-1);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut negative.as_slice()).unwrap_err(),
+        CodecError::NegativeLength(-1)
+    );
+
+    let mut overlong = header();
+    overlong.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut overlong.as_slice()).unwrap_err(),
+        CodecError::VarIntTooLong
+    );
+
+    let mut truncated = header();
+    truncated.push(0x80);
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut truncated.as_slice()),
+        Err(CodecError::Underflow { .. })
+    ));
+
+    let mut max_without_payload = header();
+    max_without_payload.write_varint(128);
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut max_without_payload.as_slice()),
+        Err(CodecError::Underflow { .. })
+    ));
+}
+
+#[test]
+fn serverbound_container_click_decode_rejects_truncated_nested_hash_counts() {
+    let mut buf = Vec::new();
+    buf.write_varint(0);
+    buf.write_varint(1);
+    buf.write_i16(36);
+    buf.write_i8(0);
+    buf.write_varint(ContainerInput::Pickup.as_wire());
+    buf.write_varint(0);
+    buf.write_bool(true);
+    buf.write_varint(7);
+    buf.write_varint(1);
+    buf.write_varint(256);
+
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut buf.as_slice()),
+        Err(CodecError::Underflow { .. })
+    ));
+}
+
+#[test]
+fn serverbound_container_click_decode_rejects_malformed_nested_hash_counts() {
+    fn through_actual_stack() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.write_varint(0);
+        buf.write_varint(1);
+        buf.write_i16(36);
+        buf.write_i8(0);
+        buf.write_varint(ContainerInput::Pickup.as_wire());
+        buf.write_varint(0);
+        buf.write_bool(true);
+        buf.write_varint(7);
+        buf.write_varint(1);
+        buf
+    }
+
+    let mut negative_added = through_actual_stack();
+    negative_added.write_varint(-1);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut negative_added.as_slice()).unwrap_err(),
+        CodecError::NegativeLength(-1)
+    );
+
+    let mut overlong_added = through_actual_stack();
+    overlong_added.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut overlong_added.as_slice()).unwrap_err(),
+        CodecError::VarIntTooLong
+    );
+
+    let mut truncated_added = through_actual_stack();
+    truncated_added.push(0x80);
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut truncated_added.as_slice()),
+        Err(CodecError::Underflow { .. })
+    ));
+
+    let mut negative_removed = through_actual_stack();
+    negative_removed.write_varint(0);
+    negative_removed.write_varint(-1);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut negative_removed.as_slice()).unwrap_err(),
+        CodecError::NegativeLength(-1)
+    );
+
+    let mut overlong_removed = through_actual_stack();
+    overlong_removed.write_varint(0);
+    overlong_removed.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80]);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut overlong_removed.as_slice()).unwrap_err(),
+        CodecError::VarIntTooLong
+    );
+
+    let mut truncated_removed = through_actual_stack();
+    truncated_removed.write_varint(0);
+    truncated_removed.push(0x80);
+    assert!(matches!(
+        ServerboundContainerClick::decode(&mut truncated_removed.as_slice()),
+        Err(CodecError::Underflow { .. })
+    ));
+}
+
+#[test]
+fn serverbound_container_click_accepts_exact_hashed_component_count_ceilings() {
+    let buf = container_click_with_hashed_components(256, 256);
+    let packet = ServerboundContainerClick::decode(&mut buf.as_slice()).unwrap();
+
+    let HashedStack::Actual { components, .. } = packet.carried_item else {
+        panic!("expected actual carried item");
+    };
+    assert_eq!(components.added.len(), 256);
+    assert_eq!(components.removed.len(), 256);
+}
+
+#[test]
+fn serverbound_container_click_rejects_added_hashed_component_count_over_ceiling() {
+    let buf = container_click_with_hashed_components(257, 0);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::StringTooLong { len: 257, max: 256 }
+    );
+}
+
+#[test]
+fn serverbound_container_click_rejects_removed_hashed_component_count_over_ceiling() {
+    let buf = container_click_with_hashed_components(0, 257);
+    assert_eq!(
+        ServerboundContainerClick::decode(&mut buf.as_slice()).unwrap_err(),
+        CodecError::StringTooLong { len: 257, max: 256 }
+    );
+}
+
+#[test]
+fn hashed_stack_component_hashes_encode_accepts_exact_count_ceilings() {
+    let components = HashedStackComponentHashes {
+        added: (0..256).map(|id| (id, id)).collect(),
+        removed: (0..256).collect(),
+    };
+    let mut encoded = Vec::new();
+
+    components.encode(&mut encoded).unwrap();
+
+    let decoded = HashedStackComponentHashes::decode(&mut encoded.as_slice()).unwrap();
+    assert_eq!(decoded, components);
+}
+
+#[test]
+fn hashed_stack_component_hashes_encode_rejects_added_over_ceiling_without_writing() {
+    let components = HashedStackComponentHashes {
+        added: (0..257).map(|id| (id, id)).collect(),
+        removed: Vec::new(),
+    };
+    let mut encoded = vec![0xA5, 0x5A];
+
+    assert_eq!(
+        components.encode(&mut encoded).unwrap_err(),
+        CodecError::StringTooLong { len: 257, max: 256 }
+    );
+    assert_eq!(encoded, [0xA5, 0x5A]);
+}
+
+#[test]
+fn hashed_stack_component_hashes_encode_rejects_removed_over_ceiling_without_writing() {
+    let components = HashedStackComponentHashes {
+        added: vec![(1, 2)],
+        removed: (0..257).collect(),
+    };
+    let mut encoded = vec![0xA5, 0x5A];
+
+    assert_eq!(
+        components.encode(&mut encoded).unwrap_err(),
+        CodecError::StringTooLong { len: 257, max: 256 }
+    );
+    assert_eq!(encoded, [0xA5, 0x5A]);
+}
+
 #[test]
 fn set_carried_item_round_trip() {
     round_trip(ServerboundSetCarriedItem { slot: 0 });
@@ -993,7 +1429,10 @@ fn clientbound_recipe_book_packets_match_local_vanilla_2612() {
     assert_eq!(bytes, expected);
 
     let mut cursor: &[u8] = &bytes;
-    assert_eq!(ClientboundRecipeBookAdd::decode(&mut cursor).unwrap(), packet);
+    assert_eq!(
+        ClientboundRecipeBookAdd::decode(&mut cursor).unwrap(),
+        packet
+    );
     assert!(cursor.is_empty());
 }
 
@@ -1079,8 +1518,8 @@ fn clientbound_shaped_recipe_display_writes_ingredient_list_length() {
     assert_eq!(
         bytes,
         vec![
-            0x01, 0x07, 0x01, 0x02, 0x01, 0x02, 0x04, 0x01, 0x00, 0x05, 0x02, 0x03,
-            0x00, 0x00, 0x04, 0x04, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x01,
+            0x01, 0x07, 0x01, 0x02, 0x01, 0x02, 0x04, 0x01, 0x00, 0x05, 0x02, 0x03, 0x00, 0x00,
+            0x04, 0x04, 0x04, 0x02, 0x01, 0x01, 0x02, 0x01, 0x00, 0x01,
         ]
     );
 }

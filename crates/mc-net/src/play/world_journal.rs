@@ -557,7 +557,7 @@ impl WorldChunkJournal {
     }
 
     #[cfg(test)]
-    fn from_parts_for_test(
+    pub(super) fn from_parts_for_test(
         path: PathBuf,
         blocks: Arc<BlockRegistry>,
         items: Arc<ItemRegistry>,
@@ -671,7 +671,7 @@ fn append_decisions(
     }
 }
 
-enum WriterRequest {
+pub(super) enum WriterRequest {
     Append {
         bytes: Vec<u8>,
         reply: std::sync::mpsc::Sender<Result<(), WriterFailure>>,
@@ -686,7 +686,7 @@ enum WriterRequest {
 }
 
 #[derive(Debug)]
-enum WriterFailure {
+pub(super) enum WriterFailure {
     Io(std::io::Error),
 }
 
@@ -1540,6 +1540,36 @@ mod tests {
         assert_eq!(journal.watermark(), Some(2));
     }
 
+    #[test]
+    fn known_reserved_append_failure_can_close_with_an_empty_decision() {
+        let temp = tempfile::tempdir().unwrap();
+        let (blocks, items) = registries();
+        let (journal, pending) =
+            WorldChunkJournal::open(temp.path(), blocks.clone(), items.clone()).unwrap();
+        assert!(pending.is_empty());
+        let decision_id = journal.reserve_decision_ids(1).unwrap()[0];
+        let error = journal
+            .record_reserved_snapshot_groups(
+                20,
+                vec![(
+                    decision_id,
+                    vec![snapshot(&blocks, ChunkPos { x: 0, z: 0 }, 20)],
+                )],
+            )
+            .expect_err("unstamped snapshot is a known pre-append failure");
+        assert!(!error.outcome_unknown());
+
+        journal
+            .record_reserved_snapshot_groups(20, vec![(decision_id, Vec::new())])
+            .unwrap();
+        drop(journal);
+
+        let (_reopened, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id(), decision_id);
+        assert!(pending[0].images().is_empty());
+    }
+
     #[tokio::test]
     async fn later_reserved_decision_waits_for_append_turn() {
         let temp = tempfile::tempdir().unwrap();
@@ -1724,26 +1754,33 @@ mod tests {
     }
 
     #[test]
-    fn append_completion_error_is_reported_as_outcome_unknown() {
+    fn append_outcome_unknown_recovery_uses_the_persisted_frame() {
         let temp = tempfile::tempdir().unwrap();
         let (blocks, items) = registries();
         let (requests, receiver) = std::sync::mpsc::sync_channel(1);
+        let path = temp.path().join("solaris/world-chunk-journal.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let writer_path = path.clone();
         let worker = std::thread::spawn(move || {
-            let WriterRequest::Replace { reply, .. } = receiver.recv().unwrap() else {
+            let WriterRequest::Replace { replacement, reply } = receiver.recv().unwrap() else {
                 panic!("expected reservation request");
             };
+            std::fs::write(&writer_path, replacement).unwrap();
             reply.send(Ok(())).unwrap();
-            let WriterRequest::Append { reply, .. } = receiver.recv().unwrap() else {
+            let WriterRequest::Append { bytes, reply } = receiver.recv().unwrap() else {
                 panic!("expected append request");
             };
+            let mut file = OpenOptions::new().append(true).open(&writer_path).unwrap();
+            file.write_all(&bytes).unwrap();
+            file.sync_all().unwrap();
             reply
                 .send(Err(WriterFailure::Io(std::io::Error::other("injected"))))
                 .unwrap();
         });
         let journal = WorldChunkJournal::from_parts_for_test(
-            temp.path().join("solaris/world-chunk-journal.bin"),
+            path,
             blocks.clone(),
-            items,
+            items.clone(),
             requests,
             worker,
         );
@@ -1753,6 +1790,11 @@ mod tests {
             .expect_err("injected append failure");
         assert!(error.outcome_unknown());
         assert_eq!(journal.watermark(), None);
+        drop(journal);
+
+        let (_reopened, pending) = WorldChunkJournal::open(temp.path(), blocks, items).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id(), 1);
     }
 
     fn flip_byte(path: &Path, offset: u64) {

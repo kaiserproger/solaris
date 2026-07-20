@@ -1,7 +1,6 @@
-use mc_data::Identifier;
-use mc_data::entity_types::{
-    EntityDimensions, fallback_entity_dimensions, fallback_entity_type_facts,
-};
+use std::sync::OnceLock;
+
+use mc_data::entity_types::{EntityTypeFacts, EntityTypeRegistry};
 use mc_entity::{AnimalBreedingState, Vec3};
 use mc_physics::Aabb;
 use mc_protocol::packets::play::{GameMode, unpack_block_pos};
@@ -31,14 +30,23 @@ pub(super) fn distance_sq(a: Vec3, b: Vec3) -> f64 {
     dx * dx + dy * dy + dz * dz
 }
 
+fn canonical_entity_registry() -> &'static EntityTypeRegistry {
+    static REGISTRY: OnceLock<EntityTypeRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(mc_data::entity_types::solaris_required_entity_types)
+}
+
+pub(super) fn canonical_entity_facts(type_name: &str) -> Option<&'static EntityTypeFacts> {
+    let id = mc_data::Identifier::parse(type_name.to_string()).ok()?;
+    canonical_entity_registry().facts_of(&id)
+}
+
 pub(in crate::play) fn entity_aabb(type_name: &str) -> Aabb {
-    let facts = Identifier::parse(type_name.to_string())
-        .map(|id| fallback_entity_type_facts(id, 0))
-        .ok();
-    facts.map_or(Aabb::COW, |facts| Aabb {
+    let facts = canonical_entity_facts(type_name)
+        .expect("entity AABB requires a canonical 26.1.2 entity type");
+    Aabb {
         half_width: facts.dimensions.half_width(),
         height: facts.dimensions.height,
-    })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,18 +59,24 @@ pub(super) fn entity_geometry(
     type_name: &str,
     animal: Option<AnimalBreedingState>,
 ) -> EntityGeometry {
-    let dimensions =
-        fallback_entity_dimensions(type_name, animal.is_some_and(AnimalBreedingState::is_baby))
-            .or_else(|| {
-                Identifier::parse(type_name.to_string())
-                    .ok()
-                    .map(|id| fallback_entity_type_facts(id, 0).dimensions)
-            })
-            .unwrap_or(EntityDimensions::new(
-                Aabb::COW.half_width * 2.0,
-                Aabb::COW.height,
-                None,
-            ));
+    if animal.is_some_and(AnimalBreedingState::is_baby) {
+        let baby = match type_name {
+            "minecraft:chicken" => Some((0.15, 0.4, 0.28)),
+            "minecraft:cow" => Some((0.225, 0.7, 0.665)),
+            "minecraft:pig" => Some((0.225, 0.45, 0.3825)),
+            "minecraft:sheep" => Some((0.225, 0.65, 0.6175)),
+            _ => None,
+        };
+        if let Some((half_width, height, eye_height)) = baby {
+            return EntityGeometry {
+                aabb: Aabb { half_width, height },
+                eye_height,
+            };
+        }
+    }
+    let dimensions = canonical_entity_facts(type_name)
+        .expect("entity geometry requires a canonical 26.1.2 entity type")
+        .dimensions;
     EntityGeometry {
         aabb: Aabb {
             half_width: dimensions.half_width(),

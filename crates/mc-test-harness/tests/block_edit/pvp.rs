@@ -72,7 +72,7 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         .expect("give PvP sword");
     wait_for_slot_stack(&mut alice, sword_id, 1).await;
 
-    wait_for_pvp_simulation_tick(&mut simulation_ticks, post_first_hit_tick + 5).await;
+    wait_for_pvp_simulation_tick(&mut simulation_ticks, post_first_hit_tick + 6).await;
     alice
         .write_packet(&mc_protocol::packets::play::ServerboundAttack {
             entity_id: bob_identity,
@@ -95,8 +95,8 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         ),
     );
     assert!(
-        (partial_hit_health - 18.225_6).abs() < 0.000_1,
-        "five-tick sword hit must use the +0.5 sample and apply only the hurt-resistance difference; health={partial_hit_health}"
+        (partial_hit_health - 17.918_4).abs() < 0.000_1,
+        "six-tick sword hit must use the +0.5 sample and apply only the hurt-resistance difference; health={partial_hit_health}"
     );
     alice
         .write_packet(&mc_protocol::packets::play::ServerboundAttack {

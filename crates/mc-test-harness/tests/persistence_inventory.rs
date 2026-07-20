@@ -37,8 +37,25 @@ use std::collections::HashSet;
 
 const VIEW_DISTANCE: i32 = 2;
 
-#[tokio::test]
-async fn place_dirt_persists_through_flush_to_disk() {
+#[test]
+fn place_dirt_persists_through_flush_to_disk() {
+    let test = std::thread::Builder::new()
+        .name("persistence-inventory".to_string())
+        .stack_size(4 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build persistence test runtime")
+                .block_on(place_dirt_persists_through_flush_to_disk_inner());
+        })
+        .expect("spawn persistence test thread");
+    if let Err(panic) = test.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+async fn place_dirt_persists_through_flush_to_disk_inner() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let vanilla_dir = manifest.join("../../data/vanilla");
     let blocks_json = vanilla_dir.join("reports/blocks.json");
@@ -115,7 +132,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -124,6 +141,7 @@ async fn place_dirt_persists_through_flush_to_disk() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let save = bound.save_handle();
     let server = tokio::spawn(async move { bound.serve().await });
 
     let mut client = Client::connect(addr).await.expect("client connect");
@@ -295,16 +313,21 @@ async fn place_dirt_persists_through_flush_to_disk() {
         // Ignore stray frames (light updates, keepalive, …).
     }
 
-    // 3. Use the production listener drain and final save. Directly calling
-    //    flush_dirty while the live server owns the world races a region plan
-    //    already being written by the server save coordinator.
+    // 3. Use the production listener drain, then save through the coordinator
+    //    after runtime owners have stopped mutating state.
     shutdown.request();
     drop(client);
     let serve_result = tokio::time::timeout(Duration::from_secs(30), server)
         .await
         .expect("server should stop after the shutdown request")
         .expect("server task should join");
-    serve_result.expect("server should save and stop cleanly");
+    serve_result.expect("server should drain and stop cleanly");
+    let save_report = save.save_all_after_drain().await;
+    assert!(
+        save_report.is_ok(),
+        "post-drain save failed: {:?}",
+        save_report.errors
+    );
     assert_eq!(
         world_handle.lock().await.dirty_count(),
         0,

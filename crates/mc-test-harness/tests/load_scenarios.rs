@@ -3253,9 +3253,10 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
         .map(Arc::new);
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
     let biome_spawns = if options.spawn_passive_entities {
         mc_data::biomes::load_biome_spawn_rules(vanilla_dir.join("data/minecraft/worldgen/biome"))
             .map(Arc::new)

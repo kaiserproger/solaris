@@ -58,6 +58,51 @@ fn arrow_selection_prefers_held_main_hand_before_other_hotbar_slots() {
 }
 
 #[test]
+fn hotbar_access_accepts_vanilla_endpoint_indices() {
+    let mut inventory = PlayerInventory::empty();
+
+    inventory.set_hotbar(0, ItemStack::new(40, 1)).unwrap();
+    inventory.set_hotbar(8, ItemStack::new(48, 1)).unwrap();
+    inventory.held_mut(0).unwrap().count = 2;
+    inventory.held_mut(8).unwrap().count = 3;
+
+    assert_eq!(inventory.held(0), Some(&ItemStack::new(40, 2)));
+    assert_eq!(inventory.held(8), Some(&ItemStack::new(48, 3)));
+}
+
+#[test]
+fn invalid_hotbar_reads_fail_closed() {
+    let inventory = PlayerInventory::empty();
+
+    for hotbar_slot in [9, u8::MAX] {
+        assert_eq!(inventory.held(hotbar_slot), None);
+    }
+}
+
+#[test]
+fn invalid_hotbar_mutable_access_fails_closed() {
+    let mut inventory = PlayerInventory::empty();
+
+    for hotbar_slot in [9, u8::MAX] {
+        assert_eq!(inventory.held_mut(hotbar_slot), None);
+    }
+
+    assert_eq!(inventory.slots, PlayerInventory::empty().slots);
+}
+
+#[test]
+fn invalid_hotbar_set_returns_the_rejected_stack() {
+    let mut inventory = PlayerInventory::empty();
+
+    for hotbar_slot in [9, u8::MAX] {
+        let stack = ItemStack::new(42, 3);
+        assert_eq!(inventory.set_hotbar(hotbar_slot, stack.clone()), Err(stack));
+    }
+
+    assert_eq!(inventory.slots, PlayerInventory::empty().slots);
+}
+
+#[test]
 fn inventory_merge_prefers_existing_stacks_then_empty_slots() {
     let mut inventory = PlayerInventory::empty();
     inventory.slots[10] = ItemStack::new(42, 63);
@@ -68,6 +113,151 @@ fn inventory_merge_prefers_existing_stacks_then_empty_slots() {
     assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
     assert_eq!(inventory.slots[9], ItemStack::new(42, 2));
     assert_eq!(changed.len(), 2);
+}
+
+#[test]
+fn inventory_merges_fail_closed_for_non_positive_max_stack() {
+    for max_stack in [0, -1] {
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[9] = ItemStack::new(42, 1);
+        let before = inventory.slots.clone();
+        let incoming = ItemStack::new(42, 3);
+
+        let (remaining, changed) = inventory.merge_stack(incoming.clone(), max_stack);
+
+        assert_eq!(remaining, incoming);
+        assert!(changed.is_empty());
+        assert_eq!(inventory.slots, before);
+
+        let Some((remaining, changed)) =
+            inventory.merge_pickup_stack(incoming.clone(), max_stack, 0)
+        else {
+            panic!("valid selected hotbar slot");
+        };
+
+        assert_eq!(remaining, incoming);
+        assert!(changed.is_empty());
+        assert_eq!(inventory.slots, before);
+    }
+}
+
+#[test]
+fn inventory_merge_canonicalizes_negative_counts_and_splits_oversized_counts() {
+    let mut inventory = PlayerInventory::empty();
+    let residual_empty = ItemStack::new(42, -1).with_damage(7);
+
+    let (remaining, changed) = inventory.merge_stack(residual_empty.clone(), 64);
+
+    assert_eq!(remaining, ItemStack::EMPTY);
+    assert!(changed.is_empty());
+
+    let (remaining, changed) = inventory.merge_pickup_stack(residual_empty, 64, 0).unwrap();
+
+    assert_eq!(remaining, ItemStack::EMPTY);
+    assert!(changed.is_empty());
+
+    let incoming = ItemStack::new(42, i32::MAX);
+    let (remaining, changed) = inventory.merge_stack(incoming, 64);
+
+    assert_eq!(changed.len(), 36);
+    assert!(
+        inventory.slots[9..=44]
+            .iter()
+            .all(|stack| stack == &ItemStack::new(42, 64))
+    );
+    assert_eq!(remaining, ItemStack::new(42, i32::MAX - 36 * 64));
+}
+
+#[test]
+fn inventory_merge_handles_overflow_adjacent_counts() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[9] = ItemStack::new(42, i32::MAX - 1);
+
+    let (remaining, changed) = inventory.merge_stack(ItemStack::new(42, 2), i32::MAX);
+
+    assert!(remaining.is_empty());
+    assert_eq!(inventory.slots[9], ItemStack::new(42, i32::MAX));
+    assert_eq!(inventory.slots[10], ItemStack::new(42, 1));
+    assert_eq!(
+        changed,
+        vec![
+            (9, ItemStack::new(42, i32::MAX)),
+            (10, ItemStack::new(42, 1)),
+        ]
+    );
+}
+
+#[test]
+fn range_merge_validates_all_ranges_before_mutating() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[44] = ItemStack::new(42, 63);
+    let before = inventory.slots.clone();
+    let incoming = ItemStack::new(42, 2);
+
+    let remaining = inventory.merge_stack_into_ranges(incoming.clone(), &[44..=46], 64);
+
+    assert_eq!(remaining, incoming);
+    assert_eq!(inventory.slots, before);
+
+    let remaining =
+        inventory.merge_stack_into_ranges(incoming.clone(), &[usize::MAX..=usize::MAX], 64);
+
+    assert_eq!(remaining, incoming);
+    assert_eq!(inventory.slots, before);
+}
+
+#[test]
+fn range_merge_fails_closed_for_non_positive_max_stack() {
+    for max_stack in [0, -1] {
+        let mut inventory = PlayerInventory::empty();
+        let incoming = ItemStack::new(42, 2);
+
+        let remaining = inventory.merge_stack_into_ranges(incoming.clone(), &[9..=10], max_stack);
+
+        assert_eq!(remaining, incoming);
+        assert_eq!(inventory.slots, PlayerInventory::empty().slots);
+    }
+}
+
+#[test]
+fn range_merge_supports_full_and_no_op_ranges() {
+    let mut inventory = PlayerInventory::empty();
+    let incoming = ItemStack::new(42, 2);
+    let empty_range = std::ops::RangeInclusive::new(10, 9);
+
+    assert_eq!(
+        inventory.merge_stack_into_ranges(incoming.clone(), &[], 64),
+        incoming
+    );
+    assert_eq!(
+        inventory.merge_stack_into_ranges(incoming.clone(), &[empty_range], 64),
+        incoming
+    );
+    assert_eq!(inventory.slots, PlayerInventory::empty().slots);
+
+    let remaining = inventory.merge_stack_into_ranges(ItemStack::new(42, 46), &[0..=45], 1);
+
+    assert!(remaining.is_empty());
+    assert!(
+        inventory
+            .slots
+            .iter()
+            .all(|stack| stack == &ItemStack::new(42, 1))
+    );
+}
+
+#[test]
+fn range_merge_leaves_input_unchanged_when_targets_are_full() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[9] = ItemStack::new(42, 64);
+    inventory.slots[10] = ItemStack::new(42, 64);
+    let before = inventory.slots.clone();
+    let incoming = ItemStack::new(42, 2);
+
+    let remaining = inventory.merge_stack_into_ranges(incoming.clone(), &[9..=10], 64);
+
+    assert_eq!(remaining, incoming);
+    assert_eq!(inventory.slots, before);
 }
 
 #[test]
@@ -84,27 +274,156 @@ fn inventory_merge_keeps_different_damage_components_separate() {
 }
 
 #[test]
-fn pickup_merge_prefers_hotbar_for_new_stacks() {
+fn inventory_merge_keeps_different_custom_names_separate() {
+    let existing = ItemStack::new(42, 1).with_custom_name("Catalog Apple");
+    let incoming = ItemStack::new(42, 1).with_custom_name("Reward Apple");
     let mut inventory = PlayerInventory::empty();
+    inventory.slots[10] = existing.clone();
 
-    let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3), 64);
+    let (remaining, changed) = inventory.merge_stack(incoming.clone(), 64);
 
     assert!(remaining.is_empty());
-    assert_eq!(inventory.slots[36], ItemStack::new(42, 3));
-    assert_eq!(changed, vec![(36, ItemStack::new(42, 3))]);
+    assert_eq!(inventory.slots[10], existing);
+    assert_eq!(inventory.slots[9], incoming.clone());
+    assert_eq!(changed, vec![(9, incoming)]);
 }
 
 #[test]
-fn pickup_merge_prefers_existing_stacks_before_empty_hotbar() {
-    let mut inventory = PlayerInventory::empty();
-    inventory.slots[10] = ItemStack::new(42, 63);
+fn inventory_merge_compares_enchantments_in_canonical_order() {
+    let sharpness = Identifier::parse("minecraft:sharpness").unwrap();
+    let unbreaking = Identifier::parse("minecraft:unbreaking").unwrap();
+    let existing = ItemStack::new(42, 1)
+        .with_enchantment(sharpness.clone(), 2)
+        .with_enchantment(unbreaking.clone(), 3);
+    let mut reordered = existing.clone();
+    reordered.enchantments.reverse();
 
-    let (remaining, changed) = inventory.merge_pickup_stack(ItemStack::new(42, 3), 64);
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[10] = existing.clone();
+    let (remaining, changed) = inventory.merge_stack(reordered.clone(), 64);
+    assert!(remaining.is_empty());
+    assert_eq!(inventory.slots[10].count, 2);
+    assert_eq!(changed, vec![(10, inventory.slots[10].clone())]);
+
+    let differently_enchanted = ItemStack::new(42, 1).with_enchantment(sharpness.clone(), 3);
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[36] = existing.clone();
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(differently_enchanted.clone(), 64, 0)
+        .unwrap();
+    assert!(remaining.is_empty());
+    assert_eq!(inventory.slots[36], existing);
+    assert_eq!(inventory.slots[37], differently_enchanted);
+    assert_eq!(changed, vec![(37, inventory.slots[37].clone())]);
+
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[9] = ItemStack::new(42, 1).with_enchantment(unbreaking, 2);
+    let incoming = ItemStack::new(42, 1).with_enchantment(sharpness, 2);
+    assert!(
+        inventory
+            .merge_stack_into_ranges(incoming.clone(), &[9..=10], 64)
+            .is_empty()
+    );
+    assert_eq!(inventory.slots[9].count, 1);
+    assert_eq!(inventory.slots[10], incoming);
+}
+
+#[test]
+fn pickup_merge_prefers_selected_hotbar_for_new_stacks() {
+    let mut inventory = PlayerInventory::empty();
+
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(ItemStack::new(42, 3), 64, 4)
+        .unwrap();
 
     assert!(remaining.is_empty());
-    assert_eq!(inventory.slots[10], ItemStack::new(42, 64));
-    assert_eq!(inventory.slots[36], ItemStack::new(42, 2));
-    assert_eq!(changed.len(), 2);
+    assert_eq!(inventory.slots[40], ItemStack::new(42, 3));
+    assert_eq!(changed, vec![(40, ItemStack::new(42, 3))]);
+}
+
+#[test]
+fn pickup_merge_uses_selected_offhand_hotbar_then_main_order() {
+    let mut inventory = PlayerInventory::empty();
+    for slot in [40, 45, 36, 9] {
+        inventory.slots[slot] = ItemStack::new(42, 63);
+    }
+
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(ItemStack::new(42, 4), 64, 4)
+        .unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(
+        changed.iter().map(|(slot, _)| *slot).collect::<Vec<_>>(),
+        vec![40, 45, 36, 9]
+    );
+    assert!(changed.iter().all(|(_, stack)| stack.count == 64));
+}
+
+#[test]
+fn pickup_merge_uses_compatible_offhand_when_inventory_is_full() {
+    let mut inventory = PlayerInventory::empty();
+    for slot in 9..=44 {
+        inventory.slots[slot] = ItemStack::new(99, 64);
+    }
+    inventory.slots[45] = ItemStack::new(42, 63);
+
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(ItemStack::new(42, 1), 64, 4)
+        .unwrap();
+
+    assert!(remaining.is_empty());
+    assert_eq!(inventory.slots[45], ItemStack::new(42, 64));
+    assert_eq!(changed, vec![(45, ItemStack::new(42, 64))]);
+}
+
+#[test]
+fn pickup_merge_does_not_place_new_stack_in_empty_offhand() {
+    let mut inventory = PlayerInventory::empty();
+    for slot in 9..=44 {
+        inventory.slots[slot] = ItemStack::new(99, 64);
+    }
+    let before = inventory.slots.clone();
+    let incoming = ItemStack::new(42, 1);
+
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(incoming.clone(), 64, 4)
+        .unwrap();
+
+    assert_eq!(remaining, incoming);
+    assert!(changed.is_empty());
+    assert_eq!(inventory.slots, before);
+}
+
+#[test]
+fn pickup_merge_credits_exact_partial_capacity() {
+    let mut inventory = PlayerInventory::empty();
+    for slot in 9..=44 {
+        inventory.slots[slot] = ItemStack::new(99, 64);
+    }
+    inventory.slots[36] = ItemStack::new(42, 63);
+    let incoming = ItemStack::new(42, 2);
+
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(incoming.clone(), 64, 4)
+        .unwrap();
+
+    assert_eq!(remaining, ItemStack::new(42, 1));
+    assert_eq!(changed, vec![(36, ItemStack::new(42, 64))]);
+    assert_eq!(inventory.slots[36], ItemStack::new(42, 64));
+}
+
+#[test]
+fn pickup_merge_rejects_invalid_selected_hotbar_before_mutation() {
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[36] = ItemStack::new(42, 63);
+    let before = inventory.slots.clone();
+
+    assert_eq!(
+        inventory.merge_pickup_stack(ItemStack::new(42, 1), 64, 9),
+        None
+    );
+    assert_eq!(inventory.slots, before);
 }
 
 #[test]
@@ -123,6 +442,79 @@ fn throw_click_takes_one_or_full_stack() {
     assert_eq!(take_throw_stack(&mut stack, 1), Some(ItemStack::new(42, 2)));
     assert!(stack.is_empty());
     assert_eq!(take_throw_stack(&mut stack, 0), None);
+}
+
+#[test]
+fn empty_stack_mutations_drop_residual_payload() {
+    let residual_empty = || ItemStack::new(42, 0).with_damage(7);
+    let mut inventory = PlayerInventory::empty();
+
+    inventory.set_hotbar(0, residual_empty()).unwrap();
+    assert_eq!(
+        inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::EMPTY
+    );
+
+    inventory.slots[PlayerInventory::HOTBAR_BASE] = residual_empty();
+    assert_eq!(inventory.held(0), Some(&ItemStack::EMPTY));
+    assert_eq!(
+        inventory.held_mut(0).map(|stack| &*stack),
+        Some(&ItemStack::EMPTY)
+    );
+    assert_eq!(
+        inventory.slots[PlayerInventory::HOTBAR_BASE],
+        ItemStack::EMPTY
+    );
+
+    inventory.slots[9] = residual_empty();
+    assert_eq!(inventory.as_wire_list()[9], ItemStack::EMPTY);
+
+    let mut slot = residual_empty();
+    assert_eq!(inventory::take_from_slot(&mut slot, 1), ItemStack::EMPTY);
+    assert_eq!(slot, ItemStack::EMPTY);
+
+    let mut cursor = ItemStack::new(42, i32::MIN).with_damage(7);
+    inventory::decrement_cursor(&mut cursor);
+    assert_eq!(cursor, ItemStack::EMPTY);
+
+    let mut thrown = residual_empty();
+    assert_eq!(take_throw_stack(&mut thrown, 0), None);
+    assert_eq!(thrown, ItemStack::EMPTY);
+
+    let mut outside = residual_empty();
+    assert_eq!(inventory::apply_outside_pickup_click(&mut outside, 0), None);
+    assert_eq!(outside, ItemStack::EMPTY);
+}
+
+#[test]
+fn regular_pickup_fails_closed_for_invalid_max_stack_and_canonicalizes_empty_cursor() {
+    for max_stack in [0, -1] {
+        let mut cursor = ItemStack::new(42, 2);
+
+        assert_eq!(
+            apply_regular_pickup_slot(&mut cursor, ItemStack::new(42, 3), 0, max_stack, true,),
+            None
+        );
+        assert_eq!(cursor, ItemStack::new(42, 2));
+    }
+
+    let mut cursor = ItemStack::new(42, 0).with_damage(7);
+    assert_eq!(
+        apply_regular_pickup_slot(&mut cursor, ItemStack::EMPTY, 0, 64, true),
+        None
+    );
+    assert_eq!(cursor, ItemStack::EMPTY);
+}
+
+#[test]
+fn right_click_split_handles_maximum_count_without_overflow() {
+    let mut cursor = ItemStack::EMPTY;
+
+    let remaining =
+        apply_regular_pickup_slot(&mut cursor, ItemStack::new(42, i32::MAX), 1, i32::MAX, true);
+
+    assert_eq!(cursor, ItemStack::new(42, i32::MAX / 2 + 1));
+    assert_eq!(remaining, Some(ItemStack::new(42, i32::MAX / 2)));
 }
 
 #[test]
@@ -258,8 +650,9 @@ fn pickup_merge_keeps_damaged_items_separate() {
     let mut inventory = PlayerInventory::empty();
     inventory.slots[36] = ItemStack::new(42, 1).with_damage(1);
 
-    let (remaining, changed) =
-        inventory.merge_pickup_stack(ItemStack::new(42, 1).with_damage(2), 1);
+    let (remaining, changed) = inventory
+        .merge_pickup_stack(ItemStack::new(42, 1).with_damage(2), 1, 0)
+        .unwrap();
 
     assert!(remaining.is_empty());
     assert_eq!(inventory.slots[36], ItemStack::new(42, 1).with_damage(1));
@@ -332,7 +725,6 @@ fn armor_material_rules_match_local_vanilla_basics() {
         .entry(&mc_data::Identifier::parse("minecraft:iron_chestplate").unwrap())
         .unwrap();
     assert_eq!(iron_chestplate.slot, mc_data::armor::ArmorSlot::Chest);
-    assert_eq!(armor_slot_for_kind(iron_chestplate.slot), 6);
     assert_eq!(iron_chestplate.armor, 6.0);
     assert_eq!(iron_chestplate.toughness, 0.0);
     assert_eq!(iron_chestplate.max_damage, 240);
@@ -346,6 +738,66 @@ fn armor_material_rules_match_local_vanilla_basics() {
         armor.entry(&mc_data::Identifier::parse("minecraft:apple").unwrap()),
         None
     );
+}
+
+#[test]
+fn armor_slot_placement_uses_equippable_component_facts() {
+    use mc_data::item_components::ItemFacts;
+    use mc_data::items::ItemReport;
+
+    let elytra = Identifier::parse("minecraft:elytra").unwrap();
+    let carved_pumpkin = Identifier::parse("minecraft:carved_pumpkin").unwrap();
+    let items = ItemRegistry::from_report(&[
+        ItemReport {
+            id: elytra.clone(),
+            protocol_id: 1,
+        },
+        ItemReport {
+            id: carved_pumpkin.clone(),
+            protocol_id: 2,
+        },
+    ]);
+    let item_facts = ItemFactsTable::from_entries([
+        (
+            elytra,
+            ItemFacts {
+                equippable_slot: Some("chest".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            carved_pumpkin,
+            ItemFacts {
+                equippable_slot: Some("head".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    assert!(can_place_in_player_slot(
+        &item_facts,
+        &items,
+        6,
+        &ItemStack::new(1, 1)
+    ));
+    assert!(can_place_in_player_slot(
+        &item_facts,
+        &items,
+        5,
+        &ItemStack::new(2, 1)
+    ));
+    assert!(!can_place_in_player_slot(
+        &item_facts,
+        &items,
+        5,
+        &ItemStack::new(1, 1)
+    ));
+    assert!(!can_place_in_player_slot(
+        &item_facts,
+        &items,
+        6,
+        &ItemStack::new(2, 1)
+    ));
 }
 
 #[test]

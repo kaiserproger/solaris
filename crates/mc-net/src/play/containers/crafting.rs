@@ -12,8 +12,8 @@ use super::quickcraft::{
 };
 use crate::play::inventory::{
     PlayerInventory, apply_regular_pickup_slot, apply_regular_swap_slot, apply_regular_throw_slot,
-    armor_entry_for_item, armor_slot_for_kind, can_place_in_player_slot, can_stack,
-    hotbar_swap_slot, item_max_stack, pickup_click_max_stack, player_swap_slot,
+    can_place_in_player_slot, can_stack, equippable_slot_for_item, hotbar_swap_slot,
+    item_max_stack, pickup_click_max_stack, player_swap_slot,
 };
 use crate::play::recipes::ingredient_accepts_item;
 
@@ -308,6 +308,7 @@ fn set_crafting_menu_stack(
 
 fn can_place_in_crafting_menu_slot(
     items: &ItemRegistry,
+    item_facts: &ItemFactsTable,
     menu_slot: usize,
     stack: &ItemStack,
 ) -> bool {
@@ -318,7 +319,7 @@ fn can_place_in_crafting_menu_slot(
         0 => false,
         1..=9 => true,
         _ => crafting_player_slot(menu_slot)
-            .is_some_and(|slot| can_place_in_player_slot(items, slot, stack)),
+            .is_some_and(|slot| can_place_in_player_slot(item_facts, items, slot, stack)),
     }
 }
 
@@ -415,7 +416,7 @@ impl CraftingTableWindow {
             QuickCraftStep::Continued { slot } => {
                 if let Some(slot) = slot
                     && (1..=9).contains(&slot)
-                    && can_place_in_crafting_menu_slot(items, slot, carried_item)
+                    && can_place_in_crafting_menu_slot(items, item_facts, slot, carried_item)
                     && crafting_menu_stack(self, inventory, slot).is_some_and(|stack| {
                         (stack.is_empty() || can_stack(&stack, carried_item))
                             && stack.count < item_max_stack(item_facts, items, carried_item)
@@ -449,7 +450,7 @@ impl CraftingTableWindow {
                         continue;
                     };
                     if !(1..=9).contains(&slot)
-                        || !can_place_in_crafting_menu_slot(items, slot, &source)
+                        || !can_place_in_crafting_menu_slot(items, item_facts, slot, &source)
                         || !(current_stack.is_empty() || can_stack(&current_stack, &source))
                     {
                         continue;
@@ -506,7 +507,8 @@ impl CraftingTableWindow {
             return (false, Vec::new());
         };
         let max_stack = pickup_click_max_stack(item_facts, items, carried_item, &slot_stack);
-        let can_place_cursor = can_place_in_crafting_menu_slot(items, menu_slot, carried_item);
+        let can_place_cursor =
+            can_place_in_crafting_menu_slot(items, item_facts, menu_slot, carried_item);
         let Some(new_slot) = apply_regular_pickup_slot(
             carried_item,
             slot_stack,
@@ -575,8 +577,8 @@ impl CraftingTableWindow {
             return false;
         };
         let swap = inventory.slots[player_slot].clone();
-        let can_place_swap = can_place_in_crafting_menu_slot(items, menu_slot, &swap);
-        let can_place_clicked = can_place_in_player_slot(items, player_slot, &clicked);
+        let can_place_swap = can_place_in_crafting_menu_slot(items, item_facts, menu_slot, &swap);
+        let can_place_clicked = can_place_in_player_slot(item_facts, items, player_slot, &clicked);
         let Some((new_clicked, new_swap)) =
             apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
         else {
@@ -695,7 +697,7 @@ impl PlayerInventory {
                 if let Some(slot) = slot
                     && slot > 0
                     && slot < self.slots.len()
-                    && can_place_in_player_slot(items, slot, carried_item)
+                    && can_place_in_player_slot(item_facts, items, slot, carried_item)
                     && (self.slots[slot].is_empty() || can_stack(&self.slots[slot], carried_item))
                     && self.slots[slot].count < item_max_stack(item_facts, items, carried_item)
                     && carried_item.count > quickcraft.selected_slot_count() as i32
@@ -725,7 +727,7 @@ impl PlayerInventory {
                 for slot in slots {
                     if slot == 0
                         || slot >= self.slots.len()
-                        || !can_place_in_player_slot(items, slot, &source)
+                        || !can_place_in_player_slot(item_facts, items, slot, &source)
                         || !(self.slots[slot].is_empty() || can_stack(&self.slots[slot], &source))
                     {
                         continue;
@@ -779,7 +781,7 @@ impl PlayerInventory {
 
         let slot_stack = self.slots[slot].clone();
         let max_stack = pickup_click_max_stack(item_facts, items, carried_item, &slot_stack);
-        let can_place_cursor = can_place_in_player_slot(items, slot, carried_item);
+        let can_place_cursor = can_place_in_player_slot(item_facts, items, slot, carried_item);
         let Some(new_slot) = apply_regular_pickup_slot(
             carried_item,
             slot_stack,
@@ -844,8 +846,8 @@ impl PlayerInventory {
         }
         let clicked = self.slots[slot].clone();
         let swap = self.slots[swap_slot].clone();
-        let can_place_swap = can_place_in_player_slot(items, slot, &swap);
-        let can_place_clicked = can_place_in_player_slot(items, swap_slot, &clicked);
+        let can_place_swap = can_place_in_player_slot(item_facts, items, slot, &swap);
+        let can_place_clicked = can_place_in_player_slot(item_facts, items, swap_slot, &clicked);
         let Some((new_clicked, new_swap)) =
             apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
         else {
@@ -908,23 +910,22 @@ impl PlayerInventory {
         let original = self.slots[slot].clone();
         let max_stack = item_max_stack(item_facts, items, &original);
         if !(5..=8).contains(&slot)
-            && let Some(entry) = armor_entry_for_item(items, original.item_id)
+            && let Some(equipment_slot) =
+                equippable_slot_for_item(item_facts, items, original.item_id)
+            && self.slots[equipment_slot].is_empty()
         {
-            let armor_slot = armor_slot_for_kind(entry.slot);
-            if self.slots[armor_slot].is_empty() {
-                let mut equipped = original.clone();
-                equipped.count = 1;
-                self.slots[armor_slot] = equipped;
-                if original.count <= 1 {
-                    self.slots[slot] = ItemStack::EMPTY;
-                } else {
-                    self.slots[slot].count -= 1;
-                }
-                if (1..=4).contains(&slot) {
-                    refresh_inventory_crafting_result(items, item_facts, tags, recipes, self);
-                }
-                return (true, Vec::new());
+            let mut equipped = original.clone();
+            equipped.count = 1;
+            self.slots[equipment_slot] = equipped;
+            if original.count <= 1 {
+                self.slots[slot] = ItemStack::EMPTY;
+            } else {
+                self.slots[slot].count -= 1;
             }
+            if (1..=4).contains(&slot) {
+                refresh_inventory_crafting_result(items, item_facts, tags, recipes, self);
+            }
+            return (true, Vec::new());
         }
 
         self.slots[slot] = ItemStack::EMPTY;

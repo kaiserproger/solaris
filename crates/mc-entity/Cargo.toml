@@ -11,12 +11,6 @@ repository.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = []
-# Retains the former vector-backed entity authority exclusively for ECS
-# shadow comparisons in downstream integration tests.
-shadow-compare = []
-
 [dependencies]
 bevy_ecs = { workspace = true }
 mc-data = { path = "../mc-data" }

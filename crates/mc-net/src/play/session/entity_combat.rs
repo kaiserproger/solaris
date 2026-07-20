@@ -2,15 +2,19 @@ use super::interaction_geometry::{entity_geometry, within_entity_reach};
 use super::player_state::{apply_player_survival_plan_locked, player_attack_cost_plan_matches};
 use super::{
     CommittedPlayerAttackCosts, ENTITY_DEATH_TICKS, ENTITY_EVENT_DEATH,
-    ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, PlayerAttackResult,
-    ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry, VisibilityDispatch,
-    apply_player_melee_knockback_locked, entity_event_dispatches_locked, entity_item_stack,
-    entity_kill_drop_stacks, mob_xp_value, server_entity_snapshot_from, spawn_item_drop_locked,
-    spawn_xp_orb_locked,
+    ENTITY_HURT_INVULNERABLE_TICKS, EntityAttackOutcome, EntityKillRewards, OutboundCommand,
+    PlayerAttackResult, ServerEntitySnapshot, SessionEntityGuards, SessionId, SessionRegistry,
+    VisibilityDispatch, apply_player_melee_knockback_locked, entity_event_dispatches_locked,
+    entity_item_stack, entity_kill_drop_stacks, mob_xp_value, record_entity_dispatches_locked,
+    server_entity_snapshot_from, session_recipients, spawn_item_drop_locked, spawn_xp_orb_locked,
+    visibility_dispatches, visible_entity_observers_locked,
 };
 use crate::play::simulation::{PlayerSurvivalPlan, SimulationAuthority};
 use crate::play::{GameMode, PlayerPose};
-use mc_entity::{EntityId, Vec3};
+use mc_entity::{
+    EntityDamageRequest, EntityEffectRejection, EntityEffectRequest, EntityEffectResult, EntityId,
+    EntitySnapshot, Vec3,
+};
 use std::time::Instant;
 
 pub(in crate::play) struct ServerEntityPlayerAttack<'a> {
@@ -22,6 +26,23 @@ pub(in crate::play) struct ServerEntityPlayerAttack<'a> {
 }
 
 impl SessionRegistry {
+    pub(in crate::play) fn apply_server_entity_effect_request(
+        &self,
+        _authority: &SimulationAuthority,
+        expected: Option<EntitySnapshot>,
+        entity_id: EntityId,
+        request: EntityEffectRequest,
+    ) -> (EntityEffectResult, Vec<VisibilityDispatch>) {
+        let mut inner = self.lock_session_entities("apply server entity effect transaction");
+        let Some(expected) = expected.or_else(|| inner.entities.snapshot(entity_id)) else {
+            return (
+                EntityEffectResult::Rejected(EntityEffectRejection::Missing),
+                Vec::new(),
+            );
+        };
+        apply_server_entity_effect_request_locked(&mut inner, expected, request)
+    }
+
     pub(super) fn player_attack_server_entity(
         &self,
         _authority: &SimulationAuthority,
@@ -159,14 +180,95 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn damage_server_entity_legacy_for_test(
+    pub(in crate::play) fn damage_server_entity_for_test(
         &self,
         entity_id: EntityId,
         amount: f32,
     ) -> Option<mc_entity::EntityDamage> {
-        let mut inner = self.lock_session_entities("damage server entity legacy test");
+        let mut inner = self.lock_session_entities("damage server entity test");
         damage_server_entity_locked(&mut inner, entity_id, amount)
     }
+
+    #[cfg(test)]
+    pub(in crate::play) fn publish_entity_health_snapshot_for_test(
+        &self,
+        snapshot: EntitySnapshot,
+    ) -> Vec<VisibilityDispatch> {
+        let mut inner = self.lock_session_entities("publish test entity health");
+        publish_accepted_entity_health_locked(&mut inner, &snapshot)
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn published_entity_health_for_test(
+        &self,
+        entity_id: EntityId,
+    ) -> Option<f32> {
+        self.lock_inner("read test published entity health")
+            .published_entity_snapshots
+            .get(&entity_id)
+            .and_then(|snapshot| snapshot.health)
+    }
+}
+
+fn apply_server_entity_effect_request_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    expected: EntitySnapshot,
+    request: EntityEffectRequest,
+) -> (EntityEffectResult, Vec<VisibilityDispatch>) {
+    if server_entity_snapshot_from(expected.clone())
+        .health
+        .is_none()
+    {
+        return (
+            EntityEffectResult::Rejected(EntityEffectRejection::NonLiving),
+            Vec::new(),
+        );
+    }
+    let result = inner.entities.apply_effect_if_current(expected, request);
+    let dispatches = match &result {
+        EntityEffectResult::Applied(applied) => {
+            publish_accepted_entity_health_locked(inner, &applied.snapshot)
+        }
+        EntityEffectResult::Rejected(_) => Vec::new(),
+    };
+    (result, dispatches)
+}
+
+pub(super) fn publish_accepted_entity_health_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    accepted: &EntitySnapshot,
+) -> Vec<VisibilityDispatch> {
+    let Some(current) = inner.entities.snapshot(accepted.id) else {
+        return Vec::new();
+    };
+    if &current != accepted {
+        return Vec::new();
+    }
+    let projected = server_entity_snapshot_from(current);
+    let Some(health) = projected.health else {
+        return Vec::new();
+    };
+    if inner
+        .published_entity_snapshots
+        .get(&projected.id)
+        .is_some_and(|published| published.health == Some(health))
+    {
+        return Vec::new();
+    }
+    if let Some(published) = inner.published_entity_snapshots.get_mut(&projected.id) {
+        published.health = Some(health);
+    } else {
+        inner
+            .published_entity_snapshots
+            .insert(projected.id, projected.clone());
+    }
+    let observer_ids = visible_entity_observers_locked(inner, projected.id);
+    let recipients = session_recipients(inner, observer_ids);
+    let dispatches = visibility_dispatches(recipients, || {
+        OutboundCommand::UpdateEntityHealth(projected.clone())
+    });
+    record_entity_dispatches_locked(inner, &dispatches);
+    dispatches
 }
 
 pub(super) fn begin_server_entity_death_locked(
@@ -175,12 +277,6 @@ pub(super) fn begin_server_entity_death_locked(
     rewards: &EntityKillRewards,
 ) -> (ServerEntitySnapshot, Vec<VisibilityDispatch>) {
     let entity_id = damage.snapshot.id;
-    let remove_tick = inner
-        .entity_lifecycle_tick
-        .saturating_add(ENTITY_DEATH_TICKS);
-    inner
-        .dying_entity_remove_ticks
-        .insert(entity_id, remove_tick);
     let entity = server_entity_snapshot_from(damage.snapshot.clone());
     let mut dispatches = Vec::new();
     for (entity_type_id, stack) in &rewards.items {
@@ -215,8 +311,10 @@ pub(super) fn attack_server_entity_locked(
     rewards: &EntityKillRewards,
 ) -> Option<EntityAttackOutcome> {
     let damage = damage_server_entity_locked(inner, entity_id, amount)?;
+    let health_dispatches = publish_accepted_entity_health_locked(inner, &damage.snapshot);
     if damage.killed {
-        let (entity, dispatches) = begin_server_entity_death_locked(inner, &damage, rewards);
+        let (entity, mut dispatches) = begin_server_entity_death_locked(inner, &damage, rewards);
+        dispatches.splice(0..0, health_dispatches);
         return Some(EntityAttackOutcome::Killed {
             damage,
             entity,
@@ -224,9 +322,10 @@ pub(super) fn attack_server_entity_locked(
             attacker_costs: None,
         });
     }
-    let dispatches = knockback_origin.map_or_else(Vec::new, |origin| {
+    let mut dispatches = health_dispatches;
+    dispatches.extend(knockback_origin.map_or_else(Vec::new, |origin| {
         apply_player_melee_knockback_locked(inner, entity_id, origin)
-    });
+    }));
     Some(EntityAttackOutcome::Damaged {
         damage,
         dispatches,
@@ -240,14 +339,20 @@ pub(super) fn damage_server_entity_locked(
     amount: f32,
 ) -> Option<mc_entity::EntityDamage> {
     let tick = inner.entity_lifecycle_tick;
-    if inner
-        .last_entity_damage_ticks
-        .get(&entity_id)
-        .is_some_and(|last| tick.saturating_sub(*last) < ENTITY_HURT_INVULNERABLE_TICKS)
+    let expected = inner.entities.snapshot(entity_id)?;
+    if expected
+        .retained
+        .last_damage_tick
+        .is_some_and(|last| tick.saturating_sub(last) < ENTITY_HURT_INVULNERABLE_TICKS)
     {
         return None;
     }
-    let damage = inner.entities.damage(entity_id, amount)?;
-    inner.last_entity_damage_ticks.insert(entity_id, tick);
-    Some(damage)
+    inner.entities.damage_if_current(
+        expected,
+        EntityDamageRequest {
+            amount,
+            tick,
+            death_remove_tick: tick.saturating_add(ENTITY_DEATH_TICKS),
+        },
+    )
 }

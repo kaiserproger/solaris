@@ -128,7 +128,7 @@ async fn observe_spawn_smoke(ctx: ScenarioContext) -> Result<ObservationSet> {
             teleport_id: sync.teleport_id,
         })
         .await?;
-    Ok(observations.normalized())
+    Ok(observations.normalize_sequence())
 }
 
 async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<ObservationSet> {
@@ -205,7 +205,7 @@ async fn observe_configuration_phase(ctx: ScenarioContext) -> Result<Observation
                 value: registry_packets.to_string(),
             });
             client.write_packet(&AcknowledgeFinishConfiguration).await?;
-            return Ok(observations.normalized());
+            return Ok(observations.normalize_sequence());
         }
         anyhow::bail!(
             "unexpected configuration frame id=0x{:02X} body_len={}",
@@ -387,9 +387,10 @@ async fn spawn_solaris_with_local_vanilla_data()
     let items_report = mc_data::items::load_items_report(&registries_json)?;
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report = mc_data::entity_types::load_entity_types_report(&registries_json)?;
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .context("entity type report is the exact 26.1.2 registry")?,
+    );
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse()?,
         motd: "M79 configuration parity".into(),
@@ -1178,7 +1179,7 @@ async fn observe_container_held_slot(ctx: ScenarioContext) -> Result<Observation
         value: saw_second_echo.to_string(),
     });
 
-    Ok(observations.normalized())
+    Ok(observations.normalize_sequence())
 }
 
 async fn observe_held_slot_until_command_fence(
@@ -1411,7 +1412,7 @@ async fn observe_entity_lifecycle(ctx: ScenarioContext) -> Result<ObservationSet
         value: "clientbound_frame".into(),
     });
 
-    Ok(observations.normalized())
+    Ok(observations.normalize_sequence())
 }
 
 async fn drain_entity_lifecycle_frames(
@@ -1723,7 +1724,7 @@ async fn observe_timed_action(ctx: ScenarioContext) -> Result<ObservationSet> {
         value: "command_response".into(),
     });
 
-    Ok(observations.normalized())
+    Ok(observations.normalize_sequence())
 }
 
 #[tokio::test]

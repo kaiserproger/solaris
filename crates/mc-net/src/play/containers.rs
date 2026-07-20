@@ -14,6 +14,9 @@ mod crafting;
 mod enchanting;
 mod furnace;
 pub(in crate::play) mod quickcraft;
+mod script_menu;
+#[cfg(test)]
+mod script_menu_tests;
 mod stonecutter;
 
 pub(in crate::play) use chest::{
@@ -58,6 +61,10 @@ pub(in crate::play) use furnace::{
     tick,
 };
 pub(in crate::play) use quickcraft::{QuickCraftClick, QuickCraftOutcome, QuickCraftState};
+pub(in crate::play) use script_menu::{
+    ScriptMenuClick, ScriptMenuClickDisposition, ScriptMenuOpenError, ScriptMenuWindow,
+    client_close_matches,
+};
 pub(in crate::play) use stonecutter::{
     STONECUTTER_MENU_TYPE_ID, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
     plan_click as plan_stonecutter_click, select_stonecutter_recipe, set_stonecutter_input,
@@ -72,6 +79,7 @@ pub(super) enum ActiveContainer {
     Stonecutter(StonecutterWindow),
     Furnace(FurnaceWindow),
     Chest(ChestWindow),
+    Script(ScriptMenuWindow),
 }
 
 impl ActiveContainer {
@@ -82,6 +90,7 @@ impl ActiveContainer {
             Self::Stonecutter(window) => window.container_id,
             Self::Furnace(window) => window.container_id,
             Self::Chest(window) => window.container_id,
+            Self::Script(window) => window.container_id,
         }
     }
 }
@@ -332,6 +341,7 @@ pub(super) async fn store_active_container(
                 return Err(error);
             }
         }
+        Some(ActiveContainer::Script(_)) => {}
         None => {}
     }
     Ok(())

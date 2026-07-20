@@ -956,6 +956,7 @@ pub(super) fn insert_hopper_stack_into_campfire(
         item_id: moving.item_id,
         damage: moving.damage,
         enchantments: moving.enchantments.clone(),
+        custom_name: None,
     };
     context.sessions.commit_campfire_cooking_insert(
         position,

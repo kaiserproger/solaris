@@ -186,10 +186,11 @@ impl SessionRegistry {
         if selected.is_empty() {
             return HerdSpawnOutcome::committed(Vec::new());
         }
+        let lifecycle_tick = self.simulation_tick();
         let candidates = selected
             .iter()
             .flat_map(|(chunk, spawns)| {
-                build_herd_spawn_candidates(*chunk, spawns, &player_positions)
+                build_herd_spawn_candidates(*chunk, spawns, &player_positions, lifecycle_tick)
             })
             .collect::<Vec<_>>();
         let committed = match self.commit_unique_herd_candidates(candidates) {
@@ -202,7 +203,6 @@ impl SessionRegistry {
             }
         };
         let committed_count = committed.len();
-        let lifecycle_tick = self.simulation_tick();
         let mut inner = self.lock_inner("publish committed chunk herd");
         let dispatches =
             install_committed_herd_spawns_locked(&mut inner, committed, lifecycle_tick);
@@ -238,11 +238,17 @@ impl SessionRegistry {
         if claimed.chunks.is_empty() {
             return HerdSpawnOutcome::committed(Vec::new());
         }
+        let lifecycle_tick = self.simulation_tick();
         let candidates = claimed
             .chunks
             .iter()
             .flat_map(|claim| {
-                build_herd_spawn_candidates(claim.chunk, &claim.spawns, &claimed.player_positions)
+                build_herd_spawn_candidates(
+                    claim.chunk,
+                    &claim.spawns,
+                    &claimed.player_positions,
+                    lifecycle_tick,
+                )
             })
             .collect::<Vec<_>>();
         let committed = match self.commit_unique_herd_candidates(candidates) {
@@ -281,7 +287,7 @@ impl SessionRegistry {
             .filter_map(|candidate| candidate.uuid)
             .collect::<Vec<_>>();
         let mut entities = self.lock_entities("commit unique herd batch");
-        match entities.try_spawn_unique_authoritative_batch(candidates) {
+        match entities.try_spawn_unique_batch(candidates) {
             Ok(committed) => Ok(committed),
             Err(mc_entity::RegionOwnerLaneError::Journal) => {
                 let failure = self.entities.take_journal_failure(candidate_uuids);
@@ -355,6 +361,7 @@ fn build_herd_spawn_candidates(
     chunk: (i32, i32),
     spawns: &[HerdSpawn],
     player_positions: &[Vec3],
+    lifecycle_tick: u64,
 ) -> Vec<SpawnEntity> {
     let mut passive_count = 0_usize;
     let mut hostile_count = 0_usize;
@@ -376,6 +383,7 @@ fn build_herd_spawn_candidates(
             spawn.entity_type_name.clone(),
             spawn.position,
         );
+        entity.retained.spawn_tick = lifecycle_tick;
         entity.uuid = Some(herd_uuid(spawn.chunk, spawn.slot));
         apply_entity_facts(&mut entity);
         if let Some(color) = spawn.sheep_color {
@@ -437,13 +445,12 @@ fn entity_type_is_aquatic(type_name: &str) -> bool {
 pub(in crate::play::session) fn install_committed_herd_spawns_locked(
     inner: &mut SessionRegistryInner,
     committed: Vec<EntitySnapshot>,
-    lifecycle_tick: u64,
+    _lifecycle_tick: u64,
 ) -> Vec<VisibilityDispatch> {
     let mut snapshots = Vec::with_capacity(committed.len());
     for entity in committed {
         let aabb = entity_aabb(&entity.type_name);
         let snapshot = server_entity_snapshot_from(entity);
-        inner.entity_spawn_ticks.insert(snapshot.id, lifecycle_tick);
         inner
             .entity_type_aabbs
             .entry(snapshot.type_id)

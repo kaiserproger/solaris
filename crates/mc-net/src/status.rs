@@ -143,7 +143,9 @@ mod tests {
             items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
             item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
             block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            entity_types: std::sync::Arc::new(
+                mc_data::entity_types::solaris_required_entity_types(),
+            ),
             biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: crate::ChunkPipelinePolicy::default(),
             random_tick: crate::RandomTickPolicy::default(),

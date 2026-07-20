@@ -18,20 +18,20 @@ async fn survival_break_mature_wheat_drops_wheat_and_seeds() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
-    let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let farmland = crop_test_state(&blocks, "minecraft:farmland", &[]);
     let wheat_age7 = crop_test_state(&blocks, "minecraft:wheat", &[("age", "7")]);
@@ -45,6 +45,17 @@ async fn survival_break_mature_wheat_drops_wheat_and_seeds() {
     let item_entity_type = entity_types
         .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
         .expect("item entity type") as i32;
+    let surface_y = top_non_air_y(
+        &mut storage,
+        0,
+        0,
+        mc_world::BlockStateId(air_state_id as u32),
+    )
+    .expect("spawn terrain");
+    let wheat_pos = (2, surface_y + 1, 2);
+    crop_test_set(&mut storage, (wheat_pos.0, surface_y, wheat_pos.2), farmland);
+    crop_test_set(&mut storage, wheat_pos, wheat_age7);
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -76,14 +87,9 @@ async fn survival_break_mature_wheat_drops_wheat_and_seeds() {
 
     let (mut client, sync) = connect_to_play(addr, "M58WheatDrops").await;
     drain_until_chunk(&mut client, (0, 0)).await;
+    move_without_position_correction(&mut client, 0.5, sync.y, 0.5, 0.0, 0.0).await;
 
-    let support_y = sync.y.floor() as i32 - 2;
-    let wheat_pos = (0, support_y + 1, 2);
-    {
-        let mut storage = world.lock().await;
-        crop_test_set(&mut storage, (wheat_pos.0, support_y, wheat_pos.2), farmland);
-        crop_test_set(&mut storage, wheat_pos, wheat_age7);
-    }
+    assert_eq!(sync.y.floor() as i32 - 2, surface_y, "seeded spawn terrain");
 
     let target_pos = pack_block_pos(wheat_pos.0, wheat_pos.1, wheat_pos.2);
     client
@@ -125,7 +131,9 @@ async fn wait_for_wheat_harvest_drops(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_block_break && saw_ack && saw_wheat && saw_seeds) {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("wheat harvest drop response");
         if handle_keepalive(client, frame.id, &frame.body).await {

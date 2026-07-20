@@ -7,8 +7,8 @@
 //! fluid placement primitives, and optional data-backed structure markers.
 //! Vertical base layers:
 //!
-//! - `y = MIN_Y` → bedrock
-//! - `MIN_Y < y < height - 3` → stone
+//! - `y = geometry.min_y()` → bedrock
+//! - `geometry.min_y() < y < height - 3` → stone
 //! - `height - 3 ≤ y < height` → dirt
 //! - `y = height` → grass_block
 //! - `y > height` → air
@@ -20,7 +20,6 @@
 use std::sync::Arc;
 
 use mc_data::Identifier;
-use mc_data::worldgen_features::{FeatureCount, WorldgenFeatureFacts};
 use mc_world::chunk::{Chunk, ChunkGeometry, ChunkPos, Heightmap, OVERWORLD_GEOMETRY};
 use mc_world::{
     BIOME_DIM, BIOME_VOLUME, BiomeSection, BlockRegistry, BlockStateId, ChunkGenerator,
@@ -62,8 +61,8 @@ const NOISE_FREQUENCY: f64 = 1.0 / 40.0;
 const NOISE_OCTAVES: u32 = 3;
 const NOISE_PERSISTENCE: f64 = 0.5;
 pub const SEA_LEVEL: i32 = 63;
-pub const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
-pub const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
+const METERS_PER_DEGREE: f64 = 111_319.491_666_666_67;
+const MAX_MERCATOR_LATITUDE: f64 = 85.051_128_78;
 const CONTINENT_FREQUENCY: f64 = 1.0 / 420.0;
 const COAST_DETAIL_FREQUENCY: f64 = 1.0 / 96.0;
 const FOREST_FREQUENCY: f64 = 1.0 / 520.0;
@@ -136,64 +135,41 @@ pub enum WorldgenMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MercatorProjection {
+struct MercatorProjection {
     world_scale_meters_per_block: f64,
 }
 
 impl MercatorProjection {
     #[must_use]
-    pub fn new(world_scale_meters_per_block: f64) -> Self {
+    fn new(world_scale_meters_per_block: f64) -> Self {
         Self {
             world_scale_meters_per_block: world_scale_meters_per_block.max(0.001),
         }
     }
 
     #[must_use]
-    pub fn from_settings(settings: TellusWorldgenSettings) -> Self {
+    fn from_settings(settings: TellusWorldgenSettings) -> Self {
         Self::new(settings.world_scale_meters_per_block)
     }
 
     #[must_use]
-    pub fn blocks_per_degree(&self) -> f64 {
+    fn blocks_per_degree(&self) -> f64 {
         METERS_PER_DEGREE / self.world_scale_meters_per_block
     }
 
     #[must_use]
-    pub fn lat_lon_to_block(&self, latitude_degrees: f64, longitude_degrees: f64) -> (f64, f64) {
-        let lat = latitude_degrees.clamp(-MAX_MERCATOR_LATITUDE, MAX_MERCATOR_LATITUDE);
-        let lon = longitude_degrees.clamp(-180.0, 180.0);
-        let x = lon * self.blocks_per_degree();
-        let lat_rad = lat.to_radians();
-        let mercator_degrees = (lat_rad.tan() + lat_rad.cos().recip()).ln().to_degrees();
-        let z = -mercator_degrees * self.blocks_per_degree();
-        (x, z)
-    }
-
-    #[must_use]
-    pub fn block_to_lat_lon(&self, x: f64, z: f64) -> (f64, f64) {
-        let longitude = (x / self.blocks_per_degree()).clamp(-180.0, 180.0);
+    fn latitude_from_block_z(&self, z: f64) -> f64 {
         let mercator_radians = (-z / self.blocks_per_degree()).to_radians();
-        let latitude = mercator_radians.sinh().atan().to_degrees();
-        (latitude, longitude)
+        mercator_radians.sinh().atan().to_degrees()
     }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TellusClimate {
-    pub latitude_degrees: f64,
-    pub temperature: f64,
-    pub moisture: f64,
+struct TellusClimate {
+    latitude_degrees: f64,
+    temperature: f64,
+    moisture: f64,
 }
-
-pub const GENERATION_STAGE_ORDER: &[&str] = &[
-    "base_terrain_and_surfaces",
-    "caves_and_ores",
-    "biome_assignment",
-    "surface_decorations",
-    "structures",
-    "heightmap_refresh",
-    "persistence_or_streaming",
-];
 
 /// Hill-noise terrain. Holds the resolved state ids of the four
 /// block types it emits so `generate` is allocation-free past the
@@ -219,10 +195,6 @@ pub struct TerrainGenerator {
     structures: StructureRules,
     decorations: DecorationBlocks,
     worldgen_mode: WorldgenMode,
-    // Kept so the generator's lifetime is bounded by something
-    // sensible if the storage drops the only other reference.
-    #[allow(dead_code)]
-    registry: Arc<BlockRegistry>,
 }
 
 #[derive(Clone)]
@@ -253,7 +225,6 @@ struct DecorationBlocks {
     short_grass: Option<BlockStateId>,
     dandelion: Option<BlockStateId>,
     poppy: Option<BlockStateId>,
-    flower_patch: Vec<BlockStateId>,
     grass_patch_spacing: u64,
     pumpkin: Option<BlockStateId>,
     sugar_cane: Option<BlockStateId>,
@@ -283,10 +254,6 @@ impl DecorationBlocks {
             short_grass: optional_block(registry, "minecraft:short_grass"),
             dandelion: optional_block(registry, "minecraft:dandelion"),
             poppy: optional_block(registry, "minecraft:poppy"),
-            flower_patch: ["minecraft:dandelion", "minecraft:poppy"]
-                .into_iter()
-                .filter_map(|name| optional_block(registry, name))
-                .collect(),
             grass_patch_spacing: 11,
             pumpkin: optional_block(registry, "minecraft:pumpkin"),
             sugar_cane: optional_block(registry, "minecraft:sugar_cane"),
@@ -295,75 +262,6 @@ impl DecorationBlocks {
             kelp_plant: optional_block(registry, "minecraft:kelp_plant"),
             kelp: optional_block(registry, "minecraft:kelp"),
         }
-    }
-
-    fn from_feature_facts(registry: &BlockRegistry, features: &[WorldgenFeatureFacts]) -> Self {
-        let mut blocks = Self::new(registry);
-        for feature in features {
-            match feature.placed_feature.as_str() {
-                "minecraft:patch_grass_plain" => {
-                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
-                        blocks.short_grass = Some(state);
-                    }
-                    if let Some(spacing) = feature.placement.count.map(|count| {
-                        decoration_spacing_from_count(count, blocks.grass_patch_spacing)
-                    }) {
-                        blocks.grass_patch_spacing = spacing;
-                    }
-                }
-                "minecraft:flower_plain" => {
-                    let states = resolve_blocks(registry, &feature.block_states);
-                    if !states.is_empty() {
-                        blocks.flower_patch = states;
-                        blocks.dandelion = blocks.flower_patch.first().copied();
-                        blocks.poppy = blocks.flower_patch.get(1).copied().or(blocks.dandelion);
-                    }
-                }
-                "minecraft:patch_cactus" => {
-                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
-                        blocks.cactus = Some(state);
-                    }
-                }
-                "minecraft:patch_sugar_cane" | "minecraft:sugar_cane" => {
-                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
-                        blocks.sugar_cane = Some(state);
-                    }
-                }
-                "minecraft:seagrass_simple" | "minecraft:seagrass_normal" => {
-                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
-                        blocks.seagrass = Some(state);
-                    }
-                }
-                "minecraft:kelp_cold" | "minecraft:kelp_warm" => {
-                    if let Some(state) = first_resolved_block(registry, &feature.block_states) {
-                        blocks.kelp = Some(state);
-                    }
-                    blocks.kelp_plant = blocks
-                        .kelp_plant
-                        .or_else(|| optional_block(registry, "minecraft:kelp_plant"));
-                }
-                _ => {}
-            }
-            let placed = feature.placed_feature.as_str();
-            if placed.contains("trees") || placed.contains("tree") {
-                let log = first_resolved_block_with_suffix(registry, &feature.block_states, "_log");
-                let leaves = first_resolved_generated_leaves(registry, &feature.block_states);
-                if placed.contains("jungle") {
-                    blocks.jungle_log = log.or(blocks.jungle_log);
-                    blocks.jungle_leaves = leaves.or(blocks.jungle_leaves);
-                } else if placed.contains("taiga") || placed.contains("spruce") {
-                    blocks.cold_log = log.or(blocks.cold_log);
-                    blocks.cold_leaves = leaves.or(blocks.cold_leaves);
-                } else if placed.contains("forest") || placed.contains("birch") {
-                    blocks.forest_log = log.or(blocks.forest_log);
-                    blocks.forest_leaves = leaves.or(blocks.forest_leaves);
-                } else {
-                    blocks.oak_log = log.or(blocks.oak_log);
-                    blocks.oak_leaves = leaves.or(blocks.oak_leaves);
-                }
-            }
-        }
-        blocks
     }
 }
 
@@ -406,46 +304,14 @@ fn generated_leaf_state(registry: &BlockRegistry, id: &Identifier) -> Option<Blo
         .or_else(|| registry.block(id).map(|block| block.default))
 }
 
-fn first_resolved_block(registry: &BlockRegistry, ids: &[Identifier]) -> Option<BlockStateId> {
-    ids.iter()
-        .find_map(|id| registry.block(id).map(|block| block.default))
+fn checked_y_offset(y: i32, offset: i32) -> Option<i32> {
+    i32::try_from(i64::from(y) + i64::from(offset)).ok()
 }
 
-fn first_resolved_block_with_suffix(
-    registry: &BlockRegistry,
-    ids: &[Identifier],
-    suffix: &str,
-) -> Option<BlockStateId> {
-    ids.iter()
-        .filter(|id| id.path().ends_with(suffix))
-        .find_map(|id| registry.block(id).map(|block| block.default))
-}
-
-fn first_resolved_generated_leaves(
-    registry: &BlockRegistry,
-    ids: &[Identifier],
-) -> Option<BlockStateId> {
-    ids.iter()
-        .filter(|id| id.path().ends_with("_leaves"))
-        .find_map(|id| generated_leaf_state(registry, id))
-}
-
-fn resolve_blocks(registry: &BlockRegistry, ids: &[Identifier]) -> Vec<BlockStateId> {
-    ids.iter()
-        .filter_map(|id| registry.block(id).map(|block| block.default))
-        .collect()
-}
-
-fn decoration_spacing_from_count(count: FeatureCount, fallback: u64) -> u64 {
-    let count = match count {
-        FeatureCount::Constant(count) => count,
-        FeatureCount::Uniform { min, max } => min.saturating_add(max) / 2,
-    };
-    if count == 0 {
-        fallback
-    } else {
-        (256 / count).clamp(3, 29) as u64
-    }
+fn heightmap_value_for_top(geometry: ChunkGeometry, top: i32) -> Option<u32> {
+    let value = i64::from(top) + 1 - i64::from(geometry.min_y());
+    let value = u32::try_from(value).ok()?;
+    (value <= geometry.height() as u32).then_some(value)
 }
 
 impl TerrainGenerator {
@@ -457,18 +323,8 @@ impl TerrainGenerator {
     /// [`TerrainGenerator::try_with_biome_rules`] for fallible startup validation.
     #[must_use]
     pub fn new(seed: i64, registry: Arc<BlockRegistry>) -> Self {
-        Self::with_biome_rules(seed, registry, BiomeRules::vanilla_overworld())
-    }
-
-    /// Build a generator with explicit biome rules.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the registry is missing required vanilla terrain blocks. Use
-    /// [`TerrainGenerator::try_with_biome_rules`] for fallible startup validation.
-    #[must_use]
-    pub fn with_biome_rules(seed: i64, registry: Arc<BlockRegistry>, biomes: BiomeRules) -> Self {
-        Self::try_with_biome_rules(seed, registry, biomes).unwrap_or_else(|err| panic!("{err}"))
+        Self::try_with_biome_rules(seed, registry, BiomeRules::vanilla_overworld())
+            .unwrap_or_else(|err| panic!("{err}"))
     }
 
     pub fn try_with_biome_rules(
@@ -558,7 +414,6 @@ impl TerrainGenerator {
             structures: StructureRules::none(),
             decorations: DecorationBlocks::new(registry.as_ref()),
             worldgen_mode: WorldgenMode::VanillaLike,
-            registry,
         })
     }
 
@@ -571,12 +426,6 @@ impl TerrainGenerator {
     #[must_use]
     pub fn with_geometry(mut self, geometry: ChunkGeometry) -> Self {
         self.geometry = geometry;
-        self
-    }
-
-    #[must_use]
-    pub fn with_feature_facts(mut self, features: &[WorldgenFeatureFacts]) -> Self {
-        self.decorations = DecorationBlocks::from_feature_facts(self.registry.as_ref(), features);
         self
     }
 
@@ -594,8 +443,11 @@ impl TerrainGenerator {
     }
 
     fn clamp_surface_height(&self, raw: f64) -> i32 {
-        let min = self.geometry.min_y() + 2;
-        let max = (self.geometry.max_y() - 2).min(250).max(min);
+        let min = checked_y_offset(self.geometry.min_y(), 2).unwrap_or(self.geometry.min_y());
+        let max = checked_y_offset(self.geometry.max_y(), -2)
+            .unwrap_or(self.geometry.max_y())
+            .min(250)
+            .max(min);
         raw.round().clamp(min as f64, max as f64) as i32
     }
 
@@ -633,7 +485,7 @@ impl TerrainGenerator {
         settings: TellusWorldgenSettings,
     ) -> i32 {
         let projection = MercatorProjection::from_settings(settings);
-        let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let latitude = projection.latitude_from_block_z(world_z as f64);
         let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
         let land_mask = self.tellus_land_mask(world_x, world_z, settings);
         let ridges = self.ridges(world_x / 8, world_z / 8);
@@ -671,7 +523,7 @@ impl TerrainGenerator {
         settings: TellusWorldgenSettings,
     ) -> f64 {
         let projection = MercatorProjection::from_settings(settings);
-        let (latitude, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let latitude = projection.latitude_from_block_z(world_z as f64);
         let equator_weight = (1.0 - latitude.abs() / MAX_MERCATOR_LATITUDE).clamp(0.0, 1.0);
         let continent = fbm_2d(
             world_x as f64 / TELLUS_CONTINENT_SCALE,
@@ -691,15 +543,16 @@ impl TerrainGenerator {
     }
 
     #[must_use]
-    pub fn tellus_climate(&self, world_x: i32, height: i32, world_z: i32) -> TellusClimate {
+    fn tellus_climate(&self, world_x: i32, height: i32, world_z: i32) -> TellusClimate {
         let settings = match self.worldgen_mode {
             WorldgenMode::VanillaLike => TellusWorldgenSettings::default(),
             WorldgenMode::TellusLike(settings) => settings,
         };
         let projection = MercatorProjection::from_settings(settings);
-        let (latitude_degrees, _) = projection.block_to_lat_lon(world_x as f64, world_z as f64);
+        let latitude_degrees = projection.latitude_from_block_z(world_z as f64);
         let latitude_cooling = latitude_degrees.abs() / MAX_MERCATOR_LATITUDE;
-        let altitude_cooling = ((height - settings.sea_level).max(0) as f64 / 128.0).min(1.0);
+        let altitude = (i64::from(height) - i64::from(settings.sea_level)).max(0);
+        let altitude_cooling = (altitude as f64 / 128.0).min(1.0);
         let weather = fbm_2d(
             world_x as f64 / TELLUS_CLIMATE_SCALE,
             world_z as f64 / TELLUS_CLIMATE_SCALE,
@@ -823,24 +676,26 @@ impl TerrainGenerator {
         settings: TellusWorldgenSettings,
     ) -> Identifier {
         let sea_level = settings.sea_level;
+        let height_y = i64::from(height);
+        let sea_y = i64::from(sea_level);
         let land_mask = self.tellus_land_mask(world_x, world_z, settings);
         let climate = self.tellus_climate(world_x, height, world_z);
         let mountain = self.tellus_mountain_factor(world_x, world_z);
         let river = self.river_signal(world_x / 2, world_z / 2);
 
         if settings.water_enabled {
-            if height < sea_level - 18 {
+            if height_y < sea_y - 18 {
                 return self
                     .biomes
                     .pick(&self.biomes.deep_ocean, world_x, world_z, 0x5444_4545);
             }
-            if height < sea_level - 1 {
+            if height_y < sea_y - 1 {
                 return self
                     .biomes
                     .pick(&self.biomes.ocean, world_x, world_z, 0x544F_434E);
             }
         }
-        if land_mask.abs() < 0.08 || height <= sea_level + BEACH_HEIGHT_ABOVE_SEA {
+        if land_mask.abs() < 0.08 || height_y <= sea_y + i64::from(BEACH_HEIGHT_ABOVE_SEA) {
             return self
                 .biomes
                 .pick(&self.biomes.beach, world_x, world_z, 0x5442_4541);
@@ -850,7 +705,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.river, world_x, world_z, 0x5452_4956);
         }
-        if height > sea_level + 86 || mountain > 0.22 {
+        if height_y > sea_y + 86 || mountain > 0.22 {
             return self
                 .biomes
                 .pick(&self.biomes.mountain, world_x, world_z, 0x544D_4F55);
@@ -860,7 +715,7 @@ impl TerrainGenerator {
                 .biomes
                 .pick(&self.biomes.cave, world_x, world_z, 0x5443_4156);
         }
-        if climate.moisture > 0.62 && height <= sea_level + 8 {
+        if climate.moisture > 0.62 && height_y <= sea_y + 8 {
             return self
                 .biomes
                 .pick(&self.biomes.swamp, world_x, world_z, 0x5453_5741);
@@ -896,7 +751,7 @@ impl TerrainGenerator {
         world_z: i32,
         surface_height: i32,
     ) -> Identifier {
-        if y < surface_height - 24 && y < 32 {
+        if i64::from(y) < i64::from(surface_height) - 24 && y < 32 {
             return self
                 .biomes
                 .pick(&self.biomes.cave, world_x, world_z, 0x554E_4447);
@@ -983,10 +838,13 @@ impl TerrainGenerator {
             WorldgenMode::TellusLike(settings) => (settings.sea_level, settings.water_enabled),
         };
         let top_non_air = if water_enabled && (height < sea_level || self.biomes.is_river(&biome)) {
-            sea_level.clamp(height, self.geometry.max_y() - 1)
+            let inclusive_top = checked_y_offset(self.geometry.max_y(), -1).unwrap_or(height);
+            sea_level.clamp(height, inclusive_top)
         } else {
             height
         };
+        let minimum_fill_y =
+            checked_y_offset(self.geometry.min_y(), 1).unwrap_or(self.geometry.min_y());
         ColumnPlan {
             lx,
             lz,
@@ -994,7 +852,9 @@ impl TerrainGenerator {
             wz,
             height,
             top_non_air,
-            dirt_start: (height - DIRT_DEPTH).max(self.geometry.min_y() + 1),
+            dirt_start: checked_y_offset(height, -DIRT_DEPTH)
+                .unwrap_or(minimum_fill_y)
+                .max(minimum_fill_y),
             biome,
             surface,
             fill,
@@ -1017,7 +877,10 @@ impl TerrainGenerator {
     fn fill_column(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
         let min_y = self.geometry.min_y();
         let _ = chunk.set_block(plan.lx, min_y, plan.lz, self.bedrock);
-        for y in (min_y + 1)..plan.dirt_start {
+        let Some(first_fill_y) = checked_y_offset(min_y, 1) else {
+            return;
+        };
+        for y in first_fill_y..plan.dirt_start {
             let _ = chunk.set_block(
                 plan.lx,
                 y,
@@ -1030,7 +893,10 @@ impl TerrainGenerator {
         }
         let _ = chunk.set_block(plan.lx, plan.height, plan.lz, plan.surface);
         if plan.top_non_air > plan.height {
-            for y in (plan.height + 1)..=plan.top_non_air {
+            let Some(first_water_y) = checked_y_offset(plan.height, 1) else {
+                return;
+            };
+            for y in first_water_y..=plan.top_non_air {
                 let _ = chunk.set_block(plan.lx, y, plan.lz, self.water);
             }
         }
@@ -1072,7 +938,13 @@ impl TerrainGenerator {
                         let lx = cx * 4 + 2;
                         let lz = cz * 4 + 2;
                         let column = &columns[lz * 16 + lx];
-                        let y = self.geometry.min_y() + section_idx as i32 * 16 + cy as i32 * 4 + 2;
+                        let y = i64::from(self.geometry.min_y())
+                            + section_idx as i64 * 16
+                            + cy as i64 * 4
+                            + 2;
+                        let Ok(y) = i32::try_from(y) else {
+                            continue;
+                        };
                         let biome = self.biome_for_cell(column.wx, y, column.wz, column.height);
                         let palette_idx = palette
                             .iter()
@@ -1095,7 +967,10 @@ impl TerrainGenerator {
     }
 
     fn apply_features(&self, chunk: &mut Chunk, plan: &ColumnPlan) {
-        if plan.dirt_start <= self.geometry.min_y() + 1 {
+        let Some(first_fill_y) = checked_y_offset(self.geometry.min_y(), 1) else {
+            return;
+        };
+        if plan.dirt_start <= first_fill_y {
             return;
         }
         let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(plan);
@@ -1104,21 +979,21 @@ impl TerrainGenerator {
     }
 
     fn apply_caves(&self, chunk: &mut Chunk, plan: &ColumnPlan, cave_mouth_depth: i32) {
-        let surface_clearance = CAVE_SURFACE_CLEARANCE - cave_mouth_depth;
-        let cave_max_y = (plan.height - surface_clearance).min(plan.dirt_start - 1);
-        let cave_min_y = self.geometry.min_y() + 8;
-        if cave_max_y < cave_min_y {
+        let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(plan, cave_mouth_depth) else {
             return;
-        }
+        };
         let mut y = cave_min_y;
         while y <= cave_max_y {
             if self.is_cave_cell(plan.wx, y, plan.wz) {
-                let end = (y + 1).min(cave_max_y);
+                let end = checked_y_offset(y, 1).unwrap_or(cave_max_y).min(cave_max_y);
                 for carve_y in y..=end {
                     let _ = chunk.set_block(plan.lx, carve_y, plan.lz, self.air);
                 }
             }
-            y += 2;
+            let Some(next_y) = checked_y_offset(y, 2) else {
+                break;
+            };
+            y = next_y;
         }
     }
 
@@ -1131,8 +1006,15 @@ impl TerrainGenerator {
         if cave_mouth_depth == 0 {
             return;
         }
-        let floor = (plan.height - cave_mouth_depth).max(self.geometry.min_y() + 8);
-        for y in (floor + 1)..=plan.height {
+        let floor = (i64::from(plan.height) - i64::from(cave_mouth_depth))
+            .max(i64::from(self.geometry.min_y()) + 8);
+        let Ok(floor) = i32::try_from(floor) else {
+            return;
+        };
+        let Some(first_carved_y) = checked_y_offset(floor, 1) else {
+            return;
+        };
+        for y in first_carved_y..=plan.height {
             let _ = chunk.set_block(plan.lx, y, plan.lz, self.air);
         }
     }
@@ -1143,6 +1025,20 @@ impl TerrainGenerator {
         } else {
             self.surface_cave_mouth_depth(plan.wx, plan.wz)
         }
+    }
+
+    fn cave_y_bounds(&self, plan: &ColumnPlan, cave_mouth_depth: i32) -> Option<(i32, i32)> {
+        let surface_clearance = i64::from(CAVE_SURFACE_CLEARANCE) - i64::from(cave_mouth_depth);
+        let cave_min_y = i64::from(self.geometry.min_y()) + 8;
+        let cave_max_y =
+            (i64::from(plan.height) - surface_clearance).min(i64::from(plan.dirt_start) - 1);
+        if cave_max_y < cave_min_y {
+            return None;
+        }
+        Some((
+            i32::try_from(cave_min_y).ok()?,
+            i32::try_from(cave_max_y).ok()?,
+        ))
     }
 
     fn apply_ores(&self, chunk: &mut Chunk) {
@@ -1158,8 +1054,14 @@ impl TerrainGenerator {
         let max_cell_z = (chunk_min_z + 15 + radius).div_euclid(cell_edge);
 
         for (rule_index, rule) in self.ores.rules().iter().enumerate() {
-            let min_y = rule.y.min.max(self.geometry.min_y() + 1);
-            let max_y = rule.y.max.min(self.geometry.max_y() - 1);
+            let Some(first_stone_y) = checked_y_offset(self.geometry.min_y(), 1) else {
+                continue;
+            };
+            let Some(inclusive_top) = checked_y_offset(self.geometry.max_y(), -1) else {
+                continue;
+            };
+            let min_y = rule.y.min.max(first_stone_y);
+            let max_y = rule.y.max.min(inclusive_top);
             if min_y > max_y {
                 continue;
             }
@@ -1171,7 +1073,11 @@ impl TerrainGenerator {
             let rule_salt = 0x0AE0_0000_u64 ^ rule_index as u64;
 
             for cell_y in min_cell_y..=max_cell_y {
-                let sample_y = cell_y * ORE_ANCHOR_CELL_EDGE + ORE_ANCHOR_CELL_EDGE / 2;
+                let sample_y = i64::from(cell_y) * i64::from(ORE_ANCHOR_CELL_EDGE)
+                    + i64::from(ORE_ANCHOR_CELL_EDGE / 2);
+                let Ok(sample_y) = i32::try_from(sample_y) else {
+                    continue;
+                };
                 let spacing = rule.spacing.at_y(sample_y, rule.y).max(1);
                 let denominator = spacing.saturating_mul(vein_size as u64).max(1);
                 for cell_z in min_cell_z..=max_cell_z {
@@ -1290,7 +1196,9 @@ impl TerrainGenerator {
 
     fn place_ore_cell(&self, chunk: &mut Chunk, rule: &OreRule, anchor: [i32; 3], offset: [i8; 3]) {
         let world_x = i64::from(anchor[0]) + i64::from(offset[0]);
-        let world_y = anchor[1] + i32::from(offset[1]);
+        let Some(world_y) = anchor[1].checked_add(i32::from(offset[1])) else {
+            return;
+        };
         let world_z = i64::from(anchor[2]) + i64::from(offset[2]);
         let chunk_min_x = i64::from(chunk.pos.x) * 16;
         let chunk_min_z = i64::from(chunk.pos.z) * 16;
@@ -1376,16 +1284,23 @@ impl TerrainGenerator {
 
         let cave_mouth_depth = self.surface_cave_mouth_depth_for_plan(&plan);
         if cave_mouth_depth != 0 {
-            let floor = (plan.height - cave_mouth_depth).max(self.geometry.min_y() + 8);
+            let floor = (i64::from(plan.height) - i64::from(cave_mouth_depth))
+                .max(i64::from(self.geometry.min_y()) + 8);
+            let Ok(floor) = i32::try_from(floor) else {
+                return None;
+            };
             if y > floor {
                 return Some(self.air);
             }
         }
-        let cave_min_y = self.geometry.min_y() + 8;
-        let surface_clearance = CAVE_SURFACE_CLEARANCE - cave_mouth_depth;
-        let cave_max_y = (plan.height - surface_clearance).min(plan.dirt_start - 1);
-        if (cave_min_y..=cave_max_y).contains(&y) {
-            let sample_y = cave_min_y + (y - cave_min_y).div_euclid(2) * 2;
+        if let Some((cave_min_y, cave_max_y)) = self.cave_y_bounds(&plan, cave_mouth_depth)
+            && (cave_min_y..=cave_max_y).contains(&y)
+        {
+            let sample_y =
+                i64::from(cave_min_y) + (i64::from(y) - i64::from(cave_min_y)).div_euclid(2) * 2;
+            let Ok(sample_y) = i32::try_from(sample_y) else {
+                return None;
+            };
             if self.is_cave_cell(world_x, sample_y, world_z) {
                 return Some(self.air);
             }
@@ -1434,7 +1349,13 @@ impl TerrainGenerator {
                 let idx = lz as usize * 16 + lx as usize;
                 let plan = &columns[idx];
                 let height = plan.height;
-                if height <= self.geometry.min_y() || height + 8 >= self.geometry.max_y() {
+                let Some(decoration_limit) = checked_y_offset(height, 8) else {
+                    continue;
+                };
+                let Some(base_y) = checked_y_offset(height, 1) else {
+                    continue;
+                };
+                if height <= self.geometry.min_y() || decoration_limit >= self.geometry.max_y() {
                     continue;
                 }
                 let biome = &plan.biome;
@@ -1451,7 +1372,7 @@ impl TerrainGenerator {
                     && self.place_tree(
                         chunk,
                         lx,
-                        height + 1,
+                        base_y,
                         lz,
                         self.tree_blocks_for_biome(biome),
                         &mut touched,
@@ -1462,13 +1383,13 @@ impl TerrainGenerator {
                 if self.biomes.hot_dry.contains(biome)
                     && surface == self.sand
                     && h.is_multiple_of(47)
-                    && self.place_cactus(chunk, lx, height + 1, lz, &mut touched)
+                    && self.place_cactus(chunk, lx, base_y, lz, &mut touched)
                 {
                     continue;
                 }
                 if (self.biomes.beach.contains(biome) || self.biomes.river.contains(biome))
                     && h.is_multiple_of(29)
-                    && self.place_sugar_cane(chunk, lx, height + 1, lz, &mut touched)
+                    && self.place_sugar_cane(chunk, lx, base_y, lz, &mut touched)
                 {
                     continue;
                 }
@@ -1489,19 +1410,22 @@ impl TerrainGenerator {
                         None
                     };
                     if let Some(plant) = plant {
-                        self.place_single(chunk, lx, height + 1, lz, plant, &mut touched);
+                        self.place_single(chunk, lx, base_y, lz, plant, &mut touched);
                     }
                 }
-                if self.biomes.is_ocean(biome) && plan.top_non_air > height + 2 {
+                if self.biomes.is_ocean(biome)
+                    && checked_y_offset(height, 2)
+                        .is_some_and(|minimum_top| plan.top_non_air > minimum_top)
+                {
                     if h.is_multiple_of(31) && self.place_kelp_column(chunk, plan, h, &mut touched)
                     {
                         continue;
                     }
                     if h.is_multiple_of(17)
                         && let Some(seagrass) = self.decorations.seagrass
-                        && chunk.get_block(lx, height + 1, lz) == Some(self.water)
+                        && chunk.get_block(lx, base_y, lz) == Some(self.water)
                     {
-                        self.place_single(chunk, lx, height + 1, lz, seagrass, &mut touched);
+                        self.place_single(chunk, lx, base_y, lz, seagrass, &mut touched);
                     }
                 }
             }
@@ -1527,16 +1451,21 @@ impl TerrainGenerator {
         let (Some(log), Some(leaves)) = blocks else {
             return false;
         };
-        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || base_y + 5 >= self.geometry.max_y()
-        {
+        let Some(top_y) = checked_y_offset(base_y, 5) else {
+            return false;
+        };
+        let Some(trunk_top_y) = checked_y_offset(base_y, 3) else {
+            return false;
+        };
+        if !(2..=13).contains(&lx) || !(2..=13).contains(&lz) || top_y >= self.geometry.max_y() {
             return false;
         }
-        for y in base_y..=(base_y + 5) {
+        for y in base_y..=top_y {
             if chunk.get_block(lx, y, lz) != Some(self.air) {
                 return false;
             }
         }
-        for y in base_y..=(base_y + 3) {
+        for y in base_y..=trunk_top_y {
             self.place_single(chunk, lx, y, lz, log, touched);
         }
         for dz in -2i8..=2 {
@@ -1547,7 +1476,7 @@ impl TerrainGenerator {
                 }
                 let x = lx.wrapping_add_signed(dx);
                 let z = lz.wrapping_add_signed(dz);
-                for y in (base_y + 3)..=(base_y + 5) {
+                for y in trunk_top_y..=top_y {
                     if chunk.get_block(x, y, z) == Some(self.air) {
                         self.place_single(chunk, x, y, z, leaves, touched);
                     }
@@ -1585,12 +1514,15 @@ impl TerrainGenerator {
         };
         let height =
             1 + (feature_hash(self.seed, lx as i32, base_y, lz as i32, 0xCA_C7) % 3) as i32;
-        for y in base_y..(base_y + height) {
+        let Some(top_exclusive) = checked_y_offset(base_y, height) else {
+            return false;
+        };
+        for y in base_y..top_exclusive {
             if chunk.get_block(lx, y, lz) != Some(self.air) {
                 return false;
             }
         }
-        for y in base_y..(base_y + height) {
+        for y in base_y..top_exclusive {
             self.place_single(chunk, lx, y, lz, cactus, touched);
         }
         true
@@ -1607,14 +1539,19 @@ impl TerrainGenerator {
         let Some(sugar_cane) = self.decorations.sugar_cane else {
             return false;
         };
+        let Some(below_y) = checked_y_offset(base_y, -1) else {
+            return false;
+        };
         if chunk.get_block(lx, base_y, lz) != Some(self.air)
-            || !self.has_adjacent_water(chunk, lx, base_y - 1, lz)
+            || !self.has_adjacent_water(chunk, lx, below_y, lz)
         {
             return false;
         }
         self.place_single(chunk, lx, base_y, lz, sugar_cane, touched);
-        if chunk.get_block(lx, base_y + 1, lz) == Some(self.air) {
-            self.place_single(chunk, lx, base_y + 1, lz, sugar_cane, touched);
+        if let Some(above_y) = checked_y_offset(base_y, 1)
+            && chunk.get_block(lx, above_y, lz) == Some(self.air)
+        {
+            self.place_single(chunk, lx, above_y, lz, sugar_cane, touched);
         }
         true
     }
@@ -1631,7 +1568,8 @@ impl TerrainGenerator {
                 let x = x as u8;
                 let z = z as u8;
                 chunk.get_block(x, y, z) == Some(self.water)
-                    || chunk.get_block(x, y + 1, z) == Some(self.water)
+                    || checked_y_offset(y, 1).and_then(|above_y| chunk.get_block(x, above_y, z))
+                        == Some(self.water)
             })
     }
 
@@ -1644,18 +1582,22 @@ impl TerrainGenerator {
     ) -> bool {
         let lx = plan.lx;
         let lz = plan.lz;
-        let base_y = plan.height + 1;
+        let Some(base_y) = checked_y_offset(plan.height, 1) else {
+            return false;
+        };
         let water_top = plan.top_non_air;
         let Some(kelp) = self.decorations.kelp else {
             return false;
         };
         let stem = self.decorations.kelp_plant.unwrap_or(kelp);
-        let available = water_top - base_y + 1;
+        let available = i64::from(water_top) - i64::from(base_y) + 1;
         if available < 2 {
             return false;
         }
-        let height = (2 + (hash % 5) as i32).min(available);
-        let top_y = base_y + height - 1;
+        let height = i64::from(2 + (hash % 5) as i32).min(available);
+        let Ok(top_y) = i32::try_from(i64::from(base_y) + height - 1) else {
+            return false;
+        };
         for y in base_y..=top_y {
             if chunk.get_block(lx, y, lz) != Some(self.water) {
                 return false;
@@ -1687,9 +1629,17 @@ impl TerrainGenerator {
         let current = chunk
             .heightmaps
             .get("MOTION_BLOCKING")
-            .map(|heightmap| heightmap.get(lx, lz) as i32 + self.geometry.min_y() - 1)
-            .unwrap_or(self.geometry.min_y());
-        let value = (top.max(current) + 1 - self.geometry.min_y()) as u32;
+            .map(|heightmap| {
+                i64::from(heightmap.get(lx, lz)) + i64::from(self.geometry.min_y()) - 1
+            })
+            .unwrap_or(i64::from(self.geometry.min_y()));
+        let top = i64::from(top).max(current);
+        let Ok(top) = i32::try_from(top) else {
+            return;
+        };
+        let Some(value) = heightmap_value_for_top(self.geometry, top) else {
+            return;
+        };
         if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
             mb.set(lx, lz, value);
         }
@@ -1722,7 +1672,9 @@ impl TerrainGenerator {
 
         let size = template.size();
         let origin_x = center_x - size[0] / 2;
-        let origin_y = center_height + 1;
+        let Some(origin_y) = checked_y_offset(center_height, 1) else {
+            return;
+        };
         let origin_z = center_z - size[2] / 2;
         paste_template(chunk, template, origin_x, origin_y, origin_z, touched);
     }
@@ -1756,7 +1708,9 @@ impl TerrainGenerator {
                     .is_some_and(|state| state != self.air)
             })
             .unwrap_or(self.geometry.min_y());
-        let value = (top + 1 - self.geometry.min_y()) as u32;
+        let Some(value) = heightmap_value_for_top(self.geometry, top) else {
+            return;
+        };
         if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
             mb.set(lx, lz, value);
         }
@@ -1990,11 +1944,19 @@ fn paste_template(
 ) {
     let min_x = chunk.pos.x * 16;
     let min_z = chunk.pos.z * 16;
+    let geometry = chunk.geometry();
     for block in template.blocks() {
         let wx = origin_x + block.pos[0];
-        let wy = origin_y + block.pos[1];
+        let Some(wy) = origin_y.checked_add(block.pos[1]) else {
+            continue;
+        };
         let wz = origin_z + block.pos[2];
-        if wx < min_x || wx >= min_x + 16 || wz < min_z || wz >= min_z + 16 {
+        if !(geometry.min_y()..geometry.max_y()).contains(&wy)
+            || wx < min_x
+            || wx >= min_x + 16
+            || wz < min_z
+            || wz >= min_z + 16
+        {
             continue;
         }
         let lx = (wx - min_x) as u8;
@@ -2005,9 +1967,16 @@ fn paste_template(
     }
     for template_chest in template.chests() {
         let x = origin_x + template_chest.pos[0];
-        let y = origin_y + template_chest.pos[1];
+        let Some(y) = origin_y.checked_add(template_chest.pos[1]) else {
+            continue;
+        };
         let z = origin_z + template_chest.pos[2];
-        if x < min_x || x >= min_x + 16 || z < min_z || z >= min_z + 16 {
+        if !(geometry.min_y()..geometry.max_y()).contains(&y)
+            || x < min_x
+            || x >= min_x + 16
+            || z < min_z
+            || z >= min_z + 16
+        {
             continue;
         }
         let Some(expected_state) = template
@@ -2050,8 +2019,13 @@ impl ChunkGenerator for TerrainGenerator {
             self.apply_features(&mut chunk, plan);
             // Heightmap value: Y of the first air cell above the
             // Heightmaps store offsets from this dimension's minimum Y.
-            let world_surface = (plan.top_non_air + 1 - self.geometry.min_y()) as u32;
-            let motion_blocking = (plan.height + 1 - self.geometry.min_y()) as u32;
+            let Some(world_surface) = heightmap_value_for_top(self.geometry, plan.top_non_air)
+            else {
+                continue;
+            };
+            let Some(motion_blocking) = heightmap_value_for_top(self.geometry, plan.height) else {
+                continue;
+            };
             if let Some(mb) = chunk.heightmaps.get_mut("MOTION_BLOCKING") {
                 mb.set(plan.lx, plan.lz, motion_blocking);
             }

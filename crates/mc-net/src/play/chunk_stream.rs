@@ -74,6 +74,7 @@ static PRESSURE_FLUSH_COORDINATOR: OnceLock<tokio::sync::Mutex<()>> = OnceLock::
 pub(super) struct ChunkStreamState {
     world: WorldHandle,
     world_read: Option<mc_world::WorldReadView>,
+    world_mutation: Option<mc_world::WorldMutationView>,
     chunk_source: Option<mc_world::ChunkSourceView>,
     biomes: Arc<Registry>,
     blocks: Arc<BlockRegistry>,
@@ -104,7 +105,12 @@ pub(super) struct ChunkStreamState {
     configured_prepare_batch_size: usize,
     prepare_limit_stop_reason: ChunkPipelineStopReason,
     runtime_control: Option<crate::RuntimeControlHandle>,
+    chunk_pressure_source: Option<crate::control_plane::RuntimeControlChunkPressureSource>,
+    first_chunk_sla_source: Option<crate::control_plane::RuntimeControlFirstChunkSlaSource>,
+    first_chunk_sla_target_ms: u64,
+    first_chunk_sla_active: bool,
     result_queue_size: usize,
+    chunk_queue_saturated: bool,
     center_cx: i32,
     center_cz: i32,
     direction_yaw: f32,
@@ -923,10 +929,10 @@ impl ChunkStreamState {
             direction_yaw,
         ));
         let active_generation = Arc::new(AtomicU64::new(scheduler.current_generation().0));
-
         Self {
             world,
             world_read: None,
+            world_mutation: None,
             chunk_source: None,
             biomes,
             blocks,
@@ -957,7 +963,12 @@ impl ChunkStreamState {
             configured_prepare_batch_size: policy.chunk_prepare_batch_size.max(1),
             prepare_limit_stop_reason: ChunkPipelineStopReason::BatchLimit,
             runtime_control: None,
+            chunk_pressure_source: None,
+            first_chunk_sla_source: None,
+            first_chunk_sla_target_ms: u64::MAX,
+            first_chunk_sla_active: false,
             result_queue_size: policy.chunk_result_queue_size,
+            chunk_queue_saturated: false,
             center_cx,
             center_cz,
             direction_yaw,
@@ -1028,6 +1039,14 @@ impl ChunkStreamState {
         self
     }
 
+    pub(super) fn with_world_mutation(
+        mut self,
+        world_mutation: Option<mc_world::WorldMutationView>,
+    ) -> Self {
+        self.world_mutation = world_mutation;
+        self
+    }
+
     pub(super) fn with_chunk_source(
         mut self,
         chunk_source: Option<mc_world::ChunkSourceView>,
@@ -1045,6 +1064,11 @@ impl ChunkStreamState {
         mut self,
         runtime_control: Option<crate::RuntimeControlHandle>,
     ) -> Self {
+        if let Some(control) = runtime_control.as_ref() {
+            self.first_chunk_sla_target_ms = control.snapshot().policy.target_first_chunk_ms;
+            self.chunk_pressure_source = Some(control.chunk_pressure_source());
+            self.first_chunk_sla_source = Some(control.first_chunk_sla_source());
+        }
         self.runtime_control = runtime_control;
         self
     }
@@ -1199,6 +1223,7 @@ impl ChunkStreamState {
     }
 
     fn reset_window_metrics(&mut self) {
+        self.recover_runtime_control_sources();
         self.staged.clear();
         self.started = Instant::now();
         self.fetch_ms = 0;
@@ -1264,6 +1289,21 @@ impl ChunkStreamState {
     where
         W: AsyncWriteExt + Unpin,
     {
+        let result = self.step_inner(writer, light_cache).await;
+        if result.is_err() {
+            self.recover_runtime_control_sources();
+        }
+        result
+    }
+
+    async fn step_inner<W>(
+        &mut self,
+        writer: &mut W,
+        light_cache: &mut LightCache,
+    ) -> Result<ChunkStreamStep, ConnectionError>
+    where
+        W: AsyncWriteExt + Unpin,
+    {
         self.drain_ready();
         let unloads = self.observe_runtime_control();
         for (chunk_x, chunk_z) in unloads {
@@ -1292,6 +1332,7 @@ impl ChunkStreamState {
         if self.scheduler.is_complete() {
             self.dispatch_forward_prewarm();
             self.set_stop_reason(ChunkPipelineStopReason::Complete);
+            self.recover_runtime_control_sources();
             return Ok(ChunkStreamStep::Complete);
         }
         if !made_send_progress {
@@ -1328,28 +1369,68 @@ impl ChunkStreamState {
         let Some(runtime_control) = self.runtime_control.clone() else {
             return Vec::new();
         };
-        let report = runtime_control.report_pressure(crate::RuntimeControlInput {
-            tick_ms: 0,
-            queued_chunks: self
-                .ready
-                .len()
-                .saturating_add(self.scheduler.in_flight_len()),
-            queue_capacity: self.result_queue_size.max(1),
-            memory_used_mb: 0,
-            memory_limit_mb: 0,
-            first_chunk_ms: self.first_chunk_ms,
-        });
-        let memory_pressure_active = report.pressure == Some(crate::AutoscalePressure::Memory);
+        // Ready results remain scheduler in-flight until publication, so the
+        // scheduler count already includes every occupied result slot.
+        let queued_chunks = self.scheduler.in_flight_len();
+        let snapshot = runtime_control.snapshot();
+        let queue_capacity = self.result_queue_size.max(1);
+        let saturated = queued_chunks.saturating_mul(100)
+            >= queue_capacity.saturating_mul(snapshot.policy.queue_pressure_percent as usize);
+        self.set_chunk_queue_saturated(saturated);
+
+        let memory = runtime_control.memory_pressure_observation();
+        let memory_pressure_active = if memory.available && memory.sample.limit_mb > 0 {
+            memory.sample.used_mb.saturating_mul(100)
+                >= memory
+                    .sample
+                    .limit_mb
+                    .saturating_mul(u64::from(snapshot.policy.memory_pressure_percent))
+        } else {
+            memory.failures > 0
+        };
         let should_shed_memory = memory_pressure_active && !self.memory_pressure_active;
         if should_shed_memory {
             self.shed_memory_pressure_work();
         }
-        let unloads = self.apply_runtime_control_limits(report.limits);
+        let unloads = self.apply_runtime_control_limits(snapshot.limits);
         self.memory_pressure_active = memory_pressure_active;
         if memory_pressure_active {
             self.set_stop_reason(ChunkPipelineStopReason::MemoryPressure);
         }
         unloads
+    }
+
+    fn set_chunk_queue_saturated(&mut self, saturated: bool) {
+        if saturated == self.chunk_queue_saturated {
+            return;
+        }
+        self.chunk_queue_saturated = saturated;
+        if self
+            .chunk_pressure_source
+            .as_mut()
+            .is_some_and(|source| !source.set_saturated(saturated))
+        {
+            debug!(saturated, "runtime control signal consumer closed");
+        }
+    }
+
+    fn set_first_chunk_sla_active(&mut self, active: bool) {
+        if active == self.first_chunk_sla_active {
+            return;
+        }
+        self.first_chunk_sla_active = active;
+        if self
+            .first_chunk_sla_source
+            .as_mut()
+            .is_some_and(|source| !source.set_active(active))
+        {
+            debug!(active, "runtime control signal consumer closed");
+        }
+    }
+
+    fn recover_runtime_control_sources(&mut self) {
+        self.set_chunk_queue_saturated(false);
+        self.set_first_chunk_sla_active(false);
     }
 
     fn apply_runtime_control_limits(
@@ -1613,6 +1694,7 @@ impl ChunkStreamState {
     fn spawn_prepare_worker(&self, request: ChunkRequest, prepare_claim: PreparedChunkClaim) {
         let world = Arc::clone(&self.world);
         let world_read = self.world_read.clone();
+        let world_mutation = self.world_mutation.clone();
         let biomes = Arc::clone(&self.biomes);
         let blocks = Arc::clone(&self.blocks);
         let block_light = self.block_light.as_ref().map(Arc::clone);
@@ -1662,6 +1744,7 @@ impl ChunkStreamState {
                     request,
                     world,
                     world_read,
+                    world_mutation,
                     biomes,
                     blocks,
                     block_light,
@@ -1711,6 +1794,7 @@ impl ChunkStreamState {
     ) {
         let world = Arc::clone(&self.world);
         let world_read = self.world_read.clone();
+        let world_mutation = self.world_mutation.clone();
         let biomes = Arc::clone(&self.biomes);
         let blocks = Arc::clone(&self.blocks);
         let block_light = self.block_light.as_ref().map(Arc::clone);
@@ -1764,6 +1848,7 @@ impl ChunkStreamState {
                 for (request, prepare_claim) in wave {
                     let world = Arc::clone(&world);
                     let world_read = world_read.clone();
+                    let world_mutation = world_mutation.clone();
                     let biomes = Arc::clone(&biomes);
                     let blocks = Arc::clone(&blocks);
                     let block_light = block_light.as_ref().map(Arc::clone);
@@ -1798,6 +1883,7 @@ impl ChunkStreamState {
                             request,
                             Arc::clone(&world),
                             world_read.clone(),
+                            world_mutation,
                             Arc::clone(&biomes),
                             Arc::clone(&blocks),
                             block_light.as_ref().map(Arc::clone),
@@ -2153,8 +2239,11 @@ impl ChunkStreamState {
         self.socket_write_ms += write_timing.socket_write_ms;
         self.framed_bytes += write_timing.framed_bytes;
         self.emitted += 1;
-        self.first_chunk_ms
-            .get_or_insert_with(|| self.started.elapsed().as_millis() as u64);
+        if self.first_chunk_ms.is_none() {
+            let elapsed_ms = self.started.elapsed().as_millis() as u64;
+            self.first_chunk_ms = Some(elapsed_ms);
+            self.set_first_chunk_sla_active(elapsed_ms > self.first_chunk_sla_target_ms);
+        }
         self.record_ring_progress(cx, cz);
         self.bytes += packet_data_len;
     }
@@ -2258,6 +2347,7 @@ impl ChunkStreamState {
 
 impl Drop for ChunkStreamState {
     fn drop(&mut self) {
+        self.recover_runtime_control_sources();
         self.active_generation.store(0, Ordering::Release);
         let cancelled_requests = self.scheduler.queued_len()
             + self.scheduler.in_flight_len()
@@ -2567,6 +2657,7 @@ async fn prepare_chunk_request(
     request: ChunkRequest,
     world: WorldHandle,
     world_read: Option<mc_world::WorldReadView>,
+    world_mutation: Option<mc_world::WorldMutationView>,
     biomes: Arc<Registry>,
     blocks: Arc<BlockRegistry>,
     block_light: Option<Arc<BlockLightTable>>,
@@ -2590,7 +2681,7 @@ async fn prepare_chunk_request(
     }
     let loaded = match load_chunk_neighbourhood(
         Arc::clone(&world),
-        world_read,
+        world_read.clone(),
         request.chunk_x,
         request.chunk_z,
         resources.clone(),
@@ -2772,6 +2863,8 @@ async fn prepare_chunk_request(
     {
         publish_computed_light_if_sources_current(
             &world,
+            world_read.as_ref(),
+            world_mutation.as_ref(),
             ChunkPos {
                 x: request.chunk_x,
                 z: request.chunk_z,
@@ -2798,10 +2891,46 @@ async fn prepare_chunk_request(
 
 async fn publish_computed_light_if_sources_current(
     world: &WorldHandle,
+    world_read: Option<&mc_world::WorldReadView>,
+    world_mutation: Option<&mc_world::WorldMutationView>,
     centre: ChunkPos,
     sources: &[[Option<Arc<Chunk>>; 3]; 3],
     light: &ChunkLight,
 ) -> bool {
+    if let Some(world_read) = world_read {
+        let Some(world_mutation) = world_mutation else {
+            return false;
+        };
+        let positions = sources
+            .iter()
+            .enumerate()
+            .flat_map(|(dz, row)| {
+                row.iter().enumerate().map(move |(dx, _)| ChunkPos {
+                    x: centre.x + dx as i32 - 1,
+                    z: centre.z + dz as i32 - 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        let current = world_read.snapshot_chunks(&positions);
+        let mut expected_current = HashMap::with_capacity(positions.len());
+        for (position, expected) in positions.into_iter().zip(sources.iter().flatten()) {
+            let Some(expected) = expected else {
+                return false;
+            };
+            let Some(current) = current.chunk(position) else {
+                return false;
+            };
+            if current.light_source_token() != expected.light_source_token() {
+                return false;
+            }
+            expected_current.insert(position, Some(current));
+        }
+        return world_mutation.publish_baked_light_conditionally(
+            &expected_current,
+            std::iter::once((centre, light)),
+        );
+    }
+
     let mut storage = crate::lock_metrics::timed_guard(
         crate::lock_metrics::LockMetricKind::ChunkPrepare,
         "publish computed chunk light",
@@ -3623,15 +3752,38 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
     use tokio::sync::Mutex;
 
+    fn canonical_entity_type_report() -> Vec<mc_data::entity_types::EntityTypeReport> {
+        (0..mc_data::entity_types::ENTITY_TYPE_COUNT as u32)
+            .map(|protocol_id| {
+                let contract =
+                    mc_data::entity_types::entity_type_contract_26_1_2_by_protocol_id(protocol_id)
+                        .expect("canonical 26.1.2 entity contract is dense");
+                mc_data::entity_types::EntityTypeReport {
+                    id: Identifier::parse(contract.name)
+                        .expect("canonical entity contract name is a valid identifier"),
+                    protocol_id,
+                }
+            })
+            .collect()
+    }
+
     fn healthy_runtime_control_input() -> crate::RuntimeControlInput {
         crate::RuntimeControlInput {
             tick_ms: 0,
-            queued_chunks: 0,
-            queue_capacity: 1,
             memory_used_mb: 0,
             memory_limit_mb: 0,
-            first_chunk_ms: None,
         }
+    }
+
+    async fn observe_next_runtime_control_signal(
+        control: &crate::RuntimeControlHandle,
+        signals: &mut crate::control_plane::RuntimeControlSignalReceiver,
+    ) -> crate::AutoscaleDecision {
+        let signal = signals
+            .recv()
+            .await
+            .expect("runtime control signal arrives");
+        control.observe_signal(signal)
     }
 
     struct InvalidatePreparedOnWrite {
@@ -3967,12 +4119,10 @@ mod tests {
             BTreeSet::from([desert.clone()]),
             BTreeSet::new(),
         );
-        let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: sheep,
-                protocol_id: 2,
-            },
-        ]);
+        let entity_types = mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(
+            &canonical_entity_type_report(),
+        )
+        .expect("canonical exact 26.1.2 entity type report builds");
         let air = BlockStateId(0);
         let grass = BlockStateId(1);
         let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, air, desert.clone());
@@ -4086,7 +4236,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -4177,7 +4327,7 @@ mod tests {
                 Arc::new(Vec::new()),
                 Arc::new(Vec::new()),
                 Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-                Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
                 Compression::Disabled,
                 Arc::clone(&sessions),
                 session_id,
@@ -4259,7 +4409,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -4343,7 +4493,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             1,
@@ -4406,7 +4556,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             1,
@@ -4482,7 +4632,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             1,
@@ -4547,6 +4697,7 @@ mod tests {
             request,
             Arc::clone(&world),
             None,
+            None,
             Arc::new(test_biome_registry()),
             registry,
             None,
@@ -4559,7 +4710,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             resources,
             Arc::new(AtomicU64::new(2)),
@@ -4610,7 +4761,7 @@ mod tests {
             &[],
             &[],
             &mc_data::biomes::BiomeSpawnRules::default(),
-            &mc_data::entity_types::EntityTypeRegistry::default(),
+            &mc_data::entity_types::solaris_required_entity_types(),
             Some(&mut workspace),
             0,
             0,
@@ -4639,6 +4790,7 @@ mod tests {
             }
         }
         let world_read = storage.read_view();
+        let world_mutation = storage.mutation_view();
         let world = Arc::new(Mutex::new(storage));
         let request = ChunkRequest {
             chunk_x: 0,
@@ -4654,6 +4806,7 @@ mod tests {
             request,
             Arc::clone(&world),
             Some(world_read.clone()),
+            Some(world_mutation),
             Arc::new(test_biome_registry()),
             Arc::clone(&registry),
             Some(Arc::new(BlockLightTable::from_arrays(
@@ -4671,7 +4824,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
             Arc::new(AtomicU64::new(1)),
@@ -4706,6 +4859,7 @@ mod tests {
             }
         }
         let world_read = storage.read_view();
+        let world_mutation = storage.mutation_view();
         let snapshot = world_read.snapshot_chunks(&positions);
         let sources = std::array::from_fn(|dz| {
             std::array::from_fn(|dx| {
@@ -4726,6 +4880,8 @@ mod tests {
         assert!(
             publish_computed_light_if_sources_current(
                 &world,
+                Some(&world_read),
+                Some(&world_mutation),
                 ChunkPos { x: 0, z: 0 },
                 &sources,
                 &ChunkLight::filled(15, 0),
@@ -4755,6 +4911,8 @@ mod tests {
         assert!(
             !publish_computed_light_if_sources_current(
                 &world,
+                Some(&world_read),
+                Some(&world_mutation),
                 ChunkPos { x: 0, z: 0 },
                 &block_sources,
                 &ChunkLight::filled(15, 0),
@@ -4892,7 +5050,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             sessions,
             session_id,
@@ -5178,7 +5336,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5197,6 +5355,7 @@ mod tests {
             request,
             Arc::clone(&world),
             None,
+            None,
             Arc::new(test_biome_registry()),
             Arc::clone(&registry),
             None,
@@ -5209,7 +5368,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&stream.active_generation),
@@ -5260,7 +5419,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5357,7 +5516,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5422,7 +5581,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5478,7 +5637,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5540,7 +5699,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5631,7 +5790,7 @@ mod tests {
                 max_chunk_load_rate: 64,
                 min_chunk_generate_rate: 1,
                 max_chunk_generate_rate: 32,
-                queue_pressure_percent: 1,
+                queue_pressure_percent: 75,
                 scale_down_after_ticks: 1,
                 ..crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced)
             },
@@ -5642,6 +5801,9 @@ mod tests {
                 chunk_generate_rate: 32,
             },
         });
+        let mut signals = control
+            .take_signal_receiver()
+            .expect("test owns runtime control receiver");
         let mut stream = ChunkStreamState::new(
             Arc::clone(&world),
             Arc::new(test_biome_registry()),
@@ -5656,7 +5818,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5668,7 +5830,7 @@ mod tests {
             policy,
         )
         .with_runtime_control(Some(control.clone()));
-        for _ in 0..3 {
+        for _ in 0..2 {
             let request = stream.scheduler.poll_next().expect("queued chunk");
             stream.accept_result(ChunkPrepareResult {
                 request,
@@ -5688,7 +5850,27 @@ mod tests {
             });
         }
         stream.observe_runtime_control();
-        let owner_decision = control.observe(healthy_runtime_control_input());
+        assert!(!stream.chunk_queue_saturated);
+        let request = stream.scheduler.poll_next().expect("third queued chunk");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            prepare_claim: None,
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Ready(Box::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"prepared-frame"),
+                light: None,
+                herd_spawns: Vec::new(),
+                hydrated_campfires: Vec::new(),
+                packet_data_len: 1,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            })),
+        });
+        stream.observe_runtime_control();
+        assert!(stream.chunk_queue_saturated);
+        let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
         assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
         stream.observe_runtime_control();
         let mut writer = tokio::io::sink();
@@ -5737,7 +5919,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5822,7 +6004,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5911,7 +6093,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -5943,6 +6125,7 @@ mod tests {
 
         stream.observe_runtime_control();
         control.observe(healthy_runtime_control_input());
+        stream.observe_runtime_control();
 
         let snapshot = control.snapshot();
         assert_eq!(
@@ -6021,7 +6204,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -6100,6 +6283,9 @@ mod tests {
                 chunk_generate_rate: 32,
             },
         });
+        let mut signals = control
+            .take_signal_receiver()
+            .expect("test owns runtime control receiver");
         let policy = ChunkPipelinePolicy {
             chunk_send_rate: 4,
             chunk_result_queue_size: 4,
@@ -6119,7 +6305,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -6131,15 +6317,17 @@ mod tests {
             policy,
         )
         .with_runtime_control(Some(control.clone()));
-        let request = stream.scheduler.poll_next().expect("queued chunk");
-        stream.accept_result(ChunkPrepareResult {
-            request,
-            prepare_claim: None,
-            fetch_ms: 0,
-            pressure_flush: PressureFlushTiming::default(),
-            staged: Vec::new(),
-            outcome: ChunkPrepareOutcome::Absent,
-        });
+        for _ in 0..2 {
+            let request = stream.scheduler.poll_next().expect("queued chunk");
+            stream.accept_result(ChunkPrepareResult {
+                request,
+                prepare_claim: None,
+                fetch_ms: 0,
+                pressure_flush: PressureFlushTiming::default(),
+                staged: Vec::new(),
+                outcome: ChunkPrepareOutcome::Absent,
+            });
+        }
         stream.loaded.insert((3, 0));
         sessions.mark_loaded(session_id, (3, 0));
 
@@ -6147,7 +6335,7 @@ mod tests {
         let mut light_cache = LightCache::new();
 
         stream.step(&mut server, &mut light_cache).await.unwrap();
-        let owner_decision = control.observe(healthy_runtime_control_input());
+        let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
         assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
         stream.step(&mut server, &mut light_cache).await.unwrap();
 
@@ -6219,7 +6407,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -6270,7 +6458,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -6325,7 +6513,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -6383,7 +6571,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -6441,7 +6629,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -6524,7 +6712,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             sessions,
             session_id,
@@ -6596,7 +6784,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -6684,7 +6872,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -6761,11 +6949,8 @@ mod tests {
         });
         let decision = control.observe(crate::RuntimeControlInput {
             tick_ms: 2,
-            queued_chunks: 0,
-            queue_capacity: 1,
             memory_used_mb: 0,
             memory_limit_mb: 0,
-            first_chunk_ms: None,
         });
         assert_eq!(decision.pressure, Some(crate::AutoscalePressure::TickTime));
 
@@ -6783,7 +6968,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             sessions,
             session_id,
@@ -6919,7 +7104,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -7012,7 +7197,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -7123,7 +7308,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -7217,7 +7402,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             primary_session,
@@ -7311,7 +7496,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             secondary_session,
@@ -7405,7 +7590,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             primary_session,
@@ -7450,7 +7635,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             secondary_session,
@@ -7546,7 +7731,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             secondary_session,
@@ -7635,7 +7820,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::clone(&sessions),
             session_id,
@@ -7721,6 +7906,9 @@ mod tests {
                 chunk_generate_rate: 64,
             },
         });
+        let mut signals = control
+            .take_signal_receiver()
+            .expect("test owns runtime control receiver");
         let mut stream = ChunkStreamState::new(
             Arc::clone(&world),
             Arc::new(test_biome_registry()),
@@ -7735,7 +7923,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -7747,7 +7935,7 @@ mod tests {
             policy,
         )
         .with_runtime_control(Some(control.clone()));
-        for _ in 0..3 {
+        for _ in 0..4 {
             let request = stream.scheduler.poll_next().expect("queued chunk");
             stream.accept_result(ChunkPrepareResult {
                 request,
@@ -7762,7 +7950,7 @@ mod tests {
         let mut light_cache = LightCache::new();
 
         stream.observe_runtime_control();
-        let owner_decision = control.observe(healthy_runtime_control_input());
+        let owner_decision = observe_next_runtime_control_signal(&control, &mut signals).await;
         assert_eq!(owner_decision.action, crate::AutoscaleAction::ScaleDown);
         stream.step(&mut writer, &mut light_cache).await.unwrap();
 
@@ -7794,7 +7982,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -7945,7 +8133,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             Arc::new(SessionRegistry::new()),
             1,
@@ -7964,6 +8152,7 @@ mod tests {
             request,
             Arc::clone(&world),
             None,
+            None,
             Arc::new(test_biome_registry()),
             Arc::clone(&registry),
             None,
@@ -7976,7 +8165,7 @@ mod tests {
             Arc::new(Vec::new()),
             Arc::new(Vec::new()),
             Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
             Compression::Disabled,
             ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&stream.active_generation),
@@ -8022,3 +8211,11 @@ mod tests {
         assert_eq!(calls.load(Ordering::Acquire), 1);
     }
 }
+
+#[cfg(test)]
+#[path = "chunk_stream_autoscale_tests.rs"]
+mod autoscale_tests;
+
+#[cfg(test)]
+#[path = "chunk_stream_world_handle_tests.rs"]
+mod world_handle_tests;

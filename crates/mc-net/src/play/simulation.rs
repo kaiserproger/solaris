@@ -18,38 +18,36 @@ use super::lighting::{
     collect_incremental_light_updates_for_applied_edits, compute_incremental_light_updates,
     incremental_light_sources_are_current, persist_baked_light_updates,
 };
-use super::persistence::PersistedEntityRecord;
+use super::persistence::PersistedEntityCheckpoint;
 #[cfg(test)]
 use super::session::EntityKillRewards;
 use super::session::{
     BucketUseTransaction, CampfireUseTransaction, ChestTransaction, ChestTransactionRequest,
     ContainerCommitContext, ContainerStateCommitError, CreditedArrowPickup,
-    CreditedExperiencePickup, CreditedItemPickup, EntityAttackOutcome, FurnaceTransaction,
-    FurnaceTransactionRequest, OutboundCommand, PlayerAttackResult, PlayerEntityAttack,
-    PlayerInventoryCommitError, ServerEntityExplosionImpact, SessionId, SessionRegistry,
-    SurvivalBreakTransaction, SurvivalPlacementTransaction, VisibilityDispatch,
+    CreditedExperiencePickup, CreditedItemPickup, ENTITY_DEATH_TICKS, EntityAttackOutcome,
+    FurnaceTransaction, FurnaceTransactionRequest, OutboundCommand, PlayerAttackResult,
+    PlayerEntityAttack, PlayerInventoryCommitError, ServerEntityExplosionImpact, SessionId,
+    SessionRegistry, SurvivalBreakTransaction, SurvivalPlacementTransaction, VisibilityDispatch,
     dispatch_visibility_commands,
 };
-#[cfg(test)]
-use super::session::{ClaimedExperience, ClaimedPickup};
 use super::{
-    AppliedBlockEdit, BlockDelta, BlockEdit, BlockEditBatchOutcome, BlockEditPrecondition,
-    BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID, CampfireCookingState, ChestCommitOutcome,
-    ChestView, ContainerDropPlan, ContainerPlayerPlan, ContainerXpPlan, EntityPhysicsQuery,
-    EntityPhysicsStep, FurnaceCommitOutcome, GameMode, HerdSpawn, PendingCampfireOutput,
-    PlayerInventoryCommitOutcome, PlayerPose, SharedContainerCommit, SurvivalState, WorldHandle,
-    air_state_id, block_edit_changes_light, chest_slot_stacks, furnace_output_was_taken,
-    furnace_slot_stacks, is_campfire_block, schedule_fluid_ticks_near_applied,
-    schedule_leaf_ticks_near_applied,
+    AppliedBlockEdit, ArrowPhysicsFact, BlockDelta, BlockEdit, BlockEditBatchOutcome,
+    BlockEditPrecondition, BlockMutationSnapshot, CAMPFIRE_BLOCK_ENTITY_TYPE_ID,
+    CampfireCookingState, ChestCommitOutcome, ChestView, ContainerDropPlan, ContainerPlayerPlan,
+    ContainerXpPlan, EntityPhysicsQuery, EntityPhysicsStep, FurnaceCommitOutcome, GameMode,
+    HerdSpawn, PendingCampfireOutput, PlayerInventoryCommitOutcome, PlayerPose,
+    SharedContainerCommit, SurvivalState, WorldHandle, air_state_id, block_edit_changes_light,
+    chest_slot_stacks, furnace_output_was_taken, furnace_slot_stacks, is_campfire_block,
+    schedule_fluid_ticks_near_applied, schedule_leaf_ticks_near_applied,
 };
 use mc_data::block_facts::BlockFactsTable;
 use mc_data::block_light::BlockLightTable;
+use mc_entity::runtime_26_1_2::TargetKind;
 use mc_entity::{
-    EntityId, EntityItemStack, EntitySnapshot, REGION_SIZE_CHUNKS, RegionKey, RegionLease,
-    RegionOwnership, RegionOwnershipError, RegionPhase, Rotation, Vec3,
+    EntityEffectOperation, EntityEffectRequest, EntityEffectResult, EntityId, EntityItemStack,
+    EntitySnapshot, REGION_SIZE_CHUNKS, RegionKey, RegionLease, RegionOwnership,
+    RegionOwnershipError, RegionPhase, Rotation, Vec3,
 };
-#[cfg(test)]
-use mc_entity::{ShadowDivergence, ShadowStage};
 use mc_physics::BlockMaterialIds;
 use mc_protocol::packets::play::ItemStack;
 use mc_world::{
@@ -65,8 +63,10 @@ use std::sync::atomic::Ordering;
 use tokio::sync::mpsc;
 #[cfg(test)]
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::{trace, warn};
 
+#[cfg(test)]
+mod block_drop_tests;
 mod queue;
 mod regional_mutation;
 
@@ -87,6 +87,78 @@ const MAX_SURVIVAL_BREAK_EDITS: usize = 512;
 const MAX_SURVIVAL_BREAK_DROPS: usize = 512;
 const MAX_BLOCK_EDIT_COMMAND_EDITS: usize = 512;
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockDropAwaitStage {
+    AfterReservation,
+    AfterAppend,
+}
+
+#[cfg(test)]
+struct BlockDropAwaitProbe {
+    stage: BlockDropAwaitStage,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+#[cfg(test)]
+static BLOCK_DROP_AWAIT_PROBE: std::sync::Mutex<Option<Arc<BlockDropAwaitProbe>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+static BLOCK_DROP_AWAIT_TEST_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+#[cfg(test)]
+fn install_block_drop_await_probe(
+    stage: BlockDropAwaitStage,
+    entered: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+) {
+    let mut slot = BLOCK_DROP_AWAIT_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(slot.is_none(), "block-drop await probe already installed");
+    *slot = Some(Arc::new(BlockDropAwaitProbe {
+        stage,
+        entered,
+        release: std::sync::Mutex::new(release),
+    }));
+}
+
+#[cfg(test)]
+async fn pause_block_drop_after(stage: BlockDropAwaitStage) {
+    let probe = BLOCK_DROP_AWAIT_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .filter(|probe| probe.stage == stage)
+        .cloned();
+    let Some(probe) = probe else {
+        return;
+    };
+    probe.entered.send(()).expect("block-drop probe receiver");
+    let waiter = Arc::clone(&probe);
+    tokio::task::spawn_blocking(move || {
+        waiter
+            .release
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .recv()
+            .expect("block-drop probe release");
+    })
+    .await
+    .expect("block-drop probe worker");
+    let mut slot = BLOCK_DROP_AWAIT_PROBE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|installed| Arc::ptr_eq(installed, &probe))
+    {
+        slot.take();
+    }
+}
+
 fn elapsed_us(started: std::time::Instant) -> u64 {
     started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
 }
@@ -102,6 +174,7 @@ pub(crate) enum SimulationRequestError {
     WorldBusy,
     WorldUnavailable,
     WorldMutationFailed,
+    CrossRegion,
     InvalidCommand,
     StaleSession,
 }
@@ -129,7 +202,7 @@ pub(crate) struct SimulationSaveSnapshot {
         super::persistence::PlayerPersistedState,
         Option<u64>,
     )>,
-    pub(crate) entities: Vec<PersistedEntityRecord>,
+    pub(crate) entities: PersistedEntityCheckpoint,
     pub(crate) entity_journal_phases: Vec<mc_entity::RegionPhase>,
     pub(crate) world_chunk_journal_watermark: Option<u64>,
     pub(crate) world_time: u64,
@@ -143,7 +216,7 @@ impl std::fmt::Debug for SimulationSaveSnapshot {
         formatter
             .debug_struct("SimulationSaveSnapshot")
             .field("players", &self.players.len())
-            .field("entities", &self.entities.len())
+            .field("entities", &self.entities.records.len())
             .field("world_time", &self.world_time)
             .field(
                 "players_sleeping_percentage",
@@ -183,12 +256,6 @@ pub(super) enum SimulationCommand {
         expected_enchantments: Vec<mc_data::ItemEnchantment>,
         max_stack: i32,
     },
-    #[cfg(test)]
-    ClaimItemPickup {
-        entity_id: EntityId,
-        collector_session: SessionId,
-        max_count: i32,
-    },
     PickupExperienceIntoPlayer {
         entity_id: EntityId,
         collector_session: SessionId,
@@ -204,17 +271,13 @@ pub(super) enum SimulationCommand {
         arrow_item_id: u32,
         max_stack: i32,
     },
-    #[cfg(test)]
-    ClaimArrowPickup {
-        entity_id: EntityId,
-        collector_session: SessionId,
-    },
     PlayerAttackServerEntity {
         attacker_session: SessionId,
         entity_id: EntityId,
         damage: f32,
         attacker_costs: Option<Box<PlayerSurvivalPlan>>,
     },
+    ApplyServerEntityEffect(Box<ServerEntityEffectCommand>),
     #[cfg(test)]
     AttackServerEntity {
         entity_id: EntityId,
@@ -310,15 +373,12 @@ impl SimulationCommand {
             Self::ReadChestSnapshot { .. } => "read_chest_snapshot",
             Self::ReadFurnaceSnapshot { .. } => "read_furnace_snapshot",
             Self::PickupItemIntoInventory { .. } => "pickup_item_into_inventory",
-            #[cfg(test)]
-            Self::ClaimItemPickup { .. } => "claim_item_pickup",
             Self::PickupExperienceIntoPlayer { .. } => "pickup_experience_into_player",
             #[cfg(test)]
             Self::ClaimExperiencePickup { .. } => "claim_experience_pickup",
             Self::PickupArrowIntoInventory { .. } => "pickup_arrow_into_inventory",
-            #[cfg(test)]
-            Self::ClaimArrowPickup { .. } => "claim_arrow_pickup",
             Self::PlayerAttackServerEntity { .. } => "player_attack_server_entity",
+            Self::ApplyServerEntityEffect(_) => "apply_server_entity_effect",
             #[cfg(test)]
             Self::AttackServerEntity { .. } => "attack_server_entity",
             Self::SpawnCommandEntity { .. } => "spawn_command_entity",
@@ -355,15 +415,12 @@ pub(super) enum SimulationResponse {
     ChestSnapshot(Result<Box<ChestReadSnapshot>, SimulationRequestError>),
     FurnaceSnapshot(Result<Box<FurnaceReadSnapshot>, SimulationRequestError>),
     ItemPickupCredit(Option<Box<CreditedItemPickup>>),
-    #[cfg(test)]
-    ItemPickup(Option<ClaimedPickup>),
     ExperiencePickupCredit(Option<Box<CreditedExperiencePickup>>),
     #[cfg(test)]
-    ExperiencePickup(Option<ClaimedExperience>),
+    ExperiencePickup,
     ArrowPickupCredit(Option<Box<CreditedArrowPickup>>),
-    #[cfg(test)]
-    ArrowPickup(Option<Vec<VisibilityDispatch>>),
     PlayerAttack(PlayerAttackResult),
+    EntityEffect(EntityEffectResult),
     #[cfg(test)]
     EntityAttack(Option<Box<EntityAttackOutcome>>),
     EntitySpawn(Vec<VisibilityDispatch>),
@@ -613,6 +670,26 @@ fn command_single_owner_region(command: &SimulationCommand) -> Option<RegionKey>
             command.plan.edit.pos.z.div_euclid(16),
         ));
     }
+    if let SimulationCommand::CommitBlockDrops {
+        edits,
+        preconditions,
+        drops,
+        ..
+    } = command
+    {
+        let mut positions = edits
+            .iter()
+            .map(|edit| edit.pos)
+            .chain(preconditions.iter().map(|precondition| precondition.pos));
+        let first = positions.next()?;
+        let owner = RegionKey::from_chunk(first.x.div_euclid(16), first.z.div_euclid(16));
+        return (positions.all(|pos| {
+            RegionKey::from_chunk(pos.x.div_euclid(16), pos.z.div_euclid(16)) == owner
+        }) && drops
+            .iter()
+            .all(|drop| RegionKey::from_position(drop.position) == Some(owner)))
+        .then_some(owner);
+    }
     if let SimulationCommand::CommitChest { positions, .. } = command {
         let mut positions = positions.iter();
         let first = positions.next()?;
@@ -709,6 +786,31 @@ fn command_can_use_resident_mutation(
         }
     }
     true
+}
+
+fn command_can_use_resident_block_drop(
+    command: &SimulationCommand,
+    world_read: Option<&mc_world::WorldReadView>,
+) -> bool {
+    let SimulationCommand::CommitBlockDrops {
+        edits,
+        preconditions,
+        drops,
+        ..
+    } = command
+    else {
+        return false;
+    };
+    let Some(world_read) = world_read else {
+        return false;
+    };
+    valid_block_drop_command(edits, preconditions, drops)
+        && command_single_owner_region(command).is_some()
+        && edits
+            .iter()
+            .map(|edit| edit.pos)
+            .chain(preconditions.iter().map(|precondition| precondition.pos))
+            .all(|position| world_read.get_cached_block(position).is_some())
 }
 
 fn command_can_use_regional_mutation(
@@ -1548,6 +1650,60 @@ pub(super) struct CommittedSelectedItemDrop {
 
 type SimulationOutcome = Result<SimulationResponse, SimulationRequestError>;
 
+#[derive(Debug)]
+pub(super) struct ServerEntityEffectCommand {
+    entity_id: EntityId,
+    expected: Option<Box<EntitySnapshot>>,
+    operation: EntityEffectOperation,
+    target_kind: TargetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityEffectRequestError {
+    Busy,
+    Unavailable,
+    ShuttingDown,
+    ResponseMismatch,
+}
+
+#[derive(Clone)]
+pub struct EntityEffectHandle {
+    simulation: SimulationHandle,
+}
+
+impl EntityEffectHandle {
+    pub async fn apply(
+        &self,
+        entity_id: EntityId,
+        operation: EntityEffectOperation,
+        target_kind: TargetKind,
+    ) -> Result<EntityEffectResult, EntityEffectRequestError> {
+        self.simulation
+            .apply_entity_effect(entity_id, None, operation, target_kind)
+            .await
+            .map_err(EntityEffectRequestError::from)
+    }
+}
+
+impl From<SimulationRequestError> for EntityEffectRequestError {
+    fn from(error: SimulationRequestError) -> Self {
+        match error {
+            SimulationRequestError::Full => Self::Busy,
+            SimulationRequestError::ShuttingDown => Self::ShuttingDown,
+            SimulationRequestError::ResponseMismatch => Self::ResponseMismatch,
+            SimulationRequestError::Closed
+            | SimulationRequestError::OwnerStopped
+            | SimulationRequestError::WorldUnavailable
+            | SimulationRequestError::WorldMutationFailed
+            | SimulationRequestError::CrossRegion
+            | SimulationRequestError::InvalidCommand
+            | SimulationRequestError::StaleSession => Self::Unavailable,
+            #[cfg(test)]
+            SimulationRequestError::WorldBusy => Self::Busy,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SimulationHandle {
     sender: mpsc::Sender<SimulationCommandEnvelope>,
@@ -1556,6 +1712,36 @@ pub(crate) struct SimulationHandle {
 }
 
 impl SimulationHandle {
+    pub(super) async fn apply_entity_effect(
+        &self,
+        entity_id: EntityId,
+        expected: Option<EntitySnapshot>,
+        operation: EntityEffectOperation,
+        target_kind: TargetKind,
+    ) -> Result<EntityEffectResult, SimulationRequestError> {
+        let receiver = self.enqueue_with_fence(
+            None,
+            SimulationCommand::ApplyServerEntityEffect(Box::new(ServerEntityEffectCommand {
+                entity_id,
+                expected: expected.map(Box::new),
+                operation,
+                target_kind,
+            })),
+        )?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::EntityEffect(result))) => Ok(result),
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    pub(crate) fn entity_effect_handle(&self) -> EntityEffectHandle {
+        EntityEffectHandle {
+            simulation: self.clone(),
+        }
+    }
+
     pub(crate) async fn save_barrier(
         &self,
         capture_world: bool,
@@ -2346,6 +2532,25 @@ pub(crate) struct SimulationTickReport {
     pub(crate) lane_attribution: Vec<SimulationLaneAttribution>,
 }
 
+struct ResidentBlockDropRunResult {
+    report: SimulationTickReport,
+    fail_stopped: bool,
+}
+
+enum BlockDropJournalAppendError {
+    Journal(crate::play::world_journal::WorldChunkJournalError),
+    Worker(tokio::task::JoinError),
+}
+
+impl BlockDropJournalAppendError {
+    fn outcome_unknown(&self) -> bool {
+        match self {
+            Self::Journal(error) => error.outcome_unknown(),
+            Self::Worker(_) => true,
+        }
+    }
+}
+
 impl SimulationOwner {
     fn prepare_single_lane_region_routes(
         &mut self,
@@ -2440,7 +2645,7 @@ impl SimulationOwner {
             .map(|tnt| {
                 let center = Vec3::new(tnt.position.x, tnt.position.y + 0.06125, tnt.position.z);
                 (
-                    tnt.fuse.entity_id,
+                    tnt.entity_id,
                     sessions.explosion_entity_targets(&self.authority, center, 8.0),
                 )
             })
@@ -2461,7 +2666,8 @@ impl SimulationOwner {
         if let Some(world) = world {
             let mut storage = world.lock().await;
             for expired in &expired_tnt {
-                let fuse = &expired.fuse;
+                let entity_id = expired.entity_id;
+                let air = expired.air;
                 let center = Vec3::new(
                     expired.position.x,
                     expired.position.y + 0.06125,
@@ -2473,7 +2679,7 @@ impl SimulationOwner {
                     &mut self.explosion_random,
                     |position| {
                         let state = storage.get_block(position).ok().flatten()?;
-                        let resistance = if state == fuse.air {
+                        let resistance = if state == air {
                             None
                         } else {
                             Some(block_facts.explosion_resistance(state.0)?)
@@ -2488,7 +2694,7 @@ impl SimulationOwner {
                 };
 
                 let block_count = i32::try_from(candidates.len()).unwrap_or(i32::MAX);
-                candidate_counts.insert(fuse.entity_id, block_count);
+                candidate_counts.insert(entity_id, block_count);
                 if let Some(materials) = materials {
                     let impacts = expired
                         .explosion_targets()
@@ -2501,9 +2707,9 @@ impl SimulationOwner {
                             .map(|impact| (target.session_id, impact))
                         })
                         .collect();
-                    player_impacts.insert(fuse.entity_id, impacts);
+                    player_impacts.insert(entity_id, impacts);
                     let impacts = entity_targets
-                        .get(&fuse.entity_id)
+                        .get(&entity_id)
                         .into_iter()
                         .flatten()
                         .filter_map(|target| {
@@ -2527,7 +2733,7 @@ impl SimulationOwner {
                             })
                         })
                         .collect();
-                    entity_impacts.insert(fuse.entity_id, impacts);
+                    entity_impacts.insert(entity_id, impacts);
                 }
                 let mut positions = candidates.into_iter().collect::<Vec<_>>();
                 positions.sort_unstable_by_key(|position| (position.x, position.y, position.z));
@@ -2538,7 +2744,7 @@ impl SimulationOwner {
                     let Ok(Some(state)) = storage.get_block(position) else {
                         continue;
                     };
-                    if state == fuse.air {
+                    if state == air {
                         continue;
                     }
                     let Some(token) = storage.block_mutation_token(position) else {
@@ -2546,7 +2752,7 @@ impl SimulationOwner {
                     };
                     edits.push(BlockEdit {
                         pos: position,
-                        new_state: fuse.air,
+                        new_state: air,
                     });
                     preconditions.push(BlockEditPrecondition {
                         pos: position,
@@ -2576,7 +2782,7 @@ impl SimulationOwner {
                                 -angle.cos() * 0.02,
                             );
                             let fuse_ticks = u64::from(self.explosion_random.next_int(20) + 10);
-                            chained_tnt.entry(fuse.entity_id).or_default().push((
+                            chained_tnt.entry(entity_id).or_default().push((
                                 expired.entity_type_id,
                                 Vec3::new(
                                     f64::from(edit.pos.x) + 0.5,
@@ -2585,7 +2791,7 @@ impl SimulationOwner {
                                 ),
                                 velocity,
                                 fuse_ticks,
-                                fuse.air,
+                                air,
                             ));
                             continue;
                         }
@@ -2605,12 +2811,16 @@ impl SimulationOwner {
                             let Some(item_id) = explosion_items.id_of(&drop.item) else {
                                 continue;
                             };
-                            let count = drop.count.sample(0);
+                            let Ok(count) = drop.count.try_sample(0) else {
+                                continue;
+                            };
                             let Ok(count) = i32::try_from(count) else {
                                 continue;
                             };
-                            explosion_drops.entry(fuse.entity_id).or_default().push(
-                                SurvivalBreakDrop {
+                            explosion_drops
+                                .entry(entity_id)
+                                .or_default()
+                                .push(SurvivalBreakDrop {
                                     entity_type_id,
                                     position: Vec3::new(
                                         f64::from(edit.pos.x) + 0.5,
@@ -2618,17 +2828,16 @@ impl SimulationOwner {
                                         f64::from(edit.pos.z) + 0.5,
                                     ),
                                     stack: EntityItemStack::new(item_id, count),
-                                },
-                            );
+                                });
                         }
                     }
-                    outcomes.insert(fuse.entity_id, additional);
+                    outcomes.insert(entity_id, additional);
                 }
             }
         }
 
         for tnt in expired_tnt {
-            let entity_id = tnt.fuse.entity_id;
+            let entity_id = tnt.entity_id;
             if let Some(outcome) = outcomes.remove(&entity_id) {
                 sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
                 let block_dispatches = sessions
@@ -2870,6 +3079,7 @@ impl SimulationOwner {
         tick: u64,
         expected: &[EntityPhysicsQuery],
         steps: &[EntityPhysicsStep],
+        arrow_physics_facts: &[ArrowPhysicsFact],
     ) -> Vec<EntityPhysicsStep> {
         sessions.apply_entity_physics_if_current_and_dispatch_owned(
             &self.authority,
@@ -2877,46 +3087,16 @@ impl SimulationOwner {
             tick,
             expected,
             steps,
+            arrow_physics_facts,
         )
-    }
-
-    #[cfg(test)]
-    pub(crate) fn compare_entity_shadow(
-        &self,
-        sessions: &SessionRegistry,
-        tick: u64,
-        stage: ShadowStage,
-    ) {
-        let Some(divergence) = sessions.compare_entity_shadow_owned(&self.authority, tick, stage)
-        else {
-            return;
-        };
-        let artifact = match write_shadow_divergence_artifact(&divergence) {
-            Ok(path) => Some(path),
-            Err(error) => {
-                warn!(%error, "failed to save entity ECS shadow divergence artifact");
-                None
-            }
-        };
-        warn!(
-            tick = divergence.tick,
-            stage = ?divergence.stage,
-            entity_id = ?divergence.entity_id,
-            legacy = ?divergence.legacy,
-            shadow = ?divergence.shadow,
-            legacy_event = ?divergence.legacy_event,
-            shadow_event = ?divergence.shadow_event,
-            artifact = ?artifact,
-            "entity ECS shadow first divergence"
-        );
     }
 
     pub(crate) fn restore_persisted_entities(
         &self,
         sessions: &SessionRegistry,
-        entities: impl IntoIterator<Item = impl Into<PersistedEntityRecord>>,
+        checkpoint: PersistedEntityCheckpoint,
     ) -> usize {
-        sessions.restore_persisted_entities_owned(&self.authority, entities)
+        sessions.restore_persisted_entities_owned(&self.authority, checkpoint)
     }
 
     pub(crate) fn restore_world_time(&self, sessions: &SessionRegistry, world_time: u64) {
@@ -3088,9 +3268,11 @@ impl SimulationOwner {
             && access.read.is_some()
             && (block_light.is_none() || access.light.is_some());
         let world_chunk_journal = sessions.world_chunk_journal();
-        let mut runs: Vec<(bool, bool, bool, Vec<SimulationCommandEnvelope>)> = Vec::new();
+        let mut runs: Vec<(bool, bool, bool, bool, Vec<SimulationCommandEnvelope>)> = Vec::new();
         for envelope in batch {
             let requires_world = command_requires_world(&envelope.command);
+            let block_drop_command =
+                matches!(envelope.command, SimulationCommand::CommitBlockDrops { .. });
             let regional_block_edit = requires_world
                 && regional_block_edits_available
                 && !envelope.response_is_closed()
@@ -3101,11 +3283,17 @@ impl SimulationOwner {
             let journaled_block_edit = regional_block_edit
                 && world_chunk_journal.is_some()
                 && matches!(envelope.command, SimulationCommand::ApplyBlockEdits { .. });
-            if let Some((last_requires_world, last_regional_block_edit, last_journaled, run)) =
-                runs.last_mut()
+            if let Some((
+                last_requires_world,
+                last_regional_block_edit,
+                last_journaled,
+                last_block_drop_command,
+                run,
+            )) = runs.last_mut()
                 && *last_requires_world == requires_world
                 && *last_regional_block_edit == regional_block_edit
                 && *last_journaled == journaled_block_edit
+                && *last_block_drop_command == block_drop_command
             {
                 run.push(envelope);
             } else {
@@ -3113,6 +3301,7 @@ impl SimulationOwner {
                     requires_world,
                     regional_block_edit,
                     journaled_block_edit,
+                    block_drop_command,
                     vec![envelope],
                 ));
             }
@@ -3120,7 +3309,16 @@ impl SimulationOwner {
 
         let mut processed = 0;
         let mut lane_attribution = Vec::new();
-        for (requires_world, regional_block_edit, journaled_block_edit, run) in runs {
+        let mut runs = runs.into_iter();
+        while let Some((
+            requires_world,
+            regional_block_edit,
+            journaled_block_edit,
+            block_drop_command,
+            run,
+        )) = runs.next()
+        {
+            let mut owner_fail_stopped = false;
             let report = if !requires_world {
                 self.process_batch(
                     sessions,
@@ -3142,6 +3340,18 @@ impl SimulationOwner {
                     run,
                 )
                 .await
+            } else if block_drop_command {
+                let result = self
+                    .process_resident_block_drop_run(
+                        sessions,
+                        access,
+                        block_light,
+                        world_chunk_journal.as_ref(),
+                        run,
+                    )
+                    .await;
+                owner_fail_stopped = result.fail_stopped;
+                result.report
             } else if let Some(world) = world {
                 let mut processed = 0;
                 for envelope in run {
@@ -3224,6 +3434,13 @@ impl SimulationOwner {
             };
             processed += report.processed;
             lane_attribution.extend(report.lane_attribution);
+            if owner_fail_stopped {
+                for envelope in runs.flat_map(|(_, _, _, _, run)| run) {
+                    self.reject_drained_envelope(envelope, SimulationRequestError::OwnerStopped);
+                }
+                self.shutdown();
+                break;
+            }
         }
 
         SimulationTickReport {
@@ -3231,6 +3448,507 @@ impl SimulationOwner {
             remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
             lane_attribution,
         }
+    }
+
+    fn reject_drained_envelope(
+        &self,
+        envelope: SimulationCommandEnvelope,
+        error: SimulationRequestError,
+    ) {
+        if envelope.response_is_closed() {
+            self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.metrics
+                .rejected_shutdown
+                .fetch_add(1, Ordering::Relaxed);
+            envelope.respond(Err(error));
+        }
+    }
+
+    async fn append_block_drop_decision(
+        journal: &crate::play::world_journal::WorldChunkJournal,
+        world_tick: u64,
+        decision_id: u64,
+        snapshots: Vec<mc_world::ChunkSnapshot>,
+    ) -> Result<(), BlockDropJournalAppendError> {
+        let journal = journal.clone();
+        tokio::task::spawn_blocking(move || {
+            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, snapshots)])
+        })
+        .await
+        .map_err(BlockDropJournalAppendError::Worker)?
+        .map_err(BlockDropJournalAppendError::Journal)
+    }
+
+    async fn close_empty_block_drop_decision(
+        journal: &crate::play::world_journal::WorldChunkJournal,
+        world_tick: u64,
+        decision_id: u64,
+    ) -> Result<(), BlockDropJournalAppendError> {
+        journal
+            .wait_for_append_turn(decision_id)
+            .await
+            .map_err(BlockDropJournalAppendError::Journal)?;
+        Self::append_block_drop_decision(journal, world_tick, decision_id, Vec::new()).await
+    }
+
+    fn request_is_stale(sessions: &SessionRegistry, envelope: &SimulationCommandEnvelope) -> bool {
+        envelope
+            .session_fence
+            .is_some_and(|session_id| !sessions.is_active_session(session_id))
+    }
+
+    async fn process_resident_block_drop_run(
+        &mut self,
+        sessions: &SessionRegistry,
+        access: SimulationWorldAccess<'_>,
+        block_light: Option<&BlockLightTable>,
+        journal: Option<&crate::play::world_journal::WorldChunkJournal>,
+        run: Vec<SimulationCommandEnvelope>,
+    ) -> ResidentBlockDropRunResult {
+        let mut processed = 0;
+        let mut fail_stopped = false;
+        let world_tick = sessions.simulation_tick();
+        let mut envelopes = run.into_iter();
+        for envelope in envelopes.by_ref() {
+            if envelope.response_is_closed() {
+                self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            if Self::request_is_stale(sessions, &envelope) {
+                self.metrics
+                    .rejected_stale_session
+                    .fetch_add(1, Ordering::Relaxed);
+                envelope.respond(Err(SimulationRequestError::StaleSession));
+                continue;
+            }
+
+            processed += 1;
+            self.metrics.processed.fetch_add(1, Ordering::Relaxed);
+            self.metrics
+                .block_edits_processed
+                .fetch_add(1, Ordering::Relaxed);
+
+            let error = match &envelope.command {
+                SimulationCommand::CommitBlockDrops {
+                    edits,
+                    preconditions,
+                    drops,
+                    ..
+                } if !valid_block_drop_command(edits, preconditions, drops) => {
+                    Some(SimulationRequestError::InvalidCommand)
+                }
+                SimulationCommand::CommitBlockDrops { .. }
+                    if command_single_owner_region(&envelope.command).is_none() =>
+                {
+                    Some(SimulationRequestError::CrossRegion)
+                }
+                SimulationCommand::CommitBlockDrops { .. }
+                    if access.mutation.is_none()
+                        || !command_can_use_resident_block_drop(&envelope.command, access.read) =>
+                {
+                    Some(SimulationRequestError::WorldUnavailable)
+                }
+                SimulationCommand::CommitBlockDrops { .. } => None,
+                _ => Some(SimulationRequestError::InvalidCommand),
+            };
+
+            if let Some(error) = error {
+                if matches!(error, SimulationRequestError::WorldUnavailable) {
+                    self.record_world_access_error(error);
+                }
+                envelope.respond(Err(error));
+                continue;
+            }
+
+            let SimulationCommand::CommitBlockDrops {
+                actor_session,
+                edits,
+                preconditions,
+                drops,
+            } = &envelope.command
+            else {
+                unreachable!("block drop route received a different command");
+            };
+            let actor_session = *actor_session;
+            let edits = edits.clone();
+            let preconditions = preconditions.clone();
+            let drops = drops.clone();
+            let mutation = access.mutation.expect("resident block drop mutation view");
+            let decision_id = if let Some(journal) = journal {
+                let journal = journal.clone();
+                match tokio::task::spawn_blocking(move || journal.reserve_decision_ids(1)).await {
+                    Ok(Ok(ids)) => {
+                        let Some(decision_id) = ids.into_iter().next() else {
+                            warn!("block-drop journal reserved no decision id");
+                            sessions.report_world_chunk_journal_failure();
+                            self.metrics
+                                .rejected_world_mutation
+                                .fetch_add(1, Ordering::Relaxed);
+                            envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                            fail_stopped = true;
+                            break;
+                        };
+                        Some(decision_id)
+                    }
+                    Ok(Err(error)) => {
+                        warn!(%error, "block-drop journal decision reservation failed");
+                        sessions.report_world_chunk_journal_failure();
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        fail_stopped = true;
+                        break;
+                    }
+                    Err(error) => {
+                        warn!(?error, "block-drop journal reservation worker failed");
+                        sessions.report_world_chunk_journal_failure();
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        fail_stopped = true;
+                        break;
+                    }
+                }
+            } else {
+                None
+            };
+
+            #[cfg(test)]
+            if decision_id.is_some() {
+                pause_block_drop_after(BlockDropAwaitStage::AfterReservation).await;
+            }
+
+            if envelope.response_is_closed() || Self::request_is_stale(sessions, &envelope) {
+                if let (Some(journal), Some(decision_id)) = (journal, decision_id)
+                    && let Err(error) =
+                        Self::close_empty_block_drop_decision(journal, world_tick, decision_id)
+                            .await
+                {
+                    match error {
+                        BlockDropJournalAppendError::Journal(error) => {
+                            warn!(
+                                outcome_unknown = error.outcome_unknown(),
+                                %error,
+                                "block-drop cancelled decision closure failed"
+                            );
+                        }
+                        BlockDropJournalAppendError::Worker(error) => {
+                            warn!(
+                                ?error,
+                                "block-drop cancelled decision closure worker failed"
+                            );
+                        }
+                    }
+                    sessions.report_world_chunk_journal_failure();
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                    fail_stopped = true;
+                    break;
+                }
+                if envelope.response_is_closed() {
+                    self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    self.metrics
+                        .rejected_stale_session
+                        .fetch_add(1, Ordering::Relaxed);
+                    envelope.respond(Err(SimulationRequestError::StaleSession));
+                }
+                continue;
+            }
+
+            if let (Some(journal), Some(decision_id)) = (journal, decision_id) {
+                if let Err(error) = journal.wait_for_append_turn(decision_id).await {
+                    warn!(%error, "block-drop journal append ordering failed");
+                    sessions.report_world_chunk_journal_failure();
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                    fail_stopped = true;
+                    break;
+                }
+                if envelope.response_is_closed() || Self::request_is_stale(sessions, &envelope) {
+                    if let Err(error) =
+                        Self::close_empty_block_drop_decision(journal, world_tick, decision_id)
+                            .await
+                    {
+                        match error {
+                            BlockDropJournalAppendError::Journal(error) => warn!(
+                                outcome_unknown = error.outcome_unknown(),
+                                %error,
+                                "block-drop ordered cancellation closure failed"
+                            ),
+                            BlockDropJournalAppendError::Worker(error) => warn!(
+                                ?error,
+                                "block-drop ordered cancellation closure worker failed"
+                            ),
+                        }
+                        sessions.report_world_chunk_journal_failure();
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        fail_stopped = true;
+                        break;
+                    }
+                    if envelope.response_is_closed() {
+                        self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.metrics
+                            .rejected_stale_session
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::StaleSession));
+                    }
+                    continue;
+                }
+            }
+
+            let resident_edits = resident_block_edits(&edits, &preconditions, block_light);
+            let resident_preconditions = resident_block_preconditions(&preconditions);
+            let (raw_outcome, touched_chunks) = if let Some(decision_id) = decision_id {
+                mutation.apply_block_edits_conditionally_journaled(
+                    decision_id,
+                    &resident_edits,
+                    &resident_preconditions,
+                    &[],
+                    block_light,
+                    Some(world_tick.saturating_add(1)),
+                )
+            } else {
+                (
+                    mutation.apply_block_edits_conditionally(
+                        &resident_edits,
+                        &resident_preconditions,
+                        &[],
+                        block_light,
+                        Some(world_tick.saturating_add(1)),
+                    ),
+                    Vec::new(),
+                )
+            };
+
+            #[cfg(test)]
+            if journal.is_some()
+                && let Some(probe) = self.regional_block_edit_probe.as_ref()
+            {
+                probe.enter(
+                    command_single_owner_region(&envelope.command)
+                        .expect("validated block-drop command has a resident owner"),
+                );
+            }
+
+            if let (Some(journal), Some(decision_id)) = (journal, decision_id) {
+                let world_read = access.read.expect("resident block drop read view");
+                let snapshot = world_read.snapshot_chunks(&touched_chunks);
+                let snapshots = touched_chunks
+                    .iter()
+                    .filter_map(|position| snapshot.chunk(*position))
+                    .collect::<Vec<_>>();
+                if snapshots.len() != touched_chunks.len() {
+                    warn!("block-drop journal snapshot was incomplete");
+                    let closure =
+                        Self::close_empty_block_drop_decision(journal, world_tick, decision_id)
+                            .await;
+                    if let Err(error) = closure {
+                        match error {
+                            BlockDropJournalAppendError::Journal(error) => warn!(
+                                outcome_unknown = error.outcome_unknown(),
+                                %error,
+                                "block-drop incomplete snapshot closure failed"
+                            ),
+                            BlockDropJournalAppendError::Worker(error) => warn!(
+                                ?error,
+                                "block-drop incomplete snapshot closure worker failed"
+                            ),
+                        }
+                    }
+                    sessions.report_world_chunk_journal_failure();
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                    fail_stopped = true;
+                    break;
+                }
+                match Self::append_block_drop_decision(journal, world_tick, decision_id, snapshots)
+                    .await
+                {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let outcome_unknown = error.outcome_unknown();
+                        match &error {
+                            BlockDropJournalAppendError::Journal(error) => warn!(
+                                outcome_unknown,
+                                %error,
+                                "block-drop journal append failed"
+                            ),
+                            BlockDropJournalAppendError::Worker(error) => warn!(
+                                outcome_unknown,
+                                ?error,
+                                "block-drop journal append worker failed"
+                            ),
+                        }
+                        if !outcome_unknown
+                            && let Err(closure_error) = Self::close_empty_block_drop_decision(
+                                journal,
+                                world_tick,
+                                decision_id,
+                            )
+                            .await
+                        {
+                            match closure_error {
+                                BlockDropJournalAppendError::Journal(error) => warn!(
+                                    outcome_unknown = error.outcome_unknown(),
+                                    %error,
+                                    "block-drop known append failure closure failed"
+                                ),
+                                BlockDropJournalAppendError::Worker(error) => warn!(
+                                    ?error,
+                                    "block-drop known append failure closure worker failed"
+                                ),
+                            }
+                        }
+                        sessions.report_world_chunk_journal_failure();
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        fail_stopped = true;
+                        break;
+                    }
+                }
+
+                #[cfg(test)]
+                pause_block_drop_after(BlockDropAwaitStage::AfterAppend).await;
+
+                let cancelled_before_clear = envelope.response_is_closed();
+                let stale_before_clear = Self::request_is_stale(sessions, &envelope);
+                let cleared =
+                    mutation.clear_journal_pending_conditionally(decision_id, &touched_chunks);
+                if cleared != touched_chunks.len() {
+                    warn!(
+                        decision_id,
+                        expected = touched_chunks.len(),
+                        cleared,
+                        "block-drop journal fence clear did not retire the exact decision"
+                    );
+                    sessions.report_world_chunk_journal_failure();
+                    self.metrics
+                        .rejected_world_mutation
+                        .fetch_add(1, Ordering::Relaxed);
+                    envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                    fail_stopped = true;
+                    break;
+                }
+                let cancelled = cancelled_before_clear || envelope.response_is_closed();
+                let stale = stale_before_clear || Self::request_is_stale(sessions, &envelope);
+                if cancelled || stale {
+                    if cancelled {
+                        self.metrics.cancelled.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        self.metrics
+                            .rejected_stale_session
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::StaleSession));
+                    }
+                    continue;
+                }
+            }
+
+            match raw_outcome {
+                ResidentBlockEditBatchResult::Applied(applied) => {
+                    let Some(outcome) = resident_block_edit_result_outcome(
+                        ResidentBlockEditBatchResult::Applied(applied),
+                    ) else {
+                        unreachable!("applied resident block-drop result lost its outcome");
+                    };
+                    if outcome.applied.len() != edits.len() {
+                        self.metrics
+                            .rejected_world_mutation
+                            .fetch_add(1, Ordering::Relaxed);
+                        envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                        fail_stopped = true;
+                        break;
+                    }
+                    let drop_dispatches = match sessions.try_spawn_item_drop_batch_owned(
+                        &self.authority,
+                        drops
+                            .iter()
+                            .map(|drop| (drop.entity_type_id, drop.position, drop.stack.clone())),
+                    ) {
+                        Ok(dispatches) => dispatches,
+                        Err(error) => {
+                            warn!(?error, "block-drop entity batch commit failed");
+                            self.metrics
+                                .rejected_world_mutation
+                                .fetch_add(1, Ordering::Relaxed);
+                            envelope.respond(Err(SimulationRequestError::WorldMutationFailed));
+                            fail_stopped = true;
+                            break;
+                        }
+                    };
+                    self.publish_resident_block_drop(
+                        sessions,
+                        actor_session,
+                        drop_dispatches,
+                        &outcome,
+                    );
+                    envelope.respond(Ok(SimulationResponse::BlockDrops(Ok(Box::new(Some(
+                        outcome,
+                    ))))));
+                }
+                ResidentBlockEditBatchResult::Stale => {
+                    envelope.respond(Ok(SimulationResponse::BlockDrops(Ok(Box::new(None)))));
+                }
+                ResidentBlockEditBatchResult::Missing => {
+                    self.record_world_access_error(SimulationRequestError::WorldUnavailable);
+                    envelope.respond(Err(SimulationRequestError::WorldUnavailable));
+                }
+                ResidentBlockEditBatchResult::CrossRegion => {
+                    envelope.respond(Err(SimulationRequestError::CrossRegion));
+                }
+            }
+        }
+
+        if fail_stopped {
+            for envelope in envelopes {
+                self.reject_drained_envelope(envelope, SimulationRequestError::OwnerStopped);
+            }
+        }
+
+        ResidentBlockDropRunResult {
+            report: SimulationTickReport {
+                processed,
+                remaining_depth: self.metrics.depth.load(Ordering::Relaxed),
+                ..SimulationTickReport::default()
+            },
+            fail_stopped,
+        }
+    }
+
+    fn publish_resident_block_drop(
+        &self,
+        sessions: &SessionRegistry,
+        actor_session: SessionId,
+        drop_dispatches: Vec<VisibilityDispatch>,
+        outcome: &BlockEditBatchOutcome,
+    ) {
+        sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
+        let mut dispatches = sessions
+            .loaded_recipients_for_chunks(&outcome.edit_chunks, Some(actor_session))
+            .into_iter()
+            .map(|recipient| VisibilityDispatch {
+                recipient,
+                command: OutboundCommand::BlockDeltas(outcome.deltas.clone()),
+            })
+            .collect::<Vec<_>>();
+        dispatches.extend(drop_dispatches);
+        dispatch_visibility_commands(dispatches);
     }
 
     fn commit_chest_command(
@@ -3629,12 +4347,10 @@ impl SimulationOwner {
                     .fetch_add(command_count as u64, Ordering::Relaxed);
                 continue;
             }
-            let item_pickup = match &envelope.command {
-                SimulationCommand::PickupItemIntoInventory { .. } => true,
-                #[cfg(test)]
-                SimulationCommand::ClaimItemPickup { .. } => true,
-                _ => false,
-            };
+            let item_pickup = matches!(
+                &envelope.command,
+                SimulationCommand::PickupItemIntoInventory { .. }
+            );
             let block_edit = matches!(
                 &envelope.command,
                 SimulationCommand::ApplyBlockEdits { .. }
@@ -3807,17 +4523,6 @@ impl SimulationOwner {
                     }
                     SimulationResponse::ItemPickupCredit(credited)
                 }
-                #[cfg(test)]
-                SimulationCommand::ClaimItemPickup {
-                    entity_id,
-                    collector_session,
-                    max_count,
-                } => SimulationResponse::ItemPickup(sessions.claim_item_pickup(
-                    &self.authority,
-                    *entity_id,
-                    *collector_session,
-                    *max_count,
-                )),
                 SimulationCommand::PickupExperienceIntoPlayer {
                     entity_id,
                     collector_session,
@@ -3838,11 +4543,16 @@ impl SimulationOwner {
                 SimulationCommand::ClaimExperiencePickup {
                     entity_id,
                     collector_session,
-                } => SimulationResponse::ExperiencePickup(sessions.claim_experience_pickup(
-                    &self.authority,
-                    *entity_id,
-                    *collector_session,
-                )),
+                } => {
+                    if let Some(mut claimed) = sessions.claim_experience_pickup(
+                        &self.authority,
+                        *entity_id,
+                        *collector_session,
+                    ) {
+                        dispatch_visibility_commands(std::mem::take(&mut claimed.dispatches));
+                    }
+                    SimulationResponse::ExperiencePickup
+                }
                 SimulationCommand::PickupArrowIntoInventory {
                     entity_id,
                     collector_session,
@@ -3863,15 +4573,6 @@ impl SimulationOwner {
                     }
                     SimulationResponse::ArrowPickupCredit(credited)
                 }
-                #[cfg(test)]
-                SimulationCommand::ClaimArrowPickup {
-                    entity_id,
-                    collector_session,
-                } => SimulationResponse::ArrowPickup(sessions.claim_arrow_pickup(
-                    &self.authority,
-                    *entity_id,
-                    *collector_session,
-                )),
                 SimulationCommand::PlayerAttackServerEntity {
                     attacker_session,
                     entity_id,
@@ -3894,6 +4595,39 @@ impl SimulationOwner {
                         dispatch_visibility_commands(std::mem::take(dispatches));
                     }
                     SimulationResponse::PlayerAttack(result)
+                }
+                SimulationCommand::ApplyServerEntityEffect(command) => {
+                    let request = EntityEffectRequest {
+                        operation: command.operation.clone(),
+                        target_kind: command.target_kind,
+                        death_remove_tick: sessions
+                            .simulation_tick()
+                            .saturating_add(ENTITY_DEATH_TICKS),
+                    };
+                    let (result, dispatches) = sessions.apply_server_entity_effect_request(
+                        &self.authority,
+                        command.expected.as_deref().cloned(),
+                        command.entity_id,
+                        request,
+                    );
+                    match &result {
+                        EntityEffectResult::Applied(applied) => {
+                            trace!(
+                                entity_id = applied.snapshot.id.0,
+                                health = applied.snapshot.health,
+                                "server entity effect transaction accepted"
+                            );
+                        }
+                        EntityEffectResult::Rejected(rejection) => {
+                            trace!(
+                                entity_id = command.entity_id.0,
+                                ?rejection,
+                                "server entity effect transaction rejected"
+                            );
+                        }
+                    }
+                    dispatch_visibility_commands(dispatches);
+                    SimulationResponse::EntityEffect(result)
                 }
                 #[cfg(test)]
                 SimulationCommand::AttackServerEntity {
@@ -4040,60 +4774,9 @@ impl SimulationOwner {
                     };
                     SimulationResponse::BlockEdits(result)
                 }
-                SimulationCommand::CommitBlockDrops {
-                    actor_session,
-                    edits,
-                    preconditions,
-                    drops,
-                } => {
-                    let result = if !valid_block_drop_command(edits, preconditions, drops) {
-                        Err(SimulationRequestError::InvalidCommand)
-                    } else if let Some(storage) = storage.as_deref_mut() {
-                        match apply_block_edit_batch_to_storage_conditionally(
-                            storage,
-                            block_light,
-                            edits,
-                            preconditions,
-                        ) {
-                            Some(outcome) if outcome.applied.len() == edits.len() => {
-                                schedule_leaf_ticks_near_applied(
-                                    storage,
-                                    sessions.simulation_tick(),
-                                    &outcome.applied,
-                                );
-                                sessions.invalidate_prepared_chunks(&outcome.edit_chunks);
-                                let mut dispatches = sessions
-                                    .loaded_recipients_for_chunks(
-                                        &outcome.edit_chunks,
-                                        Some(*actor_session),
-                                    )
-                                    .into_iter()
-                                    .map(|recipient| VisibilityDispatch {
-                                        recipient,
-                                        command: OutboundCommand::BlockDeltas(
-                                            outcome.deltas.clone(),
-                                        ),
-                                    })
-                                    .collect::<Vec<_>>();
-                                for drop in drops {
-                                    dispatches.extend(sessions.spawn_item_drop_owned(
-                                        &self.authority,
-                                        drop.entity_type_id,
-                                        drop.position,
-                                        drop.stack.clone(),
-                                    ));
-                                }
-                                dispatch_visibility_commands(dispatches);
-                                Ok(Box::new(Some(outcome)))
-                            }
-                            Some(_) => Err(SimulationRequestError::WorldMutationFailed),
-                            None => Ok(Box::new(None)),
-                        }
-                    } else {
-                        self.record_world_access_error(world_error);
-                        Err(world_error)
-                    };
-                    SimulationResponse::BlockDrops(result)
+                SimulationCommand::CommitBlockDrops { .. } => {
+                    self.record_world_access_error(world_error);
+                    SimulationResponse::BlockDrops(Err(world_error))
                 }
                 SimulationCommand::ScheduleFluidTicksNearApplied {
                     applied,
@@ -4862,74 +5545,6 @@ impl SimulationOwner {
     }
 }
 
-#[cfg(test)]
-fn write_shadow_divergence_artifact(
-    divergence: &ShadowDivergence,
-) -> std::io::Result<std::path::PathBuf> {
-    write_shadow_divergence_artifact_to(std::path::Path::new(".analysis"), divergence)
-}
-
-#[cfg(test)]
-fn write_shadow_divergence_artifact_to(
-    directory: &std::path::Path,
-    divergence: &ShadowDivergence,
-) -> std::io::Result<std::path::PathBuf> {
-    std::fs::create_dir_all(directory)?;
-    let path = directory.join("entity-shadow-first-divergence.json");
-    let value = serde_json::json!({
-        "schema": "solaris.entity_shadow_divergence.v1",
-        "tick": divergence.tick,
-        "stage": format!("{:?}", divergence.stage),
-        "entity_id": divergence.entity_id.map(|id| id.0),
-        "legacy": divergence.legacy.as_ref().map(entity_snapshot_artifact),
-        "shadow": divergence.shadow.as_ref().map(entity_snapshot_artifact),
-        "legacy_event": divergence.legacy_event.as_ref().map(|event| format!("{event:?}")),
-        "shadow_event": divergence.shadow_event.as_ref().map(|event| format!("{event:?}")),
-    });
-    let bytes = serde_json::to_vec_pretty(&value).map_err(std::io::Error::other)?;
-    std::fs::write(&path, bytes)?;
-    Ok(path)
-}
-
-#[cfg(test)]
-fn entity_snapshot_artifact(snapshot: &EntitySnapshot) -> serde_json::Value {
-    let attributes = snapshot
-        .attributes
-        .iter()
-        .map(|(kind, value)| {
-            serde_json::json!({
-                "name": kind.vanilla_name(),
-                "base": value.base,
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "id": snapshot.id.0,
-        "uuid": snapshot.uuid.to_string(),
-        "type_id": snapshot.type_id,
-        "type_name": snapshot.type_name,
-        "position": [snapshot.position.x, snapshot.position.y, snapshot.position.z],
-        "rotation": [snapshot.rotation.yaw, snapshot.rotation.pitch, snapshot.rotation.head_yaw],
-        "velocity": [snapshot.velocity.x, snapshot.velocity.y, snapshot.velocity.z],
-        "on_ground": snapshot.on_ground,
-        "item_stack": snapshot.item_stack.as_ref().map(|stack| serde_json::json!({
-            "item_id": stack.item_id,
-            "count": stack.count,
-            "damage": stack.damage,
-        })),
-        "experience_value": snapshot.experience_value,
-        "block_state": snapshot.block_state,
-        "lifecycle": format!("{:?}", snapshot.lifecycle),
-        "health": snapshot.health,
-        "attributes": attributes,
-        "goal": format!("{:?}", snapshot.goal),
-        "vehicle": snapshot.vehicle.map(|vehicle| serde_json::json!({
-            "kind": format!("{:?}", vehicle.kind),
-            "passenger": vehicle.passenger.map(|id| id.0),
-        })),
-    })
-}
-
 fn valid_survival_block_break_plan(plan: &SurvivalBlockBreakPlan) -> bool {
     plan.held.hotbar_slot <= 8
         && plan.held.max_damage.is_none_or(|max_damage| max_damage > 0)
@@ -4972,6 +5587,7 @@ fn prepare_survival_block_break_plan(
         air,
     );
     let preconditions = super::plan_break_edit_preconditions(
+        &request.blocks,
         storage,
         &edits,
         request.position,
@@ -5288,16 +5904,6 @@ mod tests {
     use std::collections::{BTreeMap, HashSet};
     use std::sync::Mutex;
 
-    #[derive(Debug, PartialEq, Eq)]
-    struct NormalizedClaims {
-        item: Option<EntityItemStack>,
-        item_dispatches: usize,
-        experience: Option<i32>,
-        experience_dispatches: usize,
-        remaining_items: usize,
-        remaining_experience: usize,
-    }
-
     struct FailOnceEntityCommitJournal {
         failure: Option<mc_entity::RegionalDecisionJournalError>,
         commits: Arc<AtomicUsize>,
@@ -5592,24 +6198,6 @@ mod tests {
             .count()
     }
 
-    fn normalize_claims(
-        registry: &SessionRegistry,
-        item: Option<ClaimedPickup>,
-        experience: Option<ClaimedExperience>,
-    ) -> NormalizedClaims {
-        let position = Vec3::new(0.5, 64.0, 0.5);
-        NormalizedClaims {
-            item: item.as_ref().map(|claim| claim.stack.clone()),
-            item_dispatches: item.as_ref().map_or(0, |claim| claim.dispatches.len()),
-            experience: experience.as_ref().map(|claim| claim.value),
-            experience_dispatches: experience
-                .as_ref()
-                .map_or(0, |claim| claim.dispatches.len()),
-            remaining_items: registry.nearby_item_entities(position, 2.25).len(),
-            remaining_experience: registry.nearby_experience_entities(position, 2.25).len(),
-        }
-    }
-
     fn claim_xp(entity_id: i32, collector_session: SessionId) -> SimulationCommand {
         SimulationCommand::ClaimExperiencePickup {
             entity_id: EntityId(entity_id),
@@ -5618,7 +6206,7 @@ mod tests {
     }
 
     fn seed_grounded_arrow(registry: &SessionRegistry) -> EntityId {
-        registry.spawn_arrow_legacy_for_test(
+        registry.spawn_arrow_for_test(
             None,
             3,
             Vec3::new(0.5, 64.0, 0.5),
@@ -5646,7 +6234,8 @@ mod tests {
     }
 
     fn seed_attack_target(registry: &SessionRegistry) -> EntityId {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             "minecraft:zombie".to_owned(),
             Vec3::new(1.5, 64.0, 0.5),
@@ -6728,7 +7317,8 @@ mod tests {
         };
         assert_eq!(outcome.damage().snapshot.health, 15.0);
 
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             5,
             "minecraft:cow".to_owned(),
             Vec3::new(20.5, 64.0, 0.5),
@@ -6826,7 +7416,8 @@ mod tests {
             let registry = SessionRegistry::new();
             let session = register_test_session(&registry, "RemoteAttackAlice");
             register_test_player_state(&registry, session, PlayerInventory::empty());
-            registry.spawn_command_entity_legacy_for_test(
+            registry.spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 5,
                 "minecraft:cow".to_owned(),
                 Vec3::new(20.5, 64.0, 0.5),
@@ -7745,50 +8336,6 @@ mod tests {
         assert!(std::panic::catch_unwind(|| simulation_channel_with_capacity(0)).is_err());
     }
 
-    #[test]
-    fn owner_phase_comparison_updates_shadow_telemetry() {
-        let registry = SessionRegistry::default();
-        registry.spawn_command_entity_legacy_for_test(
-            144,
-            "minecraft:zombie".to_owned(),
-            Vec3::new(1.0, 64.0, 1.0),
-        );
-        let (_handle, owner) = simulation_channel_with_capacity(1);
-
-        owner.compare_entity_shadow(&registry, 7, ShadowStage::InputAi);
-
-        let pressure = registry.pressure_snapshot();
-        assert_eq!(pressure.entity_shadow_comparisons, 1);
-        assert_eq!(pressure.entity_shadow_compared_entities, 0);
-        assert_eq!(pressure.entity_shadow_compared_events, 0);
-        assert!(!pressure.entity_shadow_first_divergence);
-    }
-
-    #[test]
-    fn first_shadow_divergence_writes_a_replay_artifact() {
-        let directory = tempfile::tempdir().unwrap();
-        let divergence = ShadowDivergence {
-            tick: 17,
-            stage: ShadowStage::PhysicsApply,
-            compared_entities: 0,
-            compared_events: 0,
-            entity_id: Some(EntityId(42)),
-            legacy: None,
-            shadow: None,
-            legacy_event: None,
-            shadow_event: None,
-        };
-
-        let path = write_shadow_divergence_artifact_to(directory.path(), &divergence).unwrap();
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-
-        assert_eq!(value["schema"], "solaris.entity_shadow_divergence.v1");
-        assert_eq!(value["tick"], 17);
-        assert_eq!(value["stage"], "PhysicsApply");
-        assert_eq!(value["entity_id"], 42);
-    }
-
     #[tokio::test(flavor = "current_thread")]
     async fn command_arrival_wakes_owner_and_preserves_the_envelope() {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
@@ -8269,14 +8816,16 @@ mod tests {
     #[test]
     fn item_pickup_credit_is_conservative_under_partial_capacity() {
         let registry = SessionRegistry::new();
-        let session = register_test_session(&registry, "PickupCreditBob");
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "PickupCreditBob");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
         let mut inventory = PlayerInventory::empty();
         for slot in 9..=44 {
             inventory.slots[slot] = ItemStack::new(42, 64);
         }
         inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
         let player_state = register_test_player_state(&registry, session, inventory);
-        let (item, _) = seed_claim_entities(&registry);
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let response = handle
             .for_session(session)
@@ -8312,6 +8861,13 @@ mod tests {
         );
         let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
         assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 2);
+        assert!(matches!(
+            outbound.try_recv(),
+            Ok(OutboundCommand::UpdateEntityData(snapshot))
+                if snapshot.id == item
+                    && snapshot.item_stack.as_ref().is_some_and(|stack| stack.count == 2)
+        ));
+        assert!(outbound.try_recv().is_err());
     }
 
     #[test]
@@ -8351,6 +8907,105 @@ mod tests {
         );
         let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
         assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 3);
+    }
+
+    #[test]
+    fn invalid_hotbar_rejects_pickup_without_inventory_or_entity_publication() {
+        let registry = SessionRegistry::new();
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "InvalidHotbarPickup");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let inventory = PlayerInventory::empty();
+        let player_state = register_test_player_state(&registry, session, inventory.clone());
+        player_state.lock().unwrap().selected_hotbar_slot = 9;
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+
+        assert_eq!(owner.process_tick(&registry, 1).processed, 1);
+        assert!(matches!(
+            response.blocking_recv().unwrap().unwrap(),
+            SimulationResponse::ItemPickupCredit(None)
+        ));
+
+        assert_eq!(
+            player_state.lock().unwrap().inventory.slots,
+            inventory.slots
+        );
+        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, item);
+        assert_eq!(remaining[0].item_stack.as_ref().unwrap().count, 3);
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
+    fn stale_item_stack_after_pickup_plan_preserves_inventory_entity_and_publication() {
+        let registry = Arc::new(SessionRegistry::new());
+        let (session, mut outbound) =
+            register_test_session_with_outbound(&registry, "StalePickupItemStack");
+        assert!(registry.mark_loaded(session, (0, 0)).is_empty());
+        let mut inventory = PlayerInventory::empty();
+        for slot in 9..=44 {
+            inventory.slots[slot] = ItemStack::new(42, 64);
+        }
+        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 63);
+        let player_state = register_test_player_state(&registry, session, inventory.clone());
+        let (item, _) = seed_claim_entities_published(&registry, &mut outbound);
+        let (plan_reached_tx, plan_reached_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        registry.install_item_pickup_plan_probe_for_test(plan_reached_tx, resume_rx);
+        let (handle, mut owner) = simulation_channel_with_capacity(1);
+        let response = handle
+            .for_session(session)
+            .enqueue(SimulationCommand::PickupItemIntoInventory {
+                entity_id: item,
+                collector_session: session,
+                expected_item_id: 42,
+                expected_damage: None,
+                expected_enchantments: Vec::new(),
+                max_stack: 64,
+            })
+            .expect("pickup command fits");
+        let owner_registry = Arc::clone(&registry);
+        let owner_thread = std::thread::spawn(move || owner.process_tick(&owner_registry, 1));
+
+        plan_reached_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("pickup reaches the post-plan CAS fence");
+        let replacement = EntityItemStack {
+            item_id: 42,
+            count: 3,
+            damage: Some(7),
+            enchantments: Vec::new(),
+        };
+        assert!(registry.replace_item_stack_after_pickup_plan_for_test(item, replacement.clone()));
+        resume_tx.send(()).expect("release pickup CAS");
+        assert_eq!(owner_thread.join().unwrap().processed, 1);
+        assert!(matches!(
+            response.blocking_recv().unwrap().unwrap(),
+            SimulationResponse::ItemPickupCredit(None)
+        ));
+
+        assert_eq!(
+            player_state.lock().unwrap().inventory.slots,
+            inventory.slots
+        );
+        let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, item);
+        assert_eq!(remaining[0].item_stack.as_ref(), Some(&replacement));
+        assert!(outbound.try_recv().is_err());
     }
 
     fn assert_player_state_cannot_pick_up(
@@ -8788,224 +9443,17 @@ mod tests {
     }
 
     #[test]
-    fn queued_item_and_xp_claims_match_legacy_outcomes() {
-        let legacy = SessionRegistry::new();
-        let legacy_collector = register_test_session(&legacy, "LegacyClaimCollector");
-        let (legacy_item, legacy_experience) = seed_claim_entities(&legacy);
-        let legacy_item =
-            legacy.claim_item_pickup_legacy_for_test(legacy_item, legacy_collector, 3);
-        let legacy_experience =
-            legacy.claim_experience_pickup_legacy_for_test(legacy_experience, legacy_collector);
-        let legacy_outcome = normalize_claims(&legacy, legacy_item, legacy_experience);
-
-        let queued = SessionRegistry::new();
-        let queued_collector = register_test_session(&queued, "QueuedClaimCollector");
-        let (queued_item, queued_experience) = seed_claim_entities(&queued);
-        let (handle, mut owner) = simulation_channel_with_capacity(2);
-        let item_response = handle
-            .enqueue(SimulationCommand::ClaimItemPickup {
-                entity_id: queued_item,
-                collector_session: queued_collector,
-                max_count: 3,
-            })
-            .unwrap();
-        let experience_response = handle
-            .enqueue(SimulationCommand::ClaimExperiencePickup {
-                entity_id: queued_experience,
-                collector_session: queued_collector,
-            })
-            .unwrap();
-
-        let report = owner.process_tick(&queued, 2);
-        assert_eq!(report.processed, 2);
-        let item = match item_response.blocking_recv().unwrap().unwrap() {
-            SimulationResponse::ItemPickup(item) => item,
-            SimulationResponse::SaveSnapshot(_)
-            | SimulationResponse::BlockSnapshot(_)
-            | SimulationResponse::ChestSnapshot(_)
-            | SimulationResponse::FurnaceSnapshot(_)
-            | SimulationResponse::ItemPickupCredit(_)
-            | SimulationResponse::ExperiencePickupCredit(_)
-            | SimulationResponse::ExperiencePickup(_)
-            | SimulationResponse::ArrowPickupCredit(_)
-            | SimulationResponse::ArrowPickup(_)
-            | SimulationResponse::PlayerAttack(_)
-            | SimulationResponse::EntityAttack(_)
-            | SimulationResponse::EntitySpawn(_)
-            | SimulationResponse::WorldTimeSet
-            | SimulationResponse::BlockEdits(_)
-            | SimulationResponse::BlockDrops(_)
-            | SimulationResponse::FluidTicksScheduled
-            | SimulationResponse::SurvivalBreak(_)
-            | SimulationResponse::SurvivalPlacement(_)
-            | SimulationResponse::BucketUse(_)
-            | SimulationResponse::FoodUse(_)
-            | SimulationResponse::AnimalFeed(_)
-            | SimulationResponse::SheepShear(_)
-            | SimulationResponse::PlayerSurvival(_)
-            | SimulationResponse::PlayerPose(_)
-            | SimulationResponse::PlayerStateEvent(_)
-            | SimulationResponse::PlayerInventory(_)
-            | SimulationResponse::BowRelease(_)
-            | SimulationResponse::SelectedItemDrop(_)
-            | SimulationResponse::ChestCommit(_)
-            | SimulationResponse::FurnaceCommit(_)
-            | SimulationResponse::OpaqueBlockEntity(_)
-            | SimulationResponse::CampfireUse(_)
-            | SimulationResponse::TntIgnition(_) => {
-                panic!("item response kind changed")
-            }
-        };
-        let experience = match experience_response.blocking_recv().unwrap().unwrap() {
-            SimulationResponse::ExperiencePickup(experience) => experience,
-            SimulationResponse::SaveSnapshot(_)
-            | SimulationResponse::BlockSnapshot(_)
-            | SimulationResponse::ChestSnapshot(_)
-            | SimulationResponse::FurnaceSnapshot(_)
-            | SimulationResponse::ItemPickupCredit(_)
-            | SimulationResponse::ItemPickup(_)
-            | SimulationResponse::ExperiencePickupCredit(_)
-            | SimulationResponse::ArrowPickupCredit(_)
-            | SimulationResponse::ArrowPickup(_)
-            | SimulationResponse::PlayerAttack(_)
-            | SimulationResponse::EntityAttack(_)
-            | SimulationResponse::EntitySpawn(_)
-            | SimulationResponse::WorldTimeSet
-            | SimulationResponse::BlockEdits(_)
-            | SimulationResponse::BlockDrops(_)
-            | SimulationResponse::FluidTicksScheduled
-            | SimulationResponse::SurvivalBreak(_)
-            | SimulationResponse::SurvivalPlacement(_)
-            | SimulationResponse::BucketUse(_)
-            | SimulationResponse::FoodUse(_)
-            | SimulationResponse::AnimalFeed(_)
-            | SimulationResponse::SheepShear(_)
-            | SimulationResponse::PlayerSurvival(_)
-            | SimulationResponse::PlayerPose(_)
-            | SimulationResponse::PlayerStateEvent(_)
-            | SimulationResponse::PlayerInventory(_)
-            | SimulationResponse::BowRelease(_)
-            | SimulationResponse::SelectedItemDrop(_)
-            | SimulationResponse::ChestCommit(_)
-            | SimulationResponse::FurnaceCommit(_)
-            | SimulationResponse::OpaqueBlockEntity(_)
-            | SimulationResponse::CampfireUse(_)
-            | SimulationResponse::TntIgnition(_) => {
-                panic!("experience response kind changed")
-            }
-        };
-        let queued_outcome = normalize_claims(&queued, item, experience);
-
-        assert_eq!(queued_outcome, legacy_outcome);
-    }
-
-    #[test]
-    fn queued_arrow_claim_matches_legacy_outcome() {
-        let legacy = SessionRegistry::new();
-        let legacy_arrow = seed_grounded_arrow(&legacy);
-        let legacy_collector = register_test_session(&legacy, "LegacyArrowCollector");
-        let legacy_dispatches = legacy
-            .claim_arrow_pickup_legacy_for_test(legacy_arrow, legacy_collector)
-            .expect("legacy arrow claim");
-
-        let queued = SessionRegistry::new();
-        let queued_arrow = seed_grounded_arrow(&queued);
-        let queued_collector = register_test_session(&queued, "QueuedArrowCollector");
-        let (handle, mut owner) = simulation_channel_with_capacity(1);
-        let response = handle
-            .enqueue(SimulationCommand::ClaimArrowPickup {
-                entity_id: queued_arrow,
-                collector_session: queued_collector,
-            })
-            .unwrap();
-
-        assert_eq!(owner.process_tick(&queued, 1).processed, 1);
-        let queued_dispatches = match response.blocking_recv().unwrap().unwrap() {
-            SimulationResponse::ArrowPickup(dispatches) => dispatches.expect("queued arrow claim"),
-            other => panic!("expected arrow response, got {other:?}"),
-        };
-
-        assert_eq!(queued_dispatches.len(), legacy_dispatches.len());
-        assert!(legacy.server_entity_snapshot(legacy_arrow).is_none());
-        assert!(queued.server_entity_snapshot(queued_arrow).is_none());
-    }
-
-    #[test]
-    fn queued_nonlethal_attack_matches_legacy_damage_and_knockback() {
-        let attacker = Vec3::new(0.5, 64.0, 0.5);
-        let legacy = SessionRegistry::new();
-        let legacy_target = seed_attack_target(&legacy);
-        let legacy_damage = legacy
-            .damage_server_entity_legacy_for_test(legacy_target, 5.0)
-            .expect("legacy damage");
-        let legacy_dispatches =
-            legacy.apply_player_melee_knockback_legacy_for_test(legacy_target, attacker);
-        let legacy_snapshot = legacy
-            .server_entity_snapshot(legacy_target)
-            .expect("legacy target remains");
-
-        let queued = SessionRegistry::new();
-        let queued_target = seed_attack_target(&queued);
-        let (handle, mut owner) = simulation_channel_with_capacity(1);
-        let response = handle
-            .enqueue(SimulationCommand::AttackServerEntity {
-                entity_id: queued_target,
-                damage: 5.0,
-                knockback_origin: Some(attacker),
-                rewards: EntityKillRewards::default(),
-            })
-            .unwrap();
-
-        assert_eq!(owner.process_tick(&queued, 1).processed, 1);
-        let queued_outcome = match response.blocking_recv().unwrap().unwrap() {
-            SimulationResponse::EntityAttack(Some(outcome)) => *outcome,
-            other => panic!("expected entity attack response, got {other:?}"),
-        };
-        let queued_snapshot = queued
-            .server_entity_snapshot(queued_target)
-            .expect("queued target remains");
-
-        assert_eq!(
-            queued_outcome.damage().snapshot.health,
-            legacy_damage.snapshot.health
-        );
-        assert_eq!(queued_outcome.dispatches().len(), legacy_dispatches.len());
-        assert_eq!(queued_snapshot.velocity, legacy_snapshot.velocity);
-    }
-
-    #[test]
-    fn queued_lethal_attack_removes_once_and_matches_legacy_outcome() {
-        let legacy = SessionRegistry::new();
-        let legacy_target = seed_attack_target(&legacy);
+    fn queued_duplicate_lethal_attack_does_not_duplicate_rewards() {
+        let registry = SessionRegistry::new();
+        let target = seed_attack_target(&registry);
         let rewards = EntityKillRewards {
             items: vec![(5, EntityItemStack::new(42, 1))],
             experience: Some((6, 5)),
         };
-        let legacy_outcome = legacy
-            .attack_server_entity(
-                &SimulationAuthority::for_test(),
-                legacy_target,
-                20.0,
-                Some(Vec3::new(0.5, 64.0, 0.5)),
-                &rewards,
-            )
-            .expect("direct lethal attack");
-        let EntityAttackOutcome::Killed {
-            damage: legacy_damage,
-            entity: legacy_entity,
-            dispatches: legacy_dispatches,
-            ..
-        } = legacy_outcome
-        else {
-            panic!("direct attack must be lethal");
-        };
-
-        let queued = SessionRegistry::new();
-        let queued_target = seed_attack_target(&queued);
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let lethal_response = handle
             .enqueue(SimulationCommand::AttackServerEntity {
-                entity_id: queued_target,
+                entity_id: target,
                 damage: 20.0,
                 knockback_origin: Some(Vec3::new(0.5, 64.0, 0.5)),
                 rewards: rewards.clone(),
@@ -9013,81 +9461,47 @@ mod tests {
             .unwrap();
         let duplicate_response = handle
             .enqueue(SimulationCommand::AttackServerEntity {
-                entity_id: queued_target,
+                entity_id: target,
                 damage: 20.0,
                 knockback_origin: Some(Vec3::new(0.5, 64.0, 0.5)),
                 rewards,
             })
             .unwrap();
 
-        assert_eq!(owner.process_tick(&queued, 2).processed, 2);
-        let (queued_damage, queued_entity, queued_dispatches) =
-            match lethal_response.blocking_recv().unwrap().unwrap() {
-                SimulationResponse::EntityAttack(Some(outcome)) => match *outcome {
-                    EntityAttackOutcome::Killed {
-                        damage,
-                        entity,
-                        dispatches,
-                        ..
-                    } => (damage, entity, dispatches),
-                    other => panic!("expected lethal entity attack outcome, got {other:?}"),
-                },
-                other => panic!("expected lethal entity attack response, got {other:?}"),
-            };
+        assert_eq!(owner.process_tick(&registry, 2).processed, 2);
+        let killed = match lethal_response.blocking_recv().unwrap().unwrap() {
+            SimulationResponse::EntityAttack(Some(outcome)) => match *outcome {
+                EntityAttackOutcome::Killed {
+                    damage,
+                    entity,
+                    dispatches: _,
+                    ..
+                } => (damage, entity),
+                other => panic!("expected lethal entity attack outcome, got {other:?}"),
+            },
+            other => panic!("expected lethal entity attack response, got {other:?}"),
+        };
         assert!(matches!(
             duplicate_response.blocking_recv().unwrap().unwrap(),
             SimulationResponse::EntityAttack(None)
         ));
 
-        assert_eq!(queued_damage.snapshot.health, legacy_damage.snapshot.health);
-        assert_eq!(queued_entity.type_name, legacy_entity.type_name);
-        assert_eq!(queued_dispatches.len(), legacy_dispatches.len());
-        assert!(queued.server_entity_snapshot(queued_target).is_some());
+        assert_eq!(killed.0.snapshot.health, 0.0);
+        assert_eq!(killed.1.type_name, "minecraft:zombie");
+        assert!(registry.server_entity_snapshot(target).is_some());
         assert_eq!(
-            queued
-                .nearby_item_entities(queued_entity.position, 2.25)
-                .len(),
-            legacy
-                .nearby_item_entities(legacy_entity.position, 2.25)
-                .len()
+            registry
+                .persisted_entity_records()
+                .into_iter()
+                .filter(|record| record.snapshot.item_stack.is_some())
+                .count(),
+            1
         );
         assert_eq!(
-            queued
-                .nearby_experience_entities(queued_entity.position, 2.25)
+            registry
+                .nearby_experience_entities(killed.1.position, 2.25)
                 .len(),
-            legacy
-                .nearby_experience_entities(legacy_entity.position, 2.25)
-                .len()
-        );
-    }
-
-    #[test]
-    fn queued_command_spawn_matches_legacy_entity_outcome() {
-        let position = Vec3::new(1.5, 64.0, 0.5);
-        let legacy = SessionRegistry::new();
-        let legacy_dispatches =
-            legacy.spawn_command_entity_legacy_for_test(4, "minecraft:zombie".to_owned(), position);
-
-        let queued = SessionRegistry::new();
-        let (handle, mut owner) = simulation_channel_with_capacity(1);
-        let response = handle
-            .enqueue(SimulationCommand::SpawnCommandEntity {
-                entity_type_id: 4,
-                entity_type_name: "minecraft:zombie".to_owned(),
-                position,
-            })
-            .unwrap();
-
-        assert_eq!(owner.process_tick(&queued, 1).processed, 1);
-        let queued_dispatches = match response.blocking_recv().unwrap().unwrap() {
-            SimulationResponse::EntitySpawn(dispatches) => dispatches,
-            other => panic!("expected entity spawn response, got {other:?}"),
-        };
-
-        assert_eq!(queued_dispatches.len(), legacy_dispatches.len());
-        assert_eq!(
-            queued.nearby_hostile_entities(position, 2.25).len(),
-            legacy.nearby_hostile_entities(position, 2.25).len()
+            1
         );
     }
 
@@ -9119,7 +9533,7 @@ mod tests {
         assert_request_enqueued(barrier.as_mut(), &handle).await;
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
         let snapshot = barrier.await.unwrap();
-        assert!(snapshot.entities.iter().any(|entity| {
+        assert!(snapshot.entities.records.iter().any(|entity| {
             entity.snapshot.type_name == "minecraft:pig"
                 && entity.snapshot.position == Vec3::new(2.5, 64.0, 1.5)
         }));
@@ -9150,13 +9564,6 @@ mod tests {
     #[test]
     fn single_lane_region_routes_preserve_sequence_and_spawn_outcome() {
         let positions = [Vec3::new(-0.5, 64.0, 0.5), Vec3::new(128.5, 64.0, 0.5)];
-        let legacy = SessionRegistry::new();
-        let legacy_dispatch_counts = positions.map(|position| {
-            legacy
-                .spawn_command_entity_legacy_for_test(4, "minecraft:zombie".to_owned(), position)
-                .len()
-        });
-
         let routed = SessionRegistry::new();
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let responses = positions.map(|position| {
@@ -9189,22 +9596,20 @@ mod tests {
                     other => panic!("expected regional entity spawn response, got {other:?}"),
                 },
             );
-        assert_eq!(routed_dispatch_counts, legacy_dispatch_counts);
+        assert_eq!(routed_dispatch_counts, [0, 0]);
 
-        let snapshots = |registry: &SessionRegistry| {
-            registry
-                .persisted_entity_records()
-                .into_iter()
-                .map(|record| {
-                    (
-                        record.snapshot.id,
-                        record.snapshot.type_name,
-                        record.snapshot.position,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(snapshots(&routed), snapshots(&legacy));
+        let snapshots = routed.persisted_entity_records();
+        assert_eq!(snapshots.len(), 2);
+        assert!(
+            snapshots
+                .iter()
+                .all(|record| record.snapshot.type_name == "minecraft:zombie")
+        );
+        assert!(positions.iter().all(|position| {
+            snapshots
+                .iter()
+                .any(|record| record.snapshot.position == *position)
+        }));
 
         let next_phase = owner
             .region_ownership
@@ -9354,8 +9759,8 @@ mod tests {
 
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
         let snapshot = barrier.await.expect("save barrier snapshot");
-        assert_eq!(snapshot.entities.len(), 1);
-        assert_eq!(snapshot.entities[0].type_name, "minecraft:zombie");
+        assert_eq!(snapshot.entities.records.len(), 1);
+        assert_eq!(snapshot.entities.records[0].type_name, "minecraft:zombie");
     }
 
     #[test]
@@ -9375,7 +9780,7 @@ mod tests {
     }
 
     #[test]
-    fn queued_chunk_herd_spawn_matches_legacy_and_deduplicates_chunk() {
+    fn queued_chunk_herd_spawn_deduplicates_chunk() {
         let chunk = (1, 1);
         let position = Vec3::new(24.5, 64.0, 24.5);
         let spawns = vec![super::super::HerdSpawn {
@@ -9387,9 +9792,6 @@ mod tests {
             hostile: false,
             sheep_color: None,
         }];
-        let legacy = SessionRegistry::new();
-        let legacy_dispatches = legacy.ensure_chunk_herd_legacy_for_test(chunk, &spawns);
-
         let queued = SessionRegistry::new();
         let (handle, mut owner) = simulation_channel_with_capacity(2);
         let first = handle
@@ -9412,10 +9814,12 @@ mod tests {
             other => panic!("expected herd dedupe response, got {other:?}"),
         };
 
-        assert_eq!(first_dispatches.len(), legacy_dispatches.len());
+        assert!(first_dispatches.is_empty());
         assert!(duplicate_dispatches.is_empty());
-        assert_eq!(queued.persisted_entity_records().len(), 1);
-        assert_eq!(legacy.persisted_entity_records().len(), 1);
+        let persisted = queued.persisted_entity_records();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].snapshot.type_name, "minecraft:cow");
+        assert_eq!(persisted[0].snapshot.position, position);
     }
 
     #[test]
@@ -9930,9 +10334,13 @@ mod tests {
                 ),
             )]),
         ));
-        let expected_count = mc_data::loot::LootCount::UniformInclusive { min: 4, max: 9 }.sample(
-            super::super::block_break_loot_seed(pos, BlockStateId(1), token),
-        );
+        let expected_count = mc_data::loot::LootCount::UniformInclusive { min: 4, max: 9 }
+            .try_sample(super::super::block_break_loot_seed(
+                pos,
+                BlockStateId(1),
+                token,
+            ))
+            .unwrap();
         let mut request = Box::pin(session_handle.commit_survival_block_break(plan));
 
         assert_request_enqueued(request.as_mut(), &handle).await;
@@ -11067,7 +11475,8 @@ mod tests {
             register_test_session_with_outbound(&registry, "HostileTarget");
         assert!(registry.mark_loaded(session, (0, 0)).is_empty());
         let entity_id = publish_entity_spawns(
-            registry.spawn_command_entity_legacy_for_test(
+            registry.spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_owned(),
                 Vec3::new(0.5, 64.0, 1.5),
@@ -11116,7 +11525,8 @@ mod tests {
             register_test_session_with_outbound(&registry, "SkeletonTarget");
         assert!(registry.mark_loaded(session, (0, 0)).is_empty());
         let entity_id = publish_entity_spawns(
-            registry.spawn_command_entity_legacy_for_test(
+            registry.spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 4,
                 "minecraft:skeleton".to_owned(),
                 Vec3::new(0.5, 64.0, 6.5),
@@ -11701,13 +12111,13 @@ mod tests {
         registry.advance_world_time(super::super::ITEM_PICKUP_DELAY_TICKS);
         assert!(
             registry
-                .claim_item_pickup_legacy_for_test(item_entity_id, session, 1)
+                .claim_item_pickup_for_test(item_entity_id, session, 1)
                 .is_none(),
             "drop owner must remain blocked after the generic pickup delay"
         );
         assert!(
             registry
-                .claim_item_pickup_legacy_for_test(item_entity_id, collector, 1)
+                .claim_item_pickup_for_test(item_entity_id, collector, 1)
                 .is_some(),
             "another session may collect the dropped item"
         );
@@ -13195,6 +13605,8 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn block_drop_transaction_commits_edit_and_drop_in_owner_order() {
         let (storage, pos, token) = test_block_storage();
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
         let (actor, mut actor_rx) =
@@ -13236,7 +13648,18 @@ mod tests {
 
         assert_eq!(
             owner
-                .process_tick_with_world(&registry, Some(&world), None, 1)
+                .process_commands_with_world_views(
+                    &registry,
+                    Some(&world),
+                    SimulationWorldAccess {
+                        read: Some(&read_view),
+                        mutation: Some(&mutation_view),
+                        ..SimulationWorldAccess::default()
+                    },
+                    None,
+                    1,
+                )
+                .await
                 .processed,
             1
         );
@@ -13264,6 +13687,8 @@ mod tests {
         let (mut storage, pos, stale_token) = test_block_storage();
         storage.set_block_at(pos, BlockStateId(0)).unwrap();
         storage.set_block_at(pos, BlockStateId(1)).unwrap();
+        let read_view = storage.read_view();
+        let mutation_view = storage.mutation_view();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
         let registry = SessionRegistry::new();
         let actor = register_test_session(&registry, "StaleBlockDropActor");
@@ -13287,7 +13712,19 @@ mod tests {
         ));
         assert_request_enqueued(request.as_mut(), &handle).await;
 
-        owner.process_tick_with_world(&registry, Some(&world), None, 1);
+        owner
+            .process_commands_with_world_views(
+                &registry,
+                Some(&world),
+                SimulationWorldAccess {
+                    read: Some(&read_view),
+                    mutation: Some(&mutation_view),
+                    ..SimulationWorldAccess::default()
+                },
+                None,
+                1,
+            )
+            .await;
         assert!(request.await.unwrap().is_none());
         assert_eq!(
             world.lock().await.get_cached_block(pos),
@@ -13296,7 +13733,7 @@ mod tests {
         assert_eq!(persisted_item_drop_count(&registry), 0);
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn queued_block_edit_schedules_tick_only_after_matching_commit() {
         let (storage, pos, token) = test_block_storage();
         let world = Arc::new(tokio::sync::Mutex::new(storage));
@@ -14826,78 +15263,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn queued_campfire_commit_matches_legacy_state_and_persistent_bytes() {
-        let input = super::super::ItemStack::new(42, 1);
-        let result = super::super::ItemStack::new(43, 1);
-        let expected = super::super::CampfireCookingState::default();
-        let mut updated = expected.clone();
-        assert!(updated.insert(input.clone(), result.clone(), 20));
-        let bytes = vec![10, 0, 0, 0];
-
-        let (mut direct_storage, pos, direct_token) = test_block_storage();
-        let direct_sessions = SessionRegistry::new();
-        let direct = direct_sessions
-            .insert_campfire_cooking(pos, input, result, 20)
-            .unwrap();
-        assert_eq!(direct, updated);
-        assert!(
-            apply_opaque_block_entity_to_storage_conditionally(
-                &mut direct_storage,
-                pos,
-                BlockStateId(1),
-                direct_token,
-                bytes.clone(),
-            )
-            .unwrap()
-        );
-
-        let (queued_storage, queued_pos, queued_token) = test_block_storage();
-        let world = Arc::new(tokio::sync::Mutex::new(queued_storage));
-        let sessions = Arc::new(SessionRegistry::new());
-        let session = register_test_session(&sessions, "QueuedCampfireActor");
-        let mut inventory = PlayerInventory::empty();
-        inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(42, 1);
-        let player_state = register_test_player_state(&sessions, session, inventory);
-        let (handle, mut owner) = simulation_channel_with_capacity(1);
-        let session_handle = handle.for_session(session);
-        let mut request = Box::pin(session_handle.commit_campfire_use(CampfireUsePlan {
-            position: queued_pos,
-            expected_state: BlockStateId(1),
-            expected_token: queued_token,
-            expected_cooking: expected.clone(),
-            updated_cooking: updated.clone(),
-            persistent_bytes: bytes.clone(),
-            client_nbt: mc_nbt::Tag::Compound(Vec::new()),
-            held_slot: PlayerInventory::HOTBAR_BASE,
-            expected_held: ItemStack::new(42, 1),
-        }));
-        assert_request_enqueued(request.as_mut(), &handle).await;
-
-        assert_eq!(
-            owner
-                .process_tick_with_world(&sessions, Some(&world), None, 1)
-                .processed,
-            1
-        );
-        assert!(request.await.unwrap().is_some());
-        assert_eq!(handle.snapshot().block_entity_commits_processed, 1);
-        assert_eq!(sessions.campfire_cooking_state(queued_pos), direct);
-        assert_eq!(
-            player_state.lock().unwrap().inventory.slots[PlayerInventory::HOTBAR_BASE],
-            ItemStack::EMPTY
-        );
-        let queued_bytes = world
-            .lock()
-            .await
-            .cached_chunk(ChunkPos { x: 0, z: 0 })
-            .unwrap()
-            .block_entities
-            .get(&queued_pos)
-            .cloned();
-        assert_eq!(queued_bytes, Some(bytes));
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn survival_tnt_ignition_expires_after_exactly_eighty_ticks() {
         let blocks = Arc::new(BlockRegistry::from_report(&test_block_reports()).unwrap());
         let mut storage = WorldStorage::in_memory(Arc::clone(&blocks));
@@ -14953,10 +15318,11 @@ mod tests {
             Some(1)
         );
         let saved = sessions.persisted_entity_save_snapshot().0;
-        assert!(saved.is_empty(), "primed TNT must be transient at save");
+        assert_eq!(saved.records.len(), 1, "primed TNT is retained by ECS");
+        assert!(saved.records[0].snapshot.retained.primed_tnt.is_some());
         let restored = SessionRegistry::new();
-        assert_eq!(restored.restore_persisted_entities(saved), 0);
-        assert!(restored.persisted_entity_records().is_empty());
+        assert_eq!(restored.restore_persisted_entities(saved), 1);
+        assert_eq!(restored.persisted_entity_records().len(), 1);
 
         world
             .lock()
@@ -15010,8 +15376,8 @@ mod tests {
         );
         let chained_fuses = sessions.primed_tnt_fuses_for_test();
         assert_eq!(chained_fuses.len(), 1);
-        assert!((90..=109).contains(&chained_fuses[0].expires_tick));
-        assert!(sessions.persisted_entity_records().is_empty());
+        assert!((90..=109).contains(&chained_fuses[0].1));
+        assert_eq!(sessions.persisted_entity_records().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -15072,7 +15438,8 @@ mod tests {
             super::super::dispatch_visibility_commands(spawn);
         }
         while outbound.try_recv().is_ok() {}
-        let delayed_spawn = sessions.spawn_command_entity_legacy_for_test(
+        let delayed_spawn = sessions.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(7.5, 64.0, 7.5),

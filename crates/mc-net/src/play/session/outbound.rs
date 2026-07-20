@@ -2,8 +2,6 @@ use std::collections::{BTreeMap, HashMap, VecDeque, hash_map::Entry};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-#[cfg(test)]
-use mc_entity::RegionalOwnerStatus;
 use mc_entity::{EntityId, EntityItemStack, Rotation, Vec3};
 use mc_nbt::Tag;
 use mc_protocol::codec::Identifier;
@@ -19,6 +17,8 @@ use crate::play::PlayerPose;
 use crate::play::block_wire::BlockDelta;
 use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
 use crate::play::persistence::XpState;
+use crate::play::session::{ScriptMenuCloseRequest, ScriptMenuOpenRequest};
+use crate::play::wire_entities::ServerEntityWireMove;
 
 use super::{SessionId, SessionRegistryInner};
 
@@ -42,6 +42,7 @@ pub(in crate::play) struct ServerEntitySnapshot {
     pub(in crate::play) rotation: Rotation,
     pub(in crate::play) velocity: Vec3,
     pub(in crate::play) on_ground: bool,
+    pub(in crate::play) health: Option<f32>,
     pub(in crate::play) item_stack: Option<EntityItemStack>,
     pub(in crate::play) experience_value: Option<i32>,
     pub(in crate::play) block_state: Option<u32>,
@@ -51,12 +52,12 @@ pub(in crate::play) struct ServerEntitySnapshot {
 #[derive(Debug, Clone, Copy)]
 pub(in crate::play) struct ServerEntityMove {
     pub(in crate::play) id: EntityId,
-    pub(in crate::play) delta: Vec3,
+    pub(in crate::play) wire_move: Option<ServerEntityWireMove>,
     pub(in crate::play) velocity: Vec3,
     pub(in crate::play) rotation: Rotation,
     pub(in crate::play) on_ground: bool,
-    pub(in crate::play) send_position_rotation: bool,
     pub(in crate::play) send_velocity: bool,
+    pub(in crate::play) send_head_rotation: bool,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ pub(in crate::play) enum OutboundCommand {
     DespawnPlayer(PlayerEntitySnapshot),
     SpawnEntity(ServerEntitySnapshot),
     UpdateEntityData(ServerEntitySnapshot),
+    UpdateEntityHealth(ServerEntitySnapshot),
     MoveEntityRelative(ServerEntityMove),
     MoveEntitiesRelative(Vec<ServerEntityMove>),
     EntityEvent {
@@ -131,6 +133,8 @@ pub(in crate::play) enum OutboundCommand {
     DisconnectPlayer {
         reason: String,
     },
+    OpenScriptMenu(ScriptMenuOpenRequest),
+    CloseScriptMenu(ScriptMenuCloseRequest),
     Explosion(ClientboundExplode),
 }
 
@@ -185,6 +189,7 @@ impl OutboundCommand {
             | Self::DespawnPlayer(_)
             | Self::SpawnEntity(_)
             | Self::UpdateEntityData(_)
+            | Self::UpdateEntityHealth(_)
             | Self::MoveEntityRelative(_)
             | Self::MoveEntitiesRelative(_)
             | Self::BlockDeltas(_)
@@ -206,6 +211,8 @@ impl OutboundCommand {
             | Self::WorldTime { .. }
             | Self::WakeFromBed { .. }
             | Self::DisconnectPlayer { .. }
+            | Self::OpenScriptMenu(_)
+            | Self::CloseScriptMenu(_)
             | Self::Explosion(_) => OutboundLane::Reliable,
         }
     }
@@ -399,10 +406,6 @@ pub(crate) struct SessionPressureSnapshot {
     pub(crate) furnace_viewer_sets: usize,
     pub(crate) chest_viewer_sets: usize,
     pub(crate) entity_dispatches: EntityDispatchCounters,
-    pub(crate) entity_shadow_comparisons: u64,
-    pub(crate) entity_shadow_compared_entities: u64,
-    pub(crate) entity_shadow_compared_events: u64,
-    pub(crate) entity_shadow_first_divergence: bool,
     pub(crate) best_effort_animation_drops: u64,
     pub(crate) reliable_command_drops: u64,
     pub(crate) reliable_command_retries: u64,
@@ -631,10 +634,6 @@ pub(super) struct SessionPressureObservation {
     entity_data_dispatches: AtomicU64,
     entity_take_dispatches: AtomicU64,
     entity_remove_dispatches: AtomicU64,
-    entity_shadow_comparisons: AtomicU64,
-    entity_shadow_compared_entities: AtomicU64,
-    entity_shadow_compared_events: AtomicU64,
-    entity_shadow_first_divergence: AtomicBool,
 }
 
 fn adjust_atomic_count(counter: &AtomicUsize, before: usize, after: usize) {
@@ -663,21 +662,6 @@ impl SessionPressureObservation {
             .store(inner.entity_dispatches.take, Ordering::Relaxed);
         self.entity_remove_dispatches
             .store(inner.entity_dispatches.remove, Ordering::Relaxed);
-    }
-
-    #[cfg(test)]
-    pub(super) fn publish_entities(&self, status: &RegionalOwnerStatus) {
-        self.server_entities
-            .store(status.entity_count, Ordering::Relaxed);
-        let shadow = &status.shadow;
-        self.entity_shadow_comparisons
-            .store(shadow.comparisons, Ordering::Relaxed);
-        self.entity_shadow_compared_entities
-            .store(shadow.compared_entities, Ordering::Relaxed);
-        self.entity_shadow_compared_events
-            .store(shadow.compared_events, Ordering::Relaxed);
-        self.entity_shadow_first_divergence
-            .store(shadow.first_divergence.is_some(), Ordering::Relaxed);
     }
 
     pub(super) fn record_entity_inserts(&self, count: usize) {
@@ -718,16 +702,6 @@ impl SessionPressureObservation {
                 take: self.entity_take_dispatches.load(Ordering::Relaxed),
                 remove: self.entity_remove_dispatches.load(Ordering::Relaxed),
             },
-            entity_shadow_comparisons: self.entity_shadow_comparisons.load(Ordering::Relaxed),
-            entity_shadow_compared_entities: self
-                .entity_shadow_compared_entities
-                .load(Ordering::Relaxed),
-            entity_shadow_compared_events: self
-                .entity_shadow_compared_events
-                .load(Ordering::Relaxed),
-            entity_shadow_first_divergence: self
-                .entity_shadow_first_divergence
-                .load(Ordering::Relaxed),
             best_effort_animation_drops: outbound
                 .best_effort_animation_drops
                 .load(Ordering::Relaxed),

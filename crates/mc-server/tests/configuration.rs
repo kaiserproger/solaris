@@ -14,7 +14,7 @@ use bytes::{Buf, BytesMut};
 use mc_extension::{DEFAULT_MAX_CUSTOM_PAYLOAD_BYTES, InboundEvent, ProtocolPhase};
 use mc_protocol::PROTOCOL_VERSION;
 use mc_protocol::TARGET_RELEASE;
-use mc_protocol::codec::Identifier;
+use mc_protocol::codec::{Identifier, WriteMc};
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
@@ -56,7 +56,7 @@ async fn start_server_with_data(data: std::sync::Arc<mc_data::VanillaData>) -> S
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -120,7 +120,7 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -144,6 +144,19 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression:
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
     let framed = encode_frame(P::ID, &body, compression).unwrap();
+    stream.write_all(&framed).await.unwrap();
+}
+
+async fn write_oversized_custom_payload_frame(
+    stream: &mut TcpStream,
+    packet_id: i32,
+    compression: Compression,
+) {
+    let mut body = BytesMut::new();
+    body.write_identifier(&Identifier::parse("other:channel").unwrap())
+        .unwrap();
+    body.resize(body.len() + OVERSIZED_CUSTOM_PAYLOAD_BYTES, 0);
+    let framed = encode_frame(packet_id, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
 }
 
@@ -607,17 +620,8 @@ async fn configuration_ignores_oversized_custom_payload_before_known_packs() {
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
 
-    write_frame(
-        &mut stream,
-        &ServerboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse("other:channel").unwrap(),
-                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
-            },
-        },
-        compression,
-    )
-    .await;
+    write_oversized_custom_payload_frame(&mut stream, ServerboundCustomPayload::ID, compression)
+        .await;
     write_frame(
         &mut stream,
         &ServerboundKnownPacks { packs: known.packs },
@@ -682,17 +686,8 @@ async fn configuration_ignores_oversized_custom_payload_before_finish_ack() {
     .await;
     read_to_finish_configuration(&mut stream, &mut rbuf, compression).await;
 
-    write_frame(
-        &mut stream,
-        &ServerboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse("other:channel").unwrap(),
-                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
-            },
-        },
-        compression,
-    )
-    .await;
+    write_oversized_custom_payload_frame(&mut stream, ServerboundCustomPayload::ID, compression)
+        .await;
     write_frame(&mut stream, &AcknowledgeFinishConfiguration, compression).await;
 
     let frame = tokio::time::timeout(

@@ -24,6 +24,7 @@ use super::interaction_geometry::{distance_sq, entity_aabb};
 #[cfg(test)]
 use super::outbound::ServerEntitySnapshot;
 use super::outbound::{OutboundCommand, SessionRecipient, VisibilityDispatch};
+use super::projectiles::{initial_arrow_state, projectile_identity};
 use super::visibility::{
     initialize_entity_wire_state_from_snapshot_locked, server_entity_snapshot_from,
     session_recipients, spawn_entity_visibility_from_snapshot_locked, visibility_dispatches,
@@ -307,6 +308,7 @@ impl SessionRegistry {
                         "minecraft:arrow",
                         attack.position,
                     );
+                    arrow.retained.spawn_tick = tick;
                     arrow.velocity = attack.velocity;
                     arrow.rotation = attack.rotation;
                     arrow.on_ground = false;
@@ -314,26 +316,40 @@ impl SessionRegistry {
                     (attack.hostile_id, arrow)
                 })
                 .unzip();
-            let arrow_ids = entities.spawn_authoritative_batch(arrows);
+            let arrow_ids = entities.spawn_batch(arrows);
             let arrow_id_set = arrow_ids.iter().copied().collect::<HashSet<_>>();
             entities.prefetch(&arrow_id_set);
-            hostile_ids
-                .into_iter()
-                .zip(arrow_ids)
-                .filter_map(|(hostile_id, arrow_id)| {
-                    entities
-                        .snapshot(arrow_id)
-                        .map(|snapshot| SpawnedHostileArrow {
-                            hostile_id,
-                            snapshot,
-                        })
-                })
-                .collect()
+            let mut spawned = Vec::with_capacity(arrow_ids.len());
+            let mut transaction = Vec::with_capacity(arrow_ids.len());
+            for (hostile_id, arrow_id) in hostile_ids.into_iter().zip(arrow_ids) {
+                let Some(expected) = entities.snapshot(arrow_id) else {
+                    continue;
+                };
+                let mut next = expected.clone();
+                next.retained.arrow_state = Some(
+                    initial_arrow_state(
+                        Some(projectile_identity(hostile_id)),
+                        expected.position,
+                        expected.velocity,
+                        expected.rotation,
+                    )
+                    .expect("finite hostile arrow must produce a valid kernel state"),
+                );
+                transaction.push((expected, next.clone()));
+                spawned.push(SpawnedHostileArrow {
+                    hostile_id,
+                    snapshot: next,
+                });
+            }
+            assert!(
+                entities.replace_snapshots_if_current(transaction),
+                "hostile arrows must retain owners before session publication"
+            );
+            spawned
         };
         #[cfg(test)]
         self.pause_between_hostile_entity_and_session_commit_for_test();
 
-        let lifecycle_tick = self.simulation_tick();
         let mut inner = self.lock_inner("publish hostile attacks");
         let mut attacks = 0;
         let mut dispatches = Vec::new();
@@ -355,11 +371,6 @@ impl SessionRegistry {
             let arrow_id = snapshot.id;
             let arrow_position = snapshot.position;
             let arrow_type_id = snapshot.type_id;
-            inner.entity_spawn_ticks.insert(arrow_id, lifecycle_tick);
-            inner.arrow_spawn_ticks.insert(arrow_id, lifecycle_tick);
-            inner
-                .arrow_owner_entities
-                .insert(arrow_id, arrow.hostile_id);
             inner
                 .entity_type_aabbs
                 .entry(arrow_type_id)

@@ -14,10 +14,20 @@ use bytes::{Buf, BufMut};
 use mc_nbt::Tag;
 use uuid::Uuid;
 
-use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
-use crate::codec::{Identifier, ReadMc, WriteMc};
+use super::{ClientInformation, CustomPayload, MainHand, Packet, ResourcePackStatus};
+use crate::codec::{DEFAULT_MAX_STRING_LEN, Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
 use crate::packets::login::GameProfileProperty;
+
+mod entity_sync_26_1_2;
+
+pub use entity_sync_26_1_2::{
+    AttributeId, AttributeModifierOperation, ClientboundRemoveEntityEffect,
+    ClientboundSetEntityEquipment, ClientboundSetEntityLeash, ClientboundUpdateEntityAttributes,
+    ClientboundUpdateEntityEffect, EntityAttributeModifier, EntityAttributeSnapshot,
+    EntityEffectFlags, EntityEquipment, EquipmentSlot, LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
+    MobEffectId,
+};
 
 /// Vanilla's ceiling on the chunk-data payload (`TWO_MEGABYTES` in
 /// `ClientboundLevelChunkPacketData`). Decoding rejects buffers larger
@@ -44,6 +54,10 @@ const MAX_ENTITY_ID_LIST_LEN: usize = 1024;
 const MAX_ENTITY_DATA_VALUES: usize = 64;
 const MAX_CONTAINER_CLICK_CHANGED_SLOTS: usize = 128;
 const MAX_HASHED_STACK_COMPONENT_HASHES: usize = 256;
+/// Solaris packet-wide allocation fence for serverbound Container Click.
+/// Vanilla bounds each collection independently; this additional aggregate
+/// ceiling prevents one packet from allocating tens of thousands of hashes.
+const MAX_CONTAINER_CLICK_COMPONENT_HASHES: usize = 4096;
 const MAX_RECIPE_BOOK_ENTRIES: usize = 8192;
 const MAX_RECIPE_BOOK_SLOTS: usize = 256;
 const MAX_RECIPE_BOOK_REQUIREMENTS: usize = 256;
@@ -53,6 +67,7 @@ const MAX_COMMAND_LEN: usize = 32_767;
 const MAX_CHAT_MESSAGE_LEN: usize = 256;
 const MAX_COMMAND_NODE_COUNT: usize = 1024;
 const MAX_COMMAND_CHILD_COUNT: usize = 1024;
+const MAX_COMMAND_SUGGESTION_LEN: usize = 32_500;
 const SIGN_LINE_COUNT: usize = 4;
 const MAX_SIGN_LINE_LEN: usize = 384;
 const LAST_SEEN_FIXED_BITSET_BYTES: usize = 3;
@@ -60,6 +75,19 @@ pub const ENTITY_DATA_ITEM_STACK_SERIALIZER_ID: i32 = 7;
 pub const ENTITY_DATA_BYTE_SERIALIZER_ID: i32 = 0;
 pub const ENTITY_DATA_BOOLEAN_SERIALIZER_ID: i32 = 8;
 pub const ENTITY_DATA_POSE_SERIALIZER_ID: i32 = 20;
+const ENTITY_DATA_INT_SERIALIZER_ID: i32 = 1;
+const ENTITY_DATA_LONG_SERIALIZER_ID: i32 = 2;
+const ENTITY_DATA_FLOAT_SERIALIZER_ID: i32 = 3;
+const ENTITY_DATA_STRING_SERIALIZER_ID: i32 = 4;
+const ENTITY_DATA_ROTATIONS_SERIALIZER_ID: i32 = 9;
+const ENTITY_DATA_BLOCK_POSITION_SERIALIZER_ID: i32 = 10;
+const ENTITY_DATA_OPTIONAL_BLOCK_POSITION_SERIALIZER_ID: i32 = 11;
+const ENTITY_DATA_DIRECTION_SERIALIZER_ID: i32 = 12;
+const ENTITY_DATA_OPTIONAL_LIVING_ENTITY_REFERENCE_SERIALIZER_ID: i32 = 13;
+const ENTITY_DATA_BLOCK_STATE_SERIALIZER_ID: i32 = 14;
+const ENTITY_DATA_OPTIONAL_BLOCK_STATE_SERIALIZER_ID: i32 = 15;
+const ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID: i32 = 19;
+const ENTITY_DATA_HUMANOID_ARM_SERIALIZER_ID: i32 = 42;
 pub const ENTITY_DATA_SHARED_FLAGS_INDEX: u8 = 0;
 pub const ENTITY_DATA_POSE_INDEX: u8 = 6;
 pub const LIVING_ENTITY_DATA_FLAGS_INDEX: u8 = 8;
@@ -71,6 +99,11 @@ pub const LIVING_ENTITY_FLAG_USING_ITEM: i8 = 0x01;
 pub const LIVING_ENTITY_FLAG_OFF_HAND: i8 = 0x02;
 pub const ITEM_ENTITY_DATA_ITEM_INDEX: u8 = 8;
 pub const DATA_COMPONENT_DAMAGE_ID: i32 = 3;
+/// `minecraft:custom_name` in the bundled vanilla 26.1.2
+/// `minecraft:data_component_type` registry. `DataComponents.CUSTOM_NAME`
+/// uses the `Component` stream codec, which is network NBT for the supported
+/// literal text component shape.
+pub const DATA_COMPONENT_CUSTOM_NAME_ID: i32 = 6;
 pub const DATA_COMPONENT_ENCHANTMENTS_ID: i32 = 13;
 
 fn write_long_array<B: BufMut>(buf: &mut B, longs: &[i64]) -> Result<(), CodecError> {
@@ -1659,61 +1692,460 @@ impl Packet for SetEntityMotion {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A non-negative `Block.BLOCK_STATE_REGISTRY` wire id.
+///
+/// This type distinguishes block-state ids from other registry ids. It does
+/// not claim that the id exists in a particular runtime registry; callers
+/// must resolve that before constructing packet data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockStateId(i32);
+
+impl BlockStateId {
+    pub fn new(raw: u32) -> Result<Self, CodecError> {
+        let raw = i32::try_from(raw).map_err(|_| {
+            CodecError::NotSupported("block-state registry id exceeds VarInt range")
+        })?;
+        Ok(Self(raw))
+    }
+
+    #[must_use]
+    pub const fn raw(self) -> u32 {
+        self.0 as u32
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let raw = buf.read_varint()?;
+        if raw < 0 {
+            return Err(CodecError::NotSupported("negative block-state registry id"));
+        }
+        Ok(Self(raw))
+    }
+}
+
+/// Three big-endian floats used by entity-data serializer id 9.
+#[derive(Debug, Clone, Copy)]
+pub struct EntityRotations {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl PartialEq for EntityRotations {
+    fn eq(&self, other: &Self) -> bool {
+        java_float_equals(self.x, other.x)
+            && java_float_equals(self.y, other.y)
+            && java_float_equals(self.z, other.z)
+    }
+}
+
+impl Eq for EntityRotations {}
+
+/// The six direction ids established by `Direction.STREAM_CODEC`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityDirection {
+    Down,
+    Up,
+    North,
+    South,
+    West,
+    East,
+}
+
+impl EntityDirection {
+    const fn wire_id(self) -> i32 {
+        match self {
+            Self::Down => 0,
+            Self::Up => 1,
+            Self::North => 2,
+            Self::South => 3,
+            Self::West => 4,
+            Self::East => 5,
+        }
+    }
+
+    fn from_wire(value: i32) -> Result<Self, CodecError> {
+        Ok(match value {
+            0 => Self::Down,
+            1 => Self::Up,
+            2 => Self::North,
+            3 => Self::South,
+            4 => Self::West,
+            5 => Self::East,
+            _ => return Err(CodecError::NotSupported("unknown entity direction")),
+        })
+    }
+}
+
+/// Entity-data serializers implemented for 26.1.2.
+///
+/// Supported serializer ids are 0-4, 7-15, 19, 20, and 42. Component,
+/// particle, villager/variant, global-position, vector, quaternion, and
+/// resolvable-profile serializers are rejected explicitly because this crate
+/// does not yet have faithful local value types for their payloads.
+#[derive(Debug, Clone)]
 pub enum EntityDataValue {
-    Byte { index: u8, value: i8 },
-    Boolean { index: u8, value: bool },
-    ItemStack { index: u8, stack: ItemStack },
-    Pose { index: u8, pose: EntityPose },
+    Byte {
+        index: u8,
+        value: i8,
+    },
+    Int {
+        index: u8,
+        value: i32,
+    },
+    Long {
+        index: u8,
+        value: i64,
+    },
+    Float {
+        index: u8,
+        value: f32,
+    },
+    String {
+        index: u8,
+        value: String,
+    },
+    ItemStack {
+        index: u8,
+        stack: ItemStack,
+    },
+    Boolean {
+        index: u8,
+        value: bool,
+    },
+    Rotations {
+        index: u8,
+        value: EntityRotations,
+    },
+    /// Packed `BlockPos::asLong()` value.
+    BlockPosition {
+        index: u8,
+        value: i64,
+    },
+    OptionalBlockPosition {
+        index: u8,
+        value: Option<i64>,
+    },
+    Direction {
+        index: u8,
+        value: EntityDirection,
+    },
+    OptionalLivingEntityReference {
+        index: u8,
+        value: Option<Uuid>,
+    },
+    BlockState {
+        index: u8,
+        value: BlockStateId,
+    },
+    OptionalBlockState {
+        index: u8,
+        value: Option<BlockStateId>,
+    },
+    OptionalUnsignedInt {
+        index: u8,
+        value: Option<u32>,
+    },
+    Pose {
+        index: u8,
+        pose: EntityPose,
+    },
+    HumanoidArm {
+        index: u8,
+        value: MainHand,
+    },
+}
+
+impl PartialEq for EntityDataValue {
+    fn eq(&self, other: &Self) -> bool {
+        if self.index() != other.index() || self.serializer_id() != other.serializer_id() {
+            return false;
+        }
+
+        match (self, other) {
+            (Self::Byte { value: left, .. }, Self::Byte { value: right, .. }) => left == right,
+            (Self::Int { value: left, .. }, Self::Int { value: right, .. }) => left == right,
+            (Self::Long { value: left, .. }, Self::Long { value: right, .. }) => left == right,
+            (Self::Float { value: left, .. }, Self::Float { value: right, .. }) => {
+                java_float_equals(*left, *right)
+            }
+            (Self::String { value: left, .. }, Self::String { value: right, .. }) => left == right,
+            (Self::ItemStack { stack: left, .. }, Self::ItemStack { stack: right, .. }) => {
+                left == right
+            }
+            (Self::Boolean { value: left, .. }, Self::Boolean { value: right, .. }) => {
+                left == right
+            }
+            (Self::Rotations { value: left, .. }, Self::Rotations { value: right, .. }) => {
+                left == right
+            }
+            (Self::BlockPosition { value: left, .. }, Self::BlockPosition { value: right, .. }) => {
+                left == right
+            }
+            (
+                Self::OptionalBlockPosition { value: left, .. },
+                Self::OptionalBlockPosition { value: right, .. },
+            ) => left == right,
+            (Self::Direction { value: left, .. }, Self::Direction { value: right, .. }) => {
+                left == right
+            }
+            (
+                Self::OptionalLivingEntityReference { value: left, .. },
+                Self::OptionalLivingEntityReference { value: right, .. },
+            ) => left == right,
+            (Self::BlockState { value: left, .. }, Self::BlockState { value: right, .. }) => {
+                left == right
+            }
+            (
+                Self::OptionalBlockState { value: left, .. },
+                Self::OptionalBlockState { value: right, .. },
+            ) => left == right,
+            (
+                Self::OptionalUnsignedInt { value: left, .. },
+                Self::OptionalUnsignedInt { value: right, .. },
+            ) => left == right,
+            (Self::Pose { pose: left, .. }, Self::Pose { pose: right, .. }) => left == right,
+            (Self::HumanoidArm { value: left, .. }, Self::HumanoidArm { value: right, .. }) => {
+                left == right
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Eq for EntityDataValue {}
+
+fn java_float_equals(left: f32, right: f32) -> bool {
+    fn canonical_bits(value: f32) -> u32 {
+        if value.is_nan() {
+            0x7FC0_0000
+        } else {
+            value.to_bits()
+        }
+    }
+
+    canonical_bits(left) == canonical_bits(right)
 }
 
 impl EntityDataValue {
-    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+    #[must_use]
+    pub const fn index(&self) -> u8 {
         match self {
-            Self::Byte { index, value } => {
-                buf.write_u8(*index);
-                buf.write_varint(ENTITY_DATA_BYTE_SERIALIZER_ID);
-                buf.write_i8(*value);
+            Self::Byte { index, .. }
+            | Self::Int { index, .. }
+            | Self::Long { index, .. }
+            | Self::Float { index, .. }
+            | Self::String { index, .. }
+            | Self::ItemStack { index, .. }
+            | Self::Boolean { index, .. }
+            | Self::Rotations { index, .. }
+            | Self::BlockPosition { index, .. }
+            | Self::OptionalBlockPosition { index, .. }
+            | Self::Direction { index, .. }
+            | Self::OptionalLivingEntityReference { index, .. }
+            | Self::BlockState { index, .. }
+            | Self::OptionalBlockState { index, .. }
+            | Self::OptionalUnsignedInt { index, .. }
+            | Self::Pose { index, .. }
+            | Self::HumanoidArm { index, .. } => *index,
+        }
+    }
+
+    #[must_use]
+    pub const fn serializer_id(&self) -> i32 {
+        match self {
+            Self::Byte { .. } => ENTITY_DATA_BYTE_SERIALIZER_ID,
+            Self::Int { .. } => ENTITY_DATA_INT_SERIALIZER_ID,
+            Self::Long { .. } => ENTITY_DATA_LONG_SERIALIZER_ID,
+            Self::Float { .. } => ENTITY_DATA_FLOAT_SERIALIZER_ID,
+            Self::String { .. } => ENTITY_DATA_STRING_SERIALIZER_ID,
+            Self::ItemStack { .. } => ENTITY_DATA_ITEM_STACK_SERIALIZER_ID,
+            Self::Boolean { .. } => ENTITY_DATA_BOOLEAN_SERIALIZER_ID,
+            Self::Rotations { .. } => ENTITY_DATA_ROTATIONS_SERIALIZER_ID,
+            Self::BlockPosition { .. } => ENTITY_DATA_BLOCK_POSITION_SERIALIZER_ID,
+            Self::OptionalBlockPosition { .. } => ENTITY_DATA_OPTIONAL_BLOCK_POSITION_SERIALIZER_ID,
+            Self::Direction { .. } => ENTITY_DATA_DIRECTION_SERIALIZER_ID,
+            Self::OptionalLivingEntityReference { .. } => {
+                ENTITY_DATA_OPTIONAL_LIVING_ENTITY_REFERENCE_SERIALIZER_ID
             }
-            Self::Boolean { index, value } => {
-                buf.write_u8(*index);
-                buf.write_varint(ENTITY_DATA_BOOLEAN_SERIALIZER_ID);
-                buf.write_bool(*value);
+            Self::BlockState { .. } => ENTITY_DATA_BLOCK_STATE_SERIALIZER_ID,
+            Self::OptionalBlockState { .. } => ENTITY_DATA_OPTIONAL_BLOCK_STATE_SERIALIZER_ID,
+            Self::OptionalUnsignedInt { .. } => ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID,
+            Self::Pose { .. } => ENTITY_DATA_POSE_SERIALIZER_ID,
+            Self::HumanoidArm { .. } => ENTITY_DATA_HUMANOID_ARM_SERIALIZER_ID,
+        }
+    }
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_u8(self.index());
+        buf.write_varint(self.serializer_id());
+        match self {
+            Self::Byte { value, .. } => buf.write_i8(*value),
+            Self::Int { value, .. } => buf.write_varint(*value),
+            Self::Long { value, .. } => buf.write_varlong(*value),
+            Self::Float { value, .. } => buf.write_f32(*value),
+            Self::String { value, .. } => {
+                buf.write_string(value, DEFAULT_MAX_STRING_LEN)?;
             }
-            Self::ItemStack { index, stack } => {
-                buf.write_u8(*index);
-                buf.write_varint(ENTITY_DATA_ITEM_STACK_SERIALIZER_ID);
-                stack.encode(buf)?;
+            Self::ItemStack { stack, .. } => stack.encode(buf)?,
+            Self::Boolean { value, .. } => buf.write_bool(*value),
+            Self::Rotations { value, .. } => {
+                buf.write_f32(value.x);
+                buf.write_f32(value.y);
+                buf.write_f32(value.z);
             }
-            Self::Pose { index, pose } => {
-                buf.write_u8(*index);
-                buf.write_varint(ENTITY_DATA_POSE_SERIALIZER_ID);
-                buf.write_varint(*pose as i32);
+            Self::BlockPosition { value, .. } => buf.write_i64(*value),
+            Self::OptionalBlockPosition { value, .. } => {
+                buf.write_bool(value.is_some());
+                if let Some(value) = value {
+                    buf.write_i64(*value);
+                }
             }
+            Self::Direction { value, .. } => buf.write_varint(value.wire_id()),
+            Self::OptionalLivingEntityReference { value, .. } => {
+                buf.write_bool(value.is_some());
+                if let Some(value) = value {
+                    buf.write_uuid(*value);
+                }
+            }
+            Self::BlockState { value, .. } => buf.write_varint(value.0),
+            Self::OptionalBlockState { value, .. } => match value {
+                None => buf.write_varint(0),
+                Some(value) if value.0 == 0 => {
+                    return Err(CodecError::NotSupported(
+                        "optional block-state id zero means absent",
+                    ));
+                }
+                Some(value) => buf.write_varint(value.0),
+            },
+            Self::OptionalUnsignedInt { value, .. } => match value {
+                None => buf.write_varint(0),
+                Some(value) => {
+                    let wire = value
+                        .checked_add(1)
+                        .and_then(|value| i32::try_from(value).ok())
+                        .ok_or(CodecError::NotSupported(
+                            "optional unsigned integer exceeds VarInt range",
+                        ))?;
+                    buf.write_varint(wire);
+                }
+            },
+            Self::Pose { pose, .. } => buf.write_varint(*pose as i32),
+            Self::HumanoidArm { value, .. } => buf.write_varint(match value {
+                MainHand::Left => 0,
+                MainHand::Right => 1,
+            }),
         }
         Ok(())
     }
 
     fn decode<B: Buf>(index: u8, serializer_id: i32, buf: &mut B) -> Result<Self, CodecError> {
-        match serializer_id {
-            ENTITY_DATA_BYTE_SERIALIZER_ID => Ok(Self::Byte {
+        Ok(match serializer_id {
+            ENTITY_DATA_BYTE_SERIALIZER_ID => Self::Byte {
                 index,
                 value: buf.read_i8()?,
-            }),
-            ENTITY_DATA_BOOLEAN_SERIALIZER_ID => Ok(Self::Boolean {
+            },
+            ENTITY_DATA_INT_SERIALIZER_ID => Self::Int {
                 index,
-                value: buf.read_bool()?,
-            }),
-            ENTITY_DATA_ITEM_STACK_SERIALIZER_ID => Ok(Self::ItemStack {
+                value: buf.read_varint()?,
+            },
+            ENTITY_DATA_LONG_SERIALIZER_ID => Self::Long {
+                index,
+                value: buf.read_varlong()?,
+            },
+            ENTITY_DATA_FLOAT_SERIALIZER_ID => Self::Float {
+                index,
+                value: buf.read_f32()?,
+            },
+            ENTITY_DATA_STRING_SERIALIZER_ID => Self::String {
+                index,
+                value: buf.read_string(DEFAULT_MAX_STRING_LEN)?,
+            },
+            ENTITY_DATA_ITEM_STACK_SERIALIZER_ID => Self::ItemStack {
                 index,
                 stack: ItemStack::decode(buf)?,
-            }),
-            ENTITY_DATA_POSE_SERIALIZER_ID => Ok(Self::Pose {
+            },
+            ENTITY_DATA_BOOLEAN_SERIALIZER_ID => Self::Boolean {
+                index,
+                value: buf.read_bool()?,
+            },
+            ENTITY_DATA_ROTATIONS_SERIALIZER_ID => Self::Rotations {
+                index,
+                value: EntityRotations {
+                    x: buf.read_f32()?,
+                    y: buf.read_f32()?,
+                    z: buf.read_f32()?,
+                },
+            },
+            ENTITY_DATA_BLOCK_POSITION_SERIALIZER_ID => Self::BlockPosition {
+                index,
+                value: buf.read_i64()?,
+            },
+            ENTITY_DATA_OPTIONAL_BLOCK_POSITION_SERIALIZER_ID => Self::OptionalBlockPosition {
+                index,
+                value: if buf.read_bool()? {
+                    Some(buf.read_i64()?)
+                } else {
+                    None
+                },
+            },
+            ENTITY_DATA_DIRECTION_SERIALIZER_ID => Self::Direction {
+                index,
+                value: EntityDirection::from_wire(buf.read_varint()?)?,
+            },
+            ENTITY_DATA_OPTIONAL_LIVING_ENTITY_REFERENCE_SERIALIZER_ID => {
+                Self::OptionalLivingEntityReference {
+                    index,
+                    value: if buf.read_bool()? {
+                        Some(buf.read_uuid()?)
+                    } else {
+                        None
+                    },
+                }
+            }
+            ENTITY_DATA_BLOCK_STATE_SERIALIZER_ID => Self::BlockState {
+                index,
+                value: BlockStateId::decode(buf)?,
+            },
+            ENTITY_DATA_OPTIONAL_BLOCK_STATE_SERIALIZER_ID => {
+                let raw = buf.read_varint()?;
+                if raw < 0 {
+                    return Err(CodecError::NotSupported("negative block-state registry id"));
+                }
+                Self::OptionalBlockState {
+                    index,
+                    value: (raw != 0).then_some(BlockStateId(raw)),
+                }
+            }
+            ENTITY_DATA_OPTIONAL_UNSIGNED_INT_SERIALIZER_ID => {
+                let raw = buf.read_varint()?;
+                if raw < 0 {
+                    return Err(CodecError::NotSupported(
+                        "negative optional unsigned integer",
+                    ));
+                }
+                Self::OptionalUnsignedInt {
+                    index,
+                    value: (raw != 0).then_some((raw - 1) as u32),
+                }
+            }
+            ENTITY_DATA_POSE_SERIALIZER_ID => Self::Pose {
                 index,
                 pose: EntityPose::from_wire(buf.read_varint()?)?,
-            }),
-            _ => Err(CodecError::NotSupported("entity data serializer")),
-        }
+            },
+            ENTITY_DATA_HUMANOID_ARM_SERIALIZER_ID => Self::HumanoidArm {
+                index,
+                value: match buf.read_varint()? {
+                    0 => MainHand::Left,
+                    1 => MainHand::Right,
+                    _ => return Err(CodecError::NotSupported("unknown humanoid arm")),
+                },
+            },
+            _ => {
+                return Err(CodecError::NotSupported(
+                    "entity data serializer is not implemented",
+                ));
+            }
+        })
     }
 }
 
@@ -1760,12 +2192,7 @@ impl EntityPose {
             15 => Self::Sliding,
             16 => Self::Shooting,
             17 => Self::Inhaling,
-            other => {
-                return Err(CodecError::StringTooLong {
-                    len: other as usize,
-                    max: 17,
-                });
-            }
+            _ => return Err(CodecError::NotSupported("unknown entity pose")),
         })
     }
 }
@@ -1784,6 +2211,26 @@ impl Packet for ClientboundSetEntityData {
     const ID: i32 = 0x63;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.values.len() > MAX_ENTITY_DATA_VALUES {
+            return Err(CodecError::StringTooLong {
+                len: self.values.len(),
+                max: MAX_ENTITY_DATA_VALUES,
+            });
+        }
+        let mut seen_indices = [false; 0xFF];
+        for value in &self.values {
+            let index = value.index();
+            if index == 0xFF {
+                return Err(CodecError::NotSupported(
+                    "entity data index 255 is reserved",
+                ));
+            }
+            if seen_indices[index as usize] {
+                return Err(CodecError::NotSupported("duplicate entity data index"));
+            }
+            seen_indices[index as usize] = true;
+        }
+
         buf.write_varint(self.entity_id);
         for value in &self.values {
             value.encode(buf)?;
@@ -1795,6 +2242,7 @@ impl Packet for ClientboundSetEntityData {
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let entity_id = buf.read_varint()?;
         let mut values = Vec::new();
+        let mut seen_indices = [false; 0xFF];
         loop {
             let index = buf.read_u8()?;
             if index == 0xFF {
@@ -1806,6 +2254,10 @@ impl Packet for ClientboundSetEntityData {
                     max: MAX_ENTITY_DATA_VALUES,
                 });
             }
+            if seen_indices[index as usize] {
+                return Err(CodecError::NotSupported("duplicate entity data index"));
+            }
+            seen_indices[index as usize] = true;
             let serializer_id = buf.read_varint()?;
             values.push(EntityDataValue::decode(index, serializer_id, buf)?);
         }
@@ -2454,14 +2906,21 @@ impl Packet for ServerboundCommandSuggestion {
     const ID: i32 = 0x0F;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        let command_len = self.command.encode_utf16().count();
+        if command_len > MAX_COMMAND_SUGGESTION_LEN {
+            return Err(CodecError::StringTooLong {
+                len: command_len,
+                max: MAX_COMMAND_SUGGESTION_LEN,
+            });
+        }
         buf.write_varint(self.id);
-        buf.write_string(&self.command, 32_500)
+        buf.write_string(&self.command, MAX_COMMAND_SUGGESTION_LEN)
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
             id: buf.read_varint()?,
-            command: buf.read_string(32_500)?,
+            command: buf.read_string(MAX_COMMAND_SUGGESTION_LEN)?,
         })
     }
 }
@@ -2485,6 +2944,15 @@ impl Packet for ServerboundSignUpdate {
             return Err(CodecError::NotSupported(
                 "sign update must contain four lines",
             ));
+        }
+        for line in &self.lines {
+            let line_len = line.encode_utf16().count();
+            if line_len > MAX_SIGN_LINE_LEN {
+                return Err(CodecError::StringTooLong {
+                    len: line_len,
+                    max: MAX_SIGN_LINE_LEN,
+                });
+            }
         }
         buf.write_i64(self.position);
         buf.write_bool(self.is_front_text);
@@ -2987,12 +3455,12 @@ impl Packet for ServerboundCustomPayload {
     const ID: i32 = 0x16;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        self.payload.encode(buf)
+        self.payload.encode_serverbound(buf)
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            payload: CustomPayload::decode(buf)?,
+            payload: CustomPayload::decode_serverbound(buf)?,
         })
     }
 }
@@ -3922,6 +4390,9 @@ pub struct ItemStack {
     pub damage: Option<i32>,
     /// `minecraft:enchantments`, encoded as a registry-id to level map.
     pub enchantments: Vec<mc_data::ItemEnchantment>,
+    /// `minecraft:custom_name`, limited to the literal text-component shape
+    /// used by Solaris script menus.
+    pub custom_name: Option<String>,
 }
 
 impl ItemStack {
@@ -3931,6 +4402,7 @@ impl ItemStack {
         item_id: 0,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
     };
 
     #[must_use]
@@ -3945,6 +4417,7 @@ impl ItemStack {
             item_id,
             damage: None,
             enchantments: Vec::new(),
+            custom_name: None,
         }
     }
 
@@ -3964,6 +4437,12 @@ impl ItemStack {
         self
     }
 
+    #[must_use]
+    pub fn with_custom_name(mut self, name: impl Into<String>) -> Self {
+        self.custom_name = Some(name.into());
+        self
+    }
+
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         if self.is_empty() {
             buf.write_varint(0);
@@ -3971,13 +4450,18 @@ impl ItemStack {
         }
         buf.write_varint(self.count);
         buf.write_varint(self.item_id as i32);
-        let component_count =
-            i32::from(self.damage.is_some()) + i32::from(!self.enchantments.is_empty());
+        let component_count = i32::from(self.damage.is_some())
+            + i32::from(self.custom_name.is_some())
+            + i32::from(!self.enchantments.is_empty());
         buf.write_varint(component_count);
         buf.write_varint(0);
         if let Some(damage) = self.damage {
             buf.write_varint(DATA_COMPONENT_DAMAGE_ID);
             buf.write_varint(damage);
+        }
+        if let Some(custom_name) = &self.custom_name {
+            buf.write_varint(DATA_COMPONENT_CUSTOM_NAME_ID);
+            write_literal_text_component(buf, custom_name)?;
         }
         if !self.enchantments.is_empty() {
             buf.write_varint(DATA_COMPONENT_ENCHANTMENTS_ID);
@@ -4008,18 +4492,22 @@ impl ItemStack {
         if n_add < 0 || n_remove < 0 {
             return Err(CodecError::NegativeLength(n_add.min(n_remove)));
         }
-        if n_add > 2 || n_remove != 0 {
+        if n_add > 3 || n_remove != 0 {
             return Err(CodecError::NotSupported(
                 "ItemStack with unsupported DataComponentPatch shape",
             ));
         }
         let mut damage = None;
+        let mut custom_name = None;
         let mut enchantments = Vec::new();
         for _ in 0..n_add {
             let component_id = buf.read_varint()?;
             match component_id {
                 DATA_COMPONENT_DAMAGE_ID if damage.is_none() => {
                     damage = Some(buf.read_varint()?.max(0));
+                }
+                DATA_COMPONENT_CUSTOM_NAME_ID if custom_name.is_none() => {
+                    custom_name = Some(read_literal_text_component(buf)?);
                 }
                 DATA_COMPONENT_ENCHANTMENTS_ID if enchantments.is_empty() => {
                     let count = read_count(buf, 256)?;
@@ -4059,8 +4547,40 @@ impl ItemStack {
             item_id,
             damage,
             enchantments,
+            custom_name,
         })
     }
+}
+
+fn write_literal_text_component<B: BufMut>(buf: &mut B, text: &str) -> Result<(), CodecError> {
+    mc_nbt::write_network(
+        buf,
+        &mc_nbt::Tag::Compound(vec![(
+            "text".to_owned(),
+            mc_nbt::Tag::String(text.to_owned()),
+        )]),
+    )?;
+    Ok(())
+}
+
+fn read_literal_text_component<B: Buf>(buf: &mut B) -> Result<String, CodecError> {
+    let mc_nbt::Tag::Compound(fields) = mc_nbt::read_network(buf)? else {
+        return Err(CodecError::NotSupported(
+            "ItemStack custom name must be a text component",
+        ));
+    };
+    let mut fields = fields.into_iter();
+    let Some((name, mc_nbt::Tag::String(text))) = fields.next() else {
+        return Err(CodecError::NotSupported(
+            "ItemStack custom name must be a literal text component",
+        ));
+    };
+    if name != "text" || fields.next().is_some() {
+        return Err(CodecError::NotSupported(
+            "ItemStack custom name must be a literal text component",
+        ));
+    }
+    Ok(text)
 }
 
 /// `Clientbound Set Held Slot` (CB). Tells the client which hotbar
@@ -4293,7 +4813,21 @@ impl HashedStackComponentHashes {
         }
     }
 
+    fn component_hash_count(&self) -> Result<usize, CodecError> {
+        for len in [self.added.len(), self.removed.len()] {
+            if len > MAX_HASHED_STACK_COMPONENT_HASHES {
+                return Err(CodecError::StringTooLong {
+                    len,
+                    max: MAX_HASHED_STACK_COMPONENT_HASHES,
+                });
+            }
+        }
+        Ok(self.added.len() + self.removed.len())
+    }
+
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.component_hash_count()?;
+
         write_count(buf, self.added.len())?;
         for (component_id, hash) in &self.added {
             buf.write_varint(*component_id);
@@ -4307,20 +4841,64 @@ impl HashedStackComponentHashes {
         Ok(())
     }
 
-    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+    fn decode_with_budget<B: Buf>(
+        buf: &mut B,
+        component_hash_count: &mut usize,
+    ) -> Result<Self, CodecError> {
         let added_len = read_count(buf, MAX_HASHED_STACK_COMPONENT_HASHES)?;
+        add_component_hashes_to_budget(component_hash_count, added_len)?;
+        require_remaining(buf, added_len * 5 + 1)?;
         let mut added = Vec::with_capacity(added_len);
         for _ in 0..added_len {
             added.push((buf.read_varint()?, buf.read_i32()?));
         }
 
         let removed_len = read_count(buf, MAX_HASHED_STACK_COMPONENT_HASHES)?;
+        add_component_hashes_to_budget(component_hash_count, removed_len)?;
+        require_remaining(buf, removed_len)?;
         let mut removed = Vec::with_capacity(removed_len);
         for _ in 0..removed_len {
             removed.push(buf.read_varint()?);
         }
         Ok(Self { added, removed })
     }
+
+    #[cfg(test)]
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let mut component_hash_count = 0;
+        Self::decode_with_budget(buf, &mut component_hash_count)
+    }
+}
+
+fn add_component_hashes_to_budget(
+    component_hash_count: &mut usize,
+    additional: usize,
+) -> Result<(), CodecError> {
+    let total = component_hash_count
+        .checked_add(additional)
+        .ok_or(CodecError::StringTooLong {
+            len: usize::MAX,
+            max: MAX_CONTAINER_CLICK_COMPONENT_HASHES,
+        })?;
+    if total > MAX_CONTAINER_CLICK_COMPONENT_HASHES {
+        return Err(CodecError::StringTooLong {
+            len: total,
+            max: MAX_CONTAINER_CLICK_COMPONENT_HASHES,
+        });
+    }
+    *component_hash_count = total;
+    Ok(())
+}
+
+fn require_remaining<B: Buf>(buf: &B, minimum: usize) -> Result<(), CodecError> {
+    let available = buf.remaining();
+    if available < minimum {
+        return Err(CodecError::Underflow {
+            needed: minimum - available,
+            available,
+        });
+    }
+    Ok(())
 }
 
 /// Client-side hash view of an item stack, used only by serverbound
@@ -4342,6 +4920,7 @@ impl HashedStack {
     }
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        self.component_hash_count()?;
         match self {
             Self::Empty => buf.write_bool(false),
             Self::Actual {
@@ -4358,7 +4937,30 @@ impl HashedStack {
         Ok(())
     }
 
-    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+    fn component_hash_count(&self) -> Result<usize, CodecError> {
+        match self {
+            Self::Empty => Ok(0),
+            Self::Actual {
+                item_id,
+                count,
+                components,
+            } => {
+                if *item_id > i32::MAX as u32 {
+                    return Err(CodecError::NotSupported(
+                        "hashed stack item id exceeds VarInt range",
+                    ));
+                }
+                if *count <= 0 {
+                    return Err(CodecError::NotSupported(
+                        "HashedStack actual item with non-positive count",
+                    ));
+                }
+                components.component_hash_count()
+            }
+        }
+    }
+
+    fn decode<B: Buf>(buf: &mut B, component_hash_count: &mut usize) -> Result<Self, CodecError> {
         if !buf.read_bool()? {
             return Ok(Self::Empty);
         }
@@ -4375,7 +4977,7 @@ impl HashedStack {
         Ok(Self::Actual {
             item_id: item_id as u32,
             count,
-            components: HashedStackComponentHashes::decode(buf)?,
+            components: HashedStackComponentHashes::decode_with_budget(buf, component_hash_count)?,
         })
     }
 }
@@ -4462,6 +5064,24 @@ impl Packet for ServerboundContainerClick {
     const ID: i32 = 0x12;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        if self.changed_slots.len() > MAX_CONTAINER_CLICK_CHANGED_SLOTS {
+            return Err(CodecError::StringTooLong {
+                len: self.changed_slots.len(),
+                max: MAX_CONTAINER_CLICK_CHANGED_SLOTS,
+            });
+        }
+        let mut component_hash_count = 0;
+        for (_, stack) in &self.changed_slots {
+            add_component_hashes_to_budget(
+                &mut component_hash_count,
+                stack.component_hash_count()?,
+            )?;
+        }
+        add_component_hashes_to_budget(
+            &mut component_hash_count,
+            self.carried_item.component_hash_count()?,
+        )?;
+
         buf.write_varint(self.container_id);
         buf.write_varint(self.state_id);
         buf.write_i16(self.slot_num);
@@ -4483,11 +5103,16 @@ impl Packet for ServerboundContainerClick {
         let button_num = buf.read_i8()?;
         let container_input = ContainerInput::from_wire(buf.read_varint()?)?;
         let changed_len = read_count(buf, MAX_CONTAINER_CLICK_CHANGED_SLOTS)?;
+        require_remaining(buf, changed_len * 3 + 1)?;
         let mut changed_slots = Vec::with_capacity(changed_len);
+        let mut component_hash_count = 0;
         for _ in 0..changed_len {
-            changed_slots.push((buf.read_i16()?, HashedStack::decode(buf)?));
+            changed_slots.push((
+                buf.read_i16()?,
+                HashedStack::decode(buf, &mut component_hash_count)?,
+            ));
         }
-        let carried_item = HashedStack::decode(buf)?;
+        let carried_item = HashedStack::decode(buf, &mut component_hash_count)?;
         Ok(Self {
             container_id,
             state_id,

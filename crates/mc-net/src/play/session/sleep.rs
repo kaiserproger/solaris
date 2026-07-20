@@ -1,9 +1,15 @@
 use super::*;
 use crate::play::beds::next_morning_time;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+#[cfg(test)]
+#[path = "sleep_tests.rs"]
+mod tests;
 
 pub(in crate::play::session) const DEFAULT_PLAYERS_SLEEPING_PERCENTAGE: u32 = 100;
 pub(in crate::play::session) const DEEP_SLEEP_TICKS: u64 = 100;
+
+static NEXT_WAKE_TOKEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::play) enum SleepOutcome {
@@ -31,16 +37,44 @@ pub(in crate::play::session) enum SleepTransition {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub(in crate::play::session) struct SleepingState {
     started_tick: u64,
     bed: mc_world::BlockPos,
+    wake: Option<StagedWake>,
+    deferred_dispatches: Vec<VisibilityDispatch>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::play) struct SleepingPlayer {
     pub(in crate::play) id: SessionId,
     pub(in crate::play) bed: mc_world::BlockPos,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::play::session) enum SleepWakeReason {
+    Normal,
+    Damage,
+    Spectator { previous: GameMode },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StagedWake {
+    token: u64,
+    reason: SleepWakeReason,
+    claimed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::play) struct SleepWakeToken {
+    session_id: SessionId,
+    bed: mc_world::BlockPos,
+    token: u64,
+}
+
+#[derive(Debug)]
+pub(in crate::play) struct CompletedSleepWake {
+    pub(in crate::play) dispatches: Vec<VisibilityDispatch>,
 }
 
 fn active_sleeping_players(inner: &SessionRegistryInner) -> usize {
@@ -57,14 +91,59 @@ pub(in crate::play::session) fn sleepers_needed(active_players: usize, percentag
     usize::try_from(required).unwrap_or(usize::MAX).max(1)
 }
 
-fn drain_sleepers(inner: &mut SessionRegistryInner) -> Vec<SleepingPlayer> {
+fn stage_sleepers(inner: &mut SessionRegistryInner) -> Vec<SleepingPlayer> {
     let mut sleepers = inner
         .sleeping_sessions
-        .drain()
-        .map(|(id, state)| SleepingPlayer { id, bed: state.bed })
+        .iter_mut()
+        .filter_map(|(&id, state)| {
+            if state.wake.is_some() {
+                return None;
+            }
+            state.wake = Some(StagedWake {
+                token: NEXT_WAKE_TOKEN.fetch_add(1, Ordering::Relaxed),
+                reason: SleepWakeReason::Normal,
+                claimed: false,
+            });
+            Some(SleepingPlayer { id, bed: state.bed })
+        })
         .collect::<Vec<_>>();
     sleepers.sort_unstable_by_key(|sleeper| sleeper.id);
     sleepers
+}
+
+pub(in crate::play::session) fn stage_sleep_wake_locked(
+    inner: &mut SessionRegistryInner,
+    id: SessionId,
+    reason: SleepWakeReason,
+) -> Option<SleepingPlayer> {
+    let state = inner.sleeping_sessions.get_mut(&id)?;
+    match state.wake.as_mut() {
+        Some(wake) => wake.reason = reason,
+        None => {
+            state.wake = Some(StagedWake {
+                token: NEXT_WAKE_TOKEN.fetch_add(1, Ordering::Relaxed),
+                reason,
+                claimed: false,
+            });
+        }
+    }
+    Some(SleepingPlayer { id, bed: state.bed })
+}
+
+pub(in crate::play::session) fn defer_staged_sleep_dispatches_locked(
+    inner: &mut SessionRegistryInner,
+    id: SessionId,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) {
+    let Some(state) = inner.sleeping_sessions.get_mut(&id) else {
+        return;
+    };
+    if state
+        .wake
+        .is_some_and(|wake| matches!(wake.reason, SleepWakeReason::Damage))
+    {
+        state.deferred_dispatches.append(dispatches);
+    }
 }
 
 impl SessionRegistry {
@@ -110,12 +189,16 @@ impl SessionRegistry {
         };
 
         let mut outcome = self.commit_claimed_pending_hostiles(pending);
+        let sleep_published_time =
+            matches!(sleep_transition, Some(SleepTransition::Skipped { .. }));
         outcome
             .dispatches
             .extend(self.sleep_transition_dispatches(sleep_transition));
-        outcome
-            .dispatches
-            .extend(self.broadcast_world_time(self.world_time()));
+        if !sleep_published_time {
+            outcome
+                .dispatches
+                .extend(self.broadcast_world_time(self.world_time()));
+        }
         outcome
     }
 
@@ -164,6 +247,8 @@ impl SessionRegistry {
             .or_insert_with(|| SleepingState {
                 started_tick: self.simulation_tick(),
                 bed,
+                wake: None,
+                deferred_dispatches: Vec::new(),
             });
         let sleeping = inner.sleeping_sessions.len();
         let required = sleepers_needed(
@@ -198,11 +283,157 @@ impl SessionRegistry {
         self.recompute_sleep_transition("tick player sleep")
     }
 
+    pub(in crate::play) fn request_sleep_wake(&self, id: SessionId) -> Option<mc_world::BlockPos> {
+        let mut inner = self.lock_inner("request player wake");
+        let state = inner.sleeping_sessions.get_mut(&id)?;
+        if state.wake.is_none() {
+            state.wake = Some(StagedWake {
+                token: NEXT_WAKE_TOKEN.fetch_add(1, Ordering::Relaxed),
+                reason: SleepWakeReason::Normal,
+                claimed: false,
+            });
+        }
+        Some(state.bed)
+    }
+
+    pub(in crate::play) fn cancel_sleep_reservation(&self, id: SessionId) {
+        let mut inner = self.lock_inner("cancel uncommitted sleep reservation");
+        if inner
+            .sleeping_sessions
+            .get(&id)
+            .is_some_and(|state| state.wake.is_none())
+        {
+            inner.sleeping_sessions.remove(&id);
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::play) fn stop_sleeping(&self, id: SessionId) -> Option<mc_world::BlockPos> {
-        self.lock_inner("stop player sleep")
+        self.lock_inner("stop player sleep in test")
             .sleeping_sessions
             .remove(&id)
             .map(|state| state.bed)
+    }
+
+    pub(in crate::play::session) fn stage_sleep_wake_locked(
+        &self,
+        inner: &mut SessionRegistryInner,
+        id: SessionId,
+        reason: SleepWakeReason,
+    ) -> Option<SleepingPlayer> {
+        stage_sleep_wake_locked(inner, id, reason)
+    }
+
+    pub(in crate::play) fn claim_sleep_wake(
+        &self,
+        id: SessionId,
+        bed: mc_world::BlockPos,
+    ) -> Option<SleepWakeToken> {
+        let mut inner = self.lock_inner("claim staged player wake");
+        let state = inner.sleeping_sessions.get_mut(&id)?;
+        if state.bed != bed {
+            return None;
+        }
+        let wake = state.wake.as_mut()?;
+        if wake.claimed {
+            return None;
+        }
+        wake.claimed = true;
+        Some(SleepWakeToken {
+            session_id: id,
+            bed,
+            token: wake.token,
+        })
+    }
+
+    pub(in crate::play::session) fn defer_staged_sleep_dispatches(
+        &self,
+        id: SessionId,
+        dispatches: &mut Vec<VisibilityDispatch>,
+    ) {
+        let mut inner = self.lock_inner("defer sleep damage publications");
+        defer_staged_sleep_dispatches_locked(&mut inner, id, dispatches);
+    }
+
+    pub(in crate::play) fn reject_sleep_wake(&self, token: SleepWakeToken) -> Option<GameMode> {
+        let mut inner = self.lock_inner("reject staged player wake");
+        let player_state = inner.player_persistence.get(&token.session_id).cloned();
+        let state = inner.sleeping_sessions.get_mut(&token.session_id)?;
+        if state.bed != token.bed {
+            return None;
+        }
+        let wake = state.wake?;
+        if wake.token != token.token || !wake.claimed {
+            return None;
+        }
+        match wake.reason {
+            SleepWakeReason::Spectator { previous } => {
+                let Some(player_state) = player_state else {
+                    state.wake.as_mut().expect("validated staged wake").claimed = false;
+                    return None;
+                };
+                let mut player_state = player_state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                state.wake = None;
+                if player_state.game_mode == GameMode::Spectator {
+                    player_state.game_mode = previous;
+                    Some(previous)
+                } else {
+                    None
+                }
+            }
+            SleepWakeReason::Normal | SleepWakeReason::Damage => {
+                state.wake.as_mut().expect("validated staged wake").claimed = false;
+                None
+            }
+        }
+    }
+
+    pub(in crate::play) fn complete_sleep_wake(
+        &self,
+        token: SleepWakeToken,
+    ) -> Option<CompletedSleepWake> {
+        let (transition, mut deferred_dispatches) = {
+            let mut inner = self.lock_inner("complete staged player wake");
+            let state = inner.sleeping_sessions.get(&token.session_id)?;
+            let wake = state.wake?;
+            if state.bed != token.bed || wake.token != token.token || !wake.claimed {
+                return None;
+            }
+            let reason = wake.reason;
+            let mut state = inner
+                .sleeping_sessions
+                .remove(&token.session_id)
+                .expect("validated sleeping state remains present");
+            let spectator_commit_is_current = matches!(reason, SleepWakeReason::Spectator { .. })
+                && inner
+                    .player_persistence
+                    .get(&token.session_id)
+                    .is_some_and(|player_state| {
+                        player_state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .game_mode
+                            == GameMode::Spectator
+                    });
+            if spectator_commit_is_current {
+                inner.spectator_sessions.insert(token.session_id);
+            }
+            let transition = self.resolve_sleep_transition_locked(&mut inner);
+            (transition, std::mem::take(&mut state.deferred_dispatches))
+        };
+
+        let mut dispatches = self.broadcast_player_entity_data_including_self(
+            token.session_id,
+            vec![EntityDataValue::Pose {
+                index: ENTITY_DATA_POSE_INDEX,
+                pose: EntityPose::Standing,
+            }],
+        );
+        dispatches.append(&mut deferred_dispatches);
+        dispatches.extend(self.sleep_transition_dispatches(transition));
+        Some(CompletedSleepWake { dispatches })
     }
 
     pub(in crate::play) fn sleeping_bed(&self, id: SessionId) -> Option<mc_world::BlockPos> {
@@ -216,7 +447,9 @@ impl SessionRegistry {
     pub(in crate::play::session) fn sleeping_session_count_for_test(&self) -> usize {
         self.lock_inner("read sleeping session count")
             .sleeping_sessions
-            .len()
+            .values()
+            .filter(|state| state.wake.is_none())
+            .count()
     }
 
     fn recompute_sleep_transition(&self, operation: &'static str) -> Vec<VisibilityDispatch> {
@@ -231,9 +464,6 @@ impl SessionRegistry {
         &self,
         inner: &mut SessionRegistryInner,
     ) -> Option<SleepTransition> {
-        inner.sleeping_sessions.retain(|id, _| {
-            inner.sessions.contains_key(id) && !inner.spectator_sessions.contains(id)
-        });
         if inner.sleeping_sessions.is_empty() {
             return None;
         }
@@ -241,7 +471,7 @@ impl SessionRegistry {
         let world_time = self.world_time();
         if !super::super::world_time_is_night(world_time) {
             return Some(SleepTransition::Woke {
-                sleepers: drain_sleepers(inner),
+                sleepers: stage_sleepers(inner),
             });
         }
 
@@ -253,13 +483,16 @@ impl SessionRegistry {
         let deep_sleepers = inner
             .sleeping_sessions
             .values()
-            .filter(|state| simulation_tick.saturating_sub(state.started_tick) >= DEEP_SLEEP_TICKS)
+            .filter(|state| {
+                state.wake.is_none()
+                    && simulation_tick.saturating_sub(state.started_tick) >= DEEP_SLEEP_TICKS
+            })
             .count();
         if deep_sleepers < required {
             return None;
         }
 
-        let sleepers = drain_sleepers(inner);
+        let sleepers = stage_sleepers(inner);
         let new_time = next_morning_time(world_time);
         self.world_time.store(new_time, Ordering::Release);
         Some(SleepTransition::Skipped { new_time, sleepers })
@@ -293,13 +526,6 @@ impl SessionRegistry {
             dispatches.extend(visibility_dispatches(wake_recipient, || {
                 OutboundCommand::WakeFromBed { bed: sleeper.bed }
             }));
-            dispatches.extend(self.broadcast_player_entity_data_including_self(
-                sleeper.id,
-                vec![EntityDataValue::Pose {
-                    index: ENTITY_DATA_POSE_INDEX,
-                    pose: EntityPose::Standing,
-                }],
-            ));
         }
         if let Some(new_time) = new_time {
             dispatches.extend(self.broadcast_world_time(new_time));

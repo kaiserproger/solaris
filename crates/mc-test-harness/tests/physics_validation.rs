@@ -966,9 +966,11 @@ async fn start_physics_server() -> Option<std::net::SocketAddr> {
     let items = mc_data::items::load_items_report(&registries_path)
         .map(|report| mc_data::items::ItemRegistry::from_report(&report))
         .unwrap_or_default();
-    let entity_types = mc_data::entity_types::load_entity_types_report(&registries_path)
-        .map(|report| mc_data::entity_types::EntityTypeRegistry::from_report(&report))
-        .unwrap_or_default();
+    let entity_report = mc_data::entity_types::load_entity_types_report(&registries_path)
+        .expect("entity type report loads");
+    let entity_types =
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry");
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),

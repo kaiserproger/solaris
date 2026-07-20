@@ -5,17 +5,15 @@ use std::sync::mpsc::{Receiver, SyncSender, TrySendError, channel, sync_channel}
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-#[cfg(any(test, feature = "shadow-compare"))]
-use super::RegionalShadowComparisonBatch;
 use super::{
     RegionKey, RegionLease, RegionPhase, add_goal_tick_stats, goal_reference,
     order_vehicle_group_for_removal, snapshot_vehicle_reference,
 };
-#[cfg(any(test, feature = "shadow-compare"))]
-use crate::ShadowStage;
+
 use crate::{
-    AnimalBreedingState, EntityId, EntityItemStack, EntityKinematics, EntitySnapshot, EntityStore,
-    GoalState, GoalTickStats, PreparedGoalTick, ResolvedGoalTick, Vec3,
+    AnimalBreedingState, EntityDamageRequest, EntityEffectRequest, EntityEffectResult, EntityId,
+    EntityItemStack, EntityKinematics, EntitySnapshot, EntityStore, GoalState, GoalTickStats,
+    PreparedGoalTick, ResolvedGoalTick, Vec3,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +30,11 @@ pub enum RegionOwnerMutation {
         expected: Box<EntitySnapshot>,
         animal: AnimalBreedingState,
     },
+    SetGrazingStateIfCurrent {
+        expected: Box<EntitySnapshot>,
+        velocity: Option<Vec3>,
+        remaining_ticks: Option<u8>,
+    },
     SetGoalIfCurrent {
         expected: Box<EntitySnapshot>,
         goal: GoalState,
@@ -39,6 +42,10 @@ pub enum RegionOwnerMutation {
     SetItemStackIfCurrent {
         expected: Box<EntitySnapshot>,
         item_stack: Option<EntityItemStack>,
+    },
+    ReplaceSnapshotIfCurrent {
+        expected: Box<EntitySnapshot>,
+        next: Box<EntitySnapshot>,
     },
     SetKinematicsIfCurrent {
         expected: Box<EntitySnapshot>,
@@ -50,7 +57,11 @@ pub enum RegionOwnerMutation {
     },
     DamageIfCurrent {
         expected: Box<EntitySnapshot>,
-        amount: f32,
+        request: EntityDamageRequest,
+    },
+    ApplyEffectIfCurrent {
+        expected: Box<EntitySnapshot>,
+        request: Box<EntityEffectRequest>,
     },
     ApplyGoalBatch {
         expected: Vec<EntitySnapshot>,
@@ -78,11 +89,12 @@ pub struct RegionOwnerBatch {
     pub mutations: Vec<SequencedRegionMutation>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RegionOwnerCompletion {
     pub phase: RegionPhase,
     pub applied_sequences: Vec<u64>,
     pub goal_stats: GoalTickStats,
+    pub effect_results: Vec<(u64, EntityEffectResult)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +115,7 @@ pub enum RegionOwnerLaneError {
     UnknownEntity,
     InvalidMutation,
     Journal,
+    OutcomeUnknown,
 }
 
 #[derive(Debug)]
@@ -179,12 +192,7 @@ enum RegionOwnerLaneMessage {
         active_ids: HashSet<EntityId>,
         reply: std::sync::mpsc::Sender<Result<PreparedGoalTick, RegionOwnerLaneError>>,
     },
-    #[cfg(any(test, feature = "shadow-compare"))]
-    CompareShadow {
-        tick: u64,
-        stage: ShadowStage,
-        reply: std::sync::mpsc::Sender<Result<RegionalShadowComparisonBatch, RegionOwnerLaneError>>,
-    },
+
     Shutdown {
         reply:
             std::sync::mpsc::Sender<Result<BTreeMap<RegionKey, EntityStore>, RegionOwnerLaneError>>,
@@ -204,8 +212,7 @@ enum RegionOwnerUndo {
     },
     Goal {
         lease: RegionLease,
-        entity: EntityId,
-        goal: GoalState,
+        snapshot: Box<EntitySnapshot>,
     },
     ItemStack {
         lease: RegionLease,
@@ -242,9 +249,17 @@ enum RegionOwnerUndo {
         lease: RegionLease,
         expected: Box<EntitySnapshot>,
     },
+    Effect {
+        lease: RegionLease,
+        checkpoint: Box<crate::runtime::EntityEffectCheckpoint>,
+    },
+    Snapshot {
+        lease: RegionLease,
+        snapshot: Box<EntitySnapshot>,
+    },
     GoalBatch {
         lease: RegionLease,
-        states: Vec<EntityKinematics>,
+        snapshots: Vec<EntitySnapshot>,
     },
 }
 
@@ -252,8 +267,6 @@ struct CommittedRegionOwnerBatch {
     phase: RegionPhase,
     sequence_watermark: u64,
     undo: Vec<RegionOwnerUndo>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    event_checkpoints: BTreeMap<RegionKey, (usize, usize, usize)>,
 }
 
 pub struct RegionalOwnerLane {
@@ -690,22 +703,6 @@ impl RegionalOwnerLane {
         Ok(prepared)
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub(super) fn request_shadow_comparison(
-        &self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<
-        Receiver<Result<RegionalShadowComparisonBatch, RegionOwnerLaneError>>,
-        RegionOwnerLaneError,
-    > {
-        let (reply, comparison) = channel();
-        self.sender
-            .send(RegionOwnerLaneMessage::CompareShadow { tick, stage, reply })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        Ok(comparison)
-    }
-
     pub fn shutdown(mut self) -> Result<BTreeMap<RegionKey, EntityStore>, RegionOwnerLaneError> {
         self.stop()
     }
@@ -1061,26 +1058,7 @@ fn run_region_owner_lane(
                 };
                 let _ = reply.send(result);
             }
-            #[cfg(any(test, feature = "shadow-compare"))]
-            RegionOwnerLaneMessage::CompareShadow { tick, stage, reply } => {
-                let result = if pending.is_some() || committed.is_some() {
-                    Err(RegionOwnerLaneError::Busy)
-                } else {
-                    let mut batch = RegionalShadowComparisonBatch::new(tick, stage);
-                    let mut error = None;
-                    for (&key, (_, store)) in &mut regions {
-                        if batch.compare_region(key, store).is_err() {
-                            error = Some(RegionOwnerLaneError::InvalidMutation);
-                            break;
-                        }
-                    }
-                    match error {
-                        Some(error) => Err(error),
-                        None => Ok(batch),
-                    }
-                };
-                let _ = reply.send(result);
-            }
+
             RegionOwnerLaneMessage::Shutdown { reply } => {
                 if let Some(applied) = committed.take()
                     && let Err(error) = rollback_region_owner_batch(&mut regions, applied)
@@ -1096,6 +1074,18 @@ fn run_region_owner_lane(
                 return;
             }
         }
+    }
+}
+
+fn effect_expected_snapshot_matches(current: &EntitySnapshot, expected: &EntitySnapshot) -> bool {
+    if current.health.is_nan() && expected.health.is_nan() {
+        let mut current = current.clone();
+        let mut expected = expected.clone();
+        current.health = 0.0;
+        expected.health = 0.0;
+        current == expected
+    } else {
+        current == expected
     }
 }
 
@@ -1162,9 +1152,27 @@ fn prepare_region_owner_batch(
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
+            RegionOwnerMutation::SetGrazingStateIfCurrent {
+                expected, velocity, ..
+            } => {
+                if velocity.is_some_and(|velocity| !velocity.is_finite())
+                    || store.snapshot(expected.id).as_ref() != Some(expected.as_ref())
+                {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+            }
             RegionOwnerMutation::SetGoalIfCurrent { expected, .. }
             | RegionOwnerMutation::SetItemStackIfCurrent { expected, .. } => {
                 if store.snapshot(expected.id).as_ref() != Some(expected.as_ref()) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+            }
+            RegionOwnerMutation::ReplaceSnapshotIfCurrent { expected, next } => {
+                if expected.id != next.id
+                    || expected.uuid != next.uuid
+                    || RegionKey::from_position(next.position) != Some(mutation.lease.key)
+                    || store.snapshot(expected.id).as_ref() != Some(expected.as_ref())
+                {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
@@ -1192,14 +1200,22 @@ fn prepare_region_owner_batch(
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
-            RegionOwnerMutation::DamageIfCurrent { expected, amount } => {
-                if !amount.is_finite()
+            RegionOwnerMutation::DamageIfCurrent { expected, request } => {
+                if !request.is_valid()
                     || store.snapshot(expected.id).as_ref() != Some(expected.as_ref())
                     || expected.lifecycle != crate::EntityLifecycle::Alive
                     || store
                         .snapshots()
                         .any(|snapshot| snapshot_vehicle_reference(&snapshot) == Some(expected.id))
                 {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+            }
+            RegionOwnerMutation::ApplyEffectIfCurrent { expected, .. } => {
+                let Some(current) = store.snapshot(expected.id) else {
+                    return Err(RegionOwnerLaneError::UnknownEntity);
+                };
+                if !effect_expected_snapshot_matches(&current, expected) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
             }
@@ -1313,22 +1329,10 @@ fn apply_prepared_region_owner_batch(
     regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
     batch: RegionOwnerBatch,
 ) -> Result<(RegionOwnerCompletion, CommittedRegionOwnerBatch), RegionOwnerLaneError> {
-    #[cfg(any(test, feature = "shadow-compare"))]
-    let event_checkpoints = batch
-        .mutations
-        .iter()
-        .map(|mutation| {
-            let checkpoint = regions
-                .get(&mutation.lease.key)
-                .expect("owner batch regions were preflighted")
-                .1
-                .owner_event_checkpoint();
-            (mutation.lease.key, checkpoint)
-        })
-        .collect::<BTreeMap<_, _>>();
     let mut applied_sequences = Vec::with_capacity(batch.mutations.len());
     let mut undo = Vec::with_capacity(batch.mutations.len());
     let mut goal_stats = GoalTickStats::default();
+    let mut effect_results = Vec::new();
     for mutation in batch.mutations {
         let store = &mut regions
             .get_mut(&mutation.lease.key)
@@ -1370,12 +1374,30 @@ fn apply_prepared_region_owner_batch(
                 });
                 store.set_animal_state(entity, animal)
             }
+            RegionOwnerMutation::SetGrazingStateIfCurrent {
+                expected,
+                velocity,
+                remaining_ticks,
+            } => {
+                let mut next = expected.as_ref().clone();
+                if let Some(velocity) = velocity {
+                    next.velocity = velocity;
+                }
+                next.retained.sheep_grazing_ticks = remaining_ticks;
+                let applied = store.restore_snapshot_in_place(next);
+                if applied {
+                    undo.push(RegionOwnerUndo::Snapshot {
+                        lease: mutation.lease,
+                        snapshot: expected,
+                    });
+                }
+                applied
+            }
             RegionOwnerMutation::SetGoalIfCurrent { expected, goal } => {
                 let entity = expected.id;
                 undo.push(RegionOwnerUndo::Goal {
                     lease: mutation.lease,
-                    entity,
-                    goal: expected.goal,
+                    snapshot: expected,
                 });
                 store.set_goal(entity, goal)
             }
@@ -1390,6 +1412,13 @@ fn apply_prepared_region_owner_batch(
                     item_stack: expected.item_stack,
                 });
                 store.set_item_stack(entity, item_stack)
+            }
+            RegionOwnerMutation::ReplaceSnapshotIfCurrent { expected, next } => {
+                undo.push(RegionOwnerUndo::Snapshot {
+                    lease: mutation.lease,
+                    snapshot: expected,
+                });
+                store.restore_snapshot_in_place(*next)
             }
             RegionOwnerMutation::SetKinematicsIfCurrent { expected, state } => {
                 undo.push(RegionOwnerUndo::Kinematics {
@@ -1425,9 +1454,9 @@ fn apply_prepared_region_owner_batch(
                 }
                 applied
             }
-            RegionOwnerMutation::DamageIfCurrent { expected, amount } => {
+            RegionOwnerMutation::DamageIfCurrent { expected, request } => {
                 let entity = expected.id;
-                let applied = store.damage(entity, amount).is_some();
+                let applied = store.damage(entity, request).is_some();
                 if applied {
                     undo.push(RegionOwnerUndo::Damaged {
                         lease: mutation.lease,
@@ -1436,34 +1465,39 @@ fn apply_prepared_region_owner_batch(
                 }
                 applied
             }
+            RegionOwnerMutation::ApplyEffectIfCurrent { expected, request } => {
+                let checkpoint = store
+                    .effect_checkpoint(expected.id)
+                    .ok_or(RegionOwnerLaneError::UnknownEntity)?;
+                let result = store.apply_effect(expected.id, *request);
+                if matches!(result, EntityEffectResult::Applied(_)) {
+                    undo.push(RegionOwnerUndo::Effect {
+                        lease: mutation.lease,
+                        checkpoint: Box::new(checkpoint),
+                    });
+                }
+                effect_results.push((mutation.sequence, result));
+                true
+            }
             RegionOwnerMutation::ApplyGoalBatch {
                 expected,
                 resolved,
                 follow_targets,
             } => {
-                let states = expected
-                    .iter()
-                    .map(|snapshot| EntityKinematics {
-                        id: snapshot.id,
-                        position: snapshot.position,
-                        rotation: snapshot.rotation,
-                        velocity: snapshot.velocity,
-                        on_ground: snapshot.on_ground,
-                    })
-                    .collect();
+                let snapshots = expected;
                 let stats =
                     store.apply_prepared_goal_tick_with_follow_targets(*resolved, &follow_targets);
                 add_goal_tick_stats(&mut goal_stats, stats);
                 undo.push(RegionOwnerUndo::GoalBatch {
                     lease: mutation.lease,
-                    states,
+                    snapshots,
                 });
                 true
             }
             RegionOwnerMutation::InsertSnapshot(snapshot) => {
                 let entity = snapshot.id;
                 let previous_next_id = store.next_id;
-                let inserted = store.insert_authoritative_snapshot(*snapshot);
+                let inserted = store.insert_snapshot(*snapshot);
                 if inserted {
                     undo.push(RegionOwnerUndo::Inserted {
                         lease: mutation.lease,
@@ -1479,7 +1513,7 @@ fn apply_prepared_region_owner_batch(
                     .map(|snapshot| snapshot.id)
                     .collect::<Vec<_>>();
                 let previous_next_id = store.next_id;
-                let inserted = store.insert_authoritative_snapshots_batch(snapshots);
+                let inserted = store.insert_snapshots_batch(snapshots);
                 if inserted {
                     undo.push(RegionOwnerUndo::InsertedBatch {
                         lease: mutation.lease,
@@ -1525,9 +1559,7 @@ fn apply_prepared_region_owner_batch(
                         lease: mutation.lease,
                         snapshots: expected,
                     });
-                } else if !removed.is_empty()
-                    && !store.insert_authoritative_snapshots_batch(removed)
-                {
+                } else if !removed.is_empty() && !store.insert_snapshots_batch(removed) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 success
@@ -1535,8 +1567,6 @@ fn apply_prepared_region_owner_batch(
         };
         if !applied {
             let rollback = rollback_region_owner_undo(regions, undo);
-            #[cfg(any(test, feature = "shadow-compare"))]
-            restore_region_owner_event_checkpoints(regions, &event_checkpoints);
             rollback?;
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
@@ -1546,13 +1576,12 @@ fn apply_prepared_region_owner_batch(
         phase: batch.phase,
         applied_sequences,
         goal_stats,
+        effect_results,
     };
     let applied = CommittedRegionOwnerBatch {
         phase: batch.phase,
         sequence_watermark: batch.sequence_watermark,
         undo,
-        #[cfg(any(test, feature = "shadow-compare"))]
-        event_checkpoints,
     };
     Ok((completion, applied))
 }
@@ -1561,22 +1590,7 @@ fn rollback_region_owner_batch(
     regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
     applied: CommittedRegionOwnerBatch,
 ) -> Result<(), RegionOwnerLaneError> {
-    let rollback = rollback_region_owner_undo(regions, applied.undo);
-    #[cfg(any(test, feature = "shadow-compare"))]
-    restore_region_owner_event_checkpoints(regions, &applied.event_checkpoints);
-    rollback
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-fn restore_region_owner_event_checkpoints(
-    regions: &mut BTreeMap<RegionKey, (RegionLease, EntityStore)>,
-    checkpoints: &BTreeMap<RegionKey, (usize, usize, usize)>,
-) {
-    for (key, checkpoint) in checkpoints {
-        if let Some((_, store)) = regions.get_mut(key) {
-            store.restore_owner_event_checkpoint(*checkpoint);
-        }
-    }
+    rollback_region_owner_undo(regions, applied.undo)
 }
 
 fn rollback_region_owner_undo(
@@ -1640,21 +1654,17 @@ fn rollback_region_owner_undo(
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if !store.insert_authoritative_snapshot(*snapshot) {
+                if !store.insert_snapshot(*snapshot) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;
             }
-            RegionOwnerUndo::Goal {
-                lease,
-                entity,
-                goal,
-            } => {
+            RegionOwnerUndo::Goal { lease, snapshot } => {
                 let store = &mut regions
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if !store.set_goal(entity, goal) {
+                if !store.restore_snapshot_in_place(*snapshot) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;
@@ -1678,7 +1688,7 @@ fn rollback_region_owner_undo(
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if !store.insert_authoritative_snapshots_batch(snapshots) {
+                if !store.insert_snapshots_batch(snapshots) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;
@@ -1709,20 +1719,40 @@ fn rollback_region_owner_undo(
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                if store.remove(expected.id).is_none()
-                    || !store.insert_authoritative_snapshot(*expected)
-                {
+                if !store.restore_snapshot_in_place(*expected) {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;
             }
-            RegionOwnerUndo::GoalBatch { lease, states } => {
+            RegionOwnerUndo::Effect { lease, checkpoint } => {
                 let store = &mut regions
                     .get_mut(&lease.key)
                     .ok_or(RegionOwnerLaneError::UnknownRegion)?
                     .1;
-                let expected = states.len();
-                if store.apply_kinematics(states) != expected {
+                if !store.restore_effect_checkpoint(*checkpoint) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+                continue;
+            }
+            RegionOwnerUndo::Snapshot { lease, snapshot } => {
+                let store = &mut regions
+                    .get_mut(&lease.key)
+                    .ok_or(RegionOwnerLaneError::UnknownRegion)?
+                    .1;
+                if !store.restore_snapshot_in_place(*snapshot) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+                continue;
+            }
+            RegionOwnerUndo::GoalBatch { lease, snapshots } => {
+                let store = &mut regions
+                    .get_mut(&lease.key)
+                    .ok_or(RegionOwnerLaneError::UnknownRegion)?
+                    .1;
+                if snapshots
+                    .into_iter()
+                    .any(|snapshot| !store.restore_snapshot_in_place(snapshot))
+                {
                     return Err(RegionOwnerLaneError::InvalidMutation);
                 }
                 continue;
@@ -1742,11 +1772,17 @@ fn rollback_region_owner_undo(
             RegionOwnerMutation::SetAnimalStateIfCurrent { .. } => {
                 unreachable!("conditional animal undo restores directly")
             }
+            RegionOwnerMutation::SetGrazingStateIfCurrent { .. } => {
+                unreachable!("conditional grazing undo restores directly")
+            }
             RegionOwnerMutation::SetGoalIfCurrent { .. } => {
                 unreachable!("conditional goal undo restores directly")
             }
             RegionOwnerMutation::SetItemStackIfCurrent { .. } => {
                 unreachable!("conditional item stack undo restores directly")
+            }
+            RegionOwnerMutation::ReplaceSnapshotIfCurrent { .. } => {
+                unreachable!("snapshot undo restores directly")
             }
             RegionOwnerMutation::SetKinematicsIfCurrent { .. } => {
                 unreachable!("kinematics undo restores directly")
@@ -1756,6 +1792,9 @@ fn rollback_region_owner_undo(
             }
             RegionOwnerMutation::DamageIfCurrent { .. } => {
                 unreachable!("damage undo restores snapshot directly")
+            }
+            RegionOwnerMutation::ApplyEffectIfCurrent { .. } => {
+                unreachable!("effect undo restores the ECS component checkpoint directly")
             }
             RegionOwnerMutation::ApplyGoalBatch { .. } => {
                 unreachable!("goal undo restores kinematics directly")

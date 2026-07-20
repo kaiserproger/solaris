@@ -11,8 +11,20 @@ use std::ops::Range;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use uuid::Uuid;
 
+// W05 stays caller-neutral until regional authority owns transition execution.
+#[allow(dead_code)]
+pub(crate) mod ai_core_26_1_2;
+pub mod attributes_26_1_2;
+pub mod effects_26_1_2;
+pub mod equipment_26_1_2;
+pub mod living_26_1_2;
+pub mod mob_control_26_1_2;
+pub mod navigation_26_1_2;
+pub mod projectile_26_1_2;
 mod regional;
-mod shadow;
+mod runtime;
+pub mod runtime_26_1_2;
+pub mod synced_data_26_1_2;
 
 pub use regional::{
     REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease,
@@ -26,15 +38,12 @@ pub use regional::{
     RegionalResolvedGoalTick, SequencedRegionMutation, TransferApply, TransferDecision, TransferId,
     VersionedEntitySnapshots,
 };
-#[cfg(any(test, feature = "shadow-compare"))]
-pub use regional::{
-    RegionalShadowBatchError, RegionalShadowComparisonBatch, RegionalShadowComparisonOutcome,
+
+pub use runtime::{
+    EntityCombatCommand, EntityEffectApplied, EntityEffectOperation, EntityEffectRejection,
+    EntityEffectRequest, EntityEffectResult, EntityInputCommand, EntityPhysicsResult,
+    EntityRuntime, EntityStage,
 };
-pub use shadow::{
-    ShadowCombatCommand, ShadowEntityRuntime, ShadowInputCommand, ShadowPhysicsResult, ShadowStage,
-};
-#[cfg(any(test, feature = "shadow-compare"))]
-pub use shadow::{ShadowComparison, ShadowComparisonStats, ShadowDivergence, ShadowSemanticEvent};
 
 /// Crate version, exposed so other crates and the binary can report it.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -337,6 +346,7 @@ pub struct SpawnEntity {
     pub goal: GoalState,
     pub vehicle: Option<VehicleState>,
     pub animal: Option<AnimalBreedingState>,
+    pub retained: EntityRetainedState,
 }
 
 impl SpawnEntity {
@@ -357,6 +367,7 @@ impl SpawnEntity {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: EntityRetainedState::default(),
         }
     }
 
@@ -393,6 +404,49 @@ pub struct EntitySnapshot {
     pub goal: GoalState,
     pub vehicle: Option<VehicleState>,
     pub animal: Option<AnimalBreedingState>,
+    pub retained: EntityRetainedState,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct EntityRetainedState {
+    path: RetainedPathState,
+    pub living: EntityLivingRetainedState,
+    pub active_effects: Option<EntityActiveEffectsState>,
+    pub arrow_state: Option<projectile_26_1_2::ArrowState>,
+    pub last_damage_tick: Option<u64>,
+    pub death_remove_tick: Option<u64>,
+    pub sheep_grazing_ticks: Option<u8>,
+    pub spawn_tick: u64,
+    pub item_pickup_ready_tick: Option<u64>,
+    pub item_pickup_owner_block: Option<EntityItemPickupOwnerBlock>,
+    pub primed_tnt: Option<EntityPrimedTntState>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct EntityLivingRetainedState {
+    pub absorption: f32,
+    pub invulnerable_time: u32,
+    pub hurt_time: u32,
+    pub last_hurt: f32,
+    pub death_time: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityActiveEffectsState {
+    pub effects: effects_26_1_2::ActiveEffectsSnapshot,
+    pub action_order: Vec<effects_26_1_2::EffectId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityItemPickupOwnerBlock {
+    pub owner_session: u64,
+    pub expires_tick: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityPrimedTntState {
+    pub expires_tick: u64,
+    pub air_block_state: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -420,6 +474,8 @@ pub struct EntityMotionState {
     pub is_item: bool,
     pub is_experience: bool,
     pub is_arrow: bool,
+    pub arrow_revision: Option<u64>,
+    pub arrow_embedded_block: Option<projectile_26_1_2::BlockPosition>,
     pub sends_velocity: bool,
 }
 
@@ -442,12 +498,27 @@ pub struct EntityView<'a> {
     pub goal: &'a GoalState,
     pub vehicle: Option<VehicleState>,
     pub animal: Option<AnimalBreedingState>,
+    pub retained: EntityRetainedState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntityDamage {
     pub snapshot: EntitySnapshot,
     pub killed: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EntityDamageRequest {
+    pub amount: f32,
+    pub tick: u64,
+    pub death_remove_tick: u64,
+}
+
+impl EntityDamageRequest {
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.amount.is_finite() && self.amount > 0.0 && self.death_remove_tick >= self.tick
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -665,7 +736,7 @@ const RETAINED_PATH_PROGRESS_EPSILON: f64 = 1.0e-4;
 const RETAINED_PATH_NO_PROGRESS_LIMIT: u8 = 6;
 const RETAINED_PATH_RECOMPUTE_LIMIT: u8 = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct RetainedPathState {
     nodes: [Vec3; RETAINED_PATH_NODE_CAPACITY],
     node_count: u8,
@@ -865,81 +936,17 @@ pub struct GoalTickStats {
     pub pathing_unloaded: usize,
 }
 
-/// Entity storage backed by the production ECS runtime.
-///
-/// Test builds retain the former parallel-vector authority as a comparison
-/// fixture while production builds contain only ECS state.
+/// Entity storage backed by the ECS runtime.
 #[derive(Debug, Default)]
 pub struct EntityStore {
     next_id: i32,
-    shadow: ShadowEntityRuntime,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    legacy_authority: bool,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    shadow_disabled: bool,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    ecs_authoritative_ids: HashSet<EntityId>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    shadow_expected_events: Vec<ShadowSemanticEvent>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    shadow_stats: ShadowComparisonStats,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    slots_by_id: HashMap<EntityId, usize>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    ids: Vec<EntityId>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    uuids: Vec<Uuid>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    type_ids: Vec<i32>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    type_names: Vec<String>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    positions: Vec<Vec3>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    rotations: Vec<Rotation>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    velocities: Vec<Vec3>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    on_ground: Vec<bool>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    item_stacks: Vec<Option<EntityItemStack>>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    experience_values: Vec<Option<i32>>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    block_states: Vec<Option<u32>>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    lifecycles: Vec<EntityLifecycle>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    healths: Vec<f32>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    attributes: Vec<AttributeSet>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    goals: Vec<GoalState>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pathing_states: Vec<RetainedPathState>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    vehicles: Vec<Option<VehicleState>>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    animals: Vec<Option<AnimalBreedingState>>,
+    runtime: EntityRuntime,
 }
 
 impl EntityStore {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub(crate) fn owner_event_checkpoint(&self) -> (usize, usize, usize) {
-        let (pending, published) = self.shadow.semantic_event_checkpoint();
-        (pending, published, self.shadow_expected_events.len())
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub(crate) fn restore_owner_event_checkpoint(&mut self, checkpoint: (usize, usize, usize)) {
-        self.shadow
-            .restore_semantic_event_checkpoint((checkpoint.0, checkpoint.1));
-        self.shadow_expected_events.truncate(checkpoint.2);
     }
 
     #[must_use]
@@ -950,45 +957,14 @@ impl EntityStore {
         }
     }
 
-    #[cfg(test)]
-    fn legacy_only() -> Self {
-        Self {
-            legacy_authority: true,
-            shadow_disabled: true,
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
-    fn shadowed_legacy() -> Self {
-        Self {
-            legacy_authority: true,
-            ..Self::default()
-        }
-    }
-
     #[must_use]
     pub fn len(&self) -> usize {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.len()
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.ids.len() + self.ecs_authoritative_ids.len()
-        }
+        self.runtime.len()
     }
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.is_empty()
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.ids.is_empty() && self.ecs_authoritative_ids.is_empty()
-        }
+        self.runtime.is_empty()
     }
 
     #[must_use]
@@ -1005,39 +981,19 @@ impl EntityStore {
         let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
         assert!(!self.contains_uuid(uuid), "entity UUID already exists");
         let snapshot = snapshot_from_spawn(id, uuid, entity);
-        #[cfg(not(any(test, feature = "shadow-compare")))]
+
         {
-            let inserted = self.insert_ecs_authoritative_snapshot(snapshot);
+            let inserted = self.insert_runtime_snapshot(snapshot);
             debug_assert!(inserted, "fresh entity id must be vacant in ECS");
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        if self.uses_ecs_authority() {
-            let inserted = self.insert_ecs_authoritative_snapshot(snapshot);
-            debug_assert!(inserted, "fresh entity id must be vacant in ECS");
-        } else {
-            self.insert_legacy_snapshot(snapshot);
-        }
+
         id
     }
 
-    pub fn spawn_authoritative(&mut self, entity: SpawnEntity) -> EntityId {
-        #[cfg(any(test, feature = "shadow-compare"))]
-        assert!(!self.shadow_disabled, "ECS authority is disabled");
-        let id = self.allocate_id();
-        let uuid = entity.uuid.unwrap_or_else(|| deterministic_uuid(id));
-        assert!(!self.contains_uuid(uuid), "entity UUID already exists");
-        let snapshot = snapshot_from_spawn(id, uuid, entity);
-        let inserted = self.insert_ecs_authoritative_snapshot(snapshot);
-        assert!(inserted, "fresh entity id must be vacant in ECS");
-        id
-    }
-
-    pub fn spawn_authoritative_batch(
+    pub fn spawn_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntityId> {
-        #[cfg(any(test, feature = "shadow-compare"))]
-        assert!(!self.shadow_disabled, "ECS authority is disabled");
         let mut pending = Vec::new();
         let mut pending_uuids = HashSet::new();
         for entity in entities {
@@ -1049,27 +1005,22 @@ impl EntityStore {
             );
             let mut snapshot = snapshot_from_spawn(id, uuid, entity);
             let vehicle = snapshot.vehicle.take();
-            self.shadow
-                .queue_input(ShadowInputCommand::InsertAuthoritative(snapshot));
+            self.runtime
+                .queue_input(EntityInputCommand::Insert(Box::new(snapshot)));
             pending.push((id, vehicle));
         }
         if pending.is_empty() {
             return Vec::new();
         }
 
-        self.shadow.run_stage(ShadowStage::InputAi);
+        self.runtime.run_stage(EntityStage::InputAi);
         let mut ids = Vec::with_capacity(pending.len());
         for &(id, _) in &pending {
-            #[cfg(not(any(test, feature = "shadow-compare")))]
             assert!(
-                self.shadow.contains(id),
+                self.runtime.contains(id),
                 "fresh entity id must be present in ECS after batch insert"
             );
-            #[cfg(any(test, feature = "shadow-compare"))]
-            assert!(
-                self.ecs_authoritative_ids.insert(id),
-                "fresh entity id must be vacant in ECS"
-            );
+
             ids.push(id);
         }
 
@@ -1079,26 +1030,19 @@ impl EntityStore {
                 continue;
             }
             let vehicle = self.sanitized_snapshot_vehicle(id, EntityLifecycle::Alive, requested);
-            self.shadow
-                .queue_input(ShadowInputCommand::SetVehicle { id, vehicle });
+            self.runtime
+                .queue_input(EntityInputCommand::SetVehicle { id, vehicle });
             queued_vehicle = true;
         }
         if queued_vehicle {
-            self.shadow.run_stage(ShadowStage::InputAi);
+            self.runtime.run_stage(EntityStage::InputAi);
         }
         ids
     }
 
     #[must_use]
     pub fn contains_uuid(&self, uuid: Uuid) -> bool {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.contains_uuid(uuid)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.uuids.contains(&uuid) || self.shadow.contains_uuid(uuid)
-        }
+        self.runtime.contains_uuid(uuid)
     }
 
     pub fn insert_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
@@ -1106,35 +1050,40 @@ impl EntityStore {
             return false;
         }
         self.next_id = self.next_id.max(snapshot.id.0);
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.insert_ecs_authoritative_snapshot(snapshot)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        if self.uses_ecs_authority() {
-            self.insert_ecs_authoritative_snapshot(snapshot)
-        } else {
-            self.insert_legacy_snapshot(snapshot);
-            true
-        }
+
+        self.insert_runtime_snapshot(snapshot)
     }
 
-    pub fn insert_authoritative_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
-        #[cfg(any(test, feature = "shadow-compare"))]
-        assert!(!self.shadow_disabled, "ECS authority is disabled");
-        if self.contains(snapshot.id) || self.contains_uuid(snapshot.uuid) {
-            return false;
-        }
-        self.next_id = self.next_id.max(snapshot.id.0);
-        self.insert_ecs_authoritative_snapshot(snapshot)
+    pub(crate) fn restore_snapshot_in_place(&mut self, snapshot: EntitySnapshot) -> bool {
+        self.runtime.restore_snapshot_in_place(snapshot)
     }
 
-    pub fn insert_authoritative_snapshots_batch(
+    pub(crate) fn effect_checkpoint(
+        &self,
+        id: EntityId,
+    ) -> Option<runtime::EntityEffectCheckpoint> {
+        self.runtime.effect_checkpoint(id)
+    }
+
+    pub(crate) fn restore_effect_checkpoint(
+        &mut self,
+        checkpoint: runtime::EntityEffectCheckpoint,
+    ) -> bool {
+        self.runtime.restore_effect_checkpoint(checkpoint)
+    }
+
+    pub fn apply_effect(
+        &mut self,
+        id: EntityId,
+        request: EntityEffectRequest,
+    ) -> EntityEffectResult {
+        self.runtime.apply_effect(id, request)
+    }
+
+    pub fn insert_snapshots_batch(
         &mut self,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
     ) -> bool {
-        #[cfg(any(test, feature = "shadow-compare"))]
-        assert!(!self.shadow_disabled, "ECS authority is disabled");
         let snapshots = snapshots.into_iter().collect::<Vec<_>>();
         let mut pending_ids = HashSet::new();
         let mut pending_uuids = HashSet::new();
@@ -1159,20 +1108,14 @@ impl EntityStore {
             max_id = max_id.max(snapshot.id.0);
             let id = snapshot.id;
             let vehicle = snapshot.vehicle.take();
-            self.shadow
-                .queue_input(ShadowInputCommand::InsertAuthoritative(snapshot));
+            self.runtime
+                .queue_input(EntityInputCommand::Insert(Box::new(snapshot)));
             pending.push((id, vehicle));
         }
-        self.shadow.run_stage(ShadowStage::InputAi);
+        self.runtime.run_stage(EntityStage::InputAi);
         for &(id, _) in &pending {
-            #[cfg(not(any(test, feature = "shadow-compare")))]
             assert!(
-                self.shadow.contains(id),
-                "preflighted batch snapshot must enter ECS authority"
-            );
-            #[cfg(any(test, feature = "shadow-compare"))]
-            assert!(
-                self.shadow.contains(id) && self.ecs_authoritative_ids.insert(id),
+                self.runtime.contains(id),
                 "preflighted batch snapshot must enter ECS authority"
             );
         }
@@ -1182,17 +1125,17 @@ impl EntityStore {
                 continue;
             }
             let lifecycle = self
-                .shadow
+                .runtime
                 .snapshot(id)
                 .expect("inserted batch snapshot")
                 .lifecycle;
             let vehicle = self.sanitized_snapshot_vehicle(id, lifecycle, requested);
-            self.shadow
-                .queue_input(ShadowInputCommand::SetVehicle { id, vehicle });
+            self.runtime
+                .queue_input(EntityInputCommand::SetVehicle { id, vehicle });
             queued_vehicle = true;
         }
         if queued_vehicle {
-            self.shadow.run_stage(ShadowStage::InputAi);
+            self.runtime.run_stage(EntityStage::InputAi);
         }
         self.next_id = max_id;
         true
@@ -1247,372 +1190,61 @@ impl EntityStore {
 
     #[must_use]
     pub fn contains(&self, id: EntityId) -> bool {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.contains(id)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.slots_by_id.contains_key(&id) || self.ecs_authoritative_ids.contains(&id)
-        }
+        self.runtime.contains(id)
     }
 
     #[must_use]
     pub fn snapshot(&self, id: EntityId) -> Option<EntitySnapshot> {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.snapshot(id)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if self.ecs_authoritative_ids.contains(&id) {
-                return self.shadow.snapshot(id);
-            }
-            self.slots_by_id
-                .get(&id)
-                .map(|&slot| self.snapshot_slot(slot))
-        }
+        self.runtime.snapshot(id)
     }
 
     #[must_use]
     pub fn motion_state(&self, id: EntityId) -> Option<EntityMotionState> {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.motion_state(id)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if self.ecs_authoritative_ids.contains(&id) {
-                return self.shadow.motion_state(id);
-            }
-            let &slot = self.slots_by_id.get(&id)?;
-            let type_name = self.type_names[slot].as_str();
-            Some(EntityMotionState {
-                id,
-                position: self.positions[slot],
-                rotation: self.rotations[slot],
-                velocity: self.velocities[slot],
-                on_ground: self.on_ground[slot],
-                is_item: type_name == "minecraft:item",
-                is_experience: type_name == "minecraft:experience_orb",
-                is_arrow: type_name == "minecraft:arrow",
-                sends_velocity: !matches!(type_name, "minecraft:item" | "minecraft:experience_orb"),
-            })
-        }
+        self.runtime.motion_state(id)
     }
 
     pub fn alive_kinematics_for_ids(&mut self, ids: &HashSet<EntityId>) -> Vec<EntityKinematics> {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.alive_kinematics_for_ids(ids)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let sparse = ids.len().saturating_mul(2) < self.len();
-            let mut states = if sparse {
-                let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
-                ordered_ids.sort_unstable();
-                ordered_ids
-                    .iter()
-                    .filter_map(|id| {
-                        let &slot = self.slots_by_id.get(id)?;
-                        (self.lifecycles[slot] == EntityLifecycle::Alive).then_some(
-                            EntityKinematics {
-                                id: *id,
-                                position: self.positions[slot],
-                                rotation: self.rotations[slot],
-                                velocity: self.velocities[slot],
-                                on_ground: self.on_ground[slot],
-                            },
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            } else {
-                (0..self.ids.len())
-                    .filter(|&slot| {
-                        self.lifecycles[slot] == EntityLifecycle::Alive
-                            && ids.contains(&self.ids[slot])
-                    })
-                    .map(|slot| EntityKinematics {
-                        id: self.ids[slot],
-                        position: self.positions[slot],
-                        rotation: self.rotations[slot],
-                        velocity: self.velocities[slot],
-                        on_ground: self.on_ground[slot],
-                    })
-                    .collect::<Vec<_>>()
-            };
-            states.extend(self.shadow.alive_kinematics_for_ids(ids));
-            states
-        }
+        self.runtime.alive_kinematics_for_ids(ids)
     }
 
     #[must_use]
     pub fn view(&self, id: EntityId) -> Option<EntityView<'_>> {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.view(id)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.slots_by_id
-                .get(&id)
-                .map(|&slot| self.view_slot(slot))
-                .or_else(|| self.shadow.view(id))
-        }
+        self.runtime.view(id)
     }
 
     pub fn snapshots(&self) -> impl Iterator<Item = EntitySnapshot> + '_ {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        let snapshots = self.shadow.normalized_snapshots();
-        #[cfg(any(test, feature = "shadow-compare"))]
-        let mut snapshots = (0..self.ids.len())
-            .map(|slot| self.snapshot_slot(slot))
-            .collect::<Vec<_>>();
-        #[cfg(any(test, feature = "shadow-compare"))]
-        snapshots.extend(
-            self.ecs_authoritative_ids
-                .iter()
-                .filter_map(|&id| self.shadow.snapshot(id)),
-        );
-        #[cfg(any(test, feature = "shadow-compare"))]
-        snapshots.sort_unstable_by_key(|entity| entity.id);
+        let snapshots = self.runtime.normalized_snapshots();
         snapshots.into_iter()
     }
 
     #[cfg(test)]
-    fn legacy_entity_count_for_test(&self) -> usize {
-        self.ids.len()
-    }
-
-    #[cfg(test)]
-    fn ecs_authoritative_entity_count_for_test(&self) -> usize {
-        self.ecs_authoritative_ids.len()
-    }
-
-    #[cfg(test)]
     fn input_ai_stage_runs_for_test(&self) -> usize {
-        self.shadow.input_ai_stage_runs()
+        self.runtime.input_ai_stage_runs()
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn uses_ecs_authority(&self) -> bool {
-        !self.legacy_authority
-    }
-
-    fn insert_ecs_authoritative_snapshot(&mut self, mut snapshot: EntitySnapshot) -> bool {
+    fn insert_runtime_snapshot(&mut self, mut snapshot: EntitySnapshot) -> bool {
         snapshot.vehicle =
             self.sanitized_snapshot_vehicle(snapshot.id, snapshot.lifecycle, snapshot.vehicle);
         let id = snapshot.id;
-        self.shadow
-            .queue_input(ShadowInputCommand::InsertAuthoritative(snapshot));
-        self.shadow.run_stage(ShadowStage::InputAi);
-        if self.shadow.snapshot(id).is_none() {
+        self.runtime
+            .queue_input(EntityInputCommand::Insert(Box::new(snapshot)));
+        self.runtime.run_stage(EntityStage::InputAi);
+        if self.runtime.snapshot(id).is_none() {
             return false;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        self.ecs_authoritative_ids.insert(id);
         true
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn insert_legacy_snapshot(&mut self, mut snapshot: EntitySnapshot) {
-        snapshot.vehicle =
-            self.sanitized_snapshot_vehicle(snapshot.id, snapshot.lifecycle, snapshot.vehicle);
-        let id = snapshot.id;
-        let slot = self.ids.len();
-        self.slots_by_id.insert(id, slot);
-        self.ids.push(id);
-        self.uuids.push(snapshot.uuid);
-        self.type_ids.push(snapshot.type_id);
-        self.type_names.push(snapshot.type_name);
-        self.positions.push(snapshot.position);
-        self.rotations.push(snapshot.rotation);
-        self.velocities.push(snapshot.velocity);
-        self.on_ground.push(snapshot.on_ground);
-        self.item_stacks.push(snapshot.item_stack);
-        self.experience_values.push(snapshot.experience_value);
-        self.block_states.push(snapshot.block_state);
-        self.lifecycles.push(snapshot.lifecycle);
-        self.healths.push(snapshot.health);
-        self.attributes.push(snapshot.attributes);
-        self.goals.push(snapshot.goal);
-        self.pathing_states.push(RetainedPathState::default());
-        self.vehicles.push(snapshot.vehicle);
-        self.animals.push(snapshot.animal);
-        if !self.shadow_disabled {
-            let snapshot = self.snapshot_slot(slot);
-            self.shadow
-                .queue_input(ShadowInputCommand::Insert(snapshot));
-            self.shadow.run_stage(ShadowStage::InputAi);
-            #[cfg(any(test, feature = "shadow-compare"))]
-            self.shadow_expected_events
-                .push(ShadowSemanticEvent::Spawned { id });
-        }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    #[must_use]
-    pub fn shadow_comparison_stats(&self) -> &ShadowComparisonStats {
-        &self.shadow_stats
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn compare_shadow(
-        &mut self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<ShadowComparison, Box<ShadowDivergence>> {
-        let mut legacy_ids = self.ids.clone();
-        legacy_ids.sort_unstable();
-        let shadow_ids = self
-            .shadow
-            .entity_ids()
-            .into_iter()
-            .filter(|id| !self.ecs_authoritative_ids.contains(id))
-            .collect::<Vec<_>>();
-
-        let compared_entities = legacy_ids.len().max(shadow_ids.len());
-        #[cfg(any(test, feature = "shadow-compare"))]
-        let (legacy_events, shadow_events) = {
-            self.shadow.run_stage(ShadowStage::OutputEvents);
-            let legacy_events = std::mem::take(&mut self.shadow_expected_events);
-            let comparable_event_ids = legacy_ids
-                .iter()
-                .copied()
-                .chain(legacy_events.iter().map(shadow_semantic_event_id))
-                .collect::<HashSet<_>>();
-            let shadow_events = self
-                .shadow
-                .take_output_events()
-                .into_iter()
-                .filter(|event| comparable_event_ids.contains(&shadow_semantic_event_id(event)))
-                .collect::<Vec<_>>();
-            (legacy_events, shadow_events)
-        };
-        #[cfg(any(test, feature = "shadow-compare"))]
-        let compared_events = legacy_events.len().max(shadow_events.len());
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        let compared_events = 0;
-
-        self.shadow_stats.comparisons = self.shadow_stats.comparisons.saturating_add(1);
-        self.shadow_stats.compared_entities = self
-            .shadow_stats
-            .compared_entities
-            .saturating_add(compared_entities as u64);
-        self.shadow_stats.compared_events = self
-            .shadow_stats
-            .compared_events
-            .saturating_add(compared_events as u64);
-
-        let snapshot_difference = (0..compared_entities).find_map(|index| {
-            let legacy_id = legacy_ids.get(index).copied();
-            let shadow_id = shadow_ids.get(index).copied();
-            if legacy_id != shadow_id {
-                return Some((
-                    legacy_id.and_then(|id| self.snapshot(id)),
-                    shadow_id.and_then(|id| self.shadow.snapshot(id)),
-                ));
-            }
-            let id = legacy_id?;
-            let view = self.view(id)?;
-            let &slot = self.slots_by_id.get(&id)?;
-            (!self.shadow.matches_view(view, &self.pathing_states[slot]))
-                .then(|| (self.snapshot(id), self.shadow.snapshot(id)))
-        });
-        #[cfg(any(test, feature = "shadow-compare"))]
-        let event_difference = (0..compared_events).find_map(|index| {
-            let legacy = legacy_events.get(index);
-            let shadow = shadow_events.get(index);
-            (legacy != shadow).then(|| (legacy.cloned(), shadow.cloned()))
-        });
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        let event_difference: Option<(
-            Option<ShadowSemanticEvent>,
-            Option<ShadowSemanticEvent>,
-        )> = None;
-
-        if let Some(((legacy, shadow), events)) = snapshot_difference
-            .map(|snapshots| (snapshots, (None, None)))
-            .or_else(|| event_difference.map(|events| ((None, None), events)))
-        {
-            let entity_id = legacy
-                .as_ref()
-                .or(shadow.as_ref())
-                .map(|snapshot| snapshot.id);
-            let divergence = ShadowDivergence {
-                tick,
-                stage,
-                compared_entities,
-                compared_events,
-                entity_id,
-                legacy,
-                shadow,
-                legacy_event: events.0,
-                shadow_event: events.1,
-            };
-            if self.shadow_stats.first_divergence.is_none() {
-                self.shadow_stats.first_divergence = Some(divergence.clone());
-            }
-            return Err(Box::new(divergence));
-        }
-
-        Ok(ShadowComparison {
-            tick,
-            stage,
-            compared_entities,
-            compared_events,
-        })
-    }
-
     pub fn views(&self) -> impl Iterator<Item = EntityView<'_>> + '_ {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.views()
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if self.uses_ecs_authority() {
-                self.shadow.views().collect::<Vec<_>>().into_iter()
-            } else {
-                (0..self.ids.len())
-                    .map(|slot| self.view_slot(slot))
-                    .collect::<Vec<_>>()
-                    .into_iter()
-            }
-        }
+        self.runtime.views()
     }
 
     pub fn visit_simulation_entities(&self, mut visitor: impl FnMut(EntityView<'_>)) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        self.shadow.visit_entities(&mut visitor);
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            for slot in 0..self.ids.len() {
-                visitor(self.view_slot(slot));
-            }
-            self.shadow
-                .visit_authoritative_entities(&self.ecs_authoritative_ids, &mut visitor);
-        }
+        self.runtime.visit_entities(&mut visitor);
     }
 
     pub fn visit_breeding_tick_entities(&self, mut visitor: impl FnMut(EntityView<'_>)) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        self.shadow.visit_breeding_tick_entities(&mut visitor);
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            for slot in 0..self.ids.len() {
-                if self.lifecycles[slot] == EntityLifecycle::Alive
-                    && self.animals[slot].is_some_and(AnimalBreedingState::needs_breeding_tick)
-                {
-                    visitor(self.view_slot(slot));
-                }
-            }
-            self.shadow.visit_authoritative_breeding_tick_entities(
-                &self.ecs_authoritative_ids,
-                &mut visitor,
-            );
-        }
+        self.runtime.visit_breeding_tick_entities(&mut visitor);
     }
 
     pub fn visit_sheep_entities_for_ids(
@@ -1620,25 +1252,7 @@ impl EntityStore {
         ids: &HashSet<EntityId>,
         mut visitor: impl FnMut(EntityView<'_>),
     ) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        self.shadow.visit_sheep_entities_for_ids(ids, &mut visitor);
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            for slot in 0..self.ids.len() {
-                if ids.contains(&self.ids[slot])
-                    && self.lifecycles[slot] == EntityLifecycle::Alive
-                    && self.type_names[slot] == "minecraft:sheep"
-                    && self.animals[slot].is_some_and(|animal| animal.sheep_wool.is_some())
-                {
-                    visitor(self.view_slot(slot));
-                }
-            }
-            self.shadow.visit_authoritative_sheep_entities_for_ids(
-                &self.ecs_authoritative_ids,
-                ids,
-                &mut visitor,
-            );
-        }
+        self.runtime.visit_sheep_entities_for_ids(ids, &mut visitor);
     }
 
     pub fn visit_simulation_entities_for_ids(
@@ -1646,73 +1260,17 @@ impl EntityStore {
         ids: &HashSet<EntityId>,
         mut visitor: impl FnMut(EntityView<'_>),
     ) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
         {
             let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
             ordered_ids.sort_unstable();
             for id in ordered_ids {
-                self.shadow.visit_authoritative_entity(id, &mut visitor);
-            }
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if ids.len().saturating_mul(2) >= self.len() {
-                self.visit_simulation_entities(|entity| {
-                    if ids.contains(&entity.id) {
-                        visitor(entity);
-                    }
-                });
-                return;
-            }
-            let mut ordered_ids = ids.iter().copied().collect::<Vec<_>>();
-            ordered_ids.sort_unstable();
-            for id in ordered_ids {
-                if let Some(&slot) = self.slots_by_id.get(&id) {
-                    visitor(self.view_slot(slot));
-                } else if self.ecs_authoritative_ids.contains(&id) {
-                    self.shadow.visit_authoritative_entity(id, &mut visitor);
-                }
+                self.runtime.visit_entity(id, &mut visitor);
             }
         }
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn mirror_current_physics(&mut self, id: EntityId) {
-        if self.queue_current_physics(id) {
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
-        }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn queue_current_physics(&mut self, id: EntityId) -> bool {
-        if self.shadow_disabled {
-            return false;
-        }
-        let Some(&slot) = self.slots_by_id.get(&id) else {
-            return false;
-        };
-        self.shadow.queue_physics(ShadowPhysicsResult {
-            id,
-            position: self.positions[slot],
-            rotation: self.rotations[slot],
-            velocity: self.velocities[slot],
-            on_ground: self.on_ground[slot],
-        });
-        #[cfg(any(test, feature = "shadow-compare"))]
-        self.shadow_expected_events
-            .push(ShadowSemanticEvent::PhysicsApplied { id });
-        true
-    }
-
-    fn is_ecs_authoritative(&self, id: EntityId) -> bool {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            self.shadow.contains(id)
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            self.ecs_authoritative_ids.contains(&id)
-        }
+    fn is_runtime_entity(&self, id: EntityId) -> bool {
+        self.runtime.contains(id)
     }
 
     pub fn apply_kinematics(
@@ -1720,16 +1278,16 @@ impl EntityStore {
         states: impl IntoIterator<Item = EntityKinematics>,
     ) -> usize {
         let mut applied = 0;
-        let mut shadow_queued = false;
+        let mut physics_queued = false;
         for state in states {
             if !state.is_finite() {
                 continue;
             }
-            if self.is_ecs_authoritative(state.id) {
-                if !self.shadow.contains(state.id) {
+            if self.is_runtime_entity(state.id) {
+                if !self.runtime.contains(state.id) {
                     continue;
                 }
-                self.shadow.queue_physics(ShadowPhysicsResult {
+                self.runtime.queue_physics(EntityPhysicsResult {
                     id: state.id,
                     position: state.position,
                     rotation: state.rotation,
@@ -1737,270 +1295,123 @@ impl EntityStore {
                     on_ground: state.on_ground,
                 });
                 applied += 1;
-                shadow_queued = true;
+                physics_queued = true;
                 continue;
             }
-            #[cfg(any(test, feature = "shadow-compare"))]
-            {
-                let Some(&slot) = self.slots_by_id.get(&state.id) else {
-                    continue;
-                };
-                self.positions[slot] = state.position;
-                self.rotations[slot] = state.rotation;
-                self.velocities[slot] = state.velocity;
-                self.on_ground[slot] = state.on_ground;
-                applied += 1;
-                shadow_queued |= self.queue_current_physics(state.id);
-            }
         }
-        if shadow_queued {
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
+        if physics_queued {
+            self.runtime.run_stage(EntityStage::PhysicsApply);
         }
         applied
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn mirror_current_vehicle(&mut self, id: EntityId) {
-        if self.shadow_disabled {
-            return;
-        }
-        let Some(&slot) = self.slots_by_id.get(&id) else {
-            return;
-        };
-        let vehicle = self.vehicles[slot];
-        self.shadow
-            .queue_input(ShadowInputCommand::SetVehicle { id, vehicle });
-        self.shadow.run_stage(ShadowStage::InputAi);
-        #[cfg(any(test, feature = "shadow-compare"))]
-        self.shadow_expected_events
-            .push(ShadowSemanticEvent::VehicleChanged { id });
-    }
-
-    #[cfg(test)]
-    fn perturb_shadow_position(&mut self, id: EntityId, position: Vec3) {
-        let Some(snapshot) = self.shadow.snapshot(id) else {
-            return;
-        };
-        self.shadow.queue_physics(ShadowPhysicsResult {
-            id,
-            position,
-            rotation: snapshot.rotation,
-            velocity: snapshot.velocity,
-            on_ground: snapshot.on_ground,
-        });
-        self.shadow.run_stage(ShadowStage::PhysicsApply);
-    }
-
-    #[cfg(test)]
-    fn perturb_shadow_path(&mut self, id: EntityId, path: RetainedPathState) {
-        self.shadow.perturb_path_for_test(id, path);
-    }
-
     pub fn mark_despawning(&mut self, id: EntityId) -> bool {
-        if self.is_ecs_authoritative(id) {
-            let Some(snapshot) = self.shadow.snapshot(id) else {
+        if self.is_runtime_entity(id) {
+            let Some(snapshot) = self.runtime.snapshot(id) else {
                 return false;
             };
             if snapshot.lifecycle == EntityLifecycle::Despawning {
                 return true;
             }
-            self.shadow
-                .queue_combat(ShadowCombatCommand::MarkDespawning { id });
-            self.shadow.run_stage(ShadowStage::CombatLifecycle);
+            self.runtime
+                .queue_combat(EntityCombatCommand::MarkDespawning { id });
+            self.runtime.run_stage(EntityStage::CombatLifecycle);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.lifecycles[slot] = EntityLifecycle::Despawning;
-            if !self.shadow_disabled {
-                self.shadow
-                    .queue_combat(ShadowCombatCommand::MarkDespawning { id });
-                self.shadow.run_stage(ShadowStage::CombatLifecycle);
-                #[cfg(any(test, feature = "shadow-compare"))]
-                self.shadow_expected_events
-                    .push(ShadowSemanticEvent::LifecycleChanged {
-                        id,
-                        lifecycle: EntityLifecycle::Despawning,
-                    });
-            }
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     pub fn remove(&mut self, id: EntityId) -> Option<EntitySnapshot> {
-        if self.is_ecs_authoritative(id) {
-            let removed = self.shadow.snapshot(id)?;
+        if self.is_runtime_entity(id) {
+            let removed = self.runtime.snapshot(id)?;
             self.clear_vehicle_passenger_refs(id);
-            self.shadow.queue_combat(ShadowCombatCommand::Remove { id });
-            self.shadow.run_stage(ShadowStage::CombatLifecycle);
-            #[cfg(any(test, feature = "shadow-compare"))]
-            self.ecs_authoritative_ids.remove(&id);
+            self.runtime
+                .queue_combat(EntityCombatCommand::Remove { id });
+            self.runtime.run_stage(EntityStage::CombatLifecycle);
             return Some(removed);
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let slot = self.slots_by_id.remove(&id)?;
-            let removed = self.snapshot_slot(slot);
-            self.clear_vehicle_passenger_refs(id);
-            self.swap_remove_slot(slot);
-            if !self.shadow_disabled {
-                self.shadow.queue_combat(ShadowCombatCommand::Remove { id });
-                self.shadow.run_stage(ShadowStage::CombatLifecycle);
-                #[cfg(any(test, feature = "shadow-compare"))]
-                self.shadow_expected_events
-                    .push(ShadowSemanticEvent::Removed { id });
-            }
-            Some(removed)
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            None
-        }
+
+        None
     }
 
     pub fn set_position(&mut self, id: EntityId, position: Vec3) -> bool {
         if !position.is_finite() {
             return false;
         }
-        if self.is_ecs_authoritative(id) {
-            let Some(snapshot) = self.shadow.snapshot(id) else {
+        if self.is_runtime_entity(id) {
+            let Some(snapshot) = self.runtime.snapshot(id) else {
                 return false;
             };
-            self.shadow
-                .queue_input(ShadowInputCommand::ResetPath { id });
-            self.shadow.run_stage(ShadowStage::InputAi);
-            self.shadow.queue_physics(ShadowPhysicsResult {
+            self.runtime
+                .queue_input(EntityInputCommand::ResetPath { id });
+            self.runtime.run_stage(EntityStage::InputAi);
+            self.runtime.queue_physics(EntityPhysicsResult {
                 id,
                 position,
                 rotation: snapshot.rotation,
                 velocity: snapshot.velocity,
                 on_ground: snapshot.on_ground,
             });
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
+            self.runtime.run_stage(EntityStage::PhysicsApply);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.positions[slot] = position;
-            self.pathing_states[slot] = RetainedPathState::default();
-            if !self.shadow_disabled {
-                self.shadow
-                    .queue_input(ShadowInputCommand::ResetPath { id });
-                self.shadow.run_stage(ShadowStage::InputAi);
-            }
-            self.mirror_current_physics(id);
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     pub fn set_velocity(&mut self, id: EntityId, velocity: Vec3) -> bool {
         if !velocity.is_finite() {
             return false;
         }
-        if self.is_ecs_authoritative(id) {
-            let Some(snapshot) = self.shadow.snapshot(id) else {
+        if self.is_runtime_entity(id) {
+            let Some(snapshot) = self.runtime.snapshot(id) else {
                 return false;
             };
-            self.shadow.queue_physics(ShadowPhysicsResult {
+            self.runtime.queue_physics(EntityPhysicsResult {
                 id,
                 position: snapshot.position,
                 rotation: snapshot.rotation,
                 velocity,
                 on_ground: snapshot.on_ground,
             });
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
+            self.runtime.run_stage(EntityStage::PhysicsApply);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.velocities[slot] = velocity;
-            self.mirror_current_physics(id);
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     pub fn set_on_ground(&mut self, id: EntityId, on_ground: bool) -> bool {
-        if self.is_ecs_authoritative(id) {
-            let Some(snapshot) = self.shadow.snapshot(id) else {
+        if self.is_runtime_entity(id) {
+            let Some(snapshot) = self.runtime.snapshot(id) else {
                 return false;
             };
-            self.shadow.queue_physics(ShadowPhysicsResult {
+            self.runtime.queue_physics(EntityPhysicsResult {
                 id,
                 position: snapshot.position,
                 rotation: snapshot.rotation,
                 velocity: snapshot.velocity,
                 on_ground,
             });
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
+            self.runtime.run_stage(EntityStage::PhysicsApply);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.on_ground[slot] = on_ground;
-            self.mirror_current_physics(id);
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     pub fn set_item_stack(&mut self, id: EntityId, item_stack: Option<EntityItemStack>) -> bool {
-        if self.is_ecs_authoritative(id) {
-            self.shadow.queue_input(ShadowInputCommand::SetItemStack {
+        if self.is_runtime_entity(id) {
+            self.runtime.queue_input(EntityInputCommand::SetItemStack {
                 id,
                 stack: item_stack,
             });
-            self.shadow.run_stage(ShadowStage::InputAi);
+            self.runtime.run_stage(EntityStage::InputAi);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.item_stacks[slot] = item_stack.clone();
-            if !self.shadow_disabled {
-                self.shadow.queue_input(ShadowInputCommand::SetItemStack {
-                    id,
-                    stack: item_stack,
-                });
-                self.shadow.run_stage(ShadowStage::InputAi);
-                #[cfg(any(test, feature = "shadow-compare"))]
-                self.shadow_expected_events
-                    .push(ShadowSemanticEvent::ItemStackChanged { id });
-            }
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     pub fn set_goal(&mut self, id: EntityId, goal: GoalState) -> bool {
@@ -2011,43 +1422,20 @@ impl EntityStore {
         let mut updated = 0;
         let mut queued_input = false;
         for (id, goal) in goals {
-            if self.is_ecs_authoritative(id) {
-                if self.shadow.goal_matches(id, &goal) {
+            if self.is_runtime_entity(id) {
+                if self.runtime.goal_matches(id, &goal) {
                     updated += 1;
                     continue;
                 }
-                self.shadow
-                    .queue_input(ShadowInputCommand::SetGoal { id, goal });
+                self.runtime
+                    .queue_input(EntityInputCommand::SetGoal { id, goal });
                 queued_input = true;
                 updated += 1;
                 continue;
             }
-            #[cfg(any(test, feature = "shadow-compare"))]
-            {
-                let Some(&slot) = self.slots_by_id.get(&id) else {
-                    continue;
-                };
-                if self.goals[slot] == goal {
-                    updated += 1;
-                    continue;
-                }
-                self.goals[slot] = goal;
-                self.pathing_states[slot] = RetainedPathState::default();
-                if !self.shadow_disabled {
-                    self.shadow.queue_input(ShadowInputCommand::SetGoal {
-                        id,
-                        goal: self.goals[slot].clone(),
-                    });
-                    #[cfg(any(test, feature = "shadow-compare"))]
-                    self.shadow_expected_events
-                        .push(ShadowSemanticEvent::GoalChanged { id });
-                    queued_input = true;
-                }
-                updated += 1;
-            }
         }
         if queued_input {
-            self.shadow.run_stage(ShadowStage::InputAi);
+            self.runtime.run_stage(EntityStage::InputAi);
         }
         updated
     }
@@ -2063,90 +1451,46 @@ impl EntityStore {
         let mut applied = 0;
         let mut ecs_queued = false;
         for (id, animal) in states {
-            if self.is_ecs_authoritative(id) {
+            if self.is_runtime_entity(id) {
                 if self
-                    .shadow
+                    .runtime
                     .snapshot(id)
                     .is_none_or(|snapshot| snapshot.animal.is_none())
                 {
                     continue;
                 }
-                self.shadow
-                    .queue_input(ShadowInputCommand::SetAnimalState { id, animal });
+                self.runtime
+                    .queue_input(EntityInputCommand::SetAnimalState { id, animal });
                 applied += 1;
                 ecs_queued = true;
                 continue;
             }
-            #[cfg(any(test, feature = "shadow-compare"))]
-            {
-                let Some(&slot) = self.slots_by_id.get(&id) else {
-                    continue;
-                };
-                if self.animals[slot].is_none() {
-                    continue;
-                }
-                self.animals[slot] = Some(animal);
-                applied += 1;
-                if !self.shadow_disabled {
-                    self.shadow
-                        .queue_input(ShadowInputCommand::SetAnimalState { id, animal });
-                    ecs_queued = true;
-                }
-            }
         }
         if ecs_queued {
-            self.shadow.run_stage(ShadowStage::InputAi);
+            self.runtime.run_stage(EntityStage::InputAi);
         }
         applied
     }
 
-    pub fn damage(&mut self, id: EntityId, amount: f32) -> Option<EntityDamage> {
-        if self.is_ecs_authoritative(id) {
-            if self.shadow.snapshot(id)?.lifecycle != EntityLifecycle::Alive {
+    pub fn damage(&mut self, id: EntityId, request: EntityDamageRequest) -> Option<EntityDamage> {
+        if !request.is_valid() {
+            return None;
+        }
+        if self.is_runtime_entity(id) {
+            if self.runtime.snapshot(id)?.lifecycle != EntityLifecycle::Alive {
                 return None;
             }
-            self.shadow
-                .queue_combat(ShadowCombatCommand::Damage { id, amount });
-            self.shadow.run_stage(ShadowStage::CombatLifecycle);
-            let snapshot = self.shadow.snapshot(id)?;
+            self.runtime
+                .queue_combat(EntityCombatCommand::Damage { id, request });
+            self.runtime.run_stage(EntityStage::CombatLifecycle);
+            let snapshot = self.runtime.snapshot(id)?;
             return Some(EntityDamage {
                 killed: snapshot.lifecycle == EntityLifecycle::Despawning,
                 snapshot,
             });
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let slot = *self.slots_by_id.get(&id)?;
-            if self.lifecycles[slot] != EntityLifecycle::Alive {
-                return None;
-            }
-            self.healths[slot] = (self.healths[slot] - amount.max(0.0)).max(0.0);
-            let killed = self.healths[slot] <= 0.0;
-            if killed {
-                self.lifecycles[slot] = EntityLifecycle::Despawning;
-            }
-            let damage = EntityDamage {
-                snapshot: self.snapshot_slot(slot),
-                killed,
-            };
-            if !self.shadow_disabled {
-                self.shadow
-                    .queue_combat(ShadowCombatCommand::Damage { id, amount });
-                self.shadow.run_stage(ShadowStage::CombatLifecycle);
-                #[cfg(any(test, feature = "shadow-compare"))]
-                self.shadow_expected_events
-                    .push(ShadowSemanticEvent::Damaged {
-                        id,
-                        health: damage.snapshot.health,
-                        killed,
-                    });
-            }
-            Some(damage)
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            None
-        }
+
+        None
     }
 
     pub fn mount_vehicle(
@@ -2276,25 +1620,14 @@ impl EntityStore {
     }
 
     fn set_vehicle_state(&mut self, id: EntityId, vehicle: Option<VehicleState>) -> bool {
-        if self.is_ecs_authoritative(id) {
-            self.shadow
-                .queue_input(ShadowInputCommand::SetVehicle { id, vehicle });
-            self.shadow.run_stage(ShadowStage::InputAi);
+        if self.is_runtime_entity(id) {
+            self.runtime
+                .queue_input(EntityInputCommand::SetVehicle { id, vehicle });
+            self.runtime.run_stage(EntityStage::InputAi);
             return true;
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let Some(&slot) = self.slots_by_id.get(&id) else {
-                return false;
-            };
-            self.vehicles[slot] = vehicle;
-            self.mirror_current_vehicle(id);
-            true
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            false
-        }
+
+        false
     }
 
     fn sanitized_snapshot_vehicle(
@@ -2349,18 +1682,11 @@ impl EntityStore {
     }
 
     pub fn attributes_mut(&mut self, id: EntityId) -> Option<&mut AttributeSet> {
-        if self.is_ecs_authoritative(id) {
-            return self.shadow.attributes_mut(id);
+        if self.is_runtime_entity(id) {
+            return self.runtime.attributes_mut(id);
         }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            let slot = *self.slots_by_id.get(&id)?;
-            self.attributes.get_mut(slot)
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            None
-        }
+
+        None
     }
 
     pub fn tick_goals(&mut self, tick: u64) {
@@ -2407,46 +1733,8 @@ impl EntityStore {
             active_ids.len() != self.len() || !active_ids.iter().all(|id| self.contains(*id))
         });
         let mut pathing_requests = Vec::new();
-        #[cfg(any(test, feature = "shadow-compare"))]
-        for slot in 0..self.ids.len() {
-            let id = self.ids[slot];
-            if active_ids.is_some_and(|active_ids| !active_ids.contains(&id))
-                || self.lifecycles[slot] != EntityLifecycle::Alive
-            {
-                continue;
-            }
-            let goal = self.goals[slot].clone();
-            let (target, target_epoch, speed) = match &goal {
-                GoalState::Wander {
-                    speed,
-                    period_ticks,
-                } => {
-                    let (target, epoch) = wander_pathing_target(
-                        id,
-                        self.positions[slot],
-                        self.pathing_states[slot],
-                        tick,
-                        *period_ticks,
-                    );
-                    (target, Some(epoch), *speed)
-                }
-                GoalState::FollowPosition { target, speed } => (*target, None, *speed),
-                _ => continue,
-            };
-            pathing_requests.push(GoalPathingRequest {
-                id,
-                expected_position: self.positions[slot],
-                expected_rotation: self.rotations[slot],
-                expected_velocity: self.velocities[slot],
-                expected_on_ground: self.on_ground[slot],
-                expected_goal: goal,
-                expected_path: self.pathing_states[slot],
-                target,
-                target_epoch,
-                speed,
-            });
-        }
-        pathing_requests.extend(self.shadow.pathing_requests(tick, active_ids));
+
+        pathing_requests.extend(self.runtime.pathing_requests(tick, active_ids));
         PreparedGoalTick {
             tick,
             active_ids: active_ids.cloned(),
@@ -2504,173 +1792,16 @@ impl EntityStore {
         external_follow_targets: Option<&HashMap<EntityId, Vec3>>,
     ) -> GoalTickStats {
         let mut stats = GoalTickStats::default();
-        #[cfg(any(test, feature = "shadow-compare"))]
-        let mut updated_ids = Vec::new();
-        #[cfg(any(test, feature = "shadow-compare"))]
-        for slot in 0..self.ids.len() {
-            let id = self.ids[slot];
-            if active_ids.is_some_and(|active_ids| !active_ids.contains(&id)) {
-                continue;
-            }
-            if self.lifecycles[slot] != EntityLifecycle::Alive {
-                stats.skipped_non_alive += 1;
-                continue;
-            }
-            let goal = self.goals[slot].clone();
-            let pathing_result = if pathing_enabled
-                && matches!(
-                    &goal,
-                    GoalState::Wander { .. } | GoalState::FollowPosition { .. }
-                ) {
-                let Some(result) = pathing_results.get(&id) else {
-                    continue;
-                };
-                if !result.matches(
-                    self.positions[slot],
-                    self.rotations[slot],
-                    self.velocities[slot],
-                    self.on_ground[slot],
-                    &goal,
-                    &self.pathing_states[slot],
-                ) {
-                    continue;
-                }
-                Some(result)
-            } else {
-                None
-            };
-            if let Some(result) = pathing_result {
-                self.pathing_states[slot] = result.next_path;
-            }
-            stats.alive_entities += 1;
-            match goal {
-                GoalState::Idle => {
-                    self.velocities[slot].x = 0.0;
-                    self.velocities[slot].z = 0.0;
-                }
-                GoalState::Wander {
-                    speed,
-                    period_ticks,
-                } => {
-                    let period = u64::from(period_ticks.max(1));
-                    let angle = deterministic_angle(id, tick / period);
-                    let direct = Vec3 {
-                        x: angle.cos(),
-                        y: 0.0,
-                        z: angle.sin(),
-                    };
-                    let direction = if pathing_enabled {
-                        let result = pathing_result.expect("pathing result validated above");
-                        match result.decision.kind {
-                            PathingDecisionKind::Move => stats.pathing_moves += 1,
-                            PathingDecisionKind::Blocked => stats.pathing_blocked += 1,
-                            PathingDecisionKind::Unloaded => stats.pathing_unloaded += 1,
-                        }
-                        result.decision.velocity
-                    } else {
-                        direct
-                    };
-                    self.velocities[slot].x = direction.x * speed;
-                    self.velocities[slot].z = direction.z * speed;
-                    if self.velocities[slot].horizontal_len() > 0.0 {
-                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
-                    }
-                }
-                GoalState::AquaticWander {
-                    speed,
-                    vertical_speed,
-                    period_ticks,
-                } => {
-                    let period = u64::from(period_ticks.max(1));
-                    let phase = tick / period;
-                    let angle = deterministic_angle(id, phase);
-                    let vertical_wave = deterministic_wave(id, phase);
-                    self.velocities[slot].x = angle.cos() * speed;
-                    self.velocities[slot].z = angle.sin() * speed;
-                    self.velocities[slot].y = vertical_wave * vertical_speed;
-                    self.on_ground[slot] = false;
-                    self.rotations[slot] = aquatic_rotation_from_velocity(self.velocities[slot]);
-                }
-                GoalState::FollowTarget { target, speed } => {
-                    let target_position = self
-                        .slots_by_id
-                        .get(&target)
-                        .map(|&target_slot| self.positions[target_slot])
-                        .or_else(|| {
-                            external_follow_targets
-                                .and_then(|targets| targets.get(&target).copied())
-                        });
-                    let velocity = if let Some(target_position) = target_position {
-                        Vec3 {
-                            x: target_position.x - self.positions[slot].x,
-                            y: 0.0,
-                            z: target_position.z - self.positions[slot].z,
-                        }
-                        .horizontal_normalized()
-                    } else {
-                        stats.missing_follow_targets += 1;
-                        Vec3::ZERO
-                    };
-                    self.velocities[slot].x = velocity.x * speed;
-                    self.velocities[slot].z = velocity.z * speed;
-                    if self.velocities[slot].horizontal_len() > 0.0 {
-                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
-                    }
-                }
-                GoalState::FollowPosition { target, speed } => {
-                    let vertical_velocity = self.velocities[slot].y;
-                    let velocity = if pathing_enabled {
-                        let result = pathing_result.expect("pathing result validated above");
-                        match result.decision.kind {
-                            PathingDecisionKind::Move => stats.pathing_moves += 1,
-                            PathingDecisionKind::Blocked => stats.pathing_blocked += 1,
-                            PathingDecisionKind::Unloaded => stats.pathing_unloaded += 1,
-                        }
-                        result.decision.velocity
-                    } else {
-                        Vec3 {
-                            x: target.x - self.positions[slot].x,
-                            y: 0.0,
-                            z: target.z - self.positions[slot].z,
-                        }
-                        .horizontal_normalized()
-                    };
-                    self.velocities[slot].x = velocity.x * speed;
-                    if velocity.y != 0.0 {
-                        self.velocities[slot].y = velocity.y * speed;
-                    } else {
-                        self.velocities[slot].y = vertical_velocity;
-                    }
-                    self.velocities[slot].z = velocity.z * speed;
-                    if self.velocities[slot].horizontal_len() > 0.0 {
-                        self.rotations[slot].yaw = yaw_from_velocity(self.velocities[slot]);
-                        self.rotations[slot].head_yaw = self.rotations[slot].yaw;
-                    }
-                }
-            }
-            stats.decisions_applied += 1;
-            updated_ids.push(id);
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        for id in updated_ids {
-            let _ = self.queue_current_physics(id);
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        if stats.decisions_applied > 0 && !self.shadow_disabled {
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
-        }
 
-        self.shadow.queue_goal_tick(
+        self.runtime.queue_goal_tick(
             tick,
             pathing_enabled,
             pathing_results.values().cloned(),
             active_ids,
             external_follow_targets,
         );
-        self.shadow.run_stage(ShadowStage::InputAi);
-        let authoritative_stats = self.shadow.take_goal_tick_stats();
+        self.runtime.run_stage(EntityStage::InputAi);
+        let authoritative_stats = self.runtime.take_goal_tick_stats();
         stats.alive_entities += authoritative_stats.alive_entities;
         stats.decisions_applied += authoritative_stats.decisions_applied;
         stats.skipped_non_alive += authoritative_stats.skipped_non_alive;
@@ -2682,63 +1813,17 @@ impl EntityStore {
     }
 
     pub fn tick_positions(&mut self, delta_seconds: f64) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
         {
-            self.shadow.queue_position_tick(delta_seconds);
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if self.uses_ecs_authority() {
-                self.shadow.queue_position_tick(delta_seconds);
-                self.shadow.run_stage(ShadowStage::PhysicsApply);
-                return;
-            }
-            self.tick_positions_in_range(0..self.ids.len(), delta_seconds);
-            if self.ecs_authoritative_ids.is_empty() {
-                return;
-            }
-            self.shadow.queue_position_tick(delta_seconds);
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
+            self.runtime.queue_position_tick(delta_seconds);
+            self.runtime.run_stage(EntityStage::PhysicsApply);
         }
     }
 
     pub fn tick_positions_in_range(&mut self, range: Range<usize>, delta_seconds: f64) {
-        #[cfg(not(any(test, feature = "shadow-compare")))]
         {
-            self.shadow
+            self.runtime
                 .queue_position_tick_in_range(range, delta_seconds);
-            self.shadow.run_stage(ShadowStage::PhysicsApply);
-        }
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            if self.uses_ecs_authority() {
-                self.shadow
-                    .queue_position_tick_in_range(range, delta_seconds);
-                self.shadow.run_stage(ShadowStage::PhysicsApply);
-                return;
-            }
-            assert!(
-                range.end <= self.ids.len(),
-                "entity tick range out of bounds"
-            );
-            let mut updated_ids = Vec::new();
-            for slot in range {
-                if self.lifecycles[slot] != EntityLifecycle::Alive {
-                    continue;
-                }
-                self.positions[slot].x += self.velocities[slot].x * delta_seconds;
-                self.positions[slot].y += self.velocities[slot].y * delta_seconds;
-                self.positions[slot].z += self.velocities[slot].z * delta_seconds;
-                updated_ids.push(self.ids[slot]);
-            }
-            let has_updates = !updated_ids.is_empty();
-            for id in updated_ids {
-                let _ = self.queue_current_physics(id);
-            }
-            if has_updates && !self.shadow_disabled {
-                self.shadow.run_stage(ShadowStage::PhysicsApply);
-            }
+            self.runtime.run_stage(EntityStage::PhysicsApply);
         }
     }
 
@@ -2754,78 +1839,6 @@ impl EntityStore {
                 self.next_id = next_id;
                 return id;
             }
-        }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn snapshot_slot(&self, slot: usize) -> EntitySnapshot {
-        EntitySnapshot {
-            id: self.ids[slot],
-            uuid: self.uuids[slot],
-            type_id: self.type_ids[slot],
-            type_name: self.type_names[slot].clone(),
-            position: self.positions[slot],
-            rotation: self.rotations[slot],
-            velocity: self.velocities[slot],
-            on_ground: self.on_ground[slot],
-            item_stack: self.item_stacks[slot].clone(),
-            experience_value: self.experience_values[slot],
-            block_state: self.block_states[slot],
-            lifecycle: self.lifecycles[slot],
-            health: self.healths[slot],
-            attributes: self.attributes[slot].clone(),
-            goal: self.goals[slot].clone(),
-            vehicle: self.vehicles[slot],
-            animal: self.animals[slot],
-        }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn view_slot(&self, slot: usize) -> EntityView<'_> {
-        EntityView {
-            id: self.ids[slot],
-            uuid: self.uuids[slot],
-            type_id: self.type_ids[slot],
-            type_name: &self.type_names[slot],
-            position: self.positions[slot],
-            rotation: self.rotations[slot],
-            velocity: self.velocities[slot],
-            on_ground: self.on_ground[slot],
-            item_stack: self.item_stacks[slot].clone(),
-            experience_value: self.experience_values[slot],
-            block_state: self.block_states[slot],
-            lifecycle: self.lifecycles[slot],
-            health: self.healths[slot],
-            attributes: &self.attributes[slot],
-            goal: &self.goals[slot],
-            vehicle: self.vehicles[slot],
-            animal: self.animals[slot],
-        }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    fn swap_remove_slot(&mut self, slot: usize) {
-        self.ids.swap_remove(slot);
-        self.uuids.swap_remove(slot);
-        self.type_ids.swap_remove(slot);
-        self.type_names.swap_remove(slot);
-        self.positions.swap_remove(slot);
-        self.rotations.swap_remove(slot);
-        self.velocities.swap_remove(slot);
-        self.on_ground.swap_remove(slot);
-        self.item_stacks.swap_remove(slot);
-        self.experience_values.swap_remove(slot);
-        self.block_states.swap_remove(slot);
-        self.lifecycles.swap_remove(slot);
-        self.healths.swap_remove(slot);
-        self.attributes.swap_remove(slot);
-        self.goals.swap_remove(slot);
-        self.pathing_states.swap_remove(slot);
-        self.vehicles.swap_remove(slot);
-        self.animals.swap_remove(slot);
-
-        if slot < self.ids.len() {
-            self.slots_by_id.insert(self.ids[slot], slot);
         }
     }
 }
@@ -3239,20 +2252,7 @@ fn snapshot_from_spawn(id: EntityId, uuid: Uuid, entity: SpawnEntity) -> EntityS
         goal: entity.goal,
         vehicle: entity.vehicle,
         animal: entity.animal,
-    }
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-fn shadow_semantic_event_id(event: &ShadowSemanticEvent) -> EntityId {
-    match event {
-        ShadowSemanticEvent::Spawned { id }
-        | ShadowSemanticEvent::GoalChanged { id }
-        | ShadowSemanticEvent::ItemStackChanged { id }
-        | ShadowSemanticEvent::VehicleChanged { id }
-        | ShadowSemanticEvent::PhysicsApplied { id }
-        | ShadowSemanticEvent::Damaged { id, .. }
-        | ShadowSemanticEvent::LifecycleChanged { id, .. }
-        | ShadowSemanticEvent::Removed { id } => *id,
+        retained: entity.retained,
     }
 }
 
@@ -3389,7 +2389,11 @@ mod tests {
             experience_value: None,
             block_state: None,
             lifecycle,
-            health: 20.0,
+            health: if lifecycle == EntityLifecycle::Alive {
+                20.0
+            } else {
+                0.0
+            },
             attributes: AttributeSet::new(),
             goal: GoalState::Idle,
             vehicle: Some(VehicleState {
@@ -3397,6 +2401,7 @@ mod tests {
                 passenger,
             }),
             animal: None,
+            retained: EntityRetainedState::default(),
         }
     }
 
@@ -3491,7 +2496,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_store_routes_every_family_to_ecs_authority() {
+    fn ordinary_store_routes_every_family_to_ecs_runtime() {
         let mut store = EntityStore::new();
         let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.5, 0.5));
         item.item_stack = Some(EntityItemStack::new(42, 3));
@@ -3502,8 +2507,6 @@ mod tests {
         let cow_id = store.spawn(cow(Vec3::new(2.5, 64.0, 0.5)));
 
         assert_eq!(store.len(), 3);
-        assert_eq!(store.legacy_entity_count_for_test(), 0);
-        assert_eq!(store.ecs_authoritative_entity_count_for_test(), 3);
         assert!(store.contains(item_id));
         assert!(store.contains(xp_id));
         assert!(store.contains(cow_id));
@@ -3534,10 +2537,10 @@ mod tests {
     }
 
     #[test]
-    fn simulation_views_cover_legacy_oracle_and_ecs_authority_once() {
-        let mut store = EntityStore::shadowed_legacy();
-        let legacy_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
-        let ecs_id = store.spawn_authoritative(cow(Vec3::new(2.0, 64.0, 2.0)));
+    fn simulation_views_enumerate_sole_ecs_authority_once() {
+        let mut store = EntityStore::new();
+        let first_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
+        let second_id = store.spawn(cow(Vec3::new(2.0, 64.0, 2.0)));
 
         let mut seen = Vec::new();
         store.visit_simulation_entities(|entity| {
@@ -3549,12 +2552,12 @@ mod tests {
             seen,
             vec![
                 (
-                    legacy_id,
+                    first_id,
                     "minecraft:cow".to_owned(),
                     Vec3::new(1.0, 64.0, 1.0)
                 ),
                 (
-                    ecs_id,
+                    second_id,
                     "minecraft:cow".to_owned(),
                     Vec3::new(2.0, 64.0, 2.0)
                 ),
@@ -3564,45 +2567,45 @@ mod tests {
 
     #[test]
     fn simulation_views_for_ids_only_visit_requested_entities_in_id_order() {
-        let mut store = EntityStore::shadowed_legacy();
-        let legacy_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
-        let skipped_id = store.spawn_authoritative(cow(Vec3::new(2.0, 64.0, 2.0)));
-        let ecs_id = store.spawn_authoritative(cow(Vec3::new(3.0, 64.0, 3.0)));
+        let mut store = EntityStore::new();
+        let first_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
+        let skipped_id = store.spawn(cow(Vec3::new(2.0, 64.0, 2.0)));
+        let last_id = store.spawn(cow(Vec3::new(3.0, 64.0, 3.0)));
 
         let mut seen = Vec::new();
         store.visit_simulation_entities_for_ids(
-            &HashSet::from([ecs_id, EntityId(99_999), legacy_id]),
+            &HashSet::from([last_id, EntityId(99_999), first_id]),
             |entity| seen.push(entity.id),
         );
 
-        assert_eq!(seen, vec![legacy_id, ecs_id]);
+        assert_eq!(seen, vec![first_id, last_id]);
         assert!(!seen.contains(&skipped_id));
     }
 
     #[test]
-    fn alive_kinematics_for_ids_cover_both_authorities_and_skip_despawning() {
-        let mut store = EntityStore::shadowed_legacy();
-        let legacy_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
-        let ecs_id = store.spawn_authoritative(cow(Vec3::new(2.0, 64.0, 2.0)));
-        let despawning_id = store.spawn_authoritative(cow(Vec3::new(3.0, 64.0, 3.0)));
+    fn alive_kinematics_for_ids_skips_despawning_entities() {
+        let mut store = EntityStore::new();
+        let first_id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
+        let second_id = store.spawn(cow(Vec3::new(2.0, 64.0, 2.0)));
+        let despawning_id = store.spawn(cow(Vec3::new(3.0, 64.0, 3.0)));
         assert!(store.mark_despawning(despawning_id));
 
         let mut states =
-            store.alive_kinematics_for_ids(&HashSet::from([legacy_id, ecs_id, despawning_id]));
+            store.alive_kinematics_for_ids(&HashSet::from([first_id, second_id, despawning_id]));
         states.sort_unstable_by_key(|state| state.id);
 
         assert_eq!(
             states,
             vec![
                 EntityKinematics {
-                    id: legacy_id,
+                    id: first_id,
                     position: Vec3::new(1.0, 64.0, 1.0),
                     rotation: Rotation::ZERO,
                     velocity: Vec3::ZERO,
                     on_ground: true,
                 },
                 EntityKinematics {
-                    id: ecs_id,
+                    id: second_id,
                     position: Vec3::new(2.0, 64.0, 2.0),
                     rotation: Rotation::ZERO,
                     velocity: Vec3::ZERO,
@@ -3613,7 +2616,7 @@ mod tests {
     }
 
     #[test]
-    fn projectile_and_falling_block_families_use_ecs_authority_without_legacy_slots() {
+    fn projectile_and_falling_block_families_round_trip_through_ecs_runtime() {
         let mut store = EntityStore::new();
         let arrow_id = store.spawn(SpawnEntity::new(
             1,
@@ -3626,8 +2629,6 @@ mod tests {
         store.spawn(cow(Vec3::new(2.5, 64.0, 0.5)));
 
         assert_eq!(store.len(), 3);
-        assert_eq!(store.legacy_entity_count_for_test(), 0);
-        assert_eq!(store.ecs_authoritative_entity_count_for_test(), 3);
         assert_eq!(
             store.snapshot(arrow_id).unwrap().type_name,
             "minecraft:arrow"
@@ -3647,24 +2648,21 @@ mod tests {
 
         let stats = store.tick_goals_with_stats(20);
 
-        assert_eq!(store.legacy_entity_count_for_test(), 0);
-        assert_eq!(store.ecs_authoritative_entity_count_for_test(), 1);
         assert_eq!(stats.alive_entities, 1);
         assert_eq!(stats.decisions_applied, 1);
         assert_ne!(store.snapshot(id).unwrap().velocity, Vec3::ZERO);
 
         let snapshot = store.snapshot(id).unwrap();
         let mut restored = EntityStore::new();
-        assert!(restored.insert_authoritative_snapshot(snapshot.clone()));
+        assert!(restored.insert_snapshot(snapshot.clone()));
         assert_eq!(restored.snapshot(id), Some(snapshot));
-        assert_eq!(restored.legacy_entity_count_for_test(), 0);
     }
 
     #[test]
-    fn authoritative_batch_spawns_all_entities_in_ecs() {
+    fn batch_spawn_inserts_all_entities_into_ecs_runtime() {
         let mut store = EntityStore::new();
 
-        let ids = store.spawn_authoritative_batch([
+        let ids = store.spawn_batch([
             cow(Vec3::new(0.5, 64.0, 0.5)),
             cow(Vec3::new(1.5, 64.0, 0.5)),
             cow(Vec3::new(2.5, 64.0, 0.5)),
@@ -3672,8 +2670,6 @@ mod tests {
 
         assert_eq!(ids, vec![EntityId(1), EntityId(2), EntityId(3)]);
         assert_eq!(store.len(), 3);
-        assert_eq!(store.legacy_entity_count_for_test(), 0);
-        assert_eq!(store.ecs_authoritative_entity_count_for_test(), 3);
         for id in ids {
             assert_eq!(store.snapshot(id).unwrap().type_name, "minecraft:cow");
         }
@@ -3683,107 +2679,70 @@ mod tests {
     fn damage_reduces_health_and_marks_killed_entities() {
         let mut store = EntityStore::new();
         let id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
+        let initial = store.snapshot(id).unwrap();
 
-        let hit = store.damage(id, 5.0).unwrap();
+        for invalid in [
+            EntityDamageRequest {
+                amount: 0.0,
+                tick: 1,
+                death_remove_tick: 21,
+            },
+            EntityDamageRequest {
+                amount: -1.0,
+                tick: 1,
+                death_remove_tick: 21,
+            },
+            EntityDamageRequest {
+                amount: f32::NAN,
+                tick: 1,
+                death_remove_tick: 21,
+            },
+            EntityDamageRequest {
+                amount: 1.0,
+                tick: 21,
+                death_remove_tick: 20,
+            },
+        ] {
+            assert!(store.damage(id, invalid).is_none());
+            assert_eq!(store.snapshot(id), Some(initial.clone()));
+        }
+
+        let hit = store
+            .damage(
+                id,
+                EntityDamageRequest {
+                    amount: 5.0,
+                    tick: 1,
+                    death_remove_tick: 21,
+                },
+            )
+            .unwrap();
         assert!(!hit.killed);
         assert_eq!(hit.snapshot.health, 15.0);
         assert_eq!(hit.snapshot.lifecycle, EntityLifecycle::Alive);
+        assert_eq!(hit.snapshot.retained.last_damage_tick, Some(1));
+        assert_eq!(hit.snapshot.retained.death_remove_tick, None);
 
-        let lethal = store.damage(id, 20.0).unwrap();
+        let lethal = store
+            .damage(
+                id,
+                EntityDamageRequest {
+                    amount: 20.0,
+                    tick: 2,
+                    death_remove_tick: 22,
+                },
+            )
+            .unwrap();
         assert!(lethal.killed);
         assert_eq!(lethal.snapshot.health, 0.0);
         assert_eq!(lethal.snapshot.lifecycle, EntityLifecycle::Despawning);
+        assert_eq!(lethal.snapshot.retained.last_damage_tick, Some(2));
+        assert_eq!(lethal.snapshot.retained.death_remove_tick, Some(22));
     }
 
     #[test]
-    fn legacy_oracle_and_ecs_shadow_match_after_mixed_operations() {
-        let mut store = EntityStore::shadowed_legacy();
-        let mut entity = cow(Vec3::new(1.0, 64.0, 1.0));
-        entity.goal = GoalState::Wander {
-            speed: 0.2,
-            period_ticks: 20,
-        };
-        let id = store.spawn(entity);
-
-        store.tick_goals(20);
-        assert!(store.set_position(id, Vec3::new(2.0, 64.0, 1.0)));
-        assert!(store.set_item_stack(id, Some(EntityItemStack::new(42, 1))));
-        let damage = store.damage(id, 4.0).expect("entity is alive");
-        assert!(!damage.killed);
-
-        let comparison = store
-            .compare_shadow(20, ShadowStage::CombatLifecycle)
-            .expect("legacy and ECS shadow must match");
-        assert_eq!(comparison.compared_entities, 1);
-        assert!(comparison.compared_events >= 5);
-
-        assert_eq!(store.remove(id).map(|snapshot| snapshot.id), Some(id));
-        assert!(
-            store
-                .compare_shadow(21, ShadowStage::CombatLifecycle)
-                .is_ok()
-        );
-    }
-
-    #[test]
-    fn shadow_comparison_preserves_the_first_exact_divergence() {
-        let mut store = EntityStore::shadowed_legacy();
-        let id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
-        store
-            .compare_shadow(1, ShadowStage::InputAi)
-            .expect("initial spawn must match");
-
-        let shadow_position = Vec3::new(99.0, 70.0, -4.0);
-        store.perturb_shadow_position(id, shadow_position);
-        let divergence = store
-            .compare_shadow(2, ShadowStage::PhysicsApply)
-            .expect_err("test perturbation must be detected");
-
-        assert_eq!(divergence.tick, 2);
-        assert_eq!(divergence.stage, ShadowStage::PhysicsApply);
-        assert_eq!(divergence.entity_id, Some(id));
-        assert_eq!(
-            divergence.legacy.as_ref().map(|snapshot| snapshot.position),
-            Some(Vec3::new(1.0, 64.0, 1.0))
-        );
-        assert_eq!(
-            divergence.shadow.as_ref().map(|snapshot| snapshot.position),
-            Some(shadow_position)
-        );
-        assert_eq!(
-            store.shadow_comparison_stats().first_divergence.as_ref(),
-            Some(divergence.as_ref())
-        );
-        assert_eq!(
-            store.snapshot(id).map(|snapshot| snapshot.position),
-            Some(Vec3::new(1.0, 64.0, 1.0))
-        );
-    }
-
-    #[test]
-    fn shadow_comparison_detects_retained_path_divergence() {
-        let mut store = EntityStore::shadowed_legacy();
-        let id = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
-        store
-            .compare_shadow(1, ShadowStage::InputAi)
-            .expect("initial spawn must match");
-
-        let divergent = RetainedPathState {
-            has_target: true,
-            target: Vec3::new(8.0, 64.0, 1.0),
-            ..RetainedPathState::default()
-        };
-        store.perturb_shadow_path(id, divergent);
-
-        let divergence = store
-            .compare_shadow(2, ShadowStage::InputAi)
-            .expect_err("retained path divergence must be visible to the shadow gate");
-        assert_eq!(divergence.entity_id, Some(id));
-    }
-
-    #[test]
-    fn remove_keeps_moved_slot_addressable() {
-        let mut store = EntityStore::legacy_only();
+    fn remove_keeps_remaining_entity_addressable() {
+        let mut store = EntityStore::new();
         let a = store.spawn(cow(Vec3::new(1.0, 64.0, 1.0)));
         let b = store.spawn(cow(Vec3::new(2.0, 64.0, 2.0)));
         let c = store.spawn(cow(Vec3::new(3.0, 64.0, 3.0)));
@@ -3816,8 +2775,8 @@ mod tests {
     }
 
     #[test]
-    fn position_ticks_can_be_split_into_batches() {
-        let mut store = EntityStore::legacy_only();
+    fn position_ticks_can_be_split_into_ranges() {
+        let mut store = EntityStore::new();
         let a = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
         let b = store.spawn(cow(Vec3::new(10.0, 64.0, 10.0)));
         store.set_velocity(a, Vec3::new(1.0, 0.0, 0.0));
@@ -4050,8 +3009,8 @@ mod tests {
     #[test]
     fn authoritative_vehicle_mount_steer_and_dismount_updates_ecs() {
         let mut store = EntityStore::new();
-        let passenger = store.spawn_authoritative(cow(Vec3::new(0.0, 64.0, 0.0)));
-        let boat = store.spawn_authoritative(SpawnEntity::vehicle(
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let boat = store.spawn(SpawnEntity::vehicle(
             VehicleKind::Boat,
             15,
             "minecraft:oak_boat",
@@ -4078,7 +3037,7 @@ mod tests {
             sheep_wool: None,
         });
 
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         assert_eq!(
             store.snapshot(id).unwrap().animal,
             Some(AnimalBreedingState {
@@ -4111,17 +3070,17 @@ mod tests {
         let mut store = EntityStore::new();
         let mut idle = cow(Vec3::new(1.0, 64.0, 1.0));
         idle.animal = Some(AnimalBreedingState::adult());
-        let idle_id = store.spawn_authoritative(idle);
+        let idle_id = store.spawn(idle);
         let mut baby = cow(Vec3::new(2.0, 64.0, 2.0));
         baby.animal = Some(AnimalBreedingState::baby());
-        let baby_id = store.spawn_authoritative(baby);
+        let baby_id = store.spawn(baby);
         let mut in_love = cow(Vec3::new(3.0, 64.0, 3.0));
         in_love.animal = Some(AnimalBreedingState {
             age_ticks: 0,
             love_ticks: ANIMAL_LOVE_DURATION_TICKS,
             sheep_wool: None,
         });
-        let love_id = store.spawn_authoritative(in_love);
+        let love_id = store.spawn(in_love);
 
         let mut seen = Vec::new();
         store.visit_breeding_tick_entities(|entity| seen.push(entity.id));
@@ -4155,15 +3114,15 @@ mod tests {
         near_sheep.type_id = 7;
         near_sheep.type_name = "minecraft:sheep".to_owned();
         near_sheep.animal = Some(AnimalBreedingState::adult_sheep(SheepColor::White));
-        let near_sheep_id = store.spawn_authoritative(near_sheep);
+        let near_sheep_id = store.spawn(near_sheep);
         let mut far_sheep = cow(Vec3::new(160.0, 64.0, 1.0));
         far_sheep.type_id = 7;
         far_sheep.type_name = "minecraft:sheep".to_owned();
         far_sheep.animal = Some(AnimalBreedingState::adult_sheep(SheepColor::Black));
-        let far_sheep_id = store.spawn_authoritative(far_sheep);
+        let far_sheep_id = store.spawn(far_sheep);
         let mut cow = cow(Vec3::new(2.0, 64.0, 1.0));
         cow.animal = Some(AnimalBreedingState::adult());
-        let cow_id = store.spawn_authoritative(cow);
+        let cow_id = store.spawn(cow);
 
         let mut seen = Vec::new();
         store.visit_sheep_entities_for_ids(&HashSet::from([near_sheep_id, cow_id]), |entity| {
@@ -4200,7 +3159,7 @@ mod tests {
         let mut entity = SpawnEntity::new(7, "minecraft:sheep", Vec3::new(2.0, 64.0, 3.0));
         entity.animal = Some(AnimalBreedingState::adult_sheep(SheepColor::White));
 
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         let mut animal = store.snapshot(id).unwrap().animal.unwrap();
         assert_eq!(
             animal.sheep_wool,
@@ -4226,9 +3185,9 @@ mod tests {
     }
 
     #[test]
-    fn legacy_vehicle_accepts_and_releases_authoritative_passenger() {
+    fn vehicle_releases_removed_passenger() {
         let mut store = EntityStore::new();
-        let passenger = store.spawn_authoritative(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
         let boat = store.spawn(SpawnEntity::vehicle(
             VehicleKind::Boat,
             15,
@@ -4357,7 +3316,7 @@ mod tests {
     #[test]
     fn insert_snapshot_keeps_authoritative_passenger_mount() {
         let mut store = EntityStore::new();
-        let passenger = store.spawn_authoritative(cow(Vec3::new(0.0, 64.0, 0.0)));
+        let passenger = store.spawn(cow(Vec3::new(0.0, 64.0, 0.0)));
         let vehicle = EntityId(40);
 
         assert!(store.insert_snapshot(vehicle_snapshot(
@@ -4794,7 +3753,7 @@ mod tests {
             speed: 4.0,
             period_ticks: 40,
         };
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
 
         store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
@@ -4817,7 +3776,7 @@ mod tests {
             speed: 3.0,
             period_ticks: 40,
         };
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
 
         for tick in 1..=6 {
@@ -4851,7 +3810,7 @@ mod tests {
             speed: 4.0,
             period_ticks: 40,
         };
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         let probe = TestPathingProbe::new(PathingProbeResult::Walkable);
 
         store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
@@ -4943,7 +3902,7 @@ mod tests {
             target: Vec3::new(4.0, 64.0, 0.0),
             speed: 1.0,
         };
-        let id = store.spawn_authoritative(entity);
+        let id = store.spawn(entity);
         let probe = RetreatProbe(RefCell::new(Vec::new()));
 
         let stats = store.tick_goals_with_pathing(1, &probe, PathingBudget::DEFAULT);
@@ -5087,53 +4046,44 @@ mod tests {
 
     #[test]
     fn teleport_and_goal_change_invalidate_retained_path() {
-        fn exercise(mut store: EntityStore, authoritative: bool) {
-            let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
-            entity.goal = GoalState::FollowPosition {
+        let mut store = EntityStore::new();
+        let mut entity = cow(Vec3::new(0.0, 64.0, 0.0));
+        entity.goal = GoalState::FollowPosition {
+            target: Vec3::new(4.0, 64.0, 0.0),
+            speed: 1.0,
+        };
+        let id = store.spawn(entity);
+        store.tick_goals_with_pathing(
+            1,
+            &TestPathingProbe::new(PathingProbeResult::Walkable),
+            PathingBudget::DEFAULT,
+        );
+
+        assert!(store.set_position(id, Vec3::new(2.0, 64.0, 2.0)));
+        let after_teleport = store.prepare_goal_tick_with_pathing_for_ids(2, &HashSet::from([id]));
+        assert_eq!(
+            after_teleport.pathing_requests[0].expected_path,
+            RetainedPathState::default()
+        );
+
+        store.tick_goals_with_pathing(
+            2,
+            &TestPathingProbe::new(PathingProbeResult::Walkable),
+            PathingBudget::DEFAULT,
+        );
+        assert!(store.set_goal(
+            id,
+            GoalState::FollowPosition {
                 target: Vec3::new(4.0, 64.0, 0.0),
-                speed: 1.0,
-            };
-            let id = if authoritative {
-                store.spawn_authoritative(entity)
-            } else {
-                store.spawn(entity)
-            };
-            store.tick_goals_with_pathing(
-                1,
-                &TestPathingProbe::new(PathingProbeResult::Walkable),
-                PathingBudget::DEFAULT,
-            );
-
-            assert!(store.set_position(id, Vec3::new(2.0, 64.0, 2.0)));
-            let after_teleport =
-                store.prepare_goal_tick_with_pathing_for_ids(2, &HashSet::from([id]));
-            assert_eq!(
-                after_teleport.pathing_requests[0].expected_path,
-                RetainedPathState::default()
-            );
-
-            store.tick_goals_with_pathing(
-                2,
-                &TestPathingProbe::new(PathingProbeResult::Walkable),
-                PathingBudget::DEFAULT,
-            );
-            assert!(store.set_goal(
-                id,
-                GoalState::FollowPosition {
-                    target: Vec3::new(4.0, 64.0, 0.0),
-                    speed: 2.0,
-                },
-            ));
-            let after_goal_change =
-                store.prepare_goal_tick_with_pathing_for_ids(3, &HashSet::from([id]));
-            assert_eq!(
-                after_goal_change.pathing_requests[0].expected_path,
-                RetainedPathState::default()
-            );
-        }
-
-        exercise(EntityStore::legacy_only(), false);
-        exercise(EntityStore::new(), true);
+                speed: 2.0,
+            },
+        ));
+        let after_goal_change =
+            store.prepare_goal_tick_with_pathing_for_ids(3, &HashSet::from([id]));
+        assert_eq!(
+            after_goal_change.pathing_requests[0].expected_path,
+            RetainedPathState::default()
+        );
     }
 
     #[test]
@@ -5145,7 +4095,7 @@ mod tests {
                 target: Vec3::new(4.0, 64.0, 0.0),
                 speed: 1.0,
             };
-            store.spawn_authoritative(entity)
+            store.spawn(entity)
         };
         let first = spawn_follower(&mut store);
         let _second = spawn_follower(&mut store);
@@ -5250,195 +4200,6 @@ mod tests {
         assert_eq!(store.snapshot(id).unwrap().velocity, Vec3::ZERO);
     }
 
-    fn run_mixed_shadow_replay(ticks: u64) -> (Vec<EntitySnapshot>, u64, u64) {
-        let mut store = EntityStore::shadowed_legacy();
-
-        let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 65.0, 0.5));
-        item.item_stack = Some(EntityItemStack::new(42, 3));
-        item.velocity = Vec3::new(0.02, 0.1, 0.01);
-        let item_id = store.spawn(item);
-
-        let mut xp = SpawnEntity::new(2, "minecraft:experience_orb", Vec3::new(1.5, 65.0, 0.5));
-        xp.experience_value = Some(7);
-        xp.velocity = Vec3::new(-0.01, 0.08, 0.02);
-        store.spawn(xp);
-
-        let mut passive = cow(Vec3::new(3.0, 64.0, 3.0));
-        passive.goal = GoalState::Wander {
-            speed: 0.15,
-            period_ticks: 20,
-        };
-        let passive_id = store.spawn(passive);
-        let passenger_id = store.spawn(cow(Vec3::new(4.0, 64.0, 4.0)));
-
-        let mut hostile = SpawnEntity::new(3, "minecraft:zombie", Vec3::new(8.0, 64.0, 8.0));
-        hostile.goal = GoalState::FollowTarget {
-            target: passenger_id,
-            speed: 0.23,
-        };
-        store.spawn(hostile);
-
-        let mut arrow = SpawnEntity::new(4, "minecraft:arrow", Vec3::new(0.0, 66.0, 0.0));
-        arrow.velocity = Vec3::new(0.8, 0.1, 0.2);
-        arrow.on_ground = false;
-        let arrow_id = store.spawn(arrow);
-
-        let mut falling = SpawnEntity::new(5, "minecraft:falling_block", Vec3::new(6.0, 70.0, 6.0));
-        falling.block_state = Some(91);
-        falling.velocity = Vec3::new(0.0, -0.04, 0.0);
-        falling.on_ground = false;
-        let falling_id = store.spawn(falling);
-
-        let boat_id = store.spawn(SpawnEntity::vehicle(
-            VehicleKind::Boat,
-            6,
-            "minecraft:oak_boat",
-            Vec3::new(4.0, 63.0, 4.0),
-        ));
-        store.mount_vehicle(boat_id, passenger_id).unwrap();
-        store.spawn(SpawnEntity::vehicle(
-            VehicleKind::Minecart,
-            7,
-            "minecraft:minecart",
-            Vec3::new(10.0, 64.0, 10.0),
-        ));
-
-        let mut compared_ticks = 0_u64;
-        let mut compared_events = 0_u64;
-        let initial = store
-            .compare_shadow(0, ShadowStage::InputAi)
-            .expect("initial mixed state must match");
-        compared_ticks += 1;
-        compared_events += initial.compared_events as u64;
-
-        for tick in 1..=ticks {
-            if tick == 4 {
-                assert!(store.set_item_stack(item_id, Some(EntityItemStack::new(42, 2))));
-            }
-            if tick == 5 {
-                assert!(store.damage(passive_id, 100.0).unwrap().killed);
-            }
-            if tick == 6 {
-                assert_eq!(store.remove(passive_id).unwrap().id, passive_id);
-            }
-            if tick == 7 {
-                store.dismount_vehicle(boat_id, passenger_id).unwrap();
-            }
-            if tick == 8 {
-                store.mount_vehicle(boat_id, passenger_id).unwrap();
-                assert_eq!(store.remove(arrow_id).unwrap().id, arrow_id);
-            }
-            if tick == 9 {
-                assert_eq!(store.remove(falling_id).unwrap().id, falling_id);
-            }
-
-            store.tick_goals(tick);
-            store.tick_positions(0.05);
-
-            if tick == ticks / 2 {
-                let snapshots = store.snapshots().collect::<Vec<_>>();
-                let mut restored = EntityStore::shadowed_legacy();
-                for snapshot in snapshots {
-                    assert!(restored.insert_snapshot(snapshot));
-                }
-                let restart = restored
-                    .compare_shadow(tick, ShadowStage::PersistenceExtract)
-                    .expect("restored mixed state must match");
-                compared_ticks += 1;
-                compared_events += restart.compared_events as u64;
-                store = restored;
-            }
-
-            let comparison = store
-                .compare_shadow(tick, ShadowStage::PhysicsApply)
-                .expect("mixed replay must not diverge");
-            compared_ticks += 1;
-            compared_events += comparison.compared_events as u64;
-        }
-
-        let mut snapshots = store.snapshots().collect::<Vec<_>>();
-        snapshots.sort_by_key(|snapshot| snapshot.id);
-        (snapshots, compared_ticks, compared_events)
-    }
-
-    #[test]
-    fn mixed_shadow_replay_is_deterministic_across_persistence_restart() {
-        let first = run_mixed_shadow_replay(128);
-        let second = run_mixed_shadow_replay(128);
-
-        assert_eq!(first, second);
-        assert_eq!(first.1, 130);
-        assert!(first.2 > 100);
-    }
-
-    #[test]
-    #[ignore = "explicit accelerated one-hour shadow gate"]
-    fn accelerated_one_hour_mixed_shadow_replay_has_no_divergence() {
-        const ONE_HOUR_AT_TWENTY_TPS: u64 = 60 * 60 * 20;
-
-        let (_, compared_ticks, compared_events) = run_mixed_shadow_replay(ONE_HOUR_AT_TWENTY_TPS);
-
-        assert_eq!(compared_ticks, ONE_HOUR_AT_TWENTY_TPS + 2);
-        assert!(compared_events > ONE_HOUR_AT_TWENTY_TPS);
-    }
-
-    fn density_store(ecs_authoritative: bool, entities: usize) -> EntityStore {
-        let mut store = if ecs_authoritative {
-            EntityStore::new()
-        } else {
-            EntityStore::legacy_only()
-        };
-        for index in 0..entities {
-            let mut entity = cow(Vec3::new(index as f64, 64.0, (index % 32) as f64));
-            entity.goal = GoalState::Wander {
-                speed: 0.2,
-                period_ticks: 20,
-            };
-            if ecs_authoritative {
-                store.spawn_authoritative(entity);
-            } else {
-                store.spawn(entity);
-            }
-        }
-        store
-    }
-
-    #[test]
-    #[ignore = "explicit debug ECS authority density benchmark"]
-    fn legacy_and_ecs_authority_density_benchmark_report() {
-        const ENTITIES: usize = 1_000;
-        const TICKS: u64 = 200;
-
-        let mut legacy = density_store(false, ENTITIES);
-        let legacy_started = std::time::Instant::now();
-        for tick in 1..=TICKS {
-            legacy.tick_goals(tick);
-            legacy.tick_positions(0.05);
-        }
-        let legacy_elapsed = legacy_started.elapsed();
-
-        let mut ecs = density_store(true, ENTITIES);
-        let ecs_started = std::time::Instant::now();
-        for tick in 1..=TICKS {
-            ecs.tick_goals(tick);
-            ecs.tick_positions(0.05);
-        }
-        let ecs_elapsed = ecs_started.elapsed();
-
-        assert_eq!(
-            legacy.snapshots().collect::<Vec<_>>(),
-            ecs.snapshots().collect::<Vec<_>>()
-        );
-        std::hint::black_box((&legacy, &ecs));
-        println!(
-            "ENTITY_ECS_BENCH entities={ENTITIES} ticks={TICKS} legacy_total_us={} legacy_us_per_tick={} ecs_total_us={} ecs_us_per_tick={}",
-            legacy_elapsed.as_micros(),
-            legacy_elapsed.as_micros() / u128::from(TICKS),
-            ecs_elapsed.as_micros(),
-            ecs_elapsed.as_micros() / u128::from(TICKS),
-        );
-    }
-
     #[test]
     #[ignore = "explicit debug active-subset ECS benchmark"]
     fn active_subset_ecs_density_benchmark_report() {
@@ -5454,7 +4215,7 @@ mod tests {
                 speed: 0.2,
                 period_ticks: 20,
             };
-            let id = store.spawn_authoritative(entity);
+            let id = store.spawn(entity);
             if index < ACTIVE {
                 active_ids.insert(id);
             }
@@ -5476,14 +4237,27 @@ mod tests {
         );
     }
 
+    fn runtime_density_store(entities: usize) -> EntityStore {
+        let mut store = EntityStore::new();
+        for index in 0..entities {
+            let mut entity = cow(Vec3::new(index as f64, 64.0, (index % 32) as f64));
+            entity.goal = GoalState::Wander {
+                speed: 0.2,
+                period_ticks: 20,
+            };
+            store.spawn(entity);
+        }
+        store
+    }
+
     #[test]
     #[ignore = "explicit debug dense active-set ECS benchmark"]
     fn dense_active_set_ecs_benchmark_report() {
         const ENTITIES: usize = 1_000;
         const TICKS: u64 = 200;
 
-        let mut full_query = density_store(true, ENTITIES);
-        let mut indexed = density_store(true, ENTITIES);
+        let mut full_query = runtime_density_store(ENTITIES);
+        let mut indexed = runtime_density_store(ENTITIES);
         let active_ids = indexed
             .snapshots()
             .map(|snapshot| snapshot.id)

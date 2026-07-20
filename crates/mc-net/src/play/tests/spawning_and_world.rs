@@ -29,16 +29,7 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
             ),
         ]),
     )]));
-    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: pig,
-            protocol_id: 1,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: cod,
-            protocol_id: 2,
-        },
-    ]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let mut chunk = Chunk::empty(
         ChunkPos { x: 0, z: 0 },
         mc_world::BlockStateId(0),
@@ -70,14 +61,18 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
             .all(|spawn| spawn.entity_type_name == "minecraft:pig")
     );
     assert!(spawns.iter().all(|spawn| spawn.position.y == 65.0));
-    assert!(spawns.iter().all(|spawn| spawn.entity_type_id == 1));
+    assert!(spawns.iter().all(|spawn| spawn.entity_type_id == 100));
     assert!(spawns.iter().all(|spawn| {
         let fx = spawn.position.x.fract();
         let fz = spawn.position.z.fract();
         (0.48..=0.51).contains(&fx) && (0.48..=0.51).contains(&fz)
     }));
 
-    let mut unsupported_chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains.clone());
+    let mut unsupported_chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(0),
+        plains.clone(),
+    );
     for lx in 3..=12 {
         for lz in 3..=12 {
             if (lx + lz) % 2 == 0 {
@@ -108,8 +103,11 @@ fn passive_spawn_planner_keeps_water_mobs_off_land() {
             }],
         )]),
     )]));
-    let mut ocean_chunk =
-        Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), ocean.clone());
+    let mut ocean_chunk = Chunk::empty(
+        ChunkPos { x: 0, z: 0 },
+        mc_world::BlockStateId(0),
+        ocean.clone(),
+    );
     for lx in 3..=12 {
         for lz in 3..=12 {
             let _ = ocean_chunk.set_block(lx, DEFAULT_SEA_LEVEL, lz, water);
@@ -196,12 +194,7 @@ fn water_spawn_planner_uses_mid_column_and_all_water_states() {
             }],
         )]),
     )]));
-    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: cod,
-            protocol_id: 2,
-        },
-    ]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let water_source = mc_world::BlockStateId(2);
     let water_flowing = mc_world::BlockStateId(3);
     let mut chunk = Chunk::empty(ChunkPos { x: 1, z: 0 }, mc_world::BlockStateId(0), ocean);
@@ -229,7 +222,11 @@ fn water_spawn_planner_uses_mid_column_and_all_water_states() {
     );
 
     assert!(!spawns.is_empty());
-    assert!(spawns.iter().all(|spawn| (53.0..=55.0).contains(&spawn.position.y)));
+    assert!(
+        spawns
+            .iter()
+            .all(|spawn| (53.0..=55.0).contains(&spawn.position.y))
+    );
     assert!(spawns.iter().all(|spawn| {
         let lx = (spawn.position.x.floor() as i32 - chunk.pos.x * 16) as u8;
         let lz = (spawn.position.z.floor() as i32 - chunk.pos.z * 16) as u8;
@@ -285,24 +282,7 @@ fn hostile_spawn_planner_uses_multiple_monster_facts() {
             ],
         )]),
     )]));
-    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: zombie,
-            protocol_id: 1,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: skeleton,
-            protocol_id: 2,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: spider,
-            protocol_id: 3,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: chicken,
-            protocol_id: 4,
-        },
-    ]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let mut chunk = Chunk::empty(
         ChunkPos {
             x: chunk_pos.0,
@@ -360,11 +340,7 @@ fn hostile_spawn_planner_prepares_open_surface_candidate_for_night() {
             }],
         )]),
     )]));
-    let entity_types =
-        mc_data::entity_types::EntityTypeRegistry::from_report(&[mc_data::entity_types::EntityTypeReport {
-            id: zombie,
-            protocol_id: 1,
-        }]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let passable = vec![mc_world::BlockStateId(0)];
     let grass = mc_world::BlockStateId(1);
     let mut chunk = Chunk::empty(ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains);
@@ -411,12 +387,7 @@ fn hostile_spawn_planner_surface_candidate_does_not_require_cover() {
             }],
         )]),
     )]));
-    let entity_types = mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: zombie,
-            protocol_id: 1,
-        },
-    ]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let passable = vec![mc_world::BlockStateId(0)];
     let grass = mc_world::BlockStateId(1);
     let stone = mc_world::BlockStateId(2);
@@ -487,11 +458,7 @@ fn hostile_spawn_planner_does_not_depend_on_passive_chunk_selection() {
             }],
         )]),
     )]));
-    let entity_types =
-        mc_data::entity_types::EntityTypeRegistry::from_report(&[mc_data::entity_types::EntityTypeReport {
-            id: zombie,
-            protocol_id: 1,
-        }]);
+    let entity_types = mc_data::entity_types::solaris_required_entity_types();
     let passable = vec![mc_world::BlockStateId(0)];
     let grass = mc_world::BlockStateId(1);
     let mut chunk = Chunk::empty(
@@ -735,11 +702,18 @@ fn break_replacement_next_to_water_uses_flowing_state() {
     world
         .insert_generated_chunk(
             mc_world::ChunkPos { x: 0, z: 0 },
-            Chunk::empty(mc_world::ChunkPos { x: 0, z: 0 }, mc_world::BlockStateId(0), plains),
+            Chunk::empty(
+                mc_world::ChunkPos { x: 0, z: 0 },
+                mc_world::BlockStateId(0),
+                plains,
+            ),
         )
         .unwrap();
     world
-        .set_block_at(mc_world::BlockPos { x: 7, y: 63, z: 0 }, mc_world::BlockStateId(2))
+        .set_block_at(
+            mc_world::BlockPos { x: 7, y: 63, z: 0 },
+            mc_world::BlockStateId(2),
+        )
         .unwrap();
 
     assert_eq!(
@@ -1056,9 +1030,7 @@ fn hostile_pathing_keeps_the_next_tick_inside_loaded_chunk() {
         .expect("zombie physics query");
 
     assert_ne!(zombie.velocity, Vec3::ZERO);
-    assert!(
-        zombie.position.x + zombie.velocity.x * PathingBudget::TICK_SECONDS < 16.0
-    );
+    assert!(zombie.position.x + zombie.velocity.x * PathingBudget::TICK_SECONDS < 16.0);
 }
 
 #[test]
@@ -1100,9 +1072,7 @@ fn hostile_pathing_keeps_full_speed_while_next_tick_remains_loaded() {
 
     assert_ne!(zombie.velocity, Vec3::ZERO);
     assert!((zombie.velocity.x - HOSTILE_FOLLOW_SPEED).abs() < 1.0e-9);
-    assert!(
-        zombie.position.x + zombie.velocity.x * PathingBudget::TICK_SECONDS < 16.0
-    );
+    assert!(zombie.position.x + zombie.velocity.x * PathingBudget::TICK_SECONDS < 16.0);
 }
 
 #[test]
@@ -1189,9 +1159,13 @@ fn restored_herd_uuid_dedupes_without_suppressing_missing_night_spawn() {
         goal: GoalState::Idle,
         vehicle: None,
         animal: None,
+        retained: mc_entity::EntityRetainedState::default(),
     };
 
-    assert_eq!(registry.restore_persisted_entities([restored]), 1);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(0, [restored])),
+        1
+    );
     let _ = registry.ensure_chunk_herd_legacy_for_test(
         (0, 0),
         &[
@@ -1243,11 +1217,19 @@ fn entity_physics_skips_persisted_entities_without_loaded_players() {
         goal: GoalState::Idle,
         vehicle: None,
         animal: None,
+        retained: mc_entity::EntityRetainedState::default(),
     };
 
-    assert_eq!(registry.restore_persisted_entities([restored]), 1);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(0, [restored])),
+        1
+    );
 
-    assert!(registry.tick_entities_and_collect_physics_queries(1).is_empty());
+    assert!(
+        registry
+            .tick_entities_and_collect_physics_queries(1)
+            .is_empty()
+    );
 }
 
 #[test]
@@ -1286,6 +1268,7 @@ fn entity_physics_skips_loaded_entities_outside_simulation_distance() {
         goal: GoalState::Idle,
         vehicle: None,
         animal: None,
+        retained: mc_entity::EntityRetainedState::default(),
     };
     let far = mc_entity::EntitySnapshot {
         id: EntityId(2),
@@ -1305,11 +1288,14 @@ fn entity_physics_skips_loaded_entities_outside_simulation_distance() {
         goal: GoalState::Idle,
         vehicle: None,
         animal: None,
+        retained: mc_entity::EntityRetainedState::default(),
     };
 
-    assert_eq!(registry.restore_persisted_entities([near, far]), 2);
-    let queries =
-        registry.tick_entities_and_collect_physics_queries_with_simulation_distance(1, 4);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(0, [near, far])),
+        2
+    );
+    let queries = registry.tick_entities_and_collect_physics_queries_with_simulation_distance(1, 4);
 
     assert_eq!(queries.len(), 1);
     assert_eq!(queries[0].id, EntityId(1));
@@ -1354,7 +1340,11 @@ fn entity_physics_includes_every_active_entity_under_work_pressure() {
             } else {
                 "minecraft:cow".to_string()
             },
-            position: Vec3::new(0.5 + f64::from(idx % 7), DEFAULT_SPAWN_Y, 0.5 + f64::from(idx / 7)),
+            position: Vec3::new(
+                0.5 + f64::from(idx % 7),
+                DEFAULT_SPAWN_Y,
+                0.5 + f64::from(idx / 7),
+            ),
             rotation: mc_entity::Rotation::ZERO,
             velocity: Vec3::ZERO,
             on_ground: true,
@@ -1367,12 +1357,15 @@ fn entity_physics_includes_every_active_entity_under_work_pressure() {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         })
         .collect::<Vec<_>>();
 
-    assert_eq!(registry.restore_persisted_entities(entities), 49);
-    let queries =
-        registry.tick_entities_and_collect_physics_queries_with_pathing_budget(1, 8);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(0, entities)),
+        49
+    );
+    let queries = registry.tick_entities_and_collect_physics_queries_with_pathing_budget(1, 8);
 
     assert_eq!(queries.len(), 49);
     assert!(queries.iter().any(|query| query.id == EntityId(1000)));
@@ -1475,11 +1468,14 @@ fn simulation_tick_test_config(
         items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts,
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: ChunkPipelinePolicy::default(),
         random_tick,
-        command_permissions: crate::server::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        command_permissions: crate::server::CommandPermissionConfig::new(
+            Vec::<String>::new(),
+            true,
+        ),
         shutdown: crate::server::ShutdownHandle::default(),
     }
 }
@@ -1530,7 +1526,8 @@ async fn sheep_grazing_animates_changes_grass_and_regrows_wool() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(sessions.mark_loaded(session_id, (0, 0)).is_empty());
-    let spawn = sessions.spawn_command_entity_legacy_for_test(
+    let spawn = sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         4,
         "minecraft:sheep".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -1676,11 +1673,9 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
         mc_data::Identifier::parse("minecraft:plains").unwrap(),
     );
     first_chunk.set_block(0, 0, 0, mc_world::BlockStateId(1));
-    world.commit_chunk_snapshot(
-        ChunkPos { x: 0, z: 0 },
-        first_chunk,
-    )
-    .unwrap();
+    world
+        .commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, first_chunk)
+        .unwrap();
     let mut second_chunk = Chunk::empty(
         ChunkPos { x: 1, z: 0 },
         mc_world::BlockStateId(0),
@@ -1688,10 +1683,7 @@ async fn random_ticks_ignore_ticketed_chunks_until_loaded() {
     );
     second_chunk.set_block(0, 0, 0, mc_world::BlockStateId(1));
     world
-        .commit_chunk_snapshot(
-            ChunkPos { x: 1, z: 0 },
-            second_chunk,
-        )
+        .commit_chunk_snapshot(ChunkPos { x: 1, z: 0 }, second_chunk)
         .unwrap();
     let config = simulation_tick_test_config(
         blocks,
@@ -2020,8 +2012,8 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
             _ = &mut pass => panic!("random-tick fanout completed before worker probe"),
         }
     })
-        .await
-        .expect("both random-tick workers enter before either release");
+    .await
+    .expect("both random-tick workers enter before either release");
     assert_ne!(entered[0], entered[1]);
     release_tx.send(()).unwrap();
     release_tx.send(()).unwrap();
@@ -2032,11 +2024,16 @@ async fn checkpoint_only_random_ticks_in_distinct_regions_do_not_wait_for_world_
 
     assert!(report.applied >= 2);
     for chunk in chunk_positions {
-        assert!(samples.iter().filter(|sample| sample.chunk == chunk).any(|sample| {
-            world_read
-                .block_mutation_snapshot(sample.pos)
-                .is_some_and(|(state, _)| state == BlockStateId(12))
-        }));
+        assert!(
+            samples
+                .iter()
+                .filter(|sample| sample.chunk == chunk)
+                .any(|sample| {
+                    world_read
+                        .block_mutation_snapshot(sample.pos)
+                        .is_some_and(|(state, _)| state == BlockStateId(12))
+                })
+        );
     }
     let (reopened, pending) = super::world_journal::WorldChunkJournal::open(
         temp.path(),
@@ -2112,9 +2109,7 @@ async fn boundary_random_tick_coordinator_fallback_uses_periodic_checkpoint() {
     };
     let sample = sample_random_tick_positions(policy, 0, &[(0, 0)])
         .into_iter()
-        .find(|sample| {
-            sample.pos.x.rem_euclid(128) == 0 || sample.pos.z.rem_euclid(128) == 0
-        })
+        .find(|sample| sample.pos.x.rem_euclid(128) == 0 || sample.pos.z.rem_euclid(128) == 0)
         .expect("seed zero samples the region boundary belt");
     let mut chunk = Chunk::empty(
         ChunkPos { x: 0, z: 0 },
@@ -2214,10 +2209,7 @@ fn random_tick_planning_preserves_repeated_sample_order() {
             .iter()
             .map(|edit| edit.new_state)
             .collect::<Vec<_>>(),
-        vec![
-            mc_world::BlockStateId(12),
-            mc_world::BlockStateId(13)
-        ]
+        vec![mc_world::BlockStateId(12), mc_world::BlockStateId(13)]
     );
 }
 
@@ -2265,10 +2257,7 @@ fn random_tick_region_planning_preserves_boundary_barrier_order() {
         )),
     );
     let candidates = positions.map(|pos| RandomTickCandidate {
-        sample: RandomTickSample {
-            chunk: (0, 0),
-            pos,
-        },
+        sample: RandomTickSample { chunk: (0, 0), pos },
         state: BlockStateId(11),
     });
     let snapshot = world_read.snapshot_chunks(&random_tick_planning_chunks(&candidates));
@@ -2325,13 +2314,7 @@ async fn random_tick_commit_rejects_changed_snapshot() {
     drop(world_writer);
     let (edits, preconditions) = random_tick_resident_inputs(&plan, None).unwrap();
     assert_eq!(
-        world_mutation.apply_block_edits_conditionally(
-            &edits,
-            &preconditions,
-            &[],
-            None,
-            Some(1),
-        ),
+        world_mutation.apply_block_edits_conditionally(&edits, &preconditions, &[], None, Some(1),),
         mc_world::ResidentBlockEditBatchResult::Stale
     );
     assert_eq!(
@@ -2395,12 +2378,7 @@ async fn random_leaf_decay_spawns_deterministic_natural_drop() {
         id: Identifier::parse("minecraft:oak_sapling").unwrap(),
         protocol_id: 10,
     }]));
-    config.entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 2,
-        },
-    ]));
+    config.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
 
     let sessions = SessionRegistry::new();
     let session = register_ticketed_button_session(&sessions, "LeafDecayDrop");
@@ -2481,7 +2459,9 @@ async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
         mc_data::Identifier::parse("minecraft:plains").unwrap(),
     );
     let _ = chunk.set_block(4, DEFAULT_SEA_LEVEL, 4, mc_world::BlockStateId(1));
-    world.commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk).unwrap();
+    world
+        .commit_chunk_snapshot(ChunkPos { x: 0, z: 0 }, chunk)
+        .unwrap();
     world
         .schedule_fluid_tick(mc_world::ScheduledFluidTick::new(
             pos,
@@ -2490,14 +2470,19 @@ async fn scheduled_fluid_ticks_ignore_ticketed_chunks_until_loaded() {
             0,
         ))
         .unwrap();
-    let config = simulation_tick_test_config(blocks, world, RandomTickPolicy {
-        simulation_distance: DEFAULT_VIEW_DISTANCE,
-        random_tick_speed: 0,
-        chunk_budget: 1,
-        fluid_tick_budget: 1,
-        save_interval_ticks: 20,
-        seed: 0,
-    }, block_facts);
+    let config = simulation_tick_test_config(
+        blocks,
+        world,
+        RandomTickPolicy {
+            simulation_distance: DEFAULT_VIEW_DISTANCE,
+            random_tick_speed: 0,
+            chunk_budget: 1,
+            fluid_tick_budget: 1,
+            save_interval_ticks: 20,
+            seed: 0,
+        },
+        block_facts,
+    );
 
     let unloaded = run_scheduled_fluid_ticks(&config, &registry, 0).await;
     assert_eq!(unloaded.drained, 0);
@@ -2639,11 +2624,16 @@ async fn resident_scheduled_fluid_tick_is_durable_without_world_writer() {
     .unwrap();
     let restored = reopened.decode_pending(&pending).unwrap();
     assert_eq!(restored.len(), 1);
-    assert_eq!(restored[0].get_block(4, target.y, 4), Some(mc_world::BlockStateId(2)));
-    assert!(restored[0]
-        .scheduled_fluid_ticks()
-        .iter()
-        .all(|tick| tick.trigger_tick > 0));
+    assert_eq!(
+        restored[0].get_block(4, target.y, 4),
+        Some(mc_world::BlockStateId(2))
+    );
+    assert!(
+        restored[0]
+            .scheduled_fluid_ticks()
+            .iter()
+            .all(|tick| tick.trigger_tick > 0)
+    );
     assert!(!restored[0].scheduled_fluid_ticks().is_empty());
 
     drop(world_writer);
@@ -2720,12 +2710,14 @@ async fn region_boundary_scheduled_fluid_tick_uses_exact_coordinator_fallback() 
         storage.get_cached_block(target),
         Some(mc_world::BlockStateId(2))
     );
-    assert!(storage
-        .scheduled_fluid_ticks(chunk_pos)
-        .unwrap()
-        .unwrap()
-        .iter()
-        .all(|tick| tick.trigger_tick > 0));
+    assert!(
+        storage
+            .scheduled_fluid_ticks(chunk_pos)
+            .unwrap()
+            .unwrap()
+            .iter()
+            .all(|tick| tick.trigger_tick > 0)
+    );
 }
 
 #[tokio::test]
@@ -2818,16 +2810,14 @@ async fn stale_scheduled_fluid_plan_keeps_due_tick_without_edit() {
     let (edits, preconditions) =
         resident_block_edit_inputs(&plan.edits, &plan.preconditions, None).unwrap();
     assert_eq!(
-        world_mutation.apply_fluid_tick_plan_conditionally(
-            &mc_world::ResidentFluidTickPlan {
-                consumed_ticks: &due,
-                edits: &edits,
-                preconditions: &preconditions,
-                scheduled_ticks: &plan.scheduled_fluid_ticks,
-                light_table: None,
-                leaf_trigger_tick: Some(1),
-            },
-        ),
+        world_mutation.apply_fluid_tick_plan_conditionally(&mc_world::ResidentFluidTickPlan {
+            consumed_ticks: &due,
+            edits: &edits,
+            preconditions: &preconditions,
+            scheduled_ticks: &plan.scheduled_fluid_ticks,
+            light_table: None,
+            leaf_trigger_tick: Some(1),
+        },),
         mc_world::ResidentBlockEditBatchResult::Stale
     );
     let mut storage = shared_world.lock().await;
@@ -2870,10 +2860,8 @@ fn random_tick_section_filter_skips_inert_palettes_and_keeps_crops() {
         simple_block(2, "minecraft:wheat"),
     ];
     let facts = mc_data::block_facts::BlockFactsTable::from_blocks_report(&reports);
-    let inert = mc_world::ChunkSection::filled(
-        mc_world::BlockStateId(1),
-        mc_world::BlockStateId(0),
-    );
+    let inert =
+        mc_world::ChunkSection::filled(mc_world::BlockStateId(1), mc_world::BlockStateId(0));
     let mut crop = inert.clone();
     crop.set(1, 1, 1, mc_world::BlockStateId(2));
 
@@ -3030,11 +3018,7 @@ fn light_inert_block_edits_do_not_request_full_relight() {
     );
 
     assert_eq!(outcome.light_edit_chunks, HashSet::from([(0, 0)]));
-    let updates = collect_incremental_light_updates_for_applied_edits(
-        &mut world,
-        &table,
-        &outcome,
-    );
+    let updates = collect_incremental_light_updates_for_applied_edits(&mut world, &table, &outcome);
     assert_eq!(updates.len(), 1);
     assert!(
         mc_world::light::ChunkLight::from_section_lights(
@@ -3096,8 +3080,7 @@ fn large_single_chunk_light_batch_encodes_only_final_chunk_state() {
     OUTBOUND_LIGHT_UPDATE_ENCODING_COUNT.with(|count| count.set(0));
     OUTBOUND_LIGHT_NEIGHBOURHOOD_CAPTURE_COUNT.with(|count| count.set(0));
 
-    let updates =
-        collect_incremental_light_updates_for_applied_edits(&mut world, &table, &outcome);
+    let updates = collect_incremental_light_updates_for_applied_edits(&mut world, &table, &outcome);
     let encoding_count = OUTBOUND_LIGHT_UPDATE_ENCODING_COUNT.with(std::cell::Cell::get);
     let neighbourhood_capture_count =
         OUTBOUND_LIGHT_NEIGHBOURHOOD_CAPTURE_COUNT.with(std::cell::Cell::get);
@@ -3113,7 +3096,10 @@ fn large_single_chunk_light_batch_encodes_only_final_chunk_state() {
     assert_eq!(updates[0].light, expected);
     assert_eq!(
         mc_world::light::ChunkLight::from_section_lights(
-            &world.cached_chunk_snapshot(chunk_pos).unwrap().section_lights
+            &world
+                .cached_chunk_snapshot(chunk_pos)
+                .unwrap()
+                .section_lights
         ),
         Some(updates[0].light.clone())
     );
@@ -3364,8 +3350,7 @@ fn spiral_chunks_starts_at_centre() {
 #[test]
 fn spiral_chunks_covers_every_cell_in_window() {
     for vd in 0..=4 {
-        let collected: std::collections::HashSet<(i32, i32)> =
-            spiral_chunks(0, 0, vd).collect();
+        let collected: std::collections::HashSet<(i32, i32)> = spiral_chunks(0, 0, vd).collect();
         let expected_count = ((2 * vd + 1) as usize).pow(2);
         assert_eq!(
             collected.len(),

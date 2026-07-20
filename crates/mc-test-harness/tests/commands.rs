@@ -44,7 +44,7 @@ async fn start_server_with_shutdown_and_chunk_pipeline(
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -57,10 +57,6 @@ async fn start_server_with_shutdown_and_chunk_pipeline(
         let _ = bound.serve().await;
     });
     addr
-}
-
-async fn start_server_with_runtime_control() -> (SocketAddr, mc_net::RuntimeControlHandle) {
-    start_server_with_runtime_control_and_shutdown(mc_net::ShutdownHandle::default()).await
 }
 
 async fn start_server_with_runtime_control_and_shutdown(
@@ -103,7 +99,7 @@ async fn start_server_with_runtime_control_and_shutdown(
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -202,7 +198,7 @@ async fn command_tree_gamemode_and_feedback_round_trip() {
 }
 
 #[tokio::test]
-async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
+async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("greetings");
     std::fs::create_dir(&plugin).expect("create plugin directory");
@@ -212,7 +208,8 @@ async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
             id = "greetings"
             name = "Greetings"
             version = "0.1.0"
-            api = "0.3.0"
+            api = "0.6.0"
+            events = ["player.joined"]
             player_commands = ["hello"]
         "#,
     )
@@ -220,10 +217,16 @@ async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
     std::fs::write(
         plugin.join("main.lua"),
         r#"
+            joined_player_id = 0
+
+            function on_player_joined(event)
+                joined_player_id = event.player_id
+            end
+
             function on_player_command(event)
                 solaris.send_message(
                     event.player_id,
-                    event.root .. ":" .. event.username .. ":" .. event.arguments
+                    "joined:" .. joined_player_id .. ":" .. event.root .. ":" .. event.username .. ":" .. event.arguments
                 )
             end
         "#,
@@ -249,7 +252,7 @@ async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -290,7 +293,7 @@ async fn lua_player_command_is_exposed_and_routed_for_non_operator() {
         .expect("send plugin command");
     assert_eq!(
         next_system_chat_text(&mut client).await,
-        "hello:LuaCommandPlayer:one  two"
+        "joined:1:hello:LuaCommandPlayer:one  two"
     );
 
     client
@@ -336,7 +339,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
             id = "admin-day"
             name = "Admin Day"
             version = "0.1.0"
-            api = "0.4.0"
+            api = "0.6.0"
             operator_commands = ["adminday"]
             console_commands = ["time"]
         "#,
@@ -372,7 +375,7 @@ async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operat
         items: Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -531,17 +534,15 @@ async fn save_all_and_stop_commands_report_feedback_and_signal_shutdown() {
         })
         .await
         .expect("send stop command");
-    assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "Saved all state; stopping server"
-    );
+    assert_eq!(next_system_chat_text(&mut client).await, "Stopping server");
     assert!(shutdown.is_requested());
 }
 
 #[tokio::test]
-async fn status_command_reports_runtime_control_drain_snapshot() {
-    let (addr, runtime_control) = start_server_with_runtime_control().await;
-    runtime_control.request_drain();
+async fn stop_command_publishes_exact_runtime_control_drain_snapshot() {
+    let shutdown = mc_net::ShutdownHandle::default();
+    let (addr, runtime_control) =
+        start_server_with_runtime_control_and_shutdown(shutdown.clone()).await;
     let mut client = Client::connect(addr).await.expect("client connect");
     let _ = client.drive_login(addr, "M100Status").await.expect("login");
     client.drive_configuration().await.expect("configuration");
@@ -551,14 +552,31 @@ async fn status_command_reports_runtime_control_drain_snapshot() {
 
     client
         .write_packet(&ServerboundChatCommand {
-            command: "status".to_string(),
+            command: "stop".to_string(),
         })
         .await
-        .expect("send status command");
-
+        .expect("send stop command");
+    assert_eq!(next_system_chat_text(&mut client).await, "Stopping server");
+    assert!(shutdown.is_requested());
+    let snapshot = runtime_control.snapshot();
+    assert!(snapshot.draining);
     assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "Runtime control: draining=true action=hold pressure=none limits=view_distance:2,send:1,load:2,generate:3 pressure_ticks=0 healthy_ticks=0 reason=drain active; holding minimum limits"
+        snapshot.last_decision.action,
+        mc_net::AutoscaleAction::ScaleDown
+    );
+    assert_eq!(snapshot.last_decision.pressure, None);
+    assert_eq!(
+        snapshot.limits,
+        mc_net::RuntimeControlLimits {
+            view_distance: 2,
+            chunk_send_rate: 1,
+            chunk_load_rate: 2,
+            chunk_generate_rate: 3,
+        }
+    );
+    assert_eq!(
+        snapshot.last_decision.reason,
+        "drain requested; clamped to minimum chunk throughput"
     );
 }
 
@@ -584,10 +602,7 @@ async fn stop_command_requests_runtime_control_drain() {
         .await
         .expect("send stop command");
 
-    assert_eq!(
-        next_system_chat_text(&mut client).await,
-        "Saved all state; stopping server"
-    );
+    assert_eq!(next_system_chat_text(&mut client).await, "Stopping server");
     assert!(shutdown.is_requested());
     assert!(runtime_control.snapshot().draining);
 }

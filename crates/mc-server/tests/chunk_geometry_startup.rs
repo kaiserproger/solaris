@@ -3,7 +3,6 @@ use std::sync::Arc;
 use mc_data::Identifier;
 use mc_data::biomes::BiomeSpawnRules;
 use mc_data::block_facts::BlockFactsTable;
-use mc_data::entity_types::EntityTypeRegistry;
 use mc_data::item_components::ItemFactsTable;
 use mc_data::items::ItemRegistry;
 use mc_data::loot::LootTables;
@@ -59,7 +58,7 @@ fn translate(
         Arc::new(ItemRegistry::default()),
         Arc::new(ItemFactsTable::default()),
         Arc::new(BlockFactsTable::default()),
-        Arc::new(EntityTypeRegistry::default()),
+        Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         Arc::new(BiomeSpawnRules::default()),
     )
 }

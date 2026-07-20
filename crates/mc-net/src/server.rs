@@ -29,7 +29,8 @@ use mc_physics::{
     EntityBody, PhysicsConfig,
 };
 use mc_script::{
-    ScriptBoundary, ScriptCommand, ScriptEvent, ScriptPlayerContext, ScriptQueueError,
+    AdmittedScriptCommand, ScriptBoundary, ScriptCommand, ScriptEvent, ScriptPlayerContext,
+    ScriptQueueError,
 };
 use mc_world::{BlockRegistry, ChunkGeometry, MAX_Y, MIN_Y, OVERWORLD_GEOMETRY, WorldStorage};
 use tokio::net::TcpListener;
@@ -38,11 +39,16 @@ use tracing::{debug, info, warn};
 
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::connection_driver::{ConnectionServices, handle_connection};
+use crate::control_plane::{
+    RuntimeControlApplyError, RuntimeControlOperation, RuntimeControlOutcome, RuntimeControlSignal,
+    RuntimeControlSignalReceiver,
+};
 use crate::error::ConnectionError;
 use crate::runtime_tick_metrics::{
     RuntimeTickMetricsHandle, RuntimeTickMetricsWindow, RuntimeTickPercentiles, RuntimeTickSample,
     spawn_runtime_tick_metrics_worker,
 };
+use crate::script::{PluginStorageHandle, ScriptRouter, ScriptRouterExit};
 use crate::{
     ChunkPipelinePolicy, RuntimeControlHandle, RuntimeControlInput, RuntimeWorkBudgets,
     RuntimeWorkInput,
@@ -321,6 +327,7 @@ pub struct BoundServer {
     simulation_owner: play::SimulationOwner,
     extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
+    script_storage: Option<PluginStorageHandle>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -337,10 +344,6 @@ pub struct RuntimeTelemetrySnapshot {
     pub entity_data_dispatches: u64,
     pub entity_take_dispatches: u64,
     pub entity_remove_dispatches: u64,
-    pub entity_shadow_comparisons: u64,
-    pub entity_shadow_compared_entities: u64,
-    pub entity_shadow_compared_events: u64,
-    pub entity_shadow_first_divergence: bool,
     pub simulation_queue_capacity: usize,
     pub simulation_queue_depth: usize,
     pub simulation_queue_max_depth: usize,
@@ -409,10 +412,6 @@ impl RuntimeTelemetryHandle {
             entity_data_dispatches: pressure.entity_dispatches.data,
             entity_take_dispatches: pressure.entity_dispatches.take,
             entity_remove_dispatches: pressure.entity_dispatches.remove,
-            entity_shadow_comparisons: pressure.entity_shadow_comparisons,
-            entity_shadow_compared_entities: pressure.entity_shadow_compared_entities,
-            entity_shadow_compared_events: pressure.entity_shadow_compared_events,
-            entity_shadow_first_divergence: pressure.entity_shadow_first_divergence,
             simulation_queue_capacity: simulation.capacity,
             simulation_queue_depth: simulation.depth,
             simulation_queue_max_depth: simulation.max_depth,
@@ -525,7 +524,7 @@ pub(crate) struct ScriptEventSink {
 }
 
 impl ScriptEventSink {
-    fn new(boundary: ScriptBoundary) -> Self {
+    pub(crate) fn new(boundary: ScriptBoundary) -> Self {
         Self { boundary }
     }
 
@@ -533,13 +532,13 @@ impl ScriptEventSink {
         let event_name = event.event_name();
         match self.boundary.try_enqueue_event(event) {
             Ok(()) => {}
-            Err(ScriptQueueError::Full(_)) if event_name == "server.tick" => {
+            Err(ScriptQueueError::Full) if event_name == "server.tick" => {
                 debug!(event = event_name, "script event queue full; tick dropped");
             }
-            Err(ScriptQueueError::Full(_)) => {
+            Err(ScriptQueueError::Full) => {
                 warn!(event = event_name, "script event queue full; event dropped");
             }
-            Err(ScriptQueueError::Closed(_)) => {
+            Err(ScriptQueueError::Closed) => {
                 warn!(
                     event = event_name,
                     "script event queue closed; event dropped"
@@ -549,6 +548,24 @@ impl ScriptEventSink {
                 warn!(event = event_name, "script event queue rejected event");
             }
         }
+    }
+
+    pub(crate) async fn enqueue_targeted_event(
+        &self,
+        event: ScriptEvent,
+    ) -> Result<(), ScriptQueueError> {
+        self.boundary.enqueue_targeted_event(event).await
+    }
+
+    pub(crate) fn close_event_admission(&self) {
+        self.boundary.close_event_admission();
+    }
+
+    pub(crate) fn accept_host_command(
+        &self,
+        command: ScriptCommand,
+    ) -> Result<AdmittedScriptCommand, mc_script::ScriptCommandAcceptanceError> {
+        self.boundary.accept_host_command(command)
     }
 
     pub(crate) fn player_command_roots(&self) -> Vec<String> {
@@ -567,25 +584,25 @@ impl ScriptEventSink {
         raw: &str,
         is_operator: bool,
     ) -> mc_script::PlayerCommandAdmission {
-        match self.boundary.try_enqueue_player_command_with_operator(
+        match self.boundary.try_enqueue_player_command_with_context(
             mc_script::ScriptPlayerId::new(player_id),
-            username,
+            mc_script::ScriptPlayerContext::new(
+                format!("player-{player_id}"),
+                username,
+                is_operator,
+                0.0,
+                0.0,
+                0.0,
+            ),
             raw,
-            is_operator,
         ) {
             Ok(admission) => admission,
-            Err(ScriptQueueError::Full(event)) => {
-                warn!(
-                    event = event.event_name(),
-                    "script event queue full; player command dropped"
-                );
+            Err(ScriptQueueError::Full) => {
+                warn!("script event queue full; player command dropped");
                 mc_script::PlayerCommandAdmission::Dropped
             }
-            Err(ScriptQueueError::Closed(event)) => {
-                warn!(
-                    event = event.event_name(),
-                    "script event queue closed; player command unavailable"
-                );
+            Err(ScriptQueueError::Closed) => {
+                warn!("script event queue closed; player command unavailable");
                 mc_script::PlayerCommandAdmission::NotOwned
             }
             Err(_) => {
@@ -607,18 +624,12 @@ impl ScriptEventSink {
             raw,
         ) {
             Ok(admission) => admission,
-            Err(ScriptQueueError::Full(event)) => {
-                warn!(
-                    event = event.event_name(),
-                    "script event queue full; player command dropped"
-                );
+            Err(ScriptQueueError::Full) => {
+                warn!("script event queue full; player command dropped");
                 mc_script::PlayerCommandAdmission::Dropped
             }
-            Err(ScriptQueueError::Closed(event)) => {
-                warn!(
-                    event = event.event_name(),
-                    "script event queue closed; player command unavailable"
-                );
+            Err(ScriptQueueError::Closed) => {
+                warn!("script event queue closed; player command unavailable");
                 mc_script::PlayerCommandAdmission::NotOwned
             }
             Err(_) => {
@@ -737,11 +748,16 @@ fn handle_accept_failure(
     shutdown: &ShutdownHandle,
     runtime_control: Option<&RuntimeControlHandle>,
     chunk_pipeline_resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
 ) -> std::io::Error {
     warn!(%error, "listener accept failed; draining runtime before returning");
     if let Some(runtime_control) = runtime_control {
-        let decision = runtime_control.request_drain();
-        chunk_pipeline_resources.apply_runtime_control_action(decision.action, true);
+        request_runtime_control_drain(
+            runtime_control,
+            chunk_pipeline_resources,
+            sessions,
+            shutdown,
+        );
     }
     shutdown.request();
     error
@@ -760,6 +776,11 @@ impl BoundServer {
             sessions: Arc::clone(&self.sessions),
             simulation: self.simulation.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn entity_effect_handle(&self) -> crate::EntityEffectHandle {
+        self.simulation.entity_effect_handle()
     }
 
     #[must_use]
@@ -790,8 +811,10 @@ impl BoundServer {
     }
 
     /// Accept connections forever, spawning a per-connection task each
-    /// time. An error inside a connection task is logged but does not
-    /// stop the listener.
+    /// time. Shutdown drains runtime owners and returns without performing
+    /// the final save; the caller must save through [`SaveHandle`] only after
+    /// this future succeeds. An error inside a connection task is logged but
+    /// does not stop the listener.
     pub async fn serve(self) -> std::io::Result<()> {
         info!(
             addr = %self.local_addr()?,
@@ -805,12 +828,16 @@ impl BoundServer {
         let connection_world = self.connection_world;
         let chunk_pipeline_resources = self.chunk_pipeline_resources;
         let runtime_control = self.runtime_control;
+        let mut runtime_control_signals = runtime_control
+            .as_ref()
+            .and_then(RuntimeControlHandle::take_signal_receiver);
         let runtime_tick_metrics = self.runtime_tick_metrics;
         let sessions = self.sessions;
         let simulation = self.simulation;
         let mut simulation_owner = self.simulation_owner;
         let extension = self.extension;
         let scripts = self.scripts;
+        let script_storage = self.script_storage;
         let shutdown = config.shutdown.clone();
         let connection_services = ConnectionServices {
             config: Arc::clone(&config),
@@ -853,6 +880,7 @@ impl BoundServer {
             entity_sessions.subscribe_world_chunk_journal_failure();
         let entity_config = Arc::clone(&config);
         let entity_runtime_control = runtime_control.clone();
+        let mut entity_runtime_control_signals = runtime_control_signals.take();
         let entity_tick_metrics = runtime_tick_metrics.clone();
         let entity_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         let entity_scripts = scripts.clone();
@@ -912,6 +940,7 @@ impl BoundServer {
         if let Some(requests) = periodic_save_requests.as_ref() {
             enqueue_startup_dirty_flush(&config, requests).await;
         }
+        let (entity_shutdown, mut entity_shutdown_requested) = tokio::sync::oneshot::channel();
         let mut entity_ticker = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -945,7 +974,7 @@ impl BoundServer {
                         }
                         continue;
                     }
-                    () = entity_config.shutdown.notified() => {
+                    _ = &mut entity_shutdown_requested => {
                         if let Some(job) = entity_physics_job.take() {
                             apply_entity_physics_job_result(
                                 job.await,
@@ -963,7 +992,7 @@ impl BoundServer {
                             &tick_metrics,
                             scheduled_budget_exhausted_since_publish,
                         );
-                        info!("shutdown requested; entity ticker stopping");
+                        info!("simulation drain fenced; entity ticker stopping");
                         break;
                     }
                     generation = wait_for_session_empty_save_request(
@@ -1012,11 +1041,19 @@ impl BoundServer {
                             continue;
                         };
                         if let Some(control) = entity_runtime_control.as_ref() {
-                            let decision = control.observe_work(runtime_work_input(
-                                &observation.percentiles,
-                                observation.scheduled_budget_exhausted,
-                            ));
-                            if decision.action != crate::AutoscaleAction::Hold {
+                            let outcome = apply_runtime_control_operation(
+                                control,
+                                &entity_chunk_pipeline_resources,
+                                &entity_sessions,
+                                &entity_config.shutdown,
+                                RuntimeControlOperation::ObserveWork(runtime_work_input(
+                                    &observation.percentiles,
+                                    observation.scheduled_budget_exhausted,
+                                )),
+                            );
+                            if let Some(RuntimeControlOutcome::Work(decision)) = outcome
+                                && decision.action != crate::AutoscaleAction::Hold
+                            {
                                 info!(
                                     tick,
                                     source_tick = observation.percentiles.source_tick,
@@ -1031,6 +1068,22 @@ impl BoundServer {
                                     "runtime work budgets changed"
                                 );
                             }
+                        }
+                        continue;
+                    }
+                    signal = recv_runtime_control_signal(&mut entity_runtime_control_signals) => {
+                        let Some(signal) = signal else {
+                            entity_runtime_control_signals = None;
+                            continue;
+                        };
+                        if let Some(control) = entity_runtime_control.as_ref() {
+                            observe_runtime_control_signal(
+                                control,
+                                &entity_chunk_pipeline_resources,
+                                &entity_sessions,
+                                &entity_config.shutdown,
+                                signal,
+                            );
                         }
                         continue;
                     }
@@ -1082,7 +1135,7 @@ impl BoundServer {
                     continue;
                 }
                 let tick_started = Instant::now();
-                tick = tick.wrapping_add(1);
+                tick = entity_sessions.simulation_tick().saturating_add(1);
                 if let Some(scripts) = entity_scripts.as_ref() {
                     scripts.enqueue_event(ScriptEvent::server_tick(tick));
                 }
@@ -1132,6 +1185,8 @@ impl BoundServer {
                     .sum::<u64>();
                 let started = Instant::now();
                 let world_time = simulation_owner.advance_world_time(&entity_sessions, 1);
+                tick = entity_sessions.simulation_tick();
+                entity_sessions.synchronize_entity_lifecycle_epoch(tick);
                 simulation_owner
                     .tick_dying_entities(&entity_sessions, entity_sessions.simulation_tick());
                 let world_time_us = elapsed_us(started);
@@ -1187,34 +1242,56 @@ impl BoundServer {
                         ));
                         (Vec::new(), elapsed_us(started), 0)
                     } else {
+                        let physics_snapshot =
+                            inputs.first().map(|input| Arc::clone(&input.snapshot));
                         let steps = step_entity_physics_inputs(
                             entity_chunk_pipeline_resources.clone(),
                             inputs,
                         )
                         .await;
                         let entity_physics_us = elapsed_us(started);
-                        let started = Instant::now();
-                        let accepted_steps = simulation_owner.apply_entity_physics_if_current(
-                            &entity_sessions,
-                            &entity_chunk_pipeline_resources,
-                            tick,
-                            &queries,
-                            &steps,
-                        );
-                        let entity_dispatch_us = elapsed_us(started);
-                        let landed_falling_blocks =
-                            entity_sessions.landed_falling_blocks(&accepted_steps);
-                        if !landed_falling_blocks.is_empty() {
-                            simulation_owner
-                                .land_falling_blocks(
-                                    &entity_config,
-                                    &entity_sessions,
-                                    entity_world_read.as_ref(),
-                                    &landed_falling_blocks,
-                                )
-                                .await;
+                        let world_is_current = physics_snapshot.as_ref().is_none_or(|snapshot| {
+                            entity_world_read.as_ref().is_some_and(|world_read| {
+                                entity_physics_snapshot_is_current(world_read, snapshot)
+                            })
+                        });
+                        if !world_is_current {
+                            debug!(
+                                tick,
+                                "discarded inline entity physics after world snapshot changed"
+                            );
+                            (Vec::new(), entity_physics_us, 0)
+                        } else {
+                            let arrow_physics_facts =
+                                physics_snapshot.map_or_else(Vec::new, |snapshot| {
+                                    arrow_physics_facts_from_steps(
+                                        tick, &queries, &snapshot, &steps,
+                                    )
+                                });
+                            let started = Instant::now();
+                            let accepted_steps = simulation_owner.apply_entity_physics_if_current(
+                                &entity_sessions,
+                                &entity_chunk_pipeline_resources,
+                                tick,
+                                &queries,
+                                &steps,
+                                &arrow_physics_facts,
+                            );
+                            let entity_dispatch_us = elapsed_us(started);
+                            let landed_falling_blocks =
+                                entity_sessions.landed_falling_blocks(&accepted_steps);
+                            if !landed_falling_blocks.is_empty() {
+                                simulation_owner
+                                    .land_falling_blocks(
+                                        &entity_config,
+                                        &entity_sessions,
+                                        entity_world_read.as_ref(),
+                                        &landed_falling_blocks,
+                                    )
+                                    .await;
+                            }
+                            (steps, entity_physics_us, entity_dispatch_us)
                         }
-                        (steps, entity_physics_us, entity_dispatch_us)
                     }
                 };
                 let entity_step_count = steps.len();
@@ -1359,6 +1436,7 @@ impl BoundServer {
                         control,
                         &entity_chunk_pipeline_resources,
                         &entity_sessions,
+                        &entity_config.shutdown,
                         tick_us,
                     );
                 }
@@ -1648,6 +1726,14 @@ impl BoundServer {
                 warn!(%error, "runtime tick metrics worker failed");
             }
         });
+        let runtime_control_signal_watcher = runtime_control.as_ref().map(|control| {
+            let control = control.clone();
+            let sessions = Arc::clone(&sessions);
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                forward_slow_client_sheds_to_runtime_control(sessions, control, shutdown).await;
+            })
+        });
         let mut command_tasks = tokio::task::JoinSet::new();
         if let Some(extension_commands) = extension.clone() {
             let extension_sessions = Arc::clone(&sessions);
@@ -1663,16 +1749,19 @@ impl BoundServer {
             let script_sessions = Arc::clone(&sessions);
             let script_runtime_control = runtime_control.clone();
             let script_simulation = simulation.clone();
+            let script_chunk_pipeline_resources = chunk_pipeline_resources.clone();
             let script_shutdown = shutdown.clone();
             command_tasks.spawn(async move {
-                run_script_commands(
-                    script_commands,
-                    script_config,
-                    script_sessions,
-                    script_runtime_control,
-                    script_simulation,
-                    script_shutdown,
-                )
+                run_script_commands(ScriptCommandTask {
+                    scripts: script_commands,
+                    storage: script_storage,
+                    config: script_config,
+                    sessions: script_sessions,
+                    runtime_control: script_runtime_control,
+                    simulation: script_simulation,
+                    chunk_pipeline_resources: script_chunk_pipeline_resources,
+                    shutdown: script_shutdown,
+                })
                 .await;
                 "script command"
             });
@@ -1681,17 +1770,20 @@ impl BoundServer {
         let console_sessions = Arc::clone(&sessions);
         let console_runtime_control = runtime_control.clone();
         let console_simulation = simulation.clone();
+        let console_chunk_pipeline_resources = chunk_pipeline_resources.clone();
         command_tasks.spawn(async move {
             run_console_commands(
                 console_config,
                 console_sessions,
                 console_runtime_control,
                 console_simulation,
+                console_chunk_pipeline_resources,
             )
             .await;
             "console command"
         });
-        let mut entity_ticker_joined = false;
+        let mut entity_ticker_result = None;
+        let mut command_drain_error = None;
         let mut accept_error = None;
         loop {
             tokio::select! {
@@ -1704,6 +1796,7 @@ impl BoundServer {
                                 &shutdown,
                                 runtime_control.as_ref(),
                                 &chunk_pipeline_resources,
+                                &sessions,
                             ));
                             break;
                         }
@@ -1711,9 +1804,7 @@ impl BoundServer {
                     debug!(%peer, "accepted connection");
                     let services = connection_services.clone();
                     connections.spawn(async move {
-                        if let Err(err) =
-                            handle_connection(socket, peer, services).await
-                        {
+                        if let Err(err) = Box::pin(handle_connection(socket, peer, services)).await {
                             match err {
                                 err if is_client_disconnect(&err) => {
                                     debug!(%peer, "client disconnected");
@@ -1733,27 +1824,34 @@ impl BoundServer {
                     }
                 }
                 result = command_tasks.join_next(), if !command_tasks.is_empty() => {
-                    if let Some(result) = result {
-                        log_command_task_exit(result, shutdown.is_requested());
+                    if let Some(result) = result
+                        && let Err(error) = log_command_task_exit(result, shutdown.is_requested())
+                    {
+                        command_drain_error = Some(error);
                     }
                     if let Some(runtime_control) = runtime_control.as_ref() {
-                        let decision = runtime_control.request_drain();
-                        chunk_pipeline_resources
-                            .apply_runtime_control_action(decision.action, true);
+                        request_runtime_control_drain(
+                            runtime_control,
+                            &chunk_pipeline_resources,
+                            &sessions,
+                            &shutdown,
+                        );
                     }
                     shutdown.request();
                     break;
                 }
                 result = &mut entity_ticker => {
-                    entity_ticker_joined = true;
-                    handle_entity_ticker_exit(&shutdown, result);
+                    entity_ticker_result = Some(handle_entity_ticker_exit(&shutdown, result));
                     break;
                 }
                 () = shutdown.notified() => {
                     if let Some(runtime_control) = runtime_control.as_ref() {
-                        let decision = runtime_control.request_drain();
-                        chunk_pipeline_resources
-                            .apply_runtime_control_action(decision.action, true);
+                        request_runtime_control_drain(
+                            runtime_control,
+                            &chunk_pipeline_resources,
+                            &sessions,
+                            &shutdown,
+                        );
                     }
                     info!("shutdown requested; listener stopping");
                     break;
@@ -1762,38 +1860,56 @@ impl BoundServer {
         }
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_stopping("server stopping"));
+            scripts.close_event_admission();
         }
         while let Some(result) = command_tasks.join_next().await {
-            log_command_task_exit(result, true);
-        }
-        drain_connections(&mut connections).await;
-        drain_chunk_pipeline(&chunk_pipeline_resources).await;
-        if shutdown.is_requested() && config.world.is_some() {
-            let save = async {
-                drain_periodic_save_worker(periodic_save_worker).await;
-                save_all_after_drain_with_context(
-                    "listener shutdown final save",
-                    &config,
-                    &sessions,
-                )
-                .await
-            };
-            let report = if entity_ticker_joined {
-                save.await
-            } else {
-                drain_entity_ticker_then_save(entity_ticker, save).await
-            };
-            log_save_report("listener shutdown final save", &report);
-        } else {
-            if !entity_ticker_joined {
-                drain_entity_ticker(entity_ticker).await;
+            if let Err(error) = log_command_task_exit(result, true)
+                && command_drain_error.is_none()
+            {
+                command_drain_error = Some(error);
             }
-            drain_periodic_save_worker(periodic_save_worker).await;
         }
-        match accept_error {
-            Some(error) => Err(error),
-            None => Ok(()),
+        let connection_drain_result = drain_connections(&mut connections).await;
+        if let Some(watcher) = runtime_control_signal_watcher
+            && let Err(error) = watcher.await
+        {
+            warn!(%error, "runtime control signal watcher failed");
         }
+        drain_chunk_pipeline(&chunk_pipeline_resources).await;
+        let periodic_save_drain_result = drain_periodic_save_worker(periodic_save_worker).await;
+        let entity_drain_result = match entity_ticker_result {
+            Some(result) => result,
+            None => {
+                let simulation_barrier_result = simulation
+                    .save_barrier(config.world.is_some())
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        std::io::Error::other(format!(
+                            "simulation shutdown barrier failed: {error:?}"
+                        ))
+                    });
+                let _ = entity_shutdown.send(());
+                let ticker_result = drain_entity_ticker(entity_ticker).await;
+                simulation_barrier_result.and(ticker_result)
+            }
+        };
+        if let Some(error) = accept_error {
+            return Err(error);
+        }
+        if let Some(error) = command_drain_error {
+            return Err(error);
+        }
+        connection_drain_result?;
+        entity_drain_result?;
+        periodic_save_drain_result
+    }
+
+    /// Serve until shutdown, drain every admitted mutation, and perform the
+    /// final save. Callers that need to bind before spawning should use this
+    /// instead of the drain-only [`Self::serve`].
+    pub async fn serve_and_save(self) -> std::io::Result<()> {
+        serve_then_final_save(self).await
     }
 }
 
@@ -2056,113 +2172,65 @@ async fn run_extension_commands(
     }
 }
 
-async fn run_script_commands(
+struct ScriptCommandTask {
     scripts: ScriptEventSink,
+    storage: Option<PluginStorageHandle>,
     config: Arc<ServerConfig>,
     sessions: Arc<play::SessionRegistry>,
     runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
+    chunk_pipeline_resources: ChunkPipelineResources,
     shutdown: ShutdownHandle,
-) {
+}
+
+async fn run_script_commands(task: ScriptCommandTask) {
+    let ScriptCommandTask {
+        scripts,
+        storage,
+        config,
+        sessions,
+        runtime_control,
+        simulation,
+        chunk_pipeline_resources,
+        shutdown,
+    } = task;
+    let router = ScriptRouter::new(scripts.clone(), storage);
+    let mut shutdown_observed = shutdown.is_requested();
     loop {
         tokio::select! {
             biased;
-            () = shutdown.notified() => return,
             command = scripts.recv_command() => {
                 let Some(command) = command else {
                     debug!("script command queue closed; stopping command drain");
                     return;
                 };
-                if handle_script_command(
-                    &config,
-                    &sessions,
-                    runtime_control.as_ref(),
-                    &simulation,
+                if router.route(
                     command,
-                ).await {
+                    ScriptRouter::context(
+                        &config,
+                        &sessions,
+                        runtime_control.as_ref(),
+                        &simulation,
+                        &chunk_pipeline_resources,
+                        &shutdown,
+                    ),
+                ).await == ScriptRouterExit::Stop {
                     return;
                 }
             }
+            () = router.wait_for_storage_stop() => {
+                debug!("plugin storage actor stopped; stopping script command drain");
+                return;
+            }
+            () = shutdown.notified(), if !shutdown_observed => {
+                shutdown_observed = true;
+                debug!("shutdown requested; draining commands until the script host closes");
+            }
         }
     }
 }
 
-async fn handle_script_command(
-    config: &ServerConfig,
-    sessions: &play::SessionRegistry,
-    runtime_control: Option<&RuntimeControlHandle>,
-    simulation: &play::SimulationHandle,
-    command: ScriptCommand,
-) -> bool {
-    match command {
-        ScriptCommand::SendChatMessage { player_id, message } => {
-            if !sessions.send_script_system_chat(player_id.value(), message) {
-                debug!(
-                    player_id = player_id.value(),
-                    "script chat command targeted unknown player"
-                );
-            }
-            false
-        }
-        ScriptCommand::BroadcastChatMessage { message } => {
-            sessions.broadcast_script_system_chat(message);
-            false
-        }
-        ScriptCommand::DisconnectPlayer { player_id, reason } => {
-            if !sessions.disconnect_player(player_id.value(), reason) {
-                debug!(
-                    player_id = player_id.value(),
-                    "script disconnect command targeted unknown player"
-                );
-            }
-            false
-        }
-        ScriptCommand::RunConsoleCommand { command } => {
-            execute_console_command(
-                &command,
-                "script save-all",
-                "script stop",
-                config,
-                sessions,
-                runtime_control,
-                simulation,
-            )
-            .await
-        }
-        ScriptCommand::SpawnEntity {
-            actor,
-            entity_type,
-            position,
-        } => {
-            let Some(entity_type_id) = resolve_script_entity_type(config, &entity_type) else {
-                debug!(%entity_type, "script entity spawn requested an unknown entity type");
-                return false;
-            };
-            if let Err(error) = simulation
-                .spawn_script_entity(
-                    actor.value(),
-                    entity_type_id,
-                    entity_type,
-                    mc_entity::Vec3::new(position.x(), position.y(), position.z()),
-                )
-                .await
-            {
-                debug!(
-                    ?error,
-                    player_id = actor.value(),
-                    "script entity spawn rejected"
-                );
-            }
-            false
-        }
-        _ => {
-            debug!("unknown script command ignored");
-            false
-        }
-    }
-}
-
-fn resolve_script_entity_type(config: &ServerConfig, entity_type: &str) -> Option<i32> {
+pub(crate) fn resolve_script_entity_type(config: &ServerConfig, entity_type: &str) -> Option<i32> {
     let identifier = Identifier::parse(entity_type).ok()?;
     (identifier.as_str() == entity_type)
         .then(|| config.entity_types.id_of(&identifier))??
@@ -2173,11 +2241,19 @@ fn resolve_script_entity_type(config: &ServerConfig, entity_type: &str) -> Optio
 fn log_command_task_exit(
     result: Result<&'static str, tokio::task::JoinError>,
     shutdown_requested: bool,
-) {
+) -> std::io::Result<()> {
     match result {
-        Ok(task) if shutdown_requested => debug!(task, "command task stopped during shutdown"),
-        Ok(task) => warn!(task, "command task stopped unexpectedly"),
-        Err(error) => warn!(%error, "command task join failed"),
+        Ok(task) if shutdown_requested => {
+            debug!(task, "command task stopped during shutdown");
+            Ok(())
+        }
+        Ok(task) => {
+            warn!(task, "command task stopped unexpectedly");
+            Ok(())
+        }
+        Err(error) => Err(std::io::Error::other(format!(
+            "command task join failed: {error}"
+        ))),
     }
 }
 
@@ -2257,43 +2333,43 @@ fn handle_extension_command(
 fn handle_entity_ticker_exit(
     shutdown: &ShutdownHandle,
     result: Result<(), tokio::task::JoinError>,
-) {
-    match result {
+) -> std::io::Result<()> {
+    let result = match result {
         Ok(()) if shutdown.is_requested() => {
             debug!("entity ticker stopped after shutdown request");
+            Ok(())
         }
         Ok(()) => {
             warn!("entity ticker stopped unexpectedly; requesting server shutdown");
+            Err(std::io::Error::new(
+                ErrorKind::BrokenPipe,
+                "entity ticker stopped unexpectedly",
+            ))
         }
         Err(error) => {
             warn!(%error, "entity ticker task failed; requesting server shutdown");
+            Err(std::io::Error::other(format!(
+                "entity ticker task failed: {error}"
+            )))
         }
-    }
+    };
     shutdown.request();
+    result
 }
 
-async fn drain_entity_ticker_then_save<S, SR>(
-    entity_ticker: tokio::task::JoinHandle<()>,
-    save: S,
-) -> SR
-where
-    S: Future<Output = SR>,
-{
-    drain_entity_ticker(entity_ticker).await;
-    save.await
-}
-
-async fn drain_entity_ticker(entity_ticker: tokio::task::JoinHandle<()>) {
-    drain_entity_ticker_with_timeout(entity_ticker, ENTITY_TICKER_DRAIN_TIMEOUT).await;
+async fn drain_entity_ticker(entity_ticker: tokio::task::JoinHandle<()>) -> std::io::Result<()> {
+    drain_entity_ticker_with_timeout(entity_ticker, ENTITY_TICKER_DRAIN_TIMEOUT).await
 }
 
 async fn drain_entity_ticker_with_timeout(
     mut entity_ticker: tokio::task::JoinHandle<()>,
     timeout: Duration,
-) {
+) -> std::io::Result<()> {
     match tokio::time::timeout(timeout, &mut entity_ticker).await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => warn!(error = %err, "entity ticker task join failed"),
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(std::io::Error::other(format!(
+            "entity ticker task join failed: {error}"
+        ))),
         Err(_) => {
             warn!("entity ticker drain timed out; cancelling task");
             entity_ticker.abort();
@@ -2302,40 +2378,66 @@ async fn drain_entity_ticker_with_timeout(
                 Err(error) if error.is_cancelled() => {}
                 Err(error) => warn!(%error, "entity ticker failed while being cancelled"),
             }
+            Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "entity ticker drain timed out",
+            ))
         }
     }
 }
 
-async fn drain_periodic_save_worker(worker: Option<crate::dirty_flush::DirtyFlushCoordinator>) {
+async fn drain_periodic_save_worker(
+    worker: Option<crate::dirty_flush::DirtyFlushCoordinator>,
+) -> std::io::Result<()> {
     let Some(worker) = worker else {
-        return;
+        return Ok(());
     };
-    worker.drain().await;
+    worker
+        .drain()
+        .await
+        .into_result()
+        .map_err(|error| std::io::Error::other(format!("periodic save worker: {error}")))
 }
 
-async fn drain_connections(connections: &mut tokio::task::JoinSet<()>) {
-    drain_connections_with_timeout(connections, CONNECTION_DRAIN_TIMEOUT).await;
+async fn drain_connections(connections: &mut tokio::task::JoinSet<()>) -> std::io::Result<()> {
+    drain_connections_with_timeout(connections, CONNECTION_DRAIN_TIMEOUT).await
 }
 
 async fn drain_connections_with_timeout(
     connections: &mut tokio::task::JoinSet<()>,
     timeout: Duration,
-) {
+) -> std::io::Result<()> {
     let started = Instant::now();
+    let mut join_error = None;
     while !connections.is_empty() {
         let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
             cancel_connection_tasks(connections).await;
-            return;
+            return Err(std::io::Error::new(
+                ErrorKind::TimedOut,
+                "connection drain timed out",
+            ));
         };
         match tokio::time::timeout(remaining, connections.join_next()).await {
             Ok(Some(Ok(()))) => {}
-            Ok(Some(Err(err))) => warn!(error = %err, "connection task join failed"),
-            Ok(None) => return,
+            Ok(Some(Err(error))) => {
+                warn!(%error, "connection task join failed");
+                join_error.get_or_insert_with(|| {
+                    std::io::Error::other(format!("connection task join failed: {error}"))
+                });
+            }
+            Ok(None) => break,
             Err(_) => {
                 cancel_connection_tasks(connections).await;
-                return;
+                return Err(std::io::Error::new(
+                    ErrorKind::TimedOut,
+                    "connection drain timed out",
+                ));
             }
         }
+    }
+    match join_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -2423,11 +2525,8 @@ struct SimulationCommandTelemetry {
 fn runtime_control_tick_input(tick_us: u64) -> RuntimeControlInput {
     RuntimeControlInput {
         tick_ms: tick_us.div_ceil(1_000),
-        queued_chunks: 0,
-        queue_capacity: 0,
         memory_used_mb: 0,
         memory_limit_mb: 0,
-        first_chunk_ms: None,
     }
 }
 
@@ -2451,13 +2550,97 @@ fn observe_runtime_control_tick(
     control: &RuntimeControlHandle,
     resources: &ChunkPipelineResources,
     sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
     tick_us: u64,
-) -> crate::AutoscaleDecision {
-    let decision = control.observe(runtime_control_tick_input(tick_us));
-    let cpu_limit =
-        resources.apply_runtime_control_action(decision.action, control.snapshot().draining);
+) -> Option<crate::AutoscaleDecision> {
+    match apply_runtime_control_operation(
+        control,
+        resources,
+        sessions,
+        shutdown,
+        RuntimeControlOperation::Observe(runtime_control_tick_input(tick_us)),
+    ) {
+        Some(RuntimeControlOutcome::Autoscale(decision)) => Some(decision),
+        Some(RuntimeControlOutcome::Work(_)) => unreachable!("tick observation is autoscale"),
+        None => None,
+    }
+}
+
+fn observe_runtime_control_signal(
+    control: &RuntimeControlHandle,
+    resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
+    signal: RuntimeControlSignal,
+) -> Option<crate::AutoscaleDecision> {
+    match apply_runtime_control_operation(
+        control,
+        resources,
+        sessions,
+        shutdown,
+        RuntimeControlOperation::ObserveSignal(signal),
+    ) {
+        Some(RuntimeControlOutcome::Autoscale(decision)) => Some(decision),
+        Some(RuntimeControlOutcome::Work(_)) => unreachable!("signal observation is autoscale"),
+        None => None,
+    }
+}
+
+fn request_runtime_control_drain(
+    control: &RuntimeControlHandle,
+    resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
+) -> Option<crate::AutoscaleDecision> {
+    match apply_runtime_control_operation(
+        control,
+        resources,
+        sessions,
+        shutdown,
+        RuntimeControlOperation::RequestDrain,
+    ) {
+        Some(RuntimeControlOutcome::Autoscale(decision)) => Some(decision),
+        Some(RuntimeControlOutcome::Work(_)) => unreachable!("drain is autoscale"),
+        None => None,
+    }
+}
+
+fn apply_runtime_control_operation(
+    control: &RuntimeControlHandle,
+    resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+    shutdown: &ShutdownHandle,
+    operation: RuntimeControlOperation,
+) -> Option<RuntimeControlOutcome> {
+    match control.apply(operation, |outcome, proposed| {
+        if let RuntimeControlOutcome::Autoscale(decision) = outcome {
+            apply_runtime_control_decision(resources, sessions, decision, proposed.draining)?;
+        }
+        Ok(())
+    }) {
+        Ok(outcome) => Some(outcome),
+        Err(RuntimeControlApplyError::ControlledStop { reason }) => {
+            warn!(%reason, "runtime control application requires controlled shutdown");
+            shutdown.request();
+            None
+        }
+    }
+}
+
+fn apply_runtime_control_decision(
+    resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+    decision: &crate::AutoscaleDecision,
+    draining: bool,
+) -> Result<(), RuntimeControlApplyError> {
+    let cpu_limit = resources.apply_runtime_control_action(decision.action, draining);
+    let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(cpu_limit);
+    if entity_owner_lanes != cpu_limit {
+        return Err(RuntimeControlApplyError::controlled_stop(format!(
+            "runtime CPU admission applied {cpu_limit} workers but entity authority applied {entity_owner_lanes} owner lanes"
+        )));
+    }
     if decision.action != crate::AutoscaleAction::Hold {
-        let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(cpu_limit);
         info!(
             action = ?decision.action,
             cpu_limit,
@@ -2472,7 +2655,45 @@ fn observe_runtime_control_tick(
             debug!(removed, "memory pressure released shared prepared chunks");
         }
     }
-    decision
+    Ok(())
+}
+
+async fn recv_runtime_control_signal(
+    signals: &mut Option<RuntimeControlSignalReceiver>,
+) -> Option<RuntimeControlSignal> {
+    match signals.as_mut() {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn forward_slow_client_sheds_to_runtime_control(
+    sessions: Arc<play::SessionRegistry>,
+    control: RuntimeControlHandle,
+    shutdown: ShutdownHandle,
+) {
+    let mut generation = sessions.pressure_change_generation();
+    let mut slow_client_pressure_sheds = 0;
+    let initial = sessions.pressure_snapshot().slow_client_pressure_sheds;
+    if initial > slow_client_pressure_sheds && !control.push_slow_client_shed() {
+        debug!("runtime control signal consumer closed");
+        return;
+    }
+    slow_client_pressure_sheds = initial;
+    loop {
+        tokio::select! {
+            () = shutdown.notified() => return,
+            () = sessions.wait_for_pressure_change(generation) => {
+                generation = sessions.pressure_change_generation();
+                let current = sessions.pressure_snapshot().slow_client_pressure_sheds;
+                if current > slow_client_pressure_sheds && !control.push_slow_client_shed() {
+                    debug!("runtime control signal consumer closed");
+                    return;
+                }
+                slow_client_pressure_sheds = current;
+            }
+        }
+    }
 }
 
 fn should_log_runtime_metrics(tick: u64, tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
@@ -2488,6 +2709,7 @@ async fn run_console_commands(
     sessions: Arc<play::SessionRegistry>,
     runtime_control: Option<RuntimeControlHandle>,
     simulation: play::SimulationHandle,
+    chunk_pipeline_resources: ChunkPipelineResources,
 ) {
     let mut lines = console_line_receiver();
     loop {
@@ -2519,6 +2741,7 @@ async fn run_console_commands(
             &sessions,
             runtime_control.as_ref(),
             &simulation,
+            &chunk_pipeline_resources,
         )
         .await
         {
@@ -2528,7 +2751,7 @@ async fn run_console_commands(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn execute_console_command(
+pub(crate) async fn execute_console_command(
     raw: &str,
     save_context: &'static str,
     stop_context: &'static str,
@@ -2536,6 +2759,7 @@ async fn execute_console_command(
     sessions: &play::SessionRegistry,
     runtime_control: Option<&RuntimeControlHandle>,
     simulation: &play::SimulationHandle,
+    chunk_pipeline_resources: &ChunkPipelineResources,
 ) -> bool {
     match play::commands::parse_admin_command(raw, play::commands::CommandPermissions::CONSOLE) {
         Ok(play::commands::AdminCommand::SaveAll) => {
@@ -2545,21 +2769,17 @@ async fn execute_console_command(
             false
         }
         Ok(play::commands::AdminCommand::Stop) => {
-            let report = request_stop_after_save(
+            request_stop(
                 &config.shutdown,
                 runtime_control,
-                save_all_after_simulation_barrier(stop_context, config, sessions, simulation),
-            )
-            .await;
-            log_save_report(stop_context, &report);
-            if report.is_ok() {
-                return true;
-            }
-            warn!(
-                context = stop_context,
-                "stop aborted because save-all failed"
+                chunk_pipeline_resources,
+                sessions,
             );
-            false
+            info!(
+                context = stop_context,
+                "console stop requested runtime drain"
+            );
+            true
         }
         Ok(play::commands::AdminCommand::TimeSet(time)) => {
             match simulation.set_world_time_server_owned(time).await {
@@ -2627,24 +2847,21 @@ fn console_line_receiver() -> broadcast::Receiver<String> {
         .subscribe()
 }
 
-pub(crate) async fn request_stop_after_save<S>(
+pub(crate) fn request_stop(
     shutdown: &ShutdownHandle,
     runtime_control: Option<&RuntimeControlHandle>,
-    save: S,
-) -> SaveAllReport
-where
-    S: Future<Output = SaveAllReport>,
-{
-    let report = save.await;
-    if !report.is_ok() {
-        return report;
-    }
+    chunk_pipeline_resources: &ChunkPipelineResources,
+    sessions: &play::SessionRegistry,
+) {
     if let Some(runtime_control) = runtime_control {
-        runtime_control.request_drain();
+        request_runtime_control_drain(
+            runtime_control,
+            chunk_pipeline_resources,
+            sessions,
+            shutdown,
+        );
     }
     shutdown.request();
-    info!("console stop saved an owner snapshot before requesting shutdown");
-    report
 }
 
 fn log_save_report(context: &'static str, report: &SaveAllReport) {
@@ -2700,6 +2917,7 @@ struct CompletedEntityPhysics {
     expected: Vec<play::EntityPhysicsQuery>,
     snapshot: Arc<EntityPhysicsSnapshot>,
     steps: Vec<play::EntityPhysicsStep>,
+    arrow_physics_facts: Vec<play::ArrowPhysicsFact>,
 }
 
 fn spawn_entity_physics_job(
@@ -2714,11 +2932,14 @@ fn spawn_entity_physics_job(
     tokio::spawn(async move {
         let _prepare_task = prepare_task;
         let steps = step_entity_physics_inputs(cpu_resources, inputs).await;
+        let arrow_physics_facts =
+            arrow_physics_facts_from_steps(tick, &expected, &snapshot, &steps);
         CompletedEntityPhysics {
             tick,
             expected,
             snapshot,
             steps,
+            arrow_physics_facts,
         }
     })
 }
@@ -2769,6 +2990,7 @@ async fn apply_entity_physics_job_result(
         completed.tick,
         &completed.expected,
         &completed.steps,
+        &completed.arrow_physics_facts,
     );
     if accepted_steps.len() != produced_steps {
         debug!(
@@ -2902,6 +3124,172 @@ impl SampledPhysicsWorld {
         let local_z = z.rem_euclid(mc_world::SECTION_DIM as i32) as u8;
         chunk.get_block(local_x, y, local_z).map(|state| state.0)
     }
+}
+
+fn arrow_physics_facts_from_steps(
+    tick: u64,
+    expected: &[play::EntityPhysicsQuery],
+    snapshot: &Arc<EntityPhysicsSnapshot>,
+    steps: &[play::EntityPhysicsStep],
+) -> Vec<play::ArrowPhysicsFact> {
+    let sampler = SampledPhysicsWorld {
+        snapshot: Arc::clone(snapshot),
+    };
+    let mut expected = expected.iter();
+
+    steps
+        .iter()
+        .filter_map(|step| {
+            // Physics preserves query order and may omit rejected inputs. Walking
+            // the ordered source once avoids an all-query index allocation.
+            let query = expected.find(|query| query.id == step.id)?;
+            let play::EntityPhysicsKind::ArrowProjectile { embedded_block, .. } = query.kind else {
+                return None;
+            };
+            let endpoint_block =
+                collision_block_touching_arrow_endpoint(&sampler, step.position, query.aabb);
+            let block_hit = if query.velocity != mc_entity::Vec3::ZERO {
+                endpoint_block.map(|(block_position, block_state)| play::ArrowBlockHitFact {
+                    arrow_id: step.id,
+                    block_state: mc_world::BlockStateId(block_state),
+                    block_position,
+                    // `step.position` is the contact endpoint resolved against this snapshot.
+                    location: step.position,
+                })
+            } else {
+                None
+            };
+            let retained_block_state = embedded_block.map(|position| {
+                sampler
+                    .state_id_at(position.x, position.y, position.z)
+                    .unwrap_or(snapshot.materials.air)
+            });
+            let current_block_state = retained_block_state
+                .or_else(|| endpoint_block.map(|(_, state)| state))
+                .or_else(|| {
+                    sampler.state_id_at(
+                        step.position.x.floor() as i32,
+                        step.position.y.floor() as i32,
+                        step.position.z.floor() as i32,
+                    )
+                })
+                .unwrap_or(snapshot.materials.air);
+            let retained_supports_arrow = retained_block_state
+                .is_some_and(|state| snapshot.materials.classify(state).is_solid());
+            let embedded_in_block = if embedded_block.is_some() {
+                retained_supports_arrow
+            } else {
+                endpoint_block.is_some()
+            };
+            let in_water = arrow_bounds_overlap_water(&sampler, step.position, query.aabb);
+            Some(play::ArrowPhysicsFact {
+                arrow_id: step.id,
+                block_hit,
+                embedded_in_block,
+                current_block_state: mc_world::BlockStateId(current_block_state),
+                should_fall: !embedded_in_block,
+                fall_velocity_scale: arrow_fall_velocity_scale(step.id, tick),
+                in_water,
+                // Weather is not yet a world authority; water is the complete
+                // supported source for this combined vanilla predicate.
+                in_water_or_rain: in_water,
+            })
+        })
+        .collect()
+}
+
+fn arrow_bounds_overlap_water(
+    sampler: &SampledPhysicsWorld,
+    position: mc_entity::Vec3,
+    aabb: mc_physics::Aabb,
+) -> bool {
+    const BOUNDS_EPSILON: f64 = 1.0e-9;
+    let min_x = (position.x - aabb.half_width + BOUNDS_EPSILON).floor() as i32;
+    let max_x = (position.x + aabb.half_width - BOUNDS_EPSILON).floor() as i32;
+    let min_y = (position.y + BOUNDS_EPSILON).floor() as i32;
+    let max_y = (position.y + aabb.height - BOUNDS_EPSILON).floor() as i32;
+    let min_z = (position.z - aabb.half_width + BOUNDS_EPSILON).floor() as i32;
+    let max_z = (position.z + aabb.half_width - BOUNDS_EPSILON).floor() as i32;
+    (min_y..=max_y).any(|y| {
+        (min_z..=max_z)
+            .any(|z| (min_x..=max_x).any(|x| sampler.material_at(x, y, z) == BlockMaterial::Water))
+    })
+}
+
+fn arrow_fall_velocity_scale(entity: mc_entity::EntityId, tick: u64) -> mc_entity::Vec3 {
+    fn component(seed: u64) -> f64 {
+        let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        (value >> 11) as f64 * (0.2 / ((1_u64 << 53) as f64))
+    }
+
+    let seed = tick ^ (entity.0 as i64 as u64).rotate_left(32);
+    mc_entity::Vec3::new(
+        component(seed),
+        component(seed.wrapping_add(1)),
+        component(seed.wrapping_add(2)),
+    )
+}
+
+fn collision_block_touching_arrow_endpoint(
+    sampler: &SampledPhysicsWorld,
+    position: mc_entity::Vec3,
+    aabb: mc_physics::Aabb,
+) -> Option<(mc_entity::projectile_26_1_2::BlockPosition, u32)> {
+    const CONTACT_EPSILON: f64 = 1.0e-9;
+    let min_x = (position.x - aabb.half_width - CONTACT_EPSILON).floor() as i32;
+    let max_x = (position.x + aabb.half_width + CONTACT_EPSILON).floor() as i32;
+    let min_y = (position.y - CONTACT_EPSILON).floor() as i32;
+    let max_y = (position.y + aabb.height + CONTACT_EPSILON).floor() as i32;
+    let min_z = (position.z - aabb.half_width - CONTACT_EPSILON).floor() as i32;
+    let max_z = (position.z + aabb.half_width + CONTACT_EPSILON).floor() as i32;
+    let mut first_colliding_state = None;
+
+    for y in min_y..=max_y {
+        for z in min_z..=max_z {
+            for x in min_x..=max_x {
+                let Some(state) = sampler.state_id_at(x, y, z) else {
+                    continue;
+                };
+                sampler.collision_boxes_at(x, y, z, &mut |collision_box| {
+                    let [
+                        box_min_x,
+                        box_min_y,
+                        box_min_z,
+                        box_max_x,
+                        box_max_y,
+                        box_max_z,
+                    ] = collision_box.coordinates();
+                    let touches = position.x + aabb.half_width + CONTACT_EPSILON
+                        >= f64::from(x) + f64::from(box_min_x) / 16.0
+                        && position.x - aabb.half_width - CONTACT_EPSILON
+                            <= f64::from(x) + f64::from(box_max_x) / 16.0
+                        && position.y + aabb.height + CONTACT_EPSILON
+                            >= f64::from(y) + f64::from(box_min_y) / 16.0
+                        && position.y - CONTACT_EPSILON
+                            <= f64::from(y) + f64::from(box_max_y) / 16.0
+                        && position.z + aabb.half_width + CONTACT_EPSILON
+                            >= f64::from(z) + f64::from(box_min_z) / 16.0
+                        && position.z - aabb.half_width - CONTACT_EPSILON
+                            <= f64::from(z) + f64::from(box_max_z) / 16.0;
+                    if touches {
+                        let candidate = (x, y, z, state);
+                        if first_colliding_state.is_none_or(|first| candidate < first) {
+                            first_colliding_state = Some(candidate);
+                        }
+                    }
+                });
+            }
+        }
+    }
+    first_colliding_state.map(|(x, y, z, state)| {
+        (
+            mc_entity::projectile_26_1_2::BlockPosition::new(x, y, z),
+            state,
+        )
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -3109,7 +3497,7 @@ fn step_sampled_entity(input: EntityPhysicsInput) -> play::EntityPhysicsStep {
         velocity: entity_vec(result.body.velocity),
         on_ground: result.body.on_ground,
         horizontal_collision: result.horizontal_collision
-            && input.query.kind == play::EntityPhysicsKind::Living,
+            && matches!(input.query.kind, play::EntityPhysicsKind::Living),
     }
 }
 
@@ -3117,7 +3505,18 @@ fn physics_config_for_query(query: play::EntityPhysicsQuery) -> PhysicsConfig {
     match query.kind {
         play::EntityPhysicsKind::Default => PhysicsConfig::default(),
         play::EntityPhysicsKind::Living => PhysicsConfig::living_entity(),
-        play::EntityPhysicsKind::ArrowProjectile => PhysicsConfig::arrow_projectile(),
+        play::EntityPhysicsKind::ArrowProjectile { .. } => {
+            let mut config = PhysicsConfig::arrow_projectile();
+            // Retained projectile velocity is blocks per Minecraft tick. This
+            // adapter resolves only the authoritative collision endpoint; the
+            // projectile kernel owns drag and gravity after impact ordering.
+            config.tick_seconds = 1.0;
+            config.gravity = 0.0;
+            config.air_drag = 1.0;
+            config.vertical_air_drag = 1.0;
+            config.water_drag = 1.0;
+            config
+        }
     }
 }
 
@@ -3275,6 +3674,13 @@ async fn bind_internal(
     } else {
         None
     };
+    let script_storage = match (scripts.as_ref(), entity_world_root.as_deref()) {
+        (Some(scripts), Some(root)) => Some(
+            PluginStorageHandle::start(root, scripts.clone(), config.shutdown.clone())
+                .map_err(plugin_storage_bind_error)?,
+        ),
+        _ => None,
+    };
     let (sessions, pending_entity_commits) = if let Some(root) = entity_world_root.as_deref() {
         let (journal, pending) = play::persistence::FileRegionalDecisionJournal::open(root)
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
@@ -3395,8 +3801,15 @@ async fn bind_internal(
                     let entities = play::persistence::replay_regional_commit_decisions(
                         entities,
                         &pending_entity_commits,
-                    );
-                    let expected = entities.len();
+                    )
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            ErrorKind::InvalidData,
+                            format!("regional entity recovery failed: {error}"),
+                        )
+                    })?;
+                    let lifecycle_epoch = entities.lifecycle_clock;
+                    let expected = entities.records.len();
                     let restored = simulation_owner.restore_persisted_entities(&sessions, entities);
                     if restored != expected {
                         return Err(std::io::Error::new(
@@ -3406,6 +3819,7 @@ async fn bind_internal(
                             ),
                         ));
                     }
+                    sessions.synchronize_entity_lifecycle_epoch(lifecycle_epoch);
                     if restored > 0 {
                         info!(restored, "loaded persisted entities");
                     }
@@ -3452,7 +3866,18 @@ async fn bind_internal(
         simulation_owner,
         extension,
         scripts,
+        script_storage,
     })
+}
+
+fn plugin_storage_bind_error(error: crate::PluginStorageStartError) -> std::io::Error {
+    let kind = match &error {
+        crate::PluginStorageStartError::Io(source) => source.kind(),
+        crate::PluginStorageStartError::Malformed(_)
+        | crate::PluginStorageStartError::JournalTooLarge
+        | crate::PluginStorageStartError::LiveQuotaExceeded => ErrorKind::InvalidData,
+    };
+    std::io::Error::new(kind, error)
 }
 
 fn validate_public_security_config(
@@ -3841,7 +4266,7 @@ async fn save_all_with_context_snapshot_locked(
     report.timings.players_us = elapsed_us(started);
 
     let started = Instant::now();
-    let entity_count = entities.len();
+    let entity_count = entities.records.len();
     match save_entities_blocking(root.clone(), Arc::clone(&config.items), entities).await {
         Ok(()) => {
             report.entities_saved = entity_count;
@@ -3913,7 +4338,7 @@ async fn save_player_states_blocking(
 async fn save_entities_blocking(
     root: std::path::PathBuf,
     items: Arc<ItemRegistry>,
-    entities: Vec<play::persistence::PersistedEntityRecord>,
+    entities: play::persistence::PersistedEntityCheckpoint,
 ) -> Result<(), String> {
     crate::blocking::spawn_result_blocking(move || {
         play::persistence::save_persisted_entity_records(&root, &items, &entities)
@@ -3931,22 +4356,56 @@ async fn save_world_metadata_blocking(
     .await
 }
 
-/// Convenience for the binary: `bind` followed by `serve`.
+async fn serve_then_final_save(bound: BoundServer) -> std::io::Result<()> {
+    let save = bound.save_handle();
+    let serve_result = bound.serve().await;
+    finish_serve_with_final_save(serve_result, save.save_all_after_drain()).await
+}
+
+async fn finish_serve_with_final_save<S>(
+    serve_result: std::io::Result<()>,
+    save: S,
+) -> std::io::Result<()>
+where
+    S: Future<Output = SaveAllReport>,
+{
+    let serve_error = serve_result.err();
+    let report = save.await;
+    log_save_report("server run final save", &report);
+    if let Some(error) = serve_error {
+        Err(error)
+    } else if report.is_ok() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "final save failed with {} error(s)",
+            report.errors.len()
+        )))
+    }
+}
+
+/// Convenience for the binary: bind, drain, then perform one final save.
 pub async fn run(config: ServerConfig) -> std::io::Result<()> {
-    bind(config).await?.serve().await
+    bind(config).await?.serve_and_save().await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mc_data::blocks::{BlockReport, BlockStateReport};
-    use mc_script::{ScriptEventKind, ScriptPlayerId, script_boundary_pair};
+    use mc_script::{
+        LuaHostConfig, ScriptEventKind, ScriptPlayerId, script_boundary_pair, start_lua_host,
+    };
     use std::collections::BTreeMap;
     use std::num::NonZeroUsize;
     use std::sync::atomic::AtomicUsize;
     use tokio::sync::mpsc;
 
     type StateSpec<'a> = (u32, bool, &'a [(&'a str, &'a str)]);
+
+    fn canonical_entity_types() -> Arc<EntityTypeRegistry> {
+        Arc::new(mc_data::entity_types::solaris_required_entity_types())
+    }
 
     #[test]
     fn script_sink_routes_known_player_commands_with_exact_payload() {
@@ -4053,26 +4512,18 @@ mod tests {
             items: Arc::new(ItemRegistry::default()),
             item_facts: Arc::new(ItemFactsTable::default()),
             block_facts: Arc::new(BlockFactsTable::default()),
-            entity_types: Arc::new(EntityTypeRegistry::default()),
+            entity_types: canonical_entity_types(),
             biome_spawns: Arc::new(BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
             command_permissions: CommandPermissionConfig::new(Vec::<String>::new(), false),
             shutdown: ShutdownHandle::default(),
         };
-        let sessions = play::SessionRegistry::new();
         let (simulation, _owner) = play::simulation_channel();
-        let command = ScriptCommand::SpawnEntity {
-            actor: ScriptPlayerId::new(7),
-            entity_type: "minecraft:missing".to_owned(),
-            position: mc_script::ScriptPosition::try_new(1.0, 64.0, 1.0).unwrap(),
-        };
-
         assert_eq!(
             resolve_script_entity_type(&config, "minecraft:missing"),
             None
         );
-        assert!(!handle_script_command(&config, &sessions, None, &simulation, command).await);
         assert_eq!(simulation.snapshot().depth, 0);
     }
 
@@ -4093,7 +4544,7 @@ mod tests {
             items: Arc::new(ItemRegistry::default()),
             item_facts: Arc::new(ItemFactsTable::default()),
             block_facts: Arc::new(BlockFactsTable::default()),
-            entity_types: Arc::new(EntityTypeRegistry::default()),
+            entity_types: canonical_entity_types(),
             biome_spawns: Arc::new(BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
@@ -4101,6 +4552,7 @@ mod tests {
             shutdown: ShutdownHandle::default(),
         };
         let sessions = play::SessionRegistry::new();
+        let chunk_pipeline_resources = ChunkPipelineResources::with_limits(1, 1);
         let (simulation, mut owner) = play::simulation_channel();
         let mut command = Box::pin(execute_console_command(
             "time set night",
@@ -4110,6 +4562,7 @@ mod tests {
             &sessions,
             None,
             &simulation,
+            &chunk_pipeline_resources,
         ));
 
         std::future::poll_fn(|cx| {
@@ -4132,9 +4585,11 @@ mod tests {
     fn stopped_entity_ticker_requests_server_shutdown() {
         let shutdown = ShutdownHandle::default();
 
-        handle_entity_ticker_exit(&shutdown, Ok(()));
+        let error =
+            handle_entity_ticker_exit(&shutdown, Ok(())).expect_err("unexpected stop fails");
 
         assert!(shutdown.is_requested());
+        assert_eq!(error.kind(), ErrorKind::BrokenPipe);
     }
 
     #[test]
@@ -4227,6 +4682,121 @@ mod tests {
             Ok(ExtensionOutboundCommand::DisconnectPlayer { player_id, .. })
                 if player_id == PlayerId::new(91)
         ));
+    }
+
+    #[tokio::test]
+    async fn script_command_task_drains_buffered_command_before_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = Arc::new(save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(ItemRegistry::default()),
+            canonical_entity_types(),
+        ));
+        let (boundary, endpoint) =
+            script_boundary_pair(NonZeroUsize::new(4).unwrap(), NonZeroUsize::new(4).unwrap());
+        let scripts = ScriptEventSink::new(boundary);
+        endpoint
+            .try_submit_command(ScriptCommand::BroadcastChatMessage {
+                message: "accepted before shutdown".to_owned(),
+            })
+            .unwrap();
+        drop(endpoint);
+        let shutdown = config.shutdown.clone();
+        shutdown.request();
+        let (simulation, _owner) = play::simulation_channel();
+
+        run_script_commands(ScriptCommandTask {
+            scripts: scripts.clone(),
+            storage: None,
+            config,
+            sessions: Arc::new(play::SessionRegistry::new()),
+            runtime_control: None,
+            simulation,
+            chunk_pipeline_resources: ChunkPipelineResources::with_limits(1, 1),
+            shutdown,
+        })
+        .await;
+
+        assert!(
+            scripts.recv_command().await.is_none(),
+            "buffered script command must be consumed before the shutdown fence"
+        );
+    }
+
+    #[tokio::test]
+    async fn script_stop_drains_later_commands_from_the_same_host_batch() {
+        let plugins = tempfile::tempdir().unwrap();
+        let plugin = plugins.path().join("stop-batch");
+        std::fs::create_dir(&plugin).unwrap();
+        std::fs::write(
+            plugin.join("plugin.toml"),
+            r#"id = "stop-batch"
+name = "Stop Batch"
+version = "0.1.0"
+api = "0.6.0"
+events = ["server.started", "server.stopping"]
+console_commands = ["stop"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            plugin.join("main.lua"),
+            r#"function on_server_started(_event)
+    solaris.run_console("stop")
+end
+
+function on_server_stopping(_event)
+    solaris.broadcast("accepted after stop")
+end
+"#,
+        )
+        .unwrap();
+
+        let (boundary, host) = start_lua_host(LuaHostConfig::new(plugins.path())).unwrap();
+        assert_eq!(host.loaded_plugins(), 1);
+        let shutdown_boundary = boundary.clone();
+        let scripts = ScriptEventSink::new(boundary);
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = Arc::new(save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(ItemRegistry::default()),
+            canonical_entity_types(),
+        ));
+        let sessions = Arc::new(play::SessionRegistry::new());
+        let shutdown = config.shutdown.clone();
+        let (simulation, _owner) = play::simulation_channel();
+
+        scripts.enqueue_event(ScriptEvent::server_started());
+        let command_task = tokio::spawn(run_script_commands(ScriptCommandTask {
+            scripts: scripts.clone(),
+            storage: None,
+            config,
+            sessions,
+            runtime_control: None,
+            simulation,
+            chunk_pipeline_resources: ChunkPipelineResources::with_limits(1, 1),
+            shutdown: shutdown.clone(),
+        }));
+
+        shutdown.wait_requested().await;
+        scripts.enqueue_event(ScriptEvent::server_stopping("server stopping"));
+        shutdown_boundary.close_event_admission();
+        tokio::task::spawn_blocking(move || host.join())
+            .await
+            .unwrap()
+            .unwrap();
+        command_task.await.unwrap();
+
+        let leftover = scripts.recv_command().await;
+        assert!(
+            leftover.is_none(),
+            "script stop must drain commands emitted by the accepted stopping event"
+        );
+        drop(scripts);
     }
 
     #[test]
@@ -4530,6 +5100,270 @@ mod tests {
         assert!(!entity_physics_snapshot_is_current(&world_read, &snapshot));
     }
 
+    #[test]
+    fn arrow_physics_samples_chunk_boundary_and_wires_block_hit_fact() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let stone = state_id(&reports, "minecraft:stone", &[]);
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let mut world = WorldStorage::in_memory(blocks);
+        for chunk_x in [0, 1] {
+            let position = mc_world::ChunkPos { x: chunk_x, z: 0 };
+            world
+                .insert_generated_chunk(
+                    position,
+                    mc_world::Chunk::empty(position, mc_world::BlockStateId(air), biome.clone()),
+                )
+                .unwrap();
+        }
+        world
+            .set_block_at(
+                mc_world::BlockPos { x: 16, y: 64, z: 8 },
+                mc_world::BlockStateId(stone),
+            )
+            .unwrap();
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(71),
+            position: mc_entity::Vec3::new(15.5, 64.25, 8.5),
+            velocity: mc_entity::Vec3::new(1.0, 0.0, 0.0),
+            aabb: mc_physics::Aabb {
+                half_width: 0.25,
+                height: 0.5,
+            },
+            on_ground: false,
+            kind: play::EntityPhysicsKind::ArrowProjectile {
+                revision: None,
+                embedded_block: None,
+            },
+        };
+        let input = sample_entity_physics_input(query, &mut world, &materials);
+        assert!(input.complete_samples);
+        assert!(
+            input
+                .snapshot
+                .chunks
+                .contains_key(&mc_world::ChunkPos { x: 0, z: 0 })
+        );
+        assert!(
+            input
+                .snapshot
+                .chunks
+                .contains_key(&mc_world::ChunkPos { x: 1, z: 0 })
+        );
+        let snapshot = Arc::clone(&input.snapshot);
+        let step = step_sampled_entity(input);
+
+        let facts = arrow_physics_facts_from_steps(1, &[query], &snapshot, &[step]);
+
+        assert_eq!(facts.len(), 1);
+        assert_eq!(facts[0].arrow_id, query.id);
+        let block_hit = facts[0].block_hit.expect("arrow endpoint hits stone");
+        assert_eq!(block_hit.block_state, mc_world::BlockStateId(stone));
+        assert_eq!(
+            block_hit.block_position,
+            mc_entity::projectile_26_1_2::BlockPosition::new(16, 64, 8)
+        );
+        assert_eq!(block_hit.location, step.position);
+    }
+
+    #[test]
+    fn arrow_endpoint_sampler_uses_exact_block_collision_shape() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let slab = state_id(
+            &reports,
+            "minecraft:oak_slab",
+            &[("type", "bottom"), ("waterlogged", "false")],
+        );
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let position = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut chunk = mc_world::Chunk::empty(
+            position,
+            mc_world::BlockStateId(air),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        let _ = chunk.set_block(8, 64, 8, mc_world::BlockStateId(slab));
+        let mut world = WorldStorage::in_memory(blocks);
+        world.insert_generated_chunk(position, chunk).unwrap();
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(72),
+            position: mc_entity::Vec3::new(8.5, 64.5, 8.5),
+            velocity: mc_entity::Vec3::ZERO,
+            aabb: mc_physics::Aabb {
+                half_width: 0.25,
+                height: 0.5,
+            },
+            on_ground: true,
+            kind: play::EntityPhysicsKind::ArrowProjectile {
+                revision: None,
+                embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
+            },
+        };
+        let input = sample_entity_physics_input(query, &mut world, &materials);
+        let snapshot = Arc::clone(&input.snapshot);
+        let sampler = SampledPhysicsWorld {
+            snapshot: Arc::clone(&snapshot),
+        };
+
+        assert_eq!(
+            collision_block_touching_arrow_endpoint(
+                &sampler,
+                mc_entity::Vec3::new(8.5, 64.5, 8.5),
+                query.aabb,
+            ),
+            Some((
+                mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8),
+                slab
+            ))
+        );
+        assert_eq!(
+            collision_block_touching_arrow_endpoint(
+                &sampler,
+                mc_entity::Vec3::new(8.5, 64.500_000_002, 8.5),
+                query.aabb,
+            ),
+            None
+        );
+        let embedded = play::EntityPhysicsStep {
+            id: query.id,
+            position: mc_entity::Vec3::new(8.5, 64.500_000_002, 8.5),
+            velocity: mc_entity::Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        };
+        let fact = arrow_physics_facts_from_steps(4, &[query], &snapshot, &[embedded])[0];
+        assert!(fact.embedded_in_block);
+        assert_eq!(fact.current_block_state, mc_world::BlockStateId(slab));
+        assert!(!fact.should_fall);
+        assert!(fact.block_hit.is_none());
+    }
+
+    #[test]
+    fn arrow_environment_sampler_propagates_water_and_support_loss() {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let air = state_id(&reports, "minecraft:air", &[]);
+        let water = state_id(&reports, "minecraft:water", &[]);
+        let blocks = Arc::new(BlockRegistry::from_report(&reports).unwrap());
+        let facts = BlockFactsTable::from_blocks_report(&reports);
+        let materials = material_ids(&blocks, &facts);
+        let position = mc_world::ChunkPos { x: 0, z: 0 };
+        let mut chunk = mc_world::Chunk::empty(
+            position,
+            mc_world::BlockStateId(air),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+        let _ = chunk.set_block(8, 64, 8, mc_world::BlockStateId(water));
+        let mut world = WorldStorage::in_memory(blocks);
+        world.insert_generated_chunk(position, chunk).unwrap();
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(74),
+            position: mc_entity::Vec3::new(8.5, 64.0, 8.5),
+            velocity: mc_entity::Vec3::ZERO,
+            aabb: mc_physics::Aabb {
+                half_width: 0.25,
+                height: 0.5,
+            },
+            on_ground: false,
+            kind: play::EntityPhysicsKind::ArrowProjectile {
+                revision: None,
+                embedded_block: Some(mc_entity::projectile_26_1_2::BlockPosition::new(8, 64, 8)),
+            },
+        };
+        let input = sample_entity_physics_input(query, &mut world, &materials);
+        let snapshot = Arc::clone(&input.snapshot);
+        let step = step_sampled_entity(input);
+
+        let fact = arrow_physics_facts_from_steps(9, &[query], &snapshot, &[step])[0];
+
+        assert!(fact.in_water);
+        assert!(fact.in_water_or_rain);
+        assert!(!fact.embedded_in_block);
+        assert_eq!(fact.current_block_state, mc_world::BlockStateId(water));
+        assert!(fact.should_fall);
+        for component in [
+            fact.fall_velocity_scale.x,
+            fact.fall_velocity_scale.y,
+            fact.fall_velocity_scale.z,
+        ] {
+            assert!((0.0..0.2).contains(&component));
+        }
+    }
+
+    #[test]
+    fn stale_arrow_snapshot_fact_is_rejected_after_world_mutation() {
+        let blocks = Arc::new(
+            BlockRegistry::from_report(&[
+                report("minecraft:air", &[], &[(0, true, &[])]),
+                report("minecraft:stone", &[], &[(1, true, &[])]),
+            ])
+            .unwrap(),
+        );
+        let mut world = WorldStorage::in_memory(Arc::clone(&blocks));
+        let chunk = mc_world::ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                chunk,
+                mc_world::Chunk::empty(
+                    chunk,
+                    mc_world::BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+        world
+            .set_block_at(
+                mc_world::BlockPos { x: 8, y: 64, z: 8 },
+                mc_world::BlockStateId(1),
+            )
+            .unwrap();
+        let world_read = world.read_view();
+        let captured = world_read.snapshot_chunks(&[chunk]);
+        let snapshot = Arc::new(EntityPhysicsSnapshot {
+            chunks: HashMap::from([(chunk, captured.chunk(chunk))]),
+            materials: Arc::new(BlockMaterialIds::new(0, None, None)),
+        });
+        let query = play::EntityPhysicsQuery {
+            id: mc_entity::EntityId(73),
+            position: mc_entity::Vec3::new(8.5, 64.25, 7.5),
+            velocity: mc_entity::Vec3::new(0.0, 0.0, 1.0),
+            aabb: mc_physics::Aabb {
+                half_width: 0.25,
+                height: 0.5,
+            },
+            on_ground: false,
+            kind: play::EntityPhysicsKind::ArrowProjectile {
+                revision: None,
+                embedded_block: None,
+            },
+        };
+        let step = play::EntityPhysicsStep {
+            id: query.id,
+            position: mc_entity::Vec3::new(8.5, 64.25, 7.75),
+            velocity: mc_entity::Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        };
+        assert!(
+            arrow_physics_facts_from_steps(1, &[query], &snapshot, &[step])[0]
+                .block_hit
+                .is_some()
+        );
+
+        world
+            .set_block_at(
+                mc_world::BlockPos { x: 8, y: 64, z: 8 },
+                mc_world::BlockStateId(0),
+            )
+            .unwrap();
+
+        assert!(!entity_physics_snapshot_is_current(&world_read, &snapshot));
+    }
+
     #[tokio::test]
     async fn entity_physics_sampling_does_not_wait_for_world_writer() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4552,7 +5386,7 @@ mod tests {
             tmp.path(),
             Arc::clone(&blocks),
             Arc::new(mc_data::items::ItemRegistry::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         );
         let world = Arc::clone(config.world.as_ref().unwrap());
         let world_read = {
@@ -4675,7 +5509,10 @@ mod tests {
 
         let resources = ChunkPipelineResources::with_limits(1, 8);
         let sessions = play::SessionRegistry::new();
-        let decision = observe_runtime_control_tick(&control, &resources, &sessions, 49_001);
+        let shutdown = ShutdownHandle::default();
+        let decision =
+            observe_runtime_control_tick(&control, &resources, &sessions, &shutdown, 49_001)
+                .unwrap();
         assert_eq!(decision.pressure, Some(crate::AutoscalePressure::Memory));
         assert_eq!(decision.action, crate::AutoscaleAction::ScaleDown);
         assert_eq!(resources.cpu_limit(), 4);
@@ -5218,7 +6055,7 @@ mod tests {
             items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
             item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
             block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+            entity_types: canonical_entity_types(),
             biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy::default(),
             random_tick: play::RandomTickPolicy::default(),
@@ -5252,7 +6089,7 @@ mod tests {
             items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
             item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
             block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+            entity_types: canonical_entity_types(),
             biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy {
                 chunk_worker_threads: 8,
@@ -5291,6 +6128,188 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_shutdown_drains_without_starting_final_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(mc_data::items::ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        let shutdown = config.shutdown.clone();
+        let bound = bind(config).await.expect("bind");
+        let save = bound.save_handle();
+        let serve = tokio::spawn(bound.serve());
+
+        shutdown.request();
+        tokio::time::timeout(Duration::from_secs(2), serve)
+            .await
+            .expect("serve drain exits after shutdown")
+            .expect("serve task joins")
+            .expect("serve drain succeeds");
+
+        let metadata = tmp.path().join("solaris").join("world.dat");
+        assert!(
+            !metadata.exists(),
+            "serve drain must not perform the final save"
+        );
+
+        let report = save.save_all_after_drain().await;
+        assert!(report.is_ok(), "single final save failed: {report:?}");
+        assert!(report.world_metadata_saved);
+        assert!(metadata.exists());
+    }
+
+    #[tokio::test]
+    async fn public_run_performs_final_save_after_successful_drain() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(mc_data::items::ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        config.shutdown.request();
+
+        run(config).await.expect("public run drains and saves");
+
+        assert!(tmp.path().join("solaris").join("world.dat").exists());
+    }
+
+    #[tokio::test]
+    async fn run_bound_propagates_final_save_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(mc_data::items::ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        let shutdown = config.shutdown.clone();
+        let bound = bind(config).await.expect("bind");
+        std::fs::write(tmp.path().join("solaris"), b"blocks save directory").unwrap();
+        shutdown.request();
+
+        let error = serve_then_final_save(bound)
+            .await
+            .expect_err("final save failure reaches run caller");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("final save failed"));
+    }
+
+    #[tokio::test]
+    async fn serve_error_still_runs_final_save_without_masking_primary_error() {
+        let save_called = Arc::new(AtomicBool::new(false));
+        let save_called_by_future = Arc::clone(&save_called);
+        let save = async move {
+            save_called_by_future.store(true, Ordering::SeqCst);
+            SaveAllReport {
+                players_saved: 1,
+                entities_saved: 2,
+                chunks_flushed: 3,
+                world_metadata_saved: true,
+                timings: SaveAllTimings::default(),
+                errors: vec!["final save failed".to_owned()],
+            }
+        };
+
+        let error = finish_serve_with_final_save(
+            Err(std::io::Error::new(
+                ErrorKind::ConnectionAborted,
+                "listener accept failed",
+            )),
+            save,
+        )
+        .await
+        .expect_err("primary serve error remains visible");
+
+        assert!(save_called.load(Ordering::SeqCst));
+        assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
+        assert_eq!(error.to_string(), "listener accept failed");
+    }
+
+    #[tokio::test]
+    async fn run_bound_drains_admitted_simulation_mutation_before_final_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(mc_data::items::ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        let shutdown = config.shutdown.clone();
+        let bound = bind(config).await.expect("bind");
+        let simulation = bound.simulation.clone();
+        let mut mutation = Box::pin(simulation.set_world_time_server_owned(73));
+
+        std::future::poll_fn(|context| {
+            assert!(
+                mutation.as_mut().poll(context).is_pending(),
+                "mutation must remain in flight until the simulation owner starts"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        shutdown.request();
+
+        serve_then_final_save(bound)
+            .await
+            .expect("drain and final save succeed");
+        mutation
+            .await
+            .expect("admitted mutation completes during drain");
+        let metadata = play::persistence::load_world_metadata(tmp.path())
+            .unwrap()
+            .expect("world metadata saved");
+        assert!(
+            metadata.world_time >= 73,
+            "final save must include the admitted world-time mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn command_task_join_failure_is_a_drain_error() {
+        let result = tokio::spawn(async {
+            panic!("injected command task failure");
+            #[allow(unreachable_code)]
+            "test command"
+        })
+        .await;
+
+        let error = log_command_task_exit(result, true).expect_err("join failure propagates");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("command task join failed"));
+    }
+
+    #[tokio::test]
+    async fn periodic_save_worker_failure_is_a_drain_error() {
+        let (started, started_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started);
+        let worker = crate::dirty_flush::DirtyFlushCoordinator::spawn(move || {
+            let started = started.take().expect("one flush invocation is expected");
+            async move {
+                started.send(()).expect("test observes worker start");
+                panic!("injected periodic save worker failure");
+            }
+        });
+        worker.notifier().request();
+        started_rx.await.expect("worker reports start");
+
+        let error = drain_periodic_save_worker(Some(worker))
+            .await
+            .expect_err("periodic worker failure propagates");
+
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("periodic save worker"));
+    }
+
+    #[tokio::test]
     async fn accept_failure_requests_shutdown_and_runtime_drain() {
         let shutdown = ShutdownHandle::default();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
@@ -5309,7 +6328,7 @@ mod tests {
             items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
             item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
             block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+            entity_types: canonical_entity_types(),
             biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
             chunk_pipeline: ChunkPipelinePolicy {
                 chunk_worker_threads: 8,
@@ -5339,6 +6358,7 @@ mod tests {
             &shutdown,
             Some(&runtime_control),
             &resources,
+            &bound.sessions,
         );
 
         assert_eq!(error.kind(), ErrorKind::ConnectionAborted);
@@ -5348,7 +6368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn entity_ticker_drain_waits_for_in_flight_tick_before_final_save() {
+    async fn entity_ticker_drain_waits_for_in_flight_tick() {
         let entered_tick = Arc::new(Notify::new());
         let release_tick = Arc::new(Notify::new());
         let task_entered = Arc::clone(&entered_tick);
@@ -5364,12 +6384,12 @@ mod tests {
         probe_tx.send(()).unwrap();
         tokio::select! {
             biased;
-            () = &mut drain => panic!("entity ticker drain returned before the in-flight tick completed"),
+            result = &mut drain => panic!("entity ticker drain returned before the in-flight tick completed: {result:?}"),
             result = probe_rx => result.unwrap(),
         }
 
         release_tick.notify_waiters();
-        drain.await;
+        drain.await.expect("entity ticker drains");
     }
 
     #[tokio::test]
@@ -5383,8 +6403,11 @@ mod tests {
         });
         entered_rx.await.unwrap();
 
-        drain_entity_ticker_with_timeout(ticker, Duration::ZERO).await;
+        let error = drain_entity_ticker_with_timeout(ticker, Duration::ZERO)
+            .await
+            .expect_err("entity ticker timeout fails the drain");
 
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(held_rx.await.is_err(), "ticker task must be dropped");
     }
 
@@ -5400,50 +6423,17 @@ mod tests {
         });
         entered_rx.await.unwrap();
 
-        drain_connections_with_timeout(&mut connections, Duration::ZERO).await;
+        let error = drain_connections_with_timeout(&mut connections, Duration::ZERO)
+            .await
+            .expect_err("connection timeout fails the drain");
 
+        assert_eq!(error.kind(), ErrorKind::TimedOut);
         assert!(connections.is_empty());
         assert!(held_rx.await.is_err(), "connection task must be dropped");
     }
 
-    #[tokio::test]
-    async fn listener_final_save_waits_for_entity_ticker_drain() {
-        let entered_tick = Arc::new(Notify::new());
-        let release_tick = Arc::new(Notify::new());
-        let save_started = Arc::new(AtomicBool::new(false));
-        let task_entered = Arc::clone(&entered_tick);
-        let task_release = Arc::clone(&release_tick);
-        let ticker = tokio::spawn(async move {
-            task_entered.notify_waiters();
-            task_release.notified().await;
-        });
-        entered_tick.notified().await;
-
-        let save_started_in_future = Arc::clone(&save_started);
-        let save = async move {
-            save_started_in_future.store(true, Ordering::SeqCst);
-            42
-        };
-        let mut shutdown_save = std::pin::pin!(drain_entity_ticker_then_save(ticker, save));
-        let (probe_tx, probe_rx) = tokio::sync::oneshot::channel();
-        probe_tx.send(()).unwrap();
-        tokio::select! {
-            biased;
-            value = &mut shutdown_save => panic!("final save ran before entity ticker drained: {value}"),
-            result = probe_rx => result.unwrap(),
-        }
-        assert!(
-            !save_started.load(Ordering::SeqCst),
-            "final save must not start while entity ticker is still in-flight"
-        );
-
-        release_tick.notify_waiters();
-        assert_eq!(shutdown_save.await, 42);
-        assert!(save_started.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn console_stop_requests_drain_and_shutdown_after_successful_save() {
+    #[test]
+    fn console_stop_requests_drain_and_shutdown() {
         let shutdown = ShutdownHandle::default();
         let runtime_control = RuntimeControlHandle::new(crate::RuntimeControlConfig {
             policy: crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced),
@@ -5454,35 +6444,25 @@ mod tests {
                 chunk_generate_rate: 16,
             },
         });
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let save_shutdown = shutdown.clone();
-        let save_runtime_control = runtime_control.clone();
-        let save_events = Arc::clone(&events);
-        let save = async move {
-            assert!(!save_shutdown.is_requested());
-            assert!(!save_runtime_control.snapshot().draining);
-            save_events.lock().unwrap().push("save");
-            SaveAllReport {
-                players_saved: 1,
-                entities_saved: 2,
-                chunks_flushed: 3,
-                world_metadata_saved: true,
-                timings: SaveAllTimings::default(),
-                errors: Vec::new(),
-            }
-        };
+        let resources = ChunkPipelineResources::with_limits(1, 4);
+        let sessions = play::SessionRegistry::new();
 
-        let result = request_stop_after_save(&shutdown, Some(&runtime_control), save).await;
+        request_stop(&shutdown, Some(&runtime_control), &resources, &sessions);
 
-        assert!(result.is_ok());
-        assert_eq!(events.lock().unwrap().as_slice(), ["save"]);
         assert!(runtime_control.snapshot().draining);
         assert!(shutdown.is_requested());
     }
 
     #[tokio::test]
-    async fn console_stop_save_failure_keeps_runtime_ready() {
-        let shutdown = ShutdownHandle::default();
+    async fn console_stop_requests_shutdown_without_early_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::new(BlockRegistry::from_report(&[]).unwrap()),
+            Arc::new(ItemRegistry::default()),
+            canonical_entity_types(),
+        );
         let runtime_control = RuntimeControlHandle::new(crate::RuntimeControlConfig {
             policy: crate::AutoscalePolicy::for_profile(crate::AutoscaleProfile::Balanced),
             initial_limits: crate::RuntimeControlLimits {
@@ -5492,25 +6472,53 @@ mod tests {
                 chunk_generate_rate: 16,
             },
         });
-        let failed_report = SaveAllReport {
-            players_saved: 0,
-            entities_saved: 0,
-            chunks_flushed: 0,
-            world_metadata_saved: false,
-            timings: SaveAllTimings::default(),
-            errors: vec!["disk full".to_owned()],
+        let resources = ChunkPipelineResources::with_limits(1, 4);
+        let sessions = play::SessionRegistry::new();
+        let (simulation, mut owner) = play::simulation_channel();
+        let mut stop = std::pin::pin!(execute_console_command(
+            "stop",
+            "test save",
+            "test stop",
+            &config,
+            &sessions,
+            Some(&runtime_control),
+            &simulation,
+            &resources,
+        ));
+
+        let stopped = tokio::select! {
+            biased;
+            stopped = &mut stop => stopped,
+            ready = owner.wait_for_command() => {
+                assert!(ready, "simulation command channel remains open");
+                assert_eq!(
+                    owner
+                        .process_tick_with_world(
+                            &sessions,
+                            config.world.as_ref(),
+                            config.block_light.as_deref(),
+                            1,
+                        )
+                        .processed,
+                    1,
+                );
+                stop.await
+            }
         };
 
-        let report = request_stop_after_save(
-            &shutdown,
-            Some(&runtime_control),
-            std::future::ready(failed_report),
-        )
-        .await;
+        assert!(stopped);
+        assert!(config.shutdown.is_requested());
+        assert!(runtime_control.snapshot().draining);
+        let metadata = tmp.path().join("solaris").join("world.dat");
+        assert!(
+            !metadata.exists(),
+            "console stop must not save before the runtime drain"
+        );
 
-        assert!(!report.is_ok());
-        assert!(!shutdown.is_requested());
-        assert!(!runtime_control.snapshot().draining);
+        owner.shutdown();
+        let report = save_all_after_drain_with_context("test final save", &config, &sessions).await;
+        assert!(report.is_ok(), "post-drain final save failed: {report:?}");
+        assert!(metadata.exists());
     }
 
     #[tokio::test]
@@ -5525,7 +6533,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(tmp.path(), Arc::clone(&blocks), items, entity_types);
 
         assert_eq!(startup_dirty_flush_dirty_count(&config).await, None);
@@ -5599,7 +6607,7 @@ mod tests {
             tmp.path(),
             Arc::clone(&blocks),
             items,
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         );
         config.world = Some(Arc::clone(&world));
         let config = Arc::new(config);
@@ -5665,7 +6673,7 @@ mod tests {
             tmp.path(),
             Arc::clone(&blocks),
             items,
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         );
         config.world = Some(Arc::clone(&world));
         let config = Arc::new(config);
@@ -5807,7 +6815,7 @@ mod tests {
             BlockRegistry::from_report(&[report("minecraft:air", &[], &[(0, true, &[])])]).unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::default());
+        let entity_types = canonical_entity_types();
         let world = Arc::new(Mutex::new(
             WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&blocks), 257)
                 .unwrap()
@@ -5898,7 +6906,7 @@ mod tests {
             BlockRegistry::from_report(&[report("minecraft:air", &[], &[(0, true, &[])])]).unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = bind_test_entity_types(&[]);
+        let entity_types = canonical_entity_types();
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let generator = Arc::new(PausedGenerator {
@@ -5980,35 +6988,17 @@ mod tests {
         }
     }
 
-    fn bind_test_entity_types(
-        additional: &[(&str, u32)],
-    ) -> Arc<mc_data::entity_types::EntityTypeRegistry> {
-        let mut reports = vec![mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        }];
-        reports.extend(additional.iter().map(|(id, protocol_id)| {
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse(*id).unwrap(),
-                protocol_id: *protocol_id,
-            }
-        }));
-        Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-            &reports,
-        ))
-    }
-
     #[tokio::test]
     async fn bind_replays_and_acknowledges_pending_regional_entity_commit() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let items = Arc::new(mc_data::items::ItemRegistry::default());
-        let entity_types = bind_test_entity_types(&[("minecraft:cow", 2)]);
+        let entity_types = canonical_entity_types();
         let snapshot = mc_entity::EntitySnapshot {
             id: mc_entity::EntityId(1_000_001),
             uuid: uuid::Uuid::from_u128(71),
-            type_id: 2,
+            type_id: 30,
             type_name: "minecraft:cow".into(),
             position: mc_entity::Vec3::new(4.5, 64.0, -3.5),
             rotation: mc_entity::Rotation::ZERO,
@@ -6026,6 +7016,7 @@ mod tests {
             },
             vehicle: None,
             animal: Some(mc_entity::AnimalBreedingState::baby()),
+            retained: mc_entity::EntityRetainedState::default(),
         };
         let decision = mc_entity::RegionalCommitDecision::from_parts(
             mc_entity::RegionPhase(1),
@@ -6044,7 +7035,7 @@ mod tests {
         let mut bound = bind(config)
             .await
             .expect("bind with pending owner decision");
-        let restored = bound.sessions.persisted_entity_save_snapshot().0;
+        let restored = bound.sessions.persisted_entity_save_snapshot().0.records;
         assert_eq!(restored.len(), 1);
         assert_eq!(restored[0].snapshot, snapshot);
         let (_, pending) =
@@ -6095,11 +7086,11 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let items = Arc::new(mc_data::items::ItemRegistry::default());
-        let entity_types = bind_test_entity_types(&[("minecraft:cow", 2)]);
+        let entity_types = canonical_entity_types();
         let snapshot = mc_entity::EntitySnapshot {
             id: mc_entity::EntityId(1_000_001),
             uuid: uuid::Uuid::from_u128(72),
-            type_id: 2,
+            type_id: 30,
             type_name: "minecraft:cow".into(),
             position: mc_entity::Vec3::new(4.5, 64.0, -3.5),
             rotation: mc_entity::Rotation::ZERO,
@@ -6114,6 +7105,7 @@ mod tests {
             goal: mc_entity::GoalState::Idle,
             vehicle: None,
             animal: Some(mc_entity::AnimalBreedingState::adult()),
+            retained: mc_entity::EntityRetainedState::default(),
         };
         play::persistence::save_persisted_entities(
             tmp.path(),
@@ -6137,10 +7129,86 @@ mod tests {
         let bound = bind(config)
             .await
             .expect("bind with pending entity removal");
-        assert!(bound.sessions.persisted_entity_save_snapshot().0.is_empty());
+        assert!(
+            bound
+                .sessions
+                .persisted_entity_save_snapshot()
+                .0
+                .records
+                .is_empty()
+        );
         let (_, pending) =
             play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
         assert_eq!(pending, vec![decision]);
+    }
+
+    #[tokio::test]
+    async fn bind_rejects_duplicate_final_entity_uuid_before_restore() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::default());
+        let entity_types = canonical_entity_types();
+        let duplicate_uuid = uuid::Uuid::from_u128(73);
+        let persisted = mc_entity::EntitySnapshot {
+            id: mc_entity::EntityId(1_000_001),
+            uuid: duplicate_uuid,
+            type_id: 30,
+            type_name: "minecraft:cow".into(),
+            position: mc_entity::Vec3::new(4.5, 64.0, -3.5),
+            rotation: mc_entity::Rotation::ZERO,
+            velocity: mc_entity::Vec3::ZERO,
+            on_ground: true,
+            item_stack: None,
+            experience_value: None,
+            block_state: None,
+            lifecycle: mc_entity::EntityLifecycle::Alive,
+            health: 14.0,
+            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+            goal: mc_entity::GoalState::Idle,
+            vehicle: None,
+            animal: Some(mc_entity::AnimalBreedingState::adult()),
+            retained: mc_entity::EntityRetainedState::default(),
+        };
+        play::persistence::save_persisted_entities(
+            tmp.path(),
+            items.as_ref(),
+            std::slice::from_ref(&persisted),
+        )
+        .unwrap();
+        let duplicate = mc_entity::EntitySnapshot {
+            id: mc_entity::EntityId(1_000_002),
+            ..persisted
+        };
+        let decision = mc_entity::RegionalCommitDecision::from_parts(
+            mc_entity::RegionPhase(1),
+            19,
+            vec![duplicate],
+            Vec::new(),
+        )
+        .unwrap();
+        let (mut journal, _) =
+            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        mc_entity::RegionalDecisionJournal::record_commit(&mut journal, &decision).unwrap();
+        drop(journal);
+        let journal_path = tmp.path().join("solaris/entity-owner-journal.json");
+        let journal_before_bind = std::fs::read(&journal_path).unwrap();
+
+        let error = match bind(save_all_test_config(
+            tmp.path(),
+            blocks,
+            items,
+            entity_types,
+        ))
+        .await
+        {
+            Ok(_) => panic!("bind accepted duplicate final entity UUID"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.kind(), ErrorKind::InvalidData);
+        assert!(error.to_string().contains("duplicate restored entity UUID"));
+        assert_eq!(std::fs::read(journal_path).unwrap(), journal_before_bind);
     }
 
     #[tokio::test]
@@ -6149,7 +7217,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let items = Arc::new(mc_data::items::ItemRegistry::default());
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::default());
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(tmp.path(), blocks, items, entity_types);
         let sessions = play::SessionRegistry::new();
         let (simulation, mut owner) = play::simulation_channel();
@@ -6213,12 +7281,7 @@ mod tests {
                 protocol_id: 1,
             },
         ]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 2,
-            },
-        ]));
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(
             tmp.path(),
             blocks,
@@ -6250,29 +7313,33 @@ mod tests {
                 .processed,
             1
         );
-        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(1_000_001),
-                uuid: uuid::Uuid::from_u128(1),
-                type_id: 2,
-                type_name: "minecraft:item".into(),
-                position: mc_entity::Vec3::new(0.5, 64.0, 0.5),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: mc_entity::Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(mc_entity::EntityItemStack::new(1, 1)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-                animal: None,
-            },
-            age: 0,
-            pickup_delay: 0,
-        }]);
+        sessions.restore_persisted_entities(play::persistence::PersistedEntityCheckpoint::new(
+            0,
+            vec![play::persistence::PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(1_000_001),
+                    uuid: uuid::Uuid::from_u128(1),
+                    type_id: 71,
+                    type_name: "minecraft:item".into(),
+                    position: mc_entity::Vec3::new(0.5, 64.0, 0.5),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: mc_entity::Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(mc_entity::EntityItemStack::new(1, 1)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                    animal: None,
+                    retained: mc_entity::EntityRetainedState::default(),
+                },
+                age: 0,
+                pickup_delay: 0,
+            }],
+        ));
         let report = save.await;
 
         assert!(report.is_ok(), "save errors: {:?}", report.errors);
@@ -6280,7 +7347,7 @@ mod tests {
         assert_eq!(sessions.persisted_entity_records().len(), 1);
         let saved =
             play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
-        assert!(saved.is_empty());
+        assert!(saved.records.is_empty());
     }
 
     #[tokio::test]
@@ -6295,7 +7362,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::default());
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::default());
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(tmp.path(), Arc::clone(&blocks), items, entity_types);
         let world = config.world.as_ref().unwrap();
         let cpos = mc_world::ChunkPos { x: 0, z: 0 };
@@ -6413,7 +7480,7 @@ mod tests {
             tmp.path(),
             Arc::clone(&blocks),
             items,
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         );
         config.world = Some(Arc::clone(&world));
         let config = Arc::new(config);
@@ -6486,12 +7553,7 @@ mod tests {
                 protocol_id: 1,
             },
         ]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 2,
-            },
-        ]));
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(
             tmp.path(),
             Arc::clone(&blocks),
@@ -6519,32 +7581,38 @@ mod tests {
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(73);
         let (simulation, mut owner) = play::simulation_channel();
+        let mut retained = mc_entity::EntityRetainedState::default();
+        retained.item_pickup_ready_tick = Some(13);
         assert_eq!(
             owner.restore_persisted_entities(
                 &sessions,
-                [play::persistence::PersistedEntityRecord {
-                    snapshot: mc_entity::EntitySnapshot {
-                        id: mc_entity::EntityId(1_000_003),
-                        uuid: uuid::Uuid::from_u128(3),
-                        type_id: 2,
-                        type_name: "minecraft:item".into(),
-                        position: mc_entity::Vec3::new(1.5, 64.0, 2.5),
-                        rotation: mc_entity::Rotation::ZERO,
-                        velocity: mc_entity::Vec3::ZERO,
-                        on_ground: true,
-                        item_stack: Some(mc_entity::EntityItemStack::new(1, 3)),
-                        experience_value: None,
-                        block_state: None,
-                        lifecycle: mc_entity::EntityLifecycle::Alive,
-                        health: 20.0,
-                        attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-                        goal: mc_entity::GoalState::Idle,
-                        vehicle: None,
-                        animal: None,
-                    },
-                    age: 11,
-                    pickup_delay: 2,
-                }],
+                play::persistence::PersistedEntityCheckpoint::new(
+                    11,
+                    vec![play::persistence::PersistedEntityRecord {
+                        snapshot: mc_entity::EntitySnapshot {
+                            id: mc_entity::EntityId(1_000_003),
+                            uuid: uuid::Uuid::from_u128(3),
+                            type_id: 71,
+                            type_name: "minecraft:item".into(),
+                            position: mc_entity::Vec3::new(1.5, 64.0, 2.5),
+                            rotation: mc_entity::Rotation::ZERO,
+                            velocity: mc_entity::Vec3::ZERO,
+                            on_ground: true,
+                            item_stack: Some(mc_entity::EntityItemStack::new(1, 3)),
+                            experience_value: None,
+                            block_state: None,
+                            lifecycle: mc_entity::EntityLifecycle::Alive,
+                            health: 20.0,
+                            attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                            goal: mc_entity::GoalState::Idle,
+                            vehicle: None,
+                            animal: None,
+                            retained,
+                        },
+                        age: 11,
+                        pickup_delay: 2,
+                    },]
+                ),
             ),
             1
         );
@@ -6576,8 +7644,9 @@ mod tests {
         assert_eq!(report.entities_saved, 1);
         assert_eq!(report.chunks_flushed, 1);
         assert!(report.world_metadata_saved);
-        let saved =
-            play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+        let saved = play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types)
+            .unwrap()
+            .records;
         assert_eq!(saved.len(), 1);
         assert_eq!(
             saved[0].item_stack,
@@ -6605,7 +7674,7 @@ mod tests {
             tmp.path(),
             Arc::new(BlockRegistry::from_report(&[]).unwrap()),
             items,
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         );
         let shutdown = ShutdownHandle::default();
         let sessions = play::SessionRegistry::new();
@@ -6636,32 +7705,36 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("region")).unwrap();
         let blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(tmp.path(), blocks, items, entity_types);
         let sessions = play::SessionRegistry::new();
-        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(1_000_004),
-                uuid: uuid::Uuid::from_u128(4),
-                type_id: 2,
-                type_name: "minecraft:item".into(),
-                position: mc_entity::Vec3::new(0.5, 64.0, 0.5),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: mc_entity::Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(mc_entity::EntityItemStack::new(99, 1)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-                animal: None,
-            },
-            age: 0,
-            pickup_delay: 0,
-        }]);
+        sessions.restore_persisted_entities(play::persistence::PersistedEntityCheckpoint::new(
+            0,
+            vec![play::persistence::PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(1_000_004),
+                    uuid: uuid::Uuid::from_u128(4),
+                    type_id: 71,
+                    type_name: "minecraft:item".into(),
+                    position: mc_entity::Vec3::new(0.5, 64.0, 0.5),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: mc_entity::Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(mc_entity::EntityItemStack::new(99, 1)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                    animal: None,
+                    retained: mc_entity::EntityRetainedState::default(),
+                },
+                age: 0,
+                pickup_delay: 0,
+            }],
+        ));
 
         let report = save_all(&config, &sessions).await;
 
@@ -6686,37 +7759,39 @@ mod tests {
                 protocol_id: 1,
             },
         ]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 1,
-            },
-        ]));
+        let entity_types = canonical_entity_types();
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(42);
-        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(1_000_001),
-                uuid: uuid::Uuid::from_u128(1),
-                type_id: 1,
-                type_name: "minecraft:item".into(),
-                position: mc_entity::Vec3::new(1.0, 2.0, 3.0),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: mc_entity::Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-                animal: None,
-            },
-            age: 12,
-            pickup_delay: 3,
-        }]);
+        let mut retained = mc_entity::EntityRetainedState::default();
+        retained.item_pickup_ready_tick = Some(15);
+        let checkpoint = play::persistence::PersistedEntityCheckpoint::new(
+            12,
+            vec![play::persistence::PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(1_000_001),
+                    uuid: uuid::Uuid::from_u128(1),
+                    type_id: 71,
+                    type_name: "minecraft:item".into(),
+                    position: mc_entity::Vec3::new(1.0, 2.0, 3.0),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: mc_entity::Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(mc_entity::EntityItemStack::new(1, 2)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                    animal: None,
+                    retained,
+                },
+                age: 12,
+                pickup_delay: 3,
+            }],
+        );
+        assert_eq!(sessions.restore_persisted_entities(checkpoint), 1);
         let config = save_all_test_config(
             tmp.path(),
             blocks,
@@ -6730,7 +7805,9 @@ mod tests {
         assert_eq!(report.entities_saved, 1);
         assert!(report.world_metadata_saved);
         let entities =
-            play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+            play::persistence::load_persisted_entities(tmp.path(), &items, &entity_types)
+                .unwrap()
+                .records;
         assert_eq!(entities.len(), 1);
         assert_eq!(
             entities[0].item_stack,
@@ -6755,38 +7832,40 @@ mod tests {
                 protocol_id: 1,
             },
         ]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 1,
-            },
-        ]));
+        let entity_types = canonical_entity_types();
         let sessions = play::SessionRegistry::new();
         sessions.set_world_time(99);
         sessions.set_players_sleeping_percentage(50);
-        sessions.restore_persisted_entities([play::persistence::PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(1_000_002),
-                uuid: uuid::Uuid::from_u128(2),
-                type_id: 1,
-                type_name: "minecraft:item".into(),
-                position: mc_entity::Vec3::new(4.0, 5.0, 6.0),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: mc_entity::Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(mc_entity::EntityItemStack::new(1, 5)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-                animal: None,
-            },
-            age: 8,
-            pickup_delay: 4,
-        }]);
+        let mut retained = mc_entity::EntityRetainedState::default();
+        retained.item_pickup_ready_tick = Some(12);
+        let checkpoint = play::persistence::PersistedEntityCheckpoint::new(
+            8,
+            vec![play::persistence::PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(1_000_002),
+                    uuid: uuid::Uuid::from_u128(2),
+                    type_id: 71,
+                    type_name: "minecraft:item".into(),
+                    position: mc_entity::Vec3::new(4.0, 5.0, 6.0),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: mc_entity::Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(mc_entity::EntityItemStack::new(1, 5)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::vanilla_mob_defaults(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                    animal: None,
+                    retained,
+                },
+                age: 8,
+                pickup_delay: 4,
+            }],
+        );
+        assert_eq!(sessions.restore_persisted_entities(checkpoint), 1);
         let save_config = save_all_test_config(
             tmp.path(),
             Arc::clone(&blocks),
@@ -6830,7 +7909,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = bind_test_entity_types(&[]);
+        let entity_types = canonical_entity_types();
         let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
         let chunk_position = mc_world::ChunkPos { x: 0, z: 0 };
         let mut chunk = mc_world::Chunk::empty(
@@ -6901,7 +7980,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = bind_test_entity_types(&[]);
+        let entity_types = canonical_entity_types();
         let position = mc_world::BlockPos { x: 1, y: 64, z: 1 };
         let chunk_position = mc_world::ChunkPos { x: 0, z: 0 };
         let biome = Identifier::parse("minecraft:plains").unwrap();
@@ -6985,7 +8064,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let entity_types = canonical_entity_types();
         let config = save_all_test_config(
             tmp.path(),
             Arc::clone(&blocks),
@@ -7049,7 +8128,7 @@ mod tests {
             tmp.path(),
             Arc::new(BlockRegistry::from_report(&[]).unwrap()),
             Arc::new(mc_data::items::ItemRegistry::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         ))
         .await
         {
@@ -7074,7 +8153,7 @@ mod tests {
             tmp.path(),
             Arc::new(BlockRegistry::from_report(&[]).unwrap()),
             Arc::new(mc_data::items::ItemRegistry::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         ))
         .await
         {
@@ -7104,7 +8183,7 @@ mod tests {
             tmp.path(),
             Arc::new(BlockRegistry::from_report(&[]).unwrap()),
             Arc::new(mc_data::items::ItemRegistry::default()),
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+            canonical_entity_types(),
         ))
         .await
         {
@@ -7131,7 +8210,7 @@ mod tests {
             .unwrap(),
         );
         let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[]));
-        let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[]));
+        let entity_types = canonical_entity_types();
         let sessions = play::SessionRegistry::new();
         sessions.advance_world_time(100);
         let config = save_all_test_config(

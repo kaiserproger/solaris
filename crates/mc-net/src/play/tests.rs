@@ -8,10 +8,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
 use crate::play::chunk_stream::{hostile_chunk_spawns, passive_chunk_spawns, prioritized_spiral};
-use mc_data::blocks::{BlockReport, BlockStateReport};
+use mc_data::blocks::{BlockReport, BlockStateReport, solaris_required_blocks_report};
 use mc_data::items::ItemReport;
 use mc_world::light::compute_chunk_light_in;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+
+fn no_script_player_context(session_id: SessionId) -> ScriptPlayerContext {
+    ScriptPlayerContext::new(
+        format!("test-player-{session_id}"),
+        "TestPlayer",
+        false,
+        0.5,
+        64.0,
+        0.5,
+    )
+}
 
 async fn run_scheduled_block_ticks(
     config: &ServerConfig,
@@ -335,7 +346,7 @@ fn play_loop_slow_client_test_config() -> crate::server::ServerConfig {
         items: Arc::new(mc_data::items::ItemRegistry::from_report(&[])),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[])),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: ChunkPipelinePolicy::default(),
         random_tick: RandomTickPolicy::default(),
@@ -549,6 +560,189 @@ fn only_vanilla_outside_slot_sentinel_can_drop_the_cursor() {
             ContainerClickAction::Unsupported
         ));
     }
+}
+
+#[tokio::test]
+async fn rejected_inventory_drag_resyncs_without_mutation_or_owner_publication() {
+    let item = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: item,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(items);
+    state.carried_item = ItemStack::new(10, 3);
+    let before_inventory = state.inventory.clone();
+    let before_carried = state.carried_item.clone();
+    let mut writer = Vec::new();
+    let carried = || mc_protocol::packets::play::HashedStack::Actual {
+        item_id: 10,
+        count: 3,
+        components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+    };
+    let script_player_id = ScriptPlayerId::new(state.session_id);
+    let script_context = no_script_player_context(state.session_id);
+    let xp = XpState::default();
+
+    for (button_num, slot_num) in [(0, -999), (2, -999)] {
+        handle_container_click(
+            &mut state,
+            &mut writer,
+            ContainerClickContext {
+                game_mode: GameMode::Survival,
+                survival_state: SurvivalState::FULL,
+                xp_state: &xp,
+                player_pose: PlayerPose::new(0.5, 64.0, 0.5),
+                scripts: None,
+                script_player_id,
+                script_context: script_context.clone(),
+            },
+            ServerboundContainerClick {
+                container_id: 0,
+                state_id: 1,
+                slot_num,
+                button_num,
+                container_input: ContainerInput::QuickCraft,
+                changed_slots: Vec::new(),
+                carried_item: carried(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    assert_eq!(state.inventory.slots, before_inventory.slots);
+    assert_eq!(state.carried_item, before_carried);
+    assert_eq!(state.simulation.snapshot().depth, 0);
+    let packets = decode_container_set_content_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].items, before_inventory.as_wire_list());
+    assert_eq!(packets[0].carried_item, before_carried);
+}
+
+#[tokio::test]
+async fn stale_inventory_drag_resyncs_exact_owner_state_without_loss_or_publication() {
+    let item = Identifier::parse("minecraft:dirt").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[ItemReport {
+        id: item,
+        protocol_id: 10,
+    }]));
+    let mut state = interaction_state_for_items(items);
+    state.carried_item = ItemStack::new(10, 3);
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let profile = LoggedInProfile {
+        uuid: crate::login::offline_uuid("StaleInventoryDrag"),
+        name: "StaleInventoryDrag".to_owned(),
+    };
+    let (tx, mut outbound) = mpsc::channel(8);
+    let (session_id, _) = state
+        .sessions
+        .register(&profile, (0, 0), 0, HashSet::new(), tx, pose);
+    let mut saved = PlayerPersistedState::new_default(pose);
+    saved.carried_item = state.carried_item.clone();
+    let saved = Arc::new(Mutex::new(saved));
+    state
+        .sessions
+        .register_player_persistence(session_id, Arc::clone(&saved));
+    state.session_id = session_id;
+    let sessions = Arc::clone(&state.sessions);
+    let (simulation, mut owner) = simulation_channel();
+    let simulation_probe = simulation.clone();
+    state.simulation = simulation.for_session(session_id);
+    let mut writer = Vec::new();
+    let xp = XpState::default();
+    let carried = mc_protocol::packets::play::HashedStack::Actual {
+        item_id: 10,
+        count: 3,
+        components: mc_protocol::packets::play::HashedStackComponentHashes::empty(),
+    };
+    let script_player_id = ScriptPlayerId::new(state.session_id);
+    let script_context = no_script_player_context(state.session_id);
+
+    for (button_num, slot_num) in [(0, -999), (1, 9)] {
+        handle_container_click(
+            &mut state,
+            &mut writer,
+            ContainerClickContext {
+                game_mode: GameMode::Survival,
+                survival_state: SurvivalState::FULL,
+                xp_state: &xp,
+                player_pose: pose,
+                scripts: None,
+                script_player_id,
+                script_context: script_context.clone(),
+            },
+            ServerboundContainerClick {
+                container_id: 0,
+                state_id: 1,
+                slot_num,
+                button_num,
+                container_input: ContainerInput::QuickCraft,
+                changed_slots: Vec::new(),
+                carried_item: carried.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    }
+    assert!(writer.is_empty());
+
+    let mut end = Box::pin(handle_container_click(
+        &mut state,
+        &mut writer,
+        ContainerClickContext {
+            game_mode: GameMode::Survival,
+            survival_state: SurvivalState::FULL,
+            xp_state: &xp,
+            player_pose: pose,
+            scripts: None,
+            script_player_id,
+            script_context,
+        },
+        ServerboundContainerClick {
+            container_id: 0,
+            state_id: 1,
+            slot_num: -999,
+            button_num: 2,
+            container_input: ContainerInput::QuickCraft,
+            changed_slots: Vec::new(),
+            carried_item: mc_protocol::packets::play::HashedStack::empty(),
+        },
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(
+            std::future::Future::poll(end.as_mut(), cx).is_pending(),
+            "drag must wait for its queued owner commit"
+        );
+        assert_eq!(simulation_probe.snapshot().depth, 1);
+        Poll::Ready(())
+    })
+    .await;
+    {
+        let mut saved = saved.lock().unwrap();
+        saved.inventory.slots[10] = ItemStack::new(10, 1);
+        saved.carried_item = ItemStack::new(10, 2);
+    }
+    assert_eq!(owner.process_tick(&sessions, 1).processed, 1);
+    end.await.unwrap();
+
+    assert!(state.inventory.slots[9].is_empty());
+    assert_eq!(state.inventory.slots[10], ItemStack::new(10, 1));
+    assert_eq!(state.carried_item, ItemStack::new(10, 2));
+    let total = state
+        .inventory
+        .slots
+        .iter()
+        .map(|stack| stack.count.max(0))
+        .sum::<i32>()
+        + state.carried_item.count;
+    assert_eq!(total, 3);
+    let packets = decode_container_set_content_packets(&writer);
+    assert_eq!(packets.len(), 1);
+    assert_eq!(packets[0].state_id, 1);
+    assert_eq!(packets[0].items, state.inventory.as_wire_list());
+    assert_eq!(packets[0].carried_item, state.carried_item);
+    assert!(outbound.try_recv().is_err());
+    assert!(state.sessions.persisted_entity_records().is_empty());
 }
 
 #[test]
@@ -925,7 +1119,7 @@ fn held_sharpness_uses_the_vanilla_26_1_2_damage_formula() {
         held_attack_damage(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
         ),
         7.0
     );
@@ -1112,6 +1306,7 @@ async fn play_loop_closes_session_when_outbound_write_stalls() {
             None,
             None,
             None,
+            ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&sessions),
             simulation.for_session(1),
             &config,
@@ -1191,6 +1386,7 @@ async fn play_loop_closes_session_when_direct_response_write_stalls() {
             None,
             None,
             None,
+            ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&sessions),
             simulation.for_session(1),
             &config,
@@ -1256,6 +1452,7 @@ async fn play_loop_exits_when_outbound_channel_closes() {
             None,
             None,
             None,
+            ChunkPipelineResources::with_limits(1, 1),
             sessions,
             simulation.for_session(1),
             &config,
@@ -1335,6 +1532,7 @@ async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write
             None,
             None,
             None,
+            ChunkPipelineResources::with_limits(1, 1),
             Arc::clone(&sessions),
             simulation.for_session(1),
             &config,
@@ -1526,6 +1724,7 @@ async fn teleport_command_waits_for_pending_confirmation_before_repositioning_pl
     let mut next_teleport_id = 8;
     let mut pending_teleport = Some(PendingTeleport::new(7, 0));
     let mut chunk_stream = None;
+    let chunk_pipeline_resources = ChunkPipelineResources::with_limits(1, 1);
 
     execute_player_command(
         &mut writer,
@@ -1541,6 +1740,7 @@ async fn teleport_command_waits_for_pending_confirmation_before_repositioning_pl
         None,
         &mut player_pose,
         None,
+        &chunk_pipeline_resources,
         &mut chunk_stream,
         &mut next_teleport_id,
         &mut pending_teleport,
@@ -2577,7 +2777,7 @@ pub(super) fn interaction_state_for_blocks(
         inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
-        entity_types: Arc::new(EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         item_to_block,
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
@@ -2704,6 +2904,407 @@ async fn player_collision_uses_farmland_height_and_allows_wheat_overlap() {
     assert!(
         player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.90, 0.5)).await,
         "the farmland collision shape must still reject movement through its top surface"
+    );
+}
+
+fn vanilla_collision_test_state() -> InteractionState {
+    interaction_state_for_blocks(Arc::new(
+        mc_world::BlockRegistry::from_report(&solaris_required_blocks_report())
+            .expect("embedded vanilla registry builds"),
+    ))
+}
+
+fn vanilla_collision_state_id(
+    state: &InteractionState,
+    block_name: &str,
+    properties: &[(&str, &str)],
+) -> BlockStateId {
+    let block_name = Identifier::parse(block_name).expect("valid test block name");
+    let properties = properties
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect::<Vec<_>>();
+    state
+        .blocks
+        .by_name_and_props(&block_name, &properties)
+        .unwrap_or_else(|| panic!("missing vanilla state {block_name} {properties:?}"))
+}
+
+async fn set_collision_test_block(state: &InteractionState, state_id: BlockStateId) {
+    insert_fluid_test_chunk(state).await;
+    state
+        .world
+        .lock()
+        .await
+        .set_block_at(mc_world::BlockPos { x: 0, y: 64, z: 0 }, state_id)
+        .expect("collision test block is inside the loaded chunk");
+}
+
+fn synthetic_collision_overlap_test_state() -> (InteractionState, BlockStateId) {
+    let mut reports = solaris_required_blocks_report();
+    let slab = reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:stone_slab")
+        .expect("embedded registry contains stone slab");
+    let overlapping_state = slab
+        .states
+        .iter()
+        .find(|state| {
+            state.properties.get("type").map(String::as_str) == Some("bottom")
+                && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+        })
+        .expect("embedded registry contains a dry bottom stone slab")
+        .id;
+    slab.id = Identifier::parse("solaris:synthetic_solid").unwrap();
+
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("renamed synthetic registry retains dense vanilla state ids");
+    (
+        interaction_state_for_blocks(Arc::new(blocks)),
+        BlockStateId(overlapping_state),
+    )
+}
+
+fn minecraft_synthetic_slab_overlap_test_state() -> (InteractionState, BlockStateId) {
+    let mut reports = solaris_required_blocks_report();
+    let slab = reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:stone_slab")
+        .expect("embedded registry contains stone slab");
+    let overlapping_state = slab
+        .states
+        .iter()
+        .find(|state| {
+            state.properties.get("type").map(String::as_str) == Some("bottom")
+                && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+        })
+        .expect("embedded registry contains a dry bottom stone slab")
+        .id;
+    slab.id = Identifier::parse("minecraft:synthetic_slab").unwrap();
+
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("renamed synthetic registry retains dense vanilla state ids");
+    (
+        interaction_state_for_blocks(Arc::new(blocks)),
+        BlockStateId(overlapping_state),
+    )
+}
+
+fn fake_farmland_slab_overlap_test_state() -> (InteractionState, BlockStateId) {
+    let mut reports = solaris_required_blocks_report();
+    reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:farmland")
+        .expect("embedded registry contains farmland")
+        .id = Identifier::parse("solaris:canonical_farmland").unwrap();
+    let slab = reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:stone_slab")
+        .expect("embedded registry contains stone slab");
+    let overlapping_state = slab
+        .states
+        .iter()
+        .find(|state| {
+            state.properties.get("type").map(String::as_str) == Some("bottom")
+                && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+        })
+        .expect("embedded registry contains a dry bottom stone slab")
+        .id;
+    slab.id = Identifier::parse("minecraft:farmland").unwrap();
+
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("renamed synthetic registry retains dense vanilla state ids");
+    (
+        interaction_state_for_blocks(Arc::new(blocks)),
+        BlockStateId(overlapping_state),
+    )
+}
+
+fn wrong_property_slab_overlap_test_state() -> (InteractionState, BlockStateId) {
+    let mut reports = solaris_required_blocks_report();
+    let slab = reports
+        .iter_mut()
+        .find(|block| block.id.as_str() == "minecraft:stone_slab")
+        .expect("embedded registry contains stone slab");
+    let state = slab
+        .states
+        .iter_mut()
+        .find(|state| {
+            state.properties.get("type").map(String::as_str) == Some("bottom")
+                && state.properties.get("waterlogged").map(String::as_str) == Some("false")
+        })
+        .expect("embedded registry contains a dry bottom stone slab");
+    state
+        .properties
+        .insert("type".to_string(), "synthetic".to_string());
+    let overlapping_state = state.id;
+
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("altered synthetic registry retains dense vanilla state ids");
+    (
+        interaction_state_for_blocks(Arc::new(blocks)),
+        BlockStateId(overlapping_state),
+    )
+}
+
+fn low_id_exact_farmland_test_state() -> (InteractionState, BlockStateId) {
+    let reports = vec![
+        simple_block(0, "minecraft:air"),
+        BlockReport {
+            id: Identifier::parse("minecraft:farmland").unwrap(),
+            properties: prop_schema(&[("moisture", &["0", "1", "2", "3", "4", "5", "6", "7"])]),
+            states: vec![state(1, true, &[("moisture", "0")])],
+        },
+    ];
+    let blocks = mc_world::BlockRegistry::from_report(&reports)
+        .expect("low-id exact farmland registry builds");
+    (
+        interaction_state_for_blocks(Arc::new(blocks)),
+        BlockStateId(1),
+    )
+}
+
+#[tokio::test]
+async fn player_collision_does_not_apply_vanilla_shape_to_unrelated_overlapping_state_id() {
+    let (state, synthetic_solid) = synthetic_collision_overlap_test_state();
+    assert!(
+        mc_data::collision_shapes::vanilla_collision_shapes()
+            .get(synthetic_solid.0)
+            .is_some(),
+        "the synthetic state must overlap a covered vanilla state id"
+    );
+    set_collision_test_block(&state, synthetic_solid).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
+        "an unrelated synthetic solid keeps full-cube collision despite its overlapping state id"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_rejects_minecraft_synthetic_slab_identity_on_overlapping_id() {
+    let (state, synthetic_slab) = minecraft_synthetic_slab_overlap_test_state();
+    set_collision_test_block(&state, synthetic_slab).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
+        "a synthetic Minecraft slab name must not inherit the overlapping vanilla slab shape"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_rejects_fake_farmland_identity_on_overlapping_slab_id() {
+    let (state, fake_farmland) = fake_farmland_slab_overlap_test_state();
+    set_collision_test_block(&state, fake_farmland).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
+        "fake farmland properties must neither inherit the slab table shape nor farmland height"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_rejects_wrong_properties_under_canonical_slab_name_and_id() {
+    let (state, altered_slab) = wrong_property_slab_overlap_test_state();
+    set_collision_test_block(&state, altered_slab).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
+        "a canonical name and numeric id are insufficient when ordered properties differ"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_farmland_fallback_for_exact_low_id_semantics() {
+    let (state, farmland) = low_id_exact_farmland_test_state();
+    assert!(
+        mc_data::collision_shapes::vanilla_collision_shapes()
+            .get(farmland.0)
+            .is_none(),
+        "the low synthetic id must miss the canonical shape table"
+    );
+    set_collision_test_block(&state, farmland).await;
+
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.9375, 0.5)).await,
+        "exact farmland semantics retain the direct 15/16 fallback on a noncanonical id"
+    );
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.90, 0.5)).await,
+        "the exact farmland fallback still rejects overlap below its top"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_bottom_slab_box() {
+    let state = vanilla_collision_test_state();
+    let slab = vanilla_collision_state_id(
+        &state,
+        "minecraft:stone_slab",
+        &[("type", "bottom"), ("waterlogged", "false")],
+    );
+    set_collision_test_block(&state, slab).await;
+
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.5)).await,
+        "a player may stand on the bottom slab's half-block top"
+    );
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.49, 0.5)).await,
+        "a player may not overlap the bottom slab box"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_oracle_aabb_deflation_boundary() {
+    let state = vanilla_collision_test_state();
+    let slab = vanilla_collision_state_id(
+        &state,
+        "minecraft:stone_slab",
+        &[("type", "bottom"), ("waterlogged", "false")],
+    );
+    set_collision_test_block(&state, slab).await;
+    let oracle_deflation = f64::from(1.0e-5_f32);
+
+    assert!(
+        !player_pose_collides_with_solid(
+            Some(&state),
+            PlayerPose::new(0.5, 64.5 - oracle_deflation / 2.0, 0.5),
+        )
+        .await,
+        "an overlap below the oracle deflation remains non-colliding"
+    );
+    assert!(
+        player_pose_collides_with_solid(
+            Some(&state),
+            PlayerPose::new(0.5, 64.5 - oracle_deflation * 2.0, 0.5),
+        )
+        .await,
+        "an overlap beyond the oracle deflation collides"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_top_slab_box() {
+    let state = vanilla_collision_test_state();
+    let slab = vanilla_collision_state_id(
+        &state,
+        "minecraft:stone_slab",
+        &[("type", "top"), ("waterlogged", "false")],
+    );
+    set_collision_test_block(&state, slab).await;
+
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 62.7, 0.5)).await,
+        "the lower half below a top slab is empty"
+    );
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 62.71, 0.5)).await,
+        "the player's head may not enter the top slab box"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_oriented_stair_boxes() {
+    let state = vanilla_collision_test_state();
+    let stair = vanilla_collision_state_id(
+        &state,
+        "minecraft:oak_stairs",
+        &[
+            ("facing", "north"),
+            ("half", "bottom"),
+            ("shape", "straight"),
+            ("waterlogged", "false"),
+        ],
+    );
+    set_collision_test_block(&state, stair).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.15)).await,
+        "the north stair's upper step occupies its north half"
+    );
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.5, 0.85)).await,
+        "the south half above a north stair's lower step is empty"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_uses_tall_narrow_fence_box() {
+    let state = vanilla_collision_test_state();
+    let fence = vanilla_collision_state_id(
+        &state,
+        "minecraft:oak_fence",
+        &[
+            ("east", "false"),
+            ("north", "false"),
+            ("south", "false"),
+            ("west", "false"),
+            ("waterlogged", "false"),
+        ],
+    );
+    set_collision_test_block(&state, fence).await;
+
+    assert!(
+        !player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.05, 64.0, 0.5)).await,
+        "space beside an isolated fence post is empty"
+    );
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 65.25, 0.5)).await,
+        "the isolated fence post collision extends to 1.5 blocks"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_scans_fence_below_at_deflated_top_boundary() {
+    let state = vanilla_collision_test_state();
+    let fence = vanilla_collision_state_id(
+        &state,
+        "minecraft:oak_fence",
+        &[
+            ("east", "false"),
+            ("north", "false"),
+            ("south", "false"),
+            ("west", "false"),
+            ("waterlogged", "false"),
+        ],
+    );
+    set_collision_test_block(&state, fence).await;
+    let oracle_deflation = f64::from(1.0e-5_f32);
+
+    assert!(
+        !player_pose_collides_with_solid(
+            Some(&state),
+            PlayerPose::new(0.5, 65.5 - oracle_deflation / 2.0, 0.5),
+        )
+        .await,
+        "sub-boundary overlap with the fence top is deflated away"
+    );
+    assert!(
+        player_pose_collides_with_solid(
+            Some(&state),
+            PlayerPose::new(0.5, 65.5 - oracle_deflation * 2.0, 0.5),
+        )
+        .await,
+        "the minimum Y scan must retain the 1.5-block fence below"
+    );
+}
+
+#[tokio::test]
+async fn player_collision_falls_back_to_full_cube_for_uncovered_block() {
+    let state = vanilla_collision_test_state();
+    let stone = vanilla_collision_state_id(&state, "minecraft:stone", &[]);
+    assert!(
+        mc_data::collision_shapes::vanilla_collision_shapes()
+            .get(stone.0)
+            .is_none(),
+        "stone must exercise the collision table miss fallback"
+    );
+    set_collision_test_block(&state, stone).await;
+
+    assert!(
+        player_pose_collides_with_solid(Some(&state), PlayerPose::new(0.5, 64.0, 0.5)).await,
+        "an uncovered solid block retains full-cube collision"
     );
 }
 
@@ -3745,45 +4346,51 @@ fn bucket_items_resolve_fluid_sources() {
 #[test]
 fn bucket_replacement_updates_single_held_stack_only() {
     let mut inventory = PlayerInventory::empty();
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 61,
-            count: 1,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 61,
+                count: 1,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
 
     let (next, changed) =
         plan_bucket_replacement(&inventory, PlayerInventory::HOTBAR_BASE, 60, 16).unwrap();
 
-    assert_eq!(next.held(0).item_id, 60);
-    assert_eq!(next.held(0).count, 1);
+    assert_eq!(next.held(0).unwrap().item_id, 60);
+    assert_eq!(next.held(0).unwrap().count, 1);
     assert_eq!(
         changed,
-        vec![(PlayerInventory::HOTBAR_BASE, next.held(0).clone())]
+        vec![(PlayerInventory::HOTBAR_BASE, next.held(0).unwrap().clone())]
     );
 
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 60,
-            count: 2,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 60,
+                count: 2,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
     let (next, changed) =
         plan_bucket_replacement(&inventory, PlayerInventory::HOTBAR_BASE, 61, 1).unwrap();
-    assert_eq!(next.held(0).item_id, 60);
-    assert_eq!(next.held(0).count, 1);
+    assert_eq!(next.held(0).unwrap().item_id, 60);
+    assert_eq!(next.held(0).unwrap().count, 1);
     assert_eq!(next.slots[9].item_id, 61);
     assert_eq!(next.slots[9].count, 1);
     assert_eq!(
         changed,
         vec![
-            (PlayerInventory::HOTBAR_BASE, next.held(0).clone()),
+            (PlayerInventory::HOTBAR_BASE, next.held(0).unwrap().clone(),),
             (9, next.slots[9].clone())
         ]
     );
@@ -3803,6 +4410,7 @@ fn bucket_replacement_updates_single_held_stack_only() {
         count: 1,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
     };
     let (next, changed) = plan_bucket_replacement(&inventory, 45, 61, 1).unwrap();
     assert_eq!(next.slots[45].item_id, 61);
@@ -4269,12 +4877,7 @@ async fn falling_block_start_planning_does_not_wait_for_world_writer() {
     let blocks = Arc::new(fluid_test_registry());
     let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
     state.block_facts = Arc::new(fluid_test_facts());
-    state.entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:falling_block").unwrap(),
-            protocol_id: 70,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     insert_fluid_test_chunk(&state).await;
     let support = mc_world::BlockPos { x: 4, y: 64, z: 4 };
     let sand = mc_world::BlockPos { x: 4, y: 65, z: 4 };
@@ -4376,16 +4979,7 @@ async fn falling_block_landing_on_solid_drops_item_and_despawns_entity() {
         id: Identifier::parse("minecraft:sand").unwrap(),
         protocol_id: 42,
     }]));
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 2,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:falling_block").unwrap(),
-            protocol_id: 70,
-        },
-    ]));
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let config = ServerConfig {
         blocks: Arc::clone(&blocks),
         world: Some(Arc::clone(&world)),
@@ -4777,17 +5371,14 @@ async fn cactus_placement_path_cascades_when_solid_side_neighbor_is_placed() {
             },
         ]
     );
-    assert_eq!(plan.additional_preconditions.len(), 2);
-    assert_eq!(plan.additional_preconditions[0].pos, cactus_1);
-    assert_eq!(
-        plan.additional_preconditions[0].expected_state,
-        BlockStateId(19)
-    );
-    assert_eq!(plan.additional_preconditions[1].pos, cactus_2);
-    assert_eq!(
-        plan.additional_preconditions[1].expected_state,
-        BlockStateId(19)
-    );
+    for cactus in [cactus_1, cactus_2] {
+        let precondition = plan
+            .additional_preconditions
+            .iter()
+            .find(|precondition| precondition.pos == cactus)
+            .expect("every cascaded cactus is fenced by its exact source state");
+        assert_eq!(precondition.expected_state, BlockStateId(19));
+    }
 }
 
 #[tokio::test]
@@ -4824,7 +5415,6 @@ async fn cactus_placement_path_does_not_cascade_for_non_solid_side_neighbor() {
             new_state: BlockStateId(20),
         }]
     );
-    assert!(plan.additional_preconditions.is_empty());
 }
 
 #[tokio::test]
@@ -4875,7 +5465,7 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
     let mut state = interaction_state_for_blocks(Arc::clone(&blocks));
     state.items = Arc::clone(&items);
     state.item_to_block = ItemToBlockTable::build(&items, &blocks);
-    *state.inventory.held_mut(0) = ItemStack::new(42, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(42, 1);
     insert_fluid_test_chunk(&state).await;
 
     let clicked = mc_world::BlockPos { x: 3, y: 64, z: 4 };
@@ -4901,7 +5491,7 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
     .await
     .unwrap();
 
-    assert_eq!(state.inventory.held(0), &ItemStack::new(42, 1));
+    assert_eq!(state.inventory.held(0), Some(&ItemStack::new(42, 1)));
     assert_eq!(
         state.world.lock().await.get_cached_block(target),
         Some(BlockStateId(0))
@@ -6220,19 +6810,22 @@ fn sapling_bonemeal_advances_stage_before_growing_a_varied_oak_tree() {
     assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(27)));
 
     let mut inventory = PlayerInventory::empty();
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 99,
-            count: 2,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 99,
+                count: 2,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
     let synced =
         consume_bonemeal_after_growth(&mut inventory, 0, !outcome.applied.is_empty()).unwrap();
     assert_eq!(synced.count, 1);
-    assert_eq!(inventory.held(0).count, 1);
+    assert_eq!(inventory.held(0).unwrap().count, 1);
 
     let short_tree =
         bonemeal_growth_edits(registry.as_ref(), &world, pos, BlockStateId(27), 0).unwrap();
@@ -6657,20 +7250,23 @@ fn stage_zero_sapling_advances_even_when_tree_space_is_blocked() {
     assert_eq!(world.get_block(pos).unwrap(), Some(BlockStateId(27)));
 
     let mut inventory = PlayerInventory::empty();
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 99,
-            count: 2,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 99,
+                count: 2,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
     assert_eq!(
         consume_bonemeal_after_growth(&mut inventory, 0, false),
         None
     );
-    assert_eq!(inventory.held(0).count, 2);
+    assert_eq!(inventory.held(0).unwrap().count, 2);
 }
 
 #[test]
@@ -6699,38 +7295,44 @@ fn sapling_bonemeal_unsupported_and_missing_tree_states_are_noop() {
 #[test]
 fn bonemeal_consumes_exactly_one_item_only_after_successful_growth() {
     let mut inventory = PlayerInventory::empty();
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 99,
-            count: 3,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 99,
+                count: 3,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
 
     assert_eq!(
         consume_bonemeal_after_growth(&mut inventory, 0, false),
         None
     );
-    assert_eq!(inventory.held(0).count, 3);
+    assert_eq!(inventory.held(0).unwrap().count, 3);
 
     let synced = consume_bonemeal_after_growth(&mut inventory, 0, true).unwrap();
     assert_eq!(synced.count, 2);
-    assert_eq!(inventory.held(0).count, 2);
+    assert_eq!(inventory.held(0).unwrap().count, 2);
 
-    inventory.set_hotbar(
-        0,
-        ItemStack {
-            item_id: 99,
-            count: 1,
-            damage: None,
-            enchantments: Vec::new(),
-        },
-    );
+    inventory
+        .set_hotbar(
+            0,
+            ItemStack {
+                item_id: 99,
+                count: 1,
+                damage: None,
+                enchantments: Vec::new(),
+                custom_name: None,
+            },
+        )
+        .unwrap();
     let synced = consume_bonemeal_after_growth(&mut inventory, 0, true).unwrap();
     assert!(synced.is_empty());
-    assert!(inventory.held(0).is_empty());
+    assert!(inventory.held(0).unwrap().is_empty());
 }
 
 #[test]
@@ -7824,7 +8426,7 @@ async fn scheduled_button_regions_replan_when_region_order_repeats() {
 }
 
 #[tokio::test]
-async fn scheduled_button_crossing_region_boundary_keeps_coordinator_fallback() {
+async fn scheduled_button_crossing_region_boundary_commits_without_world_storage() {
     let blocks = Arc::new(button_and_door_test_registry());
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     for chunk in [ChunkPos { x: 7, z: 0 }, ChunkPos { x: 8, z: 0 }] {
@@ -7903,25 +8505,24 @@ async fn scheduled_button_crossing_region_boundary_keeps_coordinator_fallback() 
     let (_simulation, owner) = simulation_channel();
     let resources = ChunkPipelineResources::with_limits(1, 2);
     let world_writer = world.lock().await;
-    let mut block_tick = Box::pin(owner.run_scheduled_block_ticks_with_budget(
-        &config,
-        &sessions,
-        SimulationWorldAccess {
-            read: Some(&world_read),
-            mutation: Some(&world_mutation),
-            cpu: Some(&resources),
-            light: config.block_light.as_ref(),
-        },
-        120,
-        1,
-    ));
-    std::future::poll_fn(|cx| match Future::poll(block_tick.as_mut(), cx) {
-        Poll::Pending => Poll::Ready(()),
-        Poll::Ready(_) => panic!("cross-region block transaction bypassed the coordinator"),
-    })
-    .await;
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        owner.run_scheduled_block_ticks_with_budget(
+            &config,
+            &sessions,
+            SimulationWorldAccess {
+                read: Some(&world_read),
+                mutation: Some(&world_mutation),
+                cpu: Some(&resources),
+                light: config.block_light.as_ref(),
+            },
+            120,
+            1,
+        ),
+    )
+    .await
+    .expect("cross-region scheduled block transaction must not wait for WorldStorage");
     drop(world_writer);
-    let report = block_tick.await;
 
     assert_eq!(report.drained, 1);
     assert_eq!(report.applied, 3);
@@ -7953,7 +8554,251 @@ async fn scheduled_button_crossing_region_boundary_keeps_coordinator_fallback() 
 }
 
 #[tokio::test]
-async fn scheduled_button_regions_preserve_coordinator_barrier_order() {
+async fn aborted_cross_region_scheduled_task_finishes_reserved_transaction() {
+    let blocks = Arc::new(button_and_door_test_registry());
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let west_chunk = ChunkPos { x: 7, z: 0 };
+    let east_chunk = ChunkPos { x: 8, z: 0 };
+    for chunk in [west_chunk, east_chunk] {
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    let west = mc_world::BlockPos {
+        x: 127,
+        y: 64,
+        z: 1,
+    };
+    let east = mc_world::BlockPos {
+        x: 128,
+        y: 64,
+        z: 1,
+    };
+    storage.set_block_at(west, BlockStateId(1)).unwrap();
+    storage.set_block_at(east, BlockStateId(1)).unwrap();
+    let due = ScheduledBlockTick::new(west, Identifier::parse("minecraft:stone").unwrap(), 20, 0);
+    storage.schedule_block_tick(due.clone()).unwrap();
+    let west_token = storage.block_mutation_token(west).unwrap();
+    let east_token = storage.block_mutation_token(east).unwrap();
+    let mutation = storage.mutation_view();
+    let read = storage.read_view();
+
+    let sessions = Arc::new(SessionRegistry::new());
+    let (requests, receiver) = std::sync::mpsc::sync_channel(4);
+    let (append_started_tx, append_started_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (appended_tx, appended_rx) = tokio::sync::oneshot::channel();
+    let worker = std::thread::spawn(move || {
+        let super::world_journal::WriterRequest::Replace { reply, .. } = receiver.recv().unwrap()
+        else {
+            panic!("expected reservation write");
+        };
+        reply.send(Ok(())).unwrap();
+        let super::world_journal::WriterRequest::Append { reply, .. } = receiver.recv().unwrap()
+        else {
+            panic!("expected decision append");
+        };
+        append_started_tx.send(()).unwrap();
+        release_rx.blocking_recv().unwrap();
+        reply.send(Ok(())).unwrap();
+        appended_tx.send(()).unwrap();
+        let super::world_journal::WriterRequest::Shutdown { reply } = receiver.recv().unwrap()
+        else {
+            panic!("expected journal shutdown");
+        };
+        reply.send(()).unwrap();
+    });
+    let journal = super::world_journal::WorldChunkJournal::from_parts_for_test(
+        std::path::PathBuf::from("abort-cross-region-journal"),
+        Arc::clone(&blocks),
+        Arc::new(mc_data::items::solaris_required_items()),
+        requests,
+        worker,
+    );
+    sessions.install_world_chunk_journal(journal.clone());
+
+    let task_sessions = Arc::clone(&sessions);
+    let task_mutation = mutation.clone();
+    let task = tokio::spawn(async move {
+        let edits = [
+            mc_world::ResidentBlockEdit {
+                pos: west,
+                new_state: BlockStateId(0),
+                preserve_light: true,
+            },
+            mc_world::ResidentBlockEdit {
+                pos: east,
+                new_state: BlockStateId(0),
+                preserve_light: true,
+            },
+        ];
+        let preconditions = [
+            mc_world::ResidentBlockPrecondition {
+                pos: west,
+                expected_state: BlockStateId(1),
+                expected_token: west_token,
+            },
+            mc_world::ResidentBlockPrecondition {
+                pos: east,
+                expected_state: BlockStateId(1),
+                expected_token: east_token,
+            },
+        ];
+        commit_cross_region_scheduled_block_tick(
+            &task_sessions,
+            &task_mutation,
+            20,
+            ResidentBlockCommit {
+                edits: &edits,
+                preconditions: &preconditions,
+                consumed_block_ticks: std::slice::from_ref(&due),
+                consumed_fluid_ticks: &[],
+                scheduled_fluid_ticks: &[],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        )
+        .await
+    });
+    append_started_rx.await.unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    release_tx.send(()).unwrap();
+    appended_rx.await.unwrap();
+
+    assert_eq!(mutation.schedule_fluid_ticks(&[]), 0);
+    assert_eq!(read.get_cached_block(west), Some(BlockStateId(0)));
+    assert_eq!(read.get_cached_block(east), Some(BlockStateId(0)));
+    assert_eq!(journal.watermark(), Some(1));
+    assert_eq!(storage.plan_dirty_flush().unwrap().chunk_count(), 2);
+}
+
+#[tokio::test]
+async fn known_cross_region_append_failure_closes_reserved_decision_empty() {
+    let blocks = Arc::new(button_and_door_test_registry());
+    let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
+    let west_chunk = ChunkPos { x: 7, z: 0 };
+    let east_chunk = ChunkPos { x: 8, z: 0 };
+    for chunk in [west_chunk, east_chunk] {
+        storage
+            .insert_generated_chunk(
+                chunk,
+                Chunk::empty(
+                    chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    let west = mc_world::BlockPos {
+        x: 127,
+        y: 64,
+        z: 1,
+    };
+    let east = mc_world::BlockPos {
+        x: 128,
+        y: 64,
+        z: 1,
+    };
+    storage.set_block_at(west, BlockStateId(1)).unwrap();
+    storage.set_block_at(east, BlockStateId(1)).unwrap();
+    let due = ScheduledBlockTick::new(west, Identifier::parse("minecraft:stone").unwrap(), 20, 0);
+    storage.schedule_block_tick(due.clone()).unwrap();
+    let west_token = storage.block_mutation_token(west).unwrap();
+    let east_token = storage.block_mutation_token(east).unwrap();
+    let mutation = storage.mutation_view();
+    let read = storage.read_view();
+
+    let temp = tempfile::tempdir().unwrap();
+    let journal_blocks = Arc::new(BlockRegistry::from_report(&[]).unwrap());
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+        temp.path(),
+        Arc::clone(&journal_blocks),
+        Arc::clone(&items),
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    let sessions = Arc::new(SessionRegistry::new());
+    let failure = sessions.subscribe_world_chunk_journal_failure();
+    sessions.install_world_chunk_journal(journal.clone());
+
+    let edits = [
+        mc_world::ResidentBlockEdit {
+            pos: west,
+            new_state: BlockStateId(0),
+            preserve_light: true,
+        },
+        mc_world::ResidentBlockEdit {
+            pos: east,
+            new_state: BlockStateId(0),
+            preserve_light: true,
+        },
+    ];
+    let preconditions = [
+        mc_world::ResidentBlockPrecondition {
+            pos: west,
+            expected_state: BlockStateId(1),
+            expected_token: west_token,
+        },
+        mc_world::ResidentBlockPrecondition {
+            pos: east,
+            expected_state: BlockStateId(1),
+            expected_token: east_token,
+        },
+    ];
+    let outcome = commit_cross_region_scheduled_block_tick(
+        &sessions,
+        &mutation,
+        20,
+        ResidentBlockCommit {
+            edits: &edits,
+            preconditions: &preconditions,
+            consumed_block_ticks: std::slice::from_ref(&due),
+            consumed_fluid_ticks: &[],
+            scheduled_fluid_ticks: &[],
+            light_table: None,
+            leaf_trigger_tick: None,
+        },
+    )
+    .await
+    .expect("known append failure closes its reservation")
+    .expect("known append failure is a rejected resident transaction");
+
+    assert!(outcome.applied.is_empty());
+    assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+    assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+    assert_eq!(
+        storage.scheduled_block_ticks(west_chunk).unwrap().unwrap(),
+        std::slice::from_ref(&due)
+    );
+    assert_eq!(journal.watermark(), Some(1));
+    assert!(!*failure.borrow());
+    drop(sessions);
+    drop(journal);
+
+    let (reopened, pending) =
+        super::world_journal::WorldChunkJournal::open(temp.path(), journal_blocks, items).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(reopened.decode_pending(&pending).unwrap().is_empty());
+    let next_decision_id = reopened.reserve_decision_ids(1).unwrap()[0];
+    assert_eq!(next_decision_id, pending[0].id() + 1);
+    reopened
+        .record_reserved_snapshot_groups(21, vec![(next_decision_id, Vec::new())])
+        .unwrap();
+    assert_eq!(reopened.watermark(), Some(next_decision_id));
+}
+
+#[tokio::test]
+async fn scheduled_button_regions_commit_without_the_global_world_writer() {
     let blocks = Arc::new(button_and_door_test_registry());
     let mut storage = mc_world::WorldStorage::in_memory(Arc::clone(&blocks));
     for chunk in [
@@ -8034,6 +8879,16 @@ async fn scheduled_button_regions_preserve_coordinator_barrier_order() {
     for chunk in loaded {
         let _ = sessions.mark_loaded(session, chunk);
     }
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(temp.path().join("region")).unwrap();
+    let (journal, pending) = super::world_journal::WorldChunkJournal::open(
+        temp.path(),
+        Arc::clone(&config.blocks),
+        Arc::clone(&config.items),
+    )
+    .unwrap();
+    assert!(pending.is_empty());
+    sessions.install_world_chunk_journal(journal);
     let storage = world.lock().await;
     let world_read = storage.read_view();
     let world_mutation = storage.mutation_view();
@@ -8041,44 +8896,28 @@ async fn scheduled_button_regions_preserve_coordinator_barrier_order() {
     let (_simulation, owner) = simulation_channel();
     let resources = ChunkPipelineResources::with_limits(1, 2);
     let world_writer = world.lock().await;
-    let mut block_tick = Box::pin(owner.run_scheduled_block_ticks_with_budget(
-        &config,
-        &sessions,
-        SimulationWorldAccess {
-            read: Some(&world_read),
-            mutation: Some(&world_mutation),
-            cpu: Some(&resources),
-            light: config.block_light.as_ref(),
-        },
-        120,
-        3,
-    ));
-    std::future::poll_fn(|cx| match Future::poll(block_tick.as_mut(), cx) {
-        Poll::Pending => Poll::Ready(()),
-        Poll::Ready(_) => panic!("mixed regional wave skipped its coordinator barrier"),
-    })
-    .await;
-    assert_eq!(
-        world_read
-            .block_mutation_snapshot(west_button)
-            .map(|pair| pair.0),
-        Some(BlockStateId(1))
-    );
-    assert_eq!(
-        world_read
-            .block_mutation_snapshot(boundary_button)
-            .map(|pair| pair.0),
-        Some(BlockStateId(2))
-    );
-    assert_eq!(
-        world_read
-            .block_mutation_snapshot(east_button)
-            .map(|pair| pair.0),
-        Some(BlockStateId(2))
-    );
-
+    let report = tokio::time::timeout(
+        Duration::from_secs(1),
+        owner.run_scheduled_block_ticks_with_budget(
+            &config,
+            &sessions,
+            SimulationWorldAccess {
+                read: Some(&world_read),
+                mutation: Some(&world_mutation),
+                cpu: Some(&resources),
+                light: config.block_light.as_ref(),
+            },
+            120,
+            3,
+        ),
+    )
+    .await
+    .expect("mixed single-region and cross-region wave completes without the world writer");
     drop(world_writer);
-    let report = block_tick.await;
+    assert!(
+        !*sessions.subscribe_world_chunk_journal_failure().borrow(),
+        "mixed regional wave must not fail-stop its world journal"
+    );
     assert_eq!(report.drained, 3);
     assert_eq!(report.applied, 5);
     let storage = world.lock().await;
@@ -9056,7 +9895,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
-        entity_types: Arc::new(EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         item_to_block,
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
@@ -9070,7 +9909,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
         shield_use: None,
         last_entity_attack_tick: None,
     };
-    *state.inventory.held_mut(0) = ItemStack::new(42, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(42, 1);
     let session_id = register_interaction_player(&mut state, "HopperPlacementBuilder");
     let (simulation, mut simulation_owner) = simulation_channel();
     state.simulation = simulation.for_session(session_id);
@@ -10402,10 +11241,10 @@ async fn scheduled_hopper_tick_feeds_campfire_cooking_slot() {
         .run_campfire_cooking_ticks(&config, &sessions, None, None)
         .await;
 
-    assert_eq!(cook_report.persisted, 0);
-    assert_eq!(cook_report.completed, 0);
-    assert_eq!(cook_report.dropped, 0);
-    assert!(!sessions.campfire_cooking_state(campfire_pos).is_empty());
+    assert_eq!(cook_report.persisted, 1);
+    assert_eq!(cook_report.completed, 1);
+    assert_eq!(cook_report.dropped, 1);
+    assert!(sessions.campfire_cooking_state(campfire_pos).is_empty());
 }
 
 #[test]
@@ -11756,94 +12595,23 @@ fn door_half_state_builds_two_block_placement_states() {
 }
 
 fn oriented_placement_test_registry() -> Arc<mc_world::BlockRegistry> {
-    Arc::new(
-        mc_world::BlockRegistry::from_report(&[
-            simple_block(0, "minecraft:air"),
-            BlockReport {
-                id: Identifier::parse("minecraft:oak_stairs").unwrap(),
-                properties: prop_schema(&[
-                    ("facing", &["north", "south", "east", "west"]),
-                    ("half", &["bottom", "top"]),
-                    ("shape", &["straight"]),
-                ]),
-                states: vec![
-                    state(
-                        1,
-                        true,
-                        &[
-                            ("facing", "north"),
-                            ("half", "bottom"),
-                            ("shape", "straight"),
-                        ],
-                    ),
-                    state(
-                        2,
-                        false,
-                        &[("facing", "north"), ("half", "top"), ("shape", "straight")],
-                    ),
-                    state(
-                        3,
-                        false,
-                        &[
-                            ("facing", "south"),
-                            ("half", "bottom"),
-                            ("shape", "straight"),
-                        ],
-                    ),
-                    state(
-                        4,
-                        false,
-                        &[("facing", "south"), ("half", "top"), ("shape", "straight")],
-                    ),
-                    state(
-                        5,
-                        false,
-                        &[
-                            ("facing", "east"),
-                            ("half", "bottom"),
-                            ("shape", "straight"),
-                        ],
-                    ),
-                    state(
-                        6,
-                        false,
-                        &[("facing", "east"), ("half", "top"), ("shape", "straight")],
-                    ),
-                    state(
-                        7,
-                        false,
-                        &[
-                            ("facing", "west"),
-                            ("half", "bottom"),
-                            ("shape", "straight"),
-                        ],
-                    ),
-                    state(
-                        8,
-                        false,
-                        &[("facing", "west"), ("half", "top"), ("shape", "straight")],
-                    ),
-                ],
-            },
-            BlockReport {
-                id: Identifier::parse("minecraft:oak_slab").unwrap(),
-                properties: prop_schema(&[("type", &["bottom", "top"])]),
-                states: vec![
-                    state(9, true, &[("type", "bottom")]),
-                    state(10, false, &[("type", "top")]),
-                ],
-            },
-            BlockReport {
-                id: Identifier::parse("minecraft:incomplete_stairs").unwrap(),
-                properties: prop_schema(&[
-                    ("facing", &["north", "south"]),
-                    ("half", &["bottom", "top"]),
-                ]),
-                states: vec![state(11, true, &[("facing", "north"), ("half", "bottom")])],
-            },
-        ])
-        .unwrap(),
-    )
+    Arc::new(mc_world::BlockRegistry::from_report(&solaris_required_blocks_report()).unwrap())
+}
+
+fn oriented_placement_state(
+    blocks: &mc_world::BlockRegistry,
+    block: &str,
+    properties: &[(&str, &str)],
+) -> mc_world::BlockStateId {
+    blocks
+        .by_name_and_props(
+            &Identifier::parse(block).unwrap(),
+            &properties
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_else(|| panic!("missing canonical state {block} {properties:?}"))
 }
 
 fn torch_placement_test_registry() -> Arc<mc_world::BlockRegistry> {
@@ -11977,51 +12745,63 @@ fn plan_oriented_test_placement(
 #[test]
 fn stair_placement_uses_yaw_and_cursor_height_for_all_facings_and_halves() {
     let blocks = oriented_placement_test_registry();
+    let held = blocks
+        .block(&Identifier::parse("minecraft:oak_stairs").unwrap())
+        .unwrap()
+        .default;
 
-    for (yaw, bottom, top) in [(0.0, 3, 4), (90.0, 7, 8), (180.0, 1, 2), (270.0, 5, 6)] {
-        assert_eq!(
-            plan_oriented_test_placement(
-                Arc::clone(&blocks),
-                mc_world::BlockStateId(1),
-                yaw,
-                mc_protocol::packets::play::Direction::East,
-                0.25,
-            ),
-            mc_world::BlockStateId(bottom),
-        );
-        assert_eq!(
-            plan_oriented_test_placement(
-                Arc::clone(&blocks),
-                mc_world::BlockStateId(1),
-                yaw,
-                mc_protocol::packets::play::Direction::East,
-                0.75,
-            ),
-            mc_world::BlockStateId(top),
-        );
+    for (yaw, facing) in [
+        (0.0, "south"),
+        (90.0, "west"),
+        (180.0, "north"),
+        (270.0, "east"),
+    ] {
+        for (cursor_y, half) in [(0.25, "bottom"), (0.75, "top")] {
+            assert_eq!(
+                plan_oriented_test_placement(
+                    Arc::clone(&blocks),
+                    held,
+                    yaw,
+                    mc_protocol::packets::play::Direction::East,
+                    cursor_y,
+                ),
+                oriented_placement_state(
+                    &blocks,
+                    "minecraft:oak_stairs",
+                    &[
+                        ("facing", facing),
+                        ("half", half),
+                        ("shape", "straight"),
+                        ("waterlogged", "false"),
+                    ],
+                ),
+            );
+        }
     }
 }
 
 #[test]
 fn slab_placement_uses_clicked_face_and_cursor_height() {
     let blocks = oriented_placement_test_registry();
+    let held = blocks
+        .block(&Identifier::parse("minecraft:oak_slab").unwrap())
+        .unwrap()
+        .default;
 
-    for (direction, cursor_y, expected) in [
-        (mc_protocol::packets::play::Direction::Up, 0.75, 9),
-        (mc_protocol::packets::play::Direction::Down, 0.25, 10),
-        (mc_protocol::packets::play::Direction::East, 0.25, 9),
-        (mc_protocol::packets::play::Direction::East, 0.5, 9),
-        (mc_protocol::packets::play::Direction::East, 0.75, 10),
+    for (direction, cursor_y, expected_type) in [
+        (mc_protocol::packets::play::Direction::Up, 0.75, "bottom"),
+        (mc_protocol::packets::play::Direction::Down, 0.25, "top"),
+        (mc_protocol::packets::play::Direction::East, 0.25, "bottom"),
+        (mc_protocol::packets::play::Direction::East, 0.5, "bottom"),
+        (mc_protocol::packets::play::Direction::East, 0.75, "top"),
     ] {
         assert_eq!(
-            plan_oriented_test_placement(
-                Arc::clone(&blocks),
-                mc_world::BlockStateId(9),
-                0.0,
-                direction,
-                cursor_y,
+            plan_oriented_test_placement(Arc::clone(&blocks), held, 0.0, direction, cursor_y,),
+            oriented_placement_state(
+                &blocks,
+                "minecraft:oak_slab",
+                &[("type", expected_type), ("waterlogged", "false")],
             ),
-            mc_world::BlockStateId(expected),
         );
     }
 }
@@ -12086,18 +12866,38 @@ fn placement_cursor_height_is_relative_to_the_placed_target() {
 }
 
 #[test]
-fn oriented_placement_falls_back_to_the_resolved_default_state_when_family_is_incomplete() {
-    let blocks = oriented_placement_test_registry();
+fn noncanonical_stair_family_fails_closed() {
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&[
+            simple_block(0, "minecraft:air"),
+            BlockReport {
+                id: Identifier::parse("minecraft:incomplete_stairs").unwrap(),
+                properties: prop_schema(&[
+                    ("facing", &["north", "south"]),
+                    ("half", &["bottom", "top"]),
+                ]),
+                states: vec![state(1, true, &[("facing", "north"), ("half", "bottom")])],
+            },
+        ])
+        .unwrap(),
+    );
+    let world = in_memory_button_world(Arc::clone(&blocks));
+    let snapshot = world
+        .read_view()
+        .snapshot_chunks(&[ChunkPos { x: 0, z: 0 }]);
 
-    assert_eq!(
-        plan_oriented_test_placement(
-            blocks,
-            mc_world::BlockStateId(11),
-            0.0,
+    assert!(
+        plan_block_placement(
+            &blocks,
+            mc_world::BlockStateId(1),
+            Some(&snapshot),
+            mc_world::BlockPos { x: 1, y: 64, z: 1 },
+            PlayerPose::new(0.5, 64.0, 0.5),
             mc_protocol::packets::play::Direction::East,
             0.75,
-        ),
-        mc_world::BlockStateId(11),
+            mc_world::BlockStateId(0),
+        )
+        .is_none()
     );
 }
 
@@ -12622,7 +13422,8 @@ fn nearby_monster_blocks_survival_sleep_but_not_creative_sleep() {
     );
     let state = interaction_state_for_blocks(blocks);
     let bed = mc_world::BlockPos { x: 0, y: 64, z: 0 };
-    state.sessions.spawn_command_entity_legacy_for_test(
+    state.sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(7.5, 68.5, 7.5),
@@ -12850,7 +13651,7 @@ fn interaction_state_for_items(items: Arc<ItemRegistry>) -> InteractionState {
         inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
-        entity_types: Arc::new(EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         item_to_block,
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
@@ -12878,12 +13679,7 @@ async fn disconnected_cursor_is_preserved_when_simulation_owner_is_unavailable()
         state.inventory.slots[slot] = ItemStack::new(10, 64);
     }
     state.carried_item = ItemStack::new(10, 2);
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let pose = PlayerPose::new(4.5, 65.0, 6.5);
     let profile = LoggedInProfile {
         uuid: crate::login::offline_uuid("DisconnectCursor"),
@@ -12924,12 +13720,7 @@ async fn disconnected_cursor_settlement_commits_inventory_and_drop_in_one_owner_
         state.inventory.slots[slot] = ItemStack::new(10, 64);
     }
     state.carried_item = ItemStack::new(10, 2);
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
 
     let pose = PlayerPose::new(4.5, 65.0, 6.5);
     let profile = LoggedInProfile {
@@ -12987,12 +13778,7 @@ async fn crafting_table_close_commits_returned_inputs_and_all_drops_in_one_owner
         state.inventory.slots[slot] = ItemStack::new(10, 64);
     }
     state.inventory.slots[9] = ItemStack::new(10, 63);
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let mut window = CraftingTableWindow::new(7);
     window.input[0] = ItemStack::new(10, 2);
     window.input[1] = ItemStack::new(11, 3);
@@ -13055,12 +13841,7 @@ async fn inventory_crafting_close_commits_returned_inputs_and_drop_in_one_owner_
     }
     state.inventory.slots[9] = ItemStack::new(10, 63);
     state.inventory.slots[1] = ItemStack::new(10, 2);
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
 
     let pose = PlayerPose::new(4.5, 65.0, 6.5);
     let profile = LoggedInProfile {
@@ -13286,12 +14067,7 @@ async fn disconnect_settles_table_grid_inventory_grid_and_cursor_in_one_owner_tu
     state.inventory.slots[9] = ItemStack::new(10, 63);
     state.inventory.slots[1] = ItemStack::new(10, 2);
     state.carried_item = ItemStack::new(10, 1);
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 1,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let mut window = CraftingTableWindow::new(7);
     window.input[0] = ItemStack::new(10, 2);
     let crafting_table_input = crafting_table_input_projection(&window.input);
@@ -15992,16 +16768,7 @@ fn register_survival_test_player(
         }),
     );
     state.session_id = session_id;
-    state.entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 2,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:experience_orb").unwrap(),
-            protocol_id: 3,
-        },
-    ]));
+    state.entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     state.sessions.configure_arrow_kill_rewards(
         item_entity_type_id(&state.entity_types),
         xp_orb_entity_type_id(&state.entity_types),
@@ -16151,7 +16918,7 @@ async fn grounded_arrow_pickup_credits_owner_inventory_and_writes_slot() {
     }]));
     let arrow_item_id = items.id_of(&arrow).unwrap();
     let mut state = interaction_state_for_items(items);
-    state.sessions.spawn_arrow_legacy_for_test(
+    state.sessions.spawn_arrow_for_test(
         None,
         3,
         Vec3::new(1.5, 64.0, 0.5),
@@ -16320,7 +17087,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
         ),
         4.0,
     );
@@ -16328,7 +17095,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             102,
         ),
@@ -16338,7 +17105,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             105,
         ),
@@ -16348,7 +17115,7 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             None,
             0,
         ),
@@ -16359,14 +17126,14 @@ fn empty_hand_attack_strength_scales_partial_and_full_damage() {
 #[test]
 fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
     let (mut state, sword, _) = attack_strength_test_state();
-    *state.inventory.held_mut(0) = ItemStack::new(sword, 1)
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(sword, 1)
         .with_enchantment(Identifier::parse("minecraft:sharpness").unwrap(), 3);
 
     assert_attack_damage_close(
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
         ),
         1.6,
     );
@@ -16374,7 +17141,7 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             106,
         ),
@@ -16384,7 +17151,7 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             112,
         ),
@@ -16395,13 +17162,13 @@ fn sword_attack_speed_modifier_scales_partial_and_full_damage() {
 #[test]
 fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
     let (mut state, _, axe) = attack_strength_test_state();
-    *state.inventory.held_mut(0) = ItemStack::new(axe, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(axe, 1);
 
     assert_attack_damage_close(
         held_attack_speed(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
         ),
         0.8,
     );
@@ -16409,7 +17176,7 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             112,
         ),
@@ -16419,7 +17186,7 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
         held_attack_damage_at_tick(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             Some(100),
             125,
         ),
@@ -16430,14 +17197,14 @@ fn axe_attack_speed_modifier_scales_partial_and_full_damage() {
 #[test]
 fn attack_damage_scales_all_playable_modes_without_recording_before_validation() {
     let (mut state, sword, _) = attack_strength_test_state();
-    *state.inventory.held_mut(0) = ItemStack::new(sword, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(sword, 1);
 
     for game_mode in [GameMode::Survival, GameMode::Adventure, GameMode::Creative] {
         state.last_entity_attack_tick = Some(100);
         let damage = begin_player_attack_attempt(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             game_mode,
             state.last_entity_attack_tick,
             106,
@@ -16453,7 +17220,7 @@ fn attack_damage_scales_all_playable_modes_without_recording_before_validation()
         begin_player_attack_attempt(
             &state.item_facts,
             &state.items,
-            state.inventory.held(state.selected_hotbar_slot),
+            state.inventory.held(state.selected_hotbar_slot).unwrap(),
             GameMode::Spectator,
             state.last_entity_attack_tick,
             106,
@@ -16609,7 +17376,7 @@ async fn run_pvp_commit_cost_case(
             },
         ),
     ]));
-    *state.inventory.held_mut(0) = ItemStack::new(sword, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(sword, 1);
     let mut survival = SurvivalState {
         exhaustion: 3.95,
         ..SurvivalState::FULL
@@ -16721,7 +17488,7 @@ async fn authoritative_pvp_commit_gates_exhaustion_and_weapon_durability() {
     assert!(rejected.last_entity_attack_tick.is_some());
     assert_eq!(rejected_survival.saturation, 5.0);
     assert_eq!(rejected_survival.exhaustion, 3.95);
-    assert_eq!(rejected.inventory.held(0).damage, None);
+    assert_eq!(rejected.inventory.held(0).unwrap().damage, None);
     let rejected_persisted = rejected
         .sessions
         .persisted_player_states()
@@ -16729,14 +17496,14 @@ async fn authoritative_pvp_commit_gates_exhaustion_and_weapon_durability() {
         .find(|(uuid, _, _)| *uuid == crate::login::offline_uuid("PvpCostAttacker"))
         .map(|(_, state, _)| state)
         .expect("rejected attacker authority state remains registered");
-    assert_eq!(rejected_persisted.inventory.held(0).damage, None);
+    assert_eq!(rejected_persisted.inventory.held(0).unwrap().damage, None);
     assert_eq!(rejected_persisted.survival, rejected_survival);
 
     let (accepted, accepted_survival) = run_pvp_commit_cost_case(true, true).await;
     assert!(accepted.last_entity_attack_tick.is_some());
     assert_eq!(accepted_survival.saturation, 4.0);
     assert!((accepted_survival.exhaustion - 0.05).abs() < 0.000_01);
-    assert_eq!(accepted.inventory.held(0).damage, Some(1));
+    assert_eq!(accepted.inventory.held(0).unwrap().damage, Some(1));
     let persisted = accepted
         .sessions
         .persisted_player_states()
@@ -16744,7 +17511,7 @@ async fn authoritative_pvp_commit_gates_exhaustion_and_weapon_durability() {
         .find(|(uuid, _, _)| *uuid == crate::login::offline_uuid("PvpCostAttacker"))
         .map(|(_, state, _)| state)
         .expect("attacker authority state remains registered");
-    assert_eq!(persisted.inventory.held(0).damage, Some(1));
+    assert_eq!(persisted.inventory.held(0).unwrap().damage, Some(1));
     assert_eq!(persisted.survival, accepted_survival);
 }
 
@@ -16755,18 +17522,19 @@ async fn dropped_target_publication_does_not_undo_authoritative_pvp_costs() {
     assert!(attacker.last_entity_attack_tick.is_some());
     assert_eq!(survival.saturation, 4.0);
     assert!((survival.exhaustion - 0.05).abs() < 0.000_01);
-    assert_eq!(attacker.inventory.held(0).damage, Some(1));
+    assert_eq!(attacker.inventory.held(0).unwrap().damage, Some(1));
 }
 
 #[tokio::test]
 async fn server_entity_attack_commits_weapon_costs_in_authority() {
     let (mut state, sword, _) = attack_strength_test_state();
-    *state.inventory.held_mut(0) = ItemStack::new(sword, 1);
+    *state.inventory.held_mut(0).unwrap() = ItemStack::new(sword, 1);
     let mut survival = SurvivalState::FULL;
     let mut xp = XpState::default();
     let (stop, owner_task) =
         start_survival_test_owner(&mut state, "MobCostAttacker", survival, &xp);
-    state.sessions.spawn_command_entity_legacy_for_test(
+    state.sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         54,
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.0),
@@ -16793,7 +17561,7 @@ async fn server_entity_attack_commits_weapon_costs_in_authority() {
     .await
     .unwrap();
 
-    assert_eq!(state.inventory.held(0).damage, Some(1));
+    assert_eq!(state.inventory.held(0).unwrap().damage, Some(1));
     let persisted = state
         .sessions
         .persisted_player_states()
@@ -16801,7 +17569,7 @@ async fn server_entity_attack_commits_weapon_costs_in_authority() {
         .find(|(uuid, _, _)| *uuid == crate::login::offline_uuid("MobCostAttacker"))
         .map(|(_, state, _)| state)
         .expect("attacker authority state remains registered");
-    assert_eq!(persisted.inventory.held(0).damage, Some(1));
+    assert_eq!(persisted.inventory.held(0).unwrap().damage, Some(1));
     assert_eq!(persisted.survival, survival);
 
     stop.send(()).unwrap();
@@ -16815,7 +17583,8 @@ async fn out_of_reach_attack_does_not_reset_attacker_strength() {
     let mut xp = XpState::default();
     let (stop, owner_task) =
         start_survival_test_owner(&mut state, "OutOfReachAttack", survival, &xp);
-    state.sessions.spawn_command_entity_legacy_for_test(
+    state.sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         54,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 20.5),
@@ -16856,7 +17625,8 @@ async fn reachable_mob_hurt_immunity_still_resets_attacker_strength() {
     let mut xp = XpState::default();
     let (stop, owner_task) =
         start_survival_test_owner(&mut state, "ImmuneMobAttack", survival, &xp);
-    state.sessions.spawn_command_entity_legacy_for_test(
+    state.sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         54,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 1.0),
@@ -16918,16 +17688,7 @@ async fn concurrent_lethal_attacks_create_one_drop_and_one_xp_reward() {
     let rotten_flesh_id = items
         .id_of(&Identifier::parse("minecraft:rotten_flesh").unwrap())
         .unwrap();
-    let entity_types = Arc::new(EntityTypeRegistry::from_report(&[
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:item").unwrap(),
-            protocol_id: 2,
-        },
-        mc_data::entity_types::EntityTypeReport {
-            id: Identifier::parse("minecraft:experience_orb").unwrap(),
-            protocol_id: 3,
-        },
-    ]));
+    let entity_types = Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let mut alice = interaction_state_for_items(Arc::clone(&items));
     let mut bob = interaction_state_for_items(items);
     bob.sessions = Arc::clone(&alice.sessions);
@@ -16985,7 +17746,8 @@ async fn concurrent_lethal_attacks_create_one_drop_and_one_xp_reward() {
     bob.session_id = bob_id;
     alice.simulation = simulation.for_session(alice_id);
     bob.simulation = simulation.for_session(bob_id);
-    alice.sessions.spawn_command_entity_legacy_for_test(
+    alice.sessions.spawn_command_entity(
+        &simulation::SimulationAuthority::for_test(),
         54,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -16998,7 +17760,7 @@ async fn concurrent_lethal_attacks_create_one_drop_and_one_xp_reward() {
         .expect("spawned zombie is attackable");
     let pre_damage = alice
         .sessions
-        .damage_server_entity_legacy_for_test(target.id, 19.0)
+        .damage_server_entity_for_test(target.id, 19.0)
         .expect("prime zombie to one health");
     assert_eq!(pre_damage.snapshot.health, 1.0);
     alice
@@ -17631,12 +18393,7 @@ async fn campfire_tick_does_not_load_cold_chunks_and_is_durable_when_resident() 
         world: Some(Arc::clone(&world)),
         blocks,
         items,
-        entity_types: Arc::new(EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 2,
-            },
-        ])),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         recipes: Arc::new(vec![Recipe {
             id: Identifier::parse("minecraft:test_campfire").unwrap(),
             kind: RecipeKind::CampfireCooking(SmeltingRecipe {
@@ -18402,7 +19159,7 @@ async fn campfire_test_interaction_state(pos: mc_world::BlockPos) -> Interaction
         inventory_quickcraft: QuickCraftState::default(),
         items,
         item_facts: Arc::new(ItemFactsTable::default()),
-        entity_types: Arc::new(EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         item_to_block,
         tags: Arc::new(TagsData::default()),
         recipes: Vec::new(),
@@ -18668,7 +19425,7 @@ fn older_victim_publication_preserves_newer_attacker_costs() {
     assert!(applied.survival_changed);
     assert_eq!(survival.health, 16.0);
     assert_eq!(survival.exhaustion, 0.1);
-    assert_eq!(state.inventory.held(0).damage, Some(1));
+    assert_eq!(state.inventory.held(0).unwrap().damage, Some(1));
     assert_eq!(state.inventory.slots[5].damage, Some(2));
 }
 

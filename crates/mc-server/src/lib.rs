@@ -207,6 +207,8 @@ pub struct AuthSection {
     #[serde(default)]
     pub online_mode: bool,
     #[serde(default)]
+    pub prevent_proxy_connections: bool,
+    #[serde(default)]
     pub whitelist_enabled: bool,
     #[serde(default)]
     pub whitelist: Vec<String>,
@@ -524,12 +526,15 @@ impl ServerConfig {
                 self.admin.operators.clone(),
                 self.admin.allow_local_dev_operators,
             )
-            .with_login_access(mc_net::LoginAccessConfig::normalized(
-                self.auth.online_mode,
-                self.auth.whitelist_enabled,
-                self.auth.whitelist.clone(),
-                self.auth.banned_players.clone(),
-            )),
+            .with_login_access(
+                mc_net::LoginAccessConfig::normalized(
+                    self.auth.online_mode,
+                    self.auth.whitelist_enabled,
+                    self.auth.whitelist.clone(),
+                    self.auth.banned_players.clone(),
+                )
+                .with_prevent_proxy_connections(self.auth.prevent_proxy_connections),
+            ),
             shutdown: mc_net::ShutdownHandle::default(),
         })
     }
@@ -588,6 +593,7 @@ mod tests {
         assert_eq!(cfg.data.seed, 0);
         assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
         assert!(!cfg.auth.online_mode);
+        assert!(!cfg.auth.prevent_proxy_connections);
         assert!(!cfg.auth.whitelist_enabled);
         assert!(cfg.auth.whitelist.is_empty());
         assert!(cfg.auth.banned_players.is_empty());
@@ -636,9 +642,33 @@ mod tests {
         );
         assert!(!cfg.admin.allow_local_dev_operators);
         assert!(!cfg.auth.online_mode);
+        assert!(!cfg.auth.prevent_proxy_connections);
         assert!(!cfg.auth.whitelist_enabled);
         assert!(cfg.autoscale.enabled);
         assert_eq!(cfg.autoscale.profile, AutoscaleProfile::Balanced);
+    }
+
+    #[test]
+    fn parses_ip_bound_online_authentication() {
+        let cfg: ServerConfig = toml::from_str(
+            r#"
+                [server]
+                name = "S"
+                motd = "M"
+
+                [network]
+                bind_address = "127.0.0.1"
+                port = 25565
+
+                [auth]
+                online_mode = true
+                prevent_proxy_connections = true
+            "#,
+        )
+        .expect("parse IP-bound online authentication");
+
+        assert!(cfg.auth.online_mode);
+        assert!(cfg.auth.prevent_proxy_connections);
     }
 
     #[test]
@@ -1019,7 +1049,7 @@ mod tests {
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
                 Arc::new(BlockFactsTable::default()),
-                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
                 Arc::new(BiomeSpawnRules::default()),
             )
             .unwrap();
@@ -1124,7 +1154,7 @@ mod tests {
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
                 Arc::new(BlockFactsTable::default()),
-                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
                 Arc::new(BiomeSpawnRules::default()),
             )
             .unwrap();
@@ -1168,7 +1198,7 @@ mod tests {
                 Arc::new(ItemRegistry::default()),
                 Arc::new(ItemFactsTable::default()),
                 Arc::new(BlockFactsTable::default()),
-                Arc::new(EntityTypeRegistry::default()),
+                Arc::new(mc_data::entity_types::solaris_required_entity_types()),
                 Arc::new(BiomeSpawnRules::default())
             )
             .is_err()

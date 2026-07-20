@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use mc_data::items::ItemRegistry;
 
@@ -25,6 +25,111 @@ type PublishedChunkShard = RwLock<HashMap<ChunkPos, ChunkSnapshot>>;
 type FurnaceSnapshotShard = RwLock<FurnaceSnapshotsByChunk>;
 pub type DirtyHighWaterNotifier = Arc<dyn Fn() + Send + Sync + 'static>;
 
+pub(crate) struct ResidentPublicationState {
+    mutation_gate: RwLock<()>,
+    generation: AtomicU64,
+    fail_stopped: AtomicBool,
+}
+
+impl ResidentPublicationState {
+    fn new() -> Self {
+        Self {
+            mutation_gate: RwLock::new(()),
+            generation: AtomicU64::new(0),
+            fail_stopped: AtomicBool::new(false),
+        }
+    }
+
+    pub(crate) fn mutation(&self) -> RwLockReadGuard<'_, ()> {
+        let guard = self
+            .mutation_gate
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !self.fail_stopped.load(Ordering::Acquire),
+            "resident publication is fail-stopped"
+        );
+        guard
+    }
+
+    pub(crate) fn transaction(&self) -> RwLockWriteGuard<'_, ()> {
+        let guard = self
+            .mutation_gate
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert!(
+            !self.fail_stopped.load(Ordering::Acquire),
+            "resident publication is fail-stopped"
+        );
+        guard
+    }
+
+    pub(crate) fn read_consistent<R>(&self, read: impl Fn() -> R) -> R {
+        let _admission = self.mutation();
+        let generation = self.generation.load(Ordering::Acquire);
+        assert_eq!(
+            generation & 1,
+            0,
+            "admitted resident reader saw odd generation"
+        );
+        let value = read();
+        assert_eq!(
+            self.generation.load(Ordering::Acquire),
+            generation,
+            "resident publication changed under reader admission"
+        );
+        value
+    }
+
+    pub(crate) fn begin_publish<'a>(
+        &'a self,
+        transaction: RwLockWriteGuard<'a, ()>,
+    ) -> ResidentPublishGuard<'a> {
+        let previous = self.generation.fetch_add(1, Ordering::AcqRel);
+        assert_eq!(previous & 1, 0, "resident publication cannot nest");
+        ResidentPublishGuard {
+            state: self,
+            _transaction: transaction,
+            completed: false,
+        }
+    }
+}
+
+#[must_use = "a resident publication must be completed explicitly"]
+/// Dropping without completion fail-stops the state before releasing reader
+/// admission, so no caller can observe a partial publication.
+pub(crate) struct ResidentPublishGuard<'a> {
+    state: &'a ResidentPublicationState,
+    _transaction: RwLockWriteGuard<'a, ()>,
+    completed: bool,
+}
+
+impl ResidentPublishGuard<'_> {
+    pub(crate) fn complete(mut self) {
+        let previous = self.state.generation.load(Ordering::Acquire);
+        assert_eq!(previous & 1, 1, "resident publication generation is odd");
+        self.state
+            .generation
+            .store(previous.wrapping_add(1), Ordering::Release);
+        self.completed = true;
+    }
+}
+
+impl Drop for ResidentPublishGuard<'_> {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        self.state.fail_stopped.store(true, Ordering::Release);
+        let generation = self.state.generation.load(Ordering::Acquire);
+        if generation & 1 == 1 {
+            self.state
+                .generation
+                .store(generation.wrapping_add(1), Ordering::Release);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct WorldReadView {
     chunks: Arc<[PublishedChunkShard; READ_VIEW_SHARD_COUNT]>,
@@ -34,6 +139,7 @@ pub struct WorldReadView {
     capacity: usize,
     dirty_saturated: Arc<AtomicBool>,
     dirty_high_water_notifier: Arc<RwLock<Option<DirtyHighWaterNotifier>>>,
+    publication: Arc<ResidentPublicationState>,
 }
 
 #[derive(Clone, Default)]
@@ -57,9 +163,10 @@ pub struct ChunkSourceView {
     generator_available: Arc<AtomicBool>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct ScheduledTickView {
     chunks: Arc<RwLock<HashMap<ChunkPos, ScheduledTickHint>>>,
+    publication: Arc<ResidentPublicationState>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -79,31 +186,40 @@ impl WorldReadView {
             capacity: capacity.max(1),
             dirty_saturated: Arc::new(AtomicBool::new(false)),
             dirty_high_water_notifier: Arc::new(RwLock::new(None)),
+            publication: Arc::new(ResidentPublicationState::new()),
         }
+    }
+
+    pub(crate) fn publication_state(&self) -> Arc<ResidentPublicationState> {
+        Arc::clone(&self.publication)
     }
 
     #[must_use]
     pub fn get_cached_block(&self, pos: BlockPos) -> Option<BlockStateId> {
-        let cpos = chunk_pos_of(pos);
-        let chunks = self.chunks[read_view_shard(cpos)]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let chunk = chunks.get(&cpos)?;
-        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
-        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
-        chunk.get_block(local_x, pos.y, local_z)
+        self.publication.read_consistent(|| {
+            let cpos = chunk_pos_of(pos);
+            let chunks = self.chunks[read_view_shard(cpos)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let chunk = chunks.get(&cpos)?;
+            let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            chunk.get_block(local_x, pos.y, local_z)
+        })
     }
 
     #[must_use]
     pub fn block_mutation_token(&self, pos: BlockPos) -> Option<crate::BlockMutationToken> {
-        let cpos = chunk_pos_of(pos);
-        let chunks = self.chunks[read_view_shard(cpos)]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let chunk = chunks.get(&cpos)?;
-        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
-        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
-        chunk.block_mutation_token(local_x, pos.y, local_z)
+        self.publication.read_consistent(|| {
+            let cpos = chunk_pos_of(pos);
+            let chunks = self.chunks[read_view_shard(cpos)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let chunk = chunks.get(&cpos)?;
+            let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            chunk.block_mutation_token(local_x, pos.y, local_z)
+        })
     }
 
     #[must_use]
@@ -111,64 +227,72 @@ impl WorldReadView {
         &self,
         pos: BlockPos,
     ) -> Option<(BlockStateId, crate::BlockMutationToken)> {
-        let cpos = chunk_pos_of(pos);
-        let chunks = self.chunks[read_view_shard(cpos)]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let chunk = chunks.get(&cpos)?;
-        let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
-        let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
-        Some((
-            chunk.get_block(local_x, pos.y, local_z)?,
-            chunk.block_mutation_token(local_x, pos.y, local_z)?,
-        ))
+        self.publication.read_consistent(|| {
+            let cpos = chunk_pos_of(pos);
+            let chunks = self.chunks[read_view_shard(cpos)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let chunk = chunks.get(&cpos)?;
+            let local_x = pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            Some((
+                chunk.get_block(local_x, pos.y, local_z)?,
+                chunk.block_mutation_token(local_x, pos.y, local_z)?,
+            ))
+        })
     }
 
     #[must_use]
     pub fn snapshot_chunks(&self, positions: &[ChunkPos]) -> WorldReadSnapshot {
-        let mut snapshots = HashMap::with_capacity(positions.len());
-        for &position in positions {
-            let chunks = self.chunks[read_view_shard(position)]
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(chunk) = chunks.get(&position) {
-                snapshots
-                    .entry(position)
-                    .or_insert_with(|| Arc::clone(chunk));
+        self.publication.read_consistent(|| {
+            let mut snapshots = HashMap::with_capacity(positions.len());
+            for &position in positions {
+                let chunks = self.chunks[read_view_shard(position)]
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(chunk) = chunks.get(&position) {
+                    snapshots
+                        .entry(position)
+                        .or_insert_with(|| Arc::clone(chunk));
+                }
             }
-        }
-        WorldReadSnapshot { chunks: snapshots }
+            WorldReadSnapshot { chunks: snapshots }
+        })
     }
 
     #[must_use]
     pub fn furnace_snapshots(&self, positions: &[ChunkPos]) -> Vec<(BlockPos, FurnaceBlockEntity)> {
-        let mut snapshots = Vec::new();
-        for position in positions {
-            let furnaces = self.furnaces[read_view_shard(*position)]
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(chunk_furnaces) = furnaces.get(position) {
-                snapshots.extend(
-                    chunk_furnaces
-                        .iter()
-                        .map(|(&position, furnace)| (position, furnace.clone())),
-                );
+        self.publication.read_consistent(|| {
+            let mut snapshots = Vec::new();
+            for position in positions {
+                let furnaces = self.furnaces[read_view_shard(*position)]
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(chunk_furnaces) = furnaces.get(position) {
+                    snapshots.extend(
+                        chunk_furnaces
+                            .iter()
+                            .map(|(&position, furnace)| (position, furnace.clone())),
+                    );
+                }
             }
-        }
-        snapshots
+            snapshots
+        })
     }
 
     /// Report whether a new chunk can enter the cache without waiting for the
     /// mutable storage owner. The final insert rechecks the same condition.
     #[must_use]
     pub fn can_cache_new_chunk(&self, position: ChunkPos) -> bool {
-        if !self.dirty_saturated.load(Ordering::Acquire) {
-            return true;
-        }
-        let chunks = self.chunks[read_view_shard(position)]
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        chunks.contains_key(&position)
+        self.publication.read_consistent(|| {
+            if !self.dirty_saturated.load(Ordering::Acquire) {
+                return true;
+            }
+            let chunks = self.chunks[read_view_shard(position)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            chunks.contains_key(&position)
+        })
     }
 
     fn contains_chunk(&self, position: ChunkPos) -> bool {
@@ -258,11 +382,13 @@ impl WorldReadView {
     }
 
     pub(crate) fn resident_len(&self) -> usize {
-        self.resident_chunks.load(Ordering::Acquire)
+        self.publication
+            .read_consistent(|| self.resident_chunks.load(Ordering::Acquire))
     }
 
     pub(crate) fn dirty_len(&self) -> usize {
-        self.dirty_chunks.load(Ordering::Acquire)
+        self.publication
+            .read_consistent(|| self.dirty_chunks.load(Ordering::Acquire))
     }
 
     fn record_replacement(&self, previous: Option<&Chunk>, current: Option<&Chunk>) {
@@ -355,47 +481,68 @@ impl Default for WorldReadView {
     }
 }
 
+impl ScheduledTickView {
+    pub(super) fn with_publication(publication: Arc<ResidentPublicationState>) -> Self {
+        Self {
+            chunks: Arc::new(RwLock::new(HashMap::new())),
+            publication,
+        }
+    }
+}
+
+impl Default for ScheduledTickView {
+    fn default() -> Self {
+        Self::with_publication(Arc::new(ResidentPublicationState::new()))
+    }
+}
+
 impl ChunkSourceView {
     #[must_use]
     pub fn source_for(&self, position: ChunkPos) -> ChunkPrepareSource {
-        if self.resident.contains_chunk(position) {
-            return ChunkPrepareSource::Resident;
-        }
-        let (rx, rz) = region_of(position);
-        if self.disk_backed && self.region_root.join(format!("r.{rx}.{rz}.mca")).is_file() {
-            return ChunkPrepareSource::RegionFile;
-        }
-        if self.generator_available.load(Ordering::Acquire) {
-            ChunkPrepareSource::Generator
-        } else {
-            ChunkPrepareSource::Absent
-        }
+        self.resident.publication.read_consistent(|| {
+            if self.resident.contains_chunk(position) {
+                return ChunkPrepareSource::Resident;
+            }
+            let (rx, rz) = region_of(position);
+            if self.disk_backed && self.region_root.join(format!("r.{rx}.{rz}.mca")).is_file() {
+                return ChunkPrepareSource::RegionFile;
+            }
+            if self.generator_available.load(Ordering::Acquire) {
+                ChunkPrepareSource::Generator
+            } else {
+                ChunkPrepareSource::Absent
+            }
+        })
     }
 }
 
 impl ScheduledTickView {
     #[must_use]
     pub fn block_due(&self, position: ChunkPos, world_tick: u64) -> bool {
-        self.chunks
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&position)
-            .is_some_and(|hint| {
-                hint.hopper_backfill_required
-                    || hint
-                        .next_block_tick
-                        .is_some_and(|trigger_tick| trigger_tick <= world_tick)
-            })
+        self.publication.read_consistent(|| {
+            self.chunks
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&position)
+                .is_some_and(|hint| {
+                    hint.hopper_backfill_required
+                        || hint
+                            .next_block_tick
+                            .is_some_and(|trigger_tick| trigger_tick <= world_tick)
+                })
+        })
     }
 
     #[must_use]
     pub fn fluid_due(&self, position: ChunkPos, world_tick: u64) -> bool {
-        self.chunks
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .get(&position)
-            .and_then(|hint| hint.next_fluid_tick)
-            .is_some_and(|trigger_tick| trigger_tick <= world_tick)
+        self.publication.read_consistent(|| {
+            self.chunks
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&position)
+                .and_then(|hint| hint.next_fluid_tick)
+                .is_some_and(|trigger_tick| trigger_tick <= world_tick)
+        })
     }
 
     pub(crate) fn publish_chunk(

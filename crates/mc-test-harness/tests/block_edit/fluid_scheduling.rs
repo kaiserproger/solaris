@@ -94,7 +94,7 @@ async fn water_bucket_spread_waits_for_scheduled_fluid_delay() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(block_facts.clone()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy {
@@ -221,8 +221,8 @@ async fn lava_bucket_next_to_water_solidifies_through_scheduled_fluid_tick() {
         .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .map(|b| b.default)
         .expect("dirt in registry");
-    let water_source_state_id = fluid_state_with_level(&blocks, "minecraft:water", 0)
-        .expect("water source in registry");
+    let water_source_state_id =
+        fluid_state_with_level(&blocks, "minecraft:water", 0).expect("water source in registry");
     let obsidian_state_id = blocks
         .block(&mc_data::Identifier::parse("minecraft:obsidian").unwrap())
         .map(|b| b.default)
@@ -295,7 +295,7 @@ async fn lava_bucket_next_to_water_solidifies_through_scheduled_fluid_tick() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(block_facts.clone()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy {

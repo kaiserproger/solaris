@@ -26,6 +26,14 @@ guesses, no fake validation, no hidden parity claims, no unrelated
 rewrites, no untracked local artifacts in commits, and no invented
 abstractions that tests do not need.
 
+Solaris has no released compatibility surface. Do not preserve old Solaris
+APIs, persistence schemas, duplicate authorities, adapters, feature flags, or
+fallback paths merely because they already exist. Delete superseded code in the
+same slice once callers move. Compatibility targets are vanilla protocol and
+behavior (with deliberate bug fixes) plus vanilla world load/save formats, not
+historical Solaris internals. A compatibility layer may remain only when an
+explicit current external contract and test require it.
+
 Optimization hacks and deliberately narrow fast paths are allowed when they
 move a measured bottleneck. Document the reason, applicability boundary,
 correctness fence, measured effect, and removal or fallback path in the same
@@ -60,6 +68,8 @@ follow its links only when the task needs them.
   `docs/CORE_M77_M100_ROADMAP.md` only for M77-M100 sequencing.
 - Architecture, ownership, threading, or policy: `docs/decisions/README.md`,
   then the exact ADR. Update that ADR in the same slice.
+- Detailed owner-facing explanation of the current core, module responsibilities,
+  execution paths, and known pitfalls: `docs/CORE_INTERNALS_FOR_OWNER.md`.
 - Performance, regional ownership, ECS, or autoscale: the exact active
   milestone plus ADR 0004/0005. Use `docs/M52_OPERATOR_PERFORMANCE_NOTES.md`
   only for metric definitions.
@@ -205,6 +215,12 @@ blocks further.
 Subagents are useful for scouting, implementation, and review when file
 ownership is separable. The main agent remains responsible for inspecting
 their diff and reporting exact validation evidence.
+
+Keep subagent usage bounded: never run more than four agents concurrently.
+Prefer two independent workers plus one reviewer, and use a fourth only for a
+clearly disjoint critical-path slice. Use `sol` at medium/high reasoning or
+`luna` at xhigh reasoning; do not use `terra`. Close finished agents before
+replacing them so the concurrency count stays explicit.
 
 Timebox each concrete independently revertible task to 90-120 minutes. If the
 scope will not fit, split it early into disjoint write sets and delegate those

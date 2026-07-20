@@ -29,9 +29,10 @@ async fn bonemeal_growth_debits_only_successful_survival_use() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let farmland = crop_test_state(&blocks, "minecraft:farmland", &[]);
     let wheat_age0 = crop_test_state(&blocks, "minecraft:wheat", &[("age", "0")]);
@@ -195,11 +196,7 @@ fn crop_test_set(
         .expect("crop fixture block edit succeeds");
 }
 
-async fn wait_for_mature_bonemeal_noop(
-    client: &mut Client,
-    pos: (i32, i32, i32),
-    sequence: i32,
-) {
+async fn wait_for_mature_bonemeal_noop(client: &mut Client, pos: (i32, i32, i32), sequence: i32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let frame = client

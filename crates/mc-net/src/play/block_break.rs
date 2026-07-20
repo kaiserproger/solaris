@@ -10,8 +10,9 @@ use tracing::{debug, warn};
 use crate::error::ConnectionError;
 
 use super::block_edit_commit::{
-    apply_player_block_edit_batch, finalize_visible_block_edit_outcome,
+    apply_player_block_edit_batch_conditionally, finalize_visible_block_edit_outcome,
 };
+use super::block_placement::plan_stair_state_transition;
 use super::block_wire::broadcast_level_event;
 use super::fluids::supported_flow_state;
 use super::session::{dispatch_visibility_commands, within_block_reach};
@@ -207,8 +208,9 @@ where
     let (x, y, z) = unpack_block_pos(position);
     let pos = mc_world::BlockPos { x, y, z };
     if let Some(expected_target) = expected_target {
-        dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-        let held = state.inventory.held(state.selected_hotbar_slot).clone();
+        let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
+            return Ok(false);
+        };
         let max_damage = if held.is_empty() {
             None
         } else {
@@ -279,6 +281,11 @@ where
                     && edit.previous != edit.new_state
             })
             .map(|edit| edit.previous);
+        if !committed.block.applied.is_empty() {
+            dispatch_visibility_commands(
+                state.sessions.broadcast_player_animation(state.session_id),
+            );
+        }
         state.inventory = committed.inventory;
         let changed_slots = committed.changed_slots;
         if let Some(destroyed_state) = destroyed_state {
@@ -309,7 +316,7 @@ where
         return Ok(false);
     }
     let air = air_state_id(&state.blocks);
-    let edits = {
+    let planned = {
         let mut storage = state.world.lock().await;
         let replacement = break_replacement_state_in_storage(
             &state.blocks,
@@ -321,23 +328,52 @@ where
         );
         match storage.get_block(pos) {
             Ok(Some(previous)) => {
-                plan_break_block_edits(&state.blocks, &*storage, pos, previous, replacement, air)
+                let edits = plan_break_block_edits(
+                    &state.blocks,
+                    &*storage,
+                    pos,
+                    previous,
+                    replacement,
+                    air,
+                );
+                storage.block_mutation_token(pos).and_then(|token| {
+                    let preconditions = plan_break_edit_preconditions(
+                        &state.blocks,
+                        &*storage,
+                        &edits,
+                        pos,
+                        BlockMutationSnapshot {
+                            state: previous,
+                            token,
+                        },
+                    )?;
+                    Some((edits, preconditions))
+                })
             }
-            Ok(None) => Vec::new(),
+            Ok(None) => None,
             Err(error) => {
                 warn!(%error, x, y, z, "block break target read failed");
-                Vec::new()
+                None
             }
         }
     };
-    if edits.is_empty() {
+    let Some((edits, preconditions)) = planned else {
         write_block_resync(state, writer, position).await?;
         write_block_ack(writer, state.compression, sequence).await?;
         return Ok(false);
+    };
+    let outcome = apply_player_block_edit_batch_conditionally(
+        state,
+        writer,
+        sequence,
+        &edits,
+        &preconditions,
+        &[],
+    )
+    .await?;
+    if !outcome.applied.is_empty() {
+        dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
     }
-    dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));
-
-    let outcome = apply_player_block_edit_batch(state, writer, sequence, &edits).await?;
     if let Some(destroyed_state) = outcome
         .applied
         .iter()
@@ -361,12 +397,21 @@ where
 }
 
 pub(super) fn plan_break_edit_preconditions(
+    blocks: &mc_world::BlockRegistry,
     storage: &impl BlockPlanningRead,
     edits: &[BlockEdit],
     root: mc_world::BlockPos,
     expected_root: BlockMutationSnapshot,
 ) -> Option<Vec<BlockEditPrecondition>> {
-    edits
+    let root_edit = edits.iter().find(|edit| edit.pos == root)?;
+    let transition = plan_stair_state_transition(
+        blocks,
+        storage,
+        root,
+        expected_root.state,
+        root_edit.new_state,
+    )?;
+    let mut preconditions = edits
         .iter()
         .map(|edit| {
             if edit.pos == root {
@@ -382,7 +427,16 @@ pub(super) fn plan_break_edit_preconditions(
                 expected_token: storage.block_mutation_token(edit.pos)?,
             })
         })
-        .collect()
+        .collect::<Option<Vec<_>>>()?;
+    for precondition in transition.dependency_preconditions {
+        if !preconditions
+            .iter()
+            .any(|existing| existing.pos == precondition.pos)
+        {
+            preconditions.push(precondition);
+        }
+    }
+    Some(preconditions)
 }
 
 pub(super) fn plan_survival_break_drops(
@@ -455,12 +509,20 @@ pub(super) fn plan_break_block_edits(
     replacement: mc_world::BlockStateId,
     air: mc_world::BlockStateId,
 ) -> Vec<BlockEdit> {
+    if state_id == replacement {
+        return Vec::new();
+    }
+    let Some(transition) = plan_stair_state_transition(blocks, storage, pos, state_id, replacement)
+    else {
+        return Vec::new();
+    };
     let mut edits = vec![BlockEdit {
         pos,
-        new_state: replacement,
+        new_state: transition.target_state,
     }];
+    edits.extend(transition.neighbor_edits);
     let Some(state) = blocks.by_id(state_id) else {
-        return edits;
+        return Vec::new();
     };
     if state.block.id.path().ends_with("_door") {
         let other_y = match super::block_state_property(state, "half") {

@@ -17,20 +17,42 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .expect("air block")
+        .default;
     let station_state_id = blocks
         .block(&mc_data::Identifier::parse("minecraft:smithing_table").unwrap())
         .map(|b| b.default.0 as i32)
         .expect("smithing table in registry");
-    let dirt_state_id = blocks
+    let dirt_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("dirt in registry");
+    let dirt_state_id = dirt_state.0 as i32;
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let surface_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn terrain");
+    let placement_columns = [(2, 2), (3, 2), (2, 3)];
+    for (x, z) in placement_columns {
+        storage
+            .set_block_at(mc_world::BlockPos { x, y: surface_y, z }, dirt_state)
+            .expect("seed station placement support");
+        storage
+            .set_block_at(
+                mc_world::BlockPos {
+                    x,
+                    y: surface_y + 1,
+                    z,
+                },
+                air_state,
+            )
+            .expect("clear station placement target");
+    }
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
@@ -57,7 +79,7 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -81,11 +103,13 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
     wait_for_slot_stack(&mut client, station_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
     let station_y = support_y + 1;
+    let (station_x, station_z) = placement_columns[0];
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
+            position: pack_block_pos(station_x, support_y, station_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -96,7 +120,12 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         })
         .await
         .expect("place smithing table");
-    wait_for_block_update(&mut client, (0, station_y, 0), station_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (station_x, station_y, station_z),
+        station_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -109,7 +138,7 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, station_y, 0),
+            position: pack_block_pos(station_x, station_y, station_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -120,7 +149,13 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         })
         .await
         .expect("use unsupported station");
-    read_station_noop_ack(&mut client, 702, (0, station_y + 1, 0), dirt_state_id).await;
+    read_station_noop_ack(
+        &mut client,
+        702,
+        (station_x, station_y + 1, station_z),
+        dirt_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -128,11 +163,11 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
         })
         .await
         .expect("switch to creative");
-    for (sequence, x) in [(703, 1), (704, 2)] {
+    for (sequence, (x, z)) in [(703, placement_columns[1]), (704, placement_columns[2])] {
         client
             .write_packet(&ServerboundUseItemOn {
                 hand: InteractionHand::MainHand,
-                position: pack_block_pos(x, support_y, 0),
+                position: pack_block_pos(x, support_y, z),
                 direction: Direction::Up,
                 cursor_x: 0.5,
                 cursor_y: 1.0,
@@ -143,7 +178,7 @@ async fn station_noop_and_creative_placement_preserve_inventory() {
             })
             .await
             .expect("place creative dirt");
-        wait_for_block_update(&mut client, (x, station_y, 0), dirt_state_id).await;
+        wait_for_block_update(&mut client, (x, station_y, z), dirt_state_id).await;
     }
 }
 
@@ -231,7 +266,10 @@ async fn placing_torch_on_a_wall_publishes_exact_state_then_ack_then_one_debit()
             if unpack_block_pos(packet.position) == (target.x, target.y, target.z) {
                 assert_eq!(packet.state_id, wall_torch_east.0 as i32);
                 target_updates += 1;
-                assert_eq!(target_updates, 1, "torch placement publishes one target update");
+                assert_eq!(
+                    target_updates, 1,
+                    "torch placement publishes one target update"
+                );
             }
         } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
@@ -243,7 +281,8 @@ async fn placing_torch_on_a_wall_publishes_exact_state_then_ack_then_one_debit()
             }
         } else if frame.id == ClientboundContainerSetSlot::ID {
             let mut body = frame.body;
-            let packet = ClientboundContainerSetSlot::decode(&mut body).expect("decode torch debit");
+            let packet =
+                ClientboundContainerSetSlot::decode(&mut body).expect("decode torch debit");
             if packet.container_id == 0 && packet.slot == 36 && packet.item_stack.is_empty() {
                 assert!(saw_ack, "torch debit follows acknowledgement");
                 debits += 1;

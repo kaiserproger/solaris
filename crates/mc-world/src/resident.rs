@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use mc_data::Identifier;
 use mc_data::block_light::BlockLightTable;
@@ -84,6 +84,38 @@ pub struct ResidentScheduledBlockTickPlan<'a> {
     pub preconditions: &'a [ResidentBlockPrecondition],
     pub light_table: Option<&'a BlockLightTable>,
     pub leaf_trigger_tick: Option<u64>,
+}
+
+/// A staged scheduled-block-tick change spanning more than one resident
+/// region. The transaction owns immutable source snapshots and mutable staged
+/// snapshots; no read or tick view is published until durability succeeds in
+/// [`Self::commit_durably`].
+pub struct ResidentCrossRegionScheduledBlockTickTransaction {
+    resident: ResidentChunkStore,
+    chunks: Vec<ResidentCrossRegionStagedChunk>,
+    applied: Vec<ResidentAppliedBlockEdit>,
+    touched: Vec<ChunkPos>,
+    #[cfg(test)]
+    publish_hook: Option<Arc<dyn Fn(ChunkPos) + Send + Sync>>,
+}
+
+struct ResidentCrossRegionStagedChunk {
+    position: ChunkPos,
+    expected: Option<ChunkSnapshot>,
+    staged: Option<ChunkSnapshot>,
+}
+
+pub enum ResidentCrossRegionScheduledBlockTickPrepareResult {
+    Prepared(ResidentCrossRegionScheduledBlockTickTransaction),
+    Missing,
+    Stale,
+}
+
+pub enum ResidentCrossRegionScheduledBlockTickCommitResult<E> {
+    Applied(Vec<ResidentAppliedBlockEdit>),
+    Missing,
+    Stale,
+    DurabilityFailed(E),
 }
 
 struct ResidentBlockEditPlan<'a> {
@@ -196,78 +228,80 @@ impl ResidentChunkStore {
 
     #[must_use]
     pub(crate) fn snapshot(&self, position: ChunkPos) -> Option<ChunkSnapshot> {
-        let region = self.region(position)?;
-        region
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .chunks
-            .get(&position)
-            .map(Arc::clone)
+        self.read_view
+            .publication_state()
+            .read_consistent(|| self.snapshot_with_publication_excluded(position))
     }
 
     #[must_use]
     pub(crate) fn snapshots(&self) -> Vec<(ChunkPos, ChunkSnapshot)> {
-        let regions: Vec<_> = self
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        let mut snapshots = Vec::new();
-        for region in regions {
-            snapshots.extend(
-                region
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .chunks
-                    .iter()
-                    .map(|(&position, chunk)| (position, Arc::clone(chunk))),
-            );
-        }
-        snapshots
+        self.read_view.publication_state().read_consistent(|| {
+            let regions: Vec<_> = self
+                .regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            let mut snapshots = Vec::new();
+            for region in regions {
+                snapshots.extend(
+                    region
+                        .read()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .chunks
+                        .iter()
+                        .map(|(&position, chunk)| (position, Arc::clone(chunk))),
+                );
+            }
+            snapshots
+        })
     }
 
     #[must_use]
     pub(crate) fn flushable_snapshots(&self) -> Vec<(ChunkPos, ChunkSnapshot)> {
-        let regions: Vec<_> = self
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        let mut snapshots = Vec::new();
-        for region in regions {
-            let region = region
+        self.read_view.publication_state().read_consistent(|| {
+            let regions: Vec<_> = self
+                .regions
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            snapshots.extend(
-                region
-                    .chunks
-                    .iter()
-                    .filter(|(position, _)| !region.pending_journal_lsn.contains_key(position))
-                    .map(|(&position, chunk)| (position, Arc::clone(chunk))),
-            );
-        }
-        snapshots
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            let mut snapshots = Vec::new();
+            for region in regions {
+                let region = region
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                snapshots.extend(
+                    region
+                        .chunks
+                        .iter()
+                        .filter(|(position, _)| !region.pending_journal_lsn.contains_key(position))
+                        .map(|(&position, chunk)| (position, Arc::clone(chunk))),
+                );
+            }
+            snapshots
+        })
     }
 
     #[must_use]
     pub(crate) fn has_flushable_dirty(&self) -> bool {
-        let regions: Vec<_> = self
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .values()
-            .cloned()
-            .collect();
-        regions.into_iter().any(|region| {
-            let region = region
+        self.read_view.publication_state().read_consistent(|| {
+            let regions: Vec<_> = self
+                .regions
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            region.chunks.iter().any(|(position, chunk)| {
-                chunk.dirty && !region.pending_journal_lsn.contains_key(position)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .values()
+                .cloned()
+                .collect();
+            regions.into_iter().any(|region| {
+                let region = region
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                region.chunks.iter().any(|(position, chunk)| {
+                    chunk.dirty && !region.pending_journal_lsn.contains_key(position)
+                })
             })
         })
     }
@@ -277,6 +311,8 @@ impl ResidentChunkStore {
         decision_id: u64,
         positions: &[ChunkPos],
     ) -> JournalStampResult {
+        let publication = self.read_view.publication_state();
+        let transaction = publication.transaction();
         let mut positions = positions.to_vec();
         positions.sort_unstable_by_key(|position| (position.x, position.z));
         positions.dedup();
@@ -284,31 +320,26 @@ impl ResidentChunkStore {
         region_positions.sort_unstable();
         region_positions.dedup();
 
-        let regions = self
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut locked_regions = Vec::with_capacity(region_positions.len());
-        for region_position in region_positions {
-            let Some(region) = regions.get(&region_position) else {
-                return JournalStampResult::Missing;
-            };
-            locked_regions.push((
-                region_position,
-                region
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            ));
-        }
+        let regions = {
+            let resident_regions = self
+                .regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut regions = HashMap::with_capacity(region_positions.len());
+            for region_position in region_positions {
+                let Some(region) = resident_regions.get(&region_position) else {
+                    return JournalStampResult::Missing;
+                };
+                regions.insert(region_position, Arc::clone(region));
+            }
+            regions
+        };
 
         let mut newer_decision = decision_id;
         for position in &positions {
-            let Some((_, region)) = locked_regions
-                .iter()
-                .find(|(region, _)| *region == region_of(*position))
-            else {
-                return JournalStampResult::Missing;
-            };
+            let region = regions[&region_of(*position)]
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(chunk) = region.chunks.get(position) else {
                 return JournalStampResult::Missing;
             };
@@ -322,11 +353,11 @@ impl ResidentChunkStore {
         }
 
         let mut snapshots = Vec::with_capacity(positions.len());
+        let publishing = publication.begin_publish(transaction);
         for position in positions {
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region, _)| *region == region_of(position))
-                .expect("preflighted journal region");
+            let mut region = regions[&region_of(position)]
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let chunk = region
                 .chunks
                 .get_mut(&position)
@@ -342,10 +373,13 @@ impl ResidentChunkStore {
                     .expect("stamped journal chunk remains resident"),
             ));
         }
+        publishing.complete();
         JournalStampResult::Stamped(snapshots)
     }
 
     pub(crate) fn insert_if_absent(&self, position: ChunkPos, chunk: Chunk) -> bool {
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
         let region = self.region_or_create(position);
         let mut region = region
             .write()
@@ -360,6 +394,8 @@ impl ResidentChunkStore {
     }
 
     pub(crate) fn replace(&self, position: ChunkPos, chunk: ChunkSnapshot) {
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
         let region = self.region_or_create(position);
         let mut region = region
             .write()
@@ -376,6 +412,8 @@ impl ResidentChunkStore {
     }
 
     pub(crate) fn remove_if_clean(&self, position: ChunkPos) -> bool {
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
         let Some(region) = self.region(position) else {
             return false;
         };
@@ -397,6 +435,8 @@ impl ResidentChunkStore {
         position: ChunkPos,
         update: impl FnOnce(&mut Chunk) -> R,
     ) -> Option<R> {
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
         let region = self.region(position)?;
         let mut region = region
             .write()
@@ -414,6 +454,8 @@ impl ResidentChunkStore {
         position: ChunkPos,
         update: impl FnOnce(&mut ChunkSnapshot) -> R,
     ) -> Option<R> {
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
         let region = self.region(position)?;
         let mut region = region
             .write()
@@ -452,6 +494,16 @@ impl ResidentChunkStore {
             .cloned()
     }
 
+    fn snapshot_with_publication_excluded(&self, position: ChunkPos) -> Option<ChunkSnapshot> {
+        let region = self.region(position)?;
+        region
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .chunks
+            .get(&position)
+            .map(Arc::clone)
+    }
+
     fn region_or_create(&self, position: ChunkPos) -> Arc<RwLock<ResidentRegion>> {
         let key = region_of(position);
         if let Some(region) = self
@@ -488,6 +540,8 @@ impl WorldMutationView {
         decision_id: u64,
         positions: &[ChunkPos],
     ) -> usize {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let mut cleared = 0;
         for &position in positions {
             let Some(region) = self.resident.region(position) else {
@@ -518,39 +572,20 @@ impl WorldMutationView {
         expected_sources: &HashMap<ChunkPos, Option<ChunkSnapshot>>,
         updates: impl IntoIterator<Item = (ChunkPos, &'a ChunkLight)>,
     ) -> bool {
+        let publication = self.resident.read_view.publication_state();
+        let transaction = publication.transaction();
         let updates = updates.into_iter().collect::<Vec<_>>();
-        let mut region_positions = expected_sources
-            .keys()
-            .copied()
-            .chain(updates.iter().map(|(position, _)| *position))
-            .map(region_of)
-            .collect::<Vec<_>>();
-        region_positions.sort_unstable();
-        region_positions.dedup();
-
-        let regions = self
-            .resident
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut locked_regions = Vec::with_capacity(region_positions.len());
-        for position in region_positions {
-            if let Some(region) = regions.get(&position) {
-                locked_regions.push((
-                    position,
-                    region
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ));
-            }
-        }
-
         for (position, expected) in expected_sources {
-            let current = locked_regions
-                .iter()
-                .find(|(region, _)| *region == region_of(*position))
-                .and_then(|(_, region)| region.chunks.get(position));
-            let is_current = match (expected, current) {
+            let region = self.resident.region(*position);
+            let current = region.as_ref().and_then(|region| {
+                region
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .chunks
+                    .get(position)
+                    .map(Arc::clone)
+            });
+            let is_current = match (expected, &current) {
                 (Some(expected), Some(current)) => Arc::ptr_eq(expected, current),
                 (None, None) => true,
                 _ => false,
@@ -560,19 +595,22 @@ impl WorldMutationView {
             }
         }
         if updates.iter().any(|(position, _)| {
-            locked_regions
-                .iter()
-                .find(|(region, _)| *region == region_of(*position))
-                .is_none_or(|(_, region)| !region.chunks.contains_key(position))
+            self.resident
+                .snapshot_with_publication_excluded(*position)
+                .is_none()
         }) {
             return false;
         }
 
+        let publishing = publication.begin_publish(transaction);
         for (position, light) in updates {
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region, _)| *region == region_of(position))
-                .expect("preflighted baked-light region");
+            let region = self
+                .resident
+                .region(position)
+                .expect("preflighted light region");
+            let mut region = region
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let chunk = region
                 .chunks
                 .get_mut(&position)
@@ -581,6 +619,7 @@ impl WorldMutationView {
                 .read_view
                 .update_chunk(position, chunk, |chunk| chunk.set_baked_light(light));
         }
+        publishing.complete();
         true
     }
 
@@ -598,55 +637,31 @@ impl WorldMutationView {
         F: FnOnce(&HashMap<ChunkPos, Option<ChunkSnapshot>>) -> Vec<T>,
         G: for<'a> Fn(&'a T) -> (ChunkPos, &'a ChunkLight),
     {
+        let publication = self.resident.read_view.publication_state();
+        let transaction = publication.transaction();
         let mut source_positions = source_positions.into_iter().collect::<Vec<_>>();
         source_positions.sort_unstable_by_key(|position| (position.x, position.z));
         source_positions.dedup();
-        let mut region_positions = source_positions
-            .iter()
-            .copied()
-            .map(region_of)
-            .collect::<Vec<_>>();
-        region_positions.sort_unstable();
-        region_positions.dedup();
-
-        let regions = self
-            .resident
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut locked_regions = Vec::with_capacity(region_positions.len());
-        for position in region_positions {
-            if let Some(region) = regions.get(&position) {
-                locked_regions.push((
-                    position,
-                    region
-                        .write()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner()),
-                ));
-            }
-        }
-
         let sources = source_positions
             .into_iter()
             .map(|position| {
-                let chunk = locked_regions
-                    .iter()
-                    .find(|(region, _)| *region == region_of(position))
-                    .and_then(|(_, region)| region.chunks.get(&position))
-                    .map(Arc::clone);
-                (position, chunk)
+                (
+                    position,
+                    self.resident.snapshot_with_publication_excluded(position),
+                )
             })
             .collect::<HashMap<_, _>>();
         let updates = recompute(&sources);
         let mut published = Vec::with_capacity(updates.len());
+        let publishing = publication.begin_publish(transaction);
         for update in updates {
             let (position, light) = light_of(&update);
-            let Some((_, region)) = locked_regions
-                .iter_mut()
-                .find(|(region, _)| *region == region_of(position))
-            else {
+            let Some(region) = self.resident.region(position) else {
                 continue;
             };
+            let mut region = region
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let Some(chunk) = region.chunks.get_mut(&position) else {
                 continue;
             };
@@ -655,6 +670,7 @@ impl WorldMutationView {
                 .update_chunk(position, chunk, |chunk| chunk.set_baked_light(light));
             published.push(update);
         }
+        publishing.complete();
         published
     }
 
@@ -700,6 +716,8 @@ impl WorldMutationView {
         expected_token: BlockMutationToken,
         bytes: Vec<u8>,
     ) -> (ResidentOpaqueBlockEntityCommitResult, Vec<ChunkPos>) {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let chunk_position = chunk_pos_of(position);
         let Some(region) = self.resident.region(chunk_position) else {
             return (ResidentOpaqueBlockEntityCommitResult::Missing, Vec::new());
@@ -754,12 +772,7 @@ impl WorldMutationView {
         &self,
         position: BlockPos,
     ) -> Option<(BlockStateId, FurnaceBlockEntity)> {
-        let chunk_position = chunk_pos_of(position);
-        let region = self.resident.region(chunk_position)?;
-        let region = region
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let chunk = region.chunks.get(&chunk_position)?;
+        let chunk = self.resident.snapshot(chunk_pos_of(position))?;
         let local_x = position.x.rem_euclid(SECTION_DIM as i32) as u8;
         let local_z = position.z.rem_euclid(SECTION_DIM as i32) as u8;
         Some((
@@ -769,6 +782,8 @@ impl WorldMutationView {
     }
 
     pub fn backfill_hopper_ticks(&self, positions: &[ChunkPos], trigger_tick: u64) -> usize {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let mut grouped = HashMap::<WorldRegionPos, Vec<ChunkPos>>::new();
         for &position in positions {
             grouped
@@ -889,6 +904,8 @@ impl WorldMutationView {
         expected: &FurnaceBlockEntity,
         updated: &FurnaceBlockEntity,
     ) -> (ResidentFurnaceTickCommitResult, Vec<ChunkPos>) {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let chunk_position = chunk_pos_of(position);
         let Some(region) = self.resident.region(chunk_position) else {
             return (ResidentFurnaceTickCommitResult::Missing, Vec::new());
@@ -968,6 +985,8 @@ impl WorldMutationView {
         consumed_ticks: &[ScheduledBlockTick],
         plan: &ResidentHopperTransferPlan,
     ) -> (ResidentHopperTransferCommitResult, Vec<ChunkPos>) {
+        let publication = self.resident.read_view.publication_state();
+        let transaction = publication.transaction();
         let mut positions = hopper_transfer_positions(plan);
         positions.extend(consumed_ticks.iter().map(|tick| tick.pos));
         positions.sort_unstable_by_key(|position| (position.x, position.y, position.z));
@@ -975,45 +994,22 @@ impl WorldMutationView {
         if positions.is_empty() {
             return (ResidentHopperTransferCommitResult::Missing, Vec::new());
         }
-        let mut region_positions = positions
-            .iter()
-            .map(|position| region_of(chunk_pos_of(*position)))
-            .collect::<Vec<_>>();
-        region_positions.sort_unstable();
-        region_positions.dedup();
-        let regions = self
-            .resident
-            .regions
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut locked_regions = Vec::with_capacity(region_positions.len());
-        for region_position in region_positions {
-            let Some(region) = regions.get(&region_position) else {
+        let mut staged = HashMap::<ChunkPos, ChunkSnapshot>::new();
+        for chunk_position in positions.iter().map(|position| chunk_pos_of(*position)) {
+            if staged.contains_key(&chunk_position) {
+                continue;
+            }
+            let Some(chunk) = self
+                .resident
+                .snapshot_with_publication_excluded(chunk_position)
+            else {
                 return (ResidentHopperTransferCommitResult::Missing, Vec::new());
             };
-            locked_regions.push((
-                region_position,
-                region
-                    .write()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()),
-            ));
-        }
-        if positions.iter().any(|position| {
-            let chunk_position = chunk_pos_of(*position);
-            locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(chunk_position))
-                .is_none_or(|(_, region)| !region.chunks.contains_key(&chunk_position))
-        }) {
-            return (ResidentHopperTransferCommitResult::Missing, Vec::new());
+            staged.insert(chunk_position, Arc::new((*chunk).clone()));
         }
         for (position, expected) in &plan.expected_states {
             let chunk_position = chunk_pos_of(*position);
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(chunk_position))
-                .expect("preflighted hopper region");
-            let chunk = &region.chunks[&chunk_position];
+            let chunk = &staged[&chunk_position];
             let local_x = position.x.rem_euclid(SECTION_DIM as i32) as u8;
             let local_z = position.z.rem_euclid(SECTION_DIM as i32) as u8;
             if chunk.get_block(local_x, position.y, local_z) != Some(*expected) {
@@ -1022,11 +1018,7 @@ impl WorldMutationView {
         }
         if plan.hoppers.iter().any(|change| {
             let chunk_position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(chunk_position))
-                .expect("preflighted hopper region");
-            region.chunks[&chunk_position]
+            staged[&chunk_position]
                 .hoppers
                 .get(&change.position)
                 .cloned()
@@ -1034,11 +1026,7 @@ impl WorldMutationView {
                 != change.expected
         }) || plan.chests.iter().any(|change| {
             let chunk_position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(chunk_position))
-                .expect("preflighted chest region");
-            region.chunks[&chunk_position]
+            staged[&chunk_position]
                 .chests
                 .get(&change.position)
                 .cloned()
@@ -1046,11 +1034,7 @@ impl WorldMutationView {
                 != change.expected
         }) || plan.furnaces.iter().any(|change| {
             let chunk_position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(chunk_position))
-                .expect("preflighted furnace region");
-            region.chunks[&chunk_position]
+            staged[&chunk_position]
                 .furnaces
                 .get(&change.position)
                 .cloned()
@@ -1067,11 +1051,7 @@ impl WorldMutationView {
                 .push(tick.clone());
         }
         if consumed_by_chunk.iter().any(|(position, expected)| {
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(*position))
-                .expect("preflighted consumed-tick region");
-            !region.chunks[position]
+            !staged[position]
                 .scheduled_block_ticks()
                 .starts_with(expected)
         }) {
@@ -1082,31 +1062,16 @@ impl WorldMutationView {
         let mut consumed_by_chunk = consumed_by_chunk.into_iter().collect::<Vec<_>>();
         consumed_by_chunk.sort_unstable_by_key(|(position, _)| (position.x, position.z));
         for (position, expected) in consumed_by_chunk {
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("preflighted consumed-tick region");
-            let chunk = region
-                .chunks
-                .get_mut(&position)
-                .expect("preflighted hopper tick chunk");
-            self.resident
-                .read_view
-                .update_chunk(position, chunk, |chunk| {
-                    assert!(chunk.drain_scheduled_block_tick_prefix(&expected));
-                    if let Some(decision_id) = decision_id {
-                        chunk.set_world_journal_lsn(decision_id);
-                    }
-                });
+            let chunk = Arc::make_mut(staged.get_mut(&position).expect("staged hopper tick chunk"));
+            assert!(chunk.drain_scheduled_block_tick_prefix(&expected));
+            if let Some(decision_id) = decision_id {
+                chunk.set_world_journal_lsn(decision_id);
+            }
             changed_chunks.insert(position);
         }
         for change in &plan.hoppers {
             let position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("preflighted hopper region");
-            let chunk = Arc::make_mut(region.chunks.get_mut(&position).expect("hopper chunk"));
+            let chunk = Arc::make_mut(staged.get_mut(&position).expect("hopper chunk"));
             chunk
                 .hoppers
                 .insert(change.position, change.updated.clone());
@@ -1118,11 +1083,7 @@ impl WorldMutationView {
         }
         for change in &plan.chests {
             let position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("preflighted chest region");
-            let chunk = Arc::make_mut(region.chunks.get_mut(&position).expect("chest chunk"));
+            let chunk = Arc::make_mut(staged.get_mut(&position).expect("chest chunk"));
             chunk.chests.insert(change.position, change.updated.clone());
             chunk.mark_dirty();
             if let Some(decision_id) = decision_id {
@@ -1132,11 +1093,7 @@ impl WorldMutationView {
         }
         for change in &plan.furnaces {
             let position = chunk_pos_of(change.position);
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("preflighted furnace region");
-            let chunk = Arc::make_mut(region.chunks.get_mut(&position).expect("furnace chunk"));
+            let chunk = Arc::make_mut(staged.get_mut(&position).expect("furnace chunk"));
             chunk
                 .furnaces
                 .insert(change.position, change.updated.clone());
@@ -1148,16 +1105,7 @@ impl WorldMutationView {
         }
         for tick in &plan.scheduled_block_ticks {
             let position = chunk_pos_of(tick.pos);
-            let (_, region) = locked_regions
-                .iter_mut()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("preflighted scheduled-tick region");
-            let chunk = Arc::make_mut(
-                region
-                    .chunks
-                    .get_mut(&position)
-                    .expect("scheduled-tick chunk"),
-            );
+            let chunk = Arc::make_mut(staged.get_mut(&position).expect("scheduled-tick chunk"));
             if chunk.schedule_block_tick(tick.clone()) {
                 if let Some(decision_id) = decision_id {
                     chunk.set_world_journal_lsn(decision_id);
@@ -1167,24 +1115,25 @@ impl WorldMutationView {
         }
         let mut changed_chunks = changed_chunks.into_iter().collect::<Vec<_>>();
         changed_chunks.sort_unstable_by_key(|position| (position.x, position.z));
-        if let Some(decision_id) = decision_id {
-            for &position in &changed_chunks {
-                let (_, region) = locked_regions
-                    .iter_mut()
-                    .find(|(region_position, _)| *region_position == region_of(position))
-                    .expect("changed hopper region remains locked");
+        let publishing = publication.begin_publish(transaction);
+        for &position in &changed_chunks {
+            let chunk = Arc::clone(&staged[&position]);
+            let region = self
+                .resident
+                .region(position)
+                .expect("staged hopper region");
+            let mut region = region
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            region.chunks.insert(position, Arc::clone(&chunk));
+            if let Some(decision_id) = decision_id {
                 region.pending_journal_lsn.insert(position, decision_id);
             }
+            drop(region);
+            self.resident.publish(position, &chunk);
+            self.resident.read_view.publish_furnaces(position, &chunk);
         }
-        for &position in &changed_chunks {
-            let (_, region) = locked_regions
-                .iter()
-                .find(|(region_position, _)| *region_position == region_of(position))
-                .expect("changed hopper region remains locked");
-            let chunk = &region.chunks[&position];
-            self.resident.publish(position, chunk);
-            self.resident.read_view.publish_furnaces(position, chunk);
-        }
+        publishing.complete();
         (ResidentHopperTransferCommitResult::Applied, changed_chunks)
     }
 
@@ -1194,6 +1143,8 @@ impl WorldMutationView {
         expected: &FurnaceBlockEntity,
         updated: &FurnaceBlockEntity,
     ) -> ResidentFurnaceCommitResult {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let chunk_position = chunk_pos_of(position);
         let Some(region) = self.resident.region(chunk_position) else {
             return ResidentFurnaceCommitResult::Missing;
@@ -1229,27 +1180,32 @@ impl WorldMutationView {
 
     #[must_use]
     pub fn chest_block_entities(&self, positions: &[BlockPos]) -> Option<Vec<ChestBlockEntity>> {
-        let first = *positions.first()?;
-        let owner = region_of(chunk_pos_of(first));
-        let mut unique = HashSet::with_capacity(positions.len());
-        if positions.iter().any(|position| {
-            !unique.insert(*position) || region_of(chunk_pos_of(*position)) != owner
-        }) {
-            return None;
-        }
-        let region = self.resident.region(chunk_pos_of(first))?;
-        let region = region
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        positions
-            .iter()
-            .map(|position| {
-                region
-                    .chunks
-                    .get(&chunk_pos_of(*position))
-                    .map(|chunk| chunk.chests.get(position).cloned().unwrap_or_default())
+        self.resident
+            .read_view
+            .publication_state()
+            .read_consistent(|| {
+                let first = *positions.first()?;
+                let owner = region_of(chunk_pos_of(first));
+                let mut unique = HashSet::with_capacity(positions.len());
+                if positions.iter().any(|position| {
+                    !unique.insert(*position) || region_of(chunk_pos_of(*position)) != owner
+                }) {
+                    return None;
+                }
+                let region = self.resident.region(chunk_pos_of(first))?;
+                let region = region
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                positions
+                    .iter()
+                    .map(|position| {
+                        region
+                            .chunks
+                            .get(&chunk_pos_of(*position))
+                            .map(|chunk| chunk.chests.get(position).cloned().unwrap_or_default())
+                    })
+                    .collect()
             })
-            .collect()
     }
 
     pub fn commit_chests_conditionally(
@@ -1258,6 +1214,8 @@ impl WorldMutationView {
         expected: &[ChestBlockEntity],
         updated: &[ChestBlockEntity],
     ) -> ResidentChestCommitResult {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let mut unique = HashSet::with_capacity(positions.len());
         if positions.is_empty()
             || positions.len() != expected.len()
@@ -1330,6 +1288,8 @@ impl WorldMutationView {
     }
 
     pub fn schedule_fluid_ticks(&self, ticks: &[ScheduledFluidTick]) -> usize {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let mut grouped =
             HashMap::<WorldRegionPos, HashMap<ChunkPos, Vec<ScheduledFluidTick>>>::new();
         for tick in ticks {
@@ -1508,11 +1468,290 @@ impl WorldMutationView {
         )
     }
 
+    /// Prepare a cross-region scheduled block tick without mutating a resident
+    /// store or publishing a world snapshot. Callers must persist
+    /// [`ResidentCrossRegionScheduledBlockTickTransaction::journal_snapshots`]
+    /// through
+    /// [`ResidentCrossRegionScheduledBlockTickTransaction::commit_durably`].
+    pub fn prepare_cross_region_scheduled_block_tick_transaction(
+        &self,
+        decision_id: Option<u64>,
+        plan: &ResidentScheduledBlockTickPlan<'_>,
+    ) -> ResidentCrossRegionScheduledBlockTickPrepareResult {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
+        let mut required = HashSet::new();
+        required.extend(plan.edits.iter().map(|edit| chunk_pos_of(edit.pos)));
+        required.extend(
+            plan.preconditions
+                .iter()
+                .map(|precondition| chunk_pos_of(precondition.pos)),
+        );
+        required.extend(
+            plan.consumed_ticks
+                .iter()
+                .map(|tick| chunk_pos_of(tick.pos)),
+        );
+
+        let mut positions = required.iter().copied().collect::<Vec<_>>();
+        if plan.leaf_trigger_tick.is_some() {
+            for edit in plan.edits {
+                let Some(neighbours) = block_neighbours(edit.pos) else {
+                    return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+                };
+                positions.extend(neighbours.into_iter().map(chunk_pos_of));
+            }
+        }
+        positions.sort_unstable_by_key(|position| (region_of(*position), position.x, position.z));
+        positions.dedup();
+
+        let mut region_positions = positions.iter().copied().map(region_of).collect::<Vec<_>>();
+        region_positions.sort_unstable();
+        region_positions.dedup();
+
+        let mut chunks = Vec::with_capacity(positions.len());
+        for region_position in region_positions {
+            let region_chunks = positions
+                .iter()
+                .copied()
+                .filter(|position| region_of(*position) == region_position)
+                .collect::<Vec<_>>();
+            let Some(region) = self.resident.region(region_chunks[0]) else {
+                if region_chunks
+                    .iter()
+                    .any(|position| required.contains(position))
+                {
+                    return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+                }
+                chunks.extend(region_chunks.into_iter().map(|position| {
+                    ResidentCrossRegionStagedChunk {
+                        position,
+                        expected: None,
+                        staged: None,
+                    }
+                }));
+                continue;
+            };
+            let region = region
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for position in region_chunks {
+                let Some(chunk) = region.chunks.get(&position) else {
+                    if required.contains(&position) {
+                        return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+                    }
+                    chunks.push(ResidentCrossRegionStagedChunk {
+                        position,
+                        expected: None,
+                        staged: None,
+                    });
+                    continue;
+                };
+                if region.pending_journal_lsn.contains_key(&position)
+                    || decision_id
+                        .is_some_and(|decision_id| chunk.world_journal_lsn() > decision_id)
+                {
+                    return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+                }
+                chunks.push(ResidentCrossRegionStagedChunk {
+                    position,
+                    expected: Some(Arc::clone(chunk)),
+                    staged: Some(Arc::new((**chunk).clone())),
+                });
+            }
+        }
+        chunks.sort_unstable_by_key(|chunk| {
+            (
+                region_of(chunk.position),
+                chunk.position.x,
+                chunk.position.z,
+            )
+        });
+
+        for precondition in plan.preconditions {
+            let Some(chunk) = cross_region_staged_chunk(&chunks, chunk_pos_of(precondition.pos))
+            else {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+            };
+            let local_x = precondition.pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = precondition.pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            let Some(staged) = chunk.staged.as_ref() else {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Missing;
+            };
+            if staged.get_block(local_x, precondition.pos.y, local_z)
+                != Some(precondition.expected_state)
+                || staged.block_mutation_token(local_x, precondition.pos.y, local_z)
+                    != Some(precondition.expected_token)
+            {
+                return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+            }
+        }
+
+        let mut consumed_by_chunk = HashMap::<ChunkPos, Vec<ScheduledBlockTick>>::new();
+        for tick in plan.consumed_ticks {
+            consumed_by_chunk
+                .entry(chunk_pos_of(tick.pos))
+                .or_default()
+                .push(tick.clone());
+        }
+        if consumed_by_chunk.iter().any(|(position, expected)| {
+            cross_region_staged_chunk(&chunks, *position)
+                .and_then(|chunk| chunk.staged.as_ref())
+                .is_none_or(|chunk| !chunk.scheduled_block_ticks().starts_with(expected))
+        }) {
+            return ResidentCrossRegionScheduledBlockTickPrepareResult::Stale;
+        }
+
+        let air = self
+            .resident
+            .registry
+            .block(&Identifier::parse("minecraft:air").expect("static identifier"))
+            .map(|block| block.default)
+            .unwrap_or(BlockStateId(0));
+        let registry = Arc::clone(&self.resident.registry);
+        let mut touched = HashSet::new();
+        let mut consumed_by_chunk = consumed_by_chunk.into_iter().collect::<Vec<_>>();
+        consumed_by_chunk.sort_unstable_by_key(|(position, _)| (position.x, position.z));
+        for (position, expected) in consumed_by_chunk {
+            let chunk = cross_region_staged_chunk_mut(&mut chunks, position)
+                .expect("preflighted consumed block-tick chunk");
+            let chunk = Arc::make_mut(chunk.staged.as_mut().expect("required staged chunk"));
+            assert!(chunk.drain_scheduled_block_tick_prefix(&expected));
+            if let Some(decision_id) = decision_id {
+                chunk.set_world_journal_lsn(decision_id);
+            }
+            touched.insert(position);
+        }
+
+        let mut applied = Vec::with_capacity(plan.edits.len());
+        for edit in plan.edits {
+            let position = chunk_pos_of(edit.pos);
+            let chunk = cross_region_staged_chunk_mut(&mut chunks, position)
+                .expect("preflighted resident chunk");
+            let local_x = edit.pos.x.rem_euclid(SECTION_DIM as i32) as u8;
+            let local_z = edit.pos.z.rem_euclid(SECTION_DIM as i32) as u8;
+            let previous = chunk
+                .staged
+                .as_ref()
+                .expect("required staged chunk")
+                .get_block(local_x, edit.pos.y, local_z)
+                .expect("preflighted block position");
+            let preserve_light = edit.preserve_light
+                || plan
+                    .light_table
+                    .is_some_and(|table| same_light_behaviour(table, previous, edit.new_state));
+            let previous_light = if previous != edit.new_state && !preserve_light {
+                ChunkLight::from_chunk(chunk.staged.as_ref().expect("required staged chunk"))
+            } else {
+                None
+            };
+            let changes_light = previous != edit.new_state && !preserve_light;
+            let chunk = Arc::make_mut(chunk.staged.as_mut().expect("required staged chunk"));
+            let previous = if preserve_light {
+                chunk.set_block_and_update_preserving_light(
+                    local_x,
+                    edit.pos.y,
+                    local_z,
+                    edit.new_state,
+                    air,
+                )
+            } else {
+                chunk.set_block_and_update(local_x, edit.pos.y, local_z, edit.new_state, air)
+            }
+            .expect("preflighted block position");
+            if previous != edit.new_state {
+                prune_incompatible_block_entities(chunk, edit.pos, &registry, edit.new_state);
+                if !preserve_light && let Some(light_table) = plan.light_table {
+                    chunk.update_highest_opaque_column(local_x, local_z, light_table);
+                }
+                if let Some(decision_id) = decision_id {
+                    chunk.set_world_journal_lsn(decision_id);
+                }
+                let resulting_token = chunk
+                    .block_mutation_token(local_x, edit.pos.y, local_z)
+                    .expect("mutated block token");
+                touched.insert(position);
+                applied.push(ResidentAppliedBlockEdit {
+                    pos: edit.pos,
+                    previous,
+                    new_state: edit.new_state,
+                    resulting_token,
+                    previous_light,
+                    changes_light,
+                });
+            }
+        }
+
+        if let Some(trigger_tick) = plan.leaf_trigger_tick {
+            let mut leaves = Vec::new();
+            for edit in &applied {
+                for position in block_neighbours(edit.pos).expect("preflighted neighbours") {
+                    let Some(chunk) = cross_region_staged_chunk(&chunks, chunk_pos_of(position))
+                    else {
+                        continue;
+                    };
+                    let local_x = position.x.rem_euclid(SECTION_DIM as i32) as u8;
+                    let local_z = position.z.rem_euclid(SECTION_DIM as i32) as u8;
+                    let Some(state_id) = chunk
+                        .staged
+                        .as_ref()
+                        .and_then(|chunk| chunk.get_block(local_x, position.y, local_z))
+                    else {
+                        continue;
+                    };
+                    let Some(state) = self.resident.registry.by_id(state_id) else {
+                        continue;
+                    };
+                    if state.block.id.path().ends_with("_leaves")
+                        && !leaves
+                            .iter()
+                            .any(|(existing, _): &(BlockPos, Identifier)| *existing == position)
+                    {
+                        leaves.push((position, state.block.id.clone()));
+                    }
+                }
+            }
+            leaves.sort_by_key(|(position, _)| (position.x, position.y, position.z));
+            for (position, block) in leaves {
+                let chunk_position = chunk_pos_of(position);
+                let chunk = cross_region_staged_chunk_mut(&mut chunks, chunk_position)
+                    .expect("prepared resident leaf chunk");
+                let chunk = Arc::make_mut(chunk.staged.as_mut().expect("present leaf chunk"));
+                if chunk.schedule_block_tick(ScheduledBlockTick::new(
+                    position,
+                    block,
+                    trigger_tick,
+                    0,
+                )) {
+                    if let Some(decision_id) = decision_id {
+                        chunk.set_world_journal_lsn(decision_id);
+                    }
+                    touched.insert(chunk_position);
+                }
+            }
+        }
+
+        let mut touched = touched.into_iter().collect::<Vec<_>>();
+        touched.sort_unstable_by_key(|position| (position.x, position.z));
+        ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(
+            ResidentCrossRegionScheduledBlockTickTransaction {
+                resident: self.resident.clone(),
+                chunks,
+                applied,
+                touched,
+                #[cfg(test)]
+                publish_hook: None,
+            },
+        )
+    }
+
     fn apply_block_edits_conditionally_inner(
         &self,
         decision_id: Option<u64>,
         plan: ResidentBlockEditPlan<'_>,
     ) -> (ResidentBlockEditBatchResult, Vec<ChunkPos>) {
+        let publication = self.resident.read_view.publication_state();
+        let _mutation = publication.mutation();
         let ResidentBlockEditPlan {
             edits,
             preconditions,
@@ -1936,6 +2175,175 @@ impl WorldMutationView {
     }
 }
 
+impl ResidentCrossRegionScheduledBlockTickTransaction {
+    #[cfg(test)]
+    fn set_publish_hook(&mut self, hook: Arc<dyn Fn(ChunkPos) + Send + Sync>) {
+        self.publish_hook = Some(hook);
+    }
+    #[must_use]
+    pub fn touched_chunks(&self) -> &[ChunkPos] {
+        &self.touched
+    }
+
+    #[must_use]
+    pub fn journal_snapshots(&self) -> Vec<ChunkSnapshot> {
+        self.touched
+            .iter()
+            .map(|position| {
+                Arc::clone(
+                    cross_region_staged_chunk(&self.chunks, *position)
+                        .expect("touched cross-region chunk remains staged")
+                        .staged
+                        .as_ref()
+                        .expect("touched cross-region chunk is present"),
+                )
+            })
+            .collect()
+    }
+
+    /// Verifies sources, invokes `persist`, and publishes while holding
+    /// exclusive resident admission. `persist` must not re-enter resident
+    /// readers or mutators.
+    pub fn commit_durably<E>(
+        self,
+        persist: impl FnOnce(Vec<ChunkSnapshot>) -> Result<(), E>,
+    ) -> ResidentCrossRegionScheduledBlockTickCommitResult<E> {
+        let publication = self.resident.read_view.publication_state();
+        let transaction = publication.transaction();
+        if let Some(result) = self.verify_sources() {
+            return match result {
+                ResidentBlockEditBatchResult::Missing => {
+                    ResidentCrossRegionScheduledBlockTickCommitResult::Missing
+                }
+                ResidentBlockEditBatchResult::Stale => {
+                    ResidentCrossRegionScheduledBlockTickCommitResult::Stale
+                }
+                ResidentBlockEditBatchResult::Applied(_)
+                | ResidentBlockEditBatchResult::CrossRegion => unreachable!("verification result"),
+            };
+        }
+        if let Err(error) = persist(self.journal_snapshots()) {
+            return ResidentCrossRegionScheduledBlockTickCommitResult::DurabilityFailed(error);
+        }
+        let applied = self.publish(&publication, transaction);
+        ResidentCrossRegionScheduledBlockTickCommitResult::Applied(applied)
+    }
+
+    fn verify_sources(&self) -> Option<ResidentBlockEditBatchResult> {
+        for region_position in self.region_positions() {
+            let region = self.region_for(region_position);
+            let region = region.as_ref().map(|region| {
+                region
+                    .read()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            });
+            for chunk in self.chunks_in_region(region_position) {
+                let current = region
+                    .as_ref()
+                    .and_then(|region| region.chunks.get(&chunk.position));
+                match (&chunk.expected, current) {
+                    (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => {}
+                    (Some(_), None) => return Some(ResidentBlockEditBatchResult::Missing),
+                    (None, None) => {}
+                    _ => return Some(ResidentBlockEditBatchResult::Stale),
+                }
+            }
+        }
+        None
+    }
+
+    fn publish(
+        self,
+        publication: &crate::storage::ResidentPublicationState,
+        transaction: RwLockWriteGuard<'_, ()>,
+    ) -> Vec<ResidentAppliedBlockEdit> {
+        let publishing = publication.begin_publish(transaction);
+        for region_position in self.region_positions() {
+            if !self
+                .chunks_in_region(region_position)
+                .any(|chunk| self.touched.contains(&chunk.position))
+            {
+                continue;
+            }
+            let region = self
+                .region_for(region_position)
+                .expect("required transaction region remains resident");
+            let mut region = region
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for chunk in self.chunks_in_region(region_position) {
+                if !self.touched.contains(&chunk.position) {
+                    continue;
+                }
+                region.chunks.insert(
+                    chunk.position,
+                    Arc::clone(chunk.staged.as_ref().expect("touched chunk is staged")),
+                );
+                region.pending_journal_lsn.remove(&chunk.position);
+            }
+            #[cfg(test)]
+            let installed = self
+                .chunks_in_region(region_position)
+                .find(|chunk| self.touched.contains(&chunk.position))
+                .map(|chunk| chunk.position);
+            drop(region);
+            #[cfg(test)]
+            if let (Some(hook), Some(position)) = (&self.publish_hook, installed) {
+                hook(position);
+            }
+        }
+        for position in &self.touched {
+            let chunk = cross_region_staged_chunk(&self.chunks, *position)
+                .and_then(|chunk| chunk.staged.as_ref())
+                .expect("touched cross-region chunk remains staged");
+            self.resident.publish(*position, chunk);
+            self.resident.read_view.publish_furnaces(*position, chunk);
+        }
+        publishing.complete();
+        self.applied
+    }
+
+    fn region_positions(&self) -> Vec<WorldRegionPos> {
+        let mut positions = self
+            .chunks
+            .iter()
+            .map(|chunk| region_of(chunk.position))
+            .collect::<Vec<_>>();
+        positions.sort_unstable();
+        positions.dedup();
+        positions
+    }
+
+    fn chunks_in_region(
+        &self,
+        region_position: WorldRegionPos,
+    ) -> impl Iterator<Item = &ResidentCrossRegionStagedChunk> {
+        self.chunks
+            .iter()
+            .filter(move |chunk| region_of(chunk.position) == region_position)
+    }
+
+    fn region_for(&self, region_position: WorldRegionPos) -> Option<Arc<RwLock<ResidentRegion>>> {
+        self.chunks_in_region(region_position)
+            .next()
+            .and_then(|chunk| self.resident.region(chunk.position))
+    }
+}
+
+fn cross_region_staged_chunk(
+    chunks: &[ResidentCrossRegionStagedChunk],
+    position: ChunkPos,
+) -> Option<&ResidentCrossRegionStagedChunk> {
+    chunks.iter().find(|chunk| chunk.position == position)
+}
+
+fn cross_region_staged_chunk_mut(
+    chunks: &mut [ResidentCrossRegionStagedChunk],
+    position: ChunkPos,
+) -> Option<&mut ResidentCrossRegionStagedChunk> {
+    chunks.iter_mut().find(|chunk| chunk.position == position)
+}
+
 fn same_light_behaviour(
     table: &BlockLightTable,
     previous: BlockStateId,
@@ -2008,6 +2416,8 @@ fn block_neighbours(position: BlockPos) -> Option<[BlockPos; 6]> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Mutex, mpsc};
 
     use mc_data::blocks::{BlockReport, BlockStateReport};
 
@@ -2265,6 +2675,637 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             scheduled_before
+        );
+    }
+
+    fn cross_region_scheduled_block_fixture(
+        include_east: bool,
+    ) -> (WorldStorage, BlockPos, BlockPos, ScheduledBlockTick) {
+        let mut world = WorldStorage::in_memory(hopper_registry());
+        let biome = Identifier::parse("minecraft:plains").unwrap();
+        let west_chunk = ChunkPos { x: 7, z: 0 };
+        world
+            .insert_generated_chunk(
+                west_chunk,
+                Chunk::empty(west_chunk, BlockStateId(0), biome.clone()),
+            )
+            .unwrap();
+        let west = BlockPos { x: 127, y: 2, z: 3 };
+        let east = BlockPos { x: 128, y: 2, z: 3 };
+        world.set_block_at(west, BlockStateId(1)).unwrap();
+        if include_east {
+            let east_chunk = ChunkPos { x: 8, z: 0 };
+            world
+                .insert_generated_chunk(
+                    east_chunk,
+                    Chunk::empty(east_chunk, BlockStateId(0), biome),
+                )
+                .unwrap();
+            world.set_block_at(east, BlockStateId(1)).unwrap();
+        }
+        let due =
+            ScheduledBlockTick::new(west, Identifier::parse("minecraft:stone").unwrap(), 20, 0);
+        world.schedule_block_tick(due.clone()).unwrap();
+        (world, west, east, due)
+    }
+
+    #[test]
+    fn cross_region_scheduled_block_transaction_publishes_only_after_durability() {
+        let (world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let east_token = world.block_mutation_token(east).unwrap();
+        let edits = [
+            ResidentBlockEdit {
+                pos: west,
+                new_state: BlockStateId(0),
+                preserve_light: true,
+            },
+            ResidentBlockEdit {
+                pos: east,
+                new_state: BlockStateId(0),
+                preserve_light: true,
+            },
+        ];
+        let preconditions = [
+            ResidentBlockPrecondition {
+                pos: west,
+                expected_state: BlockStateId(1),
+                expected_token: west_token,
+            },
+            ResidentBlockPrecondition {
+                pos: east,
+                expected_state: BlockStateId(1),
+                expected_token: east_token,
+            },
+        ];
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &edits,
+                preconditions: &preconditions,
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(transaction.journal_snapshots().len(), 2);
+        assert!(
+            transaction
+                .journal_snapshots()
+                .iter()
+                .all(|chunk| chunk.world_journal_lsn() == 7)
+        );
+
+        let result = transaction.commit_durably(|snapshots| {
+            assert_eq!(snapshots.len(), 2);
+            Ok::<_, ()>(())
+        });
+        let ResidentCrossRegionScheduledBlockTickCommitResult::Applied(applied) = result else {
+            panic!("durable current transaction applies");
+        };
+        assert_eq!(applied.len(), 2);
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(0)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(0)));
+    }
+
+    #[test]
+    fn cross_region_reader_cannot_return_between_owner_installs() {
+        let (world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(mut transaction) =
+            prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+        let first = Arc::new(AtomicBool::new(true));
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        transaction.set_publish_hook(Arc::new(move |_| {
+            if first.swap(false, Ordering::AcqRel) {
+                installed_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        let publish = std::thread::spawn(move || transaction.commit_durably(|_| Ok::<_, ()>(())));
+        installed_rx.recv().unwrap();
+
+        let (reader_started_tx, reader_started_rx) = mpsc::channel();
+        let (reader_done_tx, reader_done_rx) = mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            reader_started_tx.send(()).unwrap();
+            let snapshots = read.snapshot_chunks(&[chunk_pos_of(west), chunk_pos_of(east)]);
+            reader_done_tx
+                .send((
+                    snapshots.get_cached_block(west),
+                    snapshots.get_cached_block(east),
+                ))
+                .unwrap();
+        });
+        reader_started_rx.recv().unwrap();
+        assert!(matches!(
+            reader_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            reader_done_rx.recv().unwrap(),
+            (Some(BlockStateId(0)), Some(BlockStateId(0)))
+        );
+        reader.join().unwrap();
+        assert!(matches!(
+            publish.join().unwrap(),
+            ResidentCrossRegionScheduledBlockTickCommitResult::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn cross_region_mutation_waits_until_all_owner_installs_finish() {
+        let (world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let mutation = world.mutation_view();
+        let concurrent = mutation.clone();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(mut transaction) =
+            prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+        let first = Arc::new(AtomicBool::new(true));
+        let (installed_tx, installed_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        transaction.set_publish_hook(Arc::new(move |_| {
+            if first.swap(false, Ordering::AcqRel) {
+                installed_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+            }
+        }));
+        let publish = std::thread::spawn(move || transaction.commit_durably(|_| Ok::<_, ()>(())));
+        installed_rx.recv().unwrap();
+
+        let (mutation_started_tx, mutation_started_rx) = mpsc::channel();
+        let (mutation_done_tx, mutation_done_rx) = mpsc::channel();
+        let mutator = std::thread::spawn(move || {
+            mutation_started_tx.send(()).unwrap();
+            mutation_done_tx
+                .send(concurrent.set_block_if_current(
+                    west,
+                    BlockStateId(1),
+                    west_token,
+                    BlockStateId(1),
+                    true,
+                ))
+                .unwrap();
+        });
+        mutation_started_rx.recv().unwrap();
+        assert!(matches!(
+            mutation_done_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            mutation_done_rx.recv().unwrap(),
+            ResidentBlockMutation::Stale
+        );
+        mutator.join().unwrap();
+        assert!(matches!(
+            publish.join().unwrap(),
+            ResidentCrossRegionScheduledBlockTickCommitResult::Applied(_)
+        ));
+    }
+
+    #[test]
+    fn cancelled_cross_region_scheduled_block_transaction_publishes_nothing() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let east_token = world.block_mutation_token(east).unwrap();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[
+                    ResidentBlockPrecondition {
+                        pos: west,
+                        expected_state: BlockStateId(1),
+                        expected_token: west_token,
+                    },
+                    ResidentBlockPrecondition {
+                        pos: east,
+                        expected_state: BlockStateId(1),
+                        expected_token: east_token,
+                    },
+                ],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+
+        drop(transaction);
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn dropped_prepared_cross_region_transaction_installs_nothing() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let east_token = world.block_mutation_token(east).unwrap();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[
+                    ResidentBlockPrecondition {
+                        pos: west,
+                        expected_state: BlockStateId(1),
+                        expected_token: west_token,
+                    },
+                    ResidentBlockPrecondition {
+                        pos: east,
+                        expected_state: BlockStateId(1),
+                        expected_token: east_token,
+                    },
+                ],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+
+        drop(transaction);
+
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(world.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(world.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn cross_region_durability_failure_installs_nothing() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+
+        assert!(matches!(
+            transaction.commit_durably(|_| Err("injected append failure")),
+            ResidentCrossRegionScheduledBlockTickCommitResult::DurabilityFailed(
+                "injected append failure"
+            )
+        ));
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(world.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(world.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn cross_region_prepare_rejects_absent_optional_neighbor_becoming_present() {
+        let (mut world, west, _east, due) = cross_region_scheduled_block_fixture(false);
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[ResidentBlockEdit {
+                    pos: west,
+                    new_state: BlockStateId(0),
+                    preserve_light: true,
+                }],
+                preconditions: &[ResidentBlockPrecondition {
+                    pos: west,
+                    expected_state: BlockStateId(1),
+                    expected_token: west_token,
+                }],
+                light_table: None,
+                leaf_trigger_tick: Some(21),
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("an absent optional neighbour remains a valid prepared source");
+        };
+        let east_chunk = ChunkPos { x: 8, z: 0 };
+        world
+            .insert_generated_chunk(
+                east_chunk,
+                Chunk::empty(
+                    east_chunk,
+                    BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            transaction.commit_durably(|_| Ok::<_, ()>(())),
+            ResidentCrossRegionScheduledBlockTickCommitResult::Stale
+        ));
+        assert_eq!(world.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn cross_region_scheduled_block_prepare_rejects_stale_second_owner_without_publication() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let east_token = world.block_mutation_token(east).unwrap();
+        let result = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[
+                    ResidentBlockPrecondition {
+                        pos: west,
+                        expected_state: BlockStateId(1),
+                        expected_token: west_token,
+                    },
+                    ResidentBlockPrecondition {
+                        pos: east,
+                        expected_state: BlockStateId(0),
+                        expected_token: east_token,
+                    },
+                ],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            ResidentCrossRegionScheduledBlockTickPrepareResult::Stale
+        ));
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(1)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn cross_region_scheduled_block_commit_rejects_second_owner_changed_after_prepare() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(true);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let east_token = world.block_mutation_token(east).unwrap();
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[
+                    ResidentBlockPrecondition {
+                        pos: west,
+                        expected_state: BlockStateId(1),
+                        expected_token: west_token,
+                    },
+                    ResidentBlockPrecondition {
+                        pos: east,
+                        expected_state: BlockStateId(1),
+                        expected_token: east_token,
+                    },
+                ],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+        let ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(transaction) = prepared
+        else {
+            panic!("current owners prepare a cross-region scheduled block transaction");
+        };
+
+        world.set_block_at(east, BlockStateId(0)).unwrap();
+
+        assert!(matches!(
+            transaction.commit_durably(|_| Ok::<_, ()>(())),
+            ResidentCrossRegionScheduledBlockTickCommitResult::Stale
+        ));
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), Some(BlockStateId(0)));
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
+        );
+    }
+
+    #[test]
+    fn cross_region_scheduled_block_prepare_rejects_missing_second_owner_without_publication() {
+        let (mut world, west, east, due) = cross_region_scheduled_block_fixture(false);
+        let read = world.read_view();
+        let mutation = world.mutation_view();
+        let west_token = world.block_mutation_token(west).unwrap();
+        let result = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(7),
+            &ResidentScheduledBlockTickPlan {
+                consumed_ticks: std::slice::from_ref(&due),
+                edits: &[
+                    ResidentBlockEdit {
+                        pos: west,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                    ResidentBlockEdit {
+                        pos: east,
+                        new_state: BlockStateId(0),
+                        preserve_light: true,
+                    },
+                ],
+                preconditions: &[ResidentBlockPrecondition {
+                    pos: west,
+                    expected_state: BlockStateId(1),
+                    expected_token: west_token,
+                }],
+                light_table: None,
+                leaf_trigger_tick: None,
+            },
+        );
+
+        assert!(matches!(
+            result,
+            ResidentCrossRegionScheduledBlockTickPrepareResult::Missing
+        ));
+        assert_eq!(read.get_cached_block(west), Some(BlockStateId(1)));
+        assert_eq!(read.get_cached_block(east), None);
+        assert_eq!(
+            world
+                .scheduled_block_ticks(chunk_pos_of(west))
+                .unwrap()
+                .unwrap(),
+            std::slice::from_ref(&due)
         );
     }
 }

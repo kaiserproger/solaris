@@ -2,6 +2,7 @@ use mc_entity::{EntityId, SpawnEntity, Vec3};
 #[cfg(test)]
 use mc_entity::{EntityLifecycle, EntitySnapshot};
 use mc_world::BlockStateId;
+use std::sync::atomic::Ordering;
 
 use crate::play::simulation::SimulationAuthority;
 use crate::play::spawn::chunk_pos_from_coords;
@@ -20,6 +21,17 @@ use super::{SessionEntityGuards, SessionRegistry, SessionRegistryInner, apply_en
 pub(super) const ENTITY_EVENT_DEATH_COMPLETE: i8 = 60;
 
 impl SessionRegistry {
+    pub(crate) fn synchronize_entity_lifecycle_epoch(&self, lifecycle_epoch: u64) {
+        let previous = self
+            .entity_lifecycle_tick
+            .fetch_max(lifecycle_epoch, Ordering::AcqRel);
+        let lifecycle_epoch = previous.max(lifecycle_epoch);
+        if lifecycle_epoch != previous {
+            self.simulation_tick_sender.send_replace(lifecycle_epoch);
+        }
+        self.entities.advance_lifecycle_epoch(lifecycle_epoch);
+    }
+
     pub(in crate::play) fn spawn_falling_block(
         &self,
         entity_type_id: i32,
@@ -50,16 +62,6 @@ impl SessionRegistry {
         self.spawn_command_entity_owned(entity_type_id, entity_type_name, position)
     }
 
-    #[cfg(test)]
-    pub(in crate::play) fn spawn_command_entity_legacy_for_test(
-        &self,
-        entity_type_id: i32,
-        entity_type_name: String,
-        position: Vec3,
-    ) -> Vec<VisibilityDispatch> {
-        self.spawn_command_entity_owned(entity_type_id, entity_type_name, position)
-    }
-
     fn spawn_command_entity_owned(
         &self,
         entity_type_id: i32,
@@ -75,6 +77,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         current_tick: u64,
     ) -> Vec<VisibilityDispatch> {
+        self.synchronize_entity_lifecycle_epoch(current_tick);
         let mut inner = self.lock_session_entities("tick dying entities");
         finish_dying_entities_locked(&mut inner, current_tick)
     }
@@ -89,9 +92,8 @@ pub(super) fn spawn_falling_block_locked(
     let mut entity = SpawnEntity::new(entity_type_id, "minecraft:falling_block", position);
     entity.block_state = Some(block_state.0);
     entity.on_ground = false;
-    let id = inner.entities.spawn_authoritative(entity);
-    let lifecycle_tick = inner.entity_lifecycle_tick;
-    inner.entity_spawn_ticks.insert(id, lifecycle_tick);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    let id = inner.entities.spawn(entity);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -109,10 +111,9 @@ pub(super) fn spawn_command_entity_locked(
 ) -> Vec<VisibilityDispatch> {
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
     let aabb = entity_aabb(&entity.type_name);
-    let id = inner.entities.spawn_authoritative(entity);
-    let lifecycle_tick = inner.entity_lifecycle_tick;
-    inner.entity_spawn_ticks.insert(id, lifecycle_tick);
+    let id = inner.entities.spawn(entity);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -127,25 +128,31 @@ pub(super) fn finish_dying_entities_locked(
     current_tick: u64,
 ) -> Vec<VisibilityDispatch> {
     let mut due = inner
-        .dying_entity_remove_ticks
-        .iter()
-        .filter(|(_, remove_tick)| **remove_tick <= current_tick)
-        .map(|(entity_id, _)| *entity_id)
+        .entities
+        .snapshots_vec()
+        .into_iter()
+        .filter(|snapshot| {
+            snapshot.lifecycle == mc_entity::EntityLifecycle::Despawning
+                && snapshot
+                    .retained
+                    .death_remove_tick
+                    .is_some_and(|remove_tick| remove_tick <= current_tick)
+        })
         .collect::<Vec<_>>();
-    due.sort_unstable();
+    due.sort_unstable_by_key(|snapshot| snapshot.id);
 
     let mut dispatches = Vec::new();
-    for entity_id in due {
-        if !inner.entities.contains(entity_id) {
-            inner.dying_entity_remove_ticks.remove(&entity_id);
-            continue;
-        }
-        dispatches.extend(entity_event_dispatches_locked(
-            inner,
-            entity_id,
-            ENTITY_EVENT_DEATH_COMPLETE,
-        ));
-        if let Some((_, removal)) = remove_server_entity_locked(inner, entity_id) {
+    for expected in due {
+        let entity_id = expected.id;
+        if let Some(removed) = inner.entities.remove_if_current(expected) {
+            let snapshot = server_entity_snapshot_from(removed);
+            dispatches.extend(entity_event_dispatches_locked(
+                inner,
+                entity_id,
+                ENTITY_EVENT_DEATH_COMPLETE,
+            ));
+            clear_removed_entity_tracking_locked(inner, entity_id);
+            let removal = despawn_entity_visibility_locked(inner, &snapshot);
             dispatches.extend(removal);
         }
     }
@@ -197,17 +204,6 @@ pub(super) fn clear_removed_entity_tracking_locked(
 ) {
     clear_entity_publication_state_locked(inner, entity_id);
     inner.terrain_pathing_entities.remove(&entity_id);
-    inner.last_entity_damage_ticks.remove(&entity_id);
-    inner.item_pickup_ready_ticks.remove(&entity_id);
-    inner.item_pickup_owner_blocks.remove(&entity_id);
-    inner.entity_spawn_ticks.remove(&entity_id);
-    inner.item_spawn_ticks.remove(&entity_id);
-    inner.arrow_spawn_ticks.remove(&entity_id);
-    inner.arrow_owner_sessions.remove(&entity_id);
-    inner.arrow_owner_entities.remove(&entity_id);
-    inner.primed_tnt.remove(&entity_id);
-    inner.dying_entity_remove_ticks.remove(&entity_id);
-    inner.sheep_grazing_ticks.remove(&entity_id);
     untrack_entity_chunk_locked(inner, entity_id);
 }
 

@@ -129,6 +129,49 @@ pub(crate) struct DirtyFlushCoordinator {
     worker: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug)]
+pub(crate) enum DirtyFlushDrainError {
+    CompletionDropped,
+    WorkerStoppedBeforeCompletion,
+    WorkerJoin(tokio::task::JoinError),
+}
+
+impl fmt::Display for DirtyFlushDrainError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CompletionDropped => write!(f, "dirty flush drain completion was dropped"),
+            Self::WorkerStoppedBeforeCompletion => {
+                write!(f, "dirty flush worker stopped before drain completion")
+            }
+            Self::WorkerJoin(error) => write!(f, "dirty flush worker join failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DirtyFlushDrainError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::WorkerJoin(error) => Some(error),
+            Self::CompletionDropped | Self::WorkerStoppedBeforeCompletion => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum DirtyFlushDrainOutcome {
+    Complete,
+    Failed(DirtyFlushDrainError),
+}
+
+impl DirtyFlushDrainOutcome {
+    pub(crate) fn into_result(self) -> Result<(), DirtyFlushDrainError> {
+        match self {
+            Self::Complete => Ok(()),
+            Self::Failed(error) => Err(error),
+        }
+    }
+}
+
 impl DirtyFlushCoordinator {
     #[cfg(test)]
     pub(crate) fn spawn<Flush, FlushFuture>(mut flush: Flush) -> Self
@@ -230,7 +273,7 @@ impl DirtyFlushCoordinator {
 
     /// Wait until the consumer has processed every request published before
     /// this drain marker, then stop the worker.
-    pub(crate) async fn drain(self) {
+    pub(crate) async fn drain(self) -> DirtyFlushDrainOutcome {
         let (completed, received) = oneshot::channel();
         {
             let mut state = self
@@ -241,9 +284,35 @@ impl DirtyFlushCoordinator {
             state.drain = Some(completed);
         }
         self.shared.wake.notify_one();
-        let _ = received.await;
-        if let Err(error) = self.worker.await {
-            tracing::warn!(%error, "dirty flush worker join failed");
+        let mut worker = self.worker;
+        tokio::select! {
+            biased;
+            completion = received => {
+                if completion.is_err() {
+                    return match worker.await {
+                        Ok(()) => DirtyFlushDrainOutcome::Failed(
+                            DirtyFlushDrainError::CompletionDropped,
+                        ),
+                        Err(error) => DirtyFlushDrainOutcome::Failed(
+                            DirtyFlushDrainError::WorkerJoin(error),
+                        ),
+                    };
+                }
+                match worker.await {
+                    Ok(()) => DirtyFlushDrainOutcome::Complete,
+                    Err(error) => DirtyFlushDrainOutcome::Failed(
+                        DirtyFlushDrainError::WorkerJoin(error),
+                    ),
+                }
+            }
+            result = &mut worker => match result {
+                Ok(()) => DirtyFlushDrainOutcome::Failed(
+                    DirtyFlushDrainError::WorkerStoppedBeforeCompletion,
+                ),
+                Err(error) => DirtyFlushDrainOutcome::Failed(
+                    DirtyFlushDrainError::WorkerJoin(error),
+                ),
+            },
         }
     }
 }
@@ -262,7 +331,9 @@ mod tests {
 
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{DirtyFlushCompletion, DirtyFlushCoordinator};
+    use super::{
+        DirtyFlushCompletion, DirtyFlushCoordinator, DirtyFlushDrainError, DirtyFlushDrainOutcome,
+    };
 
     #[tokio::test]
     async fn awaiting_producer_completion_does_not_self_rearm_and_allows_drain() {
@@ -537,5 +608,29 @@ mod tests {
         assert_eq!(started_rx.recv().await, Some(1));
         coordinator.drain().await;
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn drain_does_not_hang_after_worker_failure() {
+        let (started, started_rx) = oneshot::channel();
+        let mut started = Some(started);
+        let coordinator = DirtyFlushCoordinator::spawn(move || {
+            let started = started.take().expect("one flush invocation is expected");
+            async move {
+                started.send(()).expect("test observes worker start");
+                panic!("injected dirty flush worker failure");
+            }
+        });
+
+        coordinator.notifier().request();
+        started_rx.await.expect("worker reports start");
+        let drain = tokio::time::timeout(std::time::Duration::from_secs(1), coordinator.drain())
+            .await
+            .expect("worker failure resolves the drain");
+
+        assert!(matches!(
+            drain,
+            DirtyFlushDrainOutcome::Failed(DirtyFlushDrainError::WorkerJoin(_))
+        ));
     }
 }

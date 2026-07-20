@@ -31,7 +31,8 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
-    let seeded_y = top_non_air_y(&mut storage, 0, 0, air_state_id).expect("spawn column has terrain");
+    let seeded_y =
+        top_non_air_y(&mut storage, 0, 0, air_state_id).expect("spawn column has terrain");
     storage
         .set_block_at(
             mc_world::BlockPos {
@@ -55,9 +56,10 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
         .expect("iron pickaxe item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
     let item_entity_type = entity_types
         .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
         .expect("item entity type") as i32;
@@ -108,7 +110,10 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
     wait_for_slot_stack(&mut client, pickaxe_id, 1).await;
 
     let target_y = sync.y.floor() as i32 - 2;
-    assert_eq!(target_y, seeded_y, "client spawn should expose seeded target");
+    assert_eq!(
+        target_y, seeded_y,
+        "client spawn should expose seeded target"
+    );
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -279,16 +284,15 @@ async fn survival_break_drops_item_entity_and_picks_it_up() {
     assert!(simulation.simulation_commands_enqueued >= 1);
     assert!(simulation.simulation_commands_processed >= 1);
     assert_eq!(simulation.simulation_queue_depth, 0);
-    assert!((1..=simulation.simulation_queue_capacity).contains(&simulation.simulation_queue_max_depth));
+    assert!(
+        (1..=simulation.simulation_queue_capacity).contains(&simulation.simulation_queue_max_depth)
+    );
     assert!((1..=simulation.simulation_queue_max_depth).contains(&simulation.simulation_max_batch));
     assert_eq!(simulation.simulation_commands_rejected_full, 0);
     assert_eq!(simulation.simulation_commands_rejected_closed, 0);
     assert_eq!(simulation.simulation_commands_rejected_shutdown, 0);
     assert_eq!(simulation.simulation_commands_rejected_world_busy, 0);
-    assert_eq!(
-        simulation.simulation_commands_rejected_world_unavailable,
-        0
-    );
+    assert_eq!(simulation.simulation_commands_rejected_world_unavailable, 0);
     assert_eq!(simulation.simulation_commands_rejected_world_mutation, 0);
     assert_eq!(simulation.simulation_commands_rejected_stale_session, 0);
     assert_eq!(simulation.simulation_commands_cancelled, 0);
@@ -332,9 +336,10 @@ async fn survival_can_place_naturally_picked_up_block() {
         .expect("dirt item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -379,11 +384,7 @@ async fn survival_can_place_naturally_picked_up_block() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 81, (0, target_y, 0)).await;
-    wait_for_world_ticks(
-        &mut client,
-        vanilla_stop_destroy_ticks(0.5, 1.0, true),
-    )
-    .await;
+    wait_for_world_ticks(&mut client, vanilla_stop_destroy_ticks(0.5, 1.0, true)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -493,9 +494,10 @@ async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
         .expect("stone item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -540,11 +542,7 @@ async fn invalid_carried_item_slot_does_not_change_survival_placement_slot() {
         .await
         .expect("send survival start break");
     read_ack_without_target_update(&mut client, 91, (0, target_y, 0)).await;
-    wait_for_world_ticks(
-        &mut client,
-        vanilla_stop_destroy_ticks(0.5, 1.0, true),
-    )
-    .await;
+    wait_for_world_ticks(&mut client, vanilla_stop_destroy_ticks(0.5, 1.0, true)).await;
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StopDestroyBlock,
@@ -675,7 +673,7 @@ async fn survival_break_damages_held_tool() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -826,7 +824,7 @@ async fn survival_hoe_use_tills_dirt_and_damages_tool() {
         items,
         item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),

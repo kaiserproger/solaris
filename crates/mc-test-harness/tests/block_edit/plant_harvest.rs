@@ -18,25 +18,33 @@ async fn survival_harvests_sweet_berry_bush_into_inventory() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
-    let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let bush_age3 = crop_test_state(&blocks, "minecraft:sweet_berry_bush", &[("age", "3")]);
     let bush_age1 = crop_test_state(&blocks, "minecraft:sweet_berry_bush", &[("age", "1")]);
     let sweet_berries = mc_data::Identifier::parse("minecraft:sweet_berries").unwrap();
     let sweet_berries_item_id = items.id_of(&sweet_berries).expect("sweet berries item");
+    let air_state_id = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
+    let surface_y = top_non_air_y(&mut storage, 1, 1, air_state_id).expect("spawn terrain");
+    let bush_pos = (1, surface_y + 1, 1);
+    crop_test_set(&mut storage, bush_pos, bush_age3);
+    let world = Arc::new(tokio::sync::Mutex::new(storage));
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -66,15 +74,8 @@ async fn survival_harvests_sweet_berry_bush_into_inventory() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M68BerryHarvest").await;
+    let (mut client, _sync) = connect_to_play(addr, "M68BerryHarvest").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-
-    let support_y = sync.y.floor() as i32 - 2;
-    let bush_pos = (0, support_y + 1, 2);
-    {
-        let mut storage = world.lock().await;
-        crop_test_set(&mut storage, bush_pos, bush_age3);
-    }
 
     client
         .write_packet(&ServerboundUseItemOn {

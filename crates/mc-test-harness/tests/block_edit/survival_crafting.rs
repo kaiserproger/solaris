@@ -39,7 +39,7 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
     let (mut client, _) = connect_to_play(addr, "P2GeneratedWood").await;
     drain_until_chunk(&mut client, (0, 0)).await;
@@ -210,7 +210,7 @@ async fn embedded_generated_seed_survival_crafts_tool_and_persists_without_debug
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("rebind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
     let (mut client, _) = connect_to_play(addr, "P2GeneratedWood").await;
     wait_for_inventory_content(&mut client, |pkt| {
@@ -537,4 +537,3 @@ async fn embedded_survival_mines_logs_and_crafts_wooden_pickaxe_at_table() {
         .expect("craft stone pickaxe at table");
     wait_for_slot_stack(&mut client, stone_pickaxe_id, 1).await;
 }
-

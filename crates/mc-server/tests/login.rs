@@ -65,7 +65,7 @@ async fn start_server_with_policy_and_permissions(
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline,
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -102,7 +102,7 @@ fn network_config_from_toml(toml_src: &str) -> mc_net::ServerConfig {
         std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
     )
     .expect("network config")

@@ -8,13 +8,11 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
-    AnimalBreedingState, EntityDamage, EntityId, EntityItemStack, EntityKinematics,
-    EntityMotionState, EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats,
-    PathingBudget, PathingProbe, PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3,
-    deterministic_uuid, snapshot_from_spawn,
+    AnimalBreedingState, EntityDamage, EntityDamageRequest, EntityEffectRequest,
+    EntityEffectResult, EntityId, EntityItemStack, EntityKinematics, EntityMotionState,
+    EntitySnapshot, EntityStore, EntityView, GoalState, GoalTickStats, PathingBudget, PathingProbe,
+    PreparedGoalTick, ResolvedGoalTick, SpawnEntity, Vec3, deterministic_uuid, snapshot_from_spawn,
 };
-#[cfg(any(test, feature = "shadow-compare"))]
-use crate::{ShadowComparison, ShadowComparisonStats, ShadowDivergence, ShadowStage};
 
 mod owner_lane;
 #[cfg(test)]
@@ -125,6 +123,7 @@ impl RegionalDecisionJournalError {
 pub struct RegionalCommitDecision {
     phase: RegionPhase,
     sequence_watermark: u64,
+    lifecycle_epoch: u64,
     upserts: Vec<EntitySnapshot>,
     removed: Vec<EntityId>,
 }
@@ -133,6 +132,22 @@ impl RegionalCommitDecision {
     pub fn from_parts(
         phase: RegionPhase,
         sequence_watermark: u64,
+        upserts: Vec<EntitySnapshot>,
+        removed: Vec<EntityId>,
+    ) -> Result<Self, RegionalDecisionJournalError> {
+        Self::from_parts_at_lifecycle_epoch(
+            phase,
+            sequence_watermark,
+            sequence_watermark,
+            upserts,
+            removed,
+        )
+    }
+
+    pub fn from_parts_at_lifecycle_epoch(
+        phase: RegionPhase,
+        sequence_watermark: u64,
+        lifecycle_epoch: u64,
         mut upserts: Vec<EntitySnapshot>,
         mut removed: Vec<EntityId>,
     ) -> Result<Self, RegionalDecisionJournalError> {
@@ -149,6 +164,7 @@ impl RegionalCommitDecision {
         Ok(Self {
             phase,
             sequence_watermark,
+            lifecycle_epoch,
             upserts,
             removed,
         })
@@ -161,6 +177,16 @@ impl RegionalCommitDecision {
     #[must_use]
     pub const fn sequence_watermark(&self) -> u64 {
         self.sequence_watermark
+    }
+
+    #[must_use]
+    pub const fn lifecycle_epoch(&self) -> u64 {
+        self.lifecycle_epoch
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> (RegionPhase, u64, u64) {
+        (self.phase, self.sequence_watermark, self.lifecycle_epoch)
     }
 
     #[must_use]
@@ -206,17 +232,33 @@ pub trait RegionalDecisionJournal: Send {
         Ok(())
     }
 
+    fn clear_commit_identities(
+        &mut self,
+        identities: &[(RegionPhase, u64, u64)],
+    ) -> Result<(), RegionalDecisionJournalError> {
+        for identity in identities {
+            self.clear_commit(identity.0)?;
+        }
+        Ok(())
+    }
+
     fn pending_phases(&self) -> Vec<RegionPhase> {
         Vec::new()
     }
 
-    fn recovery_watermark(&self) -> (RegionPhase, u64) {
-        let phase = self
-            .pending_phases()
+    fn pending_commit_identities(&self) -> Vec<(RegionPhase, u64, u64)> {
+        self.pending_phases()
             .into_iter()
-            .max()
-            .unwrap_or(RegionPhase(0));
-        (phase, 0)
+            .map(|phase| (phase, 0, 0))
+            .collect()
+    }
+
+    fn recovery_watermark(&self) -> (RegionPhase, u64) {
+        self.pending_commit_identities()
+            .into_iter()
+            .fold((RegionPhase(0), 0), |(phase, sequence), identity| {
+                (phase.max(identity.0), sequence.max(identity.1))
+            })
     }
 }
 
@@ -254,6 +296,7 @@ pub struct RegionalOwnerShutdownError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RegionalOwnerSaveSnapshot {
     sequence_watermark: u64,
+    lifecycle_epoch: u64,
     snapshots: Vec<EntitySnapshot>,
     journal_phases: Vec<RegionPhase>,
 }
@@ -262,6 +305,11 @@ impl RegionalOwnerSaveSnapshot {
     #[must_use]
     pub const fn sequence_watermark(&self) -> u64 {
         self.sequence_watermark
+    }
+
+    #[must_use]
+    pub const fn lifecycle_epoch(&self) -> u64 {
+        self.lifecycle_epoch
     }
 
     #[must_use]
@@ -600,115 +648,6 @@ struct CapturedFollowTargets {
     inputs: BTreeMap<EntityId, EntitySnapshot>,
 }
 
-#[cfg(any(test, feature = "shadow-compare"))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RegionalShadowBatchError {
-    TickMismatch,
-    StageMismatch,
-    DuplicateRegion,
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-#[derive(Debug)]
-enum RegionalShadowRegionOutcome {
-    Match(ShadowComparison),
-    Divergence(Box<ShadowDivergence>),
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-#[derive(Debug)]
-pub struct RegionalShadowComparisonBatch {
-    tick: u64,
-    stage: ShadowStage,
-    regions: BTreeMap<RegionKey, RegionalShadowRegionOutcome>,
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-#[derive(Debug)]
-pub struct RegionalShadowComparisonOutcome {
-    comparison: ShadowComparison,
-    first_divergence: Option<Box<ShadowDivergence>>,
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-impl RegionalShadowComparisonBatch {
-    #[must_use]
-    pub fn new(tick: u64, stage: ShadowStage) -> Self {
-        Self {
-            tick,
-            stage,
-            regions: BTreeMap::new(),
-        }
-    }
-
-    pub fn compare_region(
-        &mut self,
-        key: RegionKey,
-        store: &mut EntityStore,
-    ) -> Result<(), RegionalShadowBatchError> {
-        if self.regions.contains_key(&key) {
-            return Err(RegionalShadowBatchError::DuplicateRegion);
-        }
-        let outcome = match store.compare_shadow(self.tick, self.stage) {
-            Ok(comparison) => RegionalShadowRegionOutcome::Match(comparison),
-            Err(divergence) => RegionalShadowRegionOutcome::Divergence(divergence),
-        };
-        self.regions.insert(key, outcome);
-        Ok(())
-    }
-
-    pub fn merge(&mut self, other: Self) -> Result<(), RegionalShadowBatchError> {
-        if self.tick != other.tick {
-            return Err(RegionalShadowBatchError::TickMismatch);
-        }
-        if self.stage != other.stage {
-            return Err(RegionalShadowBatchError::StageMismatch);
-        }
-        if other
-            .regions
-            .keys()
-            .any(|key| self.regions.contains_key(key))
-        {
-            return Err(RegionalShadowBatchError::DuplicateRegion);
-        }
-        self.regions.extend(other.regions);
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn finish(self) -> RegionalShadowComparisonOutcome {
-        let mut compared_entities = 0usize;
-        let mut compared_events = 0usize;
-        let mut first_divergence = None;
-        for outcome in self.regions.into_values() {
-            match outcome {
-                RegionalShadowRegionOutcome::Match(comparison) => {
-                    compared_entities =
-                        compared_entities.saturating_add(comparison.compared_entities);
-                    compared_events = compared_events.saturating_add(comparison.compared_events);
-                }
-                RegionalShadowRegionOutcome::Divergence(divergence) => {
-                    compared_entities =
-                        compared_entities.saturating_add(divergence.compared_entities);
-                    compared_events = compared_events.saturating_add(divergence.compared_events);
-                    if first_divergence.is_none() {
-                        first_divergence = Some(divergence);
-                    }
-                }
-            }
-        }
-        RegionalShadowComparisonOutcome {
-            comparison: ShadowComparison {
-                tick: self.tick,
-                stage: self.stage,
-                compared_entities,
-                compared_events,
-            },
-            first_divergence,
-        }
-    }
-}
-
 impl RegionalPreparedGoalTick {
     #[must_use]
     pub fn parallel_batch_count(&self) -> usize {
@@ -834,8 +773,7 @@ pub struct RegionalEntityStore {
     uuids: HashMap<Uuid, EntityId>,
     transfers: BTreeMap<TransferId, PreparedTransfer>,
     in_flight_transfers: BTreeMap<EntityId, TransferId>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    shadow_stats: ShadowComparisonStats,
+
     next_id: i32,
 }
 
@@ -848,22 +786,29 @@ pub struct RegionalOwnerCoordinator {
     passenger_vehicles: HashMap<EntityId, EntityId>,
     transfers: BTreeMap<TransferId, PreparedTransfer>,
     in_flight_transfers: BTreeMap<EntityId, TransferId>,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    shadow_stats: ShadowComparisonStats,
+
     next_id: i32,
     lanes: BTreeMap<usize, RegionalOwnerLane>,
     commit_state: Arc<RegionalOwnerCommitState>,
 }
 
+struct MutationExecution {
+    goal_stats: GoalTickStats,
+    effect_results: Vec<(u64, EntityEffectResult)>,
+}
+
 struct RegionalOwnerCommitState {
     next_phase: AtomicU64,
     next_sequence: AtomicU64,
+    lifecycle_epoch: AtomicU64,
     journal: Mutex<Box<dyn RegionalDecisionJournal>>,
-    journal_phases: Mutex<BTreeMap<RegionPhase, u64>>,
+    journal_commits: Mutex<BTreeMap<RegionPhase, (RegionPhase, u64, u64)>>,
     outcome_unknown: AtomicBool,
     #[cfg(test)]
     save_barrier_phase_snapshot_hook: Mutex<Option<SaveBarrierPhaseSnapshotHook>>,
 }
+
+type VehicleIndexes = (HashMap<EntityId, EntityId>, HashMap<EntityId, EntityId>);
 
 #[cfg(test)]
 struct SaveBarrierPhaseSnapshotHook {
@@ -872,10 +817,16 @@ struct SaveBarrierPhaseSnapshotHook {
 }
 
 impl RegionalOwnerCommitState {
-    fn reserve_sequences(&self, count: usize) -> Result<(u64, u64), RegionOwnerLaneError> {
+    fn ensure_committed_state(&self) -> Result<(), RegionOwnerLaneError> {
         if self.outcome_unknown.load(Ordering::Acquire) {
-            return Err(RegionOwnerLaneError::Busy);
+            Err(RegionOwnerLaneError::OutcomeUnknown)
+        } else {
+            Ok(())
         }
+    }
+
+    fn reserve_sequences(&self, count: usize) -> Result<(u64, u64), RegionOwnerLaneError> {
+        self.ensure_committed_state()?;
         let count = u64::try_from(count).map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
         let start = self
             .next_sequence
@@ -890,10 +841,34 @@ impl RegionalOwnerCommitState {
         self.next_sequence.load(Ordering::Acquire)
     }
 
+    fn lifecycle_epoch(&self) -> u64 {
+        self.lifecycle_epoch.load(Ordering::Acquire)
+    }
+
+    fn advance_lifecycle_epoch(&self, next: u64) -> Result<(), RegionOwnerLaneError> {
+        self.lifecycle_epoch
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                (next >= current).then_some(next)
+            })
+            .map(|_| ())
+            .map_err(|_| RegionOwnerLaneError::InvalidMutation)
+    }
+
+    fn restore_checkpoint_boundary(
+        &self,
+        lifecycle_epoch: u64,
+        sequence_watermark: u64,
+    ) -> Result<(), RegionOwnerLaneError> {
+        self.ensure_committed_state()?;
+        self.lifecycle_epoch
+            .fetch_max(lifecycle_epoch, Ordering::AcqRel);
+        self.next_sequence
+            .fetch_max(sequence_watermark, Ordering::AcqRel);
+        Ok(())
+    }
+
     fn reserve_phase(&self) -> Result<RegionPhase, RegionOwnerLaneError> {
-        if self.outcome_unknown.load(Ordering::Acquire) {
-            return Err(RegionOwnerLaneError::Busy);
-        }
+        self.ensure_committed_state()?;
         self.next_phase
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 current.checked_add(1)
@@ -903,17 +878,29 @@ impl RegionalOwnerCommitState {
     }
 
     fn clear_recovered_commits(&self, phases: &[RegionPhase]) -> Result<(), RegionOwnerLaneError> {
+        let identities = {
+            let journal_commits = self
+                .journal_commits
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            phases
+                .iter()
+                .filter_map(|phase| journal_commits.get(phase).copied())
+                .collect::<Vec<_>>()
+        };
         self.journal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear_commits(phases)
+            .clear_commit_identities(&identities)
             .map_err(|_| RegionOwnerLaneError::Journal)?;
-        let mut journal_phases = self
-            .journal_phases
+        let mut journal_commits = self
+            .journal_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for phase in phases {
-            journal_phases.remove(phase);
+        for identity in identities {
+            if journal_commits.get(&identity.0) == Some(&identity) {
+                journal_commits.remove(&identity.0);
+            }
         }
         Ok(())
     }
@@ -933,11 +920,11 @@ impl RegionalOwnerCommitState {
                 .recv()
                 .expect("save barrier phase snapshot release dropped");
         }
-        self.journal_phases
+        self.journal_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .iter()
-            .filter_map(|(&phase, &sequence)| (sequence <= sequence_watermark).then_some(phase))
+            .filter_map(|(&phase, identity)| (identity.1 <= sequence_watermark).then_some(phase))
             .collect()
     }
 
@@ -949,10 +936,10 @@ impl RegionalOwnerCommitState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .record_commit(decision)?;
-        self.journal_phases
+        self.journal_commits
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(decision.phase(), decision.sequence_watermark());
+            .insert(decision.phase(), decision.identity());
         Ok(())
     }
 
@@ -1044,8 +1031,6 @@ struct CachedEntityReadRoute {
 pub struct RegionalOwnerStatus {
     pub entity_count: usize,
     pub lane_count: usize,
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub shadow: ShadowComparisonStats,
 }
 
 #[derive(Debug, Clone)]
@@ -1095,13 +1080,13 @@ enum RegionalOwnerCommand {
     },
     ContainsUuid {
         uuid: Uuid,
-        reply: std::sync::mpsc::Sender<bool>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     BreedingTickSnapshots {
         reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
     },
     Status {
-        reply: std::sync::mpsc::Sender<RegionalOwnerStatus>,
+        reply: std::sync::mpsc::Sender<Result<RegionalOwnerStatus, RegionOwnerLaneError>>,
     },
     ReconfigureLanes {
         lane_count: usize,
@@ -1110,20 +1095,29 @@ enum RegionalOwnerCommand {
     SaveBarrier {
         reply: std::sync::mpsc::Sender<Result<RegionalOwnerSaveSnapshot, RegionOwnerLaneError>>,
     },
-    SpawnAuthoritative {
+    AdvanceLifecycleEpoch {
+        lifecycle_epoch: u64,
+        reply: std::sync::mpsc::Sender<Result<(), RegionOwnerLaneError>>,
+    },
+    RestoreCheckpointBoundary {
+        lifecycle_epoch: u64,
+        sequence_watermark: u64,
+        reply: std::sync::mpsc::Sender<Result<(), RegionOwnerLaneError>>,
+    },
+    Spawn {
         entity: Box<SpawnEntity>,
         defer_journal: bool,
         reply: std::sync::mpsc::Sender<Result<EntityId, RegionOwnerLaneError>>,
     },
-    SpawnAuthoritativeBatch {
+    SpawnBatch {
         entities: Vec<SpawnEntity>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntityId>, RegionOwnerLaneError>>,
     },
-    SpawnUniqueAuthoritativeBatch {
+    SpawnUniqueBatch {
         entities: Vec<SpawnEntity>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
     },
-    InsertAuthoritativeSnapshots {
+    InsertSnapshots {
         snapshots: Vec<EntitySnapshot>,
         reply: std::sync::mpsc::Sender<Result<usize, RegionOwnerLaneError>>,
     },
@@ -1134,6 +1128,15 @@ enum RegionalOwnerCommand {
     RemoveIfCurrent {
         expected: Box<EntitySnapshot>,
         reply: std::sync::mpsc::Sender<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>,
+    },
+    ReplaceSnapshotIfCurrent {
+        expected: Box<EntitySnapshot>,
+        next: Box<EntitySnapshot>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
+    },
+    ReplaceSnapshotsIfCurrent {
+        snapshots: Vec<(EntitySnapshot, EntitySnapshot)>,
+        reply: std::sync::mpsc::Sender<Result<bool, RegionOwnerLaneError>>,
     },
     SetAnimalStatesIfCurrent {
         states: Vec<(EntitySnapshot, AnimalBreedingState)>,
@@ -1176,12 +1179,17 @@ enum RegionalOwnerCommand {
     },
     DamageIfCurrent {
         expected: Box<EntitySnapshot>,
-        amount: f32,
+        request: EntityDamageRequest,
         reply: std::sync::mpsc::Sender<Result<Option<EntityDamage>, RegionOwnerLaneError>>,
+    },
+    ApplyEffectIfCurrent {
+        expected: Box<EntitySnapshot>,
+        request: Box<EntityEffectRequest>,
+        reply: std::sync::mpsc::Sender<Result<EntityEffectResult, RegionOwnerLaneError>>,
     },
     Damage {
         entity: EntityId,
-        amount: f32,
+        request: EntityDamageRequest,
         reply: std::sync::mpsc::Sender<Result<Option<EntityDamage>, RegionOwnerLaneError>>,
     },
     PrepareGoalTick {
@@ -1200,14 +1208,7 @@ enum RegionalOwnerCommand {
         defer_journal: bool,
         reply: std::sync::mpsc::Sender<GoalApplyKinematicsResult>,
     },
-    #[cfg(any(test, feature = "shadow-compare"))]
-    CompareShadow {
-        tick: u64,
-        stage: ShadowStage,
-        reply: std::sync::mpsc::Sender<
-            Result<Result<ShadowComparison, Box<ShadowDivergence>>, RegionOwnerLaneError>,
-        >,
-    },
+
     #[cfg(test)]
     HoldForTest {
         entered: std::sync::mpsc::Sender<()>,
@@ -1222,12 +1223,14 @@ impl RegionalOwnerCommand {
     fn mutates_entity_snapshots(&self) -> bool {
         matches!(
             self,
-            Self::SpawnAuthoritative { .. }
-                | Self::SpawnAuthoritativeBatch { .. }
-                | Self::SpawnUniqueAuthoritativeBatch { .. }
-                | Self::InsertAuthoritativeSnapshots { .. }
+            Self::Spawn { .. }
+                | Self::SpawnBatch { .. }
+                | Self::SpawnUniqueBatch { .. }
+                | Self::InsertSnapshots { .. }
                 | Self::Remove { .. }
                 | Self::RemoveIfCurrent { .. }
+                | Self::ReplaceSnapshotIfCurrent { .. }
+                | Self::ReplaceSnapshotsIfCurrent { .. }
                 | Self::SetAnimalStatesIfCurrent { .. }
                 | Self::SetGoal { .. }
                 | Self::SetGoals { .. }
@@ -1237,6 +1240,7 @@ impl RegionalOwnerCommand {
                 | Self::SetVelocities { .. }
                 | Self::ApplyKinematicsIfCurrent { .. }
                 | Self::DamageIfCurrent { .. }
+                | Self::ApplyEffectIfCurrent { .. }
                 | Self::Damage { .. }
                 | Self::ApplyPreparedGoalTick { .. }
                 | Self::ApplyPreparedGoalTickAndKinematics { .. }
@@ -1244,7 +1248,7 @@ impl RegionalOwnerCommand {
     }
 
     fn requires_exclusive_lane_access(&self) -> bool {
-        let exclusive = self.mutates_entity_snapshots()
+        self.mutates_entity_snapshots()
             || matches!(
                 self,
                 Self::Snapshot { .. }
@@ -1255,15 +1259,7 @@ impl RegionalOwnerCommand {
                     | Self::ReconfigureLanes { .. }
                     | Self::SaveBarrier { .. }
                     | Self::Shutdown { .. }
-            );
-        #[cfg(any(test, feature = "shadow-compare"))]
-        {
-            exclusive || matches!(self, Self::CompareShadow { .. })
-        }
-        #[cfg(not(any(test, feature = "shadow-compare")))]
-        {
-            exclusive
-        }
+            )
     }
 }
 
@@ -1272,6 +1268,7 @@ impl RegionalOwnerHandle {
         &self,
         entity: EntityId,
     ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         if let Some(mut snapshots) = self.read_cached_selected_entities(&HashSet::from([entity])) {
             return Ok(snapshots.pop());
         }
@@ -1283,6 +1280,7 @@ impl RegionalOwnerHandle {
     }
 
     pub fn snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Snapshots { reply })
@@ -1331,6 +1329,7 @@ impl RegionalOwnerHandle {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Option<(u64, Vec<EntitySnapshot>)> {
+        self.commit_state.ensure_committed_state().ok()?;
         let version_before = self.entity_state_version.load(Ordering::Acquire);
         if self.active_entity_writers.load(Ordering::Acquire) != 0 {
             return None;
@@ -1398,6 +1397,7 @@ impl RegionalOwnerHandle {
             self.notify_referenced_goal_fallback_probe();
             return None;
         }
+        self.commit_state.ensure_committed_state().ok()?;
         Some((version_after, snapshots))
     }
 
@@ -1450,7 +1450,7 @@ impl RegionalOwnerHandle {
         self.sender
             .send(RegionalOwnerCommand::ContainsUuid { uuid, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
     pub fn breeding_tick_snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
@@ -1466,7 +1466,7 @@ impl RegionalOwnerHandle {
         self.sender
             .send(RegionalOwnerCommand::Status { reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
     pub fn reconfigure_lanes(&self, lane_count: usize) -> Result<usize, RegionOwnerLaneError> {
@@ -1493,13 +1493,40 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn spawn_authoritative(
+    pub fn advance_lifecycle_epoch(
         &self,
-        entity: SpawnEntity,
-    ) -> Result<EntityId, RegionOwnerLaneError> {
+        lifecycle_epoch: u64,
+    ) -> Result<(), RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::SpawnAuthoritative {
+            .send(RegionalOwnerCommand::AdvanceLifecycleEpoch {
+                lifecycle_epoch,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn restore_checkpoint_boundary(
+        &self,
+        lifecycle_epoch: u64,
+        sequence_watermark: u64,
+    ) -> Result<(), RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::RestoreCheckpointBoundary {
+                lifecycle_epoch,
+                sequence_watermark,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn spawn(&self, entity: SpawnEntity) -> Result<EntityId, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::Spawn {
                 entity: Box::new(entity),
                 defer_journal: false,
                 reply,
@@ -1508,13 +1535,13 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn spawn_authoritative_deferred_journal(
+    pub fn spawn_deferred_journal(
         &self,
         entity: SpawnEntity,
     ) -> Result<EntityId, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::SpawnAuthoritative {
+            .send(RegionalOwnerCommand::Spawn {
                 entity: Box::new(entity),
                 defer_journal: true,
                 reply,
@@ -1523,13 +1550,13 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn spawn_authoritative_batch(
+    pub fn spawn_batch(
         &self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Result<Vec<EntityId>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::SpawnAuthoritativeBatch {
+            .send(RegionalOwnerCommand::SpawnBatch {
                 entities: entities.into_iter().collect(),
                 reply,
             })
@@ -1537,13 +1564,13 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn spawn_unique_authoritative_batch(
+    pub fn spawn_unique_batch(
         &self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::SpawnUniqueAuthoritativeBatch {
+            .send(RegionalOwnerCommand::SpawnUniqueBatch {
                 entities: entities.into_iter().collect(),
                 reply,
             })
@@ -1551,13 +1578,13 @@ impl RegionalOwnerHandle {
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
 
-    pub fn insert_authoritative_snapshots_batch(
+    pub fn insert_snapshots_batch(
         &self,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
     ) -> Result<usize, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
-            .send(RegionalOwnerCommand::InsertAuthoritativeSnapshots {
+            .send(RegionalOwnerCommand::InsertSnapshots {
                 snapshots: snapshots.into_iter().collect(),
                 reply,
             })
@@ -1583,6 +1610,37 @@ impl RegionalOwnerHandle {
                 expected: Box::new(expected),
                 reply,
             })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn replace_snapshot_if_current(
+        &self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ReplaceSnapshotIfCurrent {
+                expected: Box::new(expected),
+                next: Box::new(next),
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn replace_snapshots_if_current(
+        &self,
+        snapshots: impl IntoIterator<Item = (EntitySnapshot, EntitySnapshot)>,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let snapshots = snapshots.into_iter().collect::<Vec<_>>();
+        if snapshots.is_empty() {
+            return Ok(true);
+        }
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -1963,6 +2021,7 @@ impl RegionalOwnerHandle {
                 let decision = RegionalCommitDecision {
                     phase,
                     sequence_watermark: sequence,
+                    lifecycle_epoch: self.commit_state.lifecycle_epoch(),
                     upserts: upserts.clone(),
                     removed: Vec::new(),
                 };
@@ -1970,10 +2029,10 @@ impl RegionalOwnerHandle {
                 if let Err(error) = journal_result {
                     if error.outcome_unknown() {
                         self.commit_state
-                            .journal_phases
+                            .journal_commits
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(phase, sequence);
+                            .insert(phase, decision.identity());
                         self.commit_state
                             .outcome_unknown
                             .store(true, Ordering::Release);
@@ -2087,16 +2146,16 @@ impl RegionalOwnerHandle {
     pub fn damage_if_current(
         &self,
         expected: EntitySnapshot,
-        amount: f32,
+        request: EntityDamageRequest,
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
-        if !amount.is_finite() {
+        if !request.is_valid() {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         if let Some(result) =
             self.try_commit_cached_snapshot_mutation(expected.clone(), |expected| {
                 RegionOwnerMutation::DamageIfCurrent {
                     expected: Box::new(expected),
-                    amount,
+                    request,
                 }
             })
         {
@@ -2114,7 +2173,23 @@ impl RegionalOwnerHandle {
         self.sender
             .send(RegionalOwnerCommand::DamageIfCurrent {
                 expected: Box::new(expected),
-                amount,
+                request,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn apply_effect_if_current(
+        &self,
+        expected: EntitySnapshot,
+        request: EntityEffectRequest,
+    ) -> Result<EntityEffectResult, RegionOwnerLaneError> {
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ApplyEffectIfCurrent {
+                expected: Box::new(expected),
+                request: Box::new(request),
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -2124,13 +2199,13 @@ impl RegionalOwnerHandle {
     pub fn damage(
         &self,
         entity: EntityId,
-        amount: f32,
+        request: EntityDamageRequest,
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Damage {
                 entity,
-                amount,
+                request,
                 reply,
             })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
@@ -2216,19 +2291,6 @@ impl RegionalOwnerHandle {
                 defer_journal: true,
                 reply,
             })
-            .map_err(|_| RegionOwnerLaneError::Closed)?;
-        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn compare_shadow(
-        &self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<Result<ShadowComparison, Box<ShadowDivergence>>, RegionOwnerLaneError> {
-        let (reply, result) = channel();
-        self.sender
-            .send(RegionalOwnerCommand::CompareShadow { tick, stage, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -2433,13 +2495,23 @@ fn run_regional_owner_runtime(
                 let _ = reply.send(result);
             }
             RegionalOwnerCommand::ContainsUuid { uuid, reply } => {
-                let _ = reply.send(coordinator.contains_uuid(uuid));
+                let _ = reply.send(
+                    coordinator
+                        .commit_state
+                        .ensure_committed_state()
+                        .map(|()| coordinator.contains_uuid(uuid)),
+                );
             }
             RegionalOwnerCommand::BreedingTickSnapshots { reply } => {
                 let _ = reply.send(coordinator.breeding_tick_snapshots());
             }
             RegionalOwnerCommand::Status { reply } => {
-                let _ = reply.send(coordinator.status());
+                let _ = reply.send(
+                    coordinator
+                        .commit_state
+                        .ensure_committed_state()
+                        .map(|()| coordinator.status()),
+                );
             }
             RegionalOwnerCommand::ReconfigureLanes { lane_count, reply } => {
                 let result = coordinator.reconfigure_lanes(lane_count);
@@ -2454,31 +2526,52 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::SaveBarrier { reply } => {
                 let _ = reply.send(coordinator.save_barrier());
             }
-            RegionalOwnerCommand::SpawnAuthoritative {
+            RegionalOwnerCommand::AdvanceLifecycleEpoch {
+                lifecycle_epoch,
+                reply,
+            } => {
+                let _ = reply.send(
+                    coordinator
+                        .commit_state
+                        .advance_lifecycle_epoch(lifecycle_epoch),
+                );
+            }
+            RegionalOwnerCommand::RestoreCheckpointBoundary {
+                lifecycle_epoch,
+                sequence_watermark,
+                reply,
+            } => {
+                let _ = reply.send(
+                    coordinator
+                        .commit_state
+                        .restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark),
+                );
+            }
+            RegionalOwnerCommand::Spawn {
                 entity,
                 defer_journal,
                 reply,
             } => {
                 let passenger = entity_vehicle_reference(&entity);
-                let result = coordinator.spawn_authoritative_inner(*entity, !defer_journal);
+                let result = coordinator.spawn_inner(*entity, !defer_journal);
                 if result.is_ok() {
                     invalidate_selected_read_routes(&selected_read_routes, passenger.into_iter());
                 }
                 let _ = reply.send(result);
             }
-            RegionalOwnerCommand::SpawnAuthoritativeBatch { entities, reply } => {
+            RegionalOwnerCommand::SpawnBatch { entities, reply } => {
                 let passengers = entities
                     .iter()
                     .filter_map(entity_vehicle_reference)
                     .collect::<Vec<_>>();
-                let result = coordinator.spawn_authoritative_batch(entities);
+                let result = coordinator.spawn_batch(entities);
                 if result.is_ok() {
                     invalidate_selected_read_routes(&selected_read_routes, passengers);
                 }
                 let _ = reply.send(result);
             }
-            RegionalOwnerCommand::SpawnUniqueAuthoritativeBatch { entities, reply } => {
-                let result = coordinator.spawn_unique_authoritative_batch(entities);
+            RegionalOwnerCommand::SpawnUniqueBatch { entities, reply } => {
+                let result = coordinator.spawn_unique_batch(entities);
                 if let Ok(snapshots) = &result {
                     invalidate_selected_read_routes(
                         &selected_read_routes,
@@ -2487,12 +2580,12 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
-            RegionalOwnerCommand::InsertAuthoritativeSnapshots { snapshots, reply } => {
+            RegionalOwnerCommand::InsertSnapshots { snapshots, reply } => {
                 let passengers = snapshots
                     .iter()
                     .filter_map(snapshot_vehicle_reference)
                     .collect::<Vec<_>>();
-                let result = coordinator.insert_authoritative_snapshots_batch(snapshots);
+                let result = coordinator.insert_snapshots_batch(snapshots);
                 if result.is_ok() {
                     invalidate_selected_read_routes(&selected_read_routes, passengers);
                 }
@@ -2517,6 +2610,30 @@ fn run_regional_owner_runtime(
                         &selected_read_routes,
                         std::iter::once(entity).chain(passenger),
                     );
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::ReplaceSnapshotIfCurrent {
+                expected,
+                next,
+                reply,
+            } => {
+                let result = coordinator.replace_snapshot_if_current(*expected, *next);
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
+                }
+                let _ = reply.send(result);
+            }
+            RegionalOwnerCommand::ReplaceSnapshotsIfCurrent { snapshots, reply } => {
+                let result = coordinator.replace_snapshots_if_current(snapshots);
+                if matches!(&result, Ok(true)) {
+                    selected_read_routes
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
                 }
                 let _ = reply.send(result);
             }
@@ -2591,17 +2708,24 @@ fn run_regional_owner_runtime(
             }
             RegionalOwnerCommand::DamageIfCurrent {
                 expected,
-                amount,
+                request,
                 reply,
             } => {
-                let _ = reply.send(coordinator.damage_if_current(*expected, amount));
+                let _ = reply.send(coordinator.damage_if_current(*expected, request));
+            }
+            RegionalOwnerCommand::ApplyEffectIfCurrent {
+                expected,
+                request,
+                reply,
+            } => {
+                let _ = reply.send(coordinator.apply_effect_if_current(*expected, *request));
             }
             RegionalOwnerCommand::Damage {
                 entity,
-                amount,
+                request,
                 reply,
             } => {
-                let _ = reply.send(coordinator.damage(entity, amount));
+                let _ = reply.send(coordinator.damage(entity, request));
             }
             RegionalOwnerCommand::PrepareGoalTick {
                 tick,
@@ -2647,10 +2771,7 @@ fn run_regional_owner_runtime(
                 }
                 let _ = reply.send(result);
             }
-            #[cfg(any(test, feature = "shadow-compare"))]
-            RegionalOwnerCommand::CompareShadow { tick, stage, reply } => {
-                let _ = reply.send(coordinator.compare_shadow(tick, stage));
-            }
+
             #[cfg(test)]
             RegionalOwnerCommand::HoldForTest { entered, release } => {
                 let _ = entered.send(());
@@ -2815,11 +2936,16 @@ impl RegionalOwnerCoordinator {
             mut uuids,
             transfers,
             in_flight_transfers,
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow_stats,
+
             next_id,
         } = regions;
         let (recovered_phase, recovered_sequence) = journal.recovery_watermark();
+        let recovered_lifecycle_epoch = journal
+            .pending_commit_identities()
+            .into_iter()
+            .map(|identity| identity.2)
+            .max()
+            .unwrap_or(0);
         ownership.last_phase = ownership.last_phase.max(recovered_phase.0);
         let lane_count = requested_lanes;
         let mut by_lane = (0..lane_count)
@@ -2882,24 +3008,24 @@ impl RegionalOwnerCoordinator {
                             uuids,
                             transfers,
                             in_flight_transfers,
-                            #[cfg(any(test, feature = "shadow-compare"))]
-                            shadow_stats,
+
                             next_id,
                         }),
                     });
                 }
             }
         }
-        let journal_phases = journal
-            .pending_phases()
+        let journal_commits = journal
+            .pending_commit_identities()
             .into_iter()
-            .map(|phase| (phase, recovered_sequence))
+            .map(|identity| (identity.0, identity))
             .collect::<BTreeMap<_, _>>();
         let commit_state = Arc::new(RegionalOwnerCommitState {
             next_phase: AtomicU64::new(ownership.last_phase.max(recovered_phase.0)),
             next_sequence: AtomicU64::new(recovered_sequence),
+            lifecycle_epoch: AtomicU64::new(recovered_lifecycle_epoch),
             journal: Mutex::new(journal),
-            journal_phases: Mutex::new(journal_phases),
+            journal_commits: Mutex::new(journal_commits),
             outcome_unknown: AtomicBool::new(false),
             #[cfg(test)]
             save_barrier_phase_snapshot_hook: Mutex::new(None),
@@ -2913,8 +3039,7 @@ impl RegionalOwnerCoordinator {
             passenger_vehicles,
             transfers,
             in_flight_transfers,
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow_stats,
+
             next_id,
             lanes,
             commit_state,
@@ -3048,6 +3173,7 @@ impl RegionalOwnerCoordinator {
         &self,
         entity: EntityId,
     ) -> Result<Option<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let Some(key) = self.locations.get(&entity).copied() else {
             return Ok(None);
         };
@@ -3062,6 +3188,7 @@ impl RegionalOwnerCoordinator {
     }
 
     pub fn snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let mut pending = Vec::with_capacity(self.lanes.len());
         for owner in self.lanes.values() {
             pending.push(owner.request_snapshots()?);
@@ -3091,6 +3218,7 @@ impl RegionalOwnerCoordinator {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntityKinematics>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
         let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
@@ -3140,6 +3268,7 @@ impl RegionalOwnerCoordinator {
     }
 
     pub fn breeding_tick_snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let mut pending = Vec::with_capacity(self.lanes.len());
         for owner in self.lanes.values() {
             pending.push(owner.request_breeding_tick_snapshots()?);
@@ -3166,6 +3295,7 @@ impl RegionalOwnerCoordinator {
         &self,
         entities: &HashSet<EntityId>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let mut ordered = entities.iter().copied().collect::<Vec<_>>();
         ordered.sort_unstable();
         let mut requests = BTreeMap::<usize, Vec<(RegionLease, EntityId)>>::new();
@@ -3219,39 +3349,13 @@ impl RegionalOwnerCoordinator {
         RegionalOwnerStatus {
             entity_count: self.locations.len(),
             lane_count: self.lanes.len(),
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow: self.shadow_stats.clone(),
         }
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn compare_shadow(
-        &mut self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<Result<ShadowComparison, Box<ShadowDivergence>>, RegionOwnerLaneError> {
-        let mut pending = Vec::with_capacity(self.lanes.len());
-        for owner in self.lanes.values() {
-            pending.push(owner.request_shadow_comparison(tick, stage)?);
-        }
-        let mut combined = RegionalShadowComparisonBatch::new(tick, stage);
-        for completion in pending {
-            let batch = completion
-                .recv()
-                .map_err(|_| RegionOwnerLaneError::Closed)??;
-            combined
-                .merge(batch)
-                .map_err(|_| RegionOwnerLaneError::InvalidMutation)?;
-        }
-        let outcome = combined.finish();
-        Ok(record_regional_shadow_comparison(
-            &mut self.shadow_stats,
-            outcome,
-        ))
     }
 
     pub fn save_barrier(&self) -> Result<RegionalOwnerSaveSnapshot, RegionOwnerLaneError> {
+        self.commit_state.ensure_committed_state()?;
         let sequence_watermark = self.commit_state.sequence_watermark();
+        let lifecycle_epoch = self.commit_state.lifecycle_epoch();
         let mut leases_by_lane = BTreeMap::<usize, Vec<RegionLease>>::new();
         for lease in self.ownership.leases() {
             leases_by_lane.entry(lease.lane).or_default().push(lease);
@@ -3285,12 +3389,13 @@ impl RegionalOwnerCoordinator {
         }
         Ok(RegionalOwnerSaveSnapshot {
             sequence_watermark,
+            lifecycle_epoch,
             snapshots,
             journal_phases: self.commit_state.pending_journal_phases(sequence_watermark),
         })
     }
 
-    pub fn insert_authoritative_snapshots_batch(
+    pub fn insert_snapshots_batch(
         &mut self,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
     ) -> Result<usize, RegionOwnerLaneError> {
@@ -3330,8 +3435,7 @@ impl RegionalOwnerCoordinator {
         {
             let current = self.snapshots()?;
             let mut graph_validator = EntityStore::new();
-            if !graph_validator
-                .insert_authoritative_snapshots_batch(current.into_iter().chain(snapshots.clone()))
+            if !graph_validator.insert_snapshots_batch(current.into_iter().chain(snapshots.clone()))
             {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
@@ -3372,14 +3476,11 @@ impl RegionalOwnerCoordinator {
         Ok(snapshots.len())
     }
 
-    pub fn spawn_authoritative(
-        &mut self,
-        entity: SpawnEntity,
-    ) -> Result<EntityId, RegionOwnerLaneError> {
-        self.spawn_authoritative_inner(entity, true)
+    pub fn spawn(&mut self, entity: SpawnEntity) -> Result<EntityId, RegionOwnerLaneError> {
+        self.spawn_inner(entity, true)
     }
 
-    fn spawn_authoritative_inner(
+    fn spawn_inner(
         &mut self,
         entity: SpawnEntity,
         journal_commit: bool,
@@ -3420,7 +3521,7 @@ impl RegionalOwnerCoordinator {
         Ok(id)
     }
 
-    pub fn spawn_authoritative_batch(
+    pub fn spawn_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Result<Vec<EntityId>, RegionOwnerLaneError> {
@@ -3455,13 +3556,13 @@ impl RegionalOwnerCoordinator {
             snapshots.push(snapshot_from_spawn(id, uuid, entity));
         }
         let expected = snapshots.len();
-        if self.insert_authoritative_snapshots_batch(snapshots)? != expected {
+        if self.insert_snapshots_batch(snapshots)? != expected {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         Ok(ids)
     }
 
-    pub fn spawn_unique_authoritative_batch(
+    pub fn spawn_unique_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
@@ -3507,7 +3608,7 @@ impl RegionalOwnerCoordinator {
             return Ok(Vec::new());
         }
         let expected = snapshots.len();
-        if self.insert_authoritative_snapshots_batch(snapshots.clone())? != expected {
+        if self.insert_snapshots_batch(snapshots.clone())? != expected {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         Ok(snapshots)
@@ -3587,6 +3688,192 @@ impl RegionalOwnerCoordinator {
                 self.uuids.remove(&uuid);
                 Ok(Some(expected))
             }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn replace_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let entity_id = expected.id;
+        if expected.id != next.id || expected.uuid != next.uuid {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        }
+        let Some(source) = RegionKey::from_position(expected.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        let Some(target) = RegionKey::from_position(next.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        if self.locations.get(&expected.id).copied() != Some(source)
+            || self.in_flight_transfers.contains_key(&expected.id)
+            || self.snapshot(expected.id)?.as_ref() != Some(&expected)
+        {
+            return Ok(false);
+        }
+        let (vehicle_passengers, passenger_vehicles) =
+            self.vehicle_indexes_after_replacements(std::iter::once(&next))?;
+        self.ensure_region(target)?;
+        let mutation_count = if source == target { 1 } else { 2 };
+        let (first_sequence, sequence) = self.commit_state.reserve_sequences(mutation_count)?;
+        let source_lease = self
+            .ownership
+            .lease(source)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let mut mutations = BTreeMap::new();
+        if source == target {
+            mutations.insert(
+                source_lease.lane,
+                vec![SequencedRegionMutation {
+                    sequence,
+                    lease: source_lease,
+                    mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                        expected: Box::new(expected),
+                        next: Box::new(next),
+                    },
+                }],
+            );
+        } else {
+            let target_lease = self
+                .ownership
+                .lease(target)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            mutations.insert(
+                source_lease.lane,
+                vec![SequencedRegionMutation {
+                    sequence: first_sequence + 1,
+                    lease: source_lease,
+                    mutation: RegionOwnerMutation::RemoveIfCurrent(Box::new(expected)),
+                }],
+            );
+            mutations.insert(
+                target_lease.lane,
+                vec![SequencedRegionMutation {
+                    sequence,
+                    lease: target_lease,
+                    mutation: RegionOwnerMutation::InsertSnapshot(Box::new(next)),
+                }],
+            );
+        }
+        match self.execute_mutations(mutations, sequence) {
+            Ok(()) => {
+                self.locations.insert(entity_id, target);
+                self.vehicle_passengers = vehicle_passengers;
+                self.passenger_vehicles = passenger_vehicles;
+                Ok(true)
+            }
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn replace_snapshots_if_current(
+        &mut self,
+        snapshots: impl IntoIterator<Item = (EntitySnapshot, EntitySnapshot)>,
+    ) -> Result<bool, RegionOwnerLaneError> {
+        let snapshots = snapshots.into_iter().collect::<Vec<_>>();
+        if snapshots.is_empty() {
+            return Ok(true);
+        }
+
+        let mut entity_ids = HashSet::with_capacity(snapshots.len());
+        let mut locations = Vec::with_capacity(snapshots.len());
+        let mut mutation_count = 0_usize;
+        for (expected, next) in &snapshots {
+            if expected.id != next.id
+                || expected.uuid != next.uuid
+                || !entity_ids.insert(expected.id)
+                || !next.rotation.is_finite()
+                || !next.velocity.is_finite()
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            let Some(source) = RegionKey::from_position(expected.position) else {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            };
+            let Some(target) = RegionKey::from_position(next.position) else {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            };
+            if self.locations.get(&expected.id).copied() != Some(source)
+                || self.in_flight_transfers.contains_key(&expected.id)
+                || self.snapshot(expected.id)?.as_ref() != Some(expected)
+            {
+                return Ok(false);
+            }
+            mutation_count = mutation_count
+                .checked_add(if source == target { 1 } else { 2 })
+                .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+            locations.push((expected.id, source, target));
+        }
+        for (_, _, target) in &locations {
+            self.ensure_region(*target)?;
+        }
+        let (vehicle_passengers, passenger_vehicles) =
+            self.vehicle_indexes_after_replacements(snapshots.iter().map(|(_, next)| next))?;
+
+        let (first_sequence, sequence_watermark) =
+            self.commit_state.reserve_sequences(mutation_count)?;
+        let mut sequence = first_sequence;
+        let mut mutations = BTreeMap::<usize, Vec<SequencedRegionMutation>>::new();
+        for ((expected, next), (_, source, target)) in
+            snapshots.into_iter().zip(locations.iter().copied())
+        {
+            let source_lease = self
+                .ownership
+                .lease(source)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            if source == target {
+                sequence += 1;
+                mutations
+                    .entry(source_lease.lane)
+                    .or_default()
+                    .push(SequencedRegionMutation {
+                        sequence,
+                        lease: source_lease,
+                        mutation: RegionOwnerMutation::ReplaceSnapshotIfCurrent {
+                            expected: Box::new(expected),
+                            next: Box::new(next),
+                        },
+                    });
+                continue;
+            }
+
+            let target_lease = self
+                .ownership
+                .lease(target)
+                .ok_or(RegionOwnerLaneError::StaleLease)?;
+            sequence += 1;
+            mutations
+                .entry(source_lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence,
+                    lease: source_lease,
+                    mutation: RegionOwnerMutation::RemoveIfCurrent(Box::new(expected)),
+                });
+            sequence += 1;
+            mutations
+                .entry(target_lease.lane)
+                .or_default()
+                .push(SequencedRegionMutation {
+                    sequence,
+                    lease: target_lease,
+                    mutation: RegionOwnerMutation::InsertSnapshot(Box::new(next)),
+                });
+        }
+        debug_assert_eq!(sequence, sequence_watermark);
+        match self.execute_mutations(mutations, sequence_watermark) {
+            Ok(()) => {
+                for (entity, _, target) in locations {
+                    self.locations.insert(entity, target);
+                }
+                self.vehicle_passengers = vehicle_passengers;
+                self.passenger_vehicles = passenger_vehicles;
+                Ok(true)
+            }
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -3687,6 +3974,53 @@ impl RegionalOwnerCoordinator {
                 .insert(passenger, snapshot.id)
                 .is_none()
         );
+    }
+
+    fn vehicle_indexes_after_replacements<'a>(
+        &self,
+        replacements: impl IntoIterator<Item = &'a EntitySnapshot>,
+    ) -> Result<VehicleIndexes, RegionOwnerLaneError> {
+        let mut snapshots = self
+            .snapshots()?
+            .into_iter()
+            .map(|snapshot| (snapshot.id, snapshot))
+            .collect::<BTreeMap<_, _>>();
+        for replacement in replacements {
+            if !snapshots.contains_key(&replacement.id) {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+            snapshots.insert(replacement.id, replacement.clone());
+        }
+
+        let mut vehicle_passengers = HashMap::new();
+        let mut passenger_vehicles = HashMap::new();
+        for snapshot in snapshots.values() {
+            let Some(passenger) = snapshot_vehicle_reference(snapshot) else {
+                continue;
+            };
+            let Some(passenger_snapshot) = snapshots.get(&passenger) else {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            };
+            if passenger == snapshot.id
+                || RegionKey::from_position(passenger_snapshot.position)
+                    != RegionKey::from_position(snapshot.position)
+                || vehicle_passengers.insert(snapshot.id, passenger).is_some()
+                || passenger_vehicles.insert(passenger, snapshot.id).is_some()
+            {
+                return Err(RegionOwnerLaneError::InvalidMutation);
+            }
+        }
+        for &start in snapshots.keys() {
+            let mut current = start;
+            let mut visited = HashSet::new();
+            while let Some(&passenger) = vehicle_passengers.get(&current) {
+                if !visited.insert(current) {
+                    return Err(RegionOwnerLaneError::InvalidMutation);
+                }
+                current = passenger;
+            }
+        }
+        Ok((vehicle_passengers, passenger_vehicles))
     }
 
     fn remove_vehicle_links(&mut self, snapshot: &EntitySnapshot) {
@@ -3922,12 +4256,12 @@ impl RegionalOwnerCoordinator {
     pub fn damage(
         &mut self,
         entity: EntityId,
-        amount: f32,
+        request: EntityDamageRequest,
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
         let Some(expected) = self.snapshot(entity)? else {
             return Ok(None);
         };
-        self.damage_if_current(expected, amount)
+        self.damage_if_current(expected, request)
     }
 
     pub fn apply_kinematics_if_current(
@@ -3956,6 +4290,9 @@ impl RegionalOwnerCoordinator {
             {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
+        }
+        if ids.iter().any(|id| !self.locations.contains_key(id)) {
+            return Ok(false);
         }
         let standalone_local = states.iter().all(|(expected, state)| {
             let source = RegionKey::from_position(expected.position);
@@ -4232,9 +4569,9 @@ impl RegionalOwnerCoordinator {
     pub fn damage_if_current(
         &mut self,
         expected: EntitySnapshot,
-        amount: f32,
+        request: EntityDamageRequest,
     ) -> Result<Option<EntityDamage>, RegionOwnerLaneError> {
-        if !amount.is_finite() {
+        if !request.is_valid() {
             return Err(RegionOwnerLaneError::InvalidMutation);
         }
         let Some(key) = RegionKey::from_position(expected.position) else {
@@ -4256,7 +4593,7 @@ impl RegionalOwnerCoordinator {
                 lease,
                 mutation: RegionOwnerMutation::DamageIfCurrent {
                     expected: Box::new(expected),
-                    amount,
+                    request,
                 },
             }],
         )]);
@@ -4271,6 +4608,48 @@ impl RegionalOwnerCoordinator {
                 }))
             }
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn apply_effect_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        request: EntityEffectRequest,
+    ) -> Result<EntityEffectResult, RegionOwnerLaneError> {
+        let Some(key) = RegionKey::from_position(expected.position) else {
+            return Err(RegionOwnerLaneError::InvalidMutation);
+        };
+        if self.locations.get(&expected.id).copied() != Some(key) {
+            return Ok(EntityEffectResult::Rejected(
+                crate::EntityEffectRejection::Missing,
+            ));
+        }
+        let lease = self
+            .ownership
+            .lease(key)
+            .ok_or(RegionOwnerLaneError::StaleLease)?;
+        let (_, sequence) = self.commit_state.reserve_sequences(1)?;
+        let mutations = BTreeMap::from([(
+            lease.lane,
+            vec![SequencedRegionMutation {
+                sequence,
+                lease,
+                mutation: RegionOwnerMutation::ApplyEffectIfCurrent {
+                    expected: Box::new(expected),
+                    request: Box::new(request),
+                },
+            }],
+        )]);
+        match self.execute_mutations_with_stats(mutations, sequence, true) {
+            Ok(mut execution) => execution
+                .effect_results
+                .pop()
+                .map(|(_, result)| result)
+                .ok_or(RegionOwnerLaneError::InvalidMutation),
+            Err(RegionOwnerLaneError::InvalidMutation) => Ok(EntityEffectResult::Rejected(
+                crate::EntityEffectRejection::Stale,
+            )),
             Err(error) => Err(error),
         }
     }
@@ -4555,7 +4934,7 @@ impl RegionalOwnerCoordinator {
                 });
         }
         match self.execute_mutations_with_stats(mutations, next_sequence, journal_commit) {
-            Ok(stats) => Ok(Some(stats)),
+            Ok(execution) => Ok(Some(execution.goal_stats)),
             Err(RegionOwnerLaneError::InvalidMutation) => Ok(None),
             Err(error) => Err(error),
         }
@@ -4575,7 +4954,7 @@ impl RegionalOwnerCoordinator {
         mut mutations: BTreeMap<usize, Vec<SequencedRegionMutation>>,
         sequence_watermark: u64,
         journal_commit: bool,
-    ) -> Result<GoalTickStats, RegionOwnerLaneError> {
+    ) -> Result<MutationExecution, RegionOwnerLaneError> {
         let journal_enabled = journal_commit
             && self
                 .commit_state
@@ -4590,6 +4969,7 @@ impl RegionalOwnerCoordinator {
             .begin_allocated_phase_for_lanes(phase, participants.clone())
             .map_err(|_| RegionOwnerLaneError::Busy)?;
         let mut goal_stats = GoalTickStats::default();
+        let mut effect_results = Vec::new();
 
         let mut prepared = Vec::with_capacity(participants.len());
         let mut prepared_and_committed = Vec::new();
@@ -4639,6 +5019,7 @@ impl RegionalOwnerCoordinator {
             match completion.recv() {
                 Ok(Ok(result)) if result.phase == phase => {
                     add_goal_tick_stats(&mut goal_stats, result.goal_stats);
+                    effect_results.extend(result.effect_results);
                     ready.insert(lane);
                     applied.insert(lane);
                 }
@@ -4666,6 +5047,7 @@ impl RegionalOwnerCoordinator {
                 match completion.recv() {
                     Ok(Ok(result)) if result.phase == phase => {
                         add_goal_tick_stats(&mut goal_stats, result.goal_stats);
+                        effect_results.extend(result.effect_results);
                         applied.insert(lane);
                     }
                     Ok(Err(error)) => {
@@ -4684,11 +5066,16 @@ impl RegionalOwnerCoordinator {
                 && let Err(error) = self.record_commit_decision(phase, sequence_watermark, entities)
             {
                 if error.outcome_unknown() {
+                    let identity = (
+                        phase,
+                        sequence_watermark,
+                        self.commit_state.lifecycle_epoch(),
+                    );
                     self.commit_state
-                        .journal_phases
+                        .journal_commits
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(phase, sequence_watermark);
+                        .insert(phase, identity);
                     self.commit_state
                         .outcome_unknown
                         .store(true, Ordering::Release);
@@ -4763,7 +5150,10 @@ impl RegionalOwnerCoordinator {
         }
         match first_error {
             Some(error) => Err(error),
-            None => Ok(goal_stats),
+            None => Ok(MutationExecution {
+                goal_stats,
+                effect_results,
+            }),
         }
     }
 
@@ -4807,6 +5197,7 @@ impl RegionalOwnerCoordinator {
         self.commit_state.record_commit(&RegionalCommitDecision {
             phase,
             sequence_watermark,
+            lifecycle_epoch: self.commit_state.lifecycle_epoch(),
             upserts,
             removed,
         })
@@ -4822,8 +5213,7 @@ impl RegionalOwnerCoordinator {
             passenger_vehicles: _,
             transfers,
             in_flight_transfers,
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow_stats,
+
             next_id,
             lanes,
             commit_state,
@@ -4832,7 +5222,7 @@ impl RegionalOwnerCoordinator {
             .last_phase
             .max(commit_state.next_phase.load(Ordering::Acquire));
         let mut stores = BTreeMap::new();
-        let mut first_error = None;
+        let mut first_error = commit_state.ensure_committed_state().err();
         for (_, lane) in lanes {
             match lane.shutdown() {
                 Ok(owned) => {
@@ -4857,8 +5247,7 @@ impl RegionalOwnerCoordinator {
             uuids,
             transfers,
             in_flight_transfers,
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow_stats,
+
             next_id,
         };
         match first_error {
@@ -4905,10 +5294,13 @@ fn mutation_entity_ids(mutation: &RegionOwnerMutation) -> Vec<EntityId> {
         | RegionOwnerMutation::SetAnimalState { entity, .. }
         | RegionOwnerMutation::RemoveEntity(entity) => vec![*entity],
         RegionOwnerMutation::SetAnimalStateIfCurrent { expected, .. }
+        | RegionOwnerMutation::SetGrazingStateIfCurrent { expected, .. }
         | RegionOwnerMutation::SetGoalIfCurrent { expected, .. }
         | RegionOwnerMutation::SetItemStackIfCurrent { expected, .. }
+        | RegionOwnerMutation::ReplaceSnapshotIfCurrent { expected, .. }
         | RegionOwnerMutation::SetKinematicsIfCurrent { expected, .. }
         | RegionOwnerMutation::DamageIfCurrent { expected, .. }
+        | RegionOwnerMutation::ApplyEffectIfCurrent { expected, .. }
         | RegionOwnerMutation::RemoveIfCurrent(expected)
         | RegionOwnerMutation::InsertSnapshot(expected) => vec![expected.id],
         RegionOwnerMutation::ApplyGoalBatch { expected, .. }
@@ -4944,8 +5336,7 @@ impl RegionalEntityStore {
             uuids: HashMap::new(),
             transfers: BTreeMap::new(),
             in_flight_transfers: BTreeMap::new(),
-            #[cfg(any(test, feature = "shadow-compare"))]
-            shadow_stats: ShadowComparisonStats::default(),
+
             next_id: 0,
         }
     }
@@ -5320,11 +5711,11 @@ impl RegionalEntityStore {
         &mut self,
         phase: RegionPhase,
         id: EntityId,
-        amount: f32,
+        request: EntityDamageRequest,
     ) -> Result<Option<EntityDamage>, RegionEntityStoreError> {
         Ok(self
             .store_for_entity_mutation(phase, id)?
-            .damage(id, amount))
+            .damage(id, request))
     }
 
     pub fn decide_transfer(
@@ -5424,13 +5815,13 @@ impl RegionalEntityStore {
             .stores
             .get_mut(&prepared.target.key)
             .ok_or(RegionEntityStoreError::StaleLease)?
-            .insert_authoritative_snapshots_batch(prepared.target_snapshots.clone());
+            .insert_snapshots_batch(prepared.target_snapshots.clone());
         if !inserted {
             let restored = self
                 .stores
                 .get_mut(&prepared.source.key)
                 .is_some_and(|store| {
-                    store.insert_authoritative_snapshots_batch(prepared.source_snapshots.clone())
+                    store.insert_snapshots_batch(prepared.source_snapshots.clone())
                 });
             assert!(
                 restored,
@@ -5445,7 +5836,7 @@ impl RegionalEntityStore {
         Ok(TransferApply::Committed)
     }
 
-    pub fn spawn_authoritative(
+    pub fn spawn(
         &mut self,
         phase: RegionPhase,
         lease: RegionLease,
@@ -5475,7 +5866,7 @@ impl RegionalEntityStore {
             .stores
             .get_mut(&lease.key)
             .ok_or(RegionEntityStoreError::StaleLease)?;
-        if !store.insert_authoritative_snapshot(snapshot) {
+        if !store.insert_snapshot(snapshot) {
             return Err(RegionEntityStoreError::TargetConflict);
         }
         self.locations.insert(id, lease.key);
@@ -5484,7 +5875,7 @@ impl RegionalEntityStore {
         Ok(id)
     }
 
-    pub fn spawn_authoritative_batch(
+    pub fn spawn_batch(
         &mut self,
         phase: RegionPhase,
         entities: impl IntoIterator<Item = SpawnEntity>,
@@ -5523,7 +5914,7 @@ impl RegionalEntityStore {
         Ok(ids)
     }
 
-    pub fn insert_authoritative_snapshots(
+    pub fn insert_snapshots(
         &mut self,
         phase: RegionPhase,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
@@ -5611,35 +6002,6 @@ impl RegionalEntityStore {
 
     pub fn snapshots(&self) -> impl Iterator<Item = EntitySnapshot> + '_ {
         self.locations.keys().filter_map(|&id| self.snapshot(id))
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    #[must_use]
-    pub fn shadow_comparison_stats(&self) -> &ShadowComparisonStats {
-        &self.shadow_stats
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn compare_shadow(
-        &mut self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<ShadowComparison, Box<ShadowDivergence>> {
-        let mut batch = RegionalShadowComparisonBatch::new(tick, stage);
-        for (&key, store) in &mut self.stores {
-            batch
-                .compare_region(key, store)
-                .expect("regional stores have unique keys");
-        }
-        self.record_shadow_comparison(batch.finish())
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn record_shadow_comparison(
-        &mut self,
-        outcome: RegionalShadowComparisonOutcome,
-    ) -> Result<ShadowComparison, Box<ShadowDivergence>> {
-        record_regional_shadow_comparison(&mut self.shadow_stats, outcome)
     }
 
     pub fn visit_simulation_entities(&self, mut visitor: impl FnMut(EntityView<'_>)) {
@@ -5933,7 +6295,7 @@ impl RegionalEntityStore {
                 .stores
                 .get_mut(&key)
                 .ok_or(RegionEntityStoreError::StaleLease)?
-                .insert_authoritative_snapshots_batch(snapshots);
+                .insert_snapshots_batch(snapshots);
             if !success {
                 for &(key, id) in &inserted {
                     let _ = self.stores.get_mut(&key).and_then(|store| store.remove(id));
@@ -5990,32 +6352,6 @@ impl RegionalEntityStore {
             })
             .unwrap_or_default()
     }
-}
-
-#[cfg(any(test, feature = "shadow-compare"))]
-fn record_regional_shadow_comparison(
-    stats: &mut ShadowComparisonStats,
-    outcome: RegionalShadowComparisonOutcome,
-) -> Result<ShadowComparison, Box<ShadowDivergence>> {
-    let RegionalShadowComparisonOutcome {
-        comparison,
-        first_divergence,
-    } = outcome;
-    stats.comparisons = stats.comparisons.saturating_add(1);
-    stats.compared_entities = stats
-        .compared_entities
-        .saturating_add(comparison.compared_entities as u64);
-    stats.compared_events = stats
-        .compared_events
-        .saturating_add(comparison.compared_events as u64);
-
-    if let Some(divergence) = first_divergence {
-        if stats.first_divergence.is_none() {
-            stats.first_divergence = Some((*divergence).clone());
-        }
-        return Err(divergence);
-    }
-    Ok(comparison)
 }
 
 #[derive(Debug)]
@@ -6129,20 +6465,16 @@ impl RegionalEntityAuthority {
     }
 
     pub fn spawn(&mut self, entity: SpawnEntity) -> EntityId {
-        self.spawn_authoritative(entity)
-    }
-
-    pub fn spawn_authoritative(&mut self, entity: SpawnEntity) -> EntityId {
         let key = self.ensure_position_region(entity.position);
         self.with_phase(|regions, phase| {
             let lease = regions.ownership.lease(key).expect("assigned spawn region");
             regions
-                .spawn_authoritative(phase, lease, entity)
+                .spawn(phase, lease, entity)
                 .expect("validated production entity spawn")
         })
     }
 
-    pub fn spawn_authoritative_batch(
+    pub fn spawn_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntityId> {
@@ -6152,21 +6484,17 @@ impl RegionalEntityAuthority {
         }
         self.with_phase(|regions, phase| {
             regions
-                .spawn_authoritative_batch(phase, entities)
+                .spawn_batch(phase, entities)
                 .expect("validated production entity batch")
         })
     }
 
-    pub fn insert_authoritative_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
+    pub fn insert_snapshot(&mut self, snapshot: EntitySnapshot) -> bool {
         self.ensure_position_region(snapshot.position);
-        self.with_phase(|regions, phase| {
-            regions
-                .insert_authoritative_snapshots(phase, [snapshot])
-                .is_ok()
-        })
+        self.with_phase(|regions, phase| regions.insert_snapshots(phase, [snapshot]).is_ok())
     }
 
-    pub fn insert_authoritative_snapshots_batch(
+    pub fn insert_snapshots_batch(
         &mut self,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
     ) -> bool {
@@ -6175,9 +6503,7 @@ impl RegionalEntityAuthority {
             self.ensure_position_region(snapshot.position);
         }
         let expected = snapshots.len();
-        self.with_phase(|regions, phase| {
-            regions.insert_authoritative_snapshots(phase, snapshots) == Ok(expected)
-        })
+        self.with_phase(|regions, phase| regions.insert_snapshots(phase, snapshots) == Ok(expected))
     }
 
     pub fn set_animal_state(&mut self, id: EntityId, animal: AnimalBreedingState) -> bool {
@@ -6288,9 +6614,9 @@ impl RegionalEntityAuthority {
         }]) == 1
     }
 
-    pub fn damage(&mut self, id: EntityId, amount: f32) -> Option<EntityDamage> {
+    pub fn damage(&mut self, id: EntityId, request: EntityDamageRequest) -> Option<EntityDamage> {
         self.with_entity_phase(id, |regions, phase| {
-            regions.damage(phase, id, amount).ok().flatten()
+            regions.damage(phase, id, request).ok().flatten()
         })
         .flatten()
     }
@@ -6751,21 +7077,6 @@ impl RegionalEntityAuthority {
         self.regions.visit_sheep_entities_for_ids(ids, visitor);
     }
 
-    #[cfg(any(test, feature = "shadow-compare"))]
-    #[must_use]
-    pub fn shadow_comparison_stats(&self) -> &ShadowComparisonStats {
-        self.regions.shadow_comparison_stats()
-    }
-
-    #[cfg(any(test, feature = "shadow-compare"))]
-    pub fn compare_shadow(
-        &mut self,
-        tick: u64,
-        stage: ShadowStage,
-    ) -> Result<ShadowComparison, Box<ShadowDivergence>> {
-        self.regions.compare_shadow(tick, stage)
-    }
-
     fn ensure_position_region(&mut self, position: Vec3) -> RegionKey {
         let key = RegionKey::from_position(position).expect("finite production entity position");
         if self.regions.ownership.lease(key).is_none() {
@@ -6975,15 +7286,27 @@ mod tests {
 
     use super::{
         REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey, RegionOwnership,
-        RegionOwnershipError, RegionalEntityAuthority, RegionalEntityStore,
-        RegionalShadowComparisonBatch, TransferApply, TransferDecision,
+        RegionOwnershipError, RegionalEntityAuthority, RegionalEntityStore, TransferApply,
+        TransferDecision,
+    };
+    use crate::effects_26_1_2::{
+        ActiveEffectChainSnapshot, ActiveEffectsSnapshot, EffectFlags, EffectId, EffectInstance,
+        EffectKind,
     };
     use crate::{
-        AnimalBreedingState, EntityId, EntityKinematics, EntityStore, GoalState, GoalTickStats,
-        PathingBudget, PathingProbe, PathingProbeResult, Rotation, ShadowStage, SheepColor,
-        SpawnEntity, Vec3, VehicleKind, VehicleState,
+        AnimalBreedingState, EntityActiveEffectsState, EntityDamageRequest, EntityId,
+        EntityKinematics, EntityStore, GoalState, GoalTickStats, PathingBudget, PathingProbe,
+        PathingProbeResult, Rotation, SheepColor, SpawnEntity, Vec3, VehicleKind, VehicleState,
     };
     use uuid::Uuid;
+
+    fn damage_request(amount: f32) -> EntityDamageRequest {
+        EntityDamageRequest {
+            amount,
+            tick: 10,
+            death_remove_tick: 30,
+        }
+    }
 
     fn parse_linux_cpu_list(value: &str) -> Option<Vec<usize>> {
         let mut cpus = std::collections::BTreeSet::new();
@@ -7144,22 +7467,6 @@ mod tests {
             velocity: Vec3::new(0.4, 0.1, -0.2),
             on_ground: false,
         }
-    }
-
-    fn spawn_shadowed_legacy(
-        regions: &mut RegionalEntityStore,
-        key: RegionKey,
-        entity: SpawnEntity,
-    ) -> EntityId {
-        let mut store = EntityStore::shadowed_legacy();
-        store.next_id = regions.next_id;
-        let id = store.spawn(entity);
-        let snapshot = store.snapshot(id).expect("legacy snapshot");
-        regions.stores.insert(key, store);
-        regions.locations.insert(id, key);
-        regions.uuids.insert(snapshot.uuid, id);
-        regions.next_id = id.0;
-        id
     }
 
     struct WalkablePathing;
@@ -7355,10 +7662,10 @@ mod tests {
         let phase = regions.begin_phase().expect("spawn phase");
 
         let west_id = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
             .expect("west cow");
         let east_id = regions
-            .spawn_authoritative(phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
 
         assert_ne!(west_id, east_id);
@@ -7384,12 +7691,12 @@ mod tests {
             .expect("move east region to lane 1");
         let next_phase = regions.begin_phase().expect("next phase");
         assert_eq!(
-            regions.spawn_authoritative(next_phase, east, cow(Vec3::new(129.5, 64.0, 0.5)),),
+            regions.spawn(next_phase, east, cow(Vec3::new(129.5, 64.0, 0.5)),),
             Err(RegionEntityStoreError::StaleLease)
         );
         assert!(
             regions
-                .spawn_authoritative(
+                .spawn(
                     next_phase,
                     reassigned_east,
                     cow(Vec3::new(129.5, 64.0, 0.5)),
@@ -7416,29 +7723,25 @@ mod tests {
             .expect("east region");
         let spawn_phase = regions.begin_phase().expect("spawn phase");
         let east_id = regions
-            .spawn_authoritative(spawn_phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(spawn_phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let mut follower = cow(Vec3::new(-0.5, 64.0, 0.5));
         follower.goal = GoalState::FollowTarget {
             target: east_id,
             speed: 0.25,
         };
-        assert!(
-            regions
-                .spawn_authoritative(spawn_phase, west, follower)
-                .is_ok()
-        );
+        assert!(regions.spawn(spawn_phase, west, follower).is_ok());
         let mut boat = cow(Vec3::new(-1.5, 64.0, 0.5));
         boat.vehicle = Some(VehicleState {
             kind: VehicleKind::Boat,
             passenger: Some(east_id),
         });
         assert_eq!(
-            regions.spawn_authoritative(spawn_phase, west, boat),
+            regions.spawn(spawn_phase, west, boat),
             Err(RegionEntityStoreError::CrossRegionReference)
         );
         assert_eq!(
-            regions.spawn_authoritative(spawn_phase, west, cow(Vec3::new(0.5, 64.0, 0.5)),),
+            regions.spawn(spawn_phase, west, cow(Vec3::new(0.5, 64.0, 0.5)),),
             Err(RegionEntityStoreError::WrongSpawnRegion)
         );
         assert_eq!(regions.region_len(west.key), 1);
@@ -7471,20 +7774,18 @@ mod tests {
         let mut east_cow = cow(Vec3::new(128.5, 64.0, 0.5));
         east_cow.uuid = Some(uuid);
         assert_eq!(
-            regions
-                .spawn_authoritative(phase, east, east_cow)
-                .expect("east cow"),
+            regions.spawn(phase, east, east_cow).expect("east cow"),
             EntityId(1)
         );
         let mut duplicate = cow(Vec3::new(-0.5, 64.0, 0.5));
         duplicate.uuid = Some(uuid);
         assert_eq!(
-            regions.spawn_authoritative(phase, west, duplicate),
+            regions.spawn(phase, west, duplicate),
             Err(RegionEntityStoreError::DuplicateUuid)
         );
         assert_eq!(
             regions
-                .spawn_authoritative(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
+                .spawn(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
                 .expect("next valid cow"),
             EntityId(2)
         );
@@ -7505,7 +7806,7 @@ mod tests {
             .expect("east region");
         let spawn_phase = regions.begin_phase().expect("spawn phase");
         let id = regions
-            .spawn_authoritative(spawn_phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(spawn_phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         let uuid = regions.snapshot(id).expect("source cow").uuid;
         regions
@@ -7630,7 +7931,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let id = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         let transfer = regions
             .prepare_transfer(
@@ -7687,7 +7988,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let id = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         regions
             .prepare_transfer(
@@ -7721,7 +8022,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let id = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         regions.acknowledge_lane(phase, 0).expect("west complete");
         assert_eq!(
@@ -7750,7 +8051,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let target = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.0, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.0, 64.0, 0.5)))
             .expect("target cow");
         let mut follower = cow(Vec3::new(126.0, 64.0, 0.5));
         follower.goal = GoalState::FollowTarget {
@@ -7758,7 +8059,7 @@ mod tests {
             speed: 0.25,
         };
         let follower = regions
-            .spawn_authoritative(phase, west, follower)
+            .spawn(phase, west, follower)
             .expect("source follower");
         let transfer = regions
             .prepare_transfer(
@@ -7798,7 +8099,7 @@ mod tests {
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
         let ids = regions
-            .spawn_authoritative_batch(
+            .spawn_batch(
                 phase,
                 [
                     boat,
@@ -7827,11 +8128,7 @@ mod tests {
         );
         let mut new_follower = cow(Vec3::new(126.0, 64.0, 0.5));
         new_follower.goal = follow_passenger.clone();
-        assert!(
-            regions
-                .spawn_authoritative(phase, west, new_follower)
-                .is_ok()
-        );
+        assert!(regions.spawn(phase, west, new_follower).is_ok());
         let mut second_boat = SpawnEntity::vehicle(
             VehicleKind::Boat,
             0,
@@ -7844,7 +8141,7 @@ mod tests {
             .expect("second boat state")
             .passenger = Some(ids[1]);
         assert_eq!(
-            regions.spawn_authoritative(phase, west, second_boat),
+            regions.spawn(phase, west, second_boat),
             Err(RegionEntityStoreError::TransferConflict)
         );
         assert_eq!(
@@ -7884,10 +8181,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let local = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(10.0, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(10.0, 64.0, 0.5)))
             .expect("local cow");
         let crossing = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
 
         assert_eq!(
@@ -7936,14 +8233,10 @@ mod tests {
         let phase = regions.begin_phase().expect("phase");
         let mut east_cow = cow(Vec3::new(128.5, 64.0, 0.5));
         east_cow.animal = Some(AnimalBreedingState::baby());
-        let east_id = regions
-            .spawn_authoritative(phase, east, east_cow)
-            .expect("east cow");
+        let east_id = regions.spawn(phase, east, east_cow).expect("east cow");
         let mut west_sheep = SpawnEntity::new(5, "minecraft:sheep", Vec3::new(-0.5, 64.0, 0.5));
         west_sheep.animal = Some(AnimalBreedingState::adult_sheep(SheepColor::White));
-        let west_id = regions
-            .spawn_authoritative(phase, west, west_sheep)
-            .expect("west sheep");
+        let west_id = regions.spawn(phase, west, west_sheep).expect("west sheep");
         let east_uuid = regions.snapshot(east_id).expect("east snapshot").uuid;
 
         assert_eq!(regions.len(), 2);
@@ -8008,7 +8301,7 @@ mod tests {
         );
         assert!(
             regions
-                .damage(phase, east_id, 1.0)
+                .damage(phase, east_id, damage_request(1.0))
                 .expect("damage")
                 .is_some()
         );
@@ -8025,7 +8318,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let ids = regions
-            .spawn_authoritative_batch(
+            .spawn_batch(
                 phase,
                 [
                     cow(Vec3::new(128.5, 64.0, 0.5)),
@@ -8043,13 +8336,13 @@ mod tests {
         let mut second = cow(Vec3::new(-1.5, 64.0, 0.5));
         second.uuid = Some(duplicate_uuid);
         assert_eq!(
-            regions.spawn_authoritative_batch(phase, [first, second]),
+            regions.spawn_batch(phase, [first, second]),
             Err(RegionEntityStoreError::DuplicateUuid)
         );
         assert_eq!(regions.len(), 2);
         assert_eq!(
             regions
-                .spawn_authoritative_batch(phase, [cow(Vec3::new(130.5, 64.0, 0.5))])
+                .spawn_batch(phase, [cow(Vec3::new(130.5, 64.0, 0.5))])
                 .expect("id after rejected batch"),
             vec![EntityId(3)]
         );
@@ -8066,10 +8359,10 @@ mod tests {
             .expect("source east");
         let source_phase = source.begin_phase().expect("source phase");
         let east_id = source
-            .spawn_authoritative(source_phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(source_phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let west_id = source
-            .spawn_authoritative(source_phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
+            .spawn(source_phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
             .expect("west cow");
         let mut boat = SpawnEntity::vehicle(
             VehicleKind::Boat,
@@ -8078,9 +8371,7 @@ mod tests {
             Vec3::new(-1.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(west_id);
-        source
-            .spawn_authoritative(source_phase, west, boat)
-            .expect("west boat");
+        source.spawn(source_phase, west, boat).expect("west boat");
         let snapshots = source.snapshots().collect::<Vec<_>>();
 
         let mut restored = RegionalEntityStore::new();
@@ -8091,10 +8382,7 @@ mod tests {
             .assign_region(RegionKey::new(1, 0), 0)
             .expect("restore east");
         let phase = restored.begin_phase().expect("restore phase");
-        assert_eq!(
-            restored.insert_authoritative_snapshots(phase, snapshots.clone()),
-            Ok(3)
-        );
+        assert_eq!(restored.insert_snapshots(phase, snapshots.clone()), Ok(3));
         assert_eq!(restored.snapshots().collect::<Vec<_>>(), snapshots);
 
         let mut invalid = snapshots.clone();
@@ -8111,7 +8399,7 @@ mod tests {
             .expect("rejected east");
         let rejected_phase = rejected.begin_phase().expect("rejected phase");
         assert_eq!(
-            rejected.insert_authoritative_snapshots(rejected_phase, invalid),
+            rejected.insert_snapshots(rejected_phase, invalid),
             Err(RegionEntityStoreError::CrossRegionReference)
         );
         assert!(rejected.is_empty());
@@ -8131,7 +8419,7 @@ mod tests {
             .expect("graph east");
         let graph_phase = graph_rejected.begin_phase().expect("graph phase");
         assert_eq!(
-            graph_rejected.insert_authoritative_snapshots(graph_phase, duplicate_vehicle),
+            graph_rejected.insert_snapshots(graph_phase, duplicate_vehicle),
             Err(RegionEntityStoreError::TargetConflict)
         );
         assert!(graph_rejected.is_empty());
@@ -8149,7 +8437,7 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("phase");
         let target = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("target cow");
         regions
             .prepare_transfer(
@@ -8168,7 +8456,7 @@ mod tests {
         );
         follower.vehicle.as_mut().expect("boat state").passenger = Some(target);
         assert_eq!(
-            regions.spawn_authoritative_batch(phase, [follower]),
+            regions.spawn_batch(phase, [follower]),
             Err(RegionEntityStoreError::TransferConflict)
         );
         assert_eq!(regions.len(), 1);
@@ -8190,17 +8478,13 @@ mod tests {
             target: Vec3::new(-2.5, 64.0, 0.5),
             speed: 0.25,
         };
-        let west_id = regions
-            .spawn_authoritative(phase, west, west_cow)
-            .expect("west cow");
+        let west_id = regions.spawn(phase, west, west_cow).expect("west cow");
         let mut east_cow = cow(Vec3::new(128.5, 64.0, 0.5));
         east_cow.goal = GoalState::FollowPosition {
             target: Vec3::new(130.5, 64.0, 0.5),
             speed: 0.25,
         };
-        let east_id = regions
-            .spawn_authoritative(phase, east, east_cow)
-            .expect("east cow");
+        let east_id = regions.spawn(phase, east, east_cow).expect("east cow");
 
         let prepared = regions
             .prepare_goal_tick_with_pathing_for_ids(phase, 17, &HashSet::from([west_id, east_id]))
@@ -8234,10 +8518,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("goal phase");
         let west_id = regions
-            .spawn_authoritative(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
+            .spawn(phase, west, cow(Vec3::new(-0.5, 64.0, 0.5)))
             .expect("west cow");
         let east_id = regions
-            .spawn_authoritative(phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
 
         let prepared = regions
@@ -8267,12 +8551,8 @@ mod tests {
             speed: 0.25,
             period_ticks: 1,
         };
-        let west_id = regions
-            .spawn_authoritative(phase, west, west_cow)
-            .expect("west cow");
-        let east_id = regions
-            .spawn_authoritative(phase, east, east_cow)
-            .expect("east cow");
+        let west_id = regions.spawn(phase, west, west_cow).expect("west cow");
+        let east_id = regions.spawn(phase, east, east_cow).expect("east cow");
         let prepared = regions
             .prepare_goal_tick_with_pathing_for_ids(phase, 31, &HashSet::from([west_id, east_id]))
             .expect("prepare regional goals");
@@ -8317,7 +8597,7 @@ mod tests {
             speed: 0.25,
             period_ticks: 1,
         };
-        let ids = authority.spawn_authoritative_batch([west, east]);
+        let ids = authority.spawn_batch([west, east]);
         let resolved = authority
             .prepare_goal_tick_with_pathing_for_ids(32, &ids.into_iter().collect())
             .resolve(&WalkablePathing, PathingBudget::DEFAULT);
@@ -8352,7 +8632,7 @@ mod tests {
     #[test]
     fn regional_local_kinematics_apply_runs_independent_regions_concurrently() {
         let mut authority = RegionalEntityAuthority::default();
-        let ids = authority.spawn_authoritative_batch([
+        let ids = authority.spawn_batch([
             cow(Vec3::new(-0.5, 64.0, 0.5)),
             cow(Vec3::new(128.5, 64.0, 0.5)),
         ]);
@@ -8390,7 +8670,7 @@ mod tests {
     #[test]
     fn production_kinematics_parallelism_skips_small_batches() {
         let mut authority = RegionalEntityAuthority::default();
-        let ids = authority.spawn_authoritative_batch([
+        let ids = authority.spawn_batch([
             cow(Vec3::new(-0.5, 64.0, 0.5)),
             cow(Vec3::new(128.5, 64.0, 0.5)),
         ]);
@@ -8412,7 +8692,7 @@ mod tests {
             }
         });
         let mut authority = RegionalEntityAuthority::default();
-        let ids = authority.spawn_authoritative_batch(entities);
+        let ids = authority.spawn_batch(entities);
         let states = ids
             .into_iter()
             .enumerate()
@@ -8443,9 +8723,7 @@ mod tests {
             target: Vec3::new(2.5, 64.0, 0.5),
             speed: 0.25,
         };
-        let id = regions
-            .spawn_authoritative(first_phase, lease, entity)
-            .expect("cow");
+        let id = regions.spawn(first_phase, lease, entity).expect("cow");
         let prepared = regions
             .prepare_goal_tick_with_pathing_for_ids(first_phase, 18, &HashSet::from([id]))
             .expect("prepare goals");
@@ -8476,7 +8754,7 @@ mod tests {
             .expect("region");
         let phase = regions.begin_phase().expect("phase");
         let id = regions
-            .spawn_authoritative(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         regions
             .acknowledge_lane(phase, 0)
@@ -8502,9 +8780,7 @@ mod tests {
             target: Vec3::new(2.5, 64.0, 0.5),
             speed: 0.25,
         };
-        let id = regions
-            .spawn_authoritative(phase, lease, entity)
-            .expect("cow");
+        let id = regions.spawn(phase, lease, entity).expect("cow");
         let resolved = regions
             .prepare_goal_tick_with_pathing_for_ids(phase, 20, &HashSet::from([id]))
             .expect("prepare goals")
@@ -8538,7 +8814,7 @@ mod tests {
             speed: 0.25,
         };
         let source_id = source
-            .spawn_authoritative(source_phase, source_lease, source_entity)
+            .spawn(source_phase, source_lease, source_entity)
             .expect("source cow");
         let resolved = source
             .prepare_goal_tick_with_pathing_for_ids(source_phase, 21, &HashSet::from([source_id]))
@@ -8556,7 +8832,7 @@ mod tests {
             speed: 0.25,
         };
         let target_id = target
-            .spawn_authoritative(target_phase, target_lease, target_entity)
+            .spawn(target_phase, target_lease, target_entity)
             .expect("target cow");
         assert_eq!(source_id, target_id);
 
@@ -8574,139 +8850,9 @@ mod tests {
     }
 
     #[test]
-    fn regional_shadow_stats_count_one_logical_comparison() {
-        let mut regions = RegionalEntityStore::new();
-        regions
-            .assign_region(RegionKey::new(-1, 0), 0)
-            .expect("west region");
-        regions
-            .assign_region(RegionKey::new(1, 0), 1)
-            .expect("east region");
-        spawn_shadowed_legacy(
-            &mut regions,
-            RegionKey::new(-1, 0),
-            cow(Vec3::new(-0.5, 64.0, 0.5)),
-        );
-        spawn_shadowed_legacy(
-            &mut regions,
-            RegionKey::new(1, 0),
-            cow(Vec3::new(128.5, 64.0, 0.5)),
-        );
-
-        let comparison = regions
-            .compare_shadow(30, ShadowStage::InputAi)
-            .expect("regional shadows match");
-
-        assert_eq!(comparison.compared_entities, 2);
-        assert_eq!(comparison.compared_events, 2);
-        assert_eq!(regions.shadow_comparison_stats().comparisons, 1);
-        assert_eq!(regions.shadow_comparison_stats().compared_entities, 2);
-        assert_eq!(regions.shadow_comparison_stats().compared_events, 2);
-        assert!(regions.shadow_comparison_stats().first_divergence.is_none());
-    }
-
-    #[test]
-    fn regional_shadow_comparison_preserves_first_divergence_across_calls() {
-        let mut regions = RegionalEntityStore::new();
-        let west_key = RegionKey::new(-1, 0);
-        let east_key = RegionKey::new(1, 0);
-        regions.assign_region(west_key, 0).expect("west region");
-        regions.assign_region(east_key, 1).expect("east region");
-        let west_id =
-            spawn_shadowed_legacy(&mut regions, west_key, cow(Vec3::new(-0.5, 64.0, 0.5)));
-        let east_id =
-            spawn_shadowed_legacy(&mut regions, east_key, cow(Vec3::new(128.5, 64.0, 0.5)));
-        regions
-            .stores
-            .get_mut(&east_key)
-            .expect("east store")
-            .perturb_shadow_position(east_id, Vec3::new(140.0, 70.0, 1.0));
-
-        let first = regions
-            .compare_shadow(31, ShadowStage::PhysicsApply)
-            .expect_err("east shadow diverges first");
-        assert_eq!(first.entity_id, Some(east_id));
-
-        regions
-            .stores
-            .get_mut(&west_key)
-            .expect("west store")
-            .perturb_shadow_position(west_id, Vec3::new(-8.0, 70.0, 1.0));
-        let second = regions
-            .compare_shadow(32, ShadowStage::PhysicsApply)
-            .expect_err("both region shadows now diverge");
-
-        assert_eq!(second.entity_id, Some(west_id));
-        assert_eq!(
-            regions
-                .shadow_comparison_stats()
-                .first_divergence
-                .as_ref()
-                .and_then(|first| first.entity_id),
-            Some(east_id)
-        );
-        assert_eq!(regions.shadow_comparison_stats().comparisons, 2);
-        assert_eq!(regions.shadow_comparison_stats().compared_entities, 4);
-        assert_eq!(regions.shadow_comparison_stats().compared_events, 4);
-    }
-
-    #[test]
-    fn regional_shadow_comparison_reports_current_coverage_after_child_counter_saturation() {
-        let mut regions = RegionalEntityStore::new();
-        let key = RegionKey::new(0, 0);
-        regions.assign_region(key, 0).expect("region");
-        spawn_shadowed_legacy(&mut regions, key, cow(Vec3::new(0.5, 64.0, 0.5)));
-        let store = regions.stores.get_mut(&key).expect("region store");
-        store.shadow_stats.compared_entities = u64::MAX;
-        store.shadow_stats.compared_events = u64::MAX;
-
-        let comparison = regions
-            .compare_shadow(32, ShadowStage::InputAi)
-            .expect("regional shadow matches");
-
-        assert_eq!(comparison.compared_entities, 1);
-        assert_eq!(comparison.compared_events, 1);
-        assert_eq!(regions.shadow_comparison_stats().compared_entities, 1);
-        assert_eq!(regions.shadow_comparison_stats().compared_events, 1);
-    }
-
-    #[test]
-    fn lane_local_shadow_batches_merge_without_reopening_region_stores() {
-        let west_key = RegionKey::new(-1, 0);
-        let east_key = RegionKey::new(1, 0);
-        let mut west_store = EntityStore::shadowed_legacy();
-        let west_id = west_store.spawn(cow(Vec3::new(-0.5, 64.0, 0.5)));
-        west_store.perturb_shadow_position(west_id, Vec3::new(-8.0, 70.0, 1.0));
-        let mut east_store = EntityStore::shadowed_legacy();
-        east_store.next_id = west_id.0;
-        let east_id = east_store.spawn(cow(Vec3::new(128.5, 64.0, 0.5)));
-        east_store.perturb_shadow_position(east_id, Vec3::new(140.0, 70.0, 1.0));
-
-        let mut west_batch = RegionalShadowComparisonBatch::new(33, ShadowStage::PhysicsApply);
-        west_batch
-            .compare_region(west_key, &mut west_store)
-            .expect("west report");
-        let mut east_batch = RegionalShadowComparisonBatch::new(33, ShadowStage::PhysicsApply);
-        east_batch
-            .compare_region(east_key, &mut east_store)
-            .expect("east report");
-        east_batch.merge(west_batch).expect("merge lane reports");
-
-        let mut coordinator = RegionalEntityStore::new();
-        let divergence = coordinator
-            .record_shadow_comparison(east_batch.finish())
-            .expect_err("both lane reports diverge");
-
-        assert_eq!(divergence.entity_id, Some(west_id));
-        assert_eq!(coordinator.shadow_comparison_stats().comparisons, 1);
-        assert_eq!(coordinator.shadow_comparison_stats().compared_entities, 2);
-        assert_eq!(coordinator.shadow_comparison_stats().compared_events, 4);
-    }
-
-    #[test]
     fn production_authority_rejects_non_finite_kinematics_without_panicking() {
         let mut authority = RegionalEntityAuthority::default();
-        let id = authority.spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)));
+        let id = authority.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
         let before = authority
             .snapshot(id)
             .expect("entity before invalid motion");
@@ -8729,7 +8875,7 @@ mod tests {
         west.animal = Some(ready);
         let mut east = cow(Vec3::new(128.5, 64.0, 0.5));
         east.animal = Some(ready);
-        let ids = authority.spawn_authoritative_batch([west, east]);
+        let ids = authority.spawn_batch([west, east]);
         let expected = ids
             .iter()
             .map(|id| authority.snapshot(*id).expect("parent snapshot"))
@@ -8756,6 +8902,80 @@ mod tests {
     }
 
     #[test]
+    fn conditional_snapshot_batch_rejects_stale_member_without_partial_mutation() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let authority = runtime.handle();
+        let ids = authority
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+            ])
+            .expect("entities");
+        let expected = ids
+            .iter()
+            .map(|id| {
+                authority
+                    .snapshot(*id)
+                    .expect("snapshot request")
+                    .expect("entity snapshot")
+            })
+            .collect::<Vec<_>>();
+        authority
+            .set_velocities([(ids[1], Vec3::new(0.25, 0.0, 0.0))])
+            .expect("stale second snapshot");
+        let actual_after_stale = ids
+            .iter()
+            .map(|id| {
+                authority
+                    .snapshot(*id)
+                    .expect("snapshot request")
+                    .expect("current snapshot")
+            })
+            .collect::<Vec<_>>();
+        let mut stale_next = expected.clone();
+        stale_next[0].health -= 1.0;
+        stale_next[1].health -= 1.0;
+
+        assert_eq!(
+            authority.replace_snapshots_if_current(expected.into_iter().zip(stale_next)),
+            Ok(false)
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|id| {
+                    authority
+                        .snapshot(*id)
+                        .expect("snapshot request")
+                        .expect("unchanged snapshot")
+                })
+                .collect::<Vec<_>>(),
+            actual_after_stale
+        );
+
+        let current = actual_after_stale;
+        let mut next = current.clone();
+        next[0].health -= 1.0;
+        next[1].health -= 1.0;
+        assert_eq!(
+            authority.replace_snapshots_if_current(current.into_iter().zip(next.clone())),
+            Ok(true)
+        );
+        assert_eq!(
+            ids.iter()
+                .map(|id| {
+                    authority
+                        .snapshot(*id)
+                        .expect("snapshot request")
+                        .expect("committed snapshot")
+                })
+                .collect::<Vec<_>>(),
+            next
+        );
+        runtime.shutdown().expect("clean owner shutdown");
+    }
+
+    #[test]
     fn owner_coordinator_moves_physical_stores_to_lanes_and_round_trips_them() {
         let mut regions = RegionalEntityStore::new();
         let west_lease = regions
@@ -8766,10 +8986,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         let west = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -8825,10 +9045,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         let west = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -8855,13 +9075,13 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         let west = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let west_second = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(1.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(1.5, 64.0, 0.5)))
             .expect("second west cow");
         regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -8909,10 +9129,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -8923,7 +9143,7 @@ mod tests {
         }
 
         let spawned = coordinator
-            .spawn_authoritative_batch([
+            .spawn_batch([
                 cow(Vec3::new(1.5, 64.0, 0.5)),
                 cow(Vec3::new(2.5, 64.0, 0.5)),
             ])
@@ -8942,7 +9162,7 @@ mod tests {
             .expect("region");
         let phase = regions.begin_phase().expect("spawn phase");
         let entity = regions
-            .spawn_authoritative(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -8956,7 +9176,6 @@ mod tests {
             Box::new(TestDecisionJournal(Arc::clone(&journal))),
         )
         .expect("owner coordinator");
-
         assert_eq!(
             coordinator.set_velocities([(entity, Vec3::new(0.25, 0.0, 0.0))]),
             Err(super::RegionOwnerLaneError::Journal)
@@ -8981,7 +9200,7 @@ mod tests {
             .expect("region");
         let phase = regions.begin_phase().expect("spawn phase");
         let entity = regions
-            .spawn_authoritative(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -9001,16 +9220,20 @@ mod tests {
             Err(super::RegionOwnerLaneError::Journal)
         );
         assert_eq!(
-            coordinator
-                .snapshot(entity)
-                .expect("entity read")
-                .expect("entity snapshot")
-                .velocity,
-            Vec3::new(0.25, 0.0, 0.0)
+            coordinator.snapshot(entity),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
         );
         assert_eq!(
             coordinator.set_velocities([(entity, Vec3::new(0.5, 0.0, 0.0))]),
-            Err(super::RegionOwnerLaneError::Busy)
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            coordinator.snapshots(),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            coordinator.save_barrier(),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
         );
         assert_eq!(journal.lock().expect("journal state").commits.len(), 1);
     }
@@ -9025,10 +9248,10 @@ mod tests {
         )
         .expect("owner coordinator");
         let west = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = coordinator
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
 
         coordinator
@@ -9077,10 +9300,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         let west = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -9135,10 +9358,10 @@ mod tests {
             .expect("east region");
         let phase = regions.begin_phase().expect("spawn phase");
         let west = regions
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = regions
-            .spawn_authoritative(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, east_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         regions.acknowledge_lane(phase, 0).expect("spawn lane");
         regions.finish_phase(phase).expect("spawn phase complete");
@@ -9174,10 +9397,10 @@ mod tests {
         assert_eq!(coordinator.lane_count(), 2);
 
         let west = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = coordinator
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
 
         assert_eq!(west, EntityId(1));
@@ -9232,7 +9455,7 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("empty owner coordinator");
         let entity = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("spawn cow");
 
         let removed = coordinator
@@ -9264,8 +9487,8 @@ mod tests {
         west.animal = Some(ready);
         let mut east = cow(Vec3::new(128.5, 64.0, 0.5));
         east.animal = Some(ready);
-        let west = coordinator.spawn_authoritative(west).expect("west cow");
-        let east = coordinator.spawn_authoritative(east).expect("east cow");
+        let west = coordinator.spawn(west).expect("west cow");
+        let east = coordinator.spawn(east).expect("east cow");
         let expected_west = coordinator
             .snapshot(west)
             .expect("west read")
@@ -9344,10 +9567,10 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("empty owner coordinator");
         let west = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = coordinator
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let expected_west = coordinator
             .snapshot(west)
@@ -9421,12 +9644,50 @@ mod tests {
     }
 
     #[test]
+    fn owner_coordinator_rejects_kinematics_batch_when_one_input_is_missing() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
+                .expect("empty owner coordinator");
+        let entity = coordinator
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .expect("existing cow");
+        let expected = coordinator
+            .snapshot(entity)
+            .expect("cow read")
+            .expect("cow snapshot");
+        let missing_id = EntityId(entity.0 + 1_000);
+        let mut missing = expected.clone();
+        missing.id = missing_id;
+        missing.position = Vec3::new(128.5, 64.0, 0.5);
+
+        assert!(
+            !coordinator
+                .apply_kinematics_if_current([
+                    (
+                        expected.clone(),
+                        movement(entity, Vec3::new(1.5, 64.0, 0.5)),
+                    ),
+                    (missing, movement(missing_id, Vec3::new(129.5, 64.0, 0.5)),),
+                ])
+                .expect("missing input is a rejected compare")
+        );
+        assert_eq!(
+            coordinator
+                .snapshot(entity)
+                .expect("cow read")
+                .expect("cow remains")
+                .position,
+            expected.position
+        );
+    }
+
+    #[test]
     fn owner_coordinator_moves_standalone_entity_across_region_owners() {
         let mut coordinator =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("empty owner coordinator");
         let entity = coordinator
-            .spawn_authoritative(cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         let expected = coordinator
             .snapshot(entity)
@@ -9500,7 +9761,7 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("empty owner coordinator");
         let entity = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         let expected = coordinator
             .snapshot(entity)
@@ -9508,14 +9769,14 @@ mod tests {
             .expect("cow snapshot");
 
         let damaged = coordinator
-            .damage_if_current(expected.clone(), 5.0)
+            .damage_if_current(expected.clone(), damage_request(5.0))
             .expect("damage")
             .expect("accepted damage");
         assert_eq!(damaged.snapshot.health, 15.0);
         assert!(!damaged.killed);
         assert!(
             coordinator
-                .damage_if_current(expected, 5.0)
+                .damage_if_current(expected, damage_request(5.0))
                 .expect("stale damage")
                 .is_none()
         );
@@ -9533,7 +9794,7 @@ mod tests {
             .expect("cow read")
             .expect("current cow snapshot");
         let killed = coordinator
-            .damage_if_current(current, 20.0)
+            .damage_if_current(current, damage_request(20.0))
             .expect("lethal damage")
             .expect("accepted lethal damage");
         assert!(killed.killed);
@@ -9556,8 +9817,8 @@ mod tests {
         };
         let mut east = cow(Vec3::new(128.5, 64.0, 0.5));
         east.goal = west.goal.clone();
-        let west = coordinator.spawn_authoritative(west).expect("west cow");
-        let east = coordinator.spawn_authoritative(east).expect("east cow");
+        let west = coordinator.spawn(west).expect("west cow");
+        let east = coordinator.spawn(east).expect("east cow");
         let active = HashSet::from([west, east]);
         let prepared = coordinator
             .prepare_goal_tick_with_pathing_for_ids(23, &active)
@@ -9624,8 +9885,8 @@ mod tests {
         };
         let mut east = cow(Vec3::new(128.5, 64.0, 0.5));
         east.goal = west.goal.clone();
-        let west = coordinator.spawn_authoritative(west).expect("west cow");
-        let east = coordinator.spawn_authoritative(east).expect("east cow");
+        let west = coordinator.spawn(west).expect("west cow");
+        let east = coordinator.spawn(east).expect("east cow");
         let active = HashSet::from([east, west]);
         let resolved = coordinator
             .prepare_goal_tick_with_pathing_for_ids(23, &active)
@@ -9701,13 +9962,13 @@ mod tests {
             .expect("unrelated region");
         let phase = regions.begin_phase().expect("spawn phase");
         let follower = regions
-            .spawn_authoritative(phase, follower_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(phase, follower_lease, cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("follower");
         let target = regions
-            .spawn_authoritative(phase, target_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(phase, target_lease, cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("target");
         regions
-            .spawn_authoritative(phase, unrelated_lease, cow(Vec3::new(256.5, 64.0, 0.5)))
+            .spawn(phase, unrelated_lease, cow(Vec3::new(256.5, 64.0, 0.5)))
             .expect("unrelated cow");
         regions.acknowledge_lane(phase, 0).expect("follower lane");
         regions.acknowledge_lane(phase, 1).expect("target lane");
@@ -9755,7 +10016,7 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
                 .expect("owner coordinator");
         let follower = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("follower");
         assert!(
             coordinator
@@ -9801,13 +10062,13 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
                 .expect("empty owner coordinator");
         let target = coordinator
-            .spawn_authoritative(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
             .expect("target");
         let follower = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("follower");
         coordinator
-            .spawn_authoritative(cow(Vec3::new(3.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(3.5, 64.0, 0.5)))
             .expect("unrelated cow");
         assert!(
             coordinator
@@ -9831,7 +10092,7 @@ mod tests {
         replacement.position = Vec3::new(2.5, 64.0, 0.5);
         assert_eq!(
             coordinator
-                .insert_authoritative_snapshots_batch([replacement])
+                .insert_snapshots_batch([replacement])
                 .expect("restore replacement"),
             1
         );
@@ -9855,10 +10116,10 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("empty owner coordinator");
         let west = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = coordinator
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         coordinator
             .set_velocities([
@@ -9901,9 +10162,7 @@ mod tests {
         let handle = runtime.handle();
         let mut spawn = cow(Vec3::new(0.5, 64.0, 0.5));
         spawn.animal = Some(AnimalBreedingState::adult());
-        let entity = handle
-            .spawn_authoritative(spawn)
-            .expect("durable cow spawn");
+        let entity = handle.spawn(spawn).expect("durable cow spawn");
         let initial = handle.save_barrier().expect("initial save barrier");
         handle
             .clear_recovered_commits(initial.journal_phases().iter().copied())
@@ -9991,7 +10250,7 @@ mod tests {
             .expect("source region");
         let phase = source.begin_phase().expect("source phase");
         let passenger = source
-            .spawn_authoritative(phase, west_lease, cow(Vec3::new(1.5, 64.0, 0.5)))
+            .spawn(phase, west_lease, cow(Vec3::new(1.5, 64.0, 0.5)))
             .expect("passenger");
         let mut boat = SpawnEntity::vehicle(
             VehicleKind::Boat,
@@ -10000,18 +10259,13 @@ mod tests {
             Vec3::new(0.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(passenger);
-        source
-            .spawn_authoritative(phase, west_lease, boat)
-            .expect("boat");
+        source.spawn(phase, west_lease, boat).expect("boat");
         let snapshots = source.snapshots().collect::<Vec<_>>();
 
         let mut restored =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("restore coordinator");
-        assert_eq!(
-            restored.insert_authoritative_snapshots_batch(snapshots.clone()),
-            Ok(2)
-        );
+        assert_eq!(restored.insert_snapshots_batch(snapshots.clone()), Ok(2));
         assert_eq!(
             restored
                 .save_barrier()
@@ -10030,7 +10284,7 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("reject coordinator");
         assert_eq!(
-            rejected.insert_authoritative_snapshots_batch(invalid),
+            rejected.insert_snapshots_batch(invalid),
             Err(super::RegionOwnerLaneError::InvalidMutation)
         );
         assert!(
@@ -10043,6 +10297,62 @@ mod tests {
     }
 
     #[test]
+    fn full_snapshot_cas_updates_vehicle_indexes_and_rejects_invalid_graphs() {
+        let mut coordinator =
+            super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
+                .expect("owner coordinator");
+        let passenger = coordinator
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .expect("passenger");
+        let boat = SpawnEntity::vehicle(
+            VehicleKind::Boat,
+            8,
+            "minecraft:oak_boat",
+            Vec3::new(0.5, 64.0, 0.5),
+        );
+        let boat = coordinator.spawn(boat).expect("boat");
+        let detached = coordinator.snapshot(boat).unwrap().unwrap();
+        let mut attached = detached.clone();
+        attached.vehicle.as_mut().unwrap().passenger = Some(passenger);
+        assert!(
+            coordinator
+                .replace_snapshot_if_current(detached.clone(), attached.clone())
+                .unwrap()
+        );
+        assert_eq!(coordinator.vehicle_passengers.get(&boat), Some(&passenger));
+        assert_eq!(coordinator.passenger_vehicles.get(&passenger), Some(&boat));
+
+        let mut reattached = attached.clone();
+        reattached.vehicle.as_mut().unwrap().passenger = None;
+        assert!(
+            coordinator
+                .replace_snapshot_if_current(attached.clone(), reattached.clone())
+                .unwrap()
+        );
+        assert!(!coordinator.vehicle_passengers.contains_key(&boat));
+        assert!(!coordinator.passenger_vehicles.contains_key(&passenger));
+
+        let stale_expected = attached;
+        let mut stale_reattach = reattached.clone();
+        stale_reattach.vehicle.as_mut().unwrap().passenger = Some(passenger);
+        assert!(
+            !coordinator
+                .replace_snapshot_if_current(stale_expected, stale_reattach)
+                .unwrap()
+        );
+        assert!(!coordinator.vehicle_passengers.contains_key(&boat));
+
+        let mut dangling = reattached.clone();
+        dangling.vehicle.as_mut().unwrap().passenger = Some(EntityId(i32::MAX));
+        assert_eq!(
+            coordinator.replace_snapshot_if_current(reattached, dangling),
+            Err(super::RegionOwnerLaneError::InvalidMutation)
+        );
+        assert!(!coordinator.vehicle_passengers.contains_key(&boat));
+        assert!(!coordinator.passenger_vehicles.contains_key(&passenger));
+    }
+
+    #[test]
     fn owner_coordinator_moves_vehicle_group_across_lanes_with_leader_delta() {
         let mut source = RegionalEntityStore::new();
         let source_lease = source
@@ -10050,7 +10360,7 @@ mod tests {
             .expect("source region");
         let phase = source.begin_phase().expect("source phase");
         let passenger = source
-            .spawn_authoritative(phase, source_lease, cow(Vec3::new(127.0, 64.0, 0.5)))
+            .spawn(phase, source_lease, cow(Vec3::new(127.0, 64.0, 0.5)))
             .expect("passenger");
         let mut boat = SpawnEntity::vehicle(
             VehicleKind::Boat,
@@ -10059,15 +10369,13 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(passenger);
-        let boat = source
-            .spawn_authoritative(phase, source_lease, boat)
-            .expect("boat");
+        let boat = source.spawn(phase, source_lease, boat).expect("boat");
         let snapshots = source.snapshots().collect::<Vec<_>>();
         let mut coordinator =
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 2)
                 .expect("owner coordinator");
         coordinator
-            .insert_authoritative_snapshots_batch(snapshots)
+            .insert_snapshots_batch(snapshots)
             .expect("restore vehicle group");
         let expected_boat = coordinator
             .snapshot(boat)
@@ -10111,10 +10419,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let west = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         handle
             .set_velocities([
@@ -10160,7 +10468,7 @@ mod tests {
         .expect("owner runtime");
         let handle = runtime.handle();
         let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("durable cow spawn");
         let phases = handle
             .save_barrier()
@@ -10208,10 +10516,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let west = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let selected = HashSet::from([west, east]);
         assert_eq!(
@@ -10261,9 +10569,7 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         assert_eq!(
             handle
                 .snapshot(entity)
@@ -10310,7 +10616,7 @@ mod tests {
         let handle = runtime.handle();
         let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
         item.item_stack = Some(crate::EntityItemStack::new(7, 3));
-        let entity = handle.spawn_authoritative(item).expect("item");
+        let entity = handle.spawn(item).expect("item");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10364,7 +10670,7 @@ mod tests {
         let handle = runtime.handle();
         let mut cow = cow(Vec3::new(0.5, 64.0, 0.5));
         cow.animal = Some(AnimalBreedingState::adult());
-        let entity = handle.spawn_authoritative(cow).expect("cow");
+        let entity = handle.spawn(cow).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10420,8 +10726,8 @@ mod tests {
         first.animal = Some(AnimalBreedingState::adult());
         let mut second = cow(Vec3::new(1.5, 64.0, 0.5));
         second.animal = Some(AnimalBreedingState::adult());
-        let first = handle.spawn_authoritative(first).expect("first cow");
-        let second = handle.spawn_authoritative(second).expect("second cow");
+        let first = handle.spawn(first).expect("first cow");
+        let second = handle.spawn(second).expect("second cow");
         let selected = HashSet::from([first, second]);
         let mut expected = handle
             .snapshots_for_ids(&selected)
@@ -10470,9 +10776,7 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10526,9 +10830,7 @@ mod tests {
         )
         .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10564,9 +10866,7 @@ mod tests {
         )
         .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10601,9 +10901,7 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -10664,10 +10962,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let first = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("first cow");
         let second = handle
-            .spawn_authoritative(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
             .expect("second cow");
         let selected = HashSet::from([first, second]);
         assert_eq!(
@@ -10721,10 +11019,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let target = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("target cow");
         let follower = handle
-            .spawn_authoritative(cow(Vec3::new(1.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
             .expect("follower cow");
         let selected = HashSet::from([target, follower]);
         assert_eq!(
@@ -10782,10 +11080,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let target = handle
-            .spawn_authoritative(cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("target cow");
         let follower = handle
-            .spawn_authoritative(cow(Vec3::new(126.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(126.5, 64.0, 0.5)))
             .expect("follower cow");
         let selected = HashSet::from([target, follower]);
         assert_eq!(
@@ -10887,8 +11185,8 @@ mod tests {
         let mut second = cow(Vec3::new(1.5, 64.0, 0.5));
         second.animal = Some(AnimalBreedingState::adult());
         let ids = [
-            handle.spawn_authoritative(first).expect("first cow"),
-            handle.spawn_authoritative(second).expect("second cow"),
+            handle.spawn(first).expect("first cow"),
+            handle.spawn(second).expect("second cow"),
         ];
         let mut expected = handle
             .snapshots_for_ids(&HashSet::from(ids))
@@ -10935,7 +11233,7 @@ mod tests {
         let handle = runtime.handle();
         let mut animal = cow(Vec3::new(0.5, 64.0, 0.5));
         animal.animal = Some(AnimalBreedingState::baby());
-        let id = handle.spawn_authoritative(animal).expect("baby cow");
+        let id = handle.spawn(animal).expect("baby cow");
         let expected = handle
             .snapshot(id)
             .expect("warm point route")
@@ -10982,8 +11280,8 @@ mod tests {
         let mut second = cow(Vec3::new(1.5, 64.0, 0.5));
         second.animal = Some(AnimalBreedingState::adult());
         let ids = [
-            handle.spawn_authoritative(first).expect("first cow"),
-            handle.spawn_authoritative(second).expect("second cow"),
+            handle.spawn(first).expect("first cow"),
+            handle.spawn(second).expect("second cow"),
         ];
         let selected = HashSet::from(ids);
         let states = handle
@@ -11015,13 +11313,144 @@ mod tests {
     }
 
     #[test]
+    fn cached_goal_rolls_back_exact_snapshot_on_journal_failure() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            1,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
+        assert!(
+            handle
+                .set_goal(
+                    entity,
+                    GoalState::FollowPosition {
+                        target: Vec3::new(4.5, 64.0, 0.5),
+                        speed: 0.25,
+                    },
+                )
+                .expect("set pathing goal")
+        );
+        let prepared = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, &HashSet::from([entity]))
+            .expect("prepare retained path state");
+        handle
+            .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
+            .expect("commit retained path state");
+        let before = handle
+            .snapshot(entity)
+            .expect("snapshot read")
+            .expect("cow snapshot");
+        assert_ne!(before.retained, crate::EntityRetainedState::default());
+        journal.lock().expect("journal state").fail_record = true;
+
+        assert_eq!(
+            handle.set_goal(entity, GoalState::Idle),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        assert_eq!(
+            handle
+                .snapshot(entity)
+                .expect("rolled back read")
+                .expect("rolled back cow"),
+            before,
+            "goal rollback must preserve the exact goal and retained path state"
+        );
+        journal.lock().expect("journal state").fail_record = false;
+        assert_eq!(
+            handle
+                .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+                .expect("spawn after rollback"),
+            EntityId(entity.0 + 1),
+            "goal rollback must preserve the entity ID cursor"
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn cached_goal_batch_rolls_back_exact_snapshots_on_journal_failure() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            1,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = [
+            handle
+                .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+                .expect("first cow"),
+            handle
+                .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+                .expect("second cow"),
+        ];
+        assert_eq!(
+            handle
+                .set_goals(ids.map(|entity| {
+                    (
+                        entity,
+                        GoalState::FollowPosition {
+                            target: Vec3::new(6.5, 64.0, 0.5),
+                            speed: 0.25,
+                        },
+                    )
+                }))
+                .expect("set pathing goals"),
+            2
+        );
+        let selected = HashSet::from(ids);
+        let prepared = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, &selected)
+            .expect("prepare retained path states");
+        handle
+            .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
+            .expect("commit retained path states");
+        let mut before = handle.snapshots_for_ids(&selected).expect("snapshot reads");
+        before.sort_by_key(|snapshot| snapshot.id);
+        assert!(
+            before
+                .iter()
+                .all(|snapshot| { snapshot.retained != crate::EntityRetainedState::default() })
+        );
+        journal.lock().expect("journal state").fail_record = true;
+
+        assert_eq!(
+            handle.set_goals(ids.map(|entity| (entity, GoalState::Idle))),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        let mut after = handle
+            .snapshots_for_ids(&selected)
+            .expect("rolled back reads");
+        after.sort_by_key(|snapshot| snapshot.id);
+        assert_eq!(
+            after, before,
+            "batch goal rollback must preserve exact goals and retained path states"
+        );
+        journal.lock().expect("journal state").fail_record = false;
+        assert_eq!(
+            handle
+                .spawn(cow(Vec3::new(2.5, 64.0, 0.5)))
+                .expect("spawn after rollback"),
+            EntityId(ids[1].0 + 1),
+            "batch goal rollback must preserve the entity ID cursor"
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
     fn cached_damage_cas_bypasses_the_coordinator_actor() {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -11040,7 +11469,7 @@ mod tests {
         let mutation_handle = handle.clone();
         let mutation = std::thread::spawn(move || {
             mutation_complete
-                .send(mutation_handle.damage_if_current(expected, 1.0))
+                .send(mutation_handle.damage_if_current(expected, damage_request(1.0)))
                 .expect("publish direct damage CAS");
         });
         let direct = mutation_complete_rx.recv_timeout(Duration::from_secs(1));
@@ -11068,27 +11497,84 @@ mod tests {
         )
         .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
-        let expected = handle
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
+        assert!(
+            handle
+                .set_goal(
+                    entity,
+                    GoalState::Wander {
+                        speed: 0.8,
+                        period_ticks: 80,
+                    },
+                )
+                .expect("set wander goal")
+        );
+        let prepared = handle
+            .prepare_goal_tick_with_pathing_for_ids(1, &HashSet::from([entity]))
+            .expect("prepare retained path state");
+        handle
+            .apply_prepared_goal_tick(prepared.resolve(&WalkablePathing, PathingBudget::DEFAULT))
+            .expect("commit retained path state");
+        let before_timers = handle
             .snapshot(entity)
             .expect("warm point route")
             .expect("cow snapshot");
-        let health = expected.health;
+        assert_ne!(
+            before_timers.retained,
+            crate::EntityRetainedState::default()
+        );
+        let mut expected = before_timers.clone();
+        expected.retained.last_damage_tick = Some(3);
+        expected.retained.death_remove_tick = Some(31);
+        expected.retained.sheep_grazing_ticks = Some(5);
+        let effect_id = EffectId::new(99);
+        expected.retained.active_effects = Some(EntityActiveEffectsState {
+            effects: ActiveEffectsSnapshot {
+                chains: vec![ActiveEffectChainSnapshot {
+                    current: EffectInstance::new(
+                        effect_id,
+                        EffectKind::CallerOwned,
+                        80,
+                        1,
+                        EffectFlags::default(),
+                    ),
+                    hidden: vec![EffectInstance::new(
+                        effect_id,
+                        EffectKind::CallerOwned,
+                        160,
+                        0,
+                        EffectFlags::default(),
+                    )],
+                }],
+            },
+            action_order: vec![effect_id],
+        });
+        assert!(
+            handle
+                .replace_snapshot_if_current(before_timers, expected.clone())
+                .expect("commit retained decision state")
+        );
         journal.lock().expect("journal state").fail_record = true;
 
         assert_eq!(
-            handle.damage_if_current(expected, 1.0),
+            handle.damage_if_current(expected.clone(), damage_request(1.0)),
             Err(super::RegionOwnerLaneError::Journal)
         );
         assert_eq!(
             handle
                 .snapshot(entity)
                 .expect("rolled back read")
-                .expect("rolled back cow")
-                .health,
-            health
+                .expect("rolled back cow"),
+            expected,
+            "journal rollback must restore every retained ECS component"
+        );
+        journal.lock().expect("journal state").fail_record = false;
+        assert_eq!(
+            handle
+                .spawn(cow(Vec3::new(1.5, 64.0, 0.5)))
+                .expect("spawn after rollback"),
+            EntityId(entity.0 + 1),
+            "journal rollback must preserve the entity ID cursor"
         );
 
         drop(handle);
@@ -11100,16 +11586,14 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
             .expect("cow snapshot");
 
         let damage = handle
-            .damage_if_current(expected, 100.0)
+            .damage_if_current(expected, damage_request(100.0))
             .expect("direct lethal damage")
             .expect("damage applied");
         assert!(damage.killed);
@@ -11127,9 +11611,7 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let entity = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let entity = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -11143,13 +11625,13 @@ mod tests {
             let first_barrier = Arc::clone(&barrier);
             let first = scope.spawn(move || {
                 first_barrier.wait();
-                first_handle.damage_if_current(first_expected, 1.0)
+                first_handle.damage_if_current(first_expected, damage_request(1.0))
             });
             let second_handle = handle.clone();
             let second_barrier = Arc::clone(&barrier);
             let second = scope.spawn(move || {
                 second_barrier.wait();
-                second_handle.damage_if_current(expected, 1.0)
+                second_handle.damage_if_current(expected, damage_request(1.0))
             });
             barrier.wait();
             (
@@ -11188,7 +11670,7 @@ mod tests {
         let handle = runtime.handle();
         let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
         item.item_stack = Some(crate::EntityItemStack::new(7, 3));
-        let entity = handle.spawn_authoritative(item).expect("item");
+        let entity = handle.spawn(item).expect("item");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -11234,7 +11716,7 @@ mod tests {
         let handle = runtime.handle();
         let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
         item.item_stack = Some(crate::EntityItemStack::new(7, 3));
-        let entity = handle.spawn_authoritative(item).expect("item");
+        let entity = handle.spawn(item).expect("item");
         let expected = handle
             .snapshot(entity)
             .expect("warm point route")
@@ -11259,6 +11741,49 @@ mod tests {
     }
 
     #[test]
+    fn cached_unknown_journal_outcome_blocks_point_and_batch_publication() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            1,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let mut item = SpawnEntity::new(1, "minecraft:item", Vec3::new(0.5, 64.0, 0.5));
+        item.item_stack = Some(crate::EntityItemStack::new(7, 3));
+        let entity = handle.spawn(item).expect("item");
+        let expected = handle.snapshot(entity).unwrap().unwrap();
+        journal.lock().expect("journal state").fail_record_unknown = true;
+
+        assert_eq!(
+            handle.set_item_stack_if_current(expected, Some(crate::EntityItemStack::new(7, 2)),),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        assert_eq!(
+            handle.snapshot(entity),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            handle.snapshots(),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
+        assert_eq!(
+            handle.status(),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
+
+        drop(handle);
+        let shutdown = runtime
+            .shutdown()
+            .expect_err("unknown outcome remains fail-stopped");
+        let super::RegionalOwnerRuntimeShutdownError::Owner(shutdown) = shutdown else {
+            panic!("unknown outcome must surface through controlled owner shutdown");
+        };
+        assert_eq!(shutdown.error, super::RegionOwnerLaneError::OutcomeUnknown);
+    }
+
+    #[test]
     fn direct_selected_read_admission_reserves_lane_queue_capacity() {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let mut permits = (0..super::DIRECT_SELECTED_READ_LIMIT)
@@ -11278,10 +11803,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let west = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let selected = HashSet::from([west, east]);
         assert_eq!(
@@ -11328,7 +11853,7 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let entity = handle
-            .spawn_authoritative(cow(Vec3::new(127.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(127.5, 64.0, 0.5)))
             .expect("boundary cow");
         let selected = HashSet::from([entity]);
         let expected = handle
@@ -11383,9 +11908,9 @@ mod tests {
             speed: 0.2,
             period_ticks: 20,
         };
-        let west = handle.spawn_authoritative(west).expect("west cow");
+        let west = handle.spawn(west).expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
 
         let prepared = handle
@@ -11426,7 +11951,7 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let follower = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("follower");
         assert!(
             handle
@@ -11472,9 +11997,7 @@ mod tests {
         let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
             .expect("owner runtime");
         let handle = runtime.handle();
-        let cow_id = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
-            .expect("cow");
+        let cow_id = handle.spawn(cow(Vec3::new(0.5, 64.0, 0.5))).expect("cow");
         assert!(
             handle
                 .set_goal(
@@ -11493,7 +12016,7 @@ mod tests {
         );
         assert_eq!(
             handle
-                .damage(cow_id, 5.0)
+                .damage(cow_id, damage_request(5.0))
                 .expect("damage")
                 .expect("damage result")
                 .snapshot
@@ -11503,7 +12026,7 @@ mod tests {
 
         let mut item = SpawnEntity::new(41, "minecraft:item", Vec3::new(2.5, 64.0, 0.5));
         item.item_stack = Some(crate::EntityItemStack::new(7, 1));
-        let item = handle.spawn_authoritative(item).expect("item");
+        let item = handle.spawn(item).expect("item");
         assert!(
             handle
                 .set_item_stack(item, Some(crate::EntityItemStack::new(7, 2)))
@@ -11518,7 +12041,7 @@ mod tests {
             Some(crate::EntityItemStack::new(7, 2))
         );
         let herd = handle
-            .spawn_authoritative_batch([
+            .spawn_batch([
                 cow(Vec3::new(3.5, 64.0, 0.5)),
                 cow(Vec3::new(128.5, 64.0, 0.5)),
             ])
@@ -11552,14 +12075,11 @@ mod tests {
         let mut restored_store = EntityStore::new();
         let mut restored = cow(Vec3::new(0.5, 64.0, 0.5));
         restored.uuid = Some(restored_uuid);
-        let restored_id = restored_store.spawn_authoritative(restored);
+        let restored_id = restored_store.spawn(restored);
         let restored = restored_store
             .snapshot(restored_id)
             .expect("restored snapshot");
-        assert_eq!(
-            handle.insert_authoritative_snapshots_batch([restored.clone()]),
-            Ok(1)
-        );
+        assert_eq!(handle.insert_snapshots_batch([restored.clone()]), Ok(1));
 
         let mut existing_duplicate = cow(Vec3::new(1.5, 64.0, 0.5));
         existing_duplicate.uuid = Some(restored_uuid);
@@ -11569,7 +12089,7 @@ mod tests {
         input_duplicate.uuid = Some(new_uuid);
 
         let committed = handle
-            .spawn_unique_authoritative_batch([existing_duplicate, new, input_duplicate])
+            .spawn_unique_batch([existing_duplicate, new, input_duplicate])
             .expect("unique authoritative batch");
 
         assert_eq!(committed.len(), 1);
@@ -11598,13 +12118,23 @@ mod tests {
         )
         .expect("owner runtime");
         let handle = runtime.handle();
+        handle
+            .restore_checkpoint_boundary(37, 90)
+            .expect("restore checkpoint boundary");
+        assert_eq!(
+            handle.advance_lifecycle_epoch(36),
+            Err(super::RegionOwnerLaneError::InvalidMutation)
+        );
+        handle
+            .restore_checkpoint_boundary(35, 80)
+            .expect("older checkpoint cannot regress recovered owner boundary");
         let mut west = cow(Vec3::new(0.5, 64.0, 0.5));
         west.uuid = Some(Uuid::from_u128(0x33));
         let mut east = cow(Vec3::new(128.5, 64.0, 0.5));
         east.uuid = Some(Uuid::from_u128(0x44));
 
         let committed = handle
-            .spawn_unique_authoritative_batch([west, east])
+            .spawn_unique_batch([west, east])
             .expect("unique authoritative batch");
 
         let state = journal.lock().expect("journal state");
@@ -11612,9 +12142,13 @@ mod tests {
         let decision = state.commits[0].clone();
         assert_eq!(decision.upserts(), committed.as_slice());
         assert!(decision.removed().is_empty());
+        assert_eq!(decision.lifecycle_epoch(), 37);
+        assert!(decision.sequence_watermark() > 90);
         drop(state);
         let saved = handle.save_barrier().expect("owner save barrier");
         assert_eq!(saved.snapshots(), committed.as_slice());
+        assert_eq!(saved.lifecycle_epoch(), 37);
+        assert_eq!(saved.sequence_watermark(), decision.sequence_watermark());
         assert!(saved.journal_phases().contains(&decision.phase()));
 
         drop(handle);
@@ -11633,23 +12167,42 @@ mod tests {
             Box::new(TestDecisionJournal(Arc::clone(&journal))),
         )
         .expect("owner coordinator");
+        coordinator
+            .commit_state
+            .advance_lifecycle_epoch(37)
+            .expect("advance lifecycle epoch");
         let mut uncertain = cow(Vec3::new(0.5, 64.0, 0.5));
         uncertain.uuid = Some(Uuid::from_u128(0x55));
 
         assert_eq!(
-            coordinator.spawn_unique_authoritative_batch([uncertain]),
+            coordinator.spawn_unique_batch([uncertain]),
             Err(super::RegionOwnerLaneError::Journal)
         );
         assert_eq!(coordinator.status().entity_count, 0);
+        assert_eq!(
+            coordinator.snapshots(),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
+        );
         let mut rejected = cow(Vec3::new(1.5, 64.0, 0.5));
         rejected.uuid = Some(Uuid::from_u128(0x66));
         assert_eq!(
-            coordinator.spawn_unique_authoritative_batch([rejected]),
-            Err(super::RegionOwnerLaneError::Busy)
+            coordinator.spawn_unique_batch([rejected]),
+            Err(super::RegionOwnerLaneError::OutcomeUnknown)
         );
         let state = journal.lock().expect("journal state");
         assert_eq!(state.commits.len(), 1);
         assert_eq!(state.commits[0].upserts()[0].uuid, Uuid::from_u128(0x55));
+        assert_eq!(state.commits[0].lifecycle_epoch(), 37);
+        assert_eq!(
+            coordinator
+                .commit_state
+                .journal_commits
+                .lock()
+                .expect("journal identities")
+                .get(&state.commits[0].phase())
+                .copied(),
+            Some(state.commits[0].identity())
+        );
     }
 
     #[test]
@@ -11659,10 +12212,10 @@ mod tests {
                 .expect("owner runtime");
         let handle = runtime.handle();
         let west = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         assert_eq!(west, EntityId(6_001));
         assert_eq!(east, EntityId(6_002));
@@ -11680,7 +12233,6 @@ mod tests {
         let status = handle.status().expect("owner status");
         assert_eq!(status.entity_count, 2);
         assert_eq!(status.lane_count, 2);
-        assert_eq!(status.shadow.comparisons, 0);
         assert!(
             handle
                 .contains_uuid(
@@ -11699,9 +12251,7 @@ mod tests {
             love_ticks: 0,
             sheep_wool: None,
         });
-        let breeding_cow = handle
-            .spawn_authoritative(breeding_cow)
-            .expect("breeding cow");
+        let breeding_cow = handle.spawn(breeding_cow).expect("breeding cow");
         assert_eq!(
             handle
                 .breeding_tick_snapshots()
@@ -11740,7 +12290,7 @@ mod tests {
         assert_eq!(handle.status().expect("final owner status").entity_count, 2);
 
         let item = handle
-            .spawn_authoritative({
+            .spawn({
                 let mut item = SpawnEntity::new(41, "minecraft:item", Vec3::new(2.5, 64.0, 0.5));
                 item.item_stack = Some(crate::EntityItemStack::new(7, 4));
                 item
@@ -11778,7 +12328,7 @@ mod tests {
         );
         vehicle.vehicle.as_mut().expect("vehicle state").passenger = Some(EntityId(6_006));
         let mounted = handle
-            .spawn_authoritative_batch([vehicle, cow(Vec3::new(3.75, 64.0, 0.5))])
+            .spawn_batch([vehicle, cow(Vec3::new(3.75, 64.0, 0.5))])
             .expect("mounted pair");
         let passenger = handle
             .snapshot(mounted[1])
@@ -11799,10 +12349,10 @@ mod tests {
             .expect("owner runtime");
         let handle = runtime.handle();
         let west = handle
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("west cow");
         let east = handle
-            .spawn_authoritative(cow(Vec3::new(128.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(128.5, 64.0, 0.5)))
             .expect("east cow");
         let selected = HashSet::from([west, east]);
         assert_eq!(
@@ -11878,9 +12428,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            let ids = handle
-                .spawn_authoritative_batch(entities)
-                .expect("benchmark entities");
+            let ids = handle.spawn_batch(entities).expect("benchmark entities");
             let active_ids = ids
                 .into_iter()
                 .take(active_regions * ENTITIES_PER_REGION)
@@ -12020,7 +12568,7 @@ mod tests {
                 super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), lanes)
                     .expect("direct coordinator");
             coordinator
-                .spawn_authoritative_batch(entities())
+                .spawn_batch(entities())
                 .expect("direct benchmark entities");
             let mut samples = Vec::with_capacity(ITERATIONS);
             for iteration in 0..ITERATIONS {
@@ -12040,7 +12588,7 @@ mod tests {
 
         fn raw_ecs() -> (Vec<u128>, Vec<crate::EntitySnapshot>) {
             let mut store = EntityStore::new();
-            store.spawn_authoritative_batch(entities());
+            store.spawn_batch(entities());
             let mut samples = Vec::with_capacity(ITERATIONS);
             for iteration in 0..ITERATIONS {
                 let expected = store.snapshots().collect::<Vec<_>>();
@@ -12064,7 +12612,7 @@ mod tests {
                     .expect("actor runtime");
             let handle = runtime.handle();
             handle
-                .spawn_authoritative_batch(entities())
+                .spawn_batch(entities())
                 .expect("actor benchmark entities");
             let mut samples = Vec::with_capacity(ITERATIONS);
             for iteration in 0..ITERATIONS {
@@ -12135,7 +12683,7 @@ mod tests {
                 entity
             });
             let ids = handle
-                .spawn_authoritative_batch(entities)
+                .spawn_batch(entities)
                 .expect("benchmark animals")
                 .into_iter()
                 .collect::<HashSet<_>>();
@@ -12187,9 +12735,7 @@ mod tests {
                 entity.animal = Some(AnimalBreedingState::adult());
                 entity
             });
-            let spawned = handle
-                .spawn_authoritative_batch(entities)
-                .expect("benchmark animals");
+            let spawned = handle.spawn_batch(entities).expect("benchmark animals");
             let west = spawned.iter().step_by(2).copied().collect::<HashSet<_>>();
             let east = spawned
                 .iter()
@@ -12284,7 +12830,7 @@ mod tests {
             super::RegionalOwnerCoordinator::from_store(RegionalEntityStore::new(), 1)
                 .expect("owner coordinator");
         let entity = coordinator
-            .spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)))
+            .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
             .expect("cow");
         coordinator.uuids.clear();
 
@@ -12297,46 +12843,6 @@ mod tests {
     }
 
     #[test]
-    fn owner_runtime_aggregates_one_shadow_comparison_across_lanes() {
-        let mut store = RegionalEntityStore::new();
-        store
-            .assign_region(RegionKey::new(-1, 0), 0)
-            .expect("west region");
-        store
-            .assign_region(RegionKey::new(1, 0), 1)
-            .expect("east region");
-        spawn_shadowed_legacy(
-            &mut store,
-            RegionKey::new(-1, 0),
-            cow(Vec3::new(-0.5, 64.0, 0.5)),
-        );
-        spawn_shadowed_legacy(
-            &mut store,
-            RegionKey::new(1, 0),
-            cow(Vec3::new(128.5, 64.0, 0.5)),
-        );
-        let runtime = super::RegionalOwnerRuntime::from_store(store, 2).expect("owner runtime");
-        let handle = runtime.handle();
-
-        let comparison = handle
-            .compare_shadow(9, ShadowStage::PhysicsApply)
-            .expect("owner shadow command")
-            .expect("matching owner shadows");
-        assert_eq!(comparison.compared_entities, 2);
-        let status = handle.status().expect("owner status");
-        assert_eq!(status.shadow.comparisons, 1);
-        assert_eq!(status.shadow.compared_entities, 2);
-        assert_eq!(
-            status.shadow.compared_events,
-            comparison.compared_events as u64
-        );
-        assert!(status.shadow.first_divergence.is_none());
-
-        drop(handle);
-        runtime.shutdown().expect("runtime shutdown");
-    }
-
-    #[test]
     fn production_authority_moves_vehicle_and_passenger_as_one_group() {
         let mut authority = RegionalEntityAuthority::default();
         let mut boat = SpawnEntity::vehicle(
@@ -12346,7 +12852,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
-        let ids = authority.spawn_authoritative_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
+        let ids = authority.spawn_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
         assert_eq!(ids, vec![EntityId(1), EntityId(2)]);
 
         assert_eq!(
@@ -12388,7 +12894,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
-        let ids = authority.spawn_authoritative_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
+        let ids = authority.spawn_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
 
         assert_eq!(
             authority.apply_kinematics([
@@ -12416,7 +12922,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
-        let ids = authority.spawn_authoritative_batch([
+        let ids = authority.spawn_batch([
             boat,
             cow(Vec3::new(127.75, 64.0, 0.5)),
             cow(Vec3::new(-0.5, 64.0, 0.5)),
@@ -12468,7 +12974,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
-        let ids = authority.spawn_authoritative_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
+        let ids = authority.spawn_batch([boat, cow(Vec3::new(127.75, 64.0, 0.5))]);
 
         assert_eq!(
             authority.apply_kinematics([
@@ -12499,7 +13005,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(1));
-        let ids = authority.spawn_authoritative_batch([passenger, boat]);
+        let ids = authority.spawn_batch([passenger, boat]);
 
         assert_eq!(
             authority.apply_kinematics([
@@ -12529,7 +13035,7 @@ mod tests {
             Vec3::new(127.5, 64.0, 0.5),
         );
         boat.vehicle.as_mut().expect("boat state").passenger = Some(EntityId(2));
-        let ids = authority.spawn_authoritative_batch([boat, cow(Vec3::new(0.5, 64.0, 0.5))]);
+        let ids = authority.spawn_batch([boat, cow(Vec3::new(0.5, 64.0, 0.5))]);
         let before = authority.snapshots().collect::<Vec<_>>();
 
         assert_eq!(
@@ -12550,7 +13056,7 @@ mod tests {
             target: EntityId(1),
             speed: 0.25,
         };
-        let ids = authority.spawn_authoritative_batch([target, follower]);
+        let ids = authority.spawn_batch([target, follower]);
 
         assert!(authority.set_position(ids[0], Vec3::new(128.5, 64.0, 0.5)));
         let active = HashSet::from([ids[1]]);
@@ -12583,7 +13089,7 @@ mod tests {
             target: EntityId(1),
             speed: 0.25,
         };
-        let ids = authority.spawn_authoritative_batch([target, follower]);
+        let ids = authority.spawn_batch([target, follower]);
         let active = HashSet::from([ids[1]]);
         let resolved = authority
             .prepare_goal_tick_with_pathing_for_ids(24, &active)
@@ -12609,7 +13115,7 @@ mod tests {
             target: EntityId(1),
             speed: 0.25,
         };
-        let ids = authority.spawn_authoritative_batch([target, follower]);
+        let ids = authority.spawn_batch([target, follower]);
         let active = HashSet::from([ids[1]]);
         let resolved = authority
             .prepare_goal_tick_with_pathing_for_ids(25, &active)
@@ -12635,7 +13141,7 @@ mod tests {
             target: EntityId(1),
             speed: 0.25,
         };
-        let ids = authority.spawn_authoritative_batch([target, follower]);
+        let ids = authority.spawn_batch([target, follower]);
         let active = HashSet::from([ids[1]]);
         let resolved = authority
             .prepare_goal_tick_with_pathing_for_ids(26, &active)
@@ -12659,7 +13165,7 @@ mod tests {
     #[test]
     fn production_authority_rejects_idle_batch_when_motion_changes() {
         let mut authority = RegionalEntityAuthority::default();
-        let id = authority.spawn_authoritative(cow(Vec3::new(0.5, 64.0, 0.5)));
+        let id = authority.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
         assert!(authority.set_velocity(id, Vec3::new(0.25, 0.0, 0.0)));
         let resolved = authority
             .prepare_goal_tick_with_pathing_for_ids(27, &HashSet::from([id]))
@@ -12678,7 +13184,7 @@ mod tests {
     #[test]
     fn parallel_goal_apply_validates_all_regions_before_mutation() {
         let mut authority = RegionalEntityAuthority::default();
-        let ids = authority.spawn_authoritative_batch([
+        let ids = authority.spawn_batch([
             cow(Vec3::new(-0.5, 64.0, 0.5)),
             cow(Vec3::new(128.5, 64.0, 0.5)),
         ]);
@@ -12708,16 +13214,15 @@ mod tests {
         let duplicate_uuid = Uuid::from_u128(5001);
         let mut first = cow(Vec3::new(0.5, 64.0, 0.5));
         first.uuid = Some(duplicate_uuid);
-        authority.spawn_authoritative(first);
+        authority.spawn(first);
         let mut duplicate = cow(Vec3::new(1.5, 64.0, 0.5));
         duplicate.uuid = Some(duplicate_uuid);
 
-        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            authority.spawn_authoritative(duplicate)
-        }));
+        let panic =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| authority.spawn(duplicate)));
         assert!(panic.is_err());
 
-        let recovered = authority.spawn_authoritative(cow(Vec3::new(2.5, 64.0, 0.5)));
+        let recovered = authority.spawn(cow(Vec3::new(2.5, 64.0, 0.5)));
         assert!(authority.contains(recovered));
     }
 }

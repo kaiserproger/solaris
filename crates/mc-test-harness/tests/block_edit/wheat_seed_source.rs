@@ -7,8 +7,8 @@ async fn embedded_short_grass_break_delivers_wheat_seeds_over_wire() {
 
     let mut world = embedded_world(&data);
     let spawn_surface_y =
-        top_non_air_y(&mut world, 0, 0, air_state).expect("spawn column terrain");
-    let target = (1, spawn_surface_y + 1, 0);
+        top_non_air_y(&mut world, 1, 1, air_state).expect("target column terrain");
+    let target = (1, spawn_surface_y + 1, 1);
     world
         .set_block_at(
             mc_world::BlockPos {

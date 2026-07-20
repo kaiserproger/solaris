@@ -11,6 +11,9 @@ port = 25565
 # Set true for Mojang session authentication and encrypted public play.
 # Keep offline mode bound to private/local addresses.
 online_mode = false
+# When online mode is enabled, include the connecting IP in Mojang's
+# hasJoined verification to reject proxying an authenticated session.
+prevent_proxy_connections = false
 whitelist_enabled = false
 whitelist = []
 banned_players = []

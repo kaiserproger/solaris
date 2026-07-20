@@ -84,7 +84,7 @@ fn biome_rules_can_use_sidecar_tags() {
 
     assert!(
         rules
-            .overworld_ids()
+            .all
             .contains(&Identifier::parse("minecraft:plains").unwrap())
     );
     assert!(

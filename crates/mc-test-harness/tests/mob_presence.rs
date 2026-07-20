@@ -48,13 +48,12 @@ async fn vanilla_client_receives_server_owned_passive_mob_and_motion() {
         .ok()
         .map(Arc::new);
     let registries_json = vanilla_dir.join("reports/registries.json");
-    let entity_types = mc_data::entity_types::load_entity_types_report(&registries_json)
-        .map(|report| {
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-                &report,
-            ))
-        })
-        .unwrap_or_default();
+    let entity_report = mc_data::entity_types::load_entity_types_report(&registries_json)
+        .expect("entity type report loads");
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry"),
+    );
     let biome_spawns_path = vanilla_dir.join("data/minecraft/worldgen/biome");
     let biome_spawns = mc_data::biomes::load_biome_spawn_rules(&biome_spawns_path)
         .map(Arc::new)
@@ -193,13 +192,12 @@ async fn two_clients_receive_same_server_owned_mob() {
         .ok()
         .map(Arc::new);
     let registries_json = vanilla_dir.join("reports/registries.json");
-    let entity_types = mc_data::entity_types::load_entity_types_report(&registries_json)
-        .map(|report| {
-            Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-                &report,
-            ))
-        })
-        .unwrap_or_default();
+    let entity_report = mc_data::entity_types::load_entity_types_report(&registries_json)
+        .expect("entity type report loads");
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry"),
+    );
     let biome_spawns_path = vanilla_dir.join("data/minecraft/worldgen/biome");
     let biome_spawns = mc_data::biomes::load_biome_spawn_rules(&biome_spawns_path)
         .map(Arc::new)
@@ -276,9 +274,10 @@ async fn survival_attack_passive_mob_uses_all_configured_drops() {
         .map(Arc::new);
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry"),
+    );
     let cow = mc_data::Identifier::parse("minecraft:cow").unwrap();
     let cow_type_id = entity_types
         .id_of(&cow)
@@ -448,9 +447,10 @@ async fn survival_zombie_damages_player_and_drops_rotten_flesh() {
         .map(Arc::new);
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry"),
+    );
     let zombie = mc_data::Identifier::parse("minecraft:zombie").unwrap();
     let zombie_type_id = entity_types
         .id_of(&zombie)
@@ -624,9 +624,10 @@ async fn survival_shield_blocks_frontal_zombie_damage() {
         .map(Arc::new);
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("entity type report is the exact 26.1.2 registry"),
+    );
     let zombie_type_id = entity_types
         .id_of(&mc_data::Identifier::parse("minecraft:zombie").unwrap())
         .and_then(|id| i32::try_from(id).ok())

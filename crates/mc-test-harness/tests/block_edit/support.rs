@@ -90,11 +90,11 @@ pub(super) async fn start_wall_torch_wire_fixture(
     .with_generator(generator);
     let surface_y = top_non_air_y(&mut storage, 0, 0, air_state).expect("spawn terrain");
     let clicked = mc_world::BlockPos {
-        x: 0,
+        x: 2,
         y: surface_y,
-        z: 0,
+        z: 2,
     };
-    let target = mc_world::BlockPos { x: 1, ..clicked };
+    let target = mc_world::BlockPos { x: 3, ..clicked };
     storage
         .set_block_at(clicked, support_state)
         .expect("seed wall torch support");
@@ -124,7 +124,7 @@ pub(super) async fn start_wall_torch_wire_fixture(
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -651,22 +651,40 @@ pub(super) async fn wait_for_block_update(
     state_id: i32,
 ) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let mut observed_updates = Vec::new();
+    let mut observed_acks = Vec::new();
     loop {
         let frame = client
             .read_frame_with_timeout(
                 deadline.saturating_duration_since(tokio::time::Instant::now()),
             )
             .await
-            .expect("block update");
+            .unwrap_or_else(|error| {
+                panic!(
+                    "block update: {error}; expected pos={pos:?} state={state_id}, observed updates={observed_updates:?}, acks={observed_acks:?}"
+                )
+            });
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
         if frame.id == BlockUpdate::ID {
             let mut body = frame.body;
             let pkt = BlockUpdate::decode(&mut body).expect("decode BlockUpdate");
-            if unpack_block_pos(pkt.position) == pos && pkt.state_id == state_id {
+            let update_pos = unpack_block_pos(pkt.position);
+            if update_pos == pos && pkt.state_id == state_id {
                 return;
             }
+            if observed_updates.len() == 16 {
+                observed_updates.remove(0);
+            }
+            observed_updates.push((update_pos, pkt.state_id));
+        } else if frame.id == BlockChangedAck::ID {
+            let mut body = frame.body;
+            let pkt = BlockChangedAck::decode(&mut body).expect("decode BlockChangedAck");
+            if observed_acks.len() == 16 {
+                observed_acks.remove(0);
+            }
+            observed_acks.push(pkt.sequence);
         }
     }
 }

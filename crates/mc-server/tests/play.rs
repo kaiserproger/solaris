@@ -25,7 +25,7 @@ use mc_extension::{
 };
 use mc_nbt::Tag;
 use mc_protocol::PROTOCOL_VERSION;
-use mc_protocol::codec::Identifier;
+use mc_protocol::codec::{Identifier, WriteMc};
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
@@ -78,7 +78,7 @@ async fn start_server_with_max(max_players: u32) -> SocketAddr {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick,
@@ -111,7 +111,7 @@ async fn start_server_with_extension() -> (SocketAddr, mc_extension::ExtensionEn
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -165,7 +165,7 @@ fn script_server_config(shutdown: mc_net::ShutdownHandle) -> mc_net::ServerConfi
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -178,6 +178,19 @@ async fn write_frame<P: Packet>(stream: &mut TcpStream, packet: &P, compression:
     let mut body = BytesMut::new();
     packet.encode(&mut body).unwrap();
     let framed = encode_frame(P::ID, &body, compression).unwrap();
+    stream.write_all(&framed).await.unwrap();
+}
+
+async fn write_oversized_custom_payload_frame(
+    stream: &mut TcpStream,
+    packet_id: i32,
+    compression: Compression,
+) {
+    let mut body = BytesMut::new();
+    body.write_identifier(&Identifier::parse("other:channel").unwrap())
+        .unwrap();
+    body.resize(body.len() + OVERSIZED_CUSTOM_PAYLOAD_BYTES, 0);
+    let framed = encode_frame(packet_id, &body, compression).unwrap();
     stream.write_all(&framed).await.unwrap();
 }
 
@@ -806,17 +819,8 @@ async fn play_state_ignores_oversized_custom_payload() {
 
     drain_initial_play_burst(&mut stream, &mut rbuf, compression).await;
 
-    write_frame(
-        &mut stream,
-        &ServerboundCustomPayload {
-            payload: CustomPayload::Unknown {
-                channel: Identifier::parse("other:channel").unwrap(),
-                payload: vec![0; OVERSIZED_CUSTOM_PAYLOAD_BYTES],
-            },
-        },
-        compression,
-    )
-    .await;
+    write_oversized_custom_payload_frame(&mut stream, ServerboundCustomPayload::ID, compression)
+        .await;
 
     assert_damage_command_still_processed(&mut stream, &mut rbuf, compression).await;
     drop(stream);
@@ -980,6 +984,107 @@ async fn play_script_boundary_carries_lifecycle_chat_tick_and_targeted_reply() {
 }
 
 #[tokio::test]
+async fn plugin_owned_command_argument_limits_do_not_terminate_play_ingress() {
+    const ROOT_PREFIX: &str = "owned ";
+    const MAX_PROTOCOL_COMMAND_BYTES: usize = 32_767;
+
+    let (addr, mut endpoint) = start_server_with_scripts().await;
+    let manifest = mc_script::ScriptPluginManifest::new(
+        "command-boundary",
+        "Command Boundary",
+        "0.1.0",
+        mc_script::SCRIPT_API_VERSION,
+    )
+    .declare_player_command_root("owned")
+    .validate()
+    .unwrap();
+    endpoint.register_player_commands(&manifest).unwrap();
+    recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::ServerStarted)
+    })
+    .await;
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut rbuf = BytesMut::with_capacity(8192);
+    let compression = drive_to_play(&mut stream, &mut rbuf, addr, "CommandPlayer").await;
+    recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerJoined { .. })
+    })
+    .await;
+
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: format!("{ROOT_PREFIX}{}", "a".repeat(4_096)),
+        },
+        compression,
+    )
+    .await;
+    let accepted = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerCommand { .. })
+    })
+    .await;
+    assert!(matches!(
+        accepted.kind(),
+        ScriptEventKind::PlayerCommand { root, arguments, .. }
+            if root == "owned" && arguments.len() == 4_096
+    ));
+
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: format!("{ROOT_PREFIX}{}", "b".repeat(4_097)),
+        },
+        compression,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: "owned after-4097".to_owned(),
+        },
+        compression,
+    )
+    .await;
+    let after_4097 = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerCommand { .. })
+    })
+    .await;
+    assert!(matches!(
+        after_4097.kind(),
+        ScriptEventKind::PlayerCommand { arguments, .. } if arguments == "after-4097"
+    ));
+
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: format!(
+                "{ROOT_PREFIX}{}",
+                "c".repeat(MAX_PROTOCOL_COMMAND_BYTES - ROOT_PREFIX.len())
+            ),
+        },
+        compression,
+    )
+    .await;
+    write_frame(
+        &mut stream,
+        &ServerboundChatCommand {
+            command: "owned after-32767".to_owned(),
+        },
+        compression,
+    )
+    .await;
+    let after_protocol_max = recv_script_event(&mut endpoint, |event| {
+        matches!(event.kind(), ScriptEventKind::PlayerCommand { .. })
+    })
+    .await;
+    assert!(matches!(
+        after_protocol_max.kind(),
+        ScriptEventKind::PlayerCommand { arguments, .. } if arguments == "after-32767"
+    ));
+}
+
+#[tokio::test]
 async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
     let plugins = tempfile::tempdir().unwrap();
     let plugin = plugins.path().join("welcome");
@@ -990,7 +1095,7 @@ async fn lua_plugin_loaded_from_disk_replies_to_join_and_chat_over_the_wire() {
             id = "welcome"
             name = "Welcome"
             version = "0.1.0"
-            api = "0.2.0"
+            api = "0.6.0"
             events = ["player.joined", "player.chat"]
             console_commands = ["time"]
         "#,
@@ -1136,7 +1241,7 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
             id = "pet"
             name = "Pet"
             version = "0.1.0"
-            api = "0.5.0"
+            api = "0.6.0"
             player_commands = ["pet"]
             spawn_entities = ["minecraft:pig"]
         "#,
@@ -1178,16 +1283,7 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
         .unwrap();
     config.world = Some(std::sync::Arc::new(tokio::sync::Mutex::new(world)));
     config.entity_types =
-        std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(&[
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 2,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:pig").unwrap(),
-                protocol_id: 90,
-            },
-        ]));
+        std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types());
     let bound = mc_net::bind_with_scripts(config, boundary).await.unwrap();
     let addr = bound.local_addr().unwrap();
     let server = tokio::spawn(async move { bound.serve().await });
@@ -1220,7 +1316,7 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
             let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
             if frame.id == AddEntity::ID {
                 let entity = AddEntity::decode(&mut frame.body).unwrap();
-                if entity.entity_type_id == 90 {
+                if entity.entity_type_id == 100 {
                     return entity;
                 }
             }
@@ -1228,7 +1324,7 @@ async fn lua_disk_plugin_spawns_allowlisted_entity_over_the_wire() {
     })
     .await
     .expect("allow-listed Lua entity spawn was not delivered within 2s");
-    assert_eq!(entity.entity_type_id, 90);
+    assert_eq!(entity.entity_type_id, 100);
     assert_eq!((entity.x, entity.y, entity.z), (2.5, -59.0, 0.5));
 
     drop(stream);
@@ -1255,7 +1351,7 @@ async fn lua_player_command_context_distinguishes_operator_and_exposes_identity_
             id = "context"
             name = "Context"
             version = "0.1.0"
-            api = "0.4.0"
+            api = "0.6.0"
             player_commands = ["who"]
         "#,
     )

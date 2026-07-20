@@ -6,6 +6,8 @@ use super::Packet;
 use crate::codec::{ReadMc, WriteMc};
 use crate::error::CodecError;
 
+const MAX_SERVER_ADDRESS_LEN: usize = 255;
+
 /// What the client is asking to do after the handshake.
 ///
 /// Vanilla numbers these 1/2/3 in the wire protocol. 1.20.5 added
@@ -57,8 +59,15 @@ impl Packet for Handshake {
     const ID: i32 = 0x00;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        let address_len = self.server_address.encode_utf16().count();
+        if address_len > MAX_SERVER_ADDRESS_LEN {
+            return Err(CodecError::StringTooLong {
+                len: address_len,
+                max: MAX_SERVER_ADDRESS_LEN,
+            });
+        }
         buf.write_varint(self.protocol_version);
-        buf.write_string(&self.server_address, 255)?;
+        buf.write_string(&self.server_address, MAX_SERVER_ADDRESS_LEN)?;
         buf.write_u16(self.server_port);
         buf.write_varint(self.next_state.as_i32());
         Ok(())
@@ -66,7 +75,7 @@ impl Packet for Handshake {
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         let protocol_version = buf.read_varint()?;
-        let server_address = buf.read_string(255)?;
+        let server_address = buf.read_string(MAX_SERVER_ADDRESS_LEN)?;
         let server_port = buf.read_u16()?;
         let next_state = NextState::from_i32(buf.read_varint()?)?;
         Ok(Self {
@@ -115,10 +124,62 @@ mod tests {
         // Encode a manually-malformed packet with next_state = 99.
         let mut buf: Vec<u8> = Vec::new();
         buf.write_varint(775);
-        buf.write_string("localhost", 255).unwrap();
+        buf.write_string("localhost", MAX_SERVER_ADDRESS_LEN)
+            .unwrap();
         buf.write_u16(25565);
         buf.write_varint(99);
         let mut cursor: &[u8] = &buf;
         assert!(Handshake::decode(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn server_address_accepts_empty_and_vanilla_maximum() {
+        for server_address in [String::new(), "x".repeat(MAX_SERVER_ADDRESS_LEN)] {
+            let packet = Handshake {
+                protocol_version: 775,
+                server_address,
+                server_port: 25565,
+                next_state: NextState::Login,
+            };
+            let mut encoded = Vec::new();
+            packet.encode(&mut encoded).unwrap();
+
+            let mut cursor: &[u8] = &encoded;
+            assert_eq!(Handshake::decode(&mut cursor).unwrap(), packet);
+            assert!(cursor.is_empty());
+        }
+    }
+
+    #[test]
+    fn overlong_server_address_does_not_modify_output() {
+        let packet = Handshake {
+            protocol_version: 775,
+            server_address: "x".repeat(MAX_SERVER_ADDRESS_LEN + 1),
+            server_port: 25565,
+            next_state: NextState::Login,
+        };
+        let mut encoded = vec![0xA5, 0x5A];
+
+        assert!(matches!(
+            packet.encode(&mut encoded),
+            Err(CodecError::StringTooLong {
+                len,
+                max: MAX_SERVER_ADDRESS_LEN
+            }) if len == MAX_SERVER_ADDRESS_LEN + 1
+        ));
+        assert_eq!(encoded, [0xA5, 0x5A]);
+    }
+
+    #[test]
+    fn malformed_server_address_length_is_rejected_on_decode() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(775);
+        encoded.write_varint((MAX_SERVER_ADDRESS_LEN * 3 + 1) as i32);
+
+        let mut cursor: &[u8] = &encoded;
+        assert!(matches!(
+            Handshake::decode(&mut cursor),
+            Err(CodecError::StringTooLong { .. })
+        ));
     }
 }

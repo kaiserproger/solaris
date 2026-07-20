@@ -29,6 +29,7 @@ mod login;
 mod memory_pressure;
 mod play;
 mod runtime_tick_metrics;
+mod script;
 mod server;
 mod session_auth;
 mod status;
@@ -52,8 +53,11 @@ pub use control_plane::{
 pub use error::ConnectionError;
 pub use lock_metrics::{LockMetricSnapshot, LockMetricsSnapshot, lock_pressure_snapshot};
 pub use login::{LoginAccessConfig, offline_uuid};
-pub use play::{DEFAULT_VIEW_DISTANCE, RandomTickPolicy};
+pub use play::{
+    DEFAULT_VIEW_DISTANCE, EntityEffectHandle, EntityEffectRequestError, RandomTickPolicy,
+};
 pub use runtime_tick_metrics::{RuntimeLatencyPercentiles, RuntimeTickPercentiles};
+pub use script::PluginStorageStartError;
 pub use server::{
     BoundServer, CommandPermissionConfig, OutboundPressureHandle, OutboundPressureSnapshot,
     RuntimeTelemetryHandle, RuntimeTelemetrySnapshot, SaveAllReport, SaveAllTimings, SaveHandle,

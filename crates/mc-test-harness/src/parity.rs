@@ -120,7 +120,7 @@ pub fn parse_java_major_version(version_output: &str) -> Option<u32> {
     first.parse().ok()
 }
 
-/// A normalized fact captured from either Solaris or vanilla.
+/// A fact captured from either Solaris or vanilla.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ObservationFact {
@@ -190,8 +190,7 @@ pub enum ObservationFact {
     },
 }
 
-/// Observations for one scenario phase. Facts are sorted before diffing so packet
-/// timing noise does not hide stable world-state mismatches.
+/// Ordered observations for one scenario phase.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservationSet {
@@ -215,7 +214,16 @@ impl ObservationSet {
     }
 
     #[must_use]
-    pub fn normalized(mut self) -> Self {
+    pub fn normalize_sequence(self) -> Self {
+        self
+    }
+
+    /// Deliberately discard order and duplicate facts for a set-like observation.
+    ///
+    /// Protocol and gameplay observations must use [`Self::normalize_sequence`]
+    /// instead so repeated packets and their order remain observable.
+    #[must_use]
+    pub fn normalize_set(mut self) -> Self {
         self.facts.sort();
         self.facts.dedup();
         self
@@ -227,7 +235,7 @@ impl ObservationSet {
     }
 }
 
-/// Human-readable diff between two normalized observation sets.
+/// Human-readable diff between two ordered observation sequences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObservationDiff {
     pub phase: String,
@@ -260,24 +268,16 @@ impl fmt::Display for ObservationDiff {
 
 #[must_use]
 pub fn diff_observations(expected: &ObservationSet, actual: &ObservationSet) -> ObservationDiff {
-    let expected = expected.clone().normalized();
-    let actual = actual.clone().normalized();
-    let missing_from_actual = expected
+    let first_mismatch = expected
         .facts
         .iter()
-        .filter(|fact| !actual.facts.contains(fact))
-        .cloned()
-        .collect();
-    let unexpected_in_actual = actual
-        .facts
-        .iter()
-        .filter(|fact| !expected.facts.contains(fact))
-        .cloned()
-        .collect();
+        .zip(&actual.facts)
+        .position(|(expected, actual)| expected != actual)
+        .unwrap_or_else(|| expected.facts.len().min(actual.facts.len()));
     ObservationDiff {
-        phase: expected.phase,
-        missing_from_actual,
-        unexpected_in_actual,
+        phase: expected.phase.clone(),
+        missing_from_actual: expected.facts[first_mismatch..].to_vec(),
+        unexpected_in_actual: actual.facts[first_mismatch..].to_vec(),
     }
 }
 
@@ -417,7 +417,7 @@ fn is_startup_noise_packet(packet_id: i32) -> bool {
 }
 
 /// Shared scenario surface. Implementors run the same logical flow against a
-/// supplied server address and return normalized observations for diffing.
+/// supplied server address and return ordered observations for diffing.
 pub trait ParityScenario: Send + Sync {
     fn name(&self) -> &'static str;
     fn run<'a>(&'a self, ctx: ScenarioContext) -> ScenarioFuture<'a>;
@@ -425,7 +425,7 @@ pub trait ParityScenario: Send + Sync {
 
 /// Deterministic core-action scenario shared by Solaris-only smoke tests and
 /// vanilla-backed parity diffs. It drives the login/play prelude, then executes
-/// a small movement/look/wait sequence while recording normalized observations.
+/// a small movement/look/wait sequence while recording ordered observations.
 #[derive(Debug, Clone)]
 pub struct CoreActionSequenceScenario {
     name: &'static str,
@@ -535,7 +535,7 @@ pub async fn observe_core_action_sequence(
     )
     .await?;
     observe_post_action_liveness(&mut client, &mut observations, saw_inventory).await?;
-    Ok(observations.normalized())
+    Ok(observations.normalize_sequence())
 }
 
 async fn observe_post_action_liveness(
@@ -990,7 +990,7 @@ mod tests {
     }
 
     #[test]
-    fn observation_diff_is_order_insensitive_and_points_at_phase() {
+    fn observation_diff_reports_fact_mismatch_and_points_at_phase() {
         let mut expected = ObservationSet::new("vanilla", "break-dirt");
         expected.push(ObservationFact::PacketSeen { id: 0x23 });
         expected.push(ObservationFact::BlockState {
@@ -1001,13 +1001,13 @@ mod tests {
         });
 
         let mut actual = ObservationSet::new("solaris", "break-dirt");
+        actual.push(ObservationFact::PacketSeen { id: 0x23 });
         actual.push(ObservationFact::BlockState {
             x: 0,
             y: 64,
             z: 0,
             state_id: 1,
         });
-        actual.push(ObservationFact::PacketSeen { id: 0x23 });
 
         let diff = diff_observations(&expected, &actual);
         assert_eq!(diff.phase, "break-dirt");
@@ -1017,13 +1017,38 @@ mod tests {
     }
 
     #[test]
-    fn identical_observations_match_after_normalization() {
+    fn sequence_normalization_preserves_order_and_multiplicity() {
         let mut left = ObservationSet::new("vanilla", "spawn");
+        left.push(ObservationFact::PacketSeen { id: 2 });
         left.push(ObservationFact::PacketSeen { id: 1 });
-        left.push(ObservationFact::PacketSeen { id: 1 });
+        left.push(ObservationFact::PacketSeen { id: 2 });
+
+        let normalized = left.clone().normalize_sequence();
+        assert_eq!(normalized.facts(), left.facts());
+
         let mut right = ObservationSet::new("solaris", "spawn");
+        right.push(ObservationFact::PacketSeen { id: 2 });
+        right.push(ObservationFact::PacketSeen { id: 2 });
         right.push(ObservationFact::PacketSeen { id: 1 });
 
-        assert!(diff_observations(&left, &right).is_empty());
+        let diff = diff_observations(&left, &right);
+        assert_eq!(diff.missing_from_actual, left.facts()[1..]);
+        assert_eq!(diff.unexpected_in_actual, right.facts()[1..]);
+    }
+
+    #[test]
+    fn set_normalization_discards_order_and_multiplicity() {
+        let mut observations = ObservationSet::new("vanilla", "stable-world-state");
+        observations.push(ObservationFact::PacketSeen { id: 2 });
+        observations.push(ObservationFact::PacketSeen { id: 1 });
+        observations.push(ObservationFact::PacketSeen { id: 2 });
+
+        assert_eq!(
+            observations.normalize_set().facts(),
+            &[
+                ObservationFact::PacketSeen { id: 1 },
+                ObservationFact::PacketSeen { id: 2 }
+            ]
+        );
     }
 }

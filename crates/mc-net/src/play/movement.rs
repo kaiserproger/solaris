@@ -1,4 +1,5 @@
 use mc_data::block_facts::{BlockFactsTable, FluidKind};
+use mc_data::collision_shapes::{CollisionShapeTable, vanilla_collision_shapes};
 use mc_protocol::packets::play::MovePlayerFlags;
 use mc_world::{BlockPos, BlockRegistry, BlockStateId, WorldReadSnapshot};
 use tracing::debug;
@@ -12,6 +13,7 @@ use super::survival::SurvivalState;
 
 const PLAYER_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
 const PLAYER_VERTICAL_COORDINATE_LIMIT: f64 = 20_000_000.0;
+const COLLISION_DEFLATION: f64 = 1.0e-5_f32 as f64;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AcceptedAbsoluteMovement {
@@ -116,10 +118,12 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
     snapshot: &WorldReadSnapshot,
     pose: PlayerPose,
 ) -> bool {
+    let collision_shapes = vanilla_collision_shapes();
     let half_width = 0.3;
     let min_x = (pose.x - half_width).floor() as i32;
     let max_x = (pose.x + half_width).floor() as i32;
-    let min_y = pose.y.floor() as i32;
+    let max_collision_box_y = f64::from(collision_shapes.max_box_y()) / 16.0;
+    let min_y = (pose.y - max_collision_box_y + COLLISION_DEFLATION).floor() as i32 + 1;
     let max_y = (pose.y + 1.8 - 1.0e-6).floor() as i32;
     let min_z = (pose.z - half_width).floor() as i32;
     let max_z = (pose.z + half_width).floor() as i32;
@@ -131,7 +135,13 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
                     .get_cached_block(block_pos)
                     .is_some_and(|state_id| {
                         player_collision_state_intersects(
-                            facts, blocks, state_id, block_pos, pose, half_width,
+                            facts,
+                            blocks,
+                            collision_shapes,
+                            state_id,
+                            block_pos,
+                            pose,
+                            half_width,
                         )
                     });
                 if collides {
@@ -146,6 +156,7 @@ pub(super) fn player_pose_collides_with_solid_in_snapshot(
 fn player_collision_state_intersects(
     facts: &BlockFactsTable,
     blocks: &BlockRegistry,
+    collision_shapes: &CollisionShapeTable,
     state_id: BlockStateId,
     block_pos: BlockPos,
     pose: PlayerPose,
@@ -165,25 +176,37 @@ fn player_collision_state_intersects(
         return false;
     }
 
-    let collision_height = if block_name == "minecraft:farmland" {
-        15.0 / 16.0
-    } else {
-        1.0
-    };
     let block_min_x = f64::from(block_pos.x);
     let block_min_y = f64::from(block_pos.y);
     let block_min_z = f64::from(block_pos.z);
-    let block_max_x = block_min_x + 1.0;
-    let block_max_y = block_min_y + collision_height;
-    let block_max_z = block_min_z + 1.0;
-    let epsilon = 1.0e-7;
+    let intersects = |[min_x, min_y, min_z, max_x, max_y, max_z]: [f64; 6]| {
+        pose.x - player_half_width < block_min_x + max_x - COLLISION_DEFLATION
+            && pose.x + player_half_width > block_min_x + min_x + COLLISION_DEFLATION
+            && pose.y < block_min_y + max_y - COLLISION_DEFLATION
+            && pose.y + 1.8 > block_min_y + min_y + COLLISION_DEFLATION
+            && pose.z - player_half_width < block_min_z + max_z - COLLISION_DEFLATION
+            && pose.z + player_half_width > block_min_z + min_z + COLLISION_DEFLATION
+    };
 
-    pose.x - player_half_width < block_max_x - epsilon
-        && pose.x + player_half_width > block_min_x + epsilon
-        && pose.y < block_max_y - epsilon
-        && pose.y + 1.8 > block_min_y + epsilon
-        && pose.z - player_half_width < block_max_z - epsilon
-        && pose.z + player_half_width > block_min_z + epsilon
+    if let Some(boxes) = collision_shapes.get_for_state(
+        state_id.0,
+        &block_state.block.id,
+        block_state.properties.as_slice(),
+    ) {
+        return boxes
+            .iter()
+            .copied()
+            .any(|collision_box| intersects(collision_box.as_blocks()));
+    }
+
+    let fallback_box = if collision_shapes
+        .is_exact_farmland_state(&block_state.block.id, block_state.properties.as_slice())
+    {
+        [0.0, 0.0, 0.0, 1.0, 15.0 / 16.0, 1.0]
+    } else {
+        [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    };
+    intersects(fallback_box)
 }
 
 pub(super) fn player_touches_lit_campfire_in_snapshot(

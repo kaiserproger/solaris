@@ -46,7 +46,7 @@ async fn survival_places_sign_and_updates_plain_text() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -83,9 +83,9 @@ async fn survival_places_sign_and_updates_plain_text() {
             inside: false,
             world_border_hit: false,
             sequence: 74,
-    })
-    .await
-    .expect("place sign");
+        })
+        .await
+        .expect("place sign");
     wait_for_open_sign_editor(&mut client, packed_sign_pos).await;
 
     let mismatched_pos = pack_block_pos(sign_pos.0, sign_pos.1, sign_pos.2 + 1);
@@ -260,7 +260,7 @@ async fn survival_sign_text_survives_flush_and_reopen() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -349,14 +349,26 @@ async fn survival_sign_text_survives_flush_and_reopen() {
         compound_field(&persisted, "id"),
         Some(&mc_nbt::Tag::String("minecraft:sign".into()))
     );
-    assert_eq!(compound_field(&persisted, "x"), Some(&mc_nbt::Tag::Int(sign_pos.0)));
-    assert_eq!(compound_field(&persisted, "y"), Some(&mc_nbt::Tag::Int(sign_pos.1)));
-    assert_eq!(compound_field(&persisted, "z"), Some(&mc_nbt::Tag::Int(sign_pos.2)));
+    assert_eq!(
+        compound_field(&persisted, "x"),
+        Some(&mc_nbt::Tag::Int(sign_pos.0))
+    );
+    assert_eq!(
+        compound_field(&persisted, "y"),
+        Some(&mc_nbt::Tag::Int(sign_pos.1))
+    );
+    assert_eq!(
+        compound_field(&persisted, "z"),
+        Some(&mc_nbt::Tag::Int(sign_pos.2))
+    );
     assert_plain_sign_text(&persisted, "front_text", &lines);
     assert_plain_sign_text(&persisted, "back_text", &["", "", "", ""]);
 
-    let wire_records =
-        mc_world::wire::client_block_entities(chunk, &blocks, &mc_data::items::ItemRegistry::default());
+    let wire_records = mc_world::wire::client_block_entities(
+        chunk,
+        &blocks,
+        &mc_data::items::ItemRegistry::default(),
+    );
     let sign_record = wire_records
         .iter()
         .find(|record| record.pos == block_pos)
@@ -370,7 +382,10 @@ async fn survival_sign_text_survives_flush_and_reopen() {
     assert_plain_sign_text(&sign_record.nbt, "front_text", &lines);
 }
 
-async fn wait_for_open_sign_editor(client: &mut Client, position: i64) -> ClientboundOpenSignEditor {
+async fn wait_for_open_sign_editor(
+    client: &mut Client,
+    position: i64,
+) -> ClientboundOpenSignEditor {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let frame = client
@@ -410,8 +425,8 @@ async fn wait_for_sign_block_entity_data(
         }
         if frame.id == ClientboundBlockEntityData::ID {
             let mut body = frame.body;
-            let pkt = ClientboundBlockEntityData::decode(&mut body)
-                .expect("decode BlockEntityData");
+            let pkt =
+                ClientboundBlockEntityData::decode(&mut body).expect("decode BlockEntityData");
             if pkt.position == position {
                 return pkt;
             }
@@ -439,8 +454,8 @@ async fn assert_no_sign_block_entity_data(client: &mut Client, position: i64) {
         }
         if frame.id == ClientboundSetTime::ID {
             let mut body = frame.body;
-            let _time = ClientboundSetTime::decode(&mut body)
-                .expect("decode rejected sign packet fence");
+            let _time =
+                ClientboundSetTime::decode(&mut body).expect("decode rejected sign packet fence");
             return;
         } else if frame.id == ClientboundBlockEntityData::ID {
             let mut body = frame.body;

@@ -8,8 +8,6 @@
 //! planning/write/commit paths.
 
 use std::collections::{HashMap, VecDeque};
-use std::ffi::OsStr;
-use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(test)]
@@ -40,6 +38,7 @@ mod read_view;
 mod test_support;
 
 pub use dirty_flush::{DirtyFlushCommit, DirtyFlushPlan};
+pub(crate) use read_view::ResidentPublicationState;
 pub use read_view::{
     ChunkDiskLoadPlan, ChunkPrepareSource, ChunkSnapshot, ChunkSnapshotPlan, ChunkSourceView,
     DirtyHighWaterNotifier, ScheduledTickView, WorldReadSnapshot, WorldReadView,
@@ -184,14 +183,6 @@ impl WorldStorage {
         Self::open_with_capacities(world_dir, registry, capacity, DEFAULT_REGION_LRU_CAPACITY)
     }
 
-    pub fn open_with_region_capacity(
-        world_dir: impl AsRef<Path>,
-        registry: Arc<BlockRegistry>,
-        region_capacity: usize,
-    ) -> Result<Self, WorldError> {
-        Self::open_with_capacities(world_dir, registry, DEFAULT_LRU_CAPACITY, region_capacity)
-    }
-
     pub fn open_with_capacities(
         world_dir: impl AsRef<Path>,
         registry: Arc<BlockRegistry>,
@@ -218,7 +209,8 @@ impl WorldStorage {
 
         let capacity = capacity.max(1);
         let read_view = WorldReadView::with_capacity(capacity);
-        let scheduled_tick_view = ScheduledTickView::default();
+        let scheduled_tick_view =
+            ScheduledTickView::with_publication(read_view.publication_state());
         let resident = ResidentChunkStore::new(
             read_view.clone(),
             scheduled_tick_view.clone(),
@@ -255,7 +247,8 @@ impl WorldStorage {
     pub fn in_memory_with_capacity(registry: Arc<BlockRegistry>, capacity: usize) -> Self {
         let capacity = capacity.max(1);
         let read_view = WorldReadView::with_capacity(capacity);
-        let scheduled_tick_view = ScheduledTickView::default();
+        let scheduled_tick_view =
+            ScheduledTickView::with_publication(read_view.publication_state());
         let resident = ResidentChunkStore::new(
             read_view.clone(),
             scheduled_tick_view.clone(),
@@ -295,17 +288,6 @@ impl WorldStorage {
         self.generator_available.store(true, Ordering::Release);
         self.generator = Some(generator);
         self
-    }
-
-    /// Convenience for the `mc-server` startup path: swap a generator
-    /// in after the fact. Returns the previous generator (if any).
-    pub fn set_generator(
-        &mut self,
-        generator: Option<Arc<dyn ChunkGenerator>>,
-    ) -> Option<Arc<dyn ChunkGenerator>> {
-        self.generator_available
-            .store(generator.is_some(), Ordering::Release);
-        std::mem::replace(&mut self.generator, generator)
     }
 
     #[must_use]
@@ -382,60 +364,6 @@ impl WorldStorage {
         Ok(self.resident.snapshot(cpos))
     }
 
-    /// Visit every chunk already present in region files without invoking the
-    /// fallback generator or mutating the chunk/region caches.
-    pub fn visit_existing_chunks_without_generation<F>(
-        &self,
-        mut visit: F,
-    ) -> Result<usize, WorldError>
-    where
-        F: FnMut(ChunkPos, &Chunk),
-    {
-        let entries = match std::fs::read_dir(&self.region_root) {
-            Ok(entries) => entries,
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(0),
-            Err(err) => {
-                return Err(RegionError::Io {
-                    path: self.region_root.clone(),
-                    source: err,
-                }
-                .into());
-            }
-        };
-        let mut regions = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|err| RegionError::Io {
-                path: self.region_root.clone(),
-                source: err,
-            })?;
-            let Some((rx, rz)) = parse_region_file_name(&entry.file_name()) else {
-                continue;
-            };
-            regions.push((rx, rz, entry.path()));
-        }
-        regions.sort_by_key(|(rx, rz, _)| (*rx, *rz));
-
-        let mut visited = 0usize;
-        for (rx, rz, path) in regions {
-            for payload in read_region(&path)? {
-                let cpos = ChunkPos {
-                    x: rx * REGION_AXIS_CHUNKS + i32::from(payload.local_x),
-                    z: rz * REGION_AXIS_CHUNKS + i32::from(payload.local_z),
-                };
-                let mut cursor = std::io::Cursor::new(&payload.uncompressed_nbt[..]);
-                let (_, root) = mc_nbt::read_named(&mut cursor)?;
-                let chunk = chunk_from_nbt_with_items(
-                    &root,
-                    &self.registry,
-                    self.item_registry.as_deref(),
-                )?;
-                visit(cpos, &chunk);
-                visited += 1;
-            }
-        }
-        Ok(visited)
-    }
-
     pub fn commit_chunk_snapshot(
         &mut self,
         cpos: ChunkPos,
@@ -473,10 +401,6 @@ impl WorldStorage {
         self.regions.remove(&region);
         self.region_lru.retain(|cached| *cached != region);
         Ok(true)
-    }
-
-    pub fn restore_journal_chunk(&mut self, chunk: Chunk) -> Result<(), WorldError> {
-        self.replay_journal_chunk(chunk).map(|_| ())
     }
 
     pub fn try_commit_chunk_snapshot(
@@ -1234,16 +1158,6 @@ fn region_of(cpos: ChunkPos) -> (i32, i32) {
     )
 }
 
-fn parse_region_file_name(name: &OsStr) -> Option<(i32, i32)> {
-    let name = name.to_str()?;
-    let name = name.strip_prefix("r.")?.strip_suffix(".mca")?;
-    let (rx, rz) = name.split_once('.')?;
-    if rz.contains('.') {
-        return None;
-    }
-    Some((rx.parse().ok()?, rz.parse().ok()?))
-}
-
 #[cfg(test)]
 mod tests {
     use super::test_support::*;
@@ -1282,17 +1196,6 @@ mod tests {
             chunk_pos_of(BlockPos { x: -16, y: 0, z: 0 }),
             ChunkPos { x: -1, z: 0 }
         );
-    }
-
-    #[test]
-    fn open_with_region_capacity_sets_region_lru_capacity() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
-
-        let world = WorldStorage::open_with_region_capacity(tmp.path(), registry, 7).unwrap();
-
-        assert_eq!(world.region_cache_capacity(), 7);
     }
 
     #[test]
@@ -1992,50 +1895,6 @@ mod tests {
             ChunkLight::from_section_lights(&second_after.section_lights),
             Some(newer_second_light)
         );
-    }
-
-    #[test]
-    fn journal_restore_replaces_resident_chunk_and_publishes_scheduled_state() {
-        let registry = single_air_registry();
-        let mut world = WorldStorage::in_memory(Arc::clone(&registry));
-        let position = ChunkPos { x: 2, z: -3 };
-        let biome = Identifier::parse("minecraft:plains").unwrap();
-        world
-            .insert_generated_chunk(
-                position,
-                Chunk::empty(position, BlockStateId(0), biome.clone()),
-            )
-            .unwrap();
-        let before = world.cached_chunk_snapshot(position).unwrap();
-        let tick_position = BlockPos {
-            x: position.x * 16,
-            y: 64,
-            z: position.z * 16,
-        };
-        let mut restored = Chunk::empty(position, BlockStateId(0), biome);
-        restored.schedule_block_tick(ScheduledBlockTick::new(
-            tick_position,
-            Identifier::parse("minecraft:air").unwrap(),
-            7,
-            0,
-        ));
-        restored.set_world_journal_lsn(1);
-
-        world.restore_journal_chunk(restored).unwrap();
-
-        let after = world.cached_chunk_snapshot(position).unwrap();
-        assert!(!Arc::ptr_eq(&before, &after));
-        assert!(after.dirty);
-        assert_eq!(
-            world.scheduled_block_ticks(position).unwrap().unwrap(),
-            &[ScheduledBlockTick::new(
-                tick_position,
-                Identifier::parse("minecraft:air").unwrap(),
-                7,
-                0,
-            )]
-        );
-        assert_eq!(world.stats().dirty_chunks, 1);
     }
 
     #[test]
@@ -3699,42 +3558,6 @@ mod tests {
         assert_eq!(replayed.world_journal_lsn(), 11);
         assert_eq!(replayed.get_block(1, 0, 1), Some(BlockStateId(0)));
         assert!(replayed.dirty);
-    }
-
-    #[test]
-    fn visit_existing_chunks_without_generation_scans_disk_without_cache_mutation() {
-        let tmp_world = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp_world.path().join("region")).unwrap();
-        let registry = air_stone_registry();
-        let cpos = ChunkPos { x: -1, z: 32 };
-        let biome = Identifier::parse("minecraft:plains").unwrap();
-
-        let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-        chunk.set_block(15, 0, 0, BlockStateId(1));
-        chunk.mark_dirty();
-
-        let mut world =
-            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
-        world.insert_chunk(cpos, chunk).unwrap();
-        assert_eq!(world.flush_dirty().unwrap(), 1);
-        drop(world);
-
-        let reopened =
-            WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 4).unwrap();
-        assert_eq!(reopened.stats().chunk_cache_len, 0);
-        assert_eq!(reopened.stats().region_cache_len, 0);
-
-        let mut visited = Vec::new();
-        let count = reopened
-            .visit_existing_chunks_without_generation(|pos, chunk| {
-                visited.push((pos, chunk.get_block(15, 0, 0).unwrap()));
-            })
-            .unwrap();
-
-        assert_eq!(count, 1);
-        assert_eq!(visited, vec![(cpos, BlockStateId(1))]);
-        assert_eq!(reopened.stats().chunk_cache_len, 0);
-        assert_eq!(reopened.stats().region_cache_len, 0);
     }
 
     #[test]

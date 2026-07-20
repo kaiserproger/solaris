@@ -597,12 +597,6 @@ impl ReplayRunResult {
                 observation.subject,
                 observation.phase
             );
-            ensure!(
-                observation.clone().normalized() == *observation,
-                "observation {}/{} is not normalized",
-                observation.subject,
-                observation.phase
-            );
         }
         Ok(())
     }

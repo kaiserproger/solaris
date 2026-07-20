@@ -276,6 +276,8 @@ impl ResourcePackStatus {
 }
 
 impl CustomPayload {
+    const MAX_SERVERBOUND_UNKNOWN_BODY_LEN: usize = 32_767;
+
     pub fn channel(&self) -> &Identifier {
         match self {
             Self::Brand(_) => Self::brand_channel(),
@@ -291,6 +293,13 @@ impl CustomPayload {
     pub fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
         match self {
             Self::Brand(brand) => {
+                let brand_len = brand.encode_utf16().count();
+                if brand_len > DEFAULT_MAX_STRING_LEN {
+                    return Err(CodecError::StringTooLong {
+                        len: brand_len,
+                        max: DEFAULT_MAX_STRING_LEN,
+                    });
+                }
                 buf.write_identifier(Self::brand_channel())?;
                 buf.write_string(brand, DEFAULT_MAX_STRING_LEN)?;
             }
@@ -302,12 +311,48 @@ impl CustomPayload {
         Ok(())
     }
 
+    pub fn encode_serverbound<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        match self {
+            Self::Unknown { payload, .. }
+                if payload.len() > Self::MAX_SERVERBOUND_UNKNOWN_BODY_LEN =>
+            {
+                return Err(CodecError::StringTooLong {
+                    len: payload.len(),
+                    max: Self::MAX_SERVERBOUND_UNKNOWN_BODY_LEN,
+                });
+            }
+            _ => {}
+        }
+        self.encode(buf)
+    }
+
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Self::decode_with_unknown_body_limit(buf, None)
+    }
+
+    pub fn decode_serverbound<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Self::decode_with_unknown_body_limit(buf, Some(Self::MAX_SERVERBOUND_UNKNOWN_BODY_LEN))
+    }
+
+    fn decode_with_unknown_body_limit<B: Buf>(
+        buf: &mut B,
+        max_unknown_body_len: Option<usize>,
+    ) -> Result<Self, CodecError> {
         let channel = buf.read_identifier()?;
         if channel == *Self::brand_channel() {
             return Ok(Self::Brand(buf.read_string(DEFAULT_MAX_STRING_LEN)?));
         }
-        let mut payload = vec![0; buf.remaining()];
+        let remaining = buf.remaining();
+        match max_unknown_body_len {
+            Some(max) if remaining > max => {
+                return Err(CodecError::StringTooLong {
+                    len: remaining,
+                    max,
+                });
+            }
+            _ => {}
+        }
+        let mut payload = vec![0; remaining];
         buf.copy_to_slice(&mut payload);
         Ok(Self::Unknown { channel, payload })
     }

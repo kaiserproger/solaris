@@ -1,9 +1,195 @@
 use super::{RegionEpoch, RegionKey};
-use crate::{AnimalBreedingState, EntityId, EntityStore, ShadowStage, SpawnEntity, Vec3};
+use crate::effects_26_1_2::{
+    EffectAction, EffectFlags, EffectId, EffectInstance, EffectKind, TargetEffectContext,
+};
+use crate::living_26_1_2::DamageContext;
+use crate::runtime_26_1_2::TargetKind;
+use crate::{
+    AnimalBreedingState, EntityDamageRequest, EntityEffectOperation, EntityEffectRejection,
+    EntityEffectRequest, EntityEffectResult, EntityId, EntityRetainedState, EntityStore, GoalState,
+    PathingBudget, PathingProbe, PathingProbeResult, SpawnEntity, Vec3,
+};
 use uuid::Uuid;
 
 fn cow(position: Vec3) -> SpawnEntity {
     SpawnEntity::new(4, "minecraft:cow", position)
+}
+
+fn heal_request(amount: f32) -> EntityEffectRequest {
+    EntityEffectRequest {
+        operation: EntityEffectOperation::ApplyAction {
+            effect_id: EffectId::new(6),
+            action: EffectAction::Heal { amount },
+            damage_context: None,
+        },
+        target_kind: TargetKind::NonPlayer,
+        death_remove_tick: 20,
+    }
+}
+
+#[test]
+fn regional_owner_effect_transaction_is_version_fenced_and_returns_ecs_projection() {
+    let runtime = super::RegionalOwnerRuntime::from_store(super::RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    let id = handle
+        .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+        .expect("spawn effect target");
+    let initial = handle
+        .snapshot(id)
+        .expect("effect target read")
+        .expect("effect target snapshot");
+    let damaged = handle
+        .damage_if_current(
+            initial,
+            EntityDamageRequest {
+                amount: 12.0,
+                tick: 1,
+                death_remove_tick: 21,
+            },
+        )
+        .expect("damage owner request")
+        .expect("damage accepted")
+        .snapshot;
+    let accepted = handle
+        .apply_effect_if_current(damaged.clone(), heal_request(100.0))
+        .expect("effect owner request");
+    let EntityEffectResult::Applied(accepted) = accepted else {
+        panic!("heal must commit through regional owner");
+    };
+    assert_eq!(accepted.snapshot.health, 20.0);
+    assert_eq!(
+        handle.snapshot(id).expect("committed effect target read"),
+        Some(accepted.snapshot.clone())
+    );
+    assert_eq!(
+        handle
+            .apply_effect_if_current(damaged, heal_request(1.0))
+            .expect("stale effect owner request"),
+        EntityEffectResult::Rejected(EntityEffectRejection::Stale)
+    );
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
+fn effect_only_mutation_invalidates_full_snapshot_cas() {
+    let runtime = super::RegionalOwnerRuntime::from_store(super::RegionalEntityStore::new(), 1)
+        .expect("regional owner runtime");
+    let handle = runtime.handle();
+    let id = handle
+        .spawn(cow(Vec3::new(0.5, 64.0, 0.5)))
+        .expect("spawn effect target");
+    let stale = handle.snapshot(id).unwrap().unwrap();
+    let effect = EffectInstance::new(
+        EffectId::new(10),
+        EffectKind::Regeneration,
+        80,
+        0,
+        EffectFlags::default(),
+    );
+    assert!(matches!(
+        handle
+            .apply_effect_if_current(
+                stale.clone(),
+                EntityEffectRequest {
+                    operation: EntityEffectOperation::Add(effect),
+                    target_kind: TargetKind::NonPlayer,
+                    death_remove_tick: 20,
+                },
+            )
+            .unwrap(),
+        EntityEffectResult::Applied(_)
+    ));
+    let mut stale_replacement = stale.clone();
+    stale_replacement.velocity = Vec3::new(1.0, 0.0, 0.0);
+    assert!(
+        !handle
+            .replace_snapshot_if_current(stale, stale_replacement)
+            .unwrap()
+    );
+
+    runtime.shutdown().expect("regional owner shutdown");
+}
+
+#[test]
+fn regional_owner_effect_rollback_restores_active_effect_checkpoint() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    let id = store.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
+    let expected = store.snapshot(id).unwrap();
+    let effect = EffectInstance::new(
+        EffectId::new(6),
+        EffectKind::InstantHealth,
+        1,
+        0,
+        EffectFlags::default(),
+    );
+    let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
+    let phase = super::RegionPhase(1);
+    lane.prepare(super::RegionOwnerBatch {
+        phase,
+        sequence_watermark: 1,
+        mutations: vec![super::SequencedRegionMutation {
+            sequence: 1,
+            lease,
+            mutation: super::RegionOwnerMutation::ApplyEffectIfCurrent {
+                expected: Box::new(expected),
+                request: Box::new(EntityEffectRequest {
+                    operation: EntityEffectOperation::Add(effect),
+                    target_kind: TargetKind::NonPlayer,
+                    death_remove_tick: 20,
+                }),
+            },
+        }],
+    })
+    .expect("prepare effect")
+    .recv()
+    .expect("prepare completion")
+    .expect("prepared effect");
+    let completion = lane
+        .commit(phase)
+        .expect("commit effect")
+        .recv()
+        .expect("commit completion")
+        .expect("committed effect");
+    assert!(matches!(
+        completion.effect_results.as_slice(),
+        [(1, EntityEffectResult::Applied(_))]
+    ));
+    lane.rollback(phase)
+        .expect("rollback effect")
+        .recv()
+        .expect("rollback completion")
+        .expect("rolled back effect");
+
+    let mut stores = lane.shutdown().expect("clean owner shutdown");
+    assert_eq!(
+        stores.get_mut(&lease.key).unwrap().apply_effect(
+            id,
+            EntityEffectRequest {
+                operation: EntityEffectOperation::Tick {
+                    entity_tick_count: 1,
+                    target_context: TargetEffectContext::LIVING,
+                    damage_context: DamageContext::default(),
+                },
+                target_kind: TargetKind::NonPlayer,
+                death_remove_tick: 20,
+            },
+        ),
+        EntityEffectResult::Rejected(EntityEffectRejection::NoActiveEffects)
+    );
+}
+
+struct WalkablePathing;
+
+impl PathingProbe for WalkablePathing {
+    fn can_stand_at(&self, _position: Vec3) -> PathingProbeResult {
+        PathingProbeResult::Walkable
+    }
 }
 
 #[test]
@@ -386,7 +572,7 @@ fn persistent_owner_lane_rollback_restores_removed_snapshot() {
 }
 
 #[test]
-fn persistent_owner_lane_rollback_discards_speculative_semantic_events() {
+fn persistent_owner_lane_insert_rollback_restores_store_and_id_cursor() {
     let lease = super::RegionLease {
         key: RegionKey::new(0, 0),
         epoch: RegionEpoch::INITIAL,
@@ -424,22 +610,27 @@ fn persistent_owner_lane_rollback_discards_speculative_semantic_events() {
 
     let mut stores = lane.shutdown().expect("clean owner shutdown");
     let store = stores.get_mut(&lease.key).expect("owned region");
-    store.shadow.run_stage(ShadowStage::OutputEvents);
-    assert!(store.shadow.take_output_events().is_empty());
+    assert!(store.is_empty());
+    assert_eq!(store.spawn(cow(Vec3::new(1.5, 64.0, 0.5))), entity);
 }
 
 #[test]
-fn persistent_owner_lane_damage_rollback_restores_snapshot_and_events() {
+fn persistent_owner_lane_damage_rollback_restores_snapshot() {
     let lease = super::RegionLease {
         key: RegionKey::new(0, 0),
         epoch: RegionEpoch::INITIAL,
         lane: 0,
     };
     let mut store = EntityStore::new();
-    let entity = store.spawn(cow(Vec3::new(0.5, 64.0, 0.5)));
+    let mut spawned = cow(Vec3::new(0.5, 64.0, 0.5));
+    spawned.goal = GoalState::Wander {
+        speed: 0.8,
+        period_ticks: 80,
+    };
+    let entity = store.spawn(spawned);
+    store.tick_goals_with_pathing(1, &WalkablePathing, PathingBudget::DEFAULT);
     let expected = store.snapshot(entity).expect("spawned snapshot");
-    store.shadow.run_stage(ShadowStage::OutputEvents);
-    let _ = store.shadow.take_output_events();
+    assert_ne!(expected.retained, EntityRetainedState::default());
     let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
     let phase = super::RegionPhase(1);
     lane.prepare(super::RegionOwnerBatch {
@@ -450,7 +641,11 @@ fn persistent_owner_lane_damage_rollback_restores_snapshot_and_events() {
             lease,
             mutation: super::RegionOwnerMutation::DamageIfCurrent {
                 expected: Box::new(expected.clone()),
-                amount: 20.0,
+                request: EntityDamageRequest {
+                    amount: 20.0,
+                    tick: 7,
+                    death_remove_tick: 27,
+                },
             },
         }],
     })
@@ -472,8 +667,11 @@ fn persistent_owner_lane_damage_rollback_restores_snapshot_and_events() {
     let mut stores = lane.shutdown().expect("clean owner shutdown");
     let store = stores.get_mut(&lease.key).expect("owned region");
     assert_eq!(store.snapshot(entity), Some(expected));
-    store.shadow.run_stage(ShadowStage::OutputEvents);
-    assert!(store.shadow.take_output_events().is_empty());
+    assert_eq!(
+        store.spawn(cow(Vec3::new(1.5, 64.0, 0.5))),
+        EntityId(entity.0 + 1),
+        "rollback must preserve the entity ID cursor"
+    );
 }
 
 #[test]

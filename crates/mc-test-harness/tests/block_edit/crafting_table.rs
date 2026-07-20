@@ -17,25 +17,39 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let crafting_table_state_id = blocks
+    let crafting_table_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:crafting_table").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("crafting_table in registry");
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let table_pos = mc_world::BlockPos {
+        x: 2,
+        y: top_non_air_y(&mut storage, 2, 2, air_state).expect("table column terrain") + 1,
+        z: 2,
+    };
+    storage
+        .set_block_at(table_pos, crafting_table_state)
+        .expect("seed crafting table")
+        .expect("table chunk exists");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
     let crafting_table_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:crafting_table").unwrap())
         .expect("crafting_table item");
@@ -91,15 +105,8 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M24TableCrafter").await;
+    let (mut client, _) = connect_to_play(addr, "M24TableCrafter").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-    client
-        .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:crafting_table 1 0".into(),
-        })
-        .await
-        .expect("give crafting table");
-    wait_for_slot_stack(&mut client, crafting_table_id, 1).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:oak_log 2 1".into(),
@@ -108,28 +115,10 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         .expect("give oak log");
     wait_for_slot_stack(&mut client, oak_log_id, 2).await;
 
-    let support_y = sync.y.floor() as i32 - 2;
-    let table_y = support_y + 1;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
-            direction: Direction::Up,
-            cursor_x: 0.5,
-            cursor_y: 1.0,
-            cursor_z: 0.5,
-            inside: false,
-            world_border_hit: false,
-            sequence: 101,
-        })
-        .await
-        .expect("place crafting table");
-    wait_for_block_update(&mut client, (0, table_y, 0), crafting_table_state_id).await;
-
-    client
-        .write_packet(&ServerboundUseItemOn {
-            hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, table_y, 0),
+            position: pack_block_pos(table_pos.x, table_pos.y, table_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -159,7 +148,9 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
         .await
         .expect("throw one oak log from crafting window");
     content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
-        pkt.carried_item.is_empty() && pkt.items[38].item_id == oak_log_id && pkt.items[38].count == 1
+        pkt.carried_item.is_empty()
+            && pkt.items[38].item_id == oak_log_id
+            && pkt.items[38].count == 1
     })
     .await;
     client
@@ -280,9 +271,9 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
         pkt.items[0].item_id == crafting_table_id
             && pkt.items[0].count == 1
-            && [1, 2, 4, 5].into_iter().all(|slot| {
-                pkt.items[slot].item_id == oak_planks_id && pkt.items[slot].count == 1
-            })
+            && [1, 2, 4, 5]
+                .into_iter()
+                .all(|slot| pkt.items[slot].item_id == oak_planks_id && pkt.items[slot].count == 1)
             && pkt.carried_item.is_empty()
     })
     .await;
@@ -314,4 +305,3 @@ async fn crafting_table_container_crafts_shapeless_and_shaped_results() {
     })
     .await;
 }
-

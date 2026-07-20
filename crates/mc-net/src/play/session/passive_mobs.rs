@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use mc_entity::{
     ANIMAL_BREEDING_COURTSHIP_TICKS, ANIMAL_LOVE_DURATION_TICKS, AnimalBreedingState, EntityId,
     PARENT_BREEDING_COOLDOWN_TICKS, SheepColor, Vec3,
@@ -8,7 +6,7 @@ use mc_world::BlockPos;
 
 mod authority;
 
-pub(super) const SHEEP_GRAZING_ANIMATION_TICKS: u8 = 40;
+pub(in crate::play) const SHEEP_GRAZING_ANIMATION_TICKS: u8 = 40;
 pub(in crate::play) const SHEEP_GRAZING_ACTION_TICK: u8 = 4;
 
 #[derive(Debug, Clone)]
@@ -142,10 +140,9 @@ pub(super) fn plan_breeding(simulation_tick: u64, animals: &[BreedingAnimal]) ->
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct GrazingSheep {
-    pub(super) entity_id: EntityId,
-    pub(super) position: Vec3,
+    pub(super) expected: mc_entity::EntitySnapshot,
     pub(super) is_baby: bool,
 }
 
@@ -161,9 +158,9 @@ pub(in crate::play) struct SheepGrazingPlan {
     pub(in crate::play) actions: Vec<SheepGrazingCandidate>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct SheepGrazingTimerUpdate {
-    pub(super) entity_id: EntityId,
+    pub(super) expected: mc_entity::EntitySnapshot,
     pub(super) remaining: Option<u8>,
 }
 
@@ -172,25 +169,21 @@ pub(super) struct SheepGrazingAdvance {
     pub(super) timer_updates: Vec<SheepGrazingTimerUpdate>,
 }
 
-pub(super) fn advance_sheep_grazing(
-    tick: u64,
-    sheep: &[GrazingSheep],
-    timers: &HashMap<EntityId, u8>,
-) -> SheepGrazingAdvance {
+pub(super) fn advance_sheep_grazing(tick: u64, sheep: &[GrazingSheep]) -> SheepGrazingAdvance {
     let mut plan = SheepGrazingPlan::default();
-    let mut timer_updates = Vec::with_capacity(sheep.len().min(timers.len()));
+    let mut timer_updates = Vec::with_capacity(sheep.len());
 
     for sheep in sheep {
         let candidate = SheepGrazingCandidate {
-            entity_id: sheep.entity_id,
+            entity_id: sheep.expected.id,
             block_position: BlockPos {
-                x: sheep.position.x.floor() as i32,
-                y: sheep.position.y.floor() as i32,
-                z: sheep.position.z.floor() as i32,
+                x: sheep.expected.position.x.floor() as i32,
+                y: sheep.expected.position.y.floor() as i32,
+                z: sheep.expected.position.z.floor() as i32,
             },
         };
-        let Some(remaining) = timers.get(&sheep.entity_id).copied() else {
-            if sheep_grazing_starts_on_tick(sheep.entity_id, tick, sheep.is_baby) {
+        let Some(remaining) = sheep.expected.retained.sheep_grazing_ticks else {
+            if sheep_grazing_starts_on_tick(sheep.expected.id, tick, sheep.is_baby) {
                 plan.starts.push(candidate);
             }
             continue;
@@ -199,12 +192,12 @@ pub(super) fn advance_sheep_grazing(
         let remaining = remaining.saturating_sub(1);
         if remaining == 0 {
             timer_updates.push(SheepGrazingTimerUpdate {
-                entity_id: sheep.entity_id,
+                expected: sheep.expected.clone(),
                 remaining: None,
             });
         } else {
             timer_updates.push(SheepGrazingTimerUpdate {
-                entity_id: sheep.entity_id,
+                expected: sheep.expected.clone(),
                 remaining: Some(remaining),
             });
             if remaining == SHEEP_GRAZING_ACTION_TICK {

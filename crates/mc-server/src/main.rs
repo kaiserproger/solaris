@@ -7,7 +7,6 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
-use std::{future::Future, pin::Pin};
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
@@ -725,11 +724,9 @@ async fn run_bound_server(
     bound: mc_net::BoundServer,
     shutdown_handle: mc_net::ShutdownHandle,
 ) -> Result<()> {
-    // Race the listener against Ctrl-C. A signal requests runtime drain before
-    // the final save, so gameplay tasks stop mutating state first.
-    let save_handle = bound.save_handle();
-    let runtime_control = bound.runtime_control_handle();
-    let mut run_fut = std::pin::pin!(bound.serve());
+    // Every exit path drains admitted work and performs exactly one final save.
+    // Ctrl-C only requests shutdown; it then waits for that same lifecycle.
+    let mut run_fut = std::pin::pin!(bound.serve_and_save());
     let shutdown = async {
         if let Err(err) = tokio::signal::ctrl_c().await {
             tracing::warn!(error = %err, "ctrl_c handler failed; running without graceful shutdown");
@@ -743,32 +740,11 @@ async fn run_bound_server(
         }
         () = shutdown => {
             tracing::info!("shutdown signal received");
-            let (drain_result, report) = request_shutdown_drain_then_save(
-                &shutdown_handle,
-                runtime_control.as_ref(),
-                run_fut.as_mut(),
-                save_handle.save_all_after_drain(),
-            ).await;
-            match drain_result {
-                Ok(Ok(())) => tracing::info!("shutdown: runtime tasks drained"),
-                Ok(Err(err)) => return Err(err).context("network listener"),
-                Err(_) => tracing::warn!("shutdown: drain timeout elapsed before final save"),
+            shutdown_handle.request();
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, run_fut.as_mut()).await {
+                Ok(result) => result.context("network listener"),
+                Err(_) => anyhow::bail!("shutdown drain and final save timed out"),
             }
-            if report.is_ok() {
-                tracing::info!(
-                    players = report.players_saved,
-                    entities = report.entities_saved,
-                    chunks = report.chunks_flushed,
-                    world_metadata = report.world_metadata_saved,
-                    "shutdown: save-all complete"
-                );
-            } else {
-                for error in &report.errors {
-                    tracing::error!(%error, "shutdown: save-all error");
-                }
-                anyhow::bail!("shutdown save-all failed with {} error(s)", report.errors.len());
-            }
-            Ok(())
         }
     }
 }
@@ -781,25 +757,6 @@ async fn join_lua_host(host: mc_script::LuaHost) -> Result<()> {
         bail!("Lua host thread panicked");
     }
     Ok(())
-}
-
-async fn request_shutdown_drain_then_save<D, S, SR>(
-    shutdown: &mc_net::ShutdownHandle,
-    runtime_control: Option<&mc_net::RuntimeControlHandle>,
-    drain: Pin<&mut D>,
-    save: S,
-) -> (Result<D::Output, tokio::time::error::Elapsed>, SR)
-where
-    D: Future,
-    S: Future<Output = SR>,
-{
-    if let Some(runtime_control) = runtime_control {
-        runtime_control.request_drain();
-    }
-    shutdown.request();
-    let drain_result = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, drain).await;
-    let save_result = save.await;
-    (drain_result, save_result)
 }
 
 fn build_terrain_generator(
@@ -2412,59 +2369,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_sequence_requests_and_drains_before_save() {
+    async fn production_bound_server_performs_final_save_after_internal_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap());
+        let items = Arc::new(mc_data::items::ItemRegistry::default());
+        let world = Arc::new(tokio::sync::Mutex::new(
+            mc_world::WorldStorage::open(tmp.path(), Arc::clone(&blocks))
+                .unwrap()
+                .with_item_registry(Arc::clone(&items)),
+        ));
         let shutdown = mc_net::ShutdownHandle::default();
-        let runtime_control = mc_net::RuntimeControlHandle::new(mc_net::RuntimeControlConfig {
-            policy: mc_net::AutoscalePolicy {
-                min_view_distance: 2,
-                max_view_distance: 8,
-                min_chunk_send_rate: 1,
-                max_chunk_send_rate: 16,
-                min_chunk_load_rate: 2,
-                max_chunk_load_rate: 64,
-                min_chunk_generate_rate: 3,
-                max_chunk_generate_rate: 32,
-                ..mc_net::AutoscalePolicy::for_profile(mc_net::AutoscaleProfile::Balanced)
-            },
-            initial_limits: mc_net::RuntimeControlLimits {
-                view_distance: 8,
-                chunk_send_rate: 16,
-                chunk_load_rate: 64,
-                chunk_generate_rate: 32,
-            },
-        });
-        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let drain_shutdown = shutdown.clone();
-        let drain_runtime_control = runtime_control.clone();
-        let drain_events = Arc::clone(&events);
-        let mut drain = std::pin::pin!(async move {
-            assert!(drain_shutdown.is_requested());
-            assert!(drain_runtime_control.snapshot().draining);
-            drain_events.lock().unwrap().push("drain");
-            Ok::<(), std::io::Error>(())
-        });
-        let save_shutdown = shutdown.clone();
-        let save_runtime_control = runtime_control.clone();
-        let save_events = Arc::clone(&events);
-        let save = async move {
-            assert!(save_shutdown.is_requested());
-            assert!(save_runtime_control.snapshot().draining);
-            assert_eq!(save_events.lock().unwrap().as_slice(), ["drain"]);
-            save_events.lock().unwrap().push("save");
-            42
+        let config = mc_net::ServerConfig {
+            bind_address: "127.0.0.1:0".parse().unwrap(),
+            motd: "shutdown phase test".into(),
+            max_players: 0,
+            view_distance: 0,
+            data: Arc::new(mc_data::testing::stub()),
+            blocks,
+            world: Some(world),
+            tags: Arc::new(mc_data::tags::TagsData::default()),
+            recipes: Arc::new(Vec::new()),
+            loot: Arc::new(mc_data::loot::LootTables::default()),
+            block_light: None,
+            items,
+            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+            entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+            random_tick: mc_net::RandomTickPolicy::default(),
+            command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+            shutdown: shutdown.clone(),
         };
-
-        let (drain_result, save_result) = request_shutdown_drain_then_save(
-            &shutdown,
-            Some(&runtime_control),
-            drain.as_mut(),
-            save,
-        )
-        .await;
-
-        assert!(drain_result.unwrap().is_ok());
-        assert_eq!(save_result, 42);
-        assert_eq!(events.lock().unwrap().as_slice(), ["drain", "save"]);
+        let bound = mc_net::bind(config).await.expect("bind");
+        let metadata = tmp.path().join("solaris").join("world.dat");
+        shutdown.request();
+        run_bound_server(bound, shutdown)
+            .await
+            .expect("production entrypoint drains and performs its sole final save");
+        assert!(metadata.exists());
     }
 
     #[test]

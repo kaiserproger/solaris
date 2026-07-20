@@ -35,9 +35,10 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let farmland = crop_test_state(&blocks, "minecraft:farmland", &[]);
     let melon_stem_age7 = crop_test_state(&blocks, "minecraft:melon_stem", &[("age", "7")]);
@@ -169,11 +170,7 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(
-                pumpkin_stem_pos.0,
-                pumpkin_stem_pos.1,
-                pumpkin_stem_pos.2,
-            ),
+            position: pack_block_pos(pumpkin_stem_pos.0, pumpkin_stem_pos.1, pumpkin_stem_pos.2),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -219,11 +216,7 @@ async fn survival_plant_lifecycle_covers_stems_cocoa_and_harvest() {
         })
         .await
         .expect("place cocoa beans on jungle log");
-    wait_for_plant_deltas(
-        &mut client,
-        &[(cocoa_place_pos, cocoa_age0_east.0 as i32)],
-    )
-    .await;
+    wait_for_plant_deltas(&mut client, &[(cocoa_place_pos, cocoa_age0_east.0 as i32)]).await;
 
     let mut cocoa_drops = expected_crop_drops(&items, &[("minecraft:cocoa_beans", 3)]);
     break_crop_and_wait_for_drops(
@@ -267,7 +260,8 @@ async fn wait_for_plant_deltas(client: &mut Client, expected: &[((i32, i32, i32)
         }
         if frame.id == SectionBlocksUpdate::ID {
             let mut body = frame.body;
-            let pkt = SectionBlocksUpdate::decode(&mut body).expect("decode plant SectionBlocksUpdate");
+            let pkt =
+                SectionBlocksUpdate::decode(&mut body).expect("decode plant SectionBlocksUpdate");
             mark_plant_section_deltas(&mut expected, pkt);
         }
     }

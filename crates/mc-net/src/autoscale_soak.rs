@@ -248,8 +248,9 @@ impl AutoscaleSoakReport {
 mod tests {
     use super::*;
     use crate::{
-        AutoscaleAction, AutoscalePolicy, AutoscalePressure, AutoscaleProfile, RuntimeControlInput,
-        RuntimeControlLimits, RuntimeControlPlane, SaveAllTimings, server::SaveAllReport,
+        AutoscaleAction, AutoscalePolicy, AutoscalePressure, AutoscaleProfile,
+        RuntimeControlLimits, RuntimeControlPlane, SaveAllTimings,
+        control_plane::RuntimeControlSignal, server::SaveAllReport,
     };
 
     fn policy() -> ChunkPipelinePolicy {
@@ -360,13 +361,8 @@ mod tests {
                 chunk_generate_rate: 16,
             },
         );
-        let decision = controller.observe(RuntimeControlInput {
-            tick_ms: 35,
-            queued_chunks: 64,
-            queue_capacity: 64,
-            memory_used_mb: 512,
-            memory_limit_mb: 4096,
-            first_chunk_ms: Some(500),
+        let decision = controller.observe_signal(RuntimeControlSignal::ChunkPressure {
+            saturated_sources: 1,
         });
         assert_eq!(decision.action, AutoscaleAction::ScaleDown);
         assert_eq!(decision.pressure, Some(AutoscalePressure::ChunkQueue));

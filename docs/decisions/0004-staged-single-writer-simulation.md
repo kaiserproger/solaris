@@ -144,16 +144,15 @@ planner subsumes it, or if runtime measurements show that its grouping cost is
 not beneficial; the structural reduction alone is not performance evidence.
 
 Physics prepare reads are detached from the session registry lock. The runtime
-prefetches the versioned CAS input first, then takes session state to validate
-the expected motion and plan publication; an empty published mirror avoids a
-separate owner status request. After commit, it still reads authoritative
-post-state and re-reads current state under the publication lock. Those reads
-are intentional correctness fences: returning only the accepted input can
-publish stale motion after a newer commit, and vehicle-group migration can move
-a passenger to a different authoritative position than its requested state.
-The remaining reads may only be removed after owner commit and session
-publication share a monotonic token that orders physics, removal, migration,
-and packet-visible dispatch.
+prefetches the versioned CAS input first, reads item-expiry and prior motion
+state from ECS, then takes session state only to plan publication. After commit,
+it reads authoritative post-state again under the publication lock and derives
+the published snapshot projection from that state. Those reads are intentional
+correctness fences: returning only the accepted input can publish stale motion
+after a newer commit, and vehicle-group migration can move a passenger to a
+different authoritative position than its requested state. They may only be
+removed after owner commit and session publication share a monotonic token that
+orders physics, removal, migration, expiry, and packet-visible dispatch.
 
 Goal apply has a typed post-commit projection fast path. The regional owner
 returns only sorted alive `EntityKinematics` for the requested active ids after
@@ -280,38 +279,33 @@ Dirty chunk planning and commit remain protected by world mutation tokens and
 may include later world changes, so this is an ordered simulation snapshot, not
 a global atomic disk transaction.
 
-Prompt 04 adds a standalone `bevy_ecs 0.18.1` shadow runtime inside
+Prompt 04 introduced a standalone `bevy_ecs 0.18.1` runtime inside
 `EntityStore`. The dependency is pinned below the 0.19 line because Solaris is
 on Rust 1.94 and Bevy ECS 0.19 requires Rust 1.95. Default features are disabled
 and only `std` is enabled; chunks, block entities, connections, registries, and
 Tokio handles remain outside ECS.
 
-Prompt 04 initially kept legacy `EntityStore` authoritative. Each successful
-spawn/restore, AI or physics result, item/goal/vehicle update, damage/lifecycle
-transition, and removal fed the corresponding ECS schedule in the same owner
-turn. Command drain, AI snapshot, physics apply, and persistence phases compared
-exact component state and ordered semantic events. The comparison path kept
-full snapshots only on mismatch, recorded the first divergence in telemetry,
-and wrote a replay JSON under `.analysis/`; it never changed client output.
+Prompt 04 initially kept the legacy `EntityStore` as authority and compared its
+state and ordered semantic events with ECS in the same owner turn. That
+temporary comparison authority and its feature have now been deleted. ECS is
+the sole entity authority; vanilla oracle tests and focused domain tests replace
+the deleted in-process comparison path.
 
-The shadow exit evidence includes all current `mc-entity` tests, all 531
+The migration evidence included all then-current `mc-entity` tests, all 531
 `mc-net` library tests, a deterministic mixed-family persistence/restart replay,
 an explicit 72,000-tick accelerated replay with no divergence, and a debug
-1,000-entity density report. That report measured `157 us/tick` for legacy-only
-and `9,437 us/tick` for legacy plus shadow over 200 ticks on the development
-host. This temporary overhead is accepted for shadow validation; ECS authority
-and removal of the legacy mirror belong to Prompt 05.
+1,000-entity density report. Those historical measurements justified the
+authority transfer but do not describe a retained runtime mode.
 
-Prompt 05 transfers production authority to ECS for item/XP entities,
+Prompt 05 transferred production authority to ECS for item/XP entities,
 projectiles/falling blocks, passive and hostile mobs, command-summoned
-entities, and vehicles. Every `mc-net` spawn and persistence restore now calls
-the explicit authoritative ECS API. `EntityStore` is production ECS-only: there
-is no production caller of the legacy spawn/restore path. Network, visibility,
-collision, combat, pickup, and persistence code read immutable snapshots
-reconstructed from ECS; stable runtime ids, UUIDs, and wire ordering remain
-unchanged. The former shadow comparison is default-off and can be enabled only
-through the `mc-net` dev-dependency, so it remains a test oracle rather than a
-second production authority.
+entities, and vehicles. Every spawn and persistence restore now calls the direct
+ECS API. `EntityStore` is ECS-only and has no legacy spawn/restore path.
+Network, visibility, collision, combat, pickup, and persistence code read
+immutable snapshots reconstructed from ECS; stable runtime ids, UUIDs, and wire
+ordering remain unchanged. Vanilla captures and domain oracle tests provide
+comparison evidence without retaining a second authority or comparison feature
+in production or test builds.
 
 `EntityStore` is held by its own measured mutex beside `SessionRegistryInner`,
 not inside it. Goal scheduling, pathing preparation, and physics-query
@@ -392,6 +386,43 @@ Current focused evidence is `mc-entity` `179 passed/7 ignored`, `cargo check`
 and strict Clippy for that crate, plus passing `cargo check -p mc-net --tests`.
 No final full-workspace validation has run for the completed extraction. No
 readiness claim follows from this checkpoint.
+
+The sole-ECS persistence hardening slice now treats a regional journal entry's
+`(phase, sequence watermark, lifecycle epoch)` as its durable cleanup identity.
+An append with unknown outcome remains pending in memory, recovered entries keep
+their exact identity, and checkpoint acknowledgement removes only the identity
+captured by that checkpoint. Entity checkpoint format 3 also persists head yaw,
+the current goal, vehicle state, the lifecycle epoch, and the regional sequence
+watermark; save and load reject missing, dangling, cross-region, multiply-owned,
+self-referential, or cyclic vehicle graphs.
+Full-snapshot ECS CAS rebuilds both vehicle indexes before publishing a valid
+replacement and leaves both ECS and indexes untouched on stale or invalid input.
+The simulation lifecycle clock now advances the regional owner epoch before
+lifecycle mutation, and restore reinstates the checkpoint's epoch and sequence
+boundary. Decision creation reads that owner epoch. The regional sequence is a
+global monotonic watermark: advancing the lifecycle epoch never permits replay
+below the checkpoint's sequence watermark. Replay still filters decisions from
+an older lifecycle epoch and same-epoch decisions at or below the checkpoint,
+so pre-checkpoint removals or timer values cannot overwrite post-checkpoint
+state while a newer same-epoch decision still replays. A later-epoch decision
+at or below the checkpoint sequence is invalid recovery data rather than a new
+sequence domain.
+
+Every applied WAL upsert is semantically preflighted before replay publishes a
+checkpoint: its entity type must exist in the canonical 26.1.2 registry, and
+its living and active-effect state must be accepted by the ECS runtime
+conversion. Invalid WAL therefore returns typed invalid data before ECS restore,
+without partial publication or a panic. Replay projects persisted age and pickup
+delay from each restored ECS snapshot's retained ticks at the final replay
+lifecycle boundary; new valid WAL-only spawns remain valid format-3 checkpoint
+input and repeated replay remains idempotent.
+
+Required arrow and item retained state is installed in the same ECS spawn
+transaction as identity and kinematics. Entity physics and item expiry read ECS
+snapshots; the published snapshot map is only a wire projection rederived after
+an accepted ECS mutation or invalidated on removal. The former test-only entity
+access and command-spawn compatibility wrappers are removed, and tests enter
+through the same owner lock and authority-gated spawn APIs as production.
 
 ## Staged Authority
 

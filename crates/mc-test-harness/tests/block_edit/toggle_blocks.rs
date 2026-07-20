@@ -44,7 +44,7 @@ async fn survival_hand_use_toggles_wood_and_copper_but_not_iron_doors_and_trapdo
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -141,7 +141,9 @@ async fn survival_hand_use_toggles_wood_and_copper_but_not_iron_doors_and_trapdo
         seed_block(&mut world, iron_trapdoor_pos, iron_trapdoor_closed);
         seed_block(&mut world, copper_trapdoor_pos, copper_trapdoor_closed);
         assert_eq!(
-            world.get_block(oak_door_lower).expect("read seeded oak door"),
+            world
+                .get_block(oak_door_lower)
+                .expect("read seeded oak door"),
             Some(oak_door_closed)
         );
     }
@@ -435,5 +437,9 @@ fn observe_toggle_update(
 }
 
 fn section_pos_for_block(pos: mc_world::BlockPos) -> i64 {
-    pack_section_pos(pos.x.div_euclid(16), pos.y.div_euclid(16), pos.z.div_euclid(16))
+    pack_section_pos(
+        pos.x.div_euclid(16),
+        pos.y.div_euclid(16),
+        pos.z.div_euclid(16),
+    )
 }

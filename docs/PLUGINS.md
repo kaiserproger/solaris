@@ -1,108 +1,101 @@
 # Lua Plugins
 
-Solaris can load server-side Lua plugins from the directory configured in the
-server TOML:
+Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
+other version is rejected. There is no legacy manifest or Lua API compatibility
+path.
 
-```toml
-[plugins]
-directory = "plugins"
-```
+`mc-net` provides the `0.6.0` plugin-storage adapter. Menu, transaction, zone,
+colony, and villager adapters do not exist yet. The examples are contract-tested
+fixtures, not live plugins.
 
-The path is relative to the server process working directory. Omit the section
-or `directory` to disable the plugin host.
+## Package And Manifest
 
-## Package
-
-Each plugin has its own directory:
+The configured plugin directory contains one directory per plugin:
 
 ```text
 plugins/
-`-- welcome/
+`-- currency-catalog/
     |-- plugin.toml
     `-- main.lua
 ```
 
-`plugin.toml` declares the plugin identity, API version, event subscriptions,
-player command roots, console command roots, and entity types it may spawn:
-
 ```toml
-id = "welcome"
-name = "Welcome"
+id = "currency-catalog"
+name = "Currency Catalog"
 version = "0.1.0"
-api = "0.5.0"
-events = ["player.joined", "player.chat"]
-player_commands = ["hello"]
-operator_commands = ["adminday"]
+api = "0.6.0"
+events = ["server.started", "player.zone_entered", "inventory.menu.clicked"]
+capabilities = ["storage", "inventory_menus", "inventory_storage_transactions", "zones"]
+player_commands = ["catalog"]
+operator_commands = ["catalogadmin"]
 console_commands = ["time"]
 spawn_entities = ["minecraft:pig"]
+dependencies = [{ id = "economy", relation = "required" }]
+permissions = ["solaris:catalog.read"]
 ```
 
-Plugin IDs must be unique. Invalid plugins are skipped without stopping the
-server. `player_commands` entries must be non-empty lowercase ASCII literals
-containing only `a-z`, `0-9`, `_`, or `-`. Duplicate entries in one manifest
-are deduplicated. Declaring `player_commands` requires script API `0.3.0` or
-newer. `operator_commands` uses the same root syntax but requires script API
-`0.4.0`; it is visible and invokable only by server operators. A root cannot
-appear in both lists. Older manifests, including API `0.3.0` manifests with
-only `player_commands`, remain valid. A root is
-limited to 64 ASCII bytes. At most 128 plugin roots, or 256 command-tree nodes,
-may be active across the server. Registration is atomic: a plugin is skipped as
-a whole if it would exceed a limit, if one of its roots is a Solaris built-in
-command, or if an earlier plugin already claimed the root. Changes to plugin
-files and command declarations take effect only after a server restart.
+Plugin ids use lowercase ASCII letters, digits, `_`, `-`, or `.`. Command roots
+remain lowercase ASCII literals of at most 64 bytes. Plugin command roots are
+globally exclusive, bounded to 128 roots, and cannot shadow a Solaris built-in.
+`console_commands` and `spawn_entities` remain exact allow-lists. A resource
+identifier must be fully namespaced lowercase ASCII and no more than 128 bytes.
+`relation` is `required`, `optional`, or `load_before`.
 
-`spawn_entities` is an exact allow-list for `solaris.spawn_entity`. It requires
-script API `0.5.0` or newer. Each entry is a unique, fully namespaced lowercase
-resource identifier such as `minecraft:pig`, limited to 128 bytes. A plugin may
-declare at most 32 entity types. Older `0.1.0` through `0.4.0` manifests remain
-valid when `spawn_entities` is empty.
+Discovery reads at most 128 plugin directories. `plugin.toml` is capped at 64
+KiB and `main.lua` at 1 MiB. The loader checks file metadata first and then
+performs a capped streaming read, so a growing or sparse file cannot bypass the
+limit. Plugin ids and versions are at most 64 bytes, display names at most 128
+bytes, and every manifest string/list is bounded before the normalized manifest
+allocates. A manifest may contain at most 64 events, 64 dependencies, 128
+capabilities, 64 permissions, and 128 player or operator command roots.
 
-## Handlers
+`capabilities` is an exact, duplicate-free list:
 
-`main.lua` may define handlers for its subscribed events:
+| Capability | Allows |
+| --- | --- |
+| `storage` | `storage_get`, `storage_cas`, `storage_delete` |
+| `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
+| `inventory_storage_transactions` | `inventory_storage_transaction` |
+| `zones` | `upsert_zone`, `remove_zone`, owned zone-entry events |
+| `colonies` | `upsert_colony`, `bind_nearest_villager` |
 
-```lua
-function on_player_joined(event)
-    solaris.send_message(event.player_id, "Welcome " .. event.username)
-end
+An undeclared privileged call fails synchronously in Lua before it enters the
+bounded command batch. Unknown capabilities reject the plugin during discovery.
 
-function on_player_chat(event)
-    if event.message == "day" then
-        solaris.run_console("time set day")
-    end
-end
+## Events
 
-function on_player_command(event)
-    solaris.send_message(
-        event.player_id,
-        "Hello " .. event.username .. "; arguments: " .. event.arguments
-    )
-end
-```
+`events` subscribes to broadcast events. All event values are immutable DTO
+snapshots. `player.command` and every result/owner event below are targeted: the
+host routes them to exactly the owning plugin and never broadcasts them. A
+targeted event does not need a broad subscription to reach its owner.
 
-| Event | Handler | Fields |
+| Event | Lua handler | Fields |
 | --- | --- | --- |
 | `server.started` | `on_server_started` | `name` |
 | `server.stopping` | `on_server_stopping` | `name`, `reason` |
-| `player.joined` | `on_player_joined` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z` |
-| `player.left` | `on_player_left` | `name`, `player_id`, `reason` |
-| `player.chat` | `on_player_chat` | `name`, `player_id`, `message`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z` |
-| `player.command` | `on_player_command` | `name`, `player_id`, `context_verified`, `uuid`, `username`, `operator`, `x`, `y`, `z`, `root`, `arguments` |
-| `server.tick` | `on_server_tick` | `name`, `tick` |
+| `player.joined` | `on_player_joined` | player snapshot |
+| `player.left` | `on_player_left` | `player_id`, `reason` |
+| `player.chat` | `on_player_chat` | player snapshot, `message` |
+| `server.tick` | `on_server_tick` | `tick` |
+| `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
+| `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
+| `plugin.storage.cas_result` | `on_plugin_storage_cas_result` | `request_id`, `key`, `applied`, `version`, `failure` |
+| `plugin.storage.delete_result` | `on_plugin_storage_delete_result` | `request_id`, `key`, `deleted`, `version`, `failure` |
+| `inventory.menu.clicked` | `on_inventory_menu_clicked` | player snapshot, `menu_id`, `slot`, `click` |
+| `inventory.storage_transaction.result` | `on_inventory_storage_transaction_result` | `request_id`, `committed` |
+| `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
+| `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
+| `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
 
-`player.command` is targeted to the one plugin that owns `root`; it is not a
-broadcast subscription and must not be added to `events`. `arguments` is the
-unparsed remainder after the root, with leading separator whitespace removed.
-For player gameplay events, `context_verified` is `true` when `uuid`,
-`username`, `operator`, and `x`/`y`/`z` are immutable server-authoritative
-snapshots from the verified login profile, current accepted player pose, and
-command permissions at publication time. Legacy Rust event constructors retain
-their signatures but publish `context_verified = false`; `uuid`, `operator`,
-and `x`/`y`/`z` are absent (`nil` in Lua). Their pre-existing joined/command
-`username` field remains available for compatibility but is not verified
-context. They do not provide a query API and never include the peer IP address.
+A player snapshot contains only `player_id`, `uuid`, `username`, `operator`,
+`x`, `y`, and `z`, captured by the server at publication. It contains no
+session, peer address, entity reference, or live query handle. An absent storage
+record has `value = nil` and `version = nil`. An unsuccessful villager binding
+has `binding_token = nil` and `binding_expires_at_tick = nil`.
 
 ## Commands
+
+The existing bounded presentation commands remain available:
 
 ```lua
 solaris.send_message(player_id, text)
@@ -112,58 +105,157 @@ solaris.run_console(command)
 solaris.spawn_entity(player_id, entity_type, x, y, z)
 ```
 
-`run_console` is denied unless the first word of the command is listed in
-`console_commands`. The current server executes the same command parser used by
-stdin. Commands that require a player source are rejected.
+Storage is scoped by the host-attached plugin identity. Lua does not pass a
+plugin id and cannot forge one:
 
-`spawn_entity` creates exactly one entity only when `entity_type` is in the
-plugin's `spawn_entities` declaration. The identifier must be fully namespaced
-and the coordinates must be finite, with `x` and `z` within +/-30,000,000 and
-`y` within +/-20,000,000. Invalid input and undeclared entity types fail
-synchronously in Lua before entering the server command queue. Unknown server
-registry types, a full or closed queue, shutdown, a stale player session, or a
-canceled owner response are rejected once and logged by the server; Lua receives
-no entity handle, promise, or later result event.
+```lua
+solaris.storage_get(request_id, key)
+solaris.storage_cas(request_id, key, expected_version, value)
+solaris.storage_delete(request_id, key, expected_version)
+```
 
-The player ID is only a session fence. The network adapter resolves the server
-registry type before submission. The simulation owner then allocates and records
-the entity and sends normal visibility updates through the reliable outbound
-lane. If that player disconnects before owner execution, the spawn makes no
-mutation and a later session cannot inherit it. Lua never receives a simulation
-handle, session registry, entity ID, or numeric protocol type ID.
+`request_id` is a lowercase ASCII id up to 64 bytes. A key is a non-empty
+string up to 128 bytes; a value is a non-empty string up to 4096 bytes.
+`expected_version` is a storage version returned by `storage_get`; `nil` means
+the record must be absent. The storage adapter emits exactly one targeted result
+after a committed read or mutation, and owns conflict outcomes and revision
+allocation. Reads carry either both `value` and `version` or neither; successful
+compare-and-swap and delete results carry a version. `failure` is `nil` for a
+normal absent record, stale precondition, or durable success. It is
+`"unavailable"` when the server has no persistent world and
+`"durability_failed"` after the storage actor encounters a definite pre-append
+write failure. Failure results carry no value/version and report mutations as
+not applied. A synchronization error after a complete append has an unknown
+durability outcome: the actor fail-stops without claiming that request failed,
+and startup resolves the CRC-valid transaction frame and its durable result
+outbox.
 
-Active `player_commands` roots are sent in every player's command tree as
-literal commands with an optional greedy argument string. Active
-`operator_commands` roots are sent only to operators and are marked restricted.
-They do not expose or grant any built-in administrator command. A forged
-non-operator command to an operator root returns the normal permission-denied
-response and is rejected before entering the Lua event queue. Unknown roots and
-built-in permission checks continue through the normal server command parser.
+Storage is durable below `world/solaris/plugin-storage-v1`, isolated by the
+host-attached plugin id, and has no legacy schema. The single storage actor has
+a 256-command queue; it permits at most 4,096 live records per plugin, 64 MiB
+of live values total, and a 128 MiB CRC-framed journal. Each successful mutation
+frame contains the admitted plugin id, request id, request fingerprint,
+transaction revision, state transition, and targeted result identity. The frame
+is appended and `sync_all`ed before memory changes. Result publication is then
+followed by a separately synced delivery-ack frame. Until that ack is replayed,
+the result remains in the durable outbox and is delivered again on startup.
+Reusing the same plugin/request identity with identical content reuses the
+original transaction and version without repeating the mutation; substituted
+content is rejected.
+Malformed, oversized, and checksum-invalid journals fail closed. An incomplete
+final frame is truncated only back to the verified frame prefix and synced;
+compaction writes a synced temporary journal, renames it atomically, then syncs
+the parent directory.
 
-## Isolation
+With a persistent world configured, malformed journal data or plugin-storage
+startup I/O fails the server bind with the typed storage startup error; Lua is
+not left live with storage silently disabled. Without a persistent world,
+non-storage plugin behavior remains available and every admitted storage request
+receives the targeted `unavailable` result. A definite durability failure closes
+the actor command receiver, then consumes the failed request and every command
+already queued behind it in FIFO order into one awaited targeted failure result
+each. For an unknown post-append sync outcome, the current admitted ticket is
+consumed into the durable transaction identity for startup replay; queued
+requests are consumed into explicit failure results. Later submissions either
+receive the same explicit failure after that drain or stop command orchestration
+if their queue is closed during shutdown.
 
-Plugins run on one dedicated host thread, in one Lua VM per plugin. Server tasks
-publish immutable events through a bounded queue and never wait for Lua. Lua
-commands return through another bounded queue and execute outside Lua.
+A future inventory adapter will own menus after admission. Plugins describe
+fixed display slots but will not receive container, slot-stack, NBT, or
+click-packet state:
 
-Each VM has fixed limits: 16 MiB of Lua memory, 100,000 instructions per load or
-handler, and 32 commands per event. A failed or over-budget handler disables only
-that plugin. The host exposes table, string, math, and UTF-8 libraries; filesystem,
-network, process, package loading, and debug libraries are unavailable.
+```lua
+solaris.open_inventory_menu(player_id, menu_id, title, {
+    { slot = 0, resource = "minecraft:apple", count = 1, label = "Apple" },
+})
+solaris.close_inventory_menu(player_id, menu_id)
+```
 
-Event and command queues remain bounded and nonblocking. If the event queue is
-full, an authorized recognized player command is dropped under the existing
-backpressure policy and the server does not send an immediate unknown-command
-response. Operator-root authorization happens before that queue check. If the
-Lua host queue is closed, the root is no longer accepted.
+Menu ids use the same 64-byte id rule, titles and labels are at most 128 bytes,
+and a menu has at most 54 unique slots. `click` is one of `primary`, `secondary`,
+`shift_primary`, or `shift_secondary`.
 
-Hot unload and reload are not supported. If a plugin disables after a handler
-failure, all of its roots are removed from server admission before the host
-processes another event. Players who connect afterward receive the updated
-tree. Already connected clients may retain stale completion nodes until they
-reconnect; invoking such a stale root is rejected as unknown because it no
-longer has an active owner.
+A future transaction adapter will treat each inventory/storage request as one
+commit. Positive inventory `delta` grants a resource and negative `delta`
+removes one; a delta cannot be zero or exceed 64 in magnitude. Each side must
+be non-empty and have at most 16 unique resources or storage keys. The adapter
+will commit all mutations or none.
 
-This API covers lifecycle, chat, disconnects, existing console commands, and
-allow-listed entity spawning. Direct world, inventory, recipe, and
-custom-content APIs are not implemented yet.
+```lua
+solaris.inventory_storage_transaction(player_id, request_id,
+    { { resource = "minecraft:apple", delta = 1 } },
+    { { operation = "cas", key = "coins:player", expected_version = 4, value = "7" } }
+)
+```
+
+Storage mutations use `operation = "cas"` or `operation = "delete"`; both use
+the same expected-version semantics as the standalone commands.
+
+Zones are axis-aligned definitions, scoped by the host-attached plugin id:
+
+```lua
+solaris.upsert_zone("catalog-square", "minecraft:overworld", -8, 60, -8, 8, 100, 8)
+solaris.remove_zone("catalog-square")
+```
+
+All six coordinates must be finite, within the existing script coordinate
+limits, and ordered minimum-to-maximum on every axis. A future zone adapter will
+own membership tracking and publish `player.zone_entered` only to the plugin
+that owns the zone.
+
+Colonies are bounded records, not world/entity access:
+
+```lua
+solaris.upsert_colony("register-colony", "starter-colony", "Starter Colony",
+    "minecraft:overworld", 0, 64, 0)
+solaris.bind_nearest_villager("bind-player-7", "starter-colony", 0, 64, 0, 16)
+```
+
+Colony ids follow the 64-byte id rule and names are at most 128 bytes. A binding
+search radius must be finite, positive, and no greater than 64. The result token
+is ephemeral; it is not an entity id, pointer, or durable villager capability.
+There is deliberately no Lua API for villager goals, pathing, memory, inventory,
+or direct entity mutation.
+
+## Isolation And Limits
+
+Each plugin has one Lua VM on the dedicated host thread with a 16 MiB memory
+limit, 100,000 instructions per load or handler, and at most 32 commands per
+event. Event and command queues are bounded and nonblocking. One invocation's
+command batch enters the host queue atomically or not at all. On queue
+saturation or closure, the host calls `on_command_batch_rejected(result)`
+directly with `reason = "queue_full"` or `reason = "queue_closed"` and the
+exact `command_count`; that callback cannot emit another command. A failed
+handler disables only that plugin.
+
+Shutdown publishes `server.stopping` before closing event admission. Calls that
+start after that fence receive `ScriptQueueError::Closed`; events admitted
+before it remain in the bounded queue. The host drains those events, then drops
+its command producer. The server drains commands until that producer closes,
+so commands emitted by the accepted stopping event are not lost. A shutdown
+timeout may report a stuck host as failure, but elapsed time is never treated as
+successful drain evidence.
+
+The host wraps every Lua-emitted command in a bounded, one-shot admission ticket
+before it crosses the script boundary. A production router must use this exact
+sequence:
+
+1. Receive the raw command with `ScriptBoundary::recv_command`.
+2. For `HostAttached`, immediately consume it with
+   `ScriptBoundary::accept_host_command` before any side effect.
+3. Route only the returned `AdmittedScriptCommand`; rejection means no mutation
+   and no result publication.
+4. Build storage, transaction, colony, and binding results with the matching
+   consuming method on `AdmittedScriptCommand`.
+5. For an accepted owning `OpenInventoryMenu` or `UpsertZone`, use
+   `into_open_inventory_menu` or `into_upsert_zone` and retain the returned
+   `ScriptPluginTarget` for later click or entry events.
+
+A ticket records the exact plugin and exact request. A cloned ticket can be
+accepted once, request substitution consumes and rejects it, and public code
+cannot construct an arbitrary targeted result. Directly matching and trusting
+the fields of `HostAttached` is not an adapter API. Lua exposes no filesystem,
+network, process, debug, paths, locks, NBT, sessions, or entity pointers.
+
+See [the contract examples](../examples/plugins/) for the configurable currency
+catalog and the intentionally limited colony/villager scaffold.

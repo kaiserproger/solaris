@@ -5,7 +5,7 @@
 //! Layout on the wire **without compression** (one packet):
 //!
 //! ```text
-//! [VarInt packet_length] [VarInt packet_id] [body bytes…]
+//! [VarInt21 packet_length] [VarInt packet_id] [body bytes…]
 //!                        \__________________________/
 //!                         exactly packet_length bytes
 //! ```
@@ -13,7 +13,7 @@
 //! Layout on the wire **with compression** (one packet, threshold T):
 //!
 //! ```text
-//! [VarInt packet_length] [VarInt data_length] [packet body — see below]
+//! [VarInt21 packet_length] [VarInt data_length] [packet body — see below]
 //!                        \__________________________________________/
 //!                         exactly packet_length bytes
 //!
@@ -36,16 +36,14 @@ use flate2::write::ZlibEncoder;
 use std::io::{Read, Write};
 use thiserror::Error;
 
-use crate::codec::{ReadMc, WriteMc, read_varint_partial, varint_encoded_len};
+use crate::codec::{ReadMc, WriteMc, varint_encoded_len};
 use crate::error::CodecError;
 
-/// Hard ceiling on the size of any single frame's payload, in bytes.
-///
-/// Vanilla's effective ceiling is around 2 MB for normal packets and
-/// significantly higher for a handful of bulk packets. We pick 8 MB as a
-/// generous DoS guard; if a real packet legitimately exceeds this we'll
-/// revisit per-packet limits in a later milestone.
-pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum value of the outer `packet_length` VarInt21.
+pub const MAX_PACKET_LENGTH: usize = (1 << 21) - 1;
+
+/// Maximum declared size of a decompressed packet, including its packet ID.
+pub const MAX_DECOMPRESSED_BYTES: usize = 8 * 1024 * 1024;
 
 /// One decoded frame: packet ID plus the body bytes that follow it.
 ///
@@ -112,10 +110,10 @@ pub enum FramingError {
     #[error("codec error: {0}")]
     Codec(#[from] CodecError),
 
-    #[error("frame exceeds the configured maximum of {MAX_FRAME_BYTES} bytes (got {got})")]
-    FrameTooLarge { got: usize },
+    #[error("frame exceeds the applicable maximum of {max} bytes (got {got})")]
+    FrameTooLarge { got: usize, max: usize },
 
-    #[error("declared frame length is negative ({0})")]
+    #[error("declared decompressed payload length is negative ({0})")]
     NegativeLength(i32),
 
     /// `data_length` claimed the uncompressed body would be this long, but
@@ -143,6 +141,20 @@ pub enum FramingError {
 // Decoding
 // ---------------------------------------------------------------------------
 
+fn read_packet_length(buf: &[u8]) -> Result<Option<(usize, usize)>, CodecError> {
+    let mut value = 0_usize;
+    for index in 0..3 {
+        let Some(&byte) = buf.get(index) else {
+            return Ok(None);
+        };
+        value |= usize::from(byte & 0x7F) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Ok(Some((value, index + 1)));
+        }
+    }
+    Err(CodecError::VarIntTooLong)
+}
+
 /// Try to pull a single frame off the front of `buf`.
 ///
 /// Returns:
@@ -156,18 +168,11 @@ pub fn try_decode_frame(
     buf: &mut BytesMut,
     compression: Compression,
 ) -> Result<Option<RawFrame>, FramingError> {
-    // 1. Peek the leading packet_length VarInt without consuming it.
-    let (packet_length_signed, length_bytes) = match read_varint_partial(buf)? {
+    // 1. Peek the leading packet_length VarInt21 without consuming it.
+    let (packet_length, length_bytes) = match read_packet_length(buf)? {
         None => return Ok(None),
         Some(parts) => parts,
     };
-    if packet_length_signed < 0 {
-        return Err(FramingError::NegativeLength(packet_length_signed));
-    }
-    let packet_length = packet_length_signed as usize;
-    if packet_length > MAX_FRAME_BYTES {
-        return Err(FramingError::FrameTooLarge { got: packet_length });
-    }
 
     // 2. Need all `packet_length` bytes after the length VarInt itself.
     if buf.len() < length_bytes + packet_length {
@@ -202,8 +207,11 @@ pub fn try_decode_frame(
                         threshold,
                     });
                 }
-                if data_length > MAX_FRAME_BYTES {
-                    return Err(FramingError::FrameTooLarge { got: data_length });
+                if data_length > MAX_DECOMPRESSED_BYTES {
+                    return Err(FramingError::FrameTooLarge {
+                        got: data_length,
+                        max: MAX_DECOMPRESSED_BYTES,
+                    });
                 }
                 // `body` here is the compressed payload.
                 let decoder = ZlibDecoder::new(body.as_ref());
@@ -247,9 +255,10 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
 
     match compression {
         Compression::Disabled => {
-            if uncompressed_len > MAX_FRAME_BYTES {
+            if uncompressed_len > MAX_PACKET_LENGTH {
                 return Err(FramingError::FrameTooLarge {
                     got: uncompressed_len,
+                    max: MAX_PACKET_LENGTH,
                 });
             }
             let mut out = BytesMut::with_capacity(
@@ -264,8 +273,11 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
             if uncompressed_len < threshold {
                 // data_length = 0 sentinel; transmit plaintext.
                 let inner_len = 1 /* data_length zero */ + uncompressed_len;
-                if inner_len > MAX_FRAME_BYTES {
-                    return Err(FramingError::FrameTooLarge { got: inner_len });
+                if inner_len > MAX_PACKET_LENGTH {
+                    return Err(FramingError::FrameTooLarge {
+                        got: inner_len,
+                        max: MAX_PACKET_LENGTH,
+                    });
                 }
                 let mut out =
                     BytesMut::with_capacity(varint_encoded_len(inner_len as i32) + inner_len);
@@ -275,9 +287,10 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
                 out.put_slice(body);
                 Ok(out.freeze())
             } else {
-                if uncompressed_len > MAX_FRAME_BYTES {
+                if uncompressed_len > MAX_DECOMPRESSED_BYTES {
                     return Err(FramingError::FrameTooLarge {
                         got: uncompressed_len,
+                        max: MAX_DECOMPRESSED_BYTES,
                     });
                 }
                 // Build [VarInt id][body] then compress it.
@@ -295,6 +308,12 @@ pub fn encode_frame(id: i32, body: &[u8], compression: Compression) -> Result<By
 
                 let data_length = plain.len();
                 let inner_len = varint_encoded_len(data_length as i32) + compressed.len();
+                if inner_len > MAX_PACKET_LENGTH {
+                    return Err(FramingError::FrameTooLarge {
+                        got: inner_len,
+                        max: MAX_PACKET_LENGTH,
+                    });
+                }
                 let mut out =
                     BytesMut::with_capacity(varint_encoded_len(inner_len as i32) + inner_len);
                 out.write_varint(inner_len as i32);
@@ -323,6 +342,9 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    const EXPECTED_MAX_PACKET_LENGTH: usize = 2_097_151;
+    const EXPECTED_MAX_DECOMPRESSED_BYTES: usize = 8_388_608;
+
     fn round_trip(id: i32, body: &[u8], compression: Compression) {
         let encoded = encode_frame(id, body, compression).expect("encode");
         let mut buf = BytesMut::from(&encoded[..]);
@@ -332,6 +354,18 @@ mod tests {
         assert_eq!(frame.id, id);
         assert_eq!(&frame.body[..], body);
         assert!(buf.is_empty(), "all bytes consumed");
+    }
+
+    fn incompressible_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0xD1B5_4A32_D192_ED03_u64;
+        std::iter::repeat_with(|| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .take(len)
+        .collect()
     }
 
     #[test]
@@ -433,14 +467,75 @@ mod tests {
     }
 
     #[test]
-    fn decoder_rejects_excess_size() {
-        // Hand-build a frame claiming a > 8 MiB length.
-        let mut buf = BytesMut::new();
-        let huge = MAX_FRAME_BYTES + 1;
-        buf.write_varint(huge as i32);
-        // No actual body — we only need the length to be parsed.
-        let err = try_decode_frame(&mut buf, Compression::Disabled).unwrap_err();
-        assert!(matches!(err, FramingError::FrameTooLarge { .. }));
+    fn decoder_accepts_complete_maximum_varint21_packet_and_advances_exactly() {
+        let trailing_frame = encode_frame(7, b"next", Compression::Disabled).unwrap();
+        let mut buf =
+            BytesMut::with_capacity(3 + EXPECTED_MAX_PACKET_LENGTH + trailing_frame.len());
+        buf.put_slice(&[0xFF, 0xFF, 0x7F]);
+        buf.put_u8(0); // one-byte packet id
+        buf.resize(3 + EXPECTED_MAX_PACKET_LENGTH, 0xA5);
+        buf.put_slice(&trailing_frame);
+
+        let frame = try_decode_frame(&mut buf, Compression::Disabled)
+            .unwrap()
+            .expect("complete maximum-length frame");
+
+        assert_eq!(frame.id, 0);
+        assert_eq!(frame.body.len(), EXPECTED_MAX_PACKET_LENGTH - 1);
+        assert_eq!(&frame.body[..4], &[0xA5; 4]);
+        assert_eq!(&frame.body[frame.body.len() - 4..], &[0xA5; 4]);
+        assert_eq!(&buf[..], &trailing_frame[..]);
+    }
+
+    #[test]
+    fn decoder_rejects_maximum_varint21_plus_one_before_payload_arrives() {
+        for compression in [Compression::Disabled, Compression::Threshold(256)] {
+            let mut buf = BytesMut::from(&[0x80, 0x80, 0x80, 0x01][..]);
+            let err = try_decode_frame(&mut buf, compression).unwrap_err();
+            assert!(matches!(
+                err,
+                FramingError::Codec(CodecError::VarIntTooLong)
+            ));
+            assert_eq!(&buf[..], &[0x80, 0x80, 0x80, 0x01]);
+        }
+    }
+
+    #[test]
+    fn decoder_rejects_four_byte_outer_lengths_even_when_value_is_small() {
+        for encoded in [
+            &[0x80, 0x80, 0x80, 0x00][..],
+            &[0x81, 0x80, 0x80, 0x00][..],
+            &[0xFF, 0xFF, 0xFF, 0x00][..],
+        ] {
+            let mut buf = BytesMut::from(encoded);
+            let err = try_decode_frame(&mut buf, Compression::Disabled).unwrap_err();
+            assert!(matches!(
+                err,
+                FramingError::Codec(CodecError::VarIntTooLong)
+            ));
+            assert_eq!(&buf[..], encoded);
+        }
+    }
+
+    #[test]
+    fn decoder_distinguishes_truncated_and_malformed_varint21_lengths() {
+        for encoded in [&[0x80][..], &[0x80, 0x80][..]] {
+            let mut buf = BytesMut::from(encoded);
+            assert!(
+                try_decode_frame(&mut buf, Compression::Disabled)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(&buf[..], encoded);
+        }
+
+        let mut malformed = BytesMut::from(&[0x80, 0x80, 0x80][..]);
+        let err = try_decode_frame(&mut malformed, Compression::Disabled).unwrap_err();
+        assert!(matches!(
+            err,
+            FramingError::Codec(CodecError::VarIntTooLong)
+        ));
+        assert_eq!(&malformed[..], &[0x80, 0x80, 0x80]);
     }
 
     #[test]
@@ -448,7 +543,79 @@ mod tests {
         let mut buf = BytesMut::new();
         buf.write_varint(-1); // -1 packet length
         let err = try_decode_frame(&mut buf, Compression::Disabled).unwrap_err();
-        assert!(matches!(err, FramingError::NegativeLength(-1)));
+        assert!(matches!(
+            err,
+            FramingError::Codec(CodecError::VarIntTooLong)
+        ));
+        assert_eq!(&buf[..], &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F]);
+    }
+
+    #[test]
+    fn encoder_enforces_outer_varint21_limit_with_or_without_compression_header() {
+        let disabled_max_body = vec![0; EXPECTED_MAX_PACKET_LENGTH - 1];
+        let encoded = encode_frame(0, &disabled_max_body, Compression::Disabled).unwrap();
+        assert_eq!(&encoded[..3], &[0xFF, 0xFF, 0x7F]);
+
+        let disabled_too_large = vec![0; EXPECTED_MAX_PACKET_LENGTH];
+        assert!(matches!(
+            encode_frame(0, &disabled_too_large, Compression::Disabled),
+            Err(FramingError::FrameTooLarge { got, max })
+                if got == EXPECTED_MAX_PACKET_LENGTH + 1
+                    && max == EXPECTED_MAX_PACKET_LENGTH
+        ));
+
+        let compression = Compression::Threshold(usize::MAX);
+        let enabled_max_body = vec![0; EXPECTED_MAX_PACKET_LENGTH - 2];
+        let encoded = encode_frame(0, &enabled_max_body, compression).unwrap();
+        assert_eq!(&encoded[..3], &[0xFF, 0xFF, 0x7F]);
+
+        let enabled_too_large = vec![0; EXPECTED_MAX_PACKET_LENGTH - 1];
+        assert!(matches!(
+            encode_frame(0, &enabled_too_large, compression),
+            Err(FramingError::FrameTooLarge { got, max })
+                if got == EXPECTED_MAX_PACKET_LENGTH + 1
+                    && max == EXPECTED_MAX_PACKET_LENGTH
+        ));
+    }
+
+    #[test]
+    fn compressed_payload_keeps_independent_decompressed_ceiling() {
+        let max_body = vec![0; EXPECTED_MAX_DECOMPRESSED_BYTES - 1];
+        round_trip(0, &max_body, Compression::Threshold(0));
+
+        let too_large_body = vec![0; EXPECTED_MAX_DECOMPRESSED_BYTES];
+        assert!(matches!(
+            encode_frame(0, &too_large_body, Compression::Threshold(0)),
+            Err(FramingError::FrameTooLarge { got, max })
+                if got == EXPECTED_MAX_DECOMPRESSED_BYTES + 1
+                    && max == EXPECTED_MAX_DECOMPRESSED_BYTES
+        ));
+    }
+
+    #[test]
+    fn compressed_encoder_rejects_wire_payload_larger_than_varint21() {
+        let body = incompressible_bytes(EXPECTED_MAX_PACKET_LENGTH - 1);
+        assert!(matches!(
+            encode_frame(0, &body, Compression::Threshold(0)),
+            Err(FramingError::FrameTooLarge { got, max })
+                if got > EXPECTED_MAX_PACKET_LENGTH && max == EXPECTED_MAX_PACKET_LENGTH
+        ));
+    }
+
+    #[test]
+    fn decoder_rejects_oversized_decompressed_length_before_zlib_payload() {
+        let mut buf = BytesMut::new();
+        let data_length = EXPECTED_MAX_DECOMPRESSED_BYTES + 1;
+        let outer_length = varint_encoded_len(data_length as i32);
+        buf.write_varint(outer_length as i32);
+        buf.write_varint(data_length as i32);
+
+        let err = try_decode_frame(&mut buf, Compression::Threshold(0)).unwrap_err();
+        assert!(matches!(
+            err,
+            FramingError::FrameTooLarge { got, max }
+                if got == data_length && max == EXPECTED_MAX_DECOMPRESSED_BYTES
+        ));
     }
 
     #[test]

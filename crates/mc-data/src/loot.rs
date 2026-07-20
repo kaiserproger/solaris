@@ -7,6 +7,17 @@ use thiserror::Error;
 
 use crate::{Identifier, read_json_file, visit_json_files};
 
+mod context;
+pub mod entity_26_1_2;
+
+pub use context::{
+    BlockLootContext, LootContextError, LootContextItem, LootEnchantments, LootExplosion,
+    LootRandomBinding, MAX_LOOT_CONTEXT_ENTRIES, MAX_LOOT_ENCHANTMENT_LEVEL,
+};
+
+#[cfg(test)]
+mod context_tests;
+
 const BUILTIN_SURVIVAL_LOOT: &str = include_str!("../data/survival_loot.json");
 
 #[derive(Debug, Error)]
@@ -48,6 +59,7 @@ pub enum LootCount {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BlockLoot {
+    random_sequence: Option<Identifier>,
     silk_touch_drops: Vec<BlockLootDrop>,
     regular_drops: Vec<BlockLootDrop>,
     conditional_pools: Vec<BlockStateLootPool>,
@@ -55,35 +67,17 @@ pub struct BlockLoot {
 
 impl BlockLoot {
     #[must_use]
-    pub fn drops_for_tool(&self, silk_touch: bool) -> &[BlockLootDrop] {
+    pub fn random_sequence(&self) -> Option<&Identifier> {
+        self.random_sequence.as_ref()
+    }
+
+    #[must_use]
+    fn drops_for_tool(&self, silk_touch: bool) -> &[BlockLootDrop] {
         if silk_touch && !self.silk_touch_drops.is_empty() {
             &self.silk_touch_drops
         } else {
             &self.regular_drops
         }
-    }
-
-    #[must_use]
-    pub fn drops_for_context(
-        &self,
-        silk_touch: bool,
-        block: &Identifier,
-        properties: &[(String, String)],
-    ) -> Vec<&BlockLootDrop> {
-        let mut drops: Vec<_> = self.drops_for_tool(silk_touch).iter().collect();
-        for pool in &self.conditional_pools {
-            if !pool.predicate.matches(block, properties) {
-                continue;
-            }
-            if let Some(entry) = pool
-                .entries
-                .iter()
-                .find(|entry| entry.predicate.matches(block, properties))
-            {
-                drops.push(&entry.drop);
-            }
-        }
-        drops
     }
 }
 
@@ -114,6 +108,16 @@ impl BlockStatePredicate {
                     .any(|(actual_key, actual_value)| actual_key == key && actual_value == value)
             })
     }
+
+    fn matches_context(&self, context: &BlockLootContext<'_>) -> bool {
+        self.block
+            .as_ref()
+            .is_none_or(|expected| expected == context.block())
+            && self
+                .properties
+                .iter()
+                .all(|(key, value)| context.property(key) == Some(value.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,22 +139,6 @@ impl BlockLootDrop {
             survives_explosion: false,
             explosion_decay: false,
         }
-    }
-
-    #[must_use]
-    pub fn sample_count(&self, count_roll: u64, fortune_level: u32, bonus_roll: u64) -> u32 {
-        let baseline = self.drop.count.sample(count_roll);
-        self.fortune_bonus.map_or(baseline, |bonus| {
-            bonus.apply(baseline, fortune_level, bonus_roll)
-        })
-    }
-
-    #[must_use]
-    pub fn passes_random_chance(&self, roll: u64) -> bool {
-        self.random_chance.is_none_or(|chance| {
-            let sample = (roll >> 40) as f32 / 16_777_216.0;
-            sample < chance
-        })
     }
 
     fn sample_simple_explosion_count(
@@ -197,61 +185,148 @@ pub enum FortuneBonus {
     BinomialWithBonusCount { extra_rounds: u32, probability: f32 },
 }
 
+pub const MAX_BLOCK_BONUS_ROLLS: u32 = 4_096;
+pub const MAX_BLOCK_OUTPUT_ITEMS: u64 = 65_536;
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum BlockLootEvaluationError {
+    #[error("block loot random sequence mismatch: expected {expected:?}, got {actual:?}")]
+    RandomSequenceMismatch {
+        expected: Option<Identifier>,
+        actual: Option<Identifier>,
+    },
+    #[error("block loot bonus rolls exceed the limit: {actual} > {maximum}")]
+    BonusRollLimitExceeded { actual: u64, maximum: u64 },
+    #[error("block loot probability must be finite")]
+    InvalidProbability,
+    #[error("block loot arithmetic overflow while {operation}")]
+    ArithmeticOverflow { operation: &'static str },
+    #[error("block loot explosion-decay input exceeds the limit: {actual} > {maximum}")]
+    ExplosionDecayInputLimitExceeded { actual: u64, maximum: u64 },
+    #[error("block loot output items exceed the limit: {actual} > {maximum}")]
+    OutputItemLimitExceeded { actual: u64, maximum: u64 },
+}
+
 impl FortuneBonus {
-    #[must_use]
-    pub fn apply(self, count: u32, fortune_level: u32, roll: u64) -> u32 {
+    fn try_apply(
+        self,
+        count: u32,
+        fortune_level: u32,
+        random: &mut context::LootRandom,
+    ) -> Result<u32, BlockLootEvaluationError> {
         match self {
             Self::OreDrops => {
                 if fortune_level == 0 {
-                    return count;
+                    return Ok(count);
                 }
-                let width = u64::from(fortune_level) + 2;
-                let multiplier = (roll % width).saturating_sub(1) + 1;
-                count.saturating_mul(u32::try_from(multiplier).unwrap_or(u32::MAX))
+                let width = u64::from(fortune_level).checked_add(2).ok_or(
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "calculating ore Fortune range",
+                    },
+                )?;
+                let roll = random.next_u64() % width;
+                let multiplier = if roll == 0 { 1 } else { roll };
+                u64::from(count)
+                    .checked_mul(multiplier)
+                    .and_then(|count| u32::try_from(count).ok())
+                    .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "applying ore Fortune bonus",
+                    })
             }
             Self::UniformBonusCount { bonus_multiplier } => {
                 if fortune_level == 0 {
-                    return count;
+                    return Ok(count);
                 }
-                let max_bonus = bonus_multiplier.saturating_mul(fortune_level);
-                let bonus = roll % (u64::from(max_bonus) + 1);
-                count.saturating_add(u32::try_from(bonus).unwrap_or(u32::MAX))
+                let max_bonus = u64::from(bonus_multiplier)
+                    .checked_mul(u64::from(fortune_level))
+                    .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "calculating uniform Fortune range",
+                    })?;
+                let width = max_bonus.checked_add(1).ok_or(
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "calculating uniform Fortune range",
+                    },
+                )?;
+                let bonus = random.next_u64() % width;
+                u64::from(count)
+                    .checked_add(bonus)
+                    .and_then(|count| u32::try_from(count).ok())
+                    .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "applying uniform Fortune bonus",
+                    })
             }
             Self::BinomialWithBonusCount {
                 extra_rounds,
                 probability,
             } => {
-                let rounds = fortune_level.saturating_add(extra_rounds);
-                let mut count = count;
-                let mut roll = roll;
-                for _ in 0..rounds {
-                    let sample = (roll >> 40) as f32 / 16_777_216.0;
-                    if sample < probability {
-                        count = count.saturating_add(1);
-                    }
-                    roll = splitmix64(roll);
+                if !probability.is_finite() || !(0.0..=1.0).contains(&probability) {
+                    return Err(BlockLootEvaluationError::InvalidProbability);
                 }
-                count
+                let rounds = u64::from(fortune_level)
+                    .checked_add(u64::from(extra_rounds))
+                    .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "calculating binomial Fortune rounds",
+                    })?;
+                if rounds > u64::from(MAX_BLOCK_BONUS_ROLLS) {
+                    return Err(BlockLootEvaluationError::BonusRollLimitExceeded {
+                        actual: rounds,
+                        maximum: u64::from(MAX_BLOCK_BONUS_ROLLS),
+                    });
+                }
+                if probability == 0.0 {
+                    return Ok(count);
+                }
+                if probability == 1.0 {
+                    return (0..rounds).try_fold(count, |count, _| {
+                        count
+                            .checked_add(1)
+                            .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                                operation: "applying binomial Fortune bonus",
+                            })
+                    });
+                }
+                if fortune_level == 0 {
+                    return Ok(count);
+                }
+                let mut count = count;
+                for _ in 0..rounds {
+                    if random.next_float() < probability {
+                        count = count.checked_add(1).ok_or(
+                            BlockLootEvaluationError::ArithmeticOverflow {
+                                operation: "applying binomial Fortune bonus",
+                            },
+                        )?;
+                    }
+                }
+                Ok(count)
             }
         }
     }
 }
 
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    value ^ (value >> 31)
-}
-
 impl LootCount {
-    #[must_use]
-    pub fn sample(self, roll: u64) -> u32 {
+    pub fn try_sample(self, roll: u64) -> Result<u32, BlockLootEvaluationError> {
         match self {
-            Self::Fixed(count) => count,
+            Self::Fixed(count) => Ok(count),
             Self::UniformInclusive { min, max } => {
-                let width = u64::from(max.saturating_sub(min)) + 1;
-                min + u32::try_from(roll % width).expect("loot count range fits u32")
+                let width = u64::from(max.checked_sub(min).ok_or(
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "calculating loot count range",
+                    },
+                )?)
+                .checked_add(1)
+                .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                    operation: "calculating loot count range",
+                })?;
+                let offset = u32::try_from(roll % width).map_err(|_| {
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "converting loot count offset",
+                    }
+                })?;
+                min.checked_add(offset)
+                    .ok_or(BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "sampling loot count",
+                    })
             }
         }
     }
@@ -366,6 +441,133 @@ impl LootTables {
         self.block_loot.get(block)
     }
 
+    #[must_use]
+    pub fn block_random_sequence(&self, block: &Identifier) -> Option<&Identifier> {
+        self.block_loot(block).and_then(BlockLoot::random_sequence)
+    }
+
+    pub fn evaluate_block(
+        &self,
+        context: &BlockLootContext<'_>,
+    ) -> Result<Option<Vec<LootDrop>>, BlockLootEvaluationError> {
+        let expected_sequence = self.block_random_sequence(context.block());
+        let actual_sequence = context.random_binding().sequence();
+        if expected_sequence != actual_sequence {
+            return Err(BlockLootEvaluationError::RandomSequenceMismatch {
+                expected: expected_sequence.cloned(),
+                actual: actual_sequence.cloned(),
+            });
+        }
+        let mut random = context.random();
+        let Some(rule) = self.block_loot(context.block()) else {
+            let Some(drops) = self.block_drop_stacks(context.block()) else {
+                return Ok(None);
+            };
+            let mut output_items = 0_u64;
+            let mut sampled = Vec::new();
+            for drop in drops {
+                if let Some(explosion) = context.explosion()
+                    && !survives_explosion(explosion, &mut random)
+                {
+                    continue;
+                }
+                let count = sample_loot_count(drop.count, &mut random)?;
+                if count == 0 {
+                    continue;
+                }
+                output_items = output_items.checked_add(u64::from(count)).ok_or(
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "adding block output items",
+                    },
+                )?;
+                if output_items > MAX_BLOCK_OUTPUT_ITEMS {
+                    return Err(BlockLootEvaluationError::OutputItemLimitExceeded {
+                        actual: output_items,
+                        maximum: MAX_BLOCK_OUTPUT_ITEMS,
+                    });
+                }
+                sampled.push(LootDrop::fixed(drop.item.clone(), count));
+            }
+            return Ok(Some(sampled));
+        };
+
+        let mut drops: Vec<_> = rule
+            .drops_for_tool(context.tool().silk_touch_level() > 0)
+            .iter()
+            .collect();
+        for pool in &rule.conditional_pools {
+            if !pool.predicate.matches_context(context) {
+                continue;
+            }
+            if let Some(entry) = pool
+                .entries
+                .iter()
+                .find(|entry| entry.predicate.matches_context(context))
+            {
+                drops.push(&entry.drop);
+            }
+        }
+        let mut sampled = Vec::new();
+        let mut output_items = 0_u64;
+        for drop in drops {
+            if let Some(chance) = drop.random_chance {
+                if !chance.is_finite() || !(0.0..=1.0).contains(&chance) {
+                    return Err(BlockLootEvaluationError::InvalidProbability);
+                }
+                if chance == 0.0 || (chance < 1.0 && random.next_float() >= chance) {
+                    continue;
+                }
+            }
+            if let Some(explosion) = context.explosion()
+                && drop.survives_explosion
+                && !survives_explosion(explosion, &mut random)
+            {
+                continue;
+            }
+
+            let baseline = sample_loot_count(drop.drop.count, &mut random)?;
+            let mut count = match drop.fortune_bonus {
+                Some(bonus) => {
+                    bonus.try_apply(baseline, context.tool().fortune_level(), &mut random)?
+                }
+                None => baseline,
+            };
+            if let Some(explosion) = context.explosion()
+                && drop.explosion_decay
+            {
+                if u64::from(count) > MAX_BLOCK_OUTPUT_ITEMS {
+                    return Err(BlockLootEvaluationError::ExplosionDecayInputLimitExceeded {
+                        actual: u64::from(count),
+                        maximum: MAX_BLOCK_OUTPUT_ITEMS,
+                    });
+                }
+                let survivors = (0..count)
+                    .filter(|_| survives_explosion(explosion, &mut random))
+                    .count();
+                count = u32::try_from(survivors).map_err(|_| {
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "converting explosion-decay survivors",
+                    }
+                })?;
+            }
+            if count > 0 {
+                output_items = output_items.checked_add(u64::from(count)).ok_or(
+                    BlockLootEvaluationError::ArithmeticOverflow {
+                        operation: "adding block output items",
+                    },
+                )?;
+                if output_items > MAX_BLOCK_OUTPUT_ITEMS {
+                    return Err(BlockLootEvaluationError::OutputItemLimitExceeded {
+                        actual: output_items,
+                        maximum: MAX_BLOCK_OUTPUT_ITEMS,
+                    });
+                }
+                sampled.push(LootDrop::fixed(drop.drop.item.clone(), count));
+            }
+        }
+        Ok(Some(sampled))
+    }
+
     /// Samples the exact simple block-explosion rules used by common fixed-count tables.
     /// `None` models `DESTROY`, where vanilla omits the explosion radius and explosion
     /// modifiers are identities. `Some(radius)` models `DESTROY_WITH_DECAY`. Complex
@@ -379,7 +581,20 @@ impl LootTables {
     ) -> Option<Vec<LootDrop>> {
         let common_fallbacks;
         let drops = if let Some(rule) = self.block_loot(block) {
-            rule.drops_for_context(false, block, properties)
+            let mut selected: Vec<_> = rule.drops_for_tool(false).iter().collect();
+            for pool in &rule.conditional_pools {
+                if !pool.predicate.matches(block, properties) {
+                    continue;
+                }
+                if let Some(entry) = pool
+                    .entries
+                    .iter()
+                    .find(|entry| entry.predicate.matches(block, properties))
+                {
+                    selected.push(&entry.drop);
+                }
+            }
+            selected
         } else {
             let fallback_drops = self
                 .block_drop_stacks(block)
@@ -453,6 +668,27 @@ impl LootTables {
             }
         }
     }
+}
+
+fn sample_loot_count(
+    count: LootCount,
+    random: &mut context::LootRandom,
+) -> Result<u32, BlockLootEvaluationError> {
+    match count {
+        LootCount::Fixed(count) => Ok(count),
+        LootCount::UniformInclusive { .. } => count.try_sample(random.next_u64()),
+    }
+}
+
+fn survives_explosion(explosion: LootExplosion, random: &mut context::LootRandom) -> bool {
+    let probability = 1.0 / explosion.radius();
+    if probability >= 1.0 {
+        return true;
+    }
+    if probability <= 0.0 {
+        return false;
+    }
+    explosion.survives(random.next_float())
 }
 
 #[derive(Deserialize)]
@@ -688,6 +924,11 @@ fn block_loot_from_table(
     path: &Path,
     value: &serde_json::Value,
 ) -> Result<Option<BlockLoot>, LootError> {
+    let random_sequence = value
+        .get("random_sequence")
+        .and_then(serde_json::Value::as_str)
+        .map(|sequence| parse_id(path, sequence.to_string()))
+        .transpose()?;
     let Some(pools) = value.get("pools").and_then(serde_json::Value::as_array) else {
         return Ok(None);
     };
@@ -742,6 +983,7 @@ fn block_loot_from_table(
 
     Ok(
         (!regular_drops.is_empty() || !conditional_pools.is_empty()).then_some(BlockLoot {
+            random_sequence,
             silk_touch_drops,
             regular_drops,
             conditional_pools,
@@ -989,7 +1231,31 @@ fn contextual_regular_drop(
     path: &Path,
     entry: &serde_json::Value,
 ) -> Result<Option<BlockLootDrop>, LootError> {
-    let Some(drop) = simple_drop_from_entry(path, entry, true)? else {
+    if entry
+        .get("conditions")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|conditions| {
+            conditions.iter().any(|condition| {
+                !matches!(
+                    condition
+                        .get("condition")
+                        .and_then(serde_json::Value::as_str),
+                    Some("minecraft:random_chance" | "minecraft:survives_explosion")
+                )
+            })
+        })
+    {
+        return Ok(None);
+    }
+    let Some(random_chance) = random_chance_condition(entry) else {
+        return Ok(None);
+    };
+    let mut unconditional = entry.clone();
+    unconditional
+        .as_object_mut()
+        .expect("loot item entry is an object")
+        .remove("conditions");
+    let Some(drop) = simple_drop_from_entry(path, &unconditional, true)? else {
         return Ok(None);
     };
     let Some(fortune_bonus) = fortune_bonus_from_functions(entry) else {
@@ -998,7 +1264,7 @@ fn contextual_regular_drop(
     Ok(Some(BlockLootDrop {
         drop,
         fortune_bonus,
-        random_chance: None,
+        random_chance,
         survives_explosion: has_survives_explosion_condition(entry),
         explosion_decay: has_explosion_decay_function(entry),
     }))
@@ -1300,6 +1566,22 @@ fn parse_id(path: &Path, value: String) -> Result<Identifier, LootError> {
 mod tests {
     use super::*;
     use std::fs;
+
+    fn block_context<'a>(
+        loot: &LootTables,
+        block: &'a Identifier,
+        properties: &[(String, String)],
+        tool: &'a LootContextItem,
+        seed: u64,
+    ) -> BlockLootContext<'a> {
+        BlockLootContext::try_new(
+            block,
+            properties,
+            tool,
+            LootRandomBinding::new(loot.block_random_sequence(block).cloned(), seed),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn builtin_survival_loot_loads_from_repo_json() {
@@ -1970,7 +2252,6 @@ mod tests {
             .unwrap()
             .drops_for_tool(false)[0];
         assert_eq!(diamond.fortune_bonus, Some(FortuneBonus::OreDrops));
-        assert_eq!(diamond.sample_count(0, 1, 2), 2);
         let redstone = &loot
             .block_loot(&Identifier::parse("minecraft:redstone_ore").unwrap())
             .unwrap()
@@ -1981,7 +2262,6 @@ mod tests {
                 bonus_multiplier: 1
             })
         );
-        assert_eq!(redstone.sample_count(0, 3, 3), 7);
         assert_eq!(
             loot.block_drop_stacks(&Identifier::parse("minecraft:potted_oak_sapling").unwrap()),
             Some(
@@ -2165,9 +2445,6 @@ mod tests {
             .drops_for_tool(false)[0];
 
         assert_eq!(drop.fortune_bonus, Some(FortuneBonus::OreDrops));
-        assert_eq!(drop.sample_count(0, 0, 2), 1);
-        assert_eq!(drop.sample_count(0, 1, 2), 2);
-        assert_eq!(drop.sample_count(0, 3, 4), 4);
     }
 
     #[test]
@@ -2210,9 +2487,6 @@ mod tests {
                 probability: 1.0,
             })
         );
-        assert_eq!(drop.sample_count(0, 0, 7), 4);
-        assert_eq!(drop.sample_count(0, 1, 7), 5);
-        assert_eq!(drop.sample_count(0, 3, 7), 7);
     }
 
     #[test]
@@ -2262,20 +2536,25 @@ mod tests {
 
         let loot = load_vanilla_subset(tmp.path()).unwrap();
         let wheat = Identifier::parse("minecraft:wheat").unwrap();
-        let rule = loot.block_loot(&wheat).unwrap();
         let young = vec![("age".to_string(), "6".to_string())];
         let mature = vec![("age".to_string(), "7".to_string())];
+        let tool = LootContextItem::empty();
 
-        let young_drops = rule.drops_for_context(false, &wheat, &young);
+        let young_drops = loot
+            .evaluate_block(&block_context(&loot, &wheat, &young, &tool, 0))
+            .unwrap()
+            .unwrap();
         assert_eq!(young_drops.len(), 1);
-        assert_eq!(young_drops[0].drop.item.as_str(), "minecraft:wheat_seeds");
+        assert_eq!(young_drops[0].item.as_str(), "minecraft:wheat_seeds");
 
-        let mature_drops = rule.drops_for_context(false, &wheat, &mature);
+        let mature_drops = loot
+            .evaluate_block(&block_context(&loot, &wheat, &mature, &tool, 0))
+            .unwrap()
+            .unwrap();
         assert_eq!(mature_drops.len(), 2);
-        assert_eq!(mature_drops[0].drop.item.as_str(), "minecraft:wheat");
-        assert_eq!(mature_drops[1].drop.item.as_str(), "minecraft:wheat_seeds");
-        assert_eq!(mature_drops[1].sample_count(0, 0, 0), 4);
-        assert_eq!(mature_drops[1].sample_count(0, 2, 0), 6);
+        assert_eq!(mature_drops[0].item.as_str(), "minecraft:wheat");
+        assert_eq!(mature_drops[1].item.as_str(), "minecraft:wheat_seeds");
+        assert_eq!(mature_drops[1].count, LootCount::Fixed(4));
     }
 
     #[test]
@@ -2329,11 +2608,7 @@ mod tests {
                 "6",
                 "7",
                 &["minecraft:potato"][..],
-                &[
-                    "minecraft:potato",
-                    "minecraft:potato",
-                    "minecraft:poisonous_potato",
-                ][..],
+                &["minecraft:potato", "minecraft:potato"][..],
             ),
             (
                 "minecraft:beetroots",
@@ -2344,15 +2619,32 @@ mod tests {
             ),
         ] {
             let block = Identifier::parse(block).unwrap();
-            let rule = loot.block_loot(&block).expect("real crop block loot");
             let items = |age: &str| {
-                rule.drops_for_context(false, &block, &[("age".to_string(), age.to_string())])
+                let properties = [("age".to_string(), age.to_string())];
+                let tool = LootContextItem::empty();
+                loot.evaluate_block(&block_context(&loot, &block, &properties, &tool, 0))
+                    .unwrap()
+                    .unwrap()
                     .into_iter()
-                    .map(|drop| drop.drop.item.as_str())
+                    .map(|drop| drop.item.as_str().to_string())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(items(young_age), young_expected, "young {block}");
-            assert_eq!(items(mature_age), mature_expected, "mature {block}");
+            assert_eq!(
+                items(young_age)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                young_expected,
+                "young {block}"
+            );
+            assert_eq!(
+                items(mature_age)
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                mature_expected,
+                "mature {block}"
+            );
         }
     }
 
@@ -2368,8 +2660,8 @@ mod tests {
 
         for roll in 0..12 {
             assert_eq!(
-                drop.sample_count(roll, 0, u64::MAX - roll),
-                drop.drop.count.sample(roll)
+                drop.drop.count.try_sample(roll).unwrap(),
+                drop.drop.count.try_sample(roll).unwrap()
             );
         }
     }

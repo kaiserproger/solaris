@@ -78,7 +78,9 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
-    let table_id = items.id_of(&enchanting_table).expect("enchanting table item");
+    let table_id = items
+        .id_of(&enchanting_table)
+        .expect("enchanting table item");
     let pickaxe_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:stone_pickaxe").unwrap())
         .expect("stone pickaxe item");
@@ -124,7 +126,7 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         items,
         item_facts,
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -310,8 +312,8 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         }
         if frame.id == ClientboundSetExperience::ID {
             let mut body = frame.body;
-            let packet = ClientboundSetExperience::decode(&mut body)
-                .expect("decode enchanting experience");
+            let packet =
+                ClientboundSetExperience::decode(&mut body).expect("decode enchanting experience");
             xp_spent |= packet.total_experience == 2_203 && packet.experience_level == 33;
         } else if frame.id == ClientboundContainerSetContent::ID {
             let mut body = frame.body;
@@ -351,8 +353,7 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
             && packet.items.iter().skip(2).any(|stack| {
                 stack.item_id == pickaxe_id
                     && stack.enchantments.iter().any(|enchantment| {
-                        enchantment.id.as_str() == "minecraft:efficiency"
-                            && enchantment.level == 3
+                        enchantment.id.as_str() == "minecraft:efficiency" && enchantment.level == 3
                     })
             })
     })
@@ -403,7 +404,11 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
     assert!(sharpness_data[3].is_some(), "enchantment seed is present");
     assert_eq!(
         &sharpness_data[4..7],
-        &[Some(sharpness_clue), Some(sharpness_clue), Some(sharpness_clue)]
+        &[
+            Some(sharpness_clue),
+            Some(sharpness_clue),
+            Some(sharpness_clue)
+        ]
     );
     assert_eq!(&sharpness_data[7..10], &[Some(1), Some(2), Some(3)]);
 
@@ -431,8 +436,7 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
             let mut body = frame.body;
             let packet =
                 ClientboundSetExperience::decode(&mut body).expect("decode sharpness experience");
-            sharpness_xp_spent |=
-                packet.total_experience == 2_203 && packet.experience_level == 30;
+            sharpness_xp_spent |= packet.total_experience == 2_203 && packet.experience_level == 30;
         } else if frame.id == ClientboundContainerSetContent::ID {
             let mut body = frame.body;
             let packet = ClientboundContainerSetContent::decode(&mut body)
@@ -470,9 +474,10 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         packet.items[0].is_empty()
             && packet.items.iter().skip(2).any(|stack| {
                 stack.item_id == sword_id
-                    && stack.enchantments.iter().any(|enchantment| {
-                        enchantment.id == sharpness && enchantment.level == 3
-                    })
+                    && stack
+                        .enchantments
+                        .iter()
+                        .any(|enchantment| enchantment.id == sharpness && enchantment.level == 3)
             })
     })
     .await;
@@ -552,8 +557,8 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         }
         if frame.id == ClientboundSetExperience::ID {
             let mut body = frame.body;
-            let packet = ClientboundSetExperience::decode(&mut body)
-                .expect("decode protection experience");
+            let packet =
+                ClientboundSetExperience::decode(&mut body).expect("decode protection experience");
             protection_xp_spent |=
                 packet.total_experience == 2_203 && packet.experience_level == 27;
         } else if frame.id == ClientboundContainerSetContent::ID {
@@ -592,11 +597,11 @@ async fn survival_enchanting_table_applies_high_efficiency_sharpness_and_protect
         packet.items[0].is_empty()
             && packet.items.iter().skip(2).any(|stack| {
                 stack.item_id == chestplate_id
-                    && stack.enchantments.iter().any(|enchantment| {
-                        enchantment.id == protection && enchantment.level == 3
-                    })
+                    && stack
+                        .enchantments
+                        .iter()
+                        .any(|enchantment| enchantment.id == protection && enchantment.level == 3)
             })
     })
     .await;
 }
-

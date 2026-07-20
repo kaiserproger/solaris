@@ -179,7 +179,7 @@ pub(super) fn held_item_id(state: &InteractionState) -> Option<u32> {
 }
 
 pub(super) fn held_item_stack(state: &InteractionState) -> Option<&ItemStack> {
-    let held = state.inventory.held(state.selected_hotbar_slot);
+    let held = state.inventory.held(state.selected_hotbar_slot)?;
     (!held.is_empty()).then_some(held)
 }
 
@@ -600,7 +600,15 @@ pub(super) fn arrow_entity_type_id(entity_types: &EntityTypeRegistry) -> Option<
 }
 
 pub(super) fn is_hostile_entity(entity_type: &str) -> bool {
-    mc_data::entity_types::fallback_entity_category(entity_type).is_hostile()
+    static ENTITY_TYPES: std::sync::OnceLock<mc_data::entity_types::EntityTypeRegistry> =
+        std::sync::OnceLock::new();
+    let Ok(entity_type) = mc_data::Identifier::parse(entity_type.to_string()) else {
+        return false;
+    };
+    ENTITY_TYPES
+        .get_or_init(mc_data::entity_types::solaris_required_entity_types)
+        .facts_of(&entity_type)
+        .is_some_and(|facts| facts.category.is_hostile())
 }
 
 #[cfg(test)]
@@ -649,7 +657,10 @@ pub(super) fn mob_drop_stacks_from_seed(
                 return Vec::new();
             };
             let roll = splitmix64(seed ^ (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-            split_drop_stack(items, item_facts, item_id, drop.count.sample(roll))
+            let Ok(count) = drop.count.try_sample(roll) else {
+                return Vec::new();
+            };
+            split_drop_stack(items, item_facts, item_id, count)
         })
         .collect()
 }
@@ -744,37 +755,67 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
     }
 
     let fallback = mc_data::loot::builtin();
-    let configured_drops = loot.block_drop_stacks(&block.block.id);
-    let (contextual, drops) = if configured_drops.is_some() {
-        (loot.block_loot(&block.block.id), configured_drops)
+    let source = if loot.block_loot(&block.block.id).is_some()
+        || loot.block_drop_stacks(&block.block.id).is_some()
+    {
+        loot
     } else {
-        (
-            fallback.block_loot(&block.block.id),
-            fallback.block_drop_stacks(&block.block.id),
-        )
+        fallback
     };
-    if let Some(contextual) = contextual {
-        let silk_touch = enchantment_level(held_item, "minecraft:silk_touch") > 0;
-        let fortune_level = enchantment_level(held_item, "minecraft:fortune");
-        return contextual
-            .drops_for_context(silk_touch, &block.block.id, &block.properties)
-            .into_iter()
-            .enumerate()
-            .flat_map(|(index, drop)| {
-                let Some(item_id) = items.id_of(&drop.drop.item) else {
+    if source.block_loot(&block.block.id).is_some() {
+        let tool = match held_item {
+            Some(stack) => {
+                let enchantments = stack
+                    .enchantments
+                    .iter()
+                    .filter(|enchantment| enchantment.level != 0)
+                    .map(|enchantment| {
+                        u32::try_from(enchantment.level)
+                            .map(|level| (enchantment.id.clone(), level))
+                    })
+                    .collect::<Result<Vec<_>, _>>();
+                let Ok(enchantments) = enchantments else {
                     return Vec::new();
                 };
-                let count_roll = block_drop_roll(loot_seed, index);
-                let bonus_roll = splitmix64(count_roll);
-                if !drop.passes_random_chance(splitmix64(bonus_roll)) {
+                let Ok(enchantments) =
+                    mc_data::loot::LootEnchantments::try_from_levels(enchantments)
+                else {
                     return Vec::new();
-                }
-                split_drop_stack(
-                    items,
-                    item_facts,
-                    item_id,
-                    drop.sample_count(count_roll, fortune_level, bonus_roll),
-                )
+                };
+                items
+                    .name_of(stack.item_id)
+                    .cloned()
+                    .map(mc_data::loot::LootContextItem::new)
+                    .unwrap_or_else(mc_data::loot::LootContextItem::empty)
+                    .with_enchantments(enchantments)
+            }
+            None => mc_data::loot::LootContextItem::empty(),
+        };
+        let Ok(context) = mc_data::loot::BlockLootContext::try_new(
+            &block.block.id,
+            &block.properties,
+            &tool,
+            mc_data::loot::LootRandomBinding::new(
+                source.block_random_sequence(&block.block.id).cloned(),
+                loot_seed,
+            ),
+        ) else {
+            return Vec::new();
+        };
+        let drops = match source.evaluate_block(&context) {
+            Ok(Some(drops)) => drops,
+            Ok(None) | Err(_) => return Vec::new(),
+        };
+        return drops
+            .into_iter()
+            .flat_map(|drop| {
+                let Some(item_id) = items.id_of(&drop.item) else {
+                    return Vec::new();
+                };
+                let mc_data::loot::LootCount::Fixed(count) = drop.count else {
+                    return Vec::new();
+                };
+                split_drop_stack(items, item_facts, item_id, count)
             })
             .collect();
     }
@@ -791,7 +832,7 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
             })
             .collect();
     }
-    if let Some(drops) = drops {
+    if let Some(drops) = source.block_drop_stacks(&block.block.id) {
         return drops
             .iter()
             .enumerate()
@@ -799,8 +840,10 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
                 let Some(item_id) = items.id_of(&drop.item) else {
                     return Vec::new();
                 };
-                let roll = block_drop_roll(loot_seed, index);
-                split_drop_stack(items, item_facts, item_id, drop.count.sample(roll))
+                let Ok(count) = drop.count.try_sample(block_drop_roll(loot_seed, index)) else {
+                    return Vec::new();
+                };
+                split_drop_stack(items, item_facts, item_id, count)
             })
             .collect();
     }
@@ -811,21 +854,11 @@ pub(super) fn block_drop_stacks_with_tool_and_facts_from_seeded(
         .unwrap_or_default()
 }
 
-fn enchantment_level(held_item: Option<&ItemStack>, enchantment_id: &str) -> u32 {
-    held_item
-        .into_iter()
-        .flat_map(|stack| &stack.enchantments)
-        .filter(|enchantment| enchantment.id.as_str() == enchantment_id)
-        .filter_map(|enchantment| u32::try_from(enchantment.level).ok())
-        .max()
-        .unwrap_or(0)
-}
-
-fn block_drop_roll(loot_seed: u64, pool_index: usize) -> u64 {
-    if pool_index == 0 {
+fn block_drop_roll(loot_seed: u64, drop_index: usize) -> u64 {
+    if drop_index == 0 {
         loot_seed
     } else {
-        splitmix64(loot_seed ^ (pool_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
+        splitmix64(loot_seed ^ (drop_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15))
     }
 }
 
@@ -1298,7 +1331,9 @@ mod tests {
         std::fs::write(
             blocks.join("diamond_ore.json"),
             r#"{
+              "type": "minecraft:block",
               "pools": [{
+                "bonus_rolls": 0.0,
                 "entries": [{
                   "type": "minecraft:alternatives",
                   "children": [
@@ -1320,22 +1355,19 @@ mod tests {
                     {
                       "type": "minecraft:item",
                       "functions": [{
-                        "function": "minecraft:set_count",
-                        "count": {
-                          "type": "minecraft:uniform",
-                          "min": 1,
-                          "max": 3
-                        }
-                      }, {
                         "enchantment": "minecraft:fortune",
                         "formula": "minecraft:ore_drops",
                         "function": "minecraft:apply_bonus"
+                      }, {
+                        "function": "minecraft:explosion_decay"
                       }],
                       "name": "minecraft:diamond"
                     }
                   ]
-                }]
-              }]
+                }],
+                "rolls": 1.0
+              }],
+              "random_sequence": "minecraft:blocks/diamond_ore"
             }"#,
         )
         .unwrap();
@@ -1397,6 +1429,50 @@ mod tests {
     }
 
     #[test]
+    fn contextual_loot_omits_an_unregistered_drop_item() {
+        let loot = contextual_diamond_ore_loot();
+        let (blocks, _, pickaxe_id) = contextual_diamond_ore_data();
+        let items = ItemRegistry::from_report(&[ItemReport {
+            id: Identifier::parse("minecraft:iron_pickaxe").unwrap(),
+            protocol_id: pickaxe_id,
+        }]);
+
+        assert!(
+            block_drop_stacks_with_tool_and_facts_from_seeded(
+                &loot,
+                &items,
+                &ItemFactsTable::default(),
+                &blocks,
+                BlockStateId(1),
+                Some(&ItemStack::new(pickaxe_id, 1)),
+                3,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_enchantment_level_fails_closed() {
+        let loot = contextual_diamond_ore_loot();
+        let (blocks, items, pickaxe_id) = contextual_diamond_ore_data();
+        let held = ItemStack::new(pickaxe_id, 1)
+            .with_enchantment(Identifier::parse("minecraft:fortune").unwrap(), -1);
+
+        assert!(
+            block_drop_stacks_with_tool_and_facts_from_seeded(
+                &loot,
+                &items,
+                &ItemFactsTable::default(),
+                &blocks,
+                BlockStateId(1),
+                Some(&held),
+                3,
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
     fn fortune_level_changes_ore_count_for_the_break_seed() {
         let loot = contextual_diamond_ore_loot();
         let (blocks, items, pickaxe_id) = contextual_diamond_ore_data();
@@ -1445,11 +1521,7 @@ mod tests {
                 )
             };
             assert_eq!(drops(&fortune_zero), drops(&plain), "seed {seed}");
-            assert_eq!(
-                drops(&plain),
-                vec![ItemStack::new(10, 1 + i32::try_from(seed % 3).unwrap())],
-                "seed {seed}"
-            );
+            assert_eq!(drops(&plain), vec![ItemStack::new(10, 1)], "seed {seed}");
         }
     }
 

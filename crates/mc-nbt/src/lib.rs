@@ -483,9 +483,6 @@ pub fn write_named<B: BufMut>(buf: &mut B, name: &str, root: &Tag) -> Result<(),
     write_payload(buf, root, 1)
 }
 
-/// Crate version, exposed so other crates and the binary can report it.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
 // -----------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------

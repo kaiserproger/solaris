@@ -233,11 +233,6 @@ impl BiomeRules {
         })
     }
 
-    #[must_use]
-    pub fn overworld_ids(&self) -> &[Identifier] {
-        &self.all
-    }
-
     pub(super) fn pick(&self, bucket: &[Identifier], x: i32, z: i32, salt: u64) -> Identifier {
         if bucket.is_empty() {
             return self.default.clone();

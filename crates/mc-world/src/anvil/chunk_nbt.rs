@@ -106,6 +106,8 @@ pub enum ChunkNbtError {
         name: String,
         props: Vec<(String, String)>,
     },
+    #[error("block state id {0} not in registry")]
+    UnknownBlockStateId(u32),
     #[error("item {0} not in registry")]
     UnknownItem(String),
     #[error("invalid enchantment component {0:?}")]
@@ -779,7 +781,7 @@ fn encode_block_section(
         None => {
             // Single mode: palette has exactly one entry, no data.
             let id = section.get(0, 0, 0);
-            let entry = block_state_to_palette_entry(id, registry);
+            let entry = block_state_to_palette_entry(id, registry)?;
             out.push((
                 "palette".into(),
                 Tag::List(ListTag {
@@ -792,7 +794,7 @@ fn encode_block_section(
             let pal_tags = palette
                 .iter()
                 .map(|&id| block_state_to_palette_entry(id, registry))
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
             out.push((
                 "palette".into(),
                 Tag::List(ListTag {
@@ -808,10 +810,13 @@ fn encode_block_section(
     Ok(Tag::Compound(out))
 }
 
-fn block_state_to_palette_entry(id: BlockStateId, registry: &BlockRegistry) -> Tag {
+fn block_state_to_palette_entry(
+    id: BlockStateId,
+    registry: &BlockRegistry,
+) -> Result<Tag, ChunkNbtError> {
     let state = registry
         .by_id(id)
-        .expect("registry must contain every state id present in a chunk");
+        .ok_or(ChunkNbtError::UnknownBlockStateId(id.0))?;
     let mut entry: Vec<(String, Tag)> = Vec::with_capacity(2);
     entry.push((
         "Name".into(),
@@ -825,7 +830,7 @@ fn block_state_to_palette_entry(id: BlockStateId, registry: &BlockRegistry) -> T
             .collect();
         entry.push(("Properties".into(), Tag::Compound(props)));
     }
-    Tag::Compound(entry)
+    Ok(Tag::Compound(entry))
 }
 
 fn encode_biome_section(section: &BiomeSection) -> Tag {
@@ -2024,6 +2029,23 @@ mod tests {
             },
         ];
         BlockRegistry::from_report(&report).unwrap()
+    }
+
+    #[test]
+    fn encode_unknown_block_state_returns_error_without_panicking() {
+        let registry = tiny_registry();
+        let chunk = Chunk::empty(
+            ChunkPos { x: 0, z: 0 },
+            BlockStateId(7),
+            Identifier::parse("minecraft:plains").unwrap(),
+        );
+
+        let encoded = std::panic::catch_unwind(|| chunk_to_nbt(&chunk, &registry));
+        let error = encoded
+            .expect("unknown block state encoding must not panic")
+            .expect_err("unknown block state encoding must fail");
+
+        assert!(matches!(error, ChunkNbtError::UnknownBlockStateId(7)));
     }
 
     fn scheduled_tick_tag(id: &str, x: i32, y: i32, z: i32, delay: i32, priority: i32) -> Tag {

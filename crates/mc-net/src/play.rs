@@ -43,21 +43,21 @@ use mc_protocol::packets::login::GameProfileProperty;
 use mc_protocol::packets::play::{
     AGEABLE_ENTITY_DATA_BABY_INDEX, AddEntity, BlockChangedAck, BlockEntityInfo, BlockUpdate,
     ChunkHeightmap, ClientboundBlockEntityData, ClientboundChangeDifficulty,
-    ClientboundCommandSuggestions, ClientboundContainerSetContent, ClientboundContainerSetData,
-    ClientboundContainerSetSlot, ClientboundCustomPayload, ClientboundInitializeBorder,
-    ClientboundKeepAlive, ClientboundOpenScreen, ClientboundRecipeBookSettings, ClientboundRespawn,
-    ClientboundSetEntityData, ClientboundSetExperience, ClientboundSetHealth,
-    ClientboundSetHeldSlot, ClientboundSystemChat, ClientboundTakeItemEntity, ConfirmTeleportation,
-    ContainerInput, Direction, ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX,
-    EntityAnimation, EntityAnimationAction, EntityDataValue, EntityEvent, EntityPose,
-    EntityPositionSync, EntityVec3, ForgetLevelChunk, GameEvent, GameMode, HashedStack,
-    ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack, LIVING_ENTITY_DATA_FLAGS_INDEX,
-    LevelChunkWithLight, LevelEvent, LightData, LightUpdate, LoginPlay, MoveEntityPosRot,
-    MovePlayerFlags, PlayDisconnect, PlayerActionKind, PlayerCommandAction, PlayerInfoActions,
-    PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate, PlayerInput, PositionMoveRotation,
-    RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX, SectionBlockChange,
-    SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode, ServerboundChat,
-    ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
+    ClientboundCommandSuggestions, ClientboundContainerClose, ClientboundContainerSetContent,
+    ClientboundContainerSetData, ClientboundContainerSetSlot, ClientboundCustomPayload,
+    ClientboundInitializeBorder, ClientboundKeepAlive, ClientboundOpenScreen,
+    ClientboundRecipeBookSettings, ClientboundRespawn, ClientboundSetEntityData,
+    ClientboundSetExperience, ClientboundSetHealth, ClientboundSetHeldSlot, ClientboundSystemChat,
+    ClientboundTakeItemEntity, ConfirmTeleportation, ContainerInput, Direction,
+    ENTITY_DATA_POSE_INDEX, ENTITY_DATA_SHARED_FLAGS_INDEX, EntityAnimation, EntityAnimationAction,
+    EntityDataValue, EntityEvent, EntityPose, EntityPositionSync, EntityVec3, ForgetLevelChunk,
+    GameEvent, GameMode, HashedStack, ITEM_ENTITY_DATA_ITEM_INDEX, InteractionHand, ItemStack,
+    LIVING_ENTITY_DATA_FLAGS_INDEX, LevelChunkWithLight, LevelEvent, LightData, LightUpdate,
+    LoginPlay, MoveEntityPosRot, MovePlayerFlags, PlayDisconnect, PlayerActionKind,
+    PlayerCommandAction, PlayerInfoActions, PlayerInfoEntry, PlayerInfoRemove, PlayerInfoUpdate,
+    PlayerInput, PositionMoveRotation, RemoveEntities, RotateHead, SHEEP_ENTITY_DATA_WOOL_INDEX,
+    SectionBlockChange, SectionBlocksUpdate, ServerboundAttack, ServerboundChangeGameMode,
+    ServerboundChat, ServerboundChatAck, ServerboundChatCommand, ServerboundChunkBatchReceived,
     ServerboundClientCommand, ServerboundClientInformation, ServerboundClientTickEnd,
     ServerboundCommandSuggestion, ServerboundContainerButtonClick, ServerboundContainerClick,
     ServerboundContainerClose, ServerboundCustomPayload, ServerboundInteract, ServerboundKeepAlive,
@@ -123,6 +123,12 @@ mod player_damage_adapter;
 mod random_ticks;
 mod recipes;
 mod scheduled_blocks;
+// Router and storage-owner wiring land separately; keep the bounded adapter
+// contract available without creating a second ingress path here.
+#[allow(dead_code)]
+mod script_inventory_transaction;
+#[cfg(test)]
+mod script_inventory_transaction_tests;
 mod session;
 mod simulation;
 pub(crate) use simulation::SimulationWorldAccess;
@@ -131,6 +137,8 @@ mod survival;
 mod toggles;
 mod use_item_on_adapter;
 mod wire_entities;
+#[cfg(test)]
+mod wire_entities_tests;
 pub(crate) mod world_journal;
 
 #[cfg(test)]
@@ -190,6 +198,7 @@ use simulation::{
     BowReleasePlan, FoodUsePlan, PlayerSurvivalCommitOutcome, PlayerSurvivalPlan,
     SelectedItemDropPlan, SheepShearPlan,
 };
+pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
 pub(crate) use simulation::{
     SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationSaveSnapshot,
     simulation_channel_with_explosion_seed,
@@ -260,12 +269,14 @@ use containers::{
     ChestWindow, CraftingTableWindow, ENCHANTING_MENU_SLOT_COUNT, ENCHANTING_MENU_TYPE_ID,
     EnchantingTableWindow, FURNACE_MENU_SLOT_COUNT, FurnaceClickAction, FurnaceClickInput,
     FurnaceKind, FurnaceWindow, QuickCraftClick, QuickCraftOutcome, QuickCraftState,
-    STONECUTTER_MENU_TYPE_ID, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
+    STONECUTTER_MENU_TYPE_ID, ScriptMenuClick, ScriptMenuClickDisposition, ScriptMenuOpenError,
+    ScriptMenuWindow, StonecutterClickAction, StonecutterClickInput, StonecutterWindow,
     adjacent_chest_positions,
     can_place_in_enchanting_menu_slot as can_place_in_enchanting_menu_slot_with_data,
-    chest_menu_title_nbt, chest_slot_stacks, chest_wire_items, count_valid_enchanting_bookshelves,
-    crafting_menu_title_nbt, crafting_table_input_from_projection, crafting_table_input_projection,
-    crafting_wire_items, enchant_item_candidate, enchanting_data_values, enchanting_menu_stack,
+    chest_menu_title_nbt, chest_slot_stacks, chest_wire_items, client_close_matches,
+    count_valid_enchanting_bookshelves, crafting_menu_title_nbt,
+    crafting_table_input_from_projection, crafting_table_input_projection, crafting_wire_items,
+    enchant_item_candidate, enchanting_data_values, enchanting_menu_stack,
     enchanting_menu_title_nbt, enchanting_offer, enchanting_player_slot,
     enchanting_table_input_from_projection, enchanting_table_input_projection,
     enchanting_wire_items, furnace_data_values, furnace_experience_seed, furnace_kind_for_block_id,
@@ -300,8 +311,7 @@ use fluids::{
 use inventory::damage_equipped_armor;
 #[cfg(test)]
 use inventory::{
-    ArmorStats, armor_reduced_damage, armor_slot_for_kind, player_swap_slot,
-    protection_reduced_damage, take_throw_stack,
+    ArmorStats, armor_reduced_damage, player_swap_slot, protection_reduced_damage, take_throw_stack,
 };
 use inventory::{
     PlayerInventory, apply_outside_pickup_click as apply_outside_pickup_click_with_carried,
@@ -326,7 +336,9 @@ use movement::{
     player_pose_collides_with_solid_in_snapshot, player_water_overlap_in_snapshot,
     refresh_player_fall_state, validate_player_rotation,
 };
-use persistence::{PersistedEntityRecord, PlayerPersistedState, XpState, load_player_state};
+#[cfg(test)]
+use persistence::PersistedEntityRecord;
+use persistence::{PersistedEntityCheckpoint, PlayerPersistedState, XpState, load_player_state};
 #[cfg(test)]
 use plants::{
     bonemeal_growth_edit, bonemeal_growth_edits, next_crop_growth_state, sweet_berry_harvest,
@@ -359,8 +371,9 @@ use scheduled_blocks::{
 };
 use session::{
     EntityAttackOutcome, OutboundCommand, OutboundLightUpdate, PlayerAttackResult,
-    PlayerEntitySnapshot, ServerEntityMove, ServerEntitySnapshot, SessionAdmissionError, SessionId,
-    SessionRegistration, SleepOutcome, VisibilityDispatch, dispatch_visibility_commands,
+    PlayerEntitySnapshot, ScriptMenuCloseRequest, ScriptMenuOpenRequest, ServerEntityMove,
+    ServerEntitySnapshot, SessionAdmissionError, SessionId, SessionRegistration, SleepOutcome,
+    VisibilityDispatch, dispatch_visibility_commands, publish_script_menu_click,
 };
 #[cfg(test)]
 use session::{PlayerDamagePublication, PlayerInventorySlotDelta, within_block_reach};
@@ -396,9 +409,9 @@ use use_item_on_adapter::{
 };
 use use_item_on_adapter::{ack_use_item_noop, handle_sign_update, handle_use_item_on};
 use wire_entities::{
-    send_entity_data, send_entity_despawn, send_entity_relative_move, send_entity_spawn,
-    send_player_animation, send_player_despawn, send_player_move, send_player_spawn,
-    send_take_item_entity,
+    send_entity_data, send_entity_despawn, send_entity_health, send_entity_relative_move,
+    send_entity_spawn, send_player_animation, send_player_despawn, send_player_move,
+    send_player_spawn, send_take_item_entity,
 };
 
 #[cfg(test)]
@@ -659,7 +672,6 @@ fn world_time_advance_crosses_night_start(world_time: u64, ticks: u64) -> bool {
 const ENTITY_HURT_INVULNERABLE_TICKS: u64 = 6;
 const ITEM_DESPAWN_AGE_TICKS: u64 = 6_000;
 const ITEM_DESPAWN_SWEEP_BUDGET: usize = 256;
-const ARROW_DESPAWN_AGE_TICKS: u64 = 1_200;
 const ARROW_ENTITY_HIT_DAMAGE: f32 = 4.0;
 const ARROW_ENTITY_HIT_KNOCKBACK: f64 = 0.6;
 const CHUNK_STREAM_STEPS_PER_TURN: usize = 1;
@@ -783,7 +795,10 @@ pub(crate) struct EntityPhysicsQuery {
 pub(crate) enum EntityPhysicsKind {
     Default,
     Living,
-    ArrowProjectile,
+    ArrowProjectile {
+        revision: Option<u64>,
+        embedded_block: Option<mc_entity::projectile_26_1_2::BlockPosition>,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -793,6 +808,32 @@ pub(crate) struct EntityPhysicsStep {
     pub velocity: Vec3,
     pub on_ground: bool,
     pub horizontal_collision: bool,
+}
+
+/// World-snapshot collision endpoint for one arrow physics query.
+///
+/// This stays parallel to [`EntityPhysicsStep`] so non-projectile callers do
+/// not need to manufacture projectile-only collision state.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ArrowBlockHitFact {
+    pub arrow_id: EntityId,
+    pub block_state: mc_world::BlockStateId,
+    pub block_position: mc_entity::projectile_26_1_2::BlockPosition,
+    pub location: Vec3,
+}
+
+/// Projectile-only facts sampled from the same authoritative world snapshot
+/// that produced an arrow's collision endpoint.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ArrowPhysicsFact {
+    pub arrow_id: EntityId,
+    pub block_hit: Option<ArrowBlockHitFact>,
+    pub embedded_in_block: bool,
+    pub current_block_state: mc_world::BlockStateId,
+    pub should_fall: bool,
+    pub fall_velocity_scale: Vec3,
+    pub in_water: bool,
+    pub in_water_or_rain: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1298,6 +1339,7 @@ where
     let default_spawn_pose = PlayerPose::new(spawn_x, spawn_y, spawn_z);
     let world_root = connection_world.root;
     let world_read = connection_world.read;
+    let world_mutation = connection_world.mutation;
     let chunk_source = connection_world.chunk_source;
     let default_player_state = PlayerPersistedState::new_default(default_spawn_pose);
     let mut player_state = if let Some(state) = sessions.recoverable_player_state(profile.uuid) {
@@ -1635,6 +1677,7 @@ where
                 config.chunk_pipeline,
             )
             .with_world_read(world_read.clone())
+            .with_world_mutation(world_mutation.clone())
             .with_chunk_source(chunk_source)
             .with_simulation(simulation.clone())
             .with_runtime_control(runtime_control.clone()),
@@ -1741,6 +1784,7 @@ where
             interaction.as_mut(),
             chunk_stream,
             runtime_control.clone(),
+            chunk_pipeline_resources.clone(),
             Arc::clone(&sessions),
             player_simulation,
             config,
@@ -1762,8 +1806,8 @@ where
         )
         .await;
         if let Some(state) = interaction.as_mut() {
-            if let Some(bed) = sessions.stop_sleeping(session_id) {
-                let _ = set_bed_occupied(state, writer, bed, false).await;
+            if let Some(bed) = sessions.request_sleep_wake(session_id) {
+                release_disconnected_sleep_bed(state, writer, bed).await;
             }
             player_inventory_settled =
                 settle_disconnected_inventory(state, &player_save_state).await;
@@ -2432,7 +2476,7 @@ fn can_place_in_enchanting_menu_slot(
         &state.item_facts,
         menu_slot,
         stack,
-        |slot, stack| can_place_in_player_slot(&state.items, slot, stack),
+        |slot, stack| can_place_in_player_slot(&state.item_facts, &state.items, slot, stack),
     )
 }
 
@@ -2504,7 +2548,8 @@ fn apply_enchanting_swap_click(
     };
     let swap = state.inventory.slots[player_slot].clone();
     let can_place_swap = can_place_in_enchanting_menu_slot(state, menu_slot, &swap);
-    let can_place_clicked = can_place_in_player_slot(&state.items, player_slot, &clicked);
+    let can_place_clicked =
+        can_place_in_player_slot(&state.item_facts, &state.items, player_slot, &clicked);
     let Some((new_clicked, new_swap)) =
         apply_regular_swap_slot(clicked, swap, can_place_swap, can_place_clicked)
     else {
@@ -2929,6 +2974,108 @@ where
         state.compression,
     )
     .await
+}
+
+async fn write_script_menu_content<W>(
+    state: &InteractionState,
+    writer: &mut W,
+    window: &ScriptMenuWindow,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    write_packet(
+        writer,
+        &ClientboundContainerSetContent {
+            container_id: window.container_id,
+            state_id: window.state_id,
+            items: window.wire_items(&state.inventory),
+            carried_item: state.carried_item.clone(),
+        },
+        state.compression,
+    )
+    .await
+}
+
+async fn open_script_menu<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    player_pose: PlayerPose,
+    request: ScriptMenuOpenRequest,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    if request.player_id.value() != state.session_id {
+        return Ok(());
+    }
+    let window = match ScriptMenuWindow::open(
+        state.next_container_id,
+        request.owner,
+        request.player_id,
+        request.menu,
+        &state.items,
+    ) {
+        Ok(window) => window,
+        Err(ScriptMenuOpenError::UnknownItem(item)) => {
+            debug!(%item, "script menu open rejected unknown item");
+            return Ok(());
+        }
+        Err(ScriptMenuOpenError::InvalidRows) => {
+            debug!("script menu open rejected invalid row count");
+            return Ok(());
+        }
+    };
+
+    store_active_container(state, player_pose).await?;
+    let allocated_id = next_container_id(state);
+    debug_assert_eq!(allocated_id, window.container_id);
+    write_packet(
+        writer,
+        &ClientboundOpenScreen {
+            container_id: window.container_id,
+            menu_type: window.menu_type(),
+            title_nbt: text_component_nbt(window.title())?,
+        },
+        state.compression,
+    )
+    .await?;
+    write_script_menu_content(state, writer, &window).await?;
+    state.active_container = Some(ActiveContainer::Script(window));
+    Ok(())
+}
+
+async fn close_script_menu<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    request: ScriptMenuCloseRequest,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(active) = state.active_container.take() else {
+        return Ok(());
+    };
+    match active {
+        ActiveContainer::Script(window)
+            if window.matches_close(&request.plugin_id, request.player_id, &request.menu_id) =>
+        {
+            write_packet(
+                writer,
+                &ClientboundContainerClose {
+                    container_id: window.container_id,
+                },
+                state.compression,
+            )
+            .await?;
+        }
+        ActiveContainer::Script(window) => {
+            write_script_menu_content(state, writer, &window).await?;
+            state.active_container = Some(ActiveContainer::Script(window));
+        }
+        other => state.active_container = Some(other),
+    }
+    Ok(())
 }
 
 async fn write_chest_content<W>(
@@ -4325,6 +4472,17 @@ where
         }
     };
 
+    if let Some(bed) = state.sessions.sleeping_bed(state.session_id) {
+        match release_staged_sleep_bed(state, writer, bed).await? {
+            Some(SleepBedRelease::Completed) | None => {}
+            Some(SleepBedRelease::Rejected { .. }) => {
+                return Err(ConnectionError::RuntimeUnavailable {
+                    operation: "releasing bed before damage publication",
+                });
+            }
+        }
+    }
+
     let changed_slots = expected_inventory
         .slots
         .iter()
@@ -4910,18 +5068,34 @@ fn apply_furnace_click_for_test(
     Some(plan.dropped)
 }
 
+struct ContainerClickContext<'a> {
+    game_mode: GameMode,
+    survival_state: SurvivalState,
+    xp_state: &'a XpState,
+    player_pose: PlayerPose,
+    scripts: Option<&'a ScriptEventSink>,
+    script_player_id: ScriptPlayerId,
+    script_context: ScriptPlayerContext,
+}
+
 async fn handle_container_click<W>(
     state: &mut InteractionState,
     writer: &mut W,
-    game_mode: GameMode,
-    survival_state: SurvivalState,
-    xp_state: &XpState,
-    player_pose: PlayerPose,
+    context: ContainerClickContext<'_>,
     packet: ServerboundContainerClick,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
+    let ContainerClickContext {
+        game_mode,
+        survival_state,
+        xp_state,
+        player_pose,
+        scripts,
+        script_player_id,
+        script_context,
+    } = context;
     state.pending_break = None;
     state.pending_use = None;
     clear_shield_use(state);
@@ -4954,6 +5128,10 @@ where
                     let view = load_chest_view(state, &window).await?;
                     write_chest_content(state, writer, &window, &view).await?;
                     state.active_container = Some(ActiveContainer::Chest(window));
+                }
+                ActiveContainer::Script(window) => {
+                    write_script_menu_content(state, writer, &window).await?;
+                    state.active_container = Some(ActiveContainer::Script(window));
                 }
             }
         }
@@ -5012,6 +5190,33 @@ where
                     handle_chest_container_click(state, writer, chest, player_pose, packet).await?;
                 state.active_container = Some(ActiveContainer::Chest(chest));
             }
+            ActiveContainer::Script(window) => {
+                let click = ScriptMenuClick::from_packet(
+                    window.container_id,
+                    window.state_id,
+                    packet.container_id,
+                    packet.state_id,
+                    packet.slot_num,
+                    packet.container_input,
+                    packet.button_num,
+                );
+                match window.click(click, script_player_id, script_context) {
+                    Ok(event) => {
+                        if !publish_script_menu_click(scripts, event).await {
+                            debug!(
+                                container_id = window.container_id,
+                                "script menu click rejected because targeted delivery is unavailable"
+                            );
+                        }
+                    }
+                    Err(ScriptMenuClickDisposition::Resync) => {}
+                    Err(ScriptMenuClickDisposition::Clicked { .. }) => {
+                        unreachable!("clicked dispositions are converted to script events")
+                    }
+                }
+                write_script_menu_content(state, writer, &window).await?;
+                state.active_container = Some(ActiveContainer::Script(window));
+            }
             other => {
                 debug!(
                     container_id = packet.container_id,
@@ -5021,6 +5226,12 @@ where
                 state.active_container = Some(other);
             }
         }
+        return Ok(());
+    }
+
+    if let Some(ActiveContainer::Script(window)) = state.active_container.take() {
+        write_script_menu_content(state, writer, &window).await?;
+        state.active_container = Some(ActiveContainer::Script(window));
         return Ok(());
     }
 
@@ -5300,6 +5511,7 @@ where
             count: stack.count,
             damage: stack.damage,
             enchantments: stack.enchantments.clone(),
+            custom_name: None,
         };
         let max_stack = item_max_stack(&state.item_facts, &state.items, &probe);
         let credited = match state
@@ -5678,6 +5890,13 @@ async fn handle_attack<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
+        debug!(
+            slot = state.selected_hotbar_slot,
+            "entity attack ignored for invalid selected hotbar slot"
+        );
+        return Ok(());
+    };
     state.pending_break = None;
     if game_mode == GameMode::Survival && survival_state.is_dead() {
         debug!(
@@ -5699,15 +5918,18 @@ where
     let Some(damage) = begin_player_attack_attempt(
         &state.item_facts,
         &state.items,
-        state.inventory.held(state.selected_hotbar_slot),
+        &held,
         game_mode,
         state.last_entity_attack_tick,
         current_tick,
     ) else {
         return Ok(());
     };
-    let attacker_costs =
-        player_attack_cost_plan(state, game_mode, *survival_state, xp_state, player_pose);
+    let Some(attacker_costs) =
+        player_attack_cost_plan(state, game_mode, *survival_state, xp_state, player_pose)
+    else {
+        return Ok(());
+    };
     let attack = match state
         .simulation
         .player_attack_server_entity_with_costs(entity_id, damage, attacker_costs)
@@ -5878,18 +6100,15 @@ fn player_attack_cost_plan(
     survival: SurvivalState,
     xp: &XpState,
     player_pose: PlayerPose,
-) -> PlayerSurvivalPlan {
+) -> Option<PlayerSurvivalPlan> {
     let mut updated_survival = survival;
     let mut updated_inventory = state.inventory.clone();
     if game_mode == GameMode::Survival {
+        let held = updated_inventory.held_mut(state.selected_hotbar_slot)?;
         updated_survival.add_exhaustion(SurvivalState::ENTITY_ATTACK_EXHAUSTION);
-        damage_held_weapon_stack(
-            &state.items,
-            &state.item_facts,
-            updated_inventory.held_mut(state.selected_hotbar_slot),
-        );
+        damage_held_weapon_stack(&state.items, &state.item_facts, held);
     }
-    PlayerSurvivalPlan {
+    Some(PlayerSurvivalPlan {
         expected_survival: survival,
         updated_survival,
         expected_inventory: state.inventory.clone(),
@@ -5902,7 +6121,7 @@ fn player_attack_cost_plan(
         item_entity_type_id: None,
         xp_orb_entity_type_id: None,
         position: Vec3::new(player_pose.x, player_pose.y, player_pose.z),
-    }
+    })
 }
 
 async fn start_falling_blocks_after_edits<W>(
@@ -7411,6 +7630,133 @@ async fn record_empty_resident_journal_decision(
         }
         Err(error) => {
             warn!(?error, "empty resident block journal append worker failed");
+            sessions.report_world_chunk_journal_failure();
+            Err(())
+        }
+    }
+}
+
+async fn commit_cross_region_scheduled_block_tick(
+    sessions: &SessionRegistry,
+    mutation: &mc_world::WorldMutationView,
+    world_tick: u64,
+    commit: ResidentBlockCommit<'_>,
+) -> Result<Option<BlockEditBatchOutcome>, ()> {
+    let Some(journal) = sessions.world_chunk_journal() else {
+        warn!("cross-region scheduled block transaction requires a world journal");
+        sessions.report_world_chunk_journal_failure();
+        return Err(());
+    };
+    let mutation = mutation.clone();
+    let edits = commit.edits.to_vec();
+    let preconditions = commit.preconditions.to_vec();
+    let consumed_ticks = commit.consumed_block_ticks.to_vec();
+    let light_table = commit.light_table.cloned();
+    let leaf_trigger_tick = commit.leaf_trigger_tick;
+    let runtime = tokio::runtime::Handle::current();
+    let failure = sessions.world_chunk_journal_failure_reporter();
+    let worker = tokio::task::spawn_blocking(move || {
+        let fail_stop = || {
+            failure.send_replace(true);
+            Err(())
+        };
+        let decision_id = match journal.reserve_decision_ids(1) {
+            Ok(ids) => ids[0],
+            Err(error) => {
+                warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block journal decision reservation failed");
+                return fail_stop();
+            }
+        };
+        let prepared = mutation.prepare_cross_region_scheduled_block_tick_transaction(
+            Some(decision_id),
+            &mc_world::ResidentScheduledBlockTickPlan {
+                consumed_ticks: &consumed_ticks,
+                edits: &edits,
+                preconditions: &preconditions,
+                light_table: light_table.as_ref(),
+                leaf_trigger_tick,
+            },
+        );
+        if let Err(error) = runtime.block_on(journal.wait_for_append_turn(decision_id)) {
+            warn!(%error, "cross-region scheduled block journal append turn failed");
+            return fail_stop();
+        }
+        let close_empty = || {
+            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, Vec::new())])
+        };
+        let transaction = match prepared {
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Prepared(
+                transaction,
+            ) => transaction,
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Stale => {
+                return match close_empty() {
+                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Err(error) => {
+                        warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block stale reservation closure failed");
+                        fail_stop()
+                    }
+                };
+            }
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickPrepareResult::Missing => {
+                return match close_empty() {
+                    Ok(()) => Ok(None),
+                    Err(error) => {
+                        warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block missing reservation closure failed");
+                        fail_stop()
+                    }
+                };
+            }
+        };
+        match transaction.commit_durably(|snapshots| {
+            journal.record_reserved_snapshot_groups(world_tick, vec![(decision_id, snapshots)])
+        }) {
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Applied(
+                applied,
+            ) => Ok(simulation::resident_block_edit_result_outcome(
+                mc_world::ResidentBlockEditBatchResult::Applied(applied),
+            )),
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Stale => {
+                match close_empty() {
+                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Err(error) => {
+                        warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block stale commit closure failed");
+                        fail_stop()
+                    }
+                }
+            }
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::Missing => {
+                match close_empty() {
+                    Ok(()) => Ok(None),
+                    Err(error) => {
+                        warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block missing commit closure failed");
+                        fail_stop()
+                    }
+                }
+            }
+            mc_world::resident::ResidentCrossRegionScheduledBlockTickCommitResult::DurabilityFailed(error) => {
+                let outcome_unknown = error.outcome_unknown();
+                warn!(outcome_unknown, %error, "cross-region scheduled block journal append failed");
+                if outcome_unknown {
+                    return fail_stop();
+                }
+                match close_empty() {
+                    Ok(()) => Ok(Some(BlockEditBatchOutcome::default())),
+                    Err(error) => {
+                        warn!(outcome_unknown = error.outcome_unknown(), %error, "cross-region scheduled block failed reservation closure");
+                        fail_stop()
+                    }
+                }
+            }
+        }
+    })
+    .await;
+    match worker {
+        Ok(result) => result,
+        Err(error) => {
+            warn!(
+                ?error,
+                "cross-region scheduled block transaction worker failed"
+            );
             sessions.report_world_chunk_journal_failure();
             Err(())
         }
@@ -8936,14 +9282,24 @@ async fn run_scheduled_block_ticks_owned(
                     journal_failed = true;
                     break;
                 }
-                match commit_scheduled_block_tick_coordinator(
+                let Some((edits, preconditions)) =
+                    resident_block_edit_inputs(&plan.edits, &plan.preconditions, table)
+                else {
+                    continue;
+                };
+                match commit_cross_region_scheduled_block_tick(
                     sessions,
-                    world,
                     world_mutation,
-                    table,
                     world_tick,
-                    &plan,
-                    &region_due,
+                    ResidentBlockCommit {
+                        edits: &edits,
+                        preconditions: &preconditions,
+                        consumed_block_ticks: &region_due,
+                        consumed_fluid_ticks: &[],
+                        scheduled_fluid_ticks: &[],
+                        light_table: table,
+                        leaf_trigger_tick: Some(world_tick.saturating_add(1)),
+                    },
                 )
                 .await
                 {
@@ -9846,7 +10202,7 @@ where
         }
         SleepOutcome::Waiting { sleeping, required } => {
             if set_bed_occupied(state, writer, canonical_bed, true).await? == Some(false) {
-                state.sessions.stop_sleeping(state.session_id);
+                state.sessions.cancel_sleep_reservation(state.session_id);
                 return Err(ConnectionError::RuntimeUnavailable {
                     operation: "marking occupied bed",
                 });
@@ -9919,11 +10275,17 @@ async fn wake_player_from_bed<W>(
     player_pose: &mut PlayerPose,
     next_teleport_id: &mut i32,
     pending_teleport: &mut Option<PendingTeleport>,
-) -> Result<(), ConnectionError>
+) -> Result<Option<GameMode>, ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
-    let _ = set_bed_occupied(state, writer, bed, false).await?;
+    let Some(release) = release_staged_sleep_bed(state, writer, bed).await? else {
+        return Ok(None);
+    };
+    match release {
+        SleepBedRelease::Completed => {}
+        SleepBedRelease::Rejected { rollback_mode } => return Ok(rollback_mode),
+    }
     let mut wake_pose = safe_bed_wake_pose(
         &state.world_read,
         &state.blocks,
@@ -9940,7 +10302,88 @@ where
         teleport_id,
         state.sessions.simulation_tick(),
     ));
-    Ok(())
+    Ok(None)
+}
+
+enum SleepBedRelease {
+    Completed,
+    Rejected { rollback_mode: Option<GameMode> },
+}
+
+async fn release_staged_sleep_bed<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    bed: mc_world::BlockPos,
+) -> Result<Option<SleepBedRelease>, ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(token) = state.sessions.claim_sleep_wake(state.session_id, bed) else {
+        return Ok(None);
+    };
+    match set_bed_occupied(state, writer, bed, false).await {
+        Ok(Some(true)) => {
+            let Some(completed) = state.sessions.complete_sleep_wake(token) else {
+                return Ok(None);
+            };
+            dispatch_visibility_commands(completed.dispatches);
+            Ok(Some(SleepBedRelease::Completed))
+        }
+        Ok(None | Some(false)) => {
+            let rollback = state.sessions.reject_sleep_wake(token);
+            Ok(Some(SleepBedRelease::Rejected {
+                rollback_mode: rollback,
+            }))
+        }
+        Err(error) => {
+            state.sessions.reject_sleep_wake(token);
+            Err(error)
+        }
+    }
+}
+
+async fn release_disconnected_sleep_bed<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    bed: mc_world::BlockPos,
+) where
+    W: AsyncWriteExt + Unpin,
+{
+    #[cfg(test)]
+    {
+        let _ = release_staged_sleep_bed(state, writer, bed).await;
+    }
+    #[cfg(not(test))]
+    {
+        let _ = writer;
+        let Some(token) = state.sessions.claim_sleep_wake(state.session_id, bed) else {
+            return;
+        };
+        let Some((edits, preconditions)) =
+            plan_bed_occupied_edits(&state.world_read, &state.blocks, bed, false)
+        else {
+            state.sessions.reject_sleep_wake(token);
+            return;
+        };
+        let committed = if edits.is_empty() {
+            true
+        } else {
+            matches!(
+                state
+                    .simulation
+                    .apply_block_edits_with_scheduled_ticks(edits, preconditions, Vec::new())
+                    .await,
+                Ok(Some(_))
+            )
+        };
+        if committed {
+            if let Some(completed) = state.sessions.complete_sleep_wake(token) {
+                dispatch_visibility_commands(completed.dispatches);
+            }
+        } else {
+            state.sessions.reject_sleep_wake(token);
+        }
+    }
 }
 
 async fn interact_with_toggle_block<W>(
@@ -10802,6 +11245,7 @@ async fn play_loop<R, W>(
     interaction: Option<&mut InteractionState>,
     chunk_stream: Option<ChunkStreamState>,
     runtime_control: Option<RuntimeControlHandle>,
+    chunk_pipeline_resources: ChunkPipelineResources,
     sessions: Arc<SessionRegistry>,
     simulation: SimulationHandle,
     config: &ServerConfig,
@@ -10833,6 +11277,7 @@ where
         interaction,
         chunk_stream,
         runtime_control,
+        chunk_pipeline_resources,
         Arc::clone(&sessions),
         simulation,
         config,
@@ -10876,6 +11321,7 @@ async fn play_loop_inner<R, W>(
     mut interaction: Option<&mut InteractionState>,
     mut chunk_stream: Option<ChunkStreamState>,
     runtime_control: Option<RuntimeControlHandle>,
+    chunk_pipeline_resources: ChunkPipelineResources,
     sessions: Arc<SessionRegistry>,
     simulation: SimulationHandle,
     config: &ServerConfig,
@@ -11040,6 +11486,9 @@ where
                     }
                     Some(OutboundCommand::UpdateEntityData(entity)) => {
                         send_entity_data(writer, compression, &entity).await?;
+                    }
+                    Some(OutboundCommand::UpdateEntityHealth(entity)) => {
+                        send_entity_health(writer, compression, &entity).await?;
                     }
                     Some(OutboundCommand::MoveEntityRelative(movement)) => {
                         send_entity_relative_move(writer, compression, &movement).await?;
@@ -11253,8 +11702,8 @@ where
                             .await?;
                     }
                     Some(OutboundCommand::WakeFromBed { bed }) => {
-                        if let Some(state) = interaction.as_deref_mut() {
-                            wake_player_from_bed(
+                        if let Some(state) = interaction.as_deref_mut()
+                            && let Some(previous) = wake_player_from_bed(
                                 state,
                                 writer,
                                 compression,
@@ -11263,6 +11712,23 @@ where
                                 &mut player_pose,
                                 &mut next_teleport_id,
                                 &mut pending_teleport,
+                            )
+                            .await?
+                        {
+                            game_mode = previous;
+                            write_packet(
+                                writer,
+                                &GameEvent {
+                                    event: GameEvent::EVENT_CHANGE_GAME_MODE,
+                                    value: previous.id() as f32,
+                                },
+                                compression,
+                            )
+                            .await?;
+                            write_packet(
+                                writer,
+                                &player_abilities_for_mode(previous),
+                                compression,
                             )
                             .await?;
                         }
@@ -11277,6 +11743,19 @@ where
                         )
                         .await?;
                         close_session = true;
+                    }
+                    Some(OutboundCommand::OpenScriptMenu(request)) => {
+                        if game_mode != GameMode::Spectator
+                            && !survival_state.is_dead()
+                            && let Some(state) = interaction.as_deref_mut()
+                        {
+                            open_script_menu(state, writer, player_pose, request).await?;
+                        }
+                    }
+                    Some(OutboundCommand::CloseScriptMenu(request)) => {
+                        if let Some(state) = interaction.as_deref_mut() {
+                            close_script_menu(state, writer, request).await?;
+                        }
                     }
                     Some(OutboundCommand::Explosion(mut packet)) => {
                         if game_mode != GameMode::Survival {
@@ -11570,9 +12049,9 @@ where
                         PlayerCommandAction::PressShiftKey => player_pose.shifting = true,
                         PlayerCommandAction::ReleaseShiftKey => player_pose.shifting = false,
                         PlayerCommandAction::StopSleeping => {
-                            if let Some(bed) = sessions.stop_sleeping(session_id) {
-                                if let Some(state) = interaction.as_deref_mut() {
-                                    wake_player_from_bed(
+                            if let Some(bed) = sessions.request_sleep_wake(session_id)
+                                && let Some(state) = interaction.as_deref_mut()
+                                && let Some(previous) = wake_player_from_bed(
                                         state,
                                         writer,
                                         compression,
@@ -11582,14 +12061,24 @@ where
                                         &mut next_teleport_id,
                                         &mut pending_teleport,
                                     )
-                                    .await?;
-                                }
-                                dispatch_visibility_commands(
-                                    sessions.broadcast_player_entity_data_including_self(
-                                        session_id,
-                                        vec![player_pose_entity_data(EntityPose::Standing)],
-                                    ),
-                                );
+                                    .await?
+                            {
+                                game_mode = previous;
+                                write_packet(
+                                    writer,
+                                    &GameEvent {
+                                        event: GameEvent::EVENT_CHANGE_GAME_MODE,
+                                        value: previous.id() as f32,
+                                    },
+                                    compression,
+                                )
+                                .await?;
+                                write_packet(
+                                    writer,
+                                    &player_abilities_for_mode(previous),
+                                    compression,
+                                )
+                                .await?;
                             }
                         }
                         _ => {}
@@ -11726,10 +12215,20 @@ where
                         handle_container_click(
                             state,
                             writer,
-                            game_mode,
-                            survival_state,
-                            &xp_state,
-                            player_pose,
+                            ContainerClickContext {
+                                game_mode,
+                                survival_state,
+                                xp_state: &xp_state,
+                                player_pose,
+                                scripts: scripts.as_ref(),
+                                script_player_id: ScriptPlayerId::new(session_id),
+                                script_context: script_player_context_from_values(
+                                    &player_uuid,
+                                    &player_name,
+                                    permissions,
+                                    player_pose,
+                                ),
+                            },
                             click,
                         )
                         .await?;
@@ -11744,12 +12243,28 @@ where
                     let mut body = frame.body;
                     let close = ServerboundContainerClose::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
+                        let script_close = state.active_container.as_ref().and_then(|active| {
+                            let ActiveContainer::Script(window) = active else {
+                                return None;
+                            };
+                            Some(client_close_matches(window.container_id, close.container_id))
+                        });
                         let should_store = state
-                                .active_container
-                                .as_ref()
-                                .is_some_and(|active| active.container_id() == close.container_id);
-                        if should_store {
+                            .active_container
+                            .as_ref()
+                            .is_some_and(|active| active.container_id() == close.container_id);
+                        if script_close == Some(true) || (script_close.is_none() && should_store) {
                             store_active_container(state, player_pose).await?;
+                        } else if script_close == Some(false) {
+                            let Some(ActiveContainer::Script(window)) =
+                                state.active_container.take()
+                            else {
+                                unreachable!(
+                                    "script close classification requires a script window"
+                                )
+                            };
+                            write_script_menu_content(state, writer, &window).await?;
+                            state.active_container = Some(ActiveContainer::Script(window));
                         } else if close.container_id == 0 {
                             store_inventory_crafting_inputs(state, player_pose).await?;
                         }
@@ -12024,6 +12539,7 @@ where
                         interaction.as_deref_mut(),
                         &mut player_pose,
                         runtime_control.as_ref(),
+                        &chunk_pipeline_resources,
                         &mut chunk_stream,
                         &mut next_teleport_id,
                         &mut pending_teleport,
@@ -12246,8 +12762,9 @@ mod campfire_output_recovery_tests {
         sessions.install_world_chunk_journal(world_journal);
         let (simulation, owner) = simulation::simulation_channel();
         let persisted = persistence::load_persisted_entities(root, &items, &entity_types).unwrap();
-        let replayed = persistence::replay_regional_commit_decisions(persisted, &entity_pending);
-        let expected = replayed.len();
+        let replayed = persistence::replay_regional_commit_decisions(persisted, &entity_pending)
+            .expect("persisted campfire entity journal replays");
+        let expected = replayed.records.len();
         assert_eq!(
             owner.restore_persisted_entities(&sessions, replayed),
             expected
@@ -12327,7 +12844,7 @@ mod campfire_output_recovery_tests {
         runtime: &CampfireRuntime,
         expected: &PendingCampfireOutput,
     ) {
-        let records = runtime.sessions.persisted_entity_save_snapshot().0;
+        let records = runtime.sessions.persisted_entity_save_snapshot().0.records;
         let matching = records
             .iter()
             .filter(|record| record.snapshot.uuid == expected.uuid)
@@ -12517,9 +13034,13 @@ mod campfire_output_recovery_tests {
             pending_output_from_world_journal(tmp.path(), mc_world::BlockPos { x: 1, y: 64, z: 1 });
         let (_, entity_pending) =
             persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
-        let replayed = persistence::replay_regional_commit_decisions(Vec::new(), &entity_pending);
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].snapshot.uuid, expected.uuid);
+        let replayed = persistence::replay_regional_commit_decisions(
+            PersistedEntityCheckpoint::new(0, Vec::<PersistedEntityRecord>::new()),
+            &entity_pending,
+        )
+        .expect("committed campfire entity journal replays");
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].snapshot.uuid, expected.uuid);
 
         let (first_restart, recovered) = reopen_campfire_runtime(tmp.path()).await;
         assert_eq!(recovered, 1);
@@ -12541,7 +13062,7 @@ mod campfire_output_recovery_tests {
             .run_campfire_cooking_ticks(&runtime.config, &runtime.sessions, None, None)
             .await;
         assert_eq!(report.dropped, 1);
-        let records = runtime.sessions.persisted_entity_save_snapshot().0;
+        let records = runtime.sessions.persisted_entity_save_snapshot().0.records;
         assert_eq!(records.len(), 1);
         let expected = PendingCampfireOutput {
             uuid: records[0].snapshot.uuid,

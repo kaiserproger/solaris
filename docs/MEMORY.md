@@ -9,12 +9,13 @@ and is not startup context.
 
 - Date: 2026-07-19.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `24223dc` (`feat(mc-net): add wall torches and isolate
-  regional mutation`).
+- Latest checkpoint: `02cf22a` (`refactor: split gameplay and core domain
+  modules`).
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
-- Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed for `24223dc`.
+- Last recorded full workspace tests, workspace all-target strict Clippy, fmt,
+  code-health `0 fail / KEEP`, and diff-check passed at `24223dc`. The later
+  `02cf22a` checkpoint and current entity wave still need a fresh full baseline.
 - Ignored oracle/load/benchmark rows remain explicit. Real-client,
   performance, concurrency, and soak gates did not run for that checkpoint.
 
@@ -22,7 +23,7 @@ and is not startup context.
 
 ### Core And Ownership
 
-- `play.rs` is 13,079 lines, `session.rs` 1,502, and `simulation.rs` 15,488.
+- `play.rs` is 12,589 lines, `session.rs` 1,507, and `simulation.rs` 15,488.
   The migration is staged, not complete.
 - `simulation/queue.rs` owns bounded admission, accounting, pushed wakeup,
   batching, shutdown, and channel construction.
@@ -30,18 +31,32 @@ and is not startup context.
   mutation lane behind explicit imports and code-health tripwires. The parent
   still owns classification, batching, world access, lighting/publication, and
   `SimulationOwner`.
-- Regional entity ownership and the ECS shadow/cutover path exist, but neither
-  the regional migration nor ECS transition is complete. ADR 0004/0005 are the
-  authority source of truth.
+- `EntityStore` uses the ECS runtime and the old vector comparison state,
+  `Shadow*` API, aliases, and `shadow-compare` feature are deleted. The current
+  cutover is still moving gameplay-significant temporal state and projectile
+  transactions out of `mc-net` side maps, so broad sole-authority readiness is
+  not yet established. ADR 0004/0005 are the authority source of truth.
 - Runtime work control has no operator worker-percentage knobs. Capacity is
   derived once; pushed measurements and bounded admissions drive allocation.
+- Serverbound protocol collections/strings/blobs have a complete bounded
+  allocation audit, symmetric encode limits, and no-partial-output tests.
+- Production worldgen now consumes explicit `ChunkGeometry` for terrain, ores,
+  structures, and biome assignment. Extreme valid geometries use checked/wide
+  arithmetic, and the default Overworld path has a deterministic serialized-NBT
+  fingerprint. The algorithm remains Solaris-owned rather than Mojang
+  NoiseRouter parity.
+- Lua API 0.6 has bounded DTO/files/batches and one-shot host admission. The
+  attested `mc-net` router plus storage/menu/zones/colonies adapters are active
+  implementation work, not a completed production surface.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 
 ### Playable And Client-Visible
 
-- Stair facing/half and slab top/bottom follow the inspected local 26.1.2 rule.
-  Slab merging and stair neighbour shapes remain open.
+- Stair facing/half, slab top/bottom, adjacent matching-slab merge, and
+  waterlogging follow the inspected local 26.1.2 rule. The focused executable
+  gate must be refreshed after the concurrent ECS slice; stair neighbour shapes
+  remain open.
 - Ordinary torches place as wall torches on horizontal conservative full-cube
   supports, remain standing on `UP`, and reject `DOWN` or known partial
   supports. Irregular sturdy-face parity and neighbour break cascades remain
@@ -66,12 +81,13 @@ and is not startup context.
 
 1. Rerun the focused real-client movement/performance pack without the old CPU
    cap and inspect rare stalls, not only aggregate medians.
-2. Prove wall torch, stair, and slab placement in the real client.
+2. Refresh focused and real-client wall torch, stair, and slab placement gates.
 3. Continue reducing `simulation.rs` through explicit ownership boundaries;
    avoid moves that retain `use super::*` or duplicate authority.
 4. Advance regional ownership/ECS only with exact CAS, WAL, publication, and
    cross-region failure fences.
-5. Broaden playable progression by the Pareto rule before polishing rare parity
+5. Finish the attested Lua storage/menu/zones/colony production adapters.
+6. Broaden playable progression by the Pareto rule before polishing rare parity
    edges.
 
 ## Canonical Routes
@@ -80,6 +96,7 @@ and is not startup context.
 | --- | --- |
 | Playable/client behavior | `docs/playable/README.md`, then `docs/playable/ACTIVE.md` |
 | Architecture/ownership | `docs/decisions/README.md`, then the exact ADR |
+| Detailed core internals and pitfalls | `docs/CORE_INTERNALS_FOR_OWNER.md` |
 | Current M100 milestone | `docs/milestones/M100.md` |
 | Readiness claim | `docs/DEFINITION_OF_DONE.md` and `docs/VALIDATION_LEDGER.md` |
 | Protocol | ADR 0002 and local protocol tools |

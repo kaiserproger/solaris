@@ -9,10 +9,11 @@ use flate2::Compression as GzipCompression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use mc_entity::{
-    RegionPhase, RegionalCommitDecision, RegionalDecisionJournal, RegionalDecisionJournalError,
+    EntityStore, RegionPhase, RegionalCommitDecision, RegionalDecisionJournal,
+    RegionalDecisionJournalError,
 };
 use mc_nbt::{ListTag, Tag, tag_type};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use thiserror::Error;
 
 use super::*;
@@ -20,11 +21,32 @@ use super::*;
 const PLAYERDATA_DIR: &str = "playerdata";
 const SOLARIS_DIR: &str = "solaris";
 const ENTITIES_FILE: &str = "entities.dat";
+const ENTITY_FORMAT_VERSION_FIELD: &str = "SolarisEntityFormatVersion";
+const ENTITY_FORMAT_VERSION: i32 = 3;
+const ENTITY_LIFECYCLE_TICK_FIELD: &str = "SolarisEntityLifecycleTick";
+const ENTITY_REGIONAL_SEQUENCE_FIELD: &str = "SolarisRegionalSequenceWatermark";
+const ENTITY_LIFECYCLE_FIELD: &str = "SolarisLifecycle";
+const ENTITY_ATTRIBUTES_FIELD: &str = "SolarisAttributes";
+const ENTITY_RETAINED_STATE_FIELD: &str = "SolarisRetainedState";
+const ENTITY_HEAD_YAW_FIELD: &str = "SolarisHeadYaw";
+const ENTITY_GOAL_STATE_FIELD: &str = "SolarisGoalState";
+const ENTITY_VEHICLE_STATE_FIELD: &str = "SolarisVehicleState";
+const ENTITY_HORIZONTAL_POSITION_LIMIT_26_1_2: f64 = 3.0000512E7;
+const ENTITY_VERTICAL_POSITION_LIMIT_26_1_2: f64 = 2.0E7;
+const ENTITY_VELOCITY_LIMIT_26_1_2: f64 = 10.0;
+const ENTITY_TICKS_PER_SECOND: f64 = 20.0;
 const WORLD_FILE: &str = "world.dat";
 const REGIONAL_DECISION_JOURNAL_FILE: &str = "entity-owner-journal.json";
-const LEGACY_REGIONAL_DECISION_JOURNAL_VERSION: u32 = 1;
-const REGIONAL_DECISION_JOURNAL_HEADER: &[u8] = b"SOLARIS_ENTITY_OWNER_JOURNAL 2\n";
+const REGIONAL_DECISION_JOURNAL_HEADER: &[u8] = b"SOLARIS_ENTITY_OWNER_JOURNAL 3\n";
+const REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES: usize = 8;
+// One recovery set supports the documented 30k-entity workload. The byte caps leave room for
+// rich entity snapshots while bounding crash recovery and writer memory independently.
+const MAX_REGIONAL_DECISION_JOURNAL_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_REGIONAL_DECISION_FRAME_PAYLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_REGIONAL_DECISIONS_PER_FRAME: usize = 30_000;
+const MAX_REGIONAL_ENTITY_MUTATIONS_PER_FRAME: usize = 30_000;
 const DAMAGE_COMPONENT: &str = "minecraft:damage";
+const CUSTOM_NAME_COMPONENT: &str = "minecraft:custom_name";
 const ENCHANTMENTS_COMPONENT: &str = "minecraft:enchantments";
 const CARRIED_ITEM_FIELD: &str = "SolarisCarriedItem";
 const CRAFTING_TABLE_INPUT_FIELD: &str = "SolarisCraftingTableInput";
@@ -47,12 +69,62 @@ pub(crate) enum RegionalDecisionJournalOpenError {
     },
     #[error("unsupported regional decision journal version {0}")]
     UnsupportedVersion(u32),
+    #[error("regional decision journal framing failed at {path}: {reason}")]
+    Framing { path: PathBuf, reason: &'static str },
+    #[error("regional decision journal checksum failed at {path}")]
+    Checksum { path: PathBuf },
+    #[error("regional decision journal validation failed at {path}: {source}")]
+    Validation {
+        path: PathBuf,
+        #[source]
+        source: RegionalDecisionReplayError,
+    },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct RegionalDecisionJournalFile {
-    version: u32,
-    pending: Vec<RegionalCommitDecision>,
+#[derive(Debug, Error)]
+pub(crate) enum RegionalDecisionReplayError {
+    #[error("regional decision phases and sequence watermarks must be strictly increasing")]
+    InvalidOrdering,
+    #[error("regional decision violates upsert/removal invariants")]
+    InvalidDecision,
+    #[error("regional decision contains an invalid entity snapshot")]
+    InvalidSnapshot,
+    #[error("regional decision recovery exceeds the supported 30,000-decision boundary")]
+    TooManyDecisions,
+    #[error("regional decision recovery exceeds the supported 30,000-entity mutation boundary")]
+    TooManyEntityMutations,
+    #[error("duplicate restored entity UUID {0}")]
+    DuplicateEntityUuid(uuid::Uuid),
+}
+
+impl From<RegionalDecisionReplayError> for std::io::Error {
+    fn from(source: RegionalDecisionReplayError) -> Self {
+        Self::new(std::io::ErrorKind::InvalidData, source)
+    }
+}
+
+#[derive(Deserialize)]
+struct EncodedRegionalCommitDecision {
+    phase: RegionPhase,
+    sequence_watermark: u64,
+    lifecycle_epoch: u64,
+    upserts: Vec<EntitySnapshot>,
+    removed: Vec<EntityId>,
+}
+
+impl TryFrom<EncodedRegionalCommitDecision> for RegionalCommitDecision {
+    type Error = RegionalDecisionReplayError;
+
+    fn try_from(encoded: EncodedRegionalCommitDecision) -> Result<Self, Self::Error> {
+        RegionalCommitDecision::from_parts_at_lifecycle_epoch(
+            encoded.phase,
+            encoded.sequence_watermark,
+            encoded.lifecycle_epoch,
+            encoded.upserts,
+            encoded.removed,
+        )
+        .map_err(|_| RegionalDecisionReplayError::InvalidDecision)
+    }
 }
 
 pub(crate) struct FileRegionalDecisionJournal {
@@ -83,51 +155,28 @@ impl FileRegionalDecisionJournal {
         let path = world_root
             .join(SOLARIS_DIR)
             .join(REGIONAL_DECISION_JOURNAL_FILE);
-        let (pending, migrate_legacy) = if path.is_file() {
-            let bytes =
-                std::fs::read(&path).map_err(|source| RegionalDecisionJournalOpenError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
-            if bytes.starts_with(b"{") {
-                let file: RegionalDecisionJournalFile =
-                    serde_json::from_slice(&bytes).map_err(|source| {
-                        RegionalDecisionJournalOpenError::Json {
-                            path: path.clone(),
-                            source,
-                        }
+        let pending = if path.is_file() {
+            let bytes = read_regional_decision_journal_file(&path)?;
+            let (pending, valid_len) = read_appended_regional_decisions(&path, &bytes)?;
+            if valid_len < bytes.len() {
+                let file = OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .map_err(|source| RegionalDecisionJournalOpenError::Io {
+                        path: path.clone(),
+                        source,
                     })?;
-                if file.version != LEGACY_REGIONAL_DECISION_JOURNAL_VERSION {
-                    return Err(RegionalDecisionJournalOpenError::UnsupportedVersion(
-                        file.version,
-                    ));
-                }
-                (file.pending, true)
-            } else {
-                let (pending, valid_len) = read_appended_regional_decisions(&path, &bytes)?;
-                if valid_len < bytes.len() {
-                    let file = OpenOptions::new()
-                        .write(true)
-                        .open(&path)
-                        .map_err(|source| RegionalDecisionJournalOpenError::Io {
-                            path: path.clone(),
-                            source,
-                        })?;
-                    file.set_len(valid_len as u64)
-                        .and_then(|()| file.sync_all())
-                        .map_err(|source| RegionalDecisionJournalOpenError::Io {
-                            path: path.clone(),
-                            source,
-                        })?;
-                }
-                (pending, false)
+                file.set_len(valid_len as u64)
+                    .and_then(|()| file.sync_all())
+                    .map_err(|source| RegionalDecisionJournalOpenError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
             }
+            pending
         } else {
-            (Vec::new(), false)
+            Vec::new()
         };
-        if migrate_legacy {
-            persist_regional_decisions(&path, &pending)?;
-        }
         let (requests, receiver) = std::sync::mpsc::sync_channel(64);
         let worker_path = path.clone();
         let worker = std::thread::Builder::new()
@@ -164,6 +213,8 @@ impl FileRegionalDecisionJournal {
         &self,
         decisions: &[RegionalCommitDecision],
     ) -> Result<(), RegionalDecisionJournalError> {
+        validate_regional_decision_group(decisions)
+            .map_err(|_| RegionalDecisionJournalError::SAFE)?;
         let (reply, completion) = std::sync::mpsc::channel();
         self.requests
             .send(RegionalJournalWriteRequest::Append {
@@ -221,6 +272,10 @@ fn append_regional_decisions(
     if decisions.is_empty() {
         return Ok(());
     }
+    validate_regional_commit_decisions(decisions)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
+    validate_regional_decision_group(decisions)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
     let parent = path.parent().expect("journal path has parent");
     create_regional_journal_directory(parent)?;
     let existed = path.is_file();
@@ -247,9 +302,7 @@ fn append_regional_decisions(
                 source,
             })?;
     }
-    for decision in decisions {
-        write_regional_decision_line(&mut file, path, decision)?;
-    }
+    write_regional_decision_group(&mut file, path, decisions)?;
     file.flush()
         .and_then(|()| file.sync_all())
         .map_err(|source| RegionalDecisionJournalOpenError::Io {
@@ -266,6 +319,10 @@ fn persist_regional_decisions(
     path: &Path,
     pending: &[RegionalCommitDecision],
 ) -> Result<(), RegionalDecisionJournalOpenError> {
+    validate_regional_commit_decisions(pending)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
+    validate_regional_decision_group(pending)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
     let parent = path.parent().expect("journal path has parent");
     create_regional_journal_directory(parent)?;
     if pending.is_empty() {
@@ -289,9 +346,7 @@ fn persist_regional_decisions(
             path: temporary.clone(),
             source,
         })?;
-    for decision in pending {
-        write_regional_decision_line(&mut file, &temporary, decision)?;
-    }
+    write_regional_decision_group(&mut file, &temporary, pending)?;
     file.flush()
         .and_then(|()| file.sync_all())
         .map_err(|source| RegionalDecisionJournalOpenError::Io {
@@ -334,75 +389,376 @@ fn read_appended_regional_decisions(
     if !bytes.starts_with(REGIONAL_DECISION_JOURNAL_HEADER) {
         return Err(RegionalDecisionJournalOpenError::UnsupportedVersion(0));
     }
-    let body = &bytes[REGIONAL_DECISION_JOURNAL_HEADER.len()..];
-    let complete_len = body
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |last_newline| last_newline + 1);
-    let complete = &body[..complete_len];
+    let mut cursor = REGIONAL_DECISION_JOURNAL_HEADER.len();
     let mut pending = Vec::new();
-    for line in complete
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-    {
-        pending.push(serde_json::from_slice(line).map_err(|source| {
-            RegionalDecisionJournalOpenError::Json {
+    while cursor < bytes.len() {
+        let frame_start = cursor;
+        let remaining = bytes.len() - cursor;
+        if remaining < REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES {
+            return validate_regional_recovery_prefix(path, pending, frame_start);
+        }
+        let mut payload_len_bytes = [0_u8; 4];
+        payload_len_bytes.copy_from_slice(&bytes[cursor..cursor + 4]);
+        let payload_len = u32::from_be_bytes(payload_len_bytes) as u64;
+        validate_regional_journal_frame_payload_len(payload_len).map_err(|reason| {
+            RegionalDecisionJournalOpenError::Framing {
                 path: path.to_path_buf(),
-                source,
+                reason,
             }
-        })?);
-    }
-    Ok((
-        pending,
-        REGIONAL_DECISION_JOURNAL_HEADER.len() + complete_len,
-    ))
-}
-
-fn write_regional_decision_line(
-    file: &mut File,
-    path: &Path,
-    decision: &RegionalCommitDecision,
-) -> Result<(), RegionalDecisionJournalOpenError> {
-    serde_json::to_writer(&mut *file, decision).map_err(|source| {
-        RegionalDecisionJournalOpenError::Json {
+        })?;
+        let payload_len = usize::try_from(payload_len).map_err(|_| {
+            RegionalDecisionJournalOpenError::Framing {
+                path: path.to_path_buf(),
+                reason: "record payload does not fit this platform",
+            }
+        })?;
+        let mut checksum_bytes = [0_u8; 4];
+        checksum_bytes.copy_from_slice(
+            &bytes[cursor + 4..cursor + REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES],
+        );
+        let expected_checksum = u32::from_be_bytes(checksum_bytes);
+        cursor += REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES;
+        let payload_end = cursor.checked_add(payload_len).ok_or_else(|| {
+            RegionalDecisionJournalOpenError::Framing {
+                path: path.to_path_buf(),
+                reason: "record length overflow",
+            }
+        })?;
+        let Some(payload) = bytes.get(cursor..payload_end) else {
+            return validate_regional_recovery_prefix(path, pending, frame_start);
+        };
+        if crc32fast::hash(payload) != expected_checksum {
+            return Err(RegionalDecisionJournalOpenError::Checksum {
+                path: path.to_path_buf(),
+            });
+        }
+        let encoded_group = serde_json::from_slice::<Vec<EncodedRegionalCommitDecision>>(payload)
+            .map_err(|source| RegionalDecisionJournalOpenError::Json {
             path: path.to_path_buf(),
             source,
+        })?;
+        if encoded_group.is_empty() {
+            return Err(RegionalDecisionJournalOpenError::Framing {
+                path: path.to_path_buf(),
+                reason: "empty commit group",
+            });
+        }
+        let group = encoded_group
+            .into_iter()
+            .map(RegionalCommitDecision::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| regional_decision_validation_error(path, source))?;
+        validate_regional_decision_group(&group)
+            .map_err(|source| regional_decision_validation_error(path, source))?;
+        pending.extend(group);
+        cursor = payload_end;
+    }
+    validate_regional_recovery_prefix(path, pending, cursor)
+}
+
+fn validate_regional_recovery_prefix(
+    path: &Path,
+    pending: Vec<RegionalCommitDecision>,
+    valid_len: usize,
+) -> Result<(Vec<RegionalCommitDecision>, usize), RegionalDecisionJournalOpenError> {
+    validate_regional_commit_decisions(&pending)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
+    validate_regional_decision_group(&pending)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
+    Ok((pending, valid_len))
+}
+
+fn write_regional_decision_group(
+    file: &mut File,
+    path: &Path,
+    decisions: &[RegionalCommitDecision],
+) -> Result<(), RegionalDecisionJournalOpenError> {
+    validate_regional_decision_group(decisions)
+        .map_err(|source| regional_decision_validation_error(path, source))?;
+    let mut payload = BoundedRegionalDecisionPayload::new();
+    let serialization = serde_json::to_writer(&mut payload, decisions);
+    if payload.limit_exceeded {
+        return Err(RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason: "record payload exceeds operational limit",
+        });
+    }
+    serialization.map_err(|source| RegionalDecisionJournalOpenError::Json {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let payload = payload.bytes;
+    let payload_len =
+        u32::try_from(payload.len()).map_err(|_| RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason: "record payload exceeds u32 length",
+        })?;
+    let current_len = file
+        .metadata()
+        .map_err(|source| RegionalDecisionJournalOpenError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let next_len = current_len
+        .checked_add(REGIONAL_DECISION_JOURNAL_FRAME_HEADER_BYTES as u64)
+        .and_then(|length| length.checked_add(payload.len() as u64))
+        .ok_or_else(|| RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason: "journal file length overflow",
+        })?;
+    validate_regional_journal_file_len(next_len).map_err(|reason| {
+        RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason,
         }
     })?;
-    file.write_all(b"\n")
+    file.write_all(&payload_len.to_be_bytes())
+        .and_then(|()| file.write_all(&crc32fast::hash(&payload).to_be_bytes()))
+        .and_then(|()| file.write_all(&payload))
         .map_err(|source| RegionalDecisionJournalOpenError::Io {
             path: path.to_path_buf(),
             source,
         })
 }
 
-pub(crate) fn replay_regional_commit_decisions(
-    entities: Vec<PersistedEntityRecord>,
+struct BoundedRegionalDecisionPayload {
+    bytes: Vec<u8>,
+    limit_exceeded: bool,
+}
+
+impl BoundedRegionalDecisionPayload {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit_exceeded: false,
+        }
+    }
+}
+
+impl Write for BoundedRegionalDecisionPayload {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let next_len = self.bytes.len().checked_add(bytes.len()).ok_or_else(|| {
+            self.limit_exceeded = true;
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL payload length overflow",
+            )
+        })?;
+        if u64::try_from(next_len).unwrap_or(u64::MAX) > MAX_REGIONAL_DECISION_FRAME_PAYLOAD_BYTES {
+            self.limit_exceeded = true;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "WAL payload exceeds operational limit",
+            ));
+        }
+        self.bytes.try_reserve(bytes.len()).map_err(|source| {
+            std::io::Error::other(format!("WAL payload allocation failed: {source}"))
+        })?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn read_regional_decision_journal_file(
+    path: &Path,
+) -> Result<Vec<u8>, RegionalDecisionJournalOpenError> {
+    let file = File::open(path).map_err(|source| RegionalDecisionJournalOpenError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let file_len = file
+        .metadata()
+        .map_err(|source| RegionalDecisionJournalOpenError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    validate_regional_journal_file_len(file_len).map_err(|reason| {
+        RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    let capacity =
+        usize::try_from(file_len).map_err(|_| RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason: "journal file length does not fit this platform",
+        })?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(capacity)
+        .map_err(|source| RegionalDecisionJournalOpenError::Io {
+            path: path.to_path_buf(),
+            source: std::io::Error::other(format!("journal allocation failed: {source}")),
+        })?;
+    file.take(MAX_REGIONAL_DECISION_JOURNAL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| RegionalDecisionJournalOpenError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    validate_regional_journal_file_len(bytes.len() as u64).map_err(|reason| {
+        RegionalDecisionJournalOpenError::Framing {
+            path: path.to_path_buf(),
+            reason,
+        }
+    })?;
+    Ok(bytes)
+}
+
+fn validate_regional_journal_file_len(length: u64) -> Result<(), &'static str> {
+    if length > MAX_REGIONAL_DECISION_JOURNAL_BYTES {
+        return Err("journal file exceeds operational limit");
+    }
+    Ok(())
+}
+
+fn validate_regional_journal_frame_payload_len(length: u64) -> Result<(), &'static str> {
+    if length > MAX_REGIONAL_DECISION_FRAME_PAYLOAD_BYTES {
+        return Err("record payload exceeds operational limit");
+    }
+    Ok(())
+}
+
+fn validate_regional_decision_group_shape(
+    decision_count: usize,
+    entity_mutation_count: usize,
+) -> Result<(), RegionalDecisionReplayError> {
+    if decision_count > MAX_REGIONAL_DECISIONS_PER_FRAME {
+        return Err(RegionalDecisionReplayError::TooManyDecisions);
+    }
+    if entity_mutation_count > MAX_REGIONAL_ENTITY_MUTATIONS_PER_FRAME {
+        return Err(RegionalDecisionReplayError::TooManyEntityMutations);
+    }
+    Ok(())
+}
+
+fn validate_regional_decision_group(
     decisions: &[RegionalCommitDecision],
-) -> Vec<PersistedEntityRecord> {
-    let mut entities = entities
+) -> Result<(), RegionalDecisionReplayError> {
+    let entity_mutation_count = decisions.iter().try_fold(0_usize, |count, decision| {
+        count
+            .checked_add(decision.upserts().len())
+            .and_then(|count| count.checked_add(decision.removed().len()))
+            .ok_or(RegionalDecisionReplayError::TooManyEntityMutations)
+    })?;
+    validate_regional_decision_group_shape(decisions.len(), entity_mutation_count)
+}
+
+fn regional_decision_validation_error(
+    path: &Path,
+    source: RegionalDecisionReplayError,
+) -> RegionalDecisionJournalOpenError {
+    RegionalDecisionJournalOpenError::Validation {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+fn validate_regional_commit_decisions(
+    decisions: &[RegionalCommitDecision],
+) -> Result<(), RegionalDecisionReplayError> {
+    for pair in decisions.windows(2) {
+        let [previous, current] = pair else {
+            unreachable!("two-item decision window");
+        };
+        if current.phase() <= previous.phase()
+            || current.sequence_watermark() <= previous.sequence_watermark()
+            || current.lifecycle_epoch() < previous.lifecycle_epoch()
+        {
+            return Err(RegionalDecisionReplayError::InvalidOrdering);
+        }
+    }
+    Ok(())
+}
+
+fn replayed_entity_snapshot_is_semantically_valid(
+    snapshot: &EntitySnapshot,
+    runtime_validator: &mut EntityStore,
+) -> bool {
+    static ENTITY_TYPES: std::sync::OnceLock<mc_data::entity_types::EntityTypeRegistry> =
+        std::sync::OnceLock::new();
+    let entity_types =
+        ENTITY_TYPES.get_or_init(mc_data::entity_types::solaris_required_entity_types);
+    let known_type = mc_data::Identifier::parse(snapshot.type_name.clone())
+        .ok()
+        .is_some_and(|name| entity_types.id_of(&name).is_some());
+    if !known_type {
+        return false;
+    }
+
+    let mut runtime_snapshot = snapshot.clone();
+    runtime_snapshot.vehicle = None;
+    runtime_validator.insert_snapshot(runtime_snapshot)
+        && runtime_validator.remove(snapshot.id).is_some()
+}
+
+pub(crate) fn replay_regional_commit_decisions(
+    checkpoint: PersistedEntityCheckpoint,
+    decisions: &[RegionalCommitDecision],
+) -> Result<PersistedEntityCheckpoint, RegionalDecisionReplayError> {
+    validate_regional_commit_decisions(decisions)?;
+    validate_regional_decision_group(decisions)?;
+    let PersistedEntityCheckpoint {
+        lifecycle_clock,
+        regional_sequence_watermark,
+        records,
+    } = checkpoint;
+    let mut entities = records
         .into_iter()
-        .map(|record| (record.snapshot.id, record))
+        .map(|record| (record.snapshot.id, record.snapshot))
         .collect::<BTreeMap<_, _>>();
+    let checkpoint_boundary = (lifecycle_clock, regional_sequence_watermark);
+    let mut replay_boundary = checkpoint_boundary;
+    let mut runtime_validator = EntityStore::new();
     for decision in decisions {
+        let predates_checkpoint = decision.lifecycle_epoch() < checkpoint_boundary.0
+            || (decision.lifecycle_epoch() == checkpoint_boundary.0
+                && decision.sequence_watermark() <= checkpoint_boundary.1);
+        if predates_checkpoint {
+            continue;
+        }
+        if decision.sequence_watermark() <= replay_boundary.1 {
+            return Err(RegionalDecisionReplayError::InvalidOrdering);
+        }
+        for snapshot in decision.upserts() {
+            if !replayed_entity_snapshot_is_semantically_valid(snapshot, &mut runtime_validator) {
+                return Err(RegionalDecisionReplayError::InvalidSnapshot);
+            }
+        }
         for entity in decision.removed() {
             entities.remove(entity);
         }
         for snapshot in decision.upserts() {
-            let (age, pickup_delay) = entities
-                .get(&snapshot.id)
-                .map_or((0, 0), |record| (record.age, record.pickup_delay));
-            entities.insert(
-                snapshot.id,
-                PersistedEntityRecord {
-                    snapshot: snapshot.clone(),
-                    age,
-                    pickup_delay,
-                },
-            );
+            entities.insert(snapshot.id, snapshot.clone());
+        }
+        replay_boundary.0 = replay_boundary.0.max(decision.lifecycle_epoch());
+        replay_boundary.1 = decision.sequence_watermark();
+    }
+    let restored = entities
+        .into_values()
+        .map(|snapshot| {
+            PersistedEntityRecord::from_snapshot_at_lifecycle_clock(snapshot, replay_boundary.0)
+        })
+        .collect::<Vec<_>>();
+    let mut uuids = std::collections::BTreeSet::new();
+    for record in &restored {
+        if !uuids.insert(record.snapshot.uuid) {
+            return Err(RegionalDecisionReplayError::DuplicateEntityUuid(
+                record.snapshot.uuid,
+            ));
         }
     }
-    entities.into_values().collect()
+    Ok(PersistedEntityCheckpoint {
+        lifecycle_clock: replay_boundary.0,
+        regional_sequence_watermark: replay_boundary.1,
+        records: restored,
+    })
 }
 
 impl RegionalDecisionJournal for FileRegionalDecisionJournal {
@@ -417,9 +773,26 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
         &mut self,
         decisions: &[RegionalCommitDecision],
     ) -> Result<(), RegionalDecisionJournalError> {
-        self.append_commits(decisions)?;
-        self.pending.extend_from_slice(decisions);
-        Ok(())
+        validate_regional_decision_group(decisions)
+            .map_err(|_| RegionalDecisionJournalError::SAFE)?;
+        let mut pending = self.pending.clone();
+        pending.extend_from_slice(decisions);
+        if validate_regional_commit_decisions(&pending).is_err()
+            || validate_regional_decision_group(&pending).is_err()
+        {
+            return Err(RegionalDecisionJournalError::SAFE);
+        }
+        match self.append_commits(decisions) {
+            Ok(()) => {
+                self.pending.extend_from_slice(decisions);
+                Ok(())
+            }
+            Err(error) if error.outcome_unknown() => {
+                self.pending.extend_from_slice(decisions);
+                Err(error)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn clear_commit(&mut self, phase: RegionPhase) -> Result<(), RegionalDecisionJournalError> {
@@ -434,10 +807,27 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
             .iter()
             .copied()
             .collect::<std::collections::BTreeSet<_>>();
+        let identities = self
+            .pending
+            .iter()
+            .filter(|decision| phases.contains(&decision.phase()))
+            .map(RegionalCommitDecision::identity)
+            .collect::<Vec<_>>();
+        self.clear_commit_identities(&identities)
+    }
+
+    fn clear_commit_identities(
+        &mut self,
+        identities: &[(RegionPhase, u64, u64)],
+    ) -> Result<(), RegionalDecisionJournalError> {
+        let identities = identities
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         let retained = self
             .pending
             .iter()
-            .filter(|decision| !phases.contains(&decision.phase()))
+            .filter(|decision| !identities.contains(&decision.identity()))
             .cloned()
             .collect::<Vec<_>>();
         let previous = std::mem::replace(&mut self.pending, retained);
@@ -452,6 +842,13 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
         self.pending
             .iter()
             .map(RegionalCommitDecision::phase)
+            .collect()
+    }
+
+    fn pending_commit_identities(&self) -> Vec<(RegionPhase, u64, u64)> {
+        self.pending
+            .iter()
+            .map(RegionalCommitDecision::identity)
             .collect()
     }
 
@@ -494,6 +891,132 @@ pub(crate) struct PersistedEntityRecord {
     pub(crate) snapshot: EntitySnapshot,
     pub(crate) age: i32,
     pub(crate) pickup_delay: i32,
+}
+
+impl PersistedEntityRecord {
+    pub(crate) fn from_snapshot_at_lifecycle_clock(
+        snapshot: EntitySnapshot,
+        lifecycle_clock: u64,
+    ) -> Self {
+        let age = lifecycle_clock
+            .saturating_sub(snapshot.retained.spawn_tick)
+            .min(i32::MAX as u64) as i32;
+        let pickup_delay = snapshot
+            .retained
+            .item_pickup_ready_tick
+            .map(|ready_tick| ready_tick.saturating_sub(lifecycle_clock))
+            .unwrap_or(0)
+            .min(i32::from(i16::MAX) as u64) as i32;
+        Self {
+            snapshot,
+            age,
+            pickup_delay,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedEntityCheckpoint {
+    pub(crate) lifecycle_clock: u64,
+    pub(crate) regional_sequence_watermark: u64,
+    pub(crate) records: Vec<PersistedEntityRecord>,
+}
+
+impl PersistedEntityCheckpoint {
+    #[cfg(test)]
+    pub(crate) fn new(
+        lifecycle_clock: u64,
+        records: impl IntoIterator<Item = impl Into<PersistedEntityRecord>>,
+    ) -> Self {
+        Self {
+            lifecycle_clock,
+            regional_sequence_watermark: 0,
+            records: records.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_at_owner_sequence(
+        lifecycle_clock: u64,
+        regional_sequence_watermark: u64,
+        records: impl IntoIterator<Item = impl Into<PersistedEntityRecord>>,
+    ) -> Self {
+        Self {
+            lifecycle_clock,
+            regional_sequence_watermark,
+            records: records.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub(crate) fn has_valid_temporal_state(&self) -> bool {
+        self.lifecycle_clock <= i64::MAX as u64
+            && self.records.iter().all(|record| {
+                let Ok(age) = u64::try_from(record.age) else {
+                    return false;
+                };
+                let Ok(pickup_delay) = u64::try_from(record.pickup_delay) else {
+                    return false;
+                };
+                age <= self.lifecycle_clock
+                    && record.snapshot.retained.spawn_tick <= self.lifecycle_clock
+                    && self
+                        .lifecycle_clock
+                        .saturating_sub(record.snapshot.retained.spawn_tick)
+                        == age
+                    && record
+                        .snapshot
+                        .retained
+                        .item_pickup_ready_tick
+                        .map(|ready_tick| ready_tick.saturating_sub(self.lifecycle_clock))
+                        .unwrap_or(0)
+                        == pickup_delay
+                    && self
+                        .lifecycle_clock
+                        .checked_add(pickup_delay)
+                        .is_some_and(|deadline| deadline <= i64::MAX as u64)
+                    && entity_temporal_state_is_valid(self.lifecycle_clock, &record.snapshot)
+            })
+    }
+
+    fn has_valid_vehicle_graph(&self) -> bool {
+        let entities = self
+            .records
+            .iter()
+            .map(|record| (record.snapshot.id, &record.snapshot))
+            .collect::<BTreeMap<_, _>>();
+        if entities.len() != self.records.len() {
+            return false;
+        }
+        let mut vehicle_passengers = BTreeMap::new();
+        let mut passenger_vehicles = BTreeMap::new();
+        for snapshot in entities.values() {
+            let Some(passenger) = snapshot.vehicle.and_then(|vehicle| vehicle.passenger) else {
+                continue;
+            };
+            let Some(passenger_snapshot) = entities.get(&passenger) else {
+                return false;
+            };
+            if passenger == snapshot.id
+                || mc_entity::RegionKey::from_position(passenger_snapshot.position)
+                    != mc_entity::RegionKey::from_position(snapshot.position)
+                || vehicle_passengers.insert(snapshot.id, passenger).is_some()
+                || passenger_vehicles.insert(passenger, snapshot.id).is_some()
+            {
+                return false;
+            }
+        }
+        for &start in entities.keys() {
+            let mut current = start;
+            let mut visited = std::collections::BTreeSet::new();
+            while let Some(&passenger) = vehicle_passengers.get(&current) {
+                if !visited.insert(current) {
+                    return false;
+                }
+                current = passenger;
+            }
+        }
+        true
+    }
 }
 
 impl From<EntitySnapshot> for PersistedEntityRecord {
@@ -619,6 +1142,7 @@ pub(super) struct InventorySlotExtras {
     item_id: u32,
     damage: Option<i32>,
     enchantments: Vec<mc_data::ItemEnchantment>,
+    custom_name: Option<String>,
     fields: Vec<(String, Tag)>,
 }
 
@@ -702,6 +1226,10 @@ pub(crate) enum PlayerPersistenceError {
     InvalidNumeric { path: PathBuf, field: &'static str },
     #[error("persistence field {field} at {path} has an invalid value")]
     InvalidValue { path: PathBuf, field: &'static str },
+    #[error("duplicate entity UUID {uuid} at {path}")]
+    DuplicateEntityUuid { path: PathBuf, uuid: uuid::Uuid },
+    #[error("unsupported entity persistence format version {version} at {path}")]
+    UnsupportedEntityFormatVersion { path: PathBuf, version: i32 },
 }
 
 fn validate_player_numeric_state(
@@ -757,6 +1285,52 @@ fn validate_entity_numeric_state(
             path: path.to_path_buf(),
             field: "entity Pos/Motion/Rotation/Health",
         });
+    }
+    Ok(())
+}
+
+fn normalize_loaded_entity_kinematics(
+    path: &Path,
+    position: &mut Vec3,
+    rotation: mc_entity::Rotation,
+    velocity: &mut Vec3,
+) -> Result<(), PlayerPersistenceError> {
+    if !position.is_finite() {
+        return Err(PlayerPersistenceError::InvalidNumeric {
+            path: path.to_path_buf(),
+            field: "Pos",
+        });
+    }
+    if !rotation.is_finite() {
+        return Err(PlayerPersistenceError::InvalidNumeric {
+            path: path.to_path_buf(),
+            field: "Rotation",
+        });
+    }
+    if !velocity.is_finite() {
+        return Err(PlayerPersistenceError::InvalidNumeric {
+            path: path.to_path_buf(),
+            field: "Motion",
+        });
+    }
+
+    position.x = position.x.clamp(
+        -ENTITY_HORIZONTAL_POSITION_LIMIT_26_1_2,
+        ENTITY_HORIZONTAL_POSITION_LIMIT_26_1_2,
+    );
+    position.y = position.y.clamp(
+        -ENTITY_VERTICAL_POSITION_LIMIT_26_1_2,
+        ENTITY_VERTICAL_POSITION_LIMIT_26_1_2,
+    );
+    position.z = position.z.clamp(
+        -ENTITY_HORIZONTAL_POSITION_LIMIT_26_1_2,
+        ENTITY_HORIZONTAL_POSITION_LIMIT_26_1_2,
+    );
+    for component in [&mut velocity.x, &mut velocity.y, &mut velocity.z] {
+        if component.abs() > ENTITY_VELOCITY_LIMIT_26_1_2 {
+            *component = 0.0;
+        }
+        *component *= ENTITY_TICKS_PER_SECOND;
     }
     Ok(())
 }
@@ -839,6 +1413,7 @@ pub(super) fn load_player_state(
                     item_id: stack.item_id,
                     damage: stack.damage,
                     enchantments: stack.enchantments,
+                    custom_name: stack.custom_name,
                     fields: extras,
                 });
             }
@@ -934,19 +1509,84 @@ pub(crate) fn load_persisted_entities(
     world_root: &Path,
     items: &ItemRegistry,
     entity_types: &EntityTypeRegistry,
-) -> Result<Vec<PersistedEntityRecord>, PlayerPersistenceError> {
+) -> Result<PersistedEntityCheckpoint, PlayerPersistenceError> {
     let path = entities_path(world_root);
     if !path.is_file() {
-        return Ok(Vec::new());
+        return Ok(PersistedEntityCheckpoint {
+            lifecycle_clock: 0,
+            regional_sequence_watermark: 0,
+            records: Vec::new(),
+        });
     }
     let (_, root) = read_player_root(&path)?;
     let Tag::Compound(fields) = root else {
         return Err(PlayerPersistenceError::RootNotCompound { path });
     };
+    let mut format_versions = fields
+        .iter()
+        .filter(|(name, _)| name == ENTITY_FORMAT_VERSION_FIELD);
+    let format_version = format_versions.next().map(|(_, value)| value);
+    if format_versions.next().is_some() {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path,
+            field: ENTITY_FORMAT_VERSION_FIELD,
+        });
+    }
+    match format_version {
+        None => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path,
+                field: ENTITY_FORMAT_VERSION_FIELD,
+            });
+        }
+        Some(Tag::Int(ENTITY_FORMAT_VERSION)) => {}
+        Some(Tag::Int(version)) => {
+            return Err(PlayerPersistenceError::UnsupportedEntityFormatVersion {
+                path,
+                version: *version,
+            });
+        }
+        Some(_) => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path,
+                field: ENTITY_FORMAT_VERSION_FIELD,
+            });
+        }
+    }
+    let mut lifecycle_ticks = fields
+        .iter()
+        .filter(|(name, _)| name == ENTITY_LIFECYCLE_TICK_FIELD);
+    let lifecycle_tick = match lifecycle_ticks.next().map(|(_, value)| value) {
+        Some(Tag::Long(value)) if *value >= 0 && lifecycle_ticks.next().is_none() => *value as u64,
+        _ => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path,
+                field: ENTITY_LIFECYCLE_TICK_FIELD,
+            });
+        }
+    };
+    let mut regional_sequences = fields
+        .iter()
+        .filter(|(name, _)| name == ENTITY_REGIONAL_SEQUENCE_FIELD);
+    let regional_sequence_watermark = match regional_sequences.next().map(|(_, value)| value) {
+        Some(Tag::Long(value)) if *value >= 0 && regional_sequences.next().is_none() => {
+            *value as u64
+        }
+        _ => {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path,
+                field: ENTITY_REGIONAL_SEQUENCE_FIELD,
+            });
+        }
+    };
     let Some(Tag::List(list)) = field(&fields, "Entities") else {
-        return Ok(Vec::new());
+        return Err(PlayerPersistenceError::InvalidValue {
+            path,
+            field: "Entities",
+        });
     };
     let mut entities = Vec::new();
+    let mut entity_uuids = std::collections::BTreeSet::new();
     for element in &list.elements {
         let Tag::Compound(fields) = element else {
             continue;
@@ -983,9 +1623,18 @@ pub(crate) fn load_persisted_entities(
         let experience_value = int_field(fields, "Value").filter(|value| *value > 0);
         let block_state =
             int_field(fields, "BlockState").and_then(|value| u32::try_from(value).ok());
-        let mut attributes = attributes_from_entity_facts(&parsed, type_id as u32);
         let health = float_field(fields, "Health").unwrap_or(20.0).max(0.0);
-        attributes.set_base(AttributeKind::MaxHealth, health.max(1.0) as f64);
+        let attributes = string_field(fields, ENTITY_ATTRIBUTES_FIELD)
+            .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_ATTRIBUTES_FIELD,
+            })
+            .and_then(|encoded| {
+                serde_json::from_str(encoded).map_err(|_| PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_ATTRIBUTES_FIELD,
+                })
+            })?;
         let id = EntityId(int_field(fields, "SolarisEntityId").unwrap_or(0).max(0));
         let uuid = uuid_field(fields).unwrap_or_else(|| {
             let id = int_field(fields, "SolarisEntityId").unwrap_or(0) as u32 as u128;
@@ -1017,10 +1666,70 @@ pub(crate) fn load_persisted_entities(
         });
         let age = int_field(fields, "SolarisLifetimeAge")
             .or_else(|| animal.is_none().then(|| int_field(fields, "Age")).flatten())
-            .unwrap_or(0)
-            .max(0);
-        let pickup_delay = int_field(fields, "PickupDelay").unwrap_or(0).max(0);
-        let snapshot = EntitySnapshot {
+            .unwrap_or(0);
+        let pickup_delay = int_field(fields, "PickupDelay").unwrap_or(0);
+        if age < 0
+            || age as u64 > lifecycle_tick
+            || pickup_delay < 0
+            || lifecycle_tick
+                .checked_add(pickup_delay as u64)
+                .is_none_or(|deadline| deadline > i64::MAX as u64)
+        {
+            return Err(PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_LIFECYCLE_TICK_FIELD,
+            });
+        }
+        let lifecycle = match byte_field(fields, ENTITY_LIFECYCLE_FIELD) {
+            Some(0) => EntityLifecycle::Alive,
+            Some(1) => EntityLifecycle::Despawning,
+            _ => {
+                return Err(PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_LIFECYCLE_FIELD,
+                });
+            }
+        };
+        let retained = string_field(fields, ENTITY_RETAINED_STATE_FIELD)
+            .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_RETAINED_STATE_FIELD,
+            })
+            .and_then(|encoded| {
+                serde_json::from_str(encoded).map_err(|_| PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_RETAINED_STATE_FIELD,
+                })
+            })?;
+        let head_yaw = float_field(fields, ENTITY_HEAD_YAW_FIELD).ok_or_else(|| {
+            PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_HEAD_YAW_FIELD,
+            }
+        })?;
+        let goal = string_field(fields, ENTITY_GOAL_STATE_FIELD)
+            .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_GOAL_STATE_FIELD,
+            })
+            .and_then(|encoded| {
+                serde_json::from_str(encoded).map_err(|_| PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_GOAL_STATE_FIELD,
+                })
+            })?;
+        let vehicle = string_field(fields, ENTITY_VEHICLE_STATE_FIELD)
+            .ok_or_else(|| PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_VEHICLE_STATE_FIELD,
+            })
+            .and_then(|encoded| {
+                serde_json::from_str(encoded).map_err(|_| PlayerPersistenceError::InvalidValue {
+                    path: path.clone(),
+                    field: ENTITY_VEHICLE_STATE_FIELD,
+                })
+            })?;
+        let mut snapshot = EntitySnapshot {
             id,
             uuid,
             type_id,
@@ -1029,44 +1738,97 @@ pub(crate) fn load_persisted_entities(
             rotation: mc_entity::Rotation {
                 yaw: rotation[0],
                 pitch: rotation[1],
-                head_yaw: rotation[0],
+                head_yaw,
             },
             velocity: Vec3::new(motion[0], motion[1], motion[2]),
             on_ground: byte_field(fields, "OnGround").unwrap_or(0) != 0 && !aquatic,
             item_stack,
             experience_value,
             block_state,
-            lifecycle: EntityLifecycle::Alive,
+            lifecycle,
             health,
             attributes,
-            goal: if type_name == "minecraft:item"
-                || type_name == "minecraft:falling_block"
-                || experience_value.is_some()
-            {
-                GoalState::Idle
-            } else if aquatic {
-                GoalState::AquaticWander {
-                    speed: 0.72,
-                    vertical_speed: 0.18,
-                    period_ticks: 45,
-                }
-            } else {
-                GoalState::Wander {
-                    speed: 0.8,
-                    period_ticks: 80,
-                }
-            },
-            vehicle: None,
+            goal,
+            vehicle,
             animal,
+            retained,
         };
+        normalize_loaded_entity_kinematics(
+            &path,
+            &mut snapshot.position,
+            snapshot.rotation,
+            &mut snapshot.velocity,
+        )?;
         validate_entity_numeric_state(&path, &snapshot)?;
+        validate_entity_temporal_state(&path, lifecycle_tick, &snapshot)?;
+        if !entity_uuids.insert(snapshot.uuid) {
+            return Err(PlayerPersistenceError::DuplicateEntityUuid {
+                path,
+                uuid: snapshot.uuid,
+            });
+        }
         entities.push(PersistedEntityRecord {
             snapshot,
             age,
             pickup_delay,
         });
     }
-    Ok(entities)
+    let checkpoint = PersistedEntityCheckpoint {
+        lifecycle_clock: lifecycle_tick,
+        regional_sequence_watermark,
+        records: entities,
+    };
+    if !checkpoint.has_valid_temporal_state() {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_RETAINED_STATE_FIELD,
+        });
+    }
+    if !checkpoint.has_valid_vehicle_graph() {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_VEHICLE_STATE_FIELD,
+        });
+    }
+    Ok(checkpoint)
+}
+
+fn validate_entity_temporal_state(
+    path: &Path,
+    lifecycle_tick: u64,
+    snapshot: &EntitySnapshot,
+) -> Result<(), PlayerPersistenceError> {
+    if !entity_temporal_state_is_valid(lifecycle_tick, snapshot) {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_RETAINED_STATE_FIELD,
+        });
+    }
+    Ok(())
+}
+
+fn entity_temporal_state_is_valid(lifecycle_tick: u64, snapshot: &EntitySnapshot) -> bool {
+    if snapshot
+        .retained
+        .last_damage_tick
+        .is_some_and(|tick| tick > lifecycle_tick)
+    {
+        return false;
+    }
+    let death_state_valid = match (snapshot.lifecycle, snapshot.retained.death_remove_tick) {
+        (EntityLifecycle::Alive, None) => true,
+        (EntityLifecycle::Despawning, Some(deadline)) => deadline
+            .checked_sub(lifecycle_tick)
+            .is_some_and(|remaining| remaining <= super::session::ENTITY_DEATH_TICKS),
+        _ => false,
+    };
+    death_state_valid
+        && !snapshot
+            .retained
+            .sheep_grazing_ticks
+            .is_some_and(|remaining| {
+                remaining == 0 || remaining > super::session::SHEEP_GRAZING_ANIMATION_TICKS
+            })
 }
 
 fn persisted_entity_type_is_aquatic(type_name: &str) -> bool {
@@ -1091,27 +1853,6 @@ fn persisted_entity_type_is_supported_breeding_animal(type_name: &str) -> bool {
     )
 }
 
-fn attributes_from_entity_facts(
-    id: &mc_data::Identifier,
-    protocol_id: u32,
-) -> mc_entity::AttributeSet {
-    let facts = mc_data::entity_types::fallback_entity_type_facts(id.clone(), protocol_id);
-    let mut attributes = mc_entity::AttributeSet::vanilla_mob_defaults();
-    if let Some(value) = facts.attributes.max_health {
-        attributes.set_base(AttributeKind::MaxHealth, value);
-    }
-    if let Some(value) = facts.attributes.movement_speed {
-        attributes.set_base(AttributeKind::MovementSpeed, value);
-    }
-    if let Some(value) = facts.attributes.follow_range {
-        attributes.set_base(AttributeKind::FollowRange, value);
-    }
-    if let Some(value) = facts.attributes.attack_damage {
-        attributes.set_base(AttributeKind::AttackDamage, value);
-    }
-    attributes
-}
-
 #[cfg(test)]
 pub(crate) fn save_persisted_entities(
     world_root: &Path,
@@ -1123,34 +1864,79 @@ pub(crate) fn save_persisted_entities(
         .cloned()
         .map(PersistedEntityRecord::from)
         .collect::<Vec<_>>();
-    save_persisted_entity_records(world_root, items, &records)
+    save_persisted_entity_records(
+        world_root,
+        items,
+        &PersistedEntityCheckpoint {
+            lifecycle_clock: 0,
+            regional_sequence_watermark: 0,
+            records,
+        },
+    )
 }
 
 pub(crate) fn save_persisted_entity_records(
     world_root: &Path,
     items: &ItemRegistry,
-    entities: &[PersistedEntityRecord],
+    checkpoint: &PersistedEntityCheckpoint,
 ) -> Result<(), PlayerPersistenceError> {
     let path = entities_path(world_root);
-    let mut elements = Vec::new();
-    for record in entities
-        .iter()
-        .filter(|record| record.snapshot.lifecycle == EntityLifecycle::Alive)
-    {
-        validate_entity_numeric_state(&path, &record.snapshot)?;
-        elements.push(entity_tag(items, record)?);
+    let lifecycle_tick = i64::try_from(checkpoint.lifecycle_clock).map_err(|_| {
+        PlayerPersistenceError::InvalidValue {
+            path: path.clone(),
+            field: ENTITY_LIFECYCLE_TICK_FIELD,
+        }
+    })?;
+    let regional_sequence =
+        i64::try_from(checkpoint.regional_sequence_watermark).map_err(|_| {
+            PlayerPersistenceError::InvalidValue {
+                path: path.clone(),
+                field: ENTITY_REGIONAL_SEQUENCE_FIELD,
+            }
+        })?;
+    if !checkpoint.has_valid_temporal_state() {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path,
+            field: ENTITY_RETAINED_STATE_FIELD,
+        });
     }
-    let root = Tag::Compound(vec![(
-        "Entities".into(),
-        Tag::List(ListTag {
-            element_type: if elements.is_empty() {
-                tag_type::END
-            } else {
-                tag_type::COMPOUND
-            },
-            elements,
-        }),
-    )]);
+    if !checkpoint.has_valid_vehicle_graph() {
+        return Err(PlayerPersistenceError::InvalidValue {
+            path,
+            field: ENTITY_VEHICLE_STATE_FIELD,
+        });
+    }
+    let mut elements = Vec::new();
+    for record in &checkpoint.records {
+        validate_entity_numeric_state(&path, &record.snapshot)?;
+        validate_entity_temporal_state(&path, checkpoint.lifecycle_clock, &record.snapshot)?;
+        elements.push(entity_tag(&path, items, record)?);
+    }
+    let root = Tag::Compound(vec![
+        (
+            ENTITY_FORMAT_VERSION_FIELD.into(),
+            Tag::Int(ENTITY_FORMAT_VERSION),
+        ),
+        (
+            ENTITY_LIFECYCLE_TICK_FIELD.into(),
+            Tag::Long(lifecycle_tick),
+        ),
+        (
+            ENTITY_REGIONAL_SEQUENCE_FIELD.into(),
+            Tag::Long(regional_sequence),
+        ),
+        (
+            "Entities".into(),
+            Tag::List(ListTag {
+                element_type: if elements.is_empty() {
+                    tag_type::END
+                } else {
+                    tag_type::COMPOUND
+                },
+                elements,
+            }),
+        ),
+    ]);
     write_player_root(&path, "", &root)
 }
 
@@ -1217,16 +2003,51 @@ fn entities_path(world_root: &Path) -> PathBuf {
 }
 
 fn entity_tag(
+    path: &Path,
     items: &ItemRegistry,
     record: &PersistedEntityRecord,
 ) -> Result<Tag, PlayerPersistenceError> {
     let entity = &record.snapshot;
+    let attributes = serde_json::to_string(&entity.attributes).map_err(|_| {
+        PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_ATTRIBUTES_FIELD,
+        }
+    })?;
+    let retained = serde_json::to_string(&entity.retained).map_err(|_| {
+        PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_RETAINED_STATE_FIELD,
+        }
+    })?;
+    let goal =
+        serde_json::to_string(&entity.goal).map_err(|_| PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_GOAL_STATE_FIELD,
+        })?;
+    let vehicle = serde_json::to_string(&entity.vehicle).map_err(|_| {
+        PlayerPersistenceError::InvalidValue {
+            path: path.to_path_buf(),
+            field: ENTITY_VEHICLE_STATE_FIELD,
+        }
+    })?;
+    let lifecycle = match entity.lifecycle {
+        EntityLifecycle::Alive => 0,
+        EntityLifecycle::Despawning => 1,
+    };
     let mut fields = vec![
         ("id".into(), Tag::String(entity.type_name.clone())),
         ("SolarisEntityId".into(), Tag::Int(entity.id.0)),
         ("UUID".into(), Tag::IntArray(uuid_to_int_array(entity.uuid))),
         ("Pos".into(), vec3_double_list(entity.position)),
-        ("Motion".into(), vec3_double_list(entity.velocity)),
+        (
+            "Motion".into(),
+            vec3_double_list(Vec3::new(
+                entity.velocity.x / ENTITY_TICKS_PER_SECOND,
+                entity.velocity.y / ENTITY_TICKS_PER_SECOND,
+                entity.velocity.z / ENTITY_TICKS_PER_SECOND,
+            )),
+        ),
         (
             "Rotation".into(),
             Tag::List(ListTag {
@@ -1239,6 +2060,15 @@ fn entity_tag(
         ),
         ("OnGround".into(), Tag::Byte(i8::from(entity.on_ground))),
         ("Health".into(), Tag::Float(entity.health)),
+        (ENTITY_ATTRIBUTES_FIELD.into(), Tag::String(attributes)),
+        (ENTITY_LIFECYCLE_FIELD.into(), Tag::Byte(lifecycle)),
+        (ENTITY_RETAINED_STATE_FIELD.into(), Tag::String(retained)),
+        (
+            ENTITY_HEAD_YAW_FIELD.into(),
+            Tag::Float(entity.rotation.head_yaw),
+        ),
+        (ENTITY_GOAL_STATE_FIELD.into(), Tag::String(goal)),
+        (ENTITY_VEHICLE_STATE_FIELD.into(), Tag::String(vehicle)),
         ("SolarisLifetimeAge".into(), Tag::Int(record.age.max(0))),
     ];
     if let Some(animal) = entity.animal {
@@ -1506,6 +2336,7 @@ fn inventory_tag(
                 extras.item_id == stack.item_id
                     && extras.damage == stack.damage
                     && extras.enchantments == stack.enchantments
+                    && extras.custom_name == stack.custom_name
             })
             .map(|extras| extras.fields.clone())
             .unwrap_or_default();
@@ -1540,6 +2371,7 @@ fn item_stack_from_fields(
         item_id,
         damage: damage_component(fields),
         enchantments: enchantments_component(fields)?,
+        custom_name: custom_name_component(fields),
     }))
 }
 
@@ -1616,6 +2448,9 @@ fn set_item_stack_fields(fields: &mut Vec<(String, Tag)>, name: &Identifier, sta
     if let Some(damage) = stack.damage {
         set_damage_component(fields, damage);
     }
+    if let Some(custom_name) = &stack.custom_name {
+        set_custom_name_component(fields, custom_name);
+    }
     if !stack.enchantments.is_empty() {
         set_enchantments_component(fields, &stack.enchantments);
     }
@@ -1640,6 +2475,39 @@ fn set_damage_component(fields: &mut Vec<(String, Tag)>, damage: i32) {
             fields,
             "components",
             Tag::Compound(vec![(DAMAGE_COMPONENT.into(), Tag::Int(damage))]),
+        );
+    }
+}
+
+/// The local 26.1.2 `DataComponents.CUSTOM_NAME` type is a Component. Solaris
+/// emits and restores the literal text-component form used by script labels;
+/// richer component data remains in `inventory_extras` untouched.
+fn custom_name_component(fields: &[(String, Tag)]) -> Option<String> {
+    let Tag::Compound(components) = field(fields, "components")? else {
+        return None;
+    };
+    let Tag::Compound(component) = field(components, CUSTOM_NAME_COMPONENT)? else {
+        return None;
+    };
+    let [(name, Tag::String(value))] = component.as_slice() else {
+        return None;
+    };
+    (name == "text").then(|| value.clone())
+}
+
+fn set_custom_name_component(fields: &mut Vec<(String, Tag)>, custom_name: &str) {
+    let value = Tag::Compound(vec![("text".into(), Tag::String(custom_name.to_owned()))]);
+    let components = field_mut(fields, "components").and_then(|tag| match tag {
+        Tag::Compound(fields) => Some(fields),
+        _ => None,
+    });
+    if let Some(components) = components {
+        set_field(components, CUSTOM_NAME_COMPONENT, value);
+    } else {
+        set_field(
+            fields,
+            "components",
+            Tag::Compound(vec![(CUSTOM_NAME_COMPONENT.into(), value)]),
         );
     }
 }
@@ -1833,10 +2701,15 @@ impl fmt::Display for PlayerPersistedState {
 }
 
 #[cfg(test)]
+#[path = "persistence_entity_load_tests.rs"]
+mod entity_load_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use mc_entity::{
-        RegionPhase, RegionalCommitDecision, RegionalDecisionJournal, VehicleKind, VehicleState,
+        EntityStore, RegionPhase, RegionalCommitDecision, RegionalDecisionJournal, SpawnEntity,
+        VehicleKind, VehicleState,
     };
     use mc_nbt::Tag;
 
@@ -1855,33 +2728,15 @@ mod tests {
     }
 
     fn entity_types() -> EntityTypeRegistry {
-        let reports = vec![
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 1,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:cow").unwrap(),
-                protocol_id: 2,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:cod").unwrap(),
-                protocol_id: 3,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:falling_block").unwrap(),
-                protocol_id: 4,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:chicken").unwrap(),
-                protocol_id: 5,
-            },
-            mc_data::entity_types::EntityTypeReport {
-                id: mc_data::Identifier::parse("minecraft:sheep").unwrap(),
-                protocol_id: 6,
-            },
-        ];
-        EntityTypeRegistry::from_report(&reports)
+        mc_data::entity_types::solaris_required_entity_types()
+    }
+
+    fn replay_entity(type_name: &str, spawn_tick: u64) -> EntitySnapshot {
+        let mut store = EntityStore::new();
+        let mut entity = SpawnEntity::new(1, type_name, Vec3::ZERO);
+        entity.retained.spawn_tick = spawn_tick;
+        let id = store.spawn(entity);
+        store.snapshot(id).expect("spawned replay fixture")
     }
 
     #[test]
@@ -1895,7 +2750,7 @@ mod tests {
         let snapshot = EntitySnapshot {
             id: EntityId(41),
             uuid: uuid::Uuid::from_u128(41),
-            type_id: 2,
+            type_id: 30,
             type_name: "minecraft:cow".into(),
             position: Vec3::new(-3.5, 70.0, 8.25),
             rotation: mc_entity::Rotation {
@@ -1920,10 +2775,12 @@ mod tests {
                 passenger: Some(EntityId(42)),
             }),
             animal: Some(mc_entity::AnimalBreedingState::baby()),
+            retained: mc_entity::EntityRetainedState::default(),
         };
-        let decision = RegionalCommitDecision::from_parts(
+        let decision = RegionalCommitDecision::from_parts_at_lifecycle_epoch(
             RegionPhase(7),
             91,
+            13,
             vec![snapshot],
             vec![EntityId(99)],
         )
@@ -1947,20 +2804,26 @@ mod tests {
             ..stale.clone()
         };
         let replayed = replay_regional_commit_decisions(
-            vec![
-                PersistedEntityRecord {
-                    snapshot: stale,
-                    age: 12,
-                    pickup_delay: 4,
-                },
-                PersistedEntityRecord::from(removed),
-            ],
+            PersistedEntityCheckpoint::new(
+                12,
+                vec![
+                    PersistedEntityRecord {
+                        snapshot: stale,
+                        age: 12,
+                        pickup_delay: 4,
+                    },
+                    PersistedEntityRecord::from(removed),
+                ],
+            ),
             &pending,
-        );
-        assert_eq!(replayed.len(), 1);
-        assert_eq!(replayed[0].snapshot, decision.upserts()[0]);
-        assert_eq!(replayed[0].age, 12);
-        assert_eq!(replayed[0].pickup_delay, 4);
+        )
+        .expect("valid regional decision replay");
+        assert_eq!(replayed.lifecycle_clock, 13);
+        assert_eq!(replayed.regional_sequence_watermark, 91);
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].snapshot, decision.upserts()[0]);
+        assert_eq!(replayed.records[0].age, 13);
+        assert_eq!(replayed.records[0].pickup_delay, 0);
         reopened
             .clear_commit(decision.phase())
             .expect("clear decision");
@@ -1971,51 +2834,92 @@ mod tests {
     }
 
     #[test]
-    fn regional_decision_journal_appends_and_ignores_only_a_truncated_tail() {
+    fn replay_ignores_pre_checkpoint_decision_that_would_revert_spawn_and_timer() {
+        let spawned = replay_entity("minecraft:item", 20);
+        let mut checkpoint_timer = spawned.clone();
+        checkpoint_timer.id = EntityId(2);
+        checkpoint_timer.uuid = uuid::Uuid::from_u128(2);
+        checkpoint_timer.retained.item_pickup_ready_tick = Some(30);
+        let mut stale_timer = checkpoint_timer.clone();
+        stale_timer.retained.item_pickup_ready_tick = Some(21);
+        let stale_timer_decision = RegionalCommitDecision::from_parts_at_lifecycle_epoch(
+            RegionPhase(1),
+            9,
+            19,
+            vec![stale_timer],
+            Vec::new(),
+        )
+        .expect("stale timer decision");
+        let stale_spawn_removal = RegionalCommitDecision::from_parts_at_lifecycle_epoch(
+            RegionPhase(2),
+            10,
+            19,
+            Vec::new(),
+            vec![spawned.id],
+        )
+        .expect("stale spawn removal");
+        let checkpoint = PersistedEntityCheckpoint::new_at_owner_sequence(
+            20,
+            10,
+            [
+                PersistedEntityRecord::from(spawned),
+                PersistedEntityRecord::from(checkpoint_timer.clone()),
+            ],
+        );
+
+        let replayed = replay_regional_commit_decisions(
+            checkpoint,
+            &[stale_timer_decision, stale_spawn_removal],
+        )
+        .expect("stale decisions are ignored");
+
+        assert_eq!(replayed.records.len(), 2);
+        assert_eq!(replayed.records[1].snapshot, checkpoint_timer);
+    }
+
+    #[test]
+    fn replay_applies_post_checkpoint_decision_from_the_same_lifecycle_epoch() {
+        let checkpoint_entity = replay_entity("minecraft:item", 20);
+        let decision = RegionalCommitDecision::from_parts_at_lifecycle_epoch(
+            RegionPhase(1),
+            11,
+            20,
+            Vec::new(),
+            vec![checkpoint_entity.id],
+        )
+        .expect("post-checkpoint removal");
+        let checkpoint = PersistedEntityCheckpoint::new_at_owner_sequence(
+            20,
+            10,
+            [PersistedEntityRecord::from(checkpoint_entity)],
+        );
+
+        let replayed = replay_regional_commit_decisions(checkpoint, &[decision])
+            .expect("newer same-epoch decision replays");
+
+        assert!(replayed.records.is_empty());
+        assert_eq!(replayed.lifecycle_clock, 20);
+        assert_eq!(replayed.regional_sequence_watermark, 11);
+    }
+
+    #[test]
+    fn regional_decision_journal_rejects_legacy_json_format() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = RegionalCommitDecision::from_parts(RegionPhase(1), 1, Vec::new(), Vec::new())
-            .expect("first decision");
-        let second = RegionalCommitDecision::from_parts(RegionPhase(2), 2, Vec::new(), Vec::new())
-            .expect("second decision");
         let path = tmp
             .path()
             .join(SOLARIS_DIR)
             .join(REGIONAL_DECISION_JOURNAL_FILE);
-        let (mut journal, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("open journal");
-        assert!(pending.is_empty());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, br#"{"version":1,"pending":[]}"#).unwrap();
 
-        journal.record_commit(&first).expect("append first");
-        let first_bytes = std::fs::read(&path).expect("read first append");
-        journal.record_commit(&second).expect("append second");
-        let second_bytes = std::fs::read(&path).expect("read second append");
-        assert!(
-            second_bytes.starts_with(&first_bytes),
-            "a durable decision must append instead of rewriting prior decisions"
-        );
-        drop(journal);
+        let Err(error) = FileRegionalDecisionJournal::open(tmp.path()) else {
+            panic!("unreleased JSON journal files must fail closed");
+        };
 
-        let mut file = std::fs::OpenOptions::new()
-            .append(true)
-            .open(&path)
-            .expect("open journal tail");
-        file.write_all(br#"{"phase":"#)
-            .expect("write simulated crash tail");
-        file.sync_all().expect("persist simulated crash tail");
-        drop(file);
-
-        let (mut recovered, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("ignore partial tail");
-        assert_eq!(pending, vec![first.clone(), second.clone()]);
-        let third = RegionalCommitDecision::from_parts(RegionPhase(3), 3, Vec::new(), Vec::new())
-            .expect("post-recovery decision");
-        recovered
-            .record_commit(&third)
-            .expect("append after truncated-tail recovery");
-        drop(recovered);
-        let (_, pending) =
-            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen repaired journal");
-        assert_eq!(pending, vec![first, second, third]);
+        assert!(matches!(
+            error,
+            RegionalDecisionJournalOpenError::UnsupportedVersion(0)
+        ));
     }
 
     #[test]
@@ -2042,6 +2946,34 @@ mod tests {
 
         let (_, pending) = FileRegionalDecisionJournal::open(tmp.path()).expect("reopen journal");
         assert_eq!(pending, vec![later]);
+    }
+
+    #[test]
+    fn regional_decision_journal_cleanup_requires_exact_durable_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decision =
+            RegionalCommitDecision::from_parts(RegionPhase(11), 41, Vec::new(), Vec::new())
+                .expect("decision");
+        let wrong_identity = RegionalCommitDecision::from_parts_at_lifecycle_epoch(
+            RegionPhase(11),
+            42,
+            7,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("different durable identity")
+        .identity();
+        let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        journal.record_commit(&decision).unwrap();
+
+        journal
+            .clear_commit_identities(&[wrong_identity])
+            .expect("non-matching cleanup is a no-op");
+        assert_eq!(journal.pending, vec![decision.clone()]);
+        journal
+            .clear_commit_identities(&[decision.identity()])
+            .expect("matching cleanup removes the decision");
+        assert!(journal.pending.is_empty());
     }
 
     #[test]
@@ -2095,7 +3027,7 @@ mod tests {
             .record_commit(&decision)
             .expect_err("unknown durability outcome");
         assert!(error.outcome_unknown());
-        assert!(journal.pending.is_empty());
+        assert_eq!(journal.pending, vec![decision]);
     }
 
     #[test]
@@ -2114,7 +3046,7 @@ mod tests {
         let snapshot = EntitySnapshot {
             id: EntityId(1),
             uuid: uuid::Uuid::from_u128(1),
-            type_id: 2,
+            type_id: 30,
             type_name: "minecraft:cow".into(),
             position: Vec3::new(0.5, 64.0, 0.5),
             rotation: mc_entity::Rotation::ZERO,
@@ -2129,6 +3061,7 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: Some(mc_entity::AnimalBreedingState::adult()),
+            retained: mc_entity::EntityRetainedState::default(),
         };
         let mut record_samples = Vec::with_capacity(ITERATIONS);
         let mut clear_samples = Vec::with_capacity(ITERATIONS);
@@ -2185,7 +3118,10 @@ mod tests {
         state.survival.food = 9;
         state.survival.saturation = 2.5;
         state.selected_hotbar_slot = 3;
-        state.inventory.set_hotbar(3, ItemStack::new(1, 17));
+        state
+            .inventory
+            .set_hotbar(3, ItemStack::new(1, 17))
+            .unwrap();
         state.carried_item = ItemStack::new(1, 3);
         let mut crafting_table_input = std::array::from_fn(|_| ItemStack::EMPTY);
         crafting_table_input[0] = ItemStack::new(1, 4);
@@ -2198,7 +3134,8 @@ mod tests {
         let efficiency = Identifier::parse("minecraft:efficiency").unwrap();
         state.inventory.slots[9] = ItemStack::new(2, 1)
             .with_damage(11)
-            .with_enchantment(efficiency.clone(), 1);
+            .with_enchantment(efficiency.clone(), 1)
+            .with_custom_name("Named Pickaxe");
 
         save_player_state(tmp.path(), uuid, &items, &state).unwrap();
 
@@ -2218,7 +3155,7 @@ mod tests {
         assert_eq!(loaded.survival.health, 7.5);
         assert_eq!(loaded.survival.food, 9);
         assert_eq!(loaded.selected_hotbar_slot, 3);
-        assert_eq!(loaded.inventory.held(3), &ItemStack::new(1, 17));
+        assert_eq!(loaded.inventory.held(3), Some(&ItemStack::new(1, 17)));
         assert_eq!(loaded.carried_item, ItemStack::new(1, 3));
         assert_eq!(
             loaded.crafting_table_input.as_deref(),
@@ -2233,6 +3170,7 @@ mod tests {
             ItemStack::new(2, 1)
                 .with_damage(11)
                 .with_enchantment(efficiency, 1)
+                .with_custom_name("Named Pickaxe")
         );
     }
 
@@ -2267,7 +3205,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        loaded.inventory.set_hotbar(0, ItemStack::new(1, 5));
+        loaded
+            .inventory
+            .set_hotbar(0, ItemStack::new(1, 5))
+            .unwrap();
         save_player_state(tmp.path(), uuid, &items, &loaded).unwrap();
 
         let (_, saved) = read_player_root(&path).unwrap();
@@ -2305,6 +3246,20 @@ mod tests {
                     elements: vec![Tag::Float(0.0), Tag::Float(0.0)],
                 }),
             ),
+            (
+                ENTITY_ATTRIBUTES_FIELD.into(),
+                Tag::String(
+                    serde_json::to_string(&mc_entity::AttributeSet::vanilla_mob_defaults())
+                        .unwrap(),
+                ),
+            ),
+            (ENTITY_LIFECYCLE_FIELD.into(), Tag::Byte(0)),
+            (
+                ENTITY_RETAINED_STATE_FIELD.into(),
+                Tag::String(
+                    serde_json::to_string(&mc_entity::EntityRetainedState::default()).unwrap(),
+                ),
+            ),
         ]);
         write_player_root(&path, "", &root).unwrap();
 
@@ -2326,41 +3281,32 @@ mod tests {
     fn persisted_entities_reject_non_finite_numeric_fields() {
         let tmp = tempfile::tempdir().unwrap();
         let path = entities_path(tmp.path());
-        let entity = Tag::Compound(vec![
-            ("id".into(), Tag::String("minecraft:item".into())),
-            (
-                "Pos".into(),
-                Tag::List(ListTag {
-                    element_type: tag_type::DOUBLE,
-                    elements: vec![
-                        Tag::Double(0.0),
-                        Tag::Double(f64::INFINITY),
-                        Tag::Double(0.0),
-                    ],
-                }),
-            ),
-            (
-                "Motion".into(),
-                Tag::List(ListTag {
-                    element_type: tag_type::DOUBLE,
-                    elements: vec![Tag::Double(0.0), Tag::Double(0.0), Tag::Double(0.0)],
-                }),
-            ),
-            (
-                "Rotation".into(),
-                Tag::List(ListTag {
-                    element_type: tag_type::FLOAT,
-                    elements: vec![Tag::Float(0.0), Tag::Float(0.0)],
-                }),
-            ),
-        ]);
-        let root = Tag::Compound(vec![(
-            "Entities".into(),
+        let mut item = replay_entity("minecraft:item", 0);
+        item.type_id = 71;
+        item.item_stack = Some(EntityItemStack::new(1, 1));
+        save_persisted_entities(tmp.path(), &items(), &[item]).unwrap();
+        let (_, mut root) = read_player_root(&path).unwrap();
+        let Tag::Compound(root_fields) = &mut root else {
+            panic!("saved entity root must be a compound");
+        };
+        let Some(Tag::List(entities)) = field_mut(root_fields, "Entities") else {
+            panic!("saved entity root must contain entities");
+        };
+        let Tag::Compound(entity_fields) = &mut entities.elements[0] else {
+            panic!("saved entity must be a compound");
+        };
+        set_field(
+            entity_fields,
+            "Pos",
             Tag::List(ListTag {
-                element_type: tag_type::COMPOUND,
-                elements: vec![entity],
+                element_type: tag_type::DOUBLE,
+                elements: vec![
+                    Tag::Double(0.0),
+                    Tag::Double(f64::INFINITY),
+                    Tag::Double(0.0),
+                ],
             }),
-        )]);
+        );
         write_player_root(&path, "", &root).unwrap();
 
         let error = load_persisted_entities(tmp.path(), &items(), &entity_types())
@@ -2380,7 +3326,7 @@ mod tests {
         let item = EntitySnapshot {
             id: EntityId(100),
             uuid: uuid::Uuid::from_u128(100),
-            type_id: 1,
+            type_id: 71,
             type_name: "minecraft:item".into(),
             position: Vec3::new(1.0, 65.0, 2.0),
             rotation: mc_entity::Rotation::ZERO,
@@ -2395,11 +3341,12 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         };
         let cow = EntitySnapshot {
             id: EntityId(101),
             uuid: uuid::Uuid::from_u128(101),
-            type_id: 2,
+            type_id: 30,
             type_name: "minecraft:cow".into(),
             position: Vec3::new(-4.0, 64.0, 8.0),
             rotation: mc_entity::Rotation {
@@ -2425,11 +3372,12 @@ mod tests {
                 love_ticks: 321,
                 sheep_wool: None,
             }),
+            retained: mc_entity::EntityRetainedState::default(),
         };
         let falling_block = EntitySnapshot {
             id: EntityId(102),
             uuid: uuid::Uuid::from_u128(102),
-            type_id: 4,
+            type_id: 51,
             type_name: "minecraft:falling_block".into(),
             position: Vec3::new(3.5, 70.0, 4.5),
             rotation: mc_entity::Rotation::ZERO,
@@ -2444,11 +3392,12 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         };
         let chicken = EntitySnapshot {
             id: EntityId(103),
             uuid: uuid::Uuid::from_u128(103),
-            type_id: 3,
+            type_id: 26,
             type_name: "minecraft:chicken".into(),
             position: Vec3::new(6.0, 64.0, -2.0),
             rotation: mc_entity::Rotation::ZERO,
@@ -2470,6 +3419,7 @@ mod tests {
                 love_ticks: 87,
                 sheep_wool: None,
             }),
+            retained: mc_entity::EntityRetainedState::default(),
         };
 
         save_persisted_entities(
@@ -2483,7 +3433,9 @@ mod tests {
             ],
         )
         .unwrap();
-        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types)
+            .unwrap()
+            .records;
 
         assert_eq!(loaded.len(), 4);
         assert_eq!(loaded[0].id, item.id);
@@ -2498,7 +3450,7 @@ mod tests {
         assert_eq!(loaded[1].position, cow.position);
         assert_eq!(
             loaded[1].attributes.base(&AttributeKind::MovementSpeed),
-            Some(0.2)
+            cow.attributes.base(&AttributeKind::MovementSpeed)
         );
         assert_eq!(loaded[2].type_name, falling_block.type_name);
         assert_eq!(loaded[2].block_state, falling_block.block_state);
@@ -2516,7 +3468,7 @@ mod tests {
         let sheep = EntitySnapshot {
             id: EntityId(104),
             uuid: uuid::Uuid::from_u128(104),
-            type_id: 6,
+            type_id: 111,
             type_name: "minecraft:sheep".into(),
             position: Vec3::new(4.0, 64.0, 5.0),
             rotation: mc_entity::Rotation::ZERO,
@@ -2531,10 +3483,13 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: Some(animal),
+            retained: mc_entity::EntityRetainedState::default(),
         };
 
         save_persisted_entities(tmp.path(), &items, std::slice::from_ref(&sheep)).unwrap();
-        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types()).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types())
+            .unwrap()
+            .records;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].animal, sheep.animal);
@@ -2570,11 +3525,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let items = items();
         let entity_types = entity_types();
+        let mut retained = mc_entity::EntityRetainedState::default();
+        retained.item_pickup_ready_tick = Some(130);
         let record = PersistedEntityRecord {
             snapshot: EntitySnapshot {
                 id: EntityId(104),
                 uuid: uuid::Uuid::from_u128(104),
-                type_id: 1,
+                type_id: 71,
                 type_name: "minecraft:item".into(),
                 position: Vec3::new(1.0, 65.0, 2.0),
                 rotation: mc_entity::Rotation::ZERO,
@@ -2589,13 +3546,21 @@ mod tests {
                 goal: GoalState::Idle,
                 vehicle: None,
                 animal: None,
+                retained,
             },
             age: 123,
             pickup_delay: 7,
         };
 
-        save_persisted_entity_records(tmp.path(), &items, std::slice::from_ref(&record)).unwrap();
-        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+        save_persisted_entity_records(
+            tmp.path(),
+            &items,
+            &PersistedEntityCheckpoint::new(123, vec![record.clone()]),
+        )
+        .unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types)
+            .unwrap()
+            .records;
 
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, record.id);
@@ -2604,14 +3569,14 @@ mod tests {
     }
 
     #[test]
-    fn restored_aquatic_entities_keep_aquatic_wander_goal() {
+    fn restored_aquatic_entities_keep_persisted_goal() {
         let tmp = tempfile::tempdir().unwrap();
         let items = items();
         let entity_types = entity_types();
         let cod = EntitySnapshot {
             id: EntityId(102),
             uuid: uuid::Uuid::from_u128(102),
-            type_id: 3,
+            type_id: 27,
             type_name: "minecraft:cod".into(),
             position: Vec3::new(1.0, 50.0, 2.0),
             rotation: mc_entity::Rotation::ZERO,
@@ -2626,12 +3591,15 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         };
 
         save_persisted_entities(tmp.path(), &items, &[cod]).unwrap();
-        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types).unwrap();
+        let loaded = load_persisted_entities(tmp.path(), &items, &entity_types)
+            .unwrap()
+            .records;
 
-        assert!(matches!(loaded[0].goal, GoalState::AquaticWander { .. }));
+        assert_eq!(loaded[0].goal, GoalState::Idle);
         assert!(!loaded[0].on_ground);
     }
 
@@ -2644,7 +3612,7 @@ mod tests {
         let item = EntitySnapshot {
             id: EntityId(100),
             uuid: uuid::Uuid::from_u128(100),
-            type_id: 1,
+            type_id: 71,
             type_name: "minecraft:item".into(),
             position: Vec3::new(1.0, 65.0, 2.0),
             rotation: mc_entity::Rotation::ZERO,
@@ -2659,6 +3627,7 @@ mod tests {
             goal: GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         };
 
         std::thread::scope(|scope| {
@@ -2678,7 +3647,9 @@ mod tests {
             }
         });
 
-        let loaded = load_persisted_entities(&root, &items, &entity_types).unwrap();
+        let loaded = load_persisted_entities(&root, &items, &entity_types)
+            .unwrap()
+            .records;
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, item.id);
     }

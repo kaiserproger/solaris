@@ -190,10 +190,9 @@ pub trait ReadMc: Buf {
             return Err(CodecError::NegativeLength(len_signed));
         }
         let len = len_signed as usize;
-        // Vanilla limits the byte length to 4 * max + 3 (4 bytes per char in
-        // the worst UTF-8 case). Rejecting based on byte length here also
-        // gates oversized allocations.
-        let max_bytes = max.saturating_mul(4).saturating_add(3);
+        // Netty bounds UTF-8 at three bytes per permitted UTF-16 code unit.
+        // Rejecting the declared byte length here gates payload allocation.
+        let max_bytes = max.saturating_mul(3);
         if len > max_bytes {
             return Err(CodecError::StringTooLong {
                 len,
@@ -521,6 +520,75 @@ mod tests {
     }
 
     #[test]
+    fn string_read_accepts_exact_three_byte_ceiling() {
+        let s = "\u{0800}\u{0800}";
+        assert_eq!(s.len(), 6);
+
+        let mut encoded = Vec::new();
+        encoded.write_varint(6);
+        encoded.extend_from_slice(s.as_bytes());
+
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(cursor.read_string(2).unwrap(), s);
+        assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn string_read_rejects_ceiling_plus_one_before_payload_access() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(7);
+
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(
+            cursor.read_string(2).unwrap_err(),
+            CodecError::StringTooLong { len: 7, max: 6 }
+        );
+        assert!(cursor.is_empty(), "only the declared length is consumed");
+    }
+
+    #[test]
+    fn string_round_trips_ascii_bmp_and_supplementary_scalars_at_their_limits() {
+        for (s, max) in [("abc", 3), ("\u{0800}", 1), ("\u{1F600}", 2)] {
+            let mut encoded = Vec::new();
+            encoded.write_string(s, max).unwrap();
+            assert!(s.len() <= max.saturating_mul(3));
+
+            let mut cursor: &[u8] = &encoded;
+            assert_eq!(cursor.read_string(max).unwrap(), s);
+            assert!(cursor.is_empty());
+        }
+    }
+
+    #[test]
+    fn string_limit_zero_accepts_only_empty_strings() {
+        let mut encoded = Vec::new();
+        encoded.write_string("", 0).unwrap();
+        let mut cursor: &[u8] = &encoded;
+        assert_eq!(cursor.read_string(0).unwrap(), "");
+        assert!(cursor.is_empty());
+
+        assert_eq!(
+            encoded.write_string("a", 0).unwrap_err(),
+            CodecError::StringTooLong { len: 1, max: 0 }
+        );
+        assert_eq!(encoded, vec![0]);
+
+        let mut declared_nonempty: &[u8] = &[1];
+        assert_eq!(
+            declared_nonempty.read_string(0).unwrap_err(),
+            CodecError::StringTooLong { len: 1, max: 0 }
+        );
+    }
+
+    #[test]
+    fn string_byte_ceiling_arithmetic_does_not_overflow() {
+        let max = usize::MAX / 3 + 1;
+        let mut encoded: &[u8] = &[1, b'a'];
+        assert_eq!(encoded.read_string(max).unwrap(), "a");
+        assert!(encoded.is_empty());
+    }
+
+    #[test]
     fn string_rejected_when_too_long_on_write() {
         let mut buf = Vec::new();
         let err = buf.write_string("abcdef", 3).unwrap_err();
@@ -550,16 +618,23 @@ mod tests {
     }
 
     #[test]
-    fn string_read_limit_counts_utf16_code_units() {
-        let encoded = [4, 0xF0, 0x9F, 0x98, 0x80];
+    fn string_write_and_read_limits_count_utf16_code_units() {
+        let mut output = Vec::new();
+        assert_eq!(
+            output.write_string("\u{1F600}a", 2).unwrap_err(),
+            CodecError::StringTooLong { len: 3, max: 2 }
+        );
+        assert!(output.is_empty());
+
+        let encoded = [5, 0xF0, 0x9F, 0x98, 0x80, b'a'];
         let mut cursor: &[u8] = &encoded;
         assert_eq!(
-            cursor.read_string(1).unwrap_err(),
-            CodecError::StringTooLong { len: 2, max: 1 }
+            cursor.read_string(2).unwrap_err(),
+            CodecError::StringTooLong { len: 3, max: 2 }
         );
 
         let mut cursor: &[u8] = &encoded;
-        assert_eq!(cursor.read_string(2).unwrap(), "\u{1F600}");
+        assert_eq!(cursor.read_string(3).unwrap(), "\u{1F600}a");
     }
 
     #[test]
@@ -570,6 +645,27 @@ mod tests {
         assert_eq!(
             cursor.read_string(32).unwrap_err(),
             CodecError::NegativeLength(-1)
+        );
+    }
+
+    #[test]
+    fn string_rejected_on_malformed_varint_length() {
+        let mut encoded: &[u8] = &[0x80, 0x80, 0x80, 0x80, 0x80];
+        assert_eq!(
+            encoded.read_string(32).unwrap_err(),
+            CodecError::VarIntTooLong
+        );
+    }
+
+    #[test]
+    fn string_rejected_on_truncated_varint_length() {
+        let mut encoded: &[u8] = &[0x80];
+        assert_eq!(
+            encoded.read_string(32).unwrap_err(),
+            CodecError::Underflow {
+                needed: 1,
+                available: 0,
+            }
         );
     }
 

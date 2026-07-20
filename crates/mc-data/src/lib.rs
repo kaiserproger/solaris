@@ -41,6 +41,7 @@ pub mod block_mining;
 pub mod blocks;
 pub mod collision_shapes;
 pub mod damage_types;
+mod entity_contract_26_1_2;
 pub mod entity_types;
 pub mod food;
 pub mod identifier;

@@ -36,9 +36,10 @@ async fn survival_break_mature_common_crops_drops_deterministic_items() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     const CASES: &[CropHarvestCase] = &[
         CropHarvestCase {
@@ -76,55 +77,70 @@ async fn survival_break_mature_common_crops_drops_deterministic_items() {
         .id_of(&mc_data::Identifier::parse("minecraft:item").unwrap())
         .expect("item entity type") as i32;
 
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let mut crop_positions = Vec::with_capacity(CASES.len());
     for (idx, case) in CASES.iter().enumerate() {
-        let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-        let storage = mc_world::WorldStorage::in_memory_with_capacity(
-            Arc::clone(&blocks),
-            ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+        let x = 2 + i32::try_from(idx).expect("crop index fits i32") * 2;
+        let surface_y = top_non_air_y(
+            &mut storage,
+            x,
+            2,
+            mc_world::BlockStateId(air_state_id as u32),
         )
-        .with_generator(generator);
-        let world = Arc::new(tokio::sync::Mutex::new(storage));
-        let cfg = mc_net::ServerConfig {
-            bind_address: "127.0.0.1:0".parse().unwrap(),
-            motd: format!("M72 {} harvest drops", case.name),
-            max_players: 8,
-            view_distance: VIEW_DISTANCE,
-            data: Arc::clone(&data),
-            blocks: Arc::clone(&blocks),
-            world: Some(Arc::clone(&world)),
-            tags: Arc::clone(&tags),
-            recipes: Arc::new(Vec::new()),
-            loot: Arc::new(mc_data::loot::LootTables::default()),
-            block_light: None,
-            items: Arc::clone(&items),
-            item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
-            block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-            entity_types: Arc::clone(&entity_types),
-            biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
-            chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
-            random_tick: mc_net::RandomTickPolicy::default(),
-            command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
-            shutdown: mc_net::ShutdownHandle::default(),
-        };
-        let bound = mc_net::bind(cfg).await.expect("bind");
-        let addr = bound.local_addr().expect("local_addr");
-        tokio::spawn(async move {
-            let _ = bound.serve().await;
-        });
+        .expect("spawn terrain");
+        let crop_pos = (x, surface_y + 1, 2);
+        let support = crop_test_state(&blocks, case.support, &[]);
+        let crop = crop_test_state(&blocks, case.block, &[("age", case.age)]);
+        crop_test_set(&mut storage, (x, surface_y, 2), support);
+        crop_test_set(&mut storage, crop_pos, crop);
+        crop_positions.push(crop_pos);
+    }
 
-        let username = format!("M72Crop{idx}");
-        let (mut client, sync) = connect_to_play(addr, &username).await;
-        drain_until_chunk(&mut client, (0, 0)).await;
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "M72 common crop harvest drops".into(),
+        max_players: 8,
+        view_distance: VIEW_DISTANCE,
+        data,
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(storage))),
+        tags,
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::clone(&items),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types,
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind(cfg).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    let serve = tokio::spawn(async move { bound.serve().await });
 
-        let support_y = sync.y.floor() as i32 - 2;
-        let crop_pos = (0, support_y + 1, 2);
-        {
-            let mut storage = world.lock().await;
-            let support = crop_test_state(&blocks, case.support, &[]);
-            let crop = crop_test_state(&blocks, case.block, &[("age", case.age)]);
-            crop_test_set(&mut storage, (0, support_y, 2), support);
-            crop_test_set(&mut storage, crop_pos, crop);
-        }
+    let (mut client, sync) = connect_to_play(addr, "M72Crops").await;
+    drain_until_chunk(&mut client, (0, 0)).await;
+
+    for (idx, (case, crop_pos)) in CASES.iter().zip(crop_positions).enumerate() {
+        move_without_position_correction(
+            &mut client,
+            f64::from(crop_pos.0) + 0.5,
+            sync.y,
+            0.5,
+            0.0,
+            0.0,
+        )
+        .await;
 
         let sequence = 720 + idx as i32 * 2;
         let mut drops = expected_crop_drops(&items, case.drops);
@@ -140,6 +156,14 @@ async fn survival_break_mature_common_crops_drops_deterministic_items() {
         )
         .await;
     }
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), serve)
+        .await
+        .expect("crop server shutdown")
+        .expect("crop server task")
+        .expect("crop server serve");
 }
 
 fn expected_crop_drops(
@@ -283,17 +307,14 @@ async fn wait_for_crop_harvest_drops(
         }
         if frame.id == ClientboundContainerSetSlot::ID {
             let mut body = frame.body;
-            let pkt = ClientboundContainerSetSlot::decode(&mut body)
-                .expect("decode crop pickup SetSlot");
+            let pkt =
+                ClientboundContainerSetSlot::decode(&mut body).expect("decode crop pickup SetSlot");
             mark_expected_crop_pickup(expected, pkt.item_stack.item_id, pkt.item_stack.count);
         }
     }
 }
 
-fn mark_expected_crop_drop_from_entity(
-    value: EntityDataValue,
-    expected: &mut [ExpectedCropDrop],
-) {
+fn mark_expected_crop_drop_from_entity(value: EntityDataValue, expected: &mut [ExpectedCropDrop]) {
     let EntityDataValue::ItemStack { index, stack } = value else {
         return;
     };

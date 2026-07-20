@@ -1,5 +1,68 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "pathing_tests.rs"]
+mod pathing_tests;
+
+// Entity.checkSupportingBlock probes this exact distance below the feet in 26.1.2.
+const SUPPORT_CONTACT_DEPTH: f64 = 1.0e-6;
+// Shapes.joinIsNotEmpty merges voxel coordinates this close before applying AND.
+const VOXEL_SHAPE_MERGE_TOLERANCE: f64 = 1.0e-7;
+
+#[derive(Clone)]
+struct CanonicalPathingStateFact {
+    block: Identifier,
+    properties: Box<[(String, String)]>,
+}
+
+enum PathingCollisionShape<'a> {
+    FullCube,
+    Voxel(&'a [mc_data::collision_shapes::CollisionBox]),
+}
+
+fn canonical_pathing_state_fact(state: u32) -> Option<&'static CanonicalPathingStateFact> {
+    static FACTS: std::sync::OnceLock<Box<[Option<CanonicalPathingStateFact>]>> =
+        std::sync::OnceLock::new();
+    FACTS
+        .get_or_init(|| {
+            let reports = mc_data::blocks::solaris_required_blocks_report();
+            let max_state = reports
+                .iter()
+                .flat_map(|block| block.states.iter().map(|state| state.id))
+                .max()
+                .unwrap_or(0);
+            let mut facts = (0..=max_state).map(|_| None).collect::<Vec<_>>();
+            let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
+            for block in reports {
+                for state in block.states {
+                    let properties = block
+                        .properties
+                        .keys()
+                        .map(|name| {
+                            (
+                                name.clone(),
+                                state.properties.get(name).cloned().unwrap_or_default(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice();
+                    if collision_shapes
+                        .get_for_state(state.id, &block.id, properties.as_ref())
+                        .is_some()
+                    {
+                        facts[state.id as usize] = Some(CanonicalPathingStateFact {
+                            block: block.id.clone(),
+                            properties,
+                        });
+                    }
+                }
+            }
+            facts.into_boxed_slice()
+        })
+        .get(state as usize)
+        .and_then(Option::as_ref)
+}
+
 pub(super) struct LoadedChunkPathingProbe<'a> {
     active_chunks: &'a HashSet<(i32, i32)>,
     terrain_pathing_entities: &'a HashSet<EntityId>,
@@ -165,7 +228,7 @@ impl PathingProbe for LoadedChunkPathingProbe<'_> {
         let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
         let max_collision_box_y = f64::from(collision_shapes.max_box_y()) / 16.0;
         let body_root_min_y =
-            ((position.y - max_collision_box_y).floor() as i32 + 1).max(mc_world::chunk::MIN_Y);
+            ((position.y - max_collision_box_y).floor() as i32).max(mc_world::chunk::MIN_Y);
         let max_y = (position.y + aabb.height - EPSILON).floor() as i32;
         let body_min_y = (position.y + EPSILON).floor() as i32;
         let mut touches_fluid = false;
@@ -200,9 +263,10 @@ impl PathingProbe for LoadedChunkPathingProbe<'_> {
             return PathingProbeResult::Walkable;
         }
 
-        let support_min_y =
-            ((position.y - max_collision_box_y).ceil() as i32).max(mc_world::chunk::MIN_Y);
-        let support_max_y = (position.y - EPSILON).floor() as i32;
+        let (support_min_y, support_max_y) =
+            Self::support_candidate_y_bounds(position.y, max_collision_box_y);
+        let support_min_y = support_min_y.max(mc_world::chunk::MIN_Y);
+        let support_max_y = support_max_y.min(mc_world::chunk::MAX_Y - 1);
         for x in min_x..=max_x {
             for z in min_z..=max_z {
                 for y in support_min_y..=support_max_y {
@@ -249,14 +313,38 @@ impl LoadedChunkPathingProbe<'_> {
         state: u32,
         collision_shapes: &mc_data::collision_shapes::CollisionShapeTable,
     ) -> bool {
-        collision_shapes.get(state).map_or_else(
-            || Self::body_intersects_box(position, aabb, x, y, z, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0]),
-            |boxes| {
-                boxes.iter().copied().any(|collision_box| {
-                    Self::body_intersects_box(position, aabb, x, y, z, collision_box.as_blocks())
-                })
-            },
-        )
+        match Self::collision_shape_with_facts(
+            state,
+            canonical_pathing_state_fact(state),
+            collision_shapes,
+        ) {
+            PathingCollisionShape::FullCube => {
+                Self::body_intersects_box(position, aabb, x, y, z, [0.0, 0.0, 0.0, 1.0, 1.0, 1.0])
+            }
+            PathingCollisionShape::Voxel(boxes) => boxes.iter().copied().any(|collision_box| {
+                Self::body_intersects_voxel_box(position, aabb, x, y, z, collision_box.as_blocks())
+            }),
+        }
+    }
+
+    fn collision_shape_with_facts<'a>(
+        state: u32,
+        facts: Option<&CanonicalPathingStateFact>,
+        collision_shapes: &'a mc_data::collision_shapes::CollisionShapeTable,
+    ) -> PathingCollisionShape<'a> {
+        let Some(facts) = facts else {
+            return PathingCollisionShape::FullCube;
+        };
+        let Some(boxes) =
+            collision_shapes.get_for_state(state, &facts.block, facts.properties.as_ref())
+        else {
+            return PathingCollisionShape::FullCube;
+        };
+        if boxes.len() == 1 && boxes[0].coordinates() == [0, 0, 0, 16, 16, 16] {
+            PathingCollisionShape::FullCube
+        } else {
+            PathingCollisionShape::Voxel(boxes)
+        }
     }
 
     fn body_intersects_box(
@@ -275,6 +363,56 @@ impl LoadedChunkPathingProbe<'_> {
             && position.z + aabb.half_width > f64::from(z) + min_z
     }
 
+    fn body_intersects_voxel_box(
+        position: Vec3,
+        aabb: mc_physics::Aabb,
+        x: i32,
+        y: i32,
+        z: i32,
+        [min_x, min_y, min_z, max_x, max_y, max_z]: [f64; 6],
+    ) -> bool {
+        Self::voxel_shape_axis_intersects(
+            position.x - aabb.half_width,
+            position.x + aabb.half_width,
+            f64::from(x) + min_x,
+            f64::from(x) + max_x,
+        ) && Self::voxel_shape_axis_intersects(
+            position.y,
+            position.y + aabb.height,
+            f64::from(y) + min_y,
+            f64::from(y) + max_y,
+        ) && Self::voxel_shape_axis_intersects(
+            position.z - aabb.half_width,
+            position.z + aabb.half_width,
+            f64::from(z) + min_z,
+            f64::from(z) + max_z,
+        )
+    }
+
+    fn voxel_shape_axis_intersects(
+        first_min: f64,
+        first_max: f64,
+        second_min: f64,
+        second_max: f64,
+    ) -> bool {
+        first_min < second_max - VOXEL_SHAPE_MERGE_TOLERANCE
+            && second_min < first_max - VOXEL_SHAPE_MERGE_TOLERANCE
+    }
+
+    fn support_candidate_y_bounds(feet_y: f64, max_collision_box_y: f64) -> (i32, i32) {
+        let support_strip_min = feet_y - SUPPORT_CONTACT_DEPTH;
+        // A candidate with top exactly at the rounded boundary may still overlap before
+        // f64 cancellation. Widen by one representable value; the shape test rejects it.
+        let lower_boundary = (support_strip_min - max_collision_box_y).next_down();
+        let min_y = lower_boundary.floor() as i32 + 1;
+        let max_y = feet_y.ceil() as i32 - 1;
+        (min_y, max_y)
+    }
+
+    fn support_strip_intersects_y(feet_y: f64, collision_min_y: f64, collision_max_y: f64) -> bool {
+        feet_y - SUPPORT_CONTACT_DEPTH < collision_max_y && feet_y > collision_min_y
+    }
+
     fn state_supports_feet(
         position: Vec3,
         aabb: mc_physics::Aabb,
@@ -284,25 +422,38 @@ impl LoadedChunkPathingProbe<'_> {
         state: u32,
         collision_shapes: &mc_data::collision_shapes::CollisionShapeTable,
     ) -> bool {
-        collision_shapes.get(state).map_or_else(
-            || {
-                position.y == f64::from(y) + 1.0
+        match Self::collision_shape_with_facts(
+            state,
+            canonical_pathing_state_fact(state),
+            collision_shapes,
+        ) {
+            PathingCollisionShape::FullCube => {
+                Self::support_strip_intersects_y(position.y, f64::from(y), f64::from(y) + 1.0)
                     && position.x - aabb.half_width < f64::from(x) + 1.0
                     && position.x + aabb.half_width > f64::from(x)
                     && position.z - aabb.half_width < f64::from(z) + 1.0
                     && position.z + aabb.half_width > f64::from(z)
-            },
-            |boxes| {
-                boxes.iter().copied().any(|collision_box| {
-                    let [min_x, _, min_z, max_x, max_y, max_z] = collision_box.as_blocks();
-                    position.y == f64::from(y) + max_y
-                        && position.x - aabb.half_width < f64::from(x) + max_x
-                        && position.x + aabb.half_width > f64::from(x) + min_x
-                        && position.z - aabb.half_width < f64::from(z) + max_z
-                        && position.z + aabb.half_width > f64::from(z) + min_z
-                })
-            },
-        )
+            }
+            PathingCollisionShape::Voxel(boxes) => boxes.iter().copied().any(|collision_box| {
+                let [min_x, min_y, min_z, max_x, max_y, max_z] = collision_box.as_blocks();
+                Self::voxel_shape_axis_intersects(
+                    position.y - SUPPORT_CONTACT_DEPTH,
+                    position.y,
+                    f64::from(y) + min_y,
+                    f64::from(y) + max_y,
+                ) && Self::voxel_shape_axis_intersects(
+                    position.x - aabb.half_width,
+                    position.x + aabb.half_width,
+                    f64::from(x) + min_x,
+                    f64::from(x) + max_x,
+                ) && Self::voxel_shape_axis_intersects(
+                    position.z - aabb.half_width,
+                    position.z + aabb.half_width,
+                    f64::from(z) + min_z,
+                    f64::from(z) + max_z,
+                )
+            }),
+        }
     }
 
     fn state_at(

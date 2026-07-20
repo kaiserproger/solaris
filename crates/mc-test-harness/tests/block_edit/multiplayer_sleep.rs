@@ -5,7 +5,8 @@ use uuid::Uuid;
 async fn two_clients_sleep_quorum_pushes_pose_and_morning_to_both() {
     let data = embedded_play_data();
     let world = embedded_world(&data);
-    let config = embedded_playable_config(&data, world, "multiplayer sleep quorum");
+    let mut config = embedded_playable_config(&data, world, "multiplayer sleep quorum");
+    config.biome_spawns = Arc::new(mc_data::biomes::BiomeSpawnRules::default());
     let world_handle = Arc::clone(config.world.as_ref().expect("embedded world handle"));
 
     let bound = mc_net::bind(config).await.expect("bind");
@@ -47,8 +48,8 @@ async fn two_clients_sleep_quorum_pushes_pose_and_morning_to_both() {
 
     use_sleep_test_bed(&mut bob, bob_bed_pos, 2).await;
     let (alice_result, bob_result) = tokio::join!(
-        wait_for_sleep_quorum_delivery(&mut alice, alice_id, None),
-        wait_for_sleep_quorum_delivery(&mut bob, alice_id, Some(2)),
+        wait_for_sleep_quorum_delivery(&mut alice, alice_id, bed_pos, bob_bed_pos, None),
+        wait_for_sleep_quorum_delivery(&mut bob, alice_id, bed_pos, bob_bed_pos, Some(2)),
     );
     assert_eq!(alice_result.bob_id, bob_result.bob_id);
     assert_ne!(alice_result.bob_id, alice_id);
@@ -57,10 +58,88 @@ async fn two_clients_sleep_quorum_pushes_pose_and_morning_to_both() {
 }
 
 #[tokio::test]
+async fn lowering_sleep_percentage_wakes_the_only_sleeper_once_for_both_clients() {
+    let data = embedded_play_data();
+    let world = embedded_world(&data);
+    let mut config = embedded_playable_config(&data, world, "sleep gamerule transition");
+    config.biome_spawns = Arc::new(mc_data::biomes::BiomeSpawnRules::default());
+    let world_handle = Arc::clone(config.world.as_ref().expect("embedded world handle"));
+
+    let bound = mc_net::bind(config).await.expect("bind");
+    let addr = bound.local_addr().expect("local_addr");
+    tokio::spawn(async move {
+        let _ = bound.serve().await;
+    });
+
+    let (mut alice, alice_sync) = connect_to_play(addr, "SleepRuleAlice").await;
+    drain_until_chunk(&mut alice, (0, 0)).await;
+    let (mut bob, _) = connect_to_play(addr, "SleepRuleBob").await;
+    drain_until_chunk(&mut bob, (0, 0)).await;
+
+    let bed_pos = mc_world::BlockPos {
+        x: alice_sync.x.floor() as i32 + 1,
+        y: alice_sync.y.floor() as i32 - 1,
+        z: alice_sync.z.floor() as i32,
+    };
+    let bed_states = north_facing_bed_states(&data);
+    seed_two_block_bed(&world_handle, bed_pos, bed_states).await;
+
+    alice
+        .write_packet(&ServerboundChatCommand {
+            command: "time set night".into(),
+        })
+        .await
+        .expect("set night");
+    wait_for_exact_world_time(&mut alice, 13_000).await;
+
+    use_sleep_test_bed(&mut alice, bed_pos, 31).await;
+    let alice_id = wait_for_sleeping_before_morning(&mut alice, Some(31)).await;
+    assert_eq!(
+        wait_for_sleeping_before_morning(&mut bob, None).await,
+        alice_id
+    );
+
+    bob.write_packet(&ServerboundChatCommand {
+        command: "gamerule players_sleeping_percentage 50".into(),
+    })
+    .await
+    .expect("lower sleeping percentage");
+
+    let (alice_wake, bob_wake) = tokio::join!(
+        wait_for_single_sleeper_wake(&mut alice, alice_id, bed_pos, false, true),
+        wait_for_single_sleeper_wake(&mut bob, alice_id, bed_pos, true, false),
+    );
+    assert_eq!(alice_wake.morning_publications, 1);
+    assert_eq!(bob_wake.morning_publications, 1);
+    assert!(alice_wake.saw_wake_position);
+    assert!(!bob_wake.saw_wake_position);
+
+    bob.write_packet(&ServerboundChatCommand {
+        command: "time set day".into(),
+    })
+    .await
+    .expect("send post-wake time fence");
+    let (alice_extra_mornings, bob_extra_mornings) = tokio::join!(
+        count_mornings_until_time_fence(&mut alice, 1_000),
+        count_mornings_until_time_fence(&mut bob, 1_000),
+    );
+    assert_eq!(alice_extra_mornings, 0);
+    assert_eq!(bob_extra_mornings, 0);
+
+    let world = world_handle.lock().await;
+    assert_eq!(world.get_cached_block(bed_pos), Some(bed_states.foot));
+    assert_eq!(
+        world.get_cached_block(bed_states.head_pos(bed_pos)),
+        Some(bed_states.head)
+    );
+}
+
+#[tokio::test]
 async fn disconnecting_sleeping_player_releases_bed_for_other_client() {
     let data = embedded_play_data();
     let world = embedded_world(&data);
-    let config = embedded_playable_config(&data, world, "disconnecting sleeping player");
+    let mut config = embedded_playable_config(&data, world, "disconnecting sleeping player");
+    config.biome_spawns = Arc::new(mc_data::biomes::BiomeSpawnRules::default());
     let world_handle = Arc::clone(config.world.as_ref().expect("embedded world handle"));
 
     let bound = mc_net::bind(config).await.expect("bind");
@@ -404,8 +483,8 @@ async fn wait_for_obstructed_bed_rejection(client: &mut Client, expected_ack: i3
             saw_ack |= packet.sequence == expected_ack;
         } else if frame.id == ClientboundSystemChat::ID {
             let mut body = frame.body;
-            let packet = ClientboundSystemChat::decode(&mut body)
-                .expect("decode obstructed bed rejection");
+            let packet =
+                ClientboundSystemChat::decode(&mut body).expect("decode obstructed bed rejection");
             let text = system_chat_text(&packet);
             assert!(!text.contains("Respawn point set"));
             if text.contains("bed is obstructed") {
@@ -450,8 +529,8 @@ async fn wait_for_occupied_bed_rejection(client: &mut Client, expected_ack: i32)
             saw_ack |= packet.sequence == expected_ack;
         } else if frame.id == ClientboundSystemChat::ID {
             let mut body = frame.body;
-            let packet = ClientboundSystemChat::decode(&mut body)
-                .expect("decode occupied bed rejection");
+            let packet =
+                ClientboundSystemChat::decode(&mut body).expect("decode occupied bed rejection");
             if system_chat_text(&packet).contains("bed is occupied") {
                 assert!(packet.overlay);
                 saw_occupied = true;
@@ -487,8 +566,7 @@ async fn wait_for_bed_wake_position(client: &mut Client) {
             continue;
         }
         if frame.id == SynchronizePlayerPosition::ID {
-            SynchronizePlayerPosition::decode(&mut frame.body)
-                .expect("decode bed wake position");
+            SynchronizePlayerPosition::decode(&mut frame.body).expect("decode bed wake position");
             return;
         }
     }
@@ -578,10 +656,13 @@ async fn wait_for_monster_sleep_rejection(client: &mut Client, expected_ack: i32
             saw_ack |= packet.sequence == expected_ack;
         } else if frame.id == ClientboundSystemChat::ID {
             let mut body = frame.body;
-            let packet = ClientboundSystemChat::decode(&mut body)
-                .expect("decode monster sleep rejection");
+            let packet =
+                ClientboundSystemChat::decode(&mut body).expect("decode monster sleep rejection");
             if system_chat_text(&packet).contains("monsters are nearby") {
-                assert!(packet.overlay, "vanilla bed rejection is an overlay message");
+                assert!(
+                    packet.overlay,
+                    "vanilla bed rejection is an overlay message"
+                );
                 saw_rejection = true;
             }
         } else if frame.id == ClientboundSetEntityData::ID {
@@ -601,6 +682,123 @@ async fn wait_for_monster_sleep_rejection(client: &mut Client, expected_ack: i32
         }
         if saw_ack && saw_rejection {
             return;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SingleSleeperWakeWireResult {
+    morning_publications: usize,
+    saw_wake_position: bool,
+}
+
+async fn wait_for_single_sleeper_wake(
+    client: &mut Client,
+    sleeper_id: i32,
+    bed: mc_world::BlockPos,
+    expect_gamerule_feedback: bool,
+    expect_wake_position: bool,
+) -> SingleSleeperWakeWireResult {
+    let mut saw_gamerule_feedback = !expect_gamerule_feedback;
+    let mut saw_standing = false;
+    let mut saw_wake_position = false;
+    let mut morning_publications = 0;
+    let mut saw_bed_release = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("gamerule-driven sleep wake");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode gamerule bed release");
+            saw_bed_release |= unpack_block_pos(packet.position) == (bed.x, bed.y, bed.z);
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let packet = SectionBlocksUpdate::decode(&mut body)
+                .expect("decode gamerule section bed release");
+            saw_bed_release |= section_update_contains(&packet, bed);
+        } else if frame.id == ClientboundSystemChat::ID {
+            let mut body = frame.body;
+            let packet =
+                ClientboundSystemChat::decode(&mut body).expect("decode gamerule sleep feedback");
+            saw_gamerule_feedback |=
+                system_chat_text(&packet) == "players_sleeping_percentage = 50";
+        } else if frame.id == ClientboundSetEntityData::ID {
+            let mut body = frame.body;
+            let packet = ClientboundSetEntityData::decode(&mut body)
+                .expect("decode gamerule wake entity data");
+            if packet.entity_id == sleeper_id {
+                let standing = packet.values.iter().any(|value| {
+                    matches!(
+                        value,
+                        EntityDataValue::Pose {
+                            pose: EntityPose::Standing,
+                            ..
+                        }
+                    )
+                });
+                assert!(
+                    !standing || saw_bed_release,
+                    "bed release must precede Standing metadata"
+                );
+                saw_standing |= standing;
+            }
+        } else if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let packet =
+                ClientboundSetTime::decode(&mut body).expect("decode gamerule wake world time");
+            if packet.game_time == 24_000 {
+                morning_publications += 1;
+            }
+        } else if frame.id == SynchronizePlayerPosition::ID {
+            let mut body = frame.body;
+            SynchronizePlayerPosition::decode(&mut body).expect("decode gamerule wake position");
+            assert!(saw_bed_release, "bed release must precede wake teleport");
+            saw_wake_position = true;
+        }
+
+        if saw_gamerule_feedback
+            && saw_standing
+            && morning_publications > 0
+            && (!expect_wake_position || saw_wake_position)
+        {
+            return SingleSleeperWakeWireResult {
+                morning_publications,
+                saw_wake_position,
+            };
+        }
+    }
+}
+
+async fn count_mornings_until_time_fence(client: &mut Client, fence_time: i64) -> usize {
+    let mut morning_publications = 0;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("post-wake time fence");
+        if handle_keepalive(client, frame.id, &frame.body).await {
+            continue;
+        }
+        if frame.id == ClientboundSetTime::ID {
+            let mut body = frame.body;
+            let packet =
+                ClientboundSetTime::decode(&mut body).expect("decode post-wake world time");
+            if packet.game_time == 24_000 {
+                morning_publications += 1;
+            } else if packet.game_time == fence_time {
+                return morning_publications;
+            }
         }
     }
 }
@@ -650,10 +848,7 @@ async fn wait_for_exact_world_time(client: &mut Client, expected: i64) {
     }
 }
 
-async fn wait_for_sleeping_before_morning(
-    client: &mut Client,
-    expected_ack: Option<i32>,
-) -> i32 {
+async fn wait_for_sleeping_before_morning(client: &mut Client, expected_ack: Option<i32>) -> i32 {
     let mut saw_ack = expected_ack.is_none();
     let mut sleeping_entity = None;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
@@ -684,8 +879,8 @@ async fn wait_for_sleeping_before_morning(
             );
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
-            let packet = ClientboundSetEntityData::decode(&mut body)
-                .expect("decode sleeping entity data");
+            let packet =
+                ClientboundSetEntityData::decode(&mut body).expect("decode sleeping entity data");
             if packet.values.iter().any(|value| {
                 matches!(
                     value,
@@ -714,13 +909,21 @@ async fn wait_for_sleeping_before_morning(
 async fn wait_for_sleep_quorum_delivery(
     client: &mut Client,
     alice_id: i32,
+    alice_bed: mc_world::BlockPos,
+    bob_bed: mc_world::BlockPos,
     expected_ack: Option<i32>,
 ) -> SleepQuorumWireResult {
+    let own_bed = if expected_ack.is_none() {
+        alice_bed
+    } else {
+        bob_bed
+    };
     let mut saw_ack = expected_ack.is_none();
     let mut bob_id = None;
     let mut standing_entities = HashSet::new();
     let mut saw_morning = false;
     let mut wake_position = None;
+    let mut released_beds = HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let frame = client
@@ -732,7 +935,25 @@ async fn wait_for_sleep_quorum_delivery(
         if handle_keepalive(client, frame.id, &frame.body).await {
             continue;
         }
-        if frame.id == BlockChangedAck::ID {
+        if frame.id == BlockUpdate::ID {
+            let mut body = frame.body;
+            let packet = BlockUpdate::decode(&mut body).expect("decode quorum bed release");
+            let position = unpack_block_pos(packet.position);
+            for bed in [alice_bed, bob_bed] {
+                if position == (bed.x, bed.y, bed.z) {
+                    released_beds.insert(bed);
+                }
+            }
+        } else if frame.id == SectionBlocksUpdate::ID {
+            let mut body = frame.body;
+            let packet =
+                SectionBlocksUpdate::decode(&mut body).expect("decode quorum section bed release");
+            for bed in [alice_bed, bob_bed] {
+                if section_update_contains(&packet, bed) {
+                    released_beds.insert(bed);
+                }
+            }
+        } else if frame.id == BlockChangedAck::ID {
             let mut body = frame.body;
             let packet = BlockChangedAck::decode(&mut body).expect("decode quorum bed ack");
             if expected_ack == Some(packet.sequence) {
@@ -740,8 +961,8 @@ async fn wait_for_sleep_quorum_delivery(
             }
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
-            let packet = ClientboundSetEntityData::decode(&mut body)
-                .expect("decode quorum entity data");
+            let packet =
+                ClientboundSetEntityData::decode(&mut body).expect("decode quorum entity data");
             for value in packet.values {
                 match value {
                     EntityDataValue::Pose {
@@ -752,6 +973,16 @@ async fn wait_for_sleep_quorum_delivery(
                         pose: EntityPose::Standing,
                         ..
                     } => {
+                        let expected_bed = if packet.entity_id == alice_id {
+                            alice_bed
+                        } else {
+                            bob_bed
+                        };
+                        assert!(
+                            released_beds.contains(&expected_bed),
+                            "bed release must precede Standing metadata for entity {}",
+                            packet.entity_id
+                        );
                         standing_entities.insert(packet.entity_id);
                     }
                     _ => {}
@@ -765,8 +996,12 @@ async fn wait_for_sleep_quorum_delivery(
             }
         } else if frame.id == SynchronizePlayerPosition::ID {
             let mut body = frame.body;
-            let packet = SynchronizePlayerPosition::decode(&mut body)
-                .expect("decode safe wake position");
+            let packet =
+                SynchronizePlayerPosition::decode(&mut body).expect("decode safe wake position");
+            assert!(
+                released_beds.contains(&own_bed),
+                "own bed release must precede wake teleport"
+            );
             wake_position = Some((packet.x, packet.y, packet.z));
         }
 
@@ -781,5 +1016,31 @@ async fn wait_for_sleep_quorum_delivery(
                 wake_position,
             };
         }
+    }
+}
+
+fn section_update_contains(packet: &SectionBlocksUpdate, bed: mc_world::BlockPos) -> bool {
+    section_pos_matches(packet.section_pos, (bed.x, bed.y, bed.z))
+        && packet
+            .changes
+            .iter()
+            .any(|change| change.relative_pos == pack_section_relative_pos(bed.x, bed.y, bed.z))
+}
+
+fn section_pos_matches(section_pos: i64, target: (i32, i32, i32)) -> bool {
+    let sx = unpack_signed_section_coord(section_pos >> 42, 22);
+    let sy = unpack_signed_section_coord(section_pos, 20);
+    let sz = unpack_signed_section_coord(section_pos >> 20, 22);
+    sx == target.0.div_euclid(16) && sy == target.1.div_euclid(16) && sz == target.2.div_euclid(16)
+}
+
+fn unpack_signed_section_coord(value: i64, bits: u8) -> i32 {
+    let mask = (1_i64 << bits) - 1;
+    let sign = 1_i64 << (bits - 1);
+    let value = value & mask;
+    if value & sign == 0 {
+        value as i32
+    } else {
+        (value - (1_i64 << bits)) as i32
     }
 }

@@ -15,9 +15,7 @@ use crate::play::inventory::PlayerInventory;
 use crate::play::simulation::{
     AnimalFeedPlan, CommittedAnimalFeed, CommittedSheepShear, SheepShearPlan, SimulationAuthority,
 };
-use mc_entity::{
-    EntityId, EntityItemStack, EntityKinematics, EntityLifecycle, GoalState, SpawnEntity, Vec3,
-};
+use mc_entity::{EntityId, EntityItemStack, EntityLifecycle, GoalState, SpawnEntity, Vec3};
 use mc_protocol::packets::play::{GameMode, ItemStack};
 use std::collections::{HashMap, HashSet};
 #[cfg(test)]
@@ -26,6 +24,21 @@ use std::time::Instant;
 use tracing::warn;
 
 impl SessionRegistry {
+    #[cfg(test)]
+    pub(crate) fn set_sheep_grazing_ticks_for_test(
+        &self,
+        entity_id: EntityId,
+        remaining_ticks: Option<u8>,
+    ) -> bool {
+        let mut entities = self.lock_entities("set sheep grazing timer for test");
+        let Some(expected) = entities.snapshot(entity_id) else {
+            return false;
+        };
+        let mut next = expected.clone();
+        next.retained.sheep_grazing_ticks = remaining_ticks;
+        entities.replace_snapshot_if_current(expected, next)
+    }
+
     pub(in crate::play) fn commit_animal_feed(
         &self,
         _authority: &SimulationAuthority,
@@ -320,6 +333,7 @@ impl SessionRegistry {
                     .map(|birth| {
                         let mut child =
                             SpawnEntity::new(birth.type_id, birth.type_name, birth.position);
+                        child.retained.spawn_tick = lifecycle_tick;
                         apply_entity_facts(&mut child);
                         if let Some(color) = birth.sheep_color {
                             child.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(color));
@@ -335,7 +349,7 @@ impl SessionRegistry {
                         child
                     })
                     .collect::<Vec<_>>();
-                let child_ids = entities.spawn_authoritative_batch(child_entities);
+                let child_ids = entities.spawn_batch(child_entities);
                 let child_id_set = child_ids.iter().copied().collect::<HashSet<_>>();
                 entities.prefetch(&child_id_set);
                 children.extend(child_ids.into_iter().filter_map(|id| entities.snapshot(id)));
@@ -388,7 +402,6 @@ impl SessionRegistry {
         let birth_count = children.len();
         for child in children {
             let child_id = child.id;
-            inner.entity_spawn_ticks.insert(child_id, lifecycle_tick);
             inner
                 .entity_type_aabbs
                 .entry(child.type_id)
@@ -416,48 +429,39 @@ impl SessionRegistry {
                 .flat_map(|entities| entities.iter().copied())
                 .collect::<HashSet<_>>()
         };
-        let entities = self.lock_entities("snapshot sheep grazing candidates");
+        let mut entities = self.lock_entities("snapshot sheep grazing candidates");
         #[cfg(test)]
         self.pause_during_sheep_grazing_plan_for_test();
-        let mut sheep = Vec::new();
+        let mut sheep_ids = Vec::new();
         entities.visit_sheep_entities_for_ids(&loaded_entity_ids, |entity| {
             #[cfg(test)]
             self.sheep_grazing_entity_visits
                 .fetch_add(1, Ordering::Relaxed);
             if let Some(animal) = entity.animal {
-                sheep.push(GrazingSheep {
-                    entity_id: entity.id,
-                    position: entity.position,
-                    is_baby: animal.is_baby(),
-                });
+                sheep_ids.push((entity.id, animal.is_baby()));
             }
         });
-        drop(entities);
-
-        let mut inner = self.lock_inner("advance sheep grazing plan");
-        sheep.retain(|sheep| {
-            inner
-                .entity_chunks
-                .get(&sheep.entity_id)
-                .is_some_and(|chunk| inner.loaded_chunk_refcounts.contains_key(chunk))
-        });
-        let advance = advance_sheep_grazing(tick, &sheep, &inner.sheep_grazing_ticks);
-        let live_sheep = sheep
-            .iter()
-            .map(|sheep| sheep.entity_id)
-            .collect::<HashSet<_>>();
-        inner
-            .sheep_grazing_ticks
-            .retain(|entity_id, _| live_sheep.contains(entity_id));
+        let sheep = sheep_ids
+            .into_iter()
+            .filter_map(|(entity_id, is_baby)| {
+                entities
+                    .snapshot(entity_id)
+                    .map(|expected| GrazingSheep { expected, is_baby })
+            })
+            .collect::<Vec<_>>();
+        let mut advance = advance_sheep_grazing(tick, &sheep);
+        let mut applied_updates = HashSet::new();
         for update in advance.timer_updates {
-            if let Some(remaining) = update.remaining {
-                inner
-                    .sheep_grazing_ticks
-                    .insert(update.entity_id, remaining);
-            } else {
-                inner.sheep_grazing_ticks.remove(&update.entity_id);
+            let mut next = update.expected.clone();
+            next.retained.sheep_grazing_ticks = update.remaining;
+            if entities.replace_snapshot_if_current(update.expected, next.clone()) {
+                applied_updates.insert(next.id);
             }
         }
+        advance
+            .plan
+            .actions
+            .retain(|candidate| applied_updates.contains(&candidate.entity_id));
         advance.plan
     }
 
@@ -466,14 +470,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         candidates: &[SheepGrazingCandidate],
     ) -> (usize, Vec<VisibilityDispatch>) {
-        let candidates = {
-            let inner = self.lock_inner("select sheep grazing starts");
-            candidates
-                .iter()
-                .copied()
-                .filter(|candidate| !inner.sheep_grazing_ticks.contains_key(&candidate.entity_id))
-                .collect::<Vec<_>>()
-        };
+        let candidates = candidates.to_vec();
         let mut started_entities = Vec::new();
         {
             let mut entities = self.lock_entities("start sheep grazing ECS");
@@ -494,6 +491,7 @@ impl SessionRegistry {
                 if entity.lifecycle != EntityLifecycle::Alive
                     || entity.type_name != "minecraft:sheep"
                     || entity.animal.and_then(|animal| animal.sheep_wool).is_none()
+                    || entity.retained.sheep_grazing_ticks.is_some()
                 {
                     continue;
                 }
@@ -507,30 +505,15 @@ impl SessionRegistry {
                 }
 
                 let stopped_velocity = Vec3::new(0.0, entity.velocity.y, 0.0);
-                stopped_states.push((
-                    entity.clone(),
-                    EntityKinematics {
-                        id: entity.id,
-                        position: entity.position,
-                        rotation: entity.rotation,
-                        velocity: stopped_velocity,
-                        on_ground: entity.on_ground,
-                    },
-                ));
+                let mut next = entity.clone();
+                next.velocity = stopped_velocity;
+                next.retained.sheep_grazing_ticks = Some(SHEEP_GRAZING_ANIMATION_TICKS);
+                stopped_states.push((entity, next));
             }
-            if !stopped_states.is_empty()
-                && entities.apply_kinematics_states_if_current(stopped_states.iter().cloned())
-            {
-                let stopped_ids = stopped_states
-                    .iter()
-                    .map(|(snapshot, _)| snapshot.id)
-                    .collect::<HashSet<_>>();
-                entities.prefetch(&stopped_ids);
-                started_entities.extend(
-                    stopped_states
-                        .into_iter()
-                        .filter_map(|(expected, _)| entities.snapshot(expected.id)),
-                );
+            for (expected, next) in stopped_states {
+                if entities.replace_snapshot_if_current(expected, next.clone()) {
+                    started_entities.push(next);
+                }
             }
         }
         #[cfg(test)]
@@ -543,15 +526,12 @@ impl SessionRegistry {
         let mut dispatches = Vec::new();
         for committed in committed_entities {
             let entity_id = committed.id;
-            if inner.sheep_grazing_ticks.contains_key(&entity_id) {
+            if committed.retained.sheep_grazing_ticks != Some(SHEEP_GRAZING_ANIMATION_TICKS) {
                 continue;
             }
             if let Some(snapshot) = inner.published_entity_snapshots.get_mut(&entity_id) {
                 snapshot.velocity = committed.velocity;
             }
-            inner
-                .sheep_grazing_ticks
-                .insert(entity_id, SHEEP_GRAZING_ANIMATION_TICKS);
             dispatches.extend(entity_event_dispatches_locked(&inner, entity_id, 10));
             started += 1;
         }
@@ -563,17 +543,7 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         entity_ids: &[EntityId],
     ) -> (usize, Vec<VisibilityDispatch>) {
-        let entity_ids = {
-            let inner = self.lock_inner("select sheep grazing finishes");
-            entity_ids
-                .iter()
-                .copied()
-                .filter(|entity_id| {
-                    inner.sheep_grazing_ticks.get(entity_id).copied()
-                        == Some(SHEEP_GRAZING_ACTION_TICK)
-                })
-                .collect::<Vec<_>>()
-        };
+        let entity_ids = entity_ids.to_vec();
         let mut finished_entities = Vec::new();
         {
             let mut entities = self.lock_entities("finish sheep grazing ECS");
@@ -591,6 +561,7 @@ impl SessionRegistry {
                 };
                 if entity.lifecycle != EntityLifecycle::Alive
                     || entity.type_name != "minecraft:sheep"
+                    || entity.retained.sheep_grazing_ticks != Some(SHEEP_GRAZING_ACTION_TICK)
                 {
                     continue;
                 }
@@ -646,8 +617,7 @@ impl SessionRegistry {
         for committed in committed_entities {
             let entity_id = committed.id;
             let animal = expected_animals[&entity_id];
-            if inner.sheep_grazing_ticks.get(&entity_id).copied() != Some(SHEEP_GRAZING_ACTION_TICK)
-            {
+            if committed.retained.sheep_grazing_ticks != Some(SHEEP_GRAZING_ACTION_TICK) {
                 continue;
             }
             if let Some(animal) = animal {

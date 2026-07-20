@@ -279,3 +279,74 @@ fn crafting_table_grid_quick_move_returns_input_to_inventory() {
     assert!(window.input[0].is_empty());
     assert_eq!(inventory.slots[9], ItemStack::new(42, 3));
 }
+
+#[test]
+fn inventory_quick_move_auto_equips_component_defined_items() {
+    let entries = [
+        ("minecraft:elytra", 1, "chest", 6),
+        ("minecraft:carved_pumpkin", 2, "head", 5),
+        ("minecraft:player_head", 3, "head", 5),
+        ("minecraft:skeleton_skull", 4, "head", 5),
+    ];
+    let items = ItemRegistry::from_report(
+        &entries
+            .iter()
+            .map(|(name, protocol_id, _, _)| ItemReport {
+                id: Identifier::parse(*name).unwrap(),
+                protocol_id: *protocol_id,
+            })
+            .collect::<Vec<_>>(),
+    );
+    let item_facts =
+        ItemFactsTable::from_entries(entries.iter().map(|(name, _, equippable_slot, _)| {
+            (
+                Identifier::parse(*name).unwrap(),
+                ItemFacts {
+                    equippable_slot: Some((*equippable_slot).to_owned()),
+                    ..ItemFacts::default()
+                },
+            )
+        }));
+    let tags = TagsData::default();
+
+    for (_, item_id, _, equipment_slot) in entries {
+        let mut inventory = PlayerInventory::empty();
+        inventory.slots[9] = ItemStack::new(item_id, 1);
+
+        let (changed, discarded) =
+            inventory.apply_crafting_quick_move_click(&items, &item_facts, &tags, &[], 9);
+
+        assert!(changed);
+        assert!(discarded.is_empty());
+        assert!(inventory.slots[9].is_empty());
+        assert_eq!(inventory.slots[equipment_slot], ItemStack::new(item_id, 1));
+    }
+}
+
+#[test]
+fn inventory_quick_move_does_not_auto_equip_unsupported_component_slot() {
+    let unsupported = Identifier::parse("minecraft:wolf_armor").unwrap();
+    let items = ItemRegistry::from_report(&[ItemReport {
+        id: unsupported.clone(),
+        protocol_id: 5,
+    }]);
+    let item_facts = ItemFactsTable::from_entries([(
+        unsupported,
+        ItemFacts {
+            equippable_slot: Some("body".to_owned()),
+            ..ItemFacts::default()
+        },
+    )]);
+    let tags = TagsData::default();
+    let mut inventory = PlayerInventory::empty();
+    inventory.slots[9] = ItemStack::new(5, 1);
+
+    let (changed, discarded) =
+        inventory.apply_crafting_quick_move_click(&items, &item_facts, &tags, &[], 9);
+
+    assert!(changed);
+    assert!(discarded.is_empty());
+    assert!(inventory.slots[9].is_empty());
+    assert_eq!(inventory.slots[36], ItemStack::new(5, 1));
+    assert!(inventory.slots[5..=8].iter().all(ItemStack::is_empty));
+}

@@ -17,12 +17,16 @@ use crate::connection::write_packet;
 use crate::error::ConnectionError;
 
 #[cfg(test)]
-use super::block_edit_commit::apply_opaque_block_entity_to_storage_conditionally;
+use super::block_edit_commit::{
+    apply_block_edit_batch_to_storage_conditionally,
+    apply_opaque_block_entity_to_storage_conditionally,
+};
 use super::block_edit_commit::{
     finalize_visible_block_edit_outcome, send_loaded_block_edit_resyncs,
 };
 use super::block_placement::{
-    PlannedBlockPlacement, placed_sign_edit, placement_snapshot_positions, plan_block_placement,
+    PlannedBlockPlacement, adjacent_placement_target_is_replaceable, placed_sign_edit,
+    placement_snapshot_positions, plan_block_placement, same_slab_can_replace,
     sign_block_entity_persistent_nbt, sign_block_entity_update_nbt,
 };
 use super::bucket_interactions::{handle_bucket_use_on, handle_cauldron_bucket_use_on};
@@ -50,6 +54,10 @@ use super::{
     start_falling_blocks_after_edits, write_block_ack, write_block_resync_then_ack,
     write_inventory_slot_updates,
 };
+
+#[cfg(test)]
+#[path = "use_item_on_adapter_tests.rs"]
+mod tests;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UseItemOnOutcome {
@@ -80,6 +88,8 @@ struct UseItemOnTarget {
 #[derive(Debug, Clone, Copy)]
 struct BlockPlacementValidation {
     placed_state: mc_world::BlockStateId,
+    target_pos: mc_world::BlockPos,
+    target_state: mc_world::BlockStateId,
     clicked_state: mc_world::BlockStateId,
     clicked_token: mc_world::BlockMutationToken,
     target_token: mc_world::BlockMutationToken,
@@ -125,11 +135,17 @@ pub(super) async fn handle_use_item_on<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
+    let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
+        debug!(
+            slot = state.selected_hotbar_slot,
+            "UseItemOn ignored for invalid selected hotbar slot"
+        );
+        return Ok(());
+    };
     state.pending_use = None;
     clear_shield_use(state);
 
     let (clicked_x, clicked_y, clicked_z) = unpack_block_pos(action.position);
-    let held = state.inventory.held(state.selected_hotbar_slot);
     debug!(
         sequence = action.sequence,
         clicked_x,
@@ -713,6 +729,105 @@ fn loaded_block_snapshot(
     state.world_read.snapshot_chunks(&chunks)
 }
 
+#[cfg(test)]
+pub(super) fn placement_snapshot_for_test(
+    blocks: Arc<BlockRegistry>,
+    states: &[(mc_world::BlockPos, mc_world::BlockStateId)],
+) -> mc_world::WorldReadSnapshot {
+    let mut world = placement_test_world(blocks, states);
+    let chunks = states
+        .iter()
+        .map(|(pos, _)| ChunkPos {
+            x: pos.x.div_euclid(SECTION_DIM as i32),
+            z: pos.z.div_euclid(SECTION_DIM as i32),
+        })
+        .collect::<Vec<_>>();
+    if chunks.is_empty() {
+        let chunk = ChunkPos { x: 0, z: 0 };
+        world
+            .insert_generated_chunk(
+                chunk,
+                mc_world::Chunk::empty(
+                    chunk,
+                    mc_world::BlockStateId(0),
+                    Identifier::parse("minecraft:plains").unwrap(),
+                ),
+            )
+            .unwrap();
+    }
+    world.read_view().snapshot_chunks(&chunks)
+}
+
+#[cfg(test)]
+pub(super) fn conditional_placement_rejects_test_mutation(
+    blocks: Arc<BlockRegistry>,
+    initial_states: &[(mc_world::BlockPos, mc_world::BlockStateId)],
+    target: mc_world::BlockPos,
+    mutation: (mc_world::BlockPos, mc_world::BlockStateId),
+    plan: impl FnOnce(&mc_world::WorldReadSnapshot) -> Option<PlannedBlockPlacement>,
+) -> bool {
+    let mut world = placement_test_world(blocks, initial_states);
+    let chunk = ChunkPos {
+        x: target.x.div_euclid(SECTION_DIM as i32),
+        z: target.z.div_euclid(SECTION_DIM as i32),
+    };
+    let snapshot = world.read_view().snapshot_chunks(&[chunk]);
+    let Some(plan) = plan(&snapshot) else {
+        return false;
+    };
+    let Some(expected_state) = snapshot.get_cached_block(target) else {
+        return false;
+    };
+    let Some(expected_token) = snapshot.block_mutation_token(target) else {
+        return false;
+    };
+    let mut preconditions = vec![BlockEditPrecondition {
+        pos: target,
+        expected_state,
+        expected_token,
+    }];
+    preconditions.extend(plan.additional_preconditions);
+    if world.set_block_at(mutation.0, mutation.1).is_err() {
+        return false;
+    }
+
+    apply_block_edit_batch_to_storage_conditionally(&mut world, None, &plan.edits, &preconditions)
+        .is_none()
+        && world.get_cached_block(target) == Some(expected_state)
+}
+
+#[cfg(test)]
+fn placement_test_world(
+    blocks: Arc<BlockRegistry>,
+    states: &[(mc_world::BlockPos, mc_world::BlockStateId)],
+) -> mc_world::WorldStorage {
+    let mut world = mc_world::WorldStorage::in_memory(blocks);
+    let mut chunks = Vec::new();
+    for (pos, _) in states {
+        let chunk = ChunkPos {
+            x: pos.x.div_euclid(SECTION_DIM as i32),
+            z: pos.z.div_euclid(SECTION_DIM as i32),
+        };
+        if !chunks.contains(&chunk) {
+            chunks.push(chunk);
+            world
+                .insert_generated_chunk(
+                    chunk,
+                    mc_world::Chunk::empty(
+                        chunk,
+                        mc_world::BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
+    }
+    for (pos, state) in states {
+        world.set_block_at(*pos, *state).unwrap();
+    }
+    world
+}
+
 pub(super) fn plan_loaded_bonemeal_growth(
     state: &InteractionState,
     clicked_pos: mc_world::BlockPos,
@@ -770,10 +885,9 @@ pub(super) fn plan_loaded_bonemeal_growth(
 }
 
 /// M6.f/M23 follow-up: resolve the placed block via the player's currently-held
-/// hotbar slot through the item→block table. Drops the placement silently (still
-/// acking) if the held stack is empty, if the held item has no block mapping
-/// (e.g. food, tool), or if the target cell is non-air. On success decrements
-/// the held stack and emits `ContainerSetSlot` so the client sees the new count.
+/// hotbar slot through the item→block table. Same-type slabs may replace the
+/// clicked cell; other blocks place into the adjacent air cell. On success the
+/// simulation transaction commits all block edits before publishing its inventory debit.
 pub(super) async fn handle_block_item_placement<W>(
     state: &mut InteractionState,
     writer: &mut W,
@@ -792,7 +906,7 @@ where
     let (tx, ty, tz) = (cx + dx, cy + dy, cz + dz);
 
     let air = air_state_id(&state.blocks);
-    let target_pos = mc_world::BlockPos {
+    let adjacent_pos = mc_world::BlockPos {
         x: tx,
         y: ty,
         z: tz,
@@ -800,7 +914,9 @@ where
 
     // M6.f: resolve the placed block from the held item.
     let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot).clone();
+    let Some(held) = state.inventory.held(held_slot).cloned() else {
+        return Ok(());
+    };
     if held.is_empty() {
         debug!(
             sequence = action.sequence,
@@ -838,11 +954,10 @@ where
         return Ok(());
     }
 
-    // Validate: target cell must currently be air. Crop items also
-    // inspect the clicked block because seeds place the crop above
-    // their supporting soil instead of mapping item name to block name.
+    // Resolve the item and target from one snapshot. Vanilla slabs can replace the
+    // clicked cell; all other block items continue into the adjacent cell.
     let placement_result = 'placement: {
-        let snapshot = loaded_block_snapshot(state, &[clicked_pos, target_pos]);
+        let snapshot = loaded_block_snapshot(state, &[clicked_pos, adjacent_pos]);
         let Some(clicked) = snapshot.get_cached_block(clicked_pos) else {
             debug!(
                 x = cx,
@@ -855,29 +970,50 @@ where
         let Some(clicked_token) = snapshot.block_mutation_token(clicked_pos) else {
             break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
         };
-        let target_state = snapshot.get_cached_block(target_pos);
+        let Some(placed_state) = state.item_to_block.resolve_for_use_on(
+            &state.items,
+            held.item_id,
+            clicked,
+            action.direction,
+            &state.blocks,
+        ) else {
+            break 'placement Ok(None);
+        };
+        let target_pos = if same_slab_can_replace(
+            &state.blocks,
+            placed_state,
+            clicked,
+            action.direction,
+            action.cursor_y,
+        ) {
+            clicked_pos
+        } else {
+            adjacent_pos
+        };
+        let Some(target_state) = snapshot.get_cached_block(target_pos) else {
+            break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
+        };
         let Some(target_token) = snapshot.block_mutation_token(target_pos) else {
             break 'placement Err(UseItemOnNoOpReason::ClickedCellUnavailable);
         };
-        if target_state != Some(air) {
-            Ok(None)
-        } else {
-            Ok(state
-                .item_to_block
-                .resolve_for_use_on(
-                    &state.items,
-                    held.item_id,
-                    clicked,
-                    action.direction,
-                    &state.blocks,
-                )
-                .map(|placed_state| BlockPlacementValidation {
-                    placed_state,
-                    clicked_state: clicked,
-                    clicked_token,
-                    target_token,
-                }))
+        if target_pos != clicked_pos
+            && !adjacent_placement_target_is_replaceable(
+                &state.blocks,
+                placed_state,
+                target_state,
+                air,
+            )
+        {
+            break 'placement Ok(None);
         }
+        Ok(Some(BlockPlacementValidation {
+            placed_state,
+            target_pos,
+            target_state,
+            clicked_state: clicked,
+            clicked_token,
+            target_token,
+        }))
     };
     let placement = match placement_result {
         Ok(Some(placement)) => placement,
@@ -922,14 +1058,12 @@ where
         }
     };
     let placed_state = placement.placed_state;
+    let target_pos = placement.target_pos;
+    let (tx, ty, tz) = (target_pos.x, target_pos.y, target_pos.z);
 
     let Some(plan) = plan_place_block_edits(
         state,
-        mc_world::BlockPos {
-            x: tx,
-            y: ty,
-            z: tz,
-        },
+        target_pos,
         placed_state,
         player_pose,
         action.direction,
@@ -958,19 +1092,26 @@ where
     } = plan;
     let scheduled_block_ticks =
         placed_hopper_ticks(&state.blocks, &edits, state.sessions.simulation_tick());
-    let mut preconditions = vec![
-        BlockEditPrecondition {
-            pos: target_pos,
-            expected_state: air,
-            expected_token: placement.target_token,
-        },
-        BlockEditPrecondition {
+    let mut preconditions = vec![BlockEditPrecondition {
+        pos: target_pos,
+        expected_state: placement.target_state,
+        expected_token: placement.target_token,
+    }];
+    if clicked_pos != target_pos {
+        preconditions.push(BlockEditPrecondition {
             pos: clicked_pos,
             expected_state: placement.clicked_state,
             expected_token: placement.clicked_token,
-        },
-    ];
-    preconditions.extend(additional_preconditions);
+        });
+    }
+    for precondition in additional_preconditions {
+        if !preconditions
+            .iter()
+            .any(|existing| existing.pos == precondition.pos)
+        {
+            preconditions.push(precondition);
+        }
+    }
     let committed = match state
         .simulation
         .commit_survival_placement(SurvivalPlacementPlan {
@@ -1093,7 +1234,7 @@ where
 
 fn bucket_held_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)> {
     let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot);
+    let held = state.inventory.held(held_slot)?;
     if held.is_empty() {
         return None;
     }
@@ -1112,7 +1253,7 @@ fn bucket_held_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)>
 
 fn held_item_slot_resync(state: &InteractionState) -> Option<(i16, ItemStack)> {
     let held_slot = state.selected_hotbar_slot;
-    let held = state.inventory.held(held_slot);
+    let held = state.inventory.held(held_slot)?;
     (!held.is_empty()).then(|| {
         (
             (PlayerInventory::HOTBAR_BASE + held_slot as usize) as i16,
@@ -1310,12 +1451,12 @@ pub(super) fn consume_bonemeal_after_growth(
     if !grew {
         return None;
     }
-    let held = inventory.held_mut(held_slot);
+    let held = inventory.held_mut(held_slot)?;
     held.count = held.count.saturating_sub(1);
     if held.count <= 0 {
         *held = ItemStack::EMPTY;
     }
-    Some(inventory.held(held_slot).clone())
+    inventory.held(held_slot).cloned()
 }
 
 pub(super) async fn plan_place_block_edits(

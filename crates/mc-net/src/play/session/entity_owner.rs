@@ -153,9 +153,19 @@ impl SessionEntityOwners {
         owner_result(self.handle.reconfigure_lanes(lane_count.max(1)))
     }
 
-    #[cfg(test)]
-    pub(super) fn access_for_test(&self) -> EntityOwnerAccess {
-        self.access()
+    pub(super) fn advance_lifecycle_epoch(&self, lifecycle_epoch: u64) {
+        owner_result(self.handle.advance_lifecycle_epoch(lifecycle_epoch));
+    }
+
+    pub(super) fn restore_checkpoint_boundary(
+        &self,
+        lifecycle_epoch: u64,
+        sequence_watermark: u64,
+    ) {
+        owner_result(
+            self.handle
+                .restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark),
+        );
     }
 
     #[cfg(test)]
@@ -278,6 +288,15 @@ impl EntityOwnerAccess {
 
     pub(super) fn motion_state(&self, id: EntityId) -> Option<EntityMotionState> {
         self.snapshot(id).map(|snapshot| EntityMotionState {
+            arrow_revision: snapshot
+                .retained
+                .arrow_state
+                .map(|state| state.projectile.revision),
+            arrow_embedded_block: snapshot
+                .retained
+                .arrow_state
+                .filter(|state| state.in_ground)
+                .and_then(|state| state.last_block_position),
             id: snapshot.id,
             position: snapshot.position,
             rotation: snapshot.rotation,
@@ -310,63 +329,65 @@ impl EntityOwnerAccess {
         0
     }
 
-    #[cfg(test)]
     pub(super) fn spawn(&mut self, entity: SpawnEntity) -> EntityId {
-        self.spawn_authoritative(entity)
-    }
-
-    pub(super) fn spawn_authoritative(&mut self, entity: SpawnEntity) -> EntityId {
         #[cfg(test)]
         self.record_owner_request();
-        let id = owner_result(self.handle.spawn_authoritative(entity));
+        let id = owner_result(self.handle.spawn(entity));
         self.observation.record_entity_inserts(1);
         id
     }
 
-    pub(super) fn spawn_authoritative_deferred_journal(&mut self, entity: SpawnEntity) -> EntityId {
+    pub(super) fn spawn_deferred_journal(&mut self, entity: SpawnEntity) -> EntityId {
         #[cfg(test)]
         self.record_owner_request();
-        let id = owner_result(self.handle.spawn_authoritative_deferred_journal(entity));
+        let id = owner_result(self.handle.spawn_deferred_journal(entity));
         self.observation.record_entity_inserts(1);
         id
     }
 
-    pub(super) fn spawn_authoritative_batch(
+    pub(super) fn spawn_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntityId> {
-        #[cfg(test)]
-        self.record_owner_request();
-        let ids = owner_result(self.handle.spawn_authoritative_batch(entities));
-        self.observation.record_entity_inserts(ids.len());
-        ids
+        owner_result(self.try_spawn_batch(entities))
     }
 
-    pub(super) fn spawn_unique_authoritative_batch(
+    pub(super) fn try_spawn_batch(
+        &mut self,
+        entities: impl IntoIterator<Item = SpawnEntity>,
+    ) -> Result<Vec<EntityId>, mc_entity::RegionOwnerLaneError> {
+        #[cfg(test)]
+        self.record_owner_request();
+        let ids = self.handle.spawn_batch(entities)?;
+        self.observation.record_entity_inserts(ids.len());
+        Ok(ids)
+    }
+
+    pub(super) fn spawn_unique_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Vec<EntitySnapshot> {
-        owner_result(self.try_spawn_unique_authoritative_batch(entities))
+        owner_result(self.try_spawn_unique_batch(entities))
     }
 
-    pub(super) fn try_spawn_unique_authoritative_batch(
+    pub(super) fn try_spawn_unique_batch(
         &mut self,
         entities: impl IntoIterator<Item = SpawnEntity>,
     ) -> Result<Vec<EntitySnapshot>, mc_entity::RegionOwnerLaneError> {
         #[cfg(test)]
         self.record_owner_request();
-        let snapshots = self.handle.spawn_unique_authoritative_batch(entities)?;
+        let snapshots = self.handle.spawn_unique_batch(entities)?;
         self.observation.record_entity_inserts(snapshots.len());
         Ok(snapshots)
     }
 
-    pub(super) fn insert_authoritative_snapshots_batch(
+    pub(super) fn insert_snapshots_batch(
         &mut self,
         snapshots: impl IntoIterator<Item = EntitySnapshot>,
     ) -> bool {
         let snapshots = snapshots.into_iter().collect::<Vec<_>>();
         let expected = snapshots.len();
-        let inserted = owner_result(self.handle.insert_authoritative_snapshots_batch(snapshots));
+        let inserted = owner_result(self.handle.insert_snapshots_batch(snapshots));
         self.observation.record_entity_inserts(inserted);
         inserted == expected
     }
@@ -493,17 +514,26 @@ impl EntityOwnerAccess {
         applied
     }
 
-    pub(super) fn set_position(&mut self, id: EntityId, position: Vec3) -> bool {
-        let applied = owner_result(self.handle.set_position(id, position));
-        self.invalidate(id);
-        applied
-    }
-
-    pub(super) fn damage(&mut self, id: EntityId, amount: f32) -> Option<mc_entity::EntityDamage> {
-        let expected = self.snapshot(id)?;
-        let damage = owner_result(self.handle.damage_if_current(expected, amount));
+    pub(super) fn damage_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        request: EntityDamageRequest,
+    ) -> Option<mc_entity::EntityDamage> {
+        let id = expected.id;
+        let damage = owner_result(self.handle.damage_if_current(expected, request));
         self.invalidate(id);
         damage
+    }
+
+    pub(super) fn apply_effect_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        request: mc_entity::EntityEffectRequest,
+    ) -> mc_entity::EntityEffectResult {
+        let id = expected.id;
+        let result = owner_result(self.handle.apply_effect_if_current(expected, request));
+        self.invalidate(id);
+        result
     }
 
     pub(super) fn remove_if_current(&mut self, expected: EntitySnapshot) -> Option<EntitySnapshot> {
@@ -516,6 +546,37 @@ impl EntityOwnerAccess {
             self.invalidate(id);
         }
         removed
+    }
+
+    pub(super) fn replace_snapshot_if_current(
+        &mut self,
+        expected: EntitySnapshot,
+        next: EntitySnapshot,
+    ) -> bool {
+        let id = expected.id;
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.replace_snapshot_if_current(expected, next));
+        self.invalidate(id);
+        applied
+    }
+
+    pub(super) fn replace_snapshots_if_current(
+        &mut self,
+        snapshots: impl IntoIterator<Item = (EntitySnapshot, EntitySnapshot)>,
+    ) -> bool {
+        let snapshots = snapshots.into_iter().collect::<Vec<_>>();
+        let ids = snapshots
+            .iter()
+            .map(|(expected, _)| expected.id)
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        self.record_owner_request();
+        let applied = owner_result(self.handle.replace_snapshots_if_current(snapshots));
+        for id in ids {
+            self.invalidate(id);
+        }
+        applied
     }
 
     pub(super) fn apply_kinematics_authoritative(
@@ -681,23 +742,6 @@ impl EntityOwnerAccess {
             visitor(entity_snapshot_view(&snapshot));
         }
     }
-
-    #[cfg(test)]
-    pub(super) fn shadow_comparison_stats(&self) -> ShadowComparisonStats {
-        owner_result(self.handle.status()).shadow
-    }
-
-    #[cfg(test)]
-    pub(super) fn compare_shadow(
-        &mut self,
-        tick: u64,
-        stage: mc_entity::ShadowStage,
-    ) -> Result<mc_entity::ShadowComparison, Box<mc_entity::ShadowDivergence>> {
-        let comparison = owner_result(self.handle.compare_shadow(tick, stage));
-        self.observation
-            .publish_entities(&owner_result(self.handle.status()));
-        comparison
-    }
 }
 
 fn entity_snapshot_view(snapshot: &EntitySnapshot) -> mc_entity::EntityView<'_> {
@@ -719,5 +763,6 @@ fn entity_snapshot_view(snapshot: &EntitySnapshot) -> mc_entity::EntityView<'_> 
         goal: &snapshot.goal,
         vehicle: snapshot.vehicle,
         animal: snapshot.animal,
+        retained: snapshot.retained.clone(),
     }
 }

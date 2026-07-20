@@ -1374,4 +1374,5 @@ fn level_chunk_with_light_rejects_oversized_chunk_data_on_decode() {
 // ---- M5.a: serverbound interaction packets ----
 
 include!("tests/serverbound_and_slots.rs");
+include!("tests/serverbound_encoder_atomicity.rs");
 include!("tests/set_passengers.rs");

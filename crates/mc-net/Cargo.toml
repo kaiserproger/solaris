@@ -38,5 +38,6 @@ num-bigint = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-mc-entity = { path = "../mc-entity", features = ["shadow-compare"] }
+mc-entity = { path = "../mc-entity" }
+mc-script = { path = "../mc-script", features = ["lua-runtime"] }
 tempfile = "3"

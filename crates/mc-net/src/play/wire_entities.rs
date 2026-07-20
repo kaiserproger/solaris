@@ -1,5 +1,51 @@
 use super::*;
-use mc_protocol::packets::play::SetEntityMotion;
+use bytes::{Buf, BufMut};
+use mc_protocol::CodecError;
+use mc_protocol::codec::{ReadMc, WriteMc};
+use mc_protocol::packets::play::{
+    LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2, MoveEntityPos, SetEntityMotion,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(in crate::play) enum ServerEntityWireMove {
+    Position { delta: Vec3 },
+    Rotation,
+    PositionRotation { delta: Vec3 },
+    Absolute { position: Vec3 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct MoveEntityRot {
+    entity_id: i32,
+    yaw: u8,
+    pitch: u8,
+    on_ground: bool,
+}
+
+impl Packet for MoveEntityRot {
+    // `.analysis/protocol-dump.txt`: MOVE_ENTITY_ROT follows the inserted
+    // MOVE_MINECART_ALONG_TRACK packet at game-CB index 56 (wire id 0x38).
+    // 26.1.2 `ClientboundMoveEntityPacket$Rot` javap shows VarInt id, packed
+    // y/x rotation bytes, then onGround.
+    const ID: i32 = 0x38;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        buf.write_varint(self.entity_id);
+        buf.write_u8(self.yaw);
+        buf.write_u8(self.pitch);
+        buf.write_bool(self.on_ground);
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        Ok(Self {
+            entity_id: buf.read_varint()?,
+            yaw: buf.read_u8()?,
+            pitch: buf.read_u8()?,
+            on_ground: buf.read_bool()?,
+        })
+    }
+}
 
 fn wire_velocity(velocity: Vec3) -> EntityVec3 {
     EntityVec3 {
@@ -212,8 +258,68 @@ where
         compression,
     )
     .await?;
-    send_entity_data(writer, compression, entity).await?;
+    send_entity_pairing_data(writer, compression, entity).await?;
     send_entity_move(writer, compression, entity).await
+}
+
+pub(super) async fn send_entity_pairing_data<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut values = Vec::new();
+    if let Some(ref stack) = entity.item_stack {
+        values.push(EntityDataValue::ItemStack {
+            index: ITEM_ENTITY_DATA_ITEM_INDEX,
+            stack: ItemStack {
+                item_id: stack.item_id,
+                count: stack.count,
+                damage: stack.damage,
+                enchantments: stack.enchantments.clone(),
+                custom_name: None,
+            },
+        });
+    }
+    // `LivingEntity.DATA_HEALTH_ID` defaults to 1.0. Pairing only sends
+    // non-default synchronized data, but the value itself comes from ECS.
+    if let Some(health) = entity.health.filter(|health| *health != 1.0) {
+        values.push(EntityDataValue::Float {
+            index: LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
+            value: health,
+        });
+    }
+    if let Some(animal) = entity.animal {
+        if animal.is_baby() {
+            values.push(EntityDataValue::Boolean {
+                index: AGEABLE_ENTITY_DATA_BABY_INDEX,
+                value: true,
+            });
+        }
+        if entity.type_name == "minecraft:sheep"
+            && let Some(wool) = animal.sheep_wool
+            && wool.packed_metadata() != 0
+        {
+            values.push(EntityDataValue::Byte {
+                index: SHEEP_ENTITY_DATA_WOOL_INDEX,
+                value: wool.packed_metadata(),
+            });
+        }
+    }
+    if values.is_empty() {
+        return Ok(());
+    }
+    write_packet(
+        writer,
+        &ClientboundSetEntityData {
+            entity_id: entity.id.0,
+            values,
+        },
+        compression,
+    )
+    .await
 }
 
 pub(super) async fn send_entity_data<W>(
@@ -233,6 +339,7 @@ where
                 count: stack.count,
                 damage: stack.damage,
                 enchantments: stack.enchantments.clone(),
+                custom_name: None,
             },
         });
     }
@@ -262,6 +369,31 @@ where
     .await
 }
 
+pub(super) async fn send_entity_health<W>(
+    writer: &mut W,
+    compression: Compression,
+    entity: &ServerEntitySnapshot,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(health) = entity.health else {
+        return Ok(());
+    };
+    write_packet(
+        writer,
+        &ClientboundSetEntityData {
+            entity_id: entity.id.0,
+            values: vec![EntityDataValue::Float {
+                index: LIVING_ENTITY_DATA_HEALTH_INDEX_26_1_2,
+                value: health,
+            }],
+        },
+        compression,
+    )
+    .await
+}
+
 pub(super) async fn send_entity_move<W>(
     writer: &mut W,
     compression: Compression,
@@ -272,19 +404,19 @@ where
 {
     write_packet(
         writer,
-        &EntityPositionSync {
+        &SetEntityMotion {
             entity_id: entity.id.0,
-            values: entity_position(entity),
-            on_ground: entity.on_ground,
+            movement: wire_velocity(entity.velocity),
         },
         compression,
     )
     .await?;
     write_packet(
         writer,
-        &SetEntityMotion {
+        &EntityPositionSync {
             entity_id: entity.id.0,
-            movement: wire_velocity(entity.velocity),
+            values: entity_position(entity),
+            on_ground: entity.on_ground,
         },
         compression,
     )
@@ -309,38 +441,95 @@ pub(super) async fn send_entity_relative_move<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    debug_assert!(movement.send_position_rotation || movement.send_velocity);
-    if movement.send_position_rotation {
-        write_packet(
-            writer,
-            &MoveEntityPosRot {
-                entity_id: movement.id.0,
-                delta_x: MoveEntityPosRot::delta_to_short(movement.delta.x),
-                delta_y: MoveEntityPosRot::delta_to_short(movement.delta.y),
-                delta_z: MoveEntityPosRot::delta_to_short(movement.delta.z),
-                yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
-                pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
-                on_ground: movement.on_ground,
-            },
-            compression,
-        )
-        .await?;
-        write_packet(
-            writer,
-            &RotateHead {
-                entity_id: movement.id.0,
-                head_yaw: movement.rotation.head_yaw,
-            },
-            compression,
-        )
-        .await?;
-    }
+    debug_assert!(
+        movement.wire_move.is_some() || movement.send_velocity || movement.send_head_rotation
+    );
     if movement.send_velocity {
         write_packet(
             writer,
             &SetEntityMotion {
                 entity_id: movement.id.0,
                 movement: wire_velocity(movement.velocity),
+            },
+            compression,
+        )
+        .await?;
+    }
+
+    match movement.wire_move {
+        Some(ServerEntityWireMove::Position { delta }) => {
+            write_packet(
+                writer,
+                &MoveEntityPos {
+                    entity_id: movement.id.0,
+                    delta_x: MoveEntityPos::delta_to_short(delta.x),
+                    delta_y: MoveEntityPos::delta_to_short(delta.y),
+                    delta_z: MoveEntityPos::delta_to_short(delta.z),
+                    on_ground: movement.on_ground,
+                },
+                compression,
+            )
+            .await?;
+        }
+        Some(ServerEntityWireMove::Rotation) => {
+            write_packet(
+                writer,
+                &MoveEntityRot {
+                    entity_id: movement.id.0,
+                    yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
+                    pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
+                    on_ground: movement.on_ground,
+                },
+                compression,
+            )
+            .await?;
+        }
+        Some(ServerEntityWireMove::PositionRotation { delta }) => {
+            write_packet(
+                writer,
+                &MoveEntityPosRot {
+                    entity_id: movement.id.0,
+                    delta_x: MoveEntityPosRot::delta_to_short(delta.x),
+                    delta_y: MoveEntityPosRot::delta_to_short(delta.y),
+                    delta_z: MoveEntityPosRot::delta_to_short(delta.z),
+                    yaw: MoveEntityPosRot::pack_degrees(movement.rotation.yaw),
+                    pitch: MoveEntityPosRot::pack_degrees(movement.rotation.pitch),
+                    on_ground: movement.on_ground,
+                },
+                compression,
+            )
+            .await?;
+        }
+        Some(ServerEntityWireMove::Absolute { position }) => {
+            write_packet(
+                writer,
+                &EntityPositionSync {
+                    entity_id: movement.id.0,
+                    values: PositionMoveRotation {
+                        position: EntityVec3 {
+                            x: position.x,
+                            y: position.y,
+                            z: position.z,
+                        },
+                        delta_movement: wire_velocity(movement.velocity),
+                        yaw: movement.rotation.yaw,
+                        pitch: movement.rotation.pitch,
+                    },
+                    on_ground: movement.on_ground,
+                },
+                compression,
+            )
+            .await?;
+        }
+        None => {}
+    }
+
+    if movement.send_head_rotation {
+        write_packet(
+            writer,
+            &RotateHead {
+                entity_id: movement.id.0,
+                head_yaw: movement.rotation.head_yaw,
             },
             compression,
         )
@@ -441,6 +630,7 @@ mod tests {
             rotation: Rotation::ZERO,
             velocity: Vec3::ZERO,
             on_ground: true,
+            health: Some(8.0),
             item_stack: None,
             experience_value: None,
             block_state: None,

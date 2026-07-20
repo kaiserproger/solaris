@@ -1,7 +1,7 @@
 use super::inventory::PlayerInventory;
 use super::session::VisibilityDispatch;
 use super::{BlockEditBatchOutcome, BlockEditPrecondition};
-use mc_entity::{EntityId, Vec3};
+use mc_entity::Vec3;
 use mc_protocol::packets::play::{
     ClientboundExplode, EntityVec3, ExplosionBlockParticle, GameMode, ItemStack,
 };
@@ -421,13 +421,6 @@ pub(super) struct TntIgnitionPlan {
     pub(super) expected_held: ItemStack,
     pub(super) flint_and_steel_max_damage: i32,
     pub(super) tnt_entity_type_id: i32,
-}
-
-#[derive(Debug, Clone)]
-pub(super) struct PrimedTntFuse {
-    pub(super) entity_id: EntityId,
-    pub(super) expires_tick: u64,
-    pub(super) air: BlockStateId,
 }
 
 #[derive(Debug)]

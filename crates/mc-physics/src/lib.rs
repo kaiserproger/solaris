@@ -4,8 +4,7 @@
 //!
 //! Part of the Solaris engine.
 
-/// Crate version, exposed so other crates and the binary can report it.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod entity_collision_26_1_2;
 
 pub const TICK_SECONDS: f64 = 0.05;
 pub const GRAVITY_BLOCKS_PER_SECOND_SQUARED: f64 = 32.0;
@@ -307,6 +306,7 @@ pub trait BlockSampler {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GridPos {
     pub x: i32,
@@ -314,78 +314,12 @@ pub struct GridPos {
     pub z: i32,
 }
 
+#[cfg(test)]
 impl GridPos {
     #[must_use]
     pub const fn new(x: i32, y: i32, z: i32) -> Self {
         Self { x, y, z }
     }
-
-    #[must_use]
-    pub const fn below(self) -> Self {
-        Self::new(self.x, self.y - 1, self.z)
-    }
-
-    #[must_use]
-    pub const fn horizontal_neighbours(self) -> [Self; 4] {
-        [
-            Self::new(self.x + 1, self.y, self.z),
-            Self::new(self.x - 1, self.y, self.z),
-            Self::new(self.x, self.y, self.z + 1),
-            Self::new(self.x, self.y, self.z - 1),
-        ]
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BlockUpdateIntent {
-    Move { from: GridPos, to: GridPos },
-    SpreadFluid { from: GridPos, to: GridPos },
-}
-
-pub fn falling_block_intent<S: BlockSampler>(
-    pos: GridPos,
-    sampler: &S,
-) -> Option<BlockUpdateIntent> {
-    let below = pos.below();
-    matches!(
-        sampler.material_at(below.x, below.y, below.z),
-        BlockMaterial::Air | BlockMaterial::Water | BlockMaterial::Lava
-    )
-    .then_some(BlockUpdateIntent::Move {
-        from: pos,
-        to: below,
-    })
-}
-
-pub fn fluid_spread_intents<S: BlockSampler>(
-    pos: GridPos,
-    sampler: &S,
-    max_outputs: usize,
-) -> Vec<BlockUpdateIntent> {
-    if !sampler.material_at(pos.x, pos.y, pos.z).is_fluid() {
-        return Vec::new();
-    }
-    let mut intents = Vec::new();
-    let below = pos.below();
-    if sampler.material_at(below.x, below.y, below.z) == BlockMaterial::Air {
-        intents.push(BlockUpdateIntent::SpreadFluid {
-            from: pos,
-            to: below,
-        });
-        return intents;
-    }
-    for target in pos.horizontal_neighbours() {
-        if intents.len() >= max_outputs {
-            break;
-        }
-        if sampler.material_at(target.x, target.y, target.z) == BlockMaterial::Air {
-            intents.push(BlockUpdateIntent::SpreadFluid {
-                from: pos,
-                to: target,
-            });
-        }
-    }
-    intents
 }
 
 pub fn step_entity<S: BlockSampler>(
@@ -947,60 +881,12 @@ fn horizontal_distance_squared(delta: Vec3) -> f64 {
     delta.x * delta.x + delta.z * delta.z
 }
 
-pub fn ground_y_for_body<S: BlockSampler>(body: EntityBody, sampler: &S) -> Option<f64> {
-    let feet_y = body.position.y.floor() as i32;
-    let (min_x, max_x, min_z, max_z) = body_block_bounds(body);
-    let mut highest_top: Option<f64> = None;
-
-    for x in min_x..=max_x {
-        for y in [feet_y, feet_y - 1] {
-            for z in min_z..=max_z {
-                sampler.collision_boxes_at(x, y, z, &mut |collision_box| {
-                    if body_overlaps_box_horizontally(body, x, z, collision_box) {
-                        let top = f64::from(y) + collision_box.as_blocks()[4];
-                        highest_top = Some(highest_top.map_or(top, |current| current.max(top)));
-                    }
-                });
-            }
-        }
-    }
-
-    highest_top
-}
-
 fn body_overlaps_fluid<S: BlockSampler>(body: EntityBody, sampler: &S) -> bool {
     let min_y = body.position.y.floor() as i32;
     let max_y = (body.position.y + body.aabb.height).floor() as i32;
     bbox_columns(body)
         .into_iter()
         .any(|(x, z)| (min_y..=max_y).any(|y| sampler.material_at(x, y, z).is_fluid()))
-}
-
-fn body_block_bounds(body: EntityBody) -> (i32, i32, i32, i32) {
-    let half = body.aabb.half_width;
-    (
-        (body.position.x - half).floor() as i32,
-        (body.position.x + half - 1.0e-7).floor() as i32,
-        (body.position.z - half).floor() as i32,
-        (body.position.z + half - 1.0e-7).floor() as i32,
-    )
-}
-
-fn body_overlaps_box_horizontally(
-    body: EntityBody,
-    block_x: i32,
-    block_z: i32,
-    collision_box: BlockCollisionBox,
-) -> bool {
-    let [min_x, _, min_z, max_x, _, max_z] = collision_box.as_blocks();
-    let body_min_x = body.position.x - body.aabb.half_width;
-    let body_max_x = body.position.x + body.aabb.half_width;
-    let body_min_z = body.position.z - body.aabb.half_width;
-    let body_max_z = body.position.z + body.aabb.half_width;
-    body_min_x < f64::from(block_x) + max_x
-        && body_max_x > f64::from(block_x) + min_x
-        && body_min_z < f64::from(block_z) + max_z
-        && body_max_z > f64::from(block_z) + min_z
 }
 
 fn try_start_jump(
@@ -2049,46 +1935,6 @@ mod tests {
     }
 
     #[test]
-    fn falling_block_intent_moves_into_replaceable_cell() {
-        let world = LocalBlocks {
-            solids: vec![GridPos::new(0, 10, 0)],
-            fluids: Vec::new(),
-        };
-
-        let intent = falling_block_intent(GridPos::new(0, 10, 0), &world);
-
-        assert_eq!(
-            intent,
-            Some(BlockUpdateIntent::Move {
-                from: GridPos::new(0, 10, 0),
-                to: GridPos::new(0, 9, 0)
-            })
-        );
-    }
-
-    #[test]
-    fn falling_block_intent_distinguishes_support_from_replaceable_targets() {
-        let source = GridPos::new(0, 10, 0);
-        let supported = LocalBlocks {
-            solids: vec![source, source.below()],
-            fluids: Vec::new(),
-        };
-        assert_eq!(falling_block_intent(source, &supported), None);
-
-        let through_water = LocalBlocks {
-            solids: vec![source],
-            fluids: vec![source.below()],
-        };
-        assert_eq!(
-            falling_block_intent(source, &through_water),
-            Some(BlockUpdateIntent::Move {
-                from: source,
-                to: source.below()
-            })
-        );
-    }
-
-    #[test]
     fn long_fall_clamps_velocity_before_ground_impact() {
         let world = LocalBlocks {
             solids: Vec::new(),
@@ -2108,59 +1954,5 @@ mod tests {
         assert!(body.velocity.y >= TERMINAL_VELOCITY_BLOCKS_PER_SECOND);
         assert!(body.velocity.y < -10.0);
         assert!(!body.on_ground);
-    }
-
-    #[test]
-    fn non_fluid_blocks_do_not_emit_spread_intents() {
-        let world = LocalBlocks {
-            solids: vec![GridPos::new(0, 10, 0)],
-            fluids: Vec::new(),
-        };
-
-        assert!(fluid_spread_intents(GridPos::new(0, 10, 0), &world, 4).is_empty());
-    }
-
-    #[test]
-    fn fluid_prefers_downward_spread_before_horizontal() {
-        let world = LocalBlocks {
-            solids: Vec::new(),
-            fluids: vec![GridPos::new(0, 10, 0)],
-        };
-
-        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &world, 4);
-
-        assert_eq!(
-            intents,
-            vec![BlockUpdateIntent::SpreadFluid {
-                from: GridPos::new(0, 10, 0),
-                to: GridPos::new(0, 9, 0)
-            }]
-        );
-    }
-
-    #[test]
-    fn fluid_horizontal_spread_is_bounded_and_deterministic() {
-        let world = LocalBlocks {
-            solids: vec![GridPos::new(0, 9, 0)],
-            fluids: vec![GridPos::new(0, 10, 0)],
-        };
-
-        let intents = fluid_spread_intents(GridPos::new(0, 10, 0), &world, 2);
-
-        assert_eq!(intents.len(), 2);
-        assert_eq!(
-            intents[0],
-            BlockUpdateIntent::SpreadFluid {
-                from: GridPos::new(0, 10, 0),
-                to: GridPos::new(1, 10, 0)
-            }
-        );
-        assert_eq!(
-            intents[1],
-            BlockUpdateIntent::SpreadFluid {
-                from: GridPos::new(0, 10, 0),
-                to: GridPos::new(-1, 10, 0)
-            }
-        );
     }
 }

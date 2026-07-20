@@ -3,6 +3,7 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
     let data = embedded_play_data();
     let air_state = embedded_block_state(&data, "minecraft:air");
     let dirt_state = embedded_block_state(&data, "minecraft:dirt");
+    let stone_state = embedded_block_state(&data, "minecraft:stone");
     let crafting_table_state = embedded_block_state(&data, "minecraft:crafting_table");
     let dirt_id = embedded_item_id(&data, "minecraft:dirt");
     let crafting_table_id = embedded_item_id(&data, "minecraft:crafting_table");
@@ -12,18 +13,35 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
     let mut world = embedded_disk_world(&data, world_dir.path());
     let support_y = top_non_air_y(&mut world, 0, 0, air_state).expect("spawn column terrain");
     let placed_y = support_y + 1;
-    let table_support_y =
-        top_non_air_y(&mut world, 1, 0, air_state).expect("crafting table support terrain");
+    let table_support_y = support_y;
     let table_y = table_support_y + 1;
+    for (x, y) in [(2, support_y), (3, table_support_y)] {
+        world
+            .set_block_at(mc_world::BlockPos { x, y, z: 2 }, stone_state)
+            .expect("seed stable placement support")
+            .expect("replace generated support");
+        for clear_y in y + 1..=y + 3 {
+            world
+                .set_block_at(mc_world::BlockPos {
+                    x,
+                    y: clear_y,
+                    z: 2,
+                }, air_state)
+                .expect("clear placement headroom")
+                .expect("replace placement headroom");
+        }
+    }
     let shutdown = mc_net::ShutdownHandle::default();
     let mut cfg = embedded_playable_config(&data, world, "P2 embedded persistence");
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
-    let (mut client, _) = connect_to_play(addr, "P2Persist").await;
+    let (mut client, sync) = connect_to_play(addr, "P2Persist").await;
+    assert_eq!(sync.y.floor() as i32 - 2, support_y, "spawn terrain");
     wait_for_inventory_content(&mut client, |pkt| pkt.container_id == 0).await;
+    drain_until_chunk(&mut client, (0, 0)).await;
     client
         .write_packet(&ServerboundChatCommand {
             command: "debug give minecraft:dirt 4 0".into(),
@@ -34,7 +52,7 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
+            position: pack_block_pos(2, support_y, 2),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -45,7 +63,7 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
         })
         .await
         .expect("place dirt");
-    wait_for_block_update(&mut client, (0, placed_y, 0), dirt_state.0 as i32).await;
+    wait_for_block_update(&mut client, (2, placed_y, 2), dirt_state.0 as i32).await;
     wait_for_slot_stack(&mut client, dirt_id, 3).await;
 
     client
@@ -69,7 +87,7 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(1, table_support_y, 0),
+            position: pack_block_pos(3, table_support_y, 2),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -82,14 +100,14 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
         .expect("place crafting table for close settlement");
     wait_for_block_update(
         &mut client,
-        (1, table_y, 0),
+        (3, table_y, 2),
         crafting_table_state.0 as i32,
     )
     .await;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(1, table_y, 0),
+            position: pack_block_pos(3, table_y, 2),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -179,9 +197,9 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
         .with_item_registry(Arc::clone(&data.items));
     let landed = reopened
         .get_block(mc_world::BlockPos {
-            x: 0,
+            x: 2,
             y: placed_y,
-            z: 0,
+            z: 2,
         })
         .expect("read placed block")
         .expect("placed block present");
@@ -196,7 +214,7 @@ async fn embedded_save_restart_rejoin_preserves_inventory_and_edited_block() {
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("rebind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
     let (mut client, _) = connect_to_play(addr, "P2Persist").await;
     let restored = wait_for_inventory_content(&mut client, |pkt| {
@@ -279,7 +297,7 @@ async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory(
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
     let (mut client, sync) = connect_to_play(addr, "P2NoOpPersist").await;
     drain_until_chunk(&mut client, (0, 0)).await;
@@ -358,7 +376,7 @@ async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory(
     cfg.shutdown = shutdown.clone();
     let bound = mc_net::bind(cfg).await.expect("rebind");
     let addr = bound.local_addr().expect("local_addr");
-    let serve = tokio::spawn(async move { bound.serve().await });
+    let serve = tokio::spawn(async move { bound.serve_and_save().await });
 
     let (mut client, _) = connect_to_play(addr, "P2NoOpPersist").await;
     let restored = wait_for_inventory_content(&mut client, |pkt| {
@@ -379,4 +397,3 @@ async fn embedded_non_op_shutdown_restart_preserves_survival_edit_and_inventory(
         .expect("second non-op server join")
         .expect("second non-op server serve");
 }
-

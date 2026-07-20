@@ -294,6 +294,7 @@ pub(in crate::play) fn plan_bucket_replacement(
         count: 1,
         damage: None,
         enchantments: Vec::new(),
+        custom_name: None,
     };
     if held.count <= 1 {
         *held = replacement;

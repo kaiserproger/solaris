@@ -1,12 +1,13 @@
 use std::time::Instant;
 
-use mc_protocol::packets::play::{ENTITY_DATA_POSE_INDEX, EntityDataValue, EntityPose, GameMode};
+use mc_protocol::packets::play::{EntityDataValue, GameMode};
 use tracing::warn;
 
 use crate::play::persistence::SpawnState;
 use crate::play::simulation::{PlayerStateEvent, SimulationAuthority, SimulationRequestError};
 
 use super::outbound::{OutboundCommand, VisibilityDispatch};
+use super::sleep::SleepWakeReason;
 use super::visibility::{session_recipients, visibility_dispatches, visible_observers_locked};
 use super::{SessionId, SessionRegistry};
 
@@ -38,7 +39,7 @@ impl SessionRegistry {
             wait_started,
             guard,
         );
-        let mut woke_spectator = false;
+        let mut staged_spectator_wake = None;
         match event {
             PlayerStateEvent::SelectedHotbarSlot(slot) if slot <= 8 => {
                 player_state.selected_hotbar_slot = slot;
@@ -58,32 +59,31 @@ impl SessionRegistry {
                 return Err(SimulationRequestError::InvalidCommand);
             }
             PlayerStateEvent::GameMode(game_mode) => {
+                let previous = player_state.game_mode;
                 player_state.game_mode = game_mode;
                 if game_mode == GameMode::Spectator {
-                    inner.spectator_sessions.insert(id);
-                    woke_spectator = inner.sleeping_sessions.remove(&id).is_some();
+                    staged_spectator_wake = self.stage_sleep_wake_locked(
+                        &mut inner,
+                        id,
+                        SleepWakeReason::Spectator { previous },
+                    );
+                    if staged_spectator_wake.is_none() {
+                        inner.spectator_sessions.insert(id);
+                    }
                 } else {
                     inner.spectator_sessions.remove(&id);
                 }
             }
         }
         drop(player_state);
-        let transition = matches!(event, PlayerStateEvent::GameMode(_))
-            .then(|| self.resolve_sleep_transition_locked(&mut inner))
-            .flatten();
+        let transition = (matches!(event, PlayerStateEvent::GameMode(_))
+            && staged_spectator_wake.is_none())
+        .then(|| self.resolve_sleep_transition_locked(&mut inner))
+        .flatten();
         drop(inner);
 
-        let mut dispatches = if woke_spectator {
-            self.broadcast_player_entity_data_including_self(
-                id,
-                vec![EntityDataValue::Pose {
-                    index: ENTITY_DATA_POSE_INDEX,
-                    pose: EntityPose::Standing,
-                }],
-            )
-        } else {
-            Vec::new()
-        };
+        let mut dispatches =
+            self.completed_sleep_dispatches(staged_spectator_wake.into_iter().collect(), None);
         dispatches.extend(self.sleep_transition_dispatches(transition));
         Ok(dispatches)
     }

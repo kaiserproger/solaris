@@ -54,7 +54,7 @@ async fn break_block_round_trips_update_ack_relight() {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -79,16 +79,15 @@ async fn break_block_round_trips_update_ack_relight() {
 
     // Spawn burst.
     let _ = client.read_play_login().await.expect("play entry");
-    let _: mc_protocol::packets::play::ClientboundCommands = client.read_typed().await.expect("Commands");
+    let _: mc_protocol::packets::play::ClientboundCommands =
+        client.read_typed().await.expect("Commands");
     let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
     let _: mc_protocol::packets::play::ClientboundInitializeBorder =
         client.read_typed().await.expect("InitializeBorder");
     let _: mc_protocol::packets::play::ClientboundSetTime =
         client.read_typed().await.expect("SetTime");
-    let _: mc_protocol::packets::play::SetDefaultSpawnPosition = client
-        .read_typed()
-        .await
-        .expect("SetDefaultSpawnPosition");
+    let _: mc_protocol::packets::play::SetDefaultSpawnPosition =
+        client.read_typed().await.expect("SetDefaultSpawnPosition");
     let event: GameEvent = client.read_typed().await.expect("GameEvent");
     assert_eq!(event.event, GameEvent::EVENT_START_WAITING_FOR_CHUNKS);
     let _: SetCenterChunk = client.read_typed().await.expect("SetCenterChunk");
@@ -273,7 +272,7 @@ async fn break_block_broadcasts_update_to_second_subscriber() {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -441,7 +440,7 @@ async fn early_survival_stop_completes_after_server_progress_reaches_one() {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -458,7 +457,10 @@ async fn early_survival_stop_completes_after_server_progress_reaches_one() {
     drain_until_chunk(&mut client, (0, 0)).await;
 
     let target_y = sync.y.floor() as i32 - 2;
-    assert_eq!(target_y, seeded_y, "spawn should expose seeded stone target");
+    assert_eq!(
+        target_y, seeded_y,
+        "spawn should expose seeded stone target"
+    );
     let target_pos = pack_block_pos(0, target_y, 0);
     client
         .write_packet(&ServerboundPlayerAction {
@@ -565,9 +567,10 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
         .expect("stone item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
         motd: "Prompt 02 stale block break".into(),
@@ -663,13 +666,8 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
         })
         .await
         .expect("stop stale survival break");
-    wait_for_stale_break_ack_and_resync(
-        &mut miner,
-        303,
-        (0, target_y, 0),
-        dirt_state.0 as i32,
-    )
-    .await;
+    wait_for_stale_break_ack_and_resync(&mut miner, 303, (0, target_y, 0), dirt_state.0 as i32)
+        .await;
 
     let final_state = world
         .lock()
@@ -794,13 +792,8 @@ async fn stale_survival_break_cannot_break_peer_replacement() {
         })
         .await
         .expect("stop ABA survival break");
-    wait_for_stale_break_ack_and_resync(
-        &mut miner,
-        311,
-        (0, target_y, 0),
-        stone_state.0 as i32,
-    )
-    .await;
+    wait_for_stale_break_ack_and_resync(&mut miner, 311, (0, target_y, 0), stone_state.0 as i32)
+        .await;
     assert_eq!(
         world
             .lock()
@@ -850,11 +843,7 @@ async fn wait_for_block_state_and_ack(
     }
 }
 
-async fn wait_for_block_state(
-    client: &mut Client,
-    target: (i32, i32, i32),
-    expected_state: i32,
-) {
+async fn wait_for_block_state(client: &mut Client, target: (i32, i32, i32), expected_state: i32) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         let frame = client
@@ -968,8 +957,7 @@ async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
-    let seeded_y =
-        top_non_air_y(&mut storage, 6, 0, air_state).expect("loaded column has terrain");
+    let seeded_y = top_non_air_y(&mut storage, 6, 0, air_state).expect("loaded column has terrain");
     storage
         .set_block_at(
             mc_world::BlockPos {
@@ -999,7 +987,7 @@ async fn out_of_reach_survival_and_creative_breaks_resync_target_before_ack() {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -1193,7 +1181,7 @@ async fn far_out_of_reach_survival_break_does_not_load_target_before_ack() {
         items: std::sync::Arc::new(mc_data::items::ItemRegistry::default()),
         item_facts: std::sync::Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: std::sync::Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),

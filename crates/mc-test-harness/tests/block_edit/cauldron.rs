@@ -25,11 +25,8 @@ async fn survival_water_bucket_fills_and_drains_cauldron_with_persistence() {
         .block(&mc_data::Identifier::parse("minecraft:cauldron").unwrap())
         .map(|block| block.default)
         .expect("cauldron in registry");
-    let water_cauldron_state_id = cauldron_state(
-        &blocks,
-        "minecraft:water_cauldron",
-        &[("level", "3")],
-    );
+    let water_cauldron_state_id =
+        cauldron_state(&blocks, "minecraft:water_cauldron", &[("level", "3")]);
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let temp = tempfile::tempdir().expect("create cauldron test world");
     std::fs::create_dir_all(temp.path().join("region")).expect("create region dir");
@@ -74,7 +71,7 @@ async fn survival_water_bucket_fills_and_drains_cauldron_with_persistence() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -239,11 +236,8 @@ fn cauldron_states_survive_disk_flush_and_reopen() {
         .block(&mc_data::Identifier::parse("minecraft:cauldron").unwrap())
         .map(|block| block.default)
         .expect("cauldron in registry");
-    let water_cauldron_state_id = cauldron_state(
-        &blocks,
-        "minecraft:water_cauldron",
-        &[("level", "3")],
-    );
+    let water_cauldron_state_id =
+        cauldron_state(&blocks, "minecraft:water_cauldron", &[("level", "3")]);
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let temp = tempfile::tempdir().expect("create cauldron persistence world");
     std::fs::create_dir_all(temp.path().join("region")).expect("create region dir");
@@ -265,12 +259,9 @@ fn cauldron_states_survive_disk_flush_and_reopen() {
     assert!(storage.flush_dirty().expect("flush water cauldron") >= 1);
     drop(storage);
 
-    let mut reopened = mc_world::WorldStorage::open_with_capacity(
-        temp.path(),
-        Arc::clone(&blocks),
-        128,
-    )
-    .expect("reopen water cauldron world");
+    let mut reopened =
+        mc_world::WorldStorage::open_with_capacity(temp.path(), Arc::clone(&blocks), 128)
+            .expect("reopen water cauldron world");
     assert_eq!(
         reopened
             .get_block(cauldron_pos)
@@ -284,12 +275,9 @@ fn cauldron_states_survive_disk_flush_and_reopen() {
     assert!(reopened.flush_dirty().expect("flush empty cauldron") >= 1);
     drop(reopened);
 
-    let mut reopened_empty = mc_world::WorldStorage::open_with_capacity(
-        temp.path(),
-        Arc::clone(&blocks),
-        128,
-    )
-    .expect("reopen empty cauldron world");
+    let mut reopened_empty =
+        mc_world::WorldStorage::open_with_capacity(temp.path(), Arc::clone(&blocks), 128)
+            .expect("reopen empty cauldron world");
     assert_eq!(
         reopened_empty
             .get_block(cauldron_pos)
@@ -379,7 +367,10 @@ async fn flush_and_expect_cached_block(
 ) {
     let mut storage = world.lock().await;
     let flushed = storage.flush_dirty().expect("flush cauldron world");
-    assert!(flushed >= 1, "cauldron edit should dirty at least one chunk");
+    assert!(
+        flushed >= 1,
+        "cauldron edit should dirty at least one chunk"
+    );
     assert_eq!(
         storage.get_block(pos).expect("read flushed cauldron"),
         Some(expected_state)

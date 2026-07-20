@@ -1,6 +1,7 @@
 use super::*;
 use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
-use mc_world::chunk::{MAX_Y, MIN_Y};
+use mc_data::worldgen_structures::StructureSetFacts;
+use mc_world::chunk::{MAX_Y, MIN_Y, OVERWORLD_GEOMETRY};
 use std::collections::BTreeMap;
 
 pub(in crate::terrain) fn tiny_registry() -> Arc<BlockRegistry> {
@@ -397,6 +398,19 @@ pub(in crate::terrain) fn tiny_registry() -> Arc<BlockRegistry> {
     Arc::new(BlockRegistry::from_report(&report).unwrap())
 }
 
+fn dense_plains_village_rules(templates: Vec<StructureTemplate>) -> StructureRules {
+    StructureRules::plains_village_markers(templates).with_structure_set_facts(&[
+        StructureSetFacts {
+            id: Identifier::parse("minecraft:test_villages").unwrap(),
+            structures: vec![Identifier::parse("minecraft:village_plains").unwrap()],
+            placement_type: None,
+            spacing: Some(1),
+            separation: Some(0),
+            salt: None,
+        },
+    ])
+}
+
 fn registry_without_block(missing: &str) -> Arc<BlockRegistry> {
     use mc_data::blocks::{BlockReport, BlockStateReport};
     let names = [
@@ -547,21 +561,6 @@ fn try_with_rules_allows_missing_optional_blocks_when_required_resources_exist()
     assert_eq!(generator.deepslate, generator.stone);
     assert_eq!(generator.water, generator.air);
     assert_eq!(generator.decorations.oak_log, None);
-    assert!(generator.decorations.flower_patch.is_empty());
-}
-
-#[test]
-fn tellus_mercator_projection_round_trips_and_clamps_latitude() {
-    let projection = MercatorProjection::from_settings(TellusWorldgenSettings::default());
-    assert!((projection.blocks_per_degree() - 3710.649722222222).abs() < 0.0001);
-    let (x, z) = projection.lat_lon_to_block(45.0, -73.5);
-    let (lat, lon) = projection.block_to_lat_lon(x, z);
-    assert!((lat - 45.0).abs() < 0.000_001);
-    assert!((lon + 73.5).abs() < 0.000_001);
-    let north = projection.lat_lon_to_block(120.0, 0.0).1;
-    let max_north = projection.lat_lon_to_block(MAX_MERCATOR_LATITUDE, 0.0).1;
-    assert!((north - max_north).abs() < 0.000_001);
-    assert!(projection.lat_lon_to_block(45.0, 0.0).1 < 0.0);
 }
 
 #[test]
@@ -607,7 +606,6 @@ fn tellus_like_latitude_and_altitude_drive_climate() {
 #[test]
 fn tellus_like_biomes_use_projected_climate_bands() {
     let settings = TellusWorldgenSettings::default();
-    let projection = MercatorProjection::from_settings(settings);
     let g = TerrainGenerator::with_worldgen_mode(
         77,
         tiny_registry(),
@@ -615,8 +613,7 @@ fn tellus_like_biomes_use_projected_climate_bands() {
     );
     let sea = settings.sea_level;
     let equator_biome = g.biome_for(0, 0, sea + 24);
-    let (_, arctic_z) = projection.lat_lon_to_block(78.0, 0.0);
-    let arctic_z = arctic_z.round() as i32;
+    let arctic_z = -10_000_000;
     let arctic_biome = (-4096..=4096)
         .step_by(256)
         .map(|x| g.biome_for(x, arctic_z, sea + 24))
@@ -834,6 +831,175 @@ fn generated_chunk_handles_geometry_above_vanilla_surface_band() {
         Some(generator.bedrock)
     );
     assert!(generator.surface_height(8, 8) >= geometry.min_y());
+}
+
+#[test]
+fn chunk_geometry_typed_boundary_rejects_invalid_vertical_ranges() {
+    assert_eq!(mc_world::ChunkGeometry::new(0, 0), None);
+    assert_eq!(mc_world::ChunkGeometry::new(1, 16), None);
+    assert_eq!(mc_world::ChunkGeometry::new(0, 15), None);
+    assert_eq!(mc_world::ChunkGeometry::new(0, 512), None);
+    assert_eq!(mc_world::ChunkGeometry::new(i32::MAX - 15, 16), None);
+}
+
+#[test]
+fn generated_chunks_respect_short_and_tall_geometry_boundaries() {
+    for geometry in [
+        mc_world::ChunkGeometry::new(-16, 16).expect("one section"),
+        mc_world::ChunkGeometry::new(-128, 496).expect("maximum section-aligned height"),
+    ] {
+        let generator = TerrainGenerator::new(42, tiny_registry()).with_geometry(geometry);
+        let chunk = generator.generate(ChunkPos { x: 0, z: 0 });
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(chunk.sections.len(), geometry.section_count());
+        assert_eq!(
+            chunk.get_block(8, geometry.min_y(), 8),
+            Some(generator.bedrock)
+        );
+        assert_eq!(chunk.get_block(8, geometry.min_y() - 1, 8), None);
+        assert_eq!(chunk.get_block(8, geometry.max_y(), 8), None);
+        assert!(
+            chunk.heightmaps["WORLD_SURFACE"].get(8, 8)
+                <= u32::try_from(geometry.height()).unwrap()
+        );
+    }
+}
+
+#[test]
+fn generated_chunks_handle_extreme_valid_geometry_without_y_overflow() {
+    for (geometry, sea_level) in [
+        (
+            mc_world::ChunkGeometry::new(i32::MIN, 16).expect("lowest aligned section"),
+            i32::MIN,
+        ),
+        (
+            mc_world::ChunkGeometry::new(i32::MAX - 31, 16).expect("highest aligned section"),
+            i32::MAX,
+        ),
+    ] {
+        let settings = TellusWorldgenSettings {
+            sea_level,
+            ..TellusWorldgenSettings::default()
+        };
+        let generator = TerrainGenerator::with_worldgen_mode(
+            42,
+            tiny_registry(),
+            WorldgenMode::TellusLike(settings),
+        )
+        .with_geometry(geometry);
+
+        let chunk = generator.generate(ChunkPos { x: 0, z: 0 });
+
+        assert_eq!(chunk.geometry(), geometry);
+        assert_eq!(chunk.sections.len(), 1);
+        assert_eq!(
+            chunk.get_block(8, geometry.min_y(), 8),
+            Some(generator.bedrock)
+        );
+        if let Some(below) = geometry.min_y().checked_sub(1) {
+            assert_eq!(chunk.get_block(8, below, 8), None);
+        }
+        assert_eq!(chunk.get_block(8, geometry.max_y(), 8), None);
+    }
+}
+
+fn generated_block_fingerprint(generator: &TerrainGenerator, positions: &[ChunkPos]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for &pos in positions {
+        let chunk = generator.generate(pos);
+        for value in [
+            pos.x,
+            pos.z,
+            chunk.geometry().min_y(),
+            chunk.geometry().max_y(),
+        ] {
+            for byte in value.to_le_bytes() {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+            }
+        }
+        for y in chunk.geometry().min_y()..chunk.geometry().max_y() {
+            for z in 0..16u8 {
+                for x in 0..16u8 {
+                    let state = chunk.get_block(x, y, z).expect("Y is inside geometry");
+                    for byte in state.0.to_le_bytes() {
+                        hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+                    }
+                }
+            }
+        }
+    }
+    hash
+}
+
+fn generated_serialized_fingerprint(
+    generator: &TerrainGenerator,
+    registry: &BlockRegistry,
+    items: &mc_data::items::ItemRegistry,
+    positions: &[ChunkPos],
+) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut hash_bytes = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    };
+    for &pos in positions {
+        let chunk = generator.generate(pos);
+        let payload =
+            mc_world::anvil::chunk_to_payload_with_items(&chunk, registry, Some(items), 0)
+                .expect("generated chunk serializes");
+        hash_bytes(&[payload.local_x, payload.local_z]);
+        hash_bytes(&payload.uncompressed_nbt);
+        for word in chunk.highest_opaque.to_long_array() {
+            hash_bytes(&word.to_le_bytes());
+        }
+    }
+    hash
+}
+
+#[test]
+fn explicit_overworld_geometry_preserves_deterministic_serialized_chunk_output() {
+    let positions = [
+        ChunkPos { x: 0, z: 0 },
+        ChunkPos { x: 4, z: 0 },
+        ChunkPos { x: 5, z: -3 },
+    ];
+    let registry = Arc::new(
+        BlockRegistry::from_report(&mc_data::blocks::solaris_required_blocks_report())
+            .expect("embedded block registry"),
+    );
+    let items = mc_data::items::solaris_required_items();
+    let structures = StructureRules::solaris_playable_ruin(registry.as_ref(), &items)
+        .expect("playable ruin resolves embedded data");
+    let default =
+        TerrainGenerator::new(0, Arc::clone(&registry)).with_structures(structures.clone());
+    let explicit = TerrainGenerator::new(0, Arc::clone(&registry))
+        .with_geometry(OVERWORLD_GEOMETRY)
+        .with_structures(structures);
+    let default_fingerprint =
+        generated_serialized_fingerprint(&default, registry.as_ref(), &items, &positions);
+
+    assert!(!default.generate(ChunkPos { x: 4, z: 0 }).chests.is_empty());
+
+    assert_eq!(
+        generated_serialized_fingerprint(&explicit, registry.as_ref(), &items, &positions),
+        default_fingerprint
+    );
+    assert_eq!(default_fingerprint, 10_011_881_106_522_725_119);
+}
+
+#[test]
+fn custom_geometry_generation_is_deterministic_for_the_same_seed() {
+    let geometry = mc_world::ChunkGeometry::new(0, 32).expect("two sections");
+    let positions = [ChunkPos { x: -2, z: 3 }, ChunkPos { x: 7, z: -5 }];
+    let first = TerrainGenerator::new(99, tiny_registry()).with_geometry(geometry);
+    let second = TerrainGenerator::new(99, tiny_registry()).with_geometry(geometry);
+
+    assert_eq!(
+        generated_block_fingerprint(&first, &positions),
+        generated_block_fingerprint(&second, &positions)
+    );
 }
 
 #[test]
@@ -1411,22 +1577,6 @@ fn biome_surface_rules_are_visibly_distinct() {
 }
 
 #[test]
-fn generation_stage_order_is_explicit() {
-    assert_eq!(
-        GENERATION_STAGE_ORDER,
-        &[
-            "base_terrain_and_surfaces",
-            "caves_and_ores",
-            "biome_assignment",
-            "surface_decorations",
-            "structures",
-            "heightmap_refresh",
-            "persistence_or_streaming",
-        ]
-    );
-}
-
-#[test]
 fn surface_decorations_are_visible_and_refresh_heightmaps() {
     let g = TerrainGenerator::new(42, tiny_registry());
     let decorations = [
@@ -1476,106 +1626,6 @@ fn surface_decorations_are_visible_and_refresh_heightmaps() {
 }
 
 #[test]
-fn feature_facts_drive_grass_decoration_block() {
-    let registry = tiny_registry();
-    let poppy = Identifier::parse("minecraft:poppy").unwrap();
-    let features = vec![WorldgenFeatureFacts {
-        placed_feature: Identifier::parse("minecraft:patch_grass_plain").unwrap(),
-        configured_feature: Identifier::parse("minecraft:test_patch_grass").unwrap(),
-        configured_type: Identifier::parse("minecraft:simple_block").unwrap(),
-        placement: mc_data::worldgen_features::FeaturePlacementFacts {
-            count: Some(FeatureCount::Constant(32)),
-            has_biome_filter: true,
-            ..Default::default()
-        },
-        block_states: vec![poppy],
-        tags: vec![],
-    }];
-    let g = TerrainGenerator::new(42, registry).with_feature_facts(&features);
-    let grass = BlockStateId(4);
-    let data_fed_plant = BlockStateId(30);
-
-    for cx in -16..=16 {
-        for cz in -16..=16 {
-            let chunk = g.generate(ChunkPos { x: cx, z: cz });
-            for lx in 0..16u8 {
-                for lz in 0..16u8 {
-                    let wx = cx * 16 + lx as i32;
-                    let wz = cz * 16 + lz as i32;
-                    let height = g.surface_height(wx, wz);
-                    let biome = g.biome_for(wx, wz, height);
-                    if !(g.biomes.grassland.contains(&biome)
-                        || g.biomes.temperate_forest.contains(&biome))
-                        || chunk.get_block(lx, height, lz) != Some(grass)
-                    {
-                        continue;
-                    }
-                    let h = feature_hash(g.seed, wx, height, wz, 0xDEC0_0001);
-                    if h.is_multiple_of(8)
-                        && !h.is_multiple_of(97)
-                        && !h.is_multiple_of(37)
-                        && !h.is_multiple_of(41)
-                    {
-                        assert_eq!(chunk.get_block(lx, height + 1, lz), Some(data_fed_plant));
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    panic!("sampled chunks should contain a grass decoration from feature facts");
-}
-
-#[test]
-fn feature_facts_drive_tree_blocks() {
-    let registry = tiny_registry();
-    let features = vec![WorldgenFeatureFacts {
-        placed_feature: Identifier::parse("minecraft:trees_flower_forest").unwrap(),
-        configured_feature: Identifier::parse("minecraft:test_tree").unwrap(),
-        configured_type: Identifier::parse("minecraft:tree").unwrap(),
-        placement: mc_data::worldgen_features::FeaturePlacementFacts::default(),
-        block_states: vec![
-            Identifier::parse("minecraft:birch_log").unwrap(),
-            Identifier::parse("minecraft:birch_leaves").unwrap(),
-        ],
-        tags: vec![],
-    }];
-    let g = TerrainGenerator::new(42, registry).with_feature_facts(&features);
-    let expected_log = BlockStateId(38);
-    let expected_leaves = BlockStateId(39);
-
-    for cx in -16..=16 {
-        for cz in -16..=16 {
-            let chunk = g.generate(ChunkPos { x: cx, z: cz });
-            for lx in 2..=13u8 {
-                for lz in 2..=13u8 {
-                    let wx = cx * 16 + lx as i32;
-                    let wz = cz * 16 + lz as i32;
-                    let height = g.surface_height(wx, wz);
-                    let biome = g.biome_for(wx, wz, height);
-                    if !g.biomes.temperate_forest.contains(&biome) {
-                        continue;
-                    }
-                    let h = feature_hash(g.seed, wx, height, wz, 0xDEC0_0001);
-                    if h.is_multiple_of(83)
-                        && chunk.get_block(lx, height + 1, lz) == Some(expected_log)
-                    {
-                        assert_eq!(
-                            chunk.get_block(lx + 1, height + 4, lz),
-                            Some(expected_leaves)
-                        );
-                        return;
-                    }
-                }
-            }
-        }
-    }
-
-    panic!("sampled chunks should contain a data-fed forest tree");
-}
-
-#[test]
 fn generated_overlays_survive_flush_and_reopen() {
     let registry = tiny_registry();
     let marker = BlockStateId(25);
@@ -1586,8 +1636,7 @@ fn generated_overlays_survive_flush_and_reopen() {
             state: marker,
         }],
     );
-    let structures =
-        StructureRules::plains_village_markers(vec![template]).with_spacing_for_tests(1, 0);
+    let structures = dense_plains_village_rules(vec![template]);
     let generator =
         Arc::new(TerrainGenerator::new(42, Arc::clone(&registry)).with_structures(structures));
     let mut structure_target = None;
@@ -1799,8 +1848,7 @@ fn structure_rules_paste_intersecting_template_blocks() {
             state: marker,
         }],
     );
-    let structures =
-        StructureRules::single_plains_village_marker(template).with_spacing_for_tests(1, 0);
+    let structures = dense_plains_village_rules(vec![template]);
     let g = TerrainGenerator::new(42, tiny_registry()).with_structures(structures);
 
     let mut target = None;
@@ -1830,6 +1878,88 @@ fn structure_rules_paste_intersecting_template_blocks() {
         chunk.heightmaps["WORLD_SURFACE"].get(lx, lz),
         (y + 1 - MIN_Y) as u32
     );
+}
+
+#[test]
+fn structure_paste_clips_blocks_and_chests_to_chunk_geometry() {
+    let geometry = mc_world::ChunkGeometry::new(0, 16).expect("one section");
+    let marker = BlockStateId(25);
+    let positions = [[0, -2, 0], [0, -1, 0], [0, 14, 0], [0, 15, 0]];
+    let template = StructureTemplate::new(
+        [1, 18, 1],
+        positions
+            .into_iter()
+            .map(|pos| crate::structures::TemplateBlock { pos, state: marker })
+            .collect(),
+    )
+    .with_chests(
+        positions
+            .into_iter()
+            .map(|pos| crate::structures::TemplateChest {
+                pos,
+                chest: mc_world::ChestBlockEntity::default(),
+            })
+            .collect(),
+    );
+    let mut chunk = Chunk::empty_with_geometry(
+        ChunkPos { x: 0, z: 0 },
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+        geometry,
+    );
+    let mut touched = [false; 256];
+
+    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched);
+
+    assert_eq!(chunk.get_block(0, geometry.min_y(), 0), Some(marker));
+    assert_eq!(chunk.get_block(0, geometry.max_y() - 1, 0), Some(marker));
+    assert_eq!(chunk.chests.len(), 2);
+    assert!(
+        chunk
+            .chests
+            .contains_key(&mc_world::BlockPos { x: 0, y: 0, z: 0 })
+    );
+    assert!(
+        chunk
+            .chests
+            .contains_key(&mc_world::BlockPos { x: 0, y: 15, z: 0 })
+    );
+    assert!(touched[0]);
+}
+
+#[test]
+fn structure_paste_ignores_overflowing_vertical_offsets() {
+    let geometry = mc_world::ChunkGeometry::new(0, 16).expect("one section");
+    let marker = BlockStateId(25);
+    let positions = [[0, i32::MAX, 0], [0, i32::MIN, 0]];
+    let template = StructureTemplate::new(
+        [1, 1, 1],
+        positions
+            .into_iter()
+            .map(|pos| crate::structures::TemplateBlock { pos, state: marker })
+            .collect(),
+    )
+    .with_chests(
+        positions
+            .into_iter()
+            .map(|pos| crate::structures::TemplateChest {
+                pos,
+                chest: mc_world::ChestBlockEntity::default(),
+            })
+            .collect(),
+    );
+    let mut chunk = Chunk::empty_with_geometry(
+        ChunkPos { x: 0, z: 0 },
+        BlockStateId(0),
+        Identifier::parse("minecraft:plains").unwrap(),
+        geometry,
+    );
+    let mut touched = [false; 256];
+
+    paste_template(&mut chunk, &template, 0, 1, 0, &mut touched);
+
+    assert!(chunk.chests.is_empty());
+    assert!(!touched.into_iter().any(|column| column));
 }
 
 fn find_ore_cell(
@@ -1992,9 +2122,15 @@ fn data_fed_ore_rules_reach_generation() {
             64,
         ),
     ];
-    let ores = OreRules::from_features(registry.as_ref(), &biomes, &features, Some(&biome_data))
-        .expect("sidecar ore features should fit the admission budget")
-        .expect("sidecar ore features should become rules");
+    let ores = OreRules::from_features(
+        registry.as_ref(),
+        &biomes,
+        &features,
+        Some(&biome_data),
+        OVERWORLD_GEOMETRY,
+    )
+    .expect("sidecar ore features should fit the admission budget")
+    .expect("sidecar ore features should become rules");
     let g = TerrainGenerator::with_rules(42, registry, biomes, ores);
 
     for (y, biome, stone_ore, deepslate_ore) in [

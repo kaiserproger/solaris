@@ -193,13 +193,13 @@ fn single_dye_ingredient_color(ingredient: &Ingredient) -> Option<mc_entity::She
 #[test]
 fn session_registry_stores_server_entities_in_physical_regions() {
     let registry = SessionRegistry::new();
-    let mut entities = registry.entities.access_for_test();
-    let west_id = entities.spawn_authoritative(mc_entity::SpawnEntity::new(
+    let mut entities = registry.lock_entities("test entity access");
+    let west_id = entities.spawn(mc_entity::SpawnEntity::new(
         4,
         "minecraft:cow",
         Vec3::new(-0.5, 64.0, 0.5),
     ));
-    let east_id = entities.spawn_authoritative(mc_entity::SpawnEntity::new(
+    let east_id = entities.spawn(mc_entity::SpawnEntity::new(
         4,
         "minecraft:cow",
         Vec3::new(128.5, 64.0, 0.5),
@@ -210,9 +210,16 @@ fn session_registry_stores_server_entities_in_physical_regions() {
     assert_eq!(entities.region_len(mc_entity::RegionKey::new(-1, 0)), 1);
     assert_eq!(entities.region_len(mc_entity::RegionKey::new(1, 0)), 1);
 
-    assert!(entities.set_position(west_id, Vec3::new(129.5, 64.0, 0.5)));
-    assert!(entities.set_position(west_id, Vec3::new(-1.5, 64.0, 0.5)));
-    assert!(entities.set_position(west_id, Vec3::new(130.5, 64.0, 0.5)));
+    for position in [
+        Vec3::new(129.5, 64.0, 0.5),
+        Vec3::new(-1.5, 64.0, 0.5),
+        Vec3::new(130.5, 64.0, 0.5),
+    ] {
+        let expected = entities.snapshot(west_id).expect("west entity snapshot");
+        let mut next = expected.clone();
+        next.position = position;
+        assert!(entities.replace_snapshot_if_current(expected, next));
+    }
     assert_eq!(entities.region_len(mc_entity::RegionKey::new(-1, 0)), 0);
     assert_eq!(entities.region_len(mc_entity::RegionKey::new(1, 0)), 2);
 }
@@ -358,15 +365,21 @@ fn passive_mob_breeding_plan_pairs_each_parent_once() {
 #[test]
 fn passive_mob_grazing_plan_emits_dense_timer_update_without_mutating_input() {
     let sheep_id = EntityId(7);
-    let stale_id = EntityId(8);
+    let mut store = mc_entity::EntityStore::new();
+    let mut spawned = SpawnEntity::new(4, "minecraft:sheep", Vec3::new(4.75, 63.0, -1.25));
+    spawned.animal = Some(mc_entity::AnimalBreedingState::adult_sheep(
+        mc_entity::SheepColor::White,
+    ));
+    let actual_id = store.spawn(spawned);
+    let mut expected = store.snapshot(actual_id).expect("sheep snapshot");
+    expected.id = sheep_id;
+    expected.retained.sheep_grazing_ticks = Some(5);
     let sheep = [GrazingSheep {
-        entity_id: sheep_id,
-        position: Vec3::new(4.75, 63.0, -1.25),
+        expected: expected.clone(),
         is_baby: false,
     }];
-    let timers = HashMap::from([(sheep_id, 5), (stale_id, 12)]);
 
-    let advance = advance_sheep_grazing(99, &sheep, &timers);
+    let advance = advance_sheep_grazing(99, &sheep);
 
     assert!(advance.plan.starts.is_empty());
     assert_eq!(advance.plan.actions.len(), 1);
@@ -378,15 +391,11 @@ fn passive_mob_grazing_plan_emits_dense_timer_update_without_mutating_input() {
     assert_eq!(
         advance.timer_updates,
         [passive_mobs::SheepGrazingTimerUpdate {
-            entity_id: sheep_id,
+            expected,
             remaining: Some(4),
         }]
     );
-    assert_eq!(
-        timers.len(),
-        2,
-        "pure planning must not mutate authority timers"
-    );
+    assert_eq!(sheep[0].expected.retained.sheep_grazing_ticks, Some(5));
 }
 
 #[test]
@@ -588,7 +597,7 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
     );
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby(),));
     }
     commits.store(0, Ordering::Relaxed);
@@ -608,7 +617,8 @@ fn animal_age_countdown_waits_for_entity_save_barrier() {
 #[test]
 fn entity_save_owner_barrier_does_not_hold_session_registry() {
     let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -636,7 +646,7 @@ fn entity_save_owner_barrier_does_not_hold_session_registry() {
         session_available,
         "regional save barrier must not retain session state"
     );
-    assert_eq!(records.len(), 1);
+    assert_eq!(records.records.len(), 1);
 }
 
 #[test]
@@ -657,7 +667,7 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
     );
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby()));
     }
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
@@ -717,7 +727,8 @@ fn breeding_plan_does_not_hold_session_or_entity_locks() {
 fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
     let registry = Arc::new(SessionRegistry::new());
     for x in [0.5, 1.5] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             "minecraft:cow".to_owned(),
             Vec3::new(x, 64.0, 0.5),
@@ -737,7 +748,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
         sheep_wool: None,
     };
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(parent_ids[0], ready));
         assert!(entities.set_animal_state(parent_ids[1], ready));
     }
@@ -762,7 +773,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
 
     let newer_parent_state = mc_entity::AnimalBreedingState::adult();
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(parent_ids[0], newer_parent_state));
     }
     resume_tx.send(()).expect("release breeding plan");
@@ -770,7 +781,7 @@ fn breeding_rejects_the_whole_plan_when_a_parent_changes_after_snapshot() {
 
     assert_eq!(births, 0);
     assert!(dispatches.is_empty());
-    let entities = registry.entities.access_for_test();
+    let entities = registry.lock_entities("test entity access");
     assert_eq!(entities.len(), 2, "stale plan must not spawn a child");
     assert_eq!(
         entities
@@ -795,7 +806,8 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
     assert!(registry.mark_loaded(observer, (7, 0)).is_empty());
     assert!(registry.mark_loaded(observer, (8, 0)).is_empty());
     for x in [127.5, 128.5] {
-        let dispatches = registry.spawn_command_entity_legacy_for_test(
+        let dispatches = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             "minecraft:cow".to_owned(),
             Vec3::new(x, 64.0, 0.5),
@@ -816,7 +828,7 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
         sheep_wool: None,
     };
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(parent_ids[0], ready));
         assert!(entities.set_animal_state(parent_ids[1], ready));
     }
@@ -870,14 +882,15 @@ fn breeding_commits_and_publishes_once_across_a_region_boundary() {
 #[test]
 fn breeding_commit_releases_both_locks_before_session_publication() {
     let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         assert!(entities.set_animal_state(entity_id, mc_entity::AnimalBreedingState::baby()));
     }
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
@@ -918,7 +931,8 @@ fn sheep_grazing_plan_does_not_hold_session_and_entity_locks_together() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "GrazingPlanLocksAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:sheep".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -953,7 +967,8 @@ fn sheep_grazing_plan_does_not_hold_session_and_entity_locks_together() {
 #[test]
 fn sheep_grazing_start_releases_both_locks_before_session_publication() {
     let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:sheep".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -999,7 +1014,8 @@ fn sheep_grazing_start_releases_both_locks_before_session_publication() {
 #[test]
 fn sheep_grazing_owner_validation_does_not_hold_session_registry() {
     let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:sheep".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -1041,7 +1057,8 @@ fn sheep_grazing_owner_validation_does_not_hold_session_registry() {
 fn sheep_grazing_start_uses_constant_owner_requests() {
     let registry = SessionRegistry::new();
     for x in [0.5, 1.5] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             "minecraft:sheep".to_owned(),
             Vec3::new(x, 64.0, 0.5),
@@ -1070,17 +1087,15 @@ fn sheep_grazing_start_uses_constant_owner_requests() {
 #[test]
 fn sheep_grazing_finish_releases_both_locks_before_session_publication() {
     let registry = Arc::new(SessionRegistry::new());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:sheep".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     assert!(registry.set_sheep_sheared_for_test(entity_id, true));
-    registry
-        .lock_inner("seed grazing finish timer")
-        .sheep_grazing_ticks
-        .insert(entity_id, SHEEP_GRAZING_ACTION_TICK);
+    assert!(registry.set_sheep_grazing_ticks_for_test(entity_id, Some(SHEEP_GRAZING_ACTION_TICK),));
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     *registry
@@ -1126,7 +1141,8 @@ fn sheep_grazing_finish_releases_both_locks_before_session_publication() {
 fn sheep_grazing_finish_uses_constant_owner_requests() {
     let registry = SessionRegistry::new();
     for x in [0.5, 1.5] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             "minecraft:sheep".to_owned(),
             Vec3::new(x, 64.0, 0.5),
@@ -1140,15 +1156,11 @@ fn sheep_grazing_finish_uses_constant_owner_requests() {
     for entity_id in &entity_ids {
         assert!(registry.set_sheep_sheared_for_test(*entity_id, true));
     }
-    registry
-        .lock_inner("seed grazing finish timers")
-        .sheep_grazing_ticks
-        .extend(
-            entity_ids
-                .iter()
-                .copied()
-                .map(|entity_id| (entity_id, SHEEP_GRAZING_ACTION_TICK)),
+    for entity_id in &entity_ids {
+        assert!(
+            registry.set_sheep_grazing_ticks_for_test(*entity_id, Some(SHEEP_GRAZING_ACTION_TICK),)
         );
+    }
     registry.entities.reset_owner_requests_for_test();
 
     let (ate, _) = registry.finish_sheep_grazing(&SimulationAuthority::for_test(), &entity_ids);
@@ -1174,7 +1186,8 @@ fn sheep_grazing_plan_only_visits_loaded_sheep() {
         ("minecraft:sheep", 160.5),
         ("minecraft:cow", 1.5),
     ] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             4,
             entity_type.to_owned(),
             Vec3::new(x, 64.0, 0.5),
@@ -1195,7 +1208,8 @@ fn off_phase_hostile_is_not_materialized_as_attack_candidate() {
     let registry = SessionRegistry::new();
     let player = register_test_session(&registry, "OffPhaseHostileAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -1222,7 +1236,8 @@ fn hostile_scan_only_visits_entities_in_loaded_chunks() {
     let player = register_test_session(&registry, "HostileScanIndexAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
     for x in [0.5, 160.5, 320.5] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(x, 64.0, 1.5),
@@ -1243,7 +1258,8 @@ fn hostile_candidate_scan_does_not_hold_session_registry() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "HostileScanAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -1302,7 +1318,8 @@ fn hostile_commit_releases_both_locks_before_arrow_publication() {
     );
     let player = register_test_session(&registry, "HostileCommitAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:skeleton".to_owned(),
         Vec3::new(0.5, 64.0, 6.5),
@@ -1360,20 +1377,23 @@ fn skeleton_volley_uses_constant_owner_requests() {
     );
     let player = register_test_session(&registry, "SkeletonVolleyAlice");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:skeleton".to_owned(),
         Vec3::new(0.5, 64.0, 6.5),
     );
     let first_id = registry.persisted_entity_records()[0].snapshot.id;
     for filler in 1..SKELETON_SHOT_PERIOD_TICKS {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:cow".to_owned(),
             Vec3::new(160.5 + filler as f64, 64.0, 0.5),
         );
     }
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:skeleton".to_owned(),
         Vec3::new(2.5, 64.0, 6.5),
@@ -1389,7 +1409,7 @@ fn skeleton_volley_uses_constant_owner_requests() {
     let (attacks, _) = registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick);
 
     assert_eq!(attacks, 2);
-    assert_eq!(registry.entities.owner_requests_for_test(), 4);
+    assert_eq!(registry.entities.owner_requests_for_test(), 5);
 }
 
 #[test]
@@ -1618,20 +1638,30 @@ fn multiplayer_sleep_quorum_skips_once_and_disconnect_recomputes_waiters() {
             OutboundCommand::WorldTime { world_time: 48_000 }
         )
     }));
+    let alice_bed = registry
+        .sleeping_bed(alice)
+        .expect("quorum completion keeps bed authority until release");
     assert!(disconnect_dispatches.iter().any(|dispatch| {
         matches!(
             &dispatch.command,
-            OutboundCommand::PlayerEntityData { entity_id, values }
-                if *entity_id == i32::try_from(alice).unwrap()
-                    && values.iter().any(|value| matches!(
-                        value,
-                        EntityDataValue::Pose {
-                            pose: EntityPose::Standing,
-                            ..
-                        }
-                    ))
+            OutboundCommand::WakeFromBed { bed } if *bed == alice_bed
         )
     }));
+    let token = registry
+        .claim_sleep_wake(alice, alice_bed)
+        .expect("wake command stages an exact release token");
+    let released = registry
+        .complete_sleep_wake(token)
+        .expect("confirmed bed release completes wake");
+    assert!(released.dispatches.iter().any(|dispatch| matches!(
+        &dispatch.command,
+        OutboundCommand::PlayerEntityData { entity_id, values }
+            if *entity_id == i32::try_from(alice).unwrap()
+                && values.iter().any(|value| matches!(
+                    value,
+                    EntityDataValue::Pose { pose: EntityPose::Standing, .. }
+                ))
+    )));
 
     let _charlie = register_test_session(&registry, "SleepCharlie");
     registry.set_world_time(60_542);
@@ -1684,16 +1714,27 @@ fn multiplayer_sleep_uses_vanilla_percentage_spectators_and_deep_sleep_delay() {
         dispatch.command,
         OutboundCommand::WorldTime { world_time: 24_000 }
     )));
-    assert!(dispatches.iter().any(|dispatch| matches!(
+    assert!(
+        dispatches
+            .iter()
+            .any(|dispatch| matches!(dispatch.command, OutboundCommand::WakeFromBed { .. }))
+    );
+    let bed = registry
+        .sleeping_bed(alice)
+        .expect("sleep completion keeps bed authority until release");
+    let token = registry
+        .claim_sleep_wake(alice, bed)
+        .expect("wake command stages an exact release token");
+    let released = registry
+        .complete_sleep_wake(token)
+        .expect("confirmed bed release completes wake");
+    assert!(released.dispatches.iter().any(|dispatch| matches!(
         &dispatch.command,
         OutboundCommand::PlayerEntityData { entity_id, values }
             if *entity_id == i32::try_from(alice).unwrap()
                 && values.iter().any(|value| matches!(
                     value,
-                    EntityDataValue::Pose {
-                        pose: EntityPose::Standing,
-                        ..
-                    }
+                    EntityDataValue::Pose { pose: EntityPose::Standing, .. }
                 ))
     )));
 }
@@ -1713,16 +1754,26 @@ fn natural_dawn_pushes_sleeping_player_back_to_standing() {
 
     assert_eq!(registry.world_time(), 24_000);
     assert_eq!(registry.sleeping_session_count_for_test(), 0);
+    let bed = registry
+        .sleeping_bed(alice)
+        .expect("natural dawn keeps bed authority until release");
     assert!(dispatches.iter().any(|dispatch| matches!(
+        dispatch.command,
+        OutboundCommand::WakeFromBed { bed: wake_bed } if wake_bed == bed
+    )));
+    let token = registry
+        .claim_sleep_wake(alice, bed)
+        .expect("dawn wake stages an exact release token");
+    let released = registry
+        .complete_sleep_wake(token)
+        .expect("confirmed dawn bed release completes wake");
+    assert!(released.dispatches.iter().any(|dispatch| matches!(
         &dispatch.command,
         OutboundCommand::PlayerEntityData { entity_id, values }
             if *entity_id == i32::try_from(alice).unwrap()
                 && values.iter().any(|value| matches!(
                     value,
-                    EntityDataValue::Pose {
-                        pose: EntityPose::Standing,
-                        ..
-                    }
+                    EntityDataValue::Pose { pose: EntityPose::Standing, .. }
                 ))
     )));
 }
@@ -2198,6 +2249,14 @@ fn publish_single_entity_spawn(
     }
 }
 
+fn server_entity_health(registry: &SessionRegistry, entity_id: EntityId) -> f32 {
+    registry
+        .lock_entities("read authoritative entity health")
+        .snapshot(entity_id)
+        .expect("entity remains authoritative")
+        .health
+}
+
 fn profile(name: &str) -> LoggedInProfile {
     LoggedInProfile {
         uuid: crate::login::offline_uuid(name),
@@ -2631,7 +2690,8 @@ fn hostile_forgets_target_when_last_player_unregisters() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "TargetAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(4.5, 64.0, 0.5),
@@ -2640,7 +2700,7 @@ fn hostile_forgets_target_when_last_player_unregisters() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
     assert_eq!(queries.len(), 1);
     {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         let entity = entities.snapshots().next().expect("spawned hostile");
         assert!(matches!(entity.goal, GoalState::FollowPosition { .. }));
     }
@@ -2652,7 +2712,7 @@ fn hostile_forgets_target_when_last_player_unregisters() {
             .is_empty()
     );
 
-    let entities = registry.entities.access_for_test();
+    let entities = registry.lock_entities("test entity access");
     let entity = entities.snapshots().next().expect("spawned hostile");
     assert!(matches!(entity.goal, GoalState::Wander { .. }));
 }
@@ -2707,7 +2767,8 @@ fn melee_hostile_stops_without_rewriting_unchanged_idle_goal() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "CloseTargetAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -2720,7 +2781,7 @@ fn melee_hostile_stops_without_rewriting_unchanged_idle_goal() {
     assert_eq!(registry.entities.owner_requests_for_test(), 3);
     assert_eq!(queries[0].velocity.x, 0.0);
     assert_eq!(queries[0].velocity.z, 0.0);
-    let entities = registry.entities.access_for_test();
+    let entities = registry.lock_entities("test entity access");
     let entity = entities.snapshots().next().expect("spawned hostile");
     assert_eq!(entity.goal, GoalState::Idle);
 }
@@ -2734,7 +2795,8 @@ fn entity_tick_checkpoints_transient_motion_without_per_tick_journal() {
     );
     let alice = register_test_session(&registry, "EntityTickJournalAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -2780,7 +2842,8 @@ fn living_physics_rotation_follows_collision_resolved_velocity() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         4,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -2788,7 +2851,7 @@ fn living_physics_rotation_follows_collision_resolved_velocity() {
     dispatch_visibility_commands(spawn_dispatches);
     assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
     let cow_id = registry.persisted_entity_records()[0].id;
-    assert!(registry.entities.access_for_test().set_goal(
+    assert!(registry.lock_entities("test entity access").set_goal(
         cow_id,
         GoalState::FollowPosition {
             target: Vec3::new(0.5, 64.0, 10.5),
@@ -2833,7 +2896,8 @@ fn hostile_target_refresh_waits_for_entity_save_barrier() {
     );
     let alice = register_test_session(&registry, "HostileTargetJournalAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(4.5, 64.0, 0.5),
@@ -2843,7 +2907,7 @@ fn hostile_target_refresh_waits_for_entity_save_barrier() {
     let queries = registry.tick_entities_and_collect_physics_queries(1);
 
     assert_eq!(queries.len(), 1);
-    let entities = registry.entities.access_for_test();
+    let entities = registry.lock_entities("test entity access");
     let zombie = entities.snapshots().next().expect("spawned zombie");
     assert!(matches!(zombie.goal, GoalState::FollowPosition { .. }));
     assert_eq!(
@@ -2882,17 +2946,20 @@ fn unloaded_entities_do_not_run_goal_ticks() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "ActiveChunkAlice");
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(8.5, 64.0, 0.5),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(160.5, 64.0, 0.5),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(320.5, 64.0, 0.5),
@@ -2909,7 +2976,7 @@ fn unloaded_entities_do_not_run_goal_ticks() {
         "initial active selection should visit only entities indexed in loaded chunks"
     );
     assert_ne!(queries[0].velocity, Vec3::ZERO);
-    let entities = registry.entities.access_for_test();
+    let entities = registry.lock_entities("test entity access");
     let far = entities
         .snapshots()
         .find(|entity| entity.position.x > 100.0)
@@ -3320,7 +3387,8 @@ fn entity_tick_detours_around_published_two_block_wall() {
         PlayerPose::new(4.5, 64.0, 0.5),
     );
     registry.mark_loaded(player, (0, 0));
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(1.75, 64.0, 0.5),
@@ -3380,7 +3448,8 @@ fn entity_tick_detours_around_published_two_block_wall() {
 #[test]
 fn climb_jump_collision_does_not_start_wall_detour() {
     let registry = SessionRegistry::new();
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -3406,7 +3475,8 @@ fn entity_goal_pathing_compute_releases_store_and_rejects_stale_motion() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "GoalComputeTarget");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(4.5, 64.0, 0.5),
@@ -3430,8 +3500,7 @@ fn entity_goal_pathing_compute_releases_store_and_rejects_stale_motion() {
     let store_was_available = registry.entities.owner_responsive_for_test();
     assert!(
         registry
-            .entities
-            .access_for_test()
+            .lock_entities("test entity access")
             .set_velocity(entity_id, newer_velocity)
     );
     resume_tx.send(()).expect("resume entity goal compute");
@@ -3453,7 +3522,8 @@ fn stale_entity_goal_apply_rechecks_current_simulation_membership() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "GoalMembershipTarget");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(4.5, 64.0, 0.5),
@@ -3462,7 +3532,7 @@ fn stale_entity_goal_apply_rechecks_current_simulation_membership() {
         OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
         command => panic!("expected entity spawn, got {command:?}"),
     };
-    assert!(registry.entities.access_for_test().set_goal(
+    assert!(registry.lock_entities("test entity access").set_goal(
         entity_id,
         GoalState::FollowPosition {
             target: Vec3::new(10.5, 64.0, 0.5),
@@ -3480,22 +3550,20 @@ fn stale_entity_goal_apply_rechecks_current_simulation_membership() {
         .recv_timeout(Duration::from_secs(1))
         .expect("entity goal compute boundary");
 
+    let mut entities = registry.lock_entities("move stale goal entity");
+    let expected = entities.snapshot(entity_id).expect("goal entity snapshot");
+    let mut moved = expected.clone();
+    moved.position = Vec3::new(512.5, 64.0, 0.5);
+    assert!(entities.replace_snapshot_if_current(expected, moved));
+    drop(entities);
     assert!(
         registry
-            .entities
-            .access_for_test()
-            .set_position(entity_id, Vec3::new(512.5, 64.0, 0.5))
-    );
-    assert!(
-        registry
-            .entities
-            .access_for_test()
+            .lock_entities("test entity access")
             .set_velocity(entity_id, Vec3::new(0.125, 0.0, 0.0))
     );
     assert!(
         registry
-            .entities
-            .access_for_test()
+            .lock_entities("test entity access")
             .set_goal(entity_id, GoalState::Idle,)
     );
     resume_tx.send(()).expect("resume entity goal compute");
@@ -3512,7 +3580,8 @@ fn goal_projection_rechecks_grazing_entity_outside_goal_cas() {
     let registry = Arc::new(SessionRegistry::new());
     let player = register_test_session(&registry, "GrazingProjectionTarget");
     assert!(registry.mark_loaded(player, (0, 0)).is_empty());
-    let cow_spawn = registry.spawn_command_entity_legacy_for_test(
+    let cow_spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(4.5, 64.0, 0.5),
@@ -3521,14 +3590,15 @@ fn goal_projection_rechecks_grazing_entity_outside_goal_cas() {
         OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
         command => panic!("expected cow spawn, got {command:?}"),
     };
-    assert!(registry.entities.access_for_test().set_goal(
+    assert!(registry.lock_entities("test entity access").set_goal(
         cow_id,
         GoalState::FollowPosition {
             target: Vec3::new(10.5, 64.0, 0.5),
             speed: 0.2,
         },
     ));
-    let sheep_spawn = registry.spawn_command_entity_legacy_for_test(
+    let sheep_spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:sheep".to_owned(),
         Vec3::new(6.5, 64.0, 0.5),
@@ -3537,10 +3607,9 @@ fn goal_projection_rechecks_grazing_entity_outside_goal_cas() {
         OutboundCommand::SpawnEntity(snapshot) => snapshot.id,
         command => panic!("expected sheep spawn, got {command:?}"),
     };
-    registry
-        .lock_inner("seed grazing projection test")
-        .sheep_grazing_ticks
-        .insert(sheep_id, SHEEP_GRAZING_ANIMATION_TICKS);
+    assert!(
+        registry.set_sheep_grazing_ticks_for_test(sheep_id, Some(SHEEP_GRAZING_ANIMATION_TICKS),)
+    );
     let (reached_tx, reached_rx) = std::sync::mpsc::channel();
     let (resume_tx, resume_rx) = std::sync::mpsc::channel();
     registry.install_entity_goal_compute_probe(reached_tx, resume_rx);
@@ -3551,12 +3620,14 @@ fn goal_projection_rechecks_grazing_entity_outside_goal_cas() {
     reached_rx
         .recv_timeout(Duration::from_secs(1))
         .expect("entity goal compute boundary");
-    assert!(
-        registry
-            .entities
-            .access_for_test()
-            .set_position(sheep_id, Vec3::new(512.5, 64.0, 0.5))
-    );
+    let mut entities = registry.lock_entities("move stale grazing entity");
+    let expected = entities
+        .snapshot(sheep_id)
+        .expect("grazing entity snapshot");
+    let mut moved = expected.clone();
+    moved.position = Vec3::new(512.5, 64.0, 0.5);
+    assert!(entities.replace_snapshot_if_current(expected, moved));
+    drop(entities);
     resume_tx.send(()).expect("resume entity goal compute");
     let queries = tick.join().expect("entity goal tick");
 
@@ -3581,13 +3652,14 @@ fn chicken_pathing_uses_its_own_aabb_next_to_a_wall() {
         PlayerPose::new(4.5, 64.0, 0.5),
     );
     registry.mark_loaded(player, (0, 0));
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:chicken".to_string(),
         Vec3::new(1.75, 64.0, 0.5),
     );
     let chicken_id = registry.persisted_entity_records()[0].id;
-    assert!(registry.entities.access_for_test().set_goal(
+    assert!(registry.lock_entities("test entity access").set_goal(
         chicken_id,
         GoalState::Wander {
             speed: 2.5,
@@ -3633,7 +3705,7 @@ fn registry_recovers_after_inner_mutex_poison() {
 fn mark_loaded_does_not_wait_for_entity_store() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "LockOrderAlice");
-    let entity_guard = registry.entities.access_for_test();
+    let entity_guard = registry.lock_entities("test entity access");
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let worker_registry = Arc::clone(&registry);
     let worker = std::thread::spawn(move || {
@@ -3664,20 +3736,21 @@ fn committed_herd_batch_publication_preserves_visibility_order_and_indexes() {
     registry.mark_loaded(bob, west);
 
     let mut store = mc_entity::EntityStore::new();
-    let west_id = store.spawn_authoritative(SpawnEntity::new(
-        4,
-        "minecraft:cow",
-        Vec3::new(0.5, 64.0, 0.5),
-    ));
-    let east_id = store.spawn_authoritative(SpawnEntity::new(
-        4,
-        "minecraft:cow",
-        Vec3::new(16.5, 64.0, 0.5),
-    ));
+    let mut west_entity = SpawnEntity::new(4, "minecraft:cow", Vec3::new(0.5, 64.0, 0.5));
+    west_entity.retained.spawn_tick = 77;
+    let west_id = store.spawn(west_entity);
+    let mut east_entity = SpawnEntity::new(4, "minecraft:cow", Vec3::new(16.5, 64.0, 0.5));
+    east_entity.retained.spawn_tick = 77;
+    let east_id = store.spawn(east_entity);
     let committed = [west_id, east_id]
         .into_iter()
         .map(|id| store.snapshot(id).expect("committed herd snapshot"))
         .collect::<Vec<_>>();
+    assert!(
+        registry
+            .lock_entities("install committed herd owner state")
+            .insert_snapshots_batch(committed.clone())
+    );
 
     let dispatches = {
         let mut inner = registry.lock_inner("publish committed herd batch");
@@ -3707,11 +3780,13 @@ fn committed_herd_batch_publication_preserves_visibility_order_and_indexes() {
     west_recipients.sort_unstable();
     assert_eq!(west_recipients, vec![alice, bob]);
 
+    let entities = registry.lock_entities("inspect committed herd retained state");
+    assert_eq!(entities.snapshot(west_id).unwrap().retained.spawn_tick, 77);
+    assert_eq!(entities.snapshot(east_id).unwrap().retained.spawn_tick, 77);
+    drop(entities);
     let inner = registry.lock_inner("inspect committed herd batch");
     assert_eq!(inner.entity_chunks.get(&west_id), Some(&west));
     assert_eq!(inner.entity_chunks.get(&east_id), Some(&east));
-    assert_eq!(inner.entity_spawn_ticks.get(&west_id), Some(&77));
-    assert_eq!(inner.entity_spawn_ticks.get(&east_id), Some(&77));
     assert!(inner.published_entity_snapshots.contains_key(&west_id));
     assert!(inner.published_entity_snapshots.contains_key(&east_id));
     assert!(inner.sessions[&alice].visible_entities.contains(&west_id));
@@ -3742,16 +3817,19 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
     let mut restored_store = mc_entity::EntityStore::new();
     let mut restored_spawn = SpawnEntity::new(4, "minecraft:cow", Vec3::new(32.5, 64.0, 0.5));
     restored_spawn.uuid = Some(duplicate_uuid);
-    let restored_id = restored_store.spawn_authoritative(restored_spawn);
+    let restored_id = restored_store.spawn(restored_spawn);
     let restored = restored_store
         .snapshot(restored_id)
         .expect("restored duplicate snapshot");
     assert_eq!(
-        registry.restore_persisted_entities([PersistedEntityRecord {
-            snapshot: restored,
-            age: 0,
-            pickup_delay: 0,
-        }]),
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            0,
+            vec![PersistedEntityRecord {
+                snapshot: restored,
+                age: 0,
+                pickup_delay: 0,
+            }],
+        )),
         1
     );
     let alice = register_test_session(&registry, "HerdLockAlice");
@@ -3855,8 +3933,7 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
         "mark_loaded after phase three must use published herd indexes"
     );
     let authoritative = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .collect::<Vec<_>>();
     assert_eq!(authoritative.len(), 2);
@@ -3947,7 +4024,6 @@ fn safe_chunk_herd_failure_releases_claim_for_one_exact_retry() {
         assert!(!inner.entities_by_chunk.contains_key(&chunk));
         assert!(inner.published_entity_snapshots.is_empty());
         assert!(inner.last_sent_entity_states.is_empty());
-        assert!(inner.entity_spawn_ticks.is_empty());
     }
     registry.ensure_chunk_herd_legacy_for_test(chunk, &spawns);
     assert_eq!(registry.persisted_entity_records().len(), 1);
@@ -4000,11 +4076,8 @@ fn unknown_chunk_herd_failure_keeps_claim_and_cannot_retry() {
     let mut probe = SpawnEntity::new(4, "minecraft:cow", Vec3::new(49.5, 64.0, 16.5));
     probe.uuid = Some(uuid::Uuid::from_u128(0x301));
     assert_eq!(
-        registry
-            .entities
-            .handle
-            .spawn_unique_authoritative_batch([probe]),
-        Err(mc_entity::RegionOwnerLaneError::Busy)
+        registry.entities.handle.spawn_unique_batch([probe]),
+        Err(mc_entity::RegionOwnerLaneError::OutcomeUnknown)
     );
 }
 
@@ -4145,8 +4218,7 @@ fn pending_hostile_activation_releases_session_lock_during_journal_commit() {
     assert_eq!(spawned_for, vec![alice, bob]);
 
     let authoritative = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .collect::<Vec<_>>();
     assert_eq!(authoritative.len(), 1);
@@ -4387,7 +4459,6 @@ fn unknown_pending_hostile_failure_does_not_publish_or_retry() {
         assert!(!inner.entities_by_chunk.contains_key(&chunk));
         assert!(inner.published_entity_snapshots.is_empty());
         assert!(inner.last_sent_entity_states.is_empty());
-        assert!(inner.entity_spawn_ticks.is_empty());
         assert!(inner.sessions[&observer].visible_entities.is_empty());
     }
     assert!(
@@ -4404,18 +4475,15 @@ fn unknown_pending_hostile_failure_does_not_publish_or_retry() {
     );
     probe.uuid = Some(uuid::Uuid::from_u128(0x100));
     assert_eq!(
-        registry
-            .entities
-            .handle
-            .spawn_unique_authoritative_batch([probe]),
-        Err(mc_entity::RegionOwnerLaneError::Busy)
+        registry.entities.handle.spawn_unique_batch([probe]),
+        Err(mc_entity::RegionOwnerLaneError::OutcomeUnknown)
     );
 }
 
 #[test]
 fn pressure_snapshot_does_not_wait_for_runtime_state_locks() {
     let registry = Arc::new(SessionRegistry::new());
-    let entity_guard = registry.entities.access_for_test();
+    let entity_guard = registry.lock_entities("test entity access");
     let session_guard = registry.inner.lock().expect("session registry lock");
     let prepared_cache_guard = registry.prepared_cache.lock().expect("prepared cache lock");
     let container_guard = registry.containers.shards[0]
@@ -4466,7 +4534,7 @@ fn pressure_snapshot_aggregates_container_viewers_across_shards() {
 fn unregister_does_not_wait_for_entity_store() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "DisconnectAlice");
-    let entity_guard = registry.entities.access_for_test();
+    let entity_guard = registry.lock_entities("test entity access");
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
     let worker_registry = Arc::clone(&registry);
     let worker = std::thread::spawn(move || {
@@ -4491,7 +4559,8 @@ fn mark_loaded_spawns_latest_published_entity_snapshot() {
     let session = register_test_session(&registry, "PublishedEntityAlice");
     assert!(
         registry
-            .spawn_command_entity_legacy_for_test(
+            .spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_owned(),
                 Vec3::new(0.5, 64.0, 0.5),
@@ -4531,7 +4600,8 @@ fn mark_loaded_does_not_wait_for_move_fanout() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "MoveFanoutAlice");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -4591,7 +4661,8 @@ fn entity_physics_owner_apply_does_not_hold_session_registry() {
     let session = register_test_session(&registry, "PhysicsOwnerApplyAlice");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.5, 64.0, 0.5),
@@ -4644,7 +4715,8 @@ fn entity_physics_uses_prepare_and_one_current_read_after_commit() {
     let session = register_test_session(&registry, "PhysicsPostStateAlice");
     registry.mark_loaded(session, (0, 0));
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.5, 64.0, 0.5),
@@ -4670,8 +4742,8 @@ fn entity_physics_uses_prepare_and_one_current_read_after_commit() {
 
     assert_eq!(
         registry.entity_owner_requests_for_test(),
-        2,
-        "physics needs one prepare read and one current-state publication fence"
+        3,
+        "physics reads ECS for preparation, item expiry, and current-state publication"
     );
 }
 
@@ -4681,7 +4753,8 @@ fn delayed_entity_physics_apply_cannot_overwrite_newer_commit() {
     let session = register_test_session(&registry, "PhysicsApplyRaceAlice");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.5, 64.0, 0.5),
@@ -4759,7 +4832,8 @@ fn entity_store_is_released_before_session_movement_plan() {
     let registry = Arc::new(SessionRegistry::new());
     let session = register_test_session(&registry, "EntityReleaseAlice");
     assert!(registry.mark_loaded(session, (0, 0)).is_empty());
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -4833,7 +4907,7 @@ fn save_all_recovers_after_player_persistence_mutex_poison() {
 }
 
 #[test]
-fn arrow_despawns_after_lifetime_and_dispatches_remove() {
+fn airborne_arrow_does_not_expire_from_total_spawn_age() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(8);
     let profile = profile("ArrowAlice");
@@ -4848,7 +4922,7 @@ fn arrow_despawns_after_lifetime_and_dispatches_remove() {
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
 
     let entity_id = publish_single_entity_spawn(
-        registry.spawn_arrow_legacy_for_test(
+        registry.spawn_arrow_for_test(
             Some(session_id),
             1,
             Vec3::new(0.5, 64.0, 0.5),
@@ -4858,18 +4932,15 @@ fn arrow_despawns_after_lifetime_and_dispatches_remove() {
         &mut rx,
     );
 
-    registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS);
+    registry.advance_world_time(mc_entity::projectile_26_1_2::ARROW_DESPAWN_TICKS as u64);
     registry.apply_entity_physics_and_dispatch(1, &[]);
 
-    assert!(registry.server_entity_snapshot(entity_id).is_none());
-    match rx.try_recv().expect("arrow despawn dispatch") {
-        OutboundCommand::DespawnEntity(entity) => assert_eq!(entity.id, entity_id),
-        other => panic!("expected arrow despawn dispatch, got {other:?}"),
-    }
+    assert!(registry.server_entity_snapshot(entity_id).is_some());
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
-fn arrow_before_lifetime_remains_tracked() {
+fn grounded_arrow_despawns_only_from_projectile_kernel_age() {
     let registry = SessionRegistry::new();
     let (tx, mut rx) = mpsc::channel(8);
     let profile = profile("ArrowBob");
@@ -4882,7 +4953,7 @@ fn arrow_before_lifetime_remains_tracked() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_arrow_legacy_for_test(
+    let spawn_dispatches = registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.0, 0.5),
@@ -4894,11 +4965,59 @@ fn arrow_before_lifetime_remains_tracked() {
         other => panic!("expected arrow spawn dispatch, got {other:?}"),
     };
 
-    registry.advance_world_time(ARROW_DESPAWN_AGE_TICKS - 1);
-    registry.apply_entity_physics_and_dispatch(1, &[]);
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: entity_id,
+            position: Vec3::new(0.5, 64.0, 0.6),
+            velocity: Vec3::new(0.0, 0.0, 0.1),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+    {
+        let mut inner = registry.lock_session_entities("seed grounded arrow kernel age");
+        let expected = inner
+            .entities
+            .snapshot(entity_id)
+            .expect("spawned arrow is owned by the regional ECS");
+        let mut next = expected.clone();
+        let state = next
+            .retained
+            .arrow_state
+            .as_mut()
+            .expect("spawned arrow initializes ECS kernel state");
+        state.in_ground = true;
+        state.despawn_age = mc_entity::projectile_26_1_2::ARROW_DESPAWN_TICKS - 1;
+        state.last_block_state = Some(mc_entity::projectile_26_1_2::BlockStateId::new(1));
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
+    }
 
-    assert!(registry.server_entity_snapshot(entity_id).is_some());
-    assert!(rx.try_recv().is_err());
+    registry.apply_entity_physics_with_arrow_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: entity_id,
+            position: Vec3::new(0.5, 64.0, 0.6),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: true,
+        }],
+        &[ArrowPhysicsFact {
+            arrow_id: entity_id,
+            block_hit: None,
+            embedded_in_block: true,
+            current_block_state: mc_world::BlockStateId(1),
+            should_fall: false,
+            fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+            in_water: false,
+            in_water_or_rain: false,
+        }],
+    );
+
+    assert!(registry.server_entity_snapshot(entity_id).is_none());
+    while let Ok(command) = rx.try_recv() {
+        assert!(!matches!(command, OutboundCommand::DamagePlayer { .. }));
+    }
 }
 
 #[test]
@@ -4906,18 +5025,111 @@ fn spawned_arrow_uses_projectile_physics_kind() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ArrowPhysicsAlice");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    registry.spawn_arrow_legacy_for_test(
+    let arrow_id = match &registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.0, 0.5),
         Vec3::new(0.0, 0.0, 1.0),
         Rotation::ZERO,
-    );
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
 
     let queries = registry.tick_entities_and_collect_physics_queries(1);
 
     assert_eq!(queries.len(), 1);
-    assert_eq!(queries[0].kind, EntityPhysicsKind::ArrowProjectile);
+    assert_eq!(
+        queries[0].kind,
+        EntityPhysicsKind::ArrowProjectile {
+            revision: Some(0),
+            embedded_block: None
+        }
+    );
+    let embedded_block = mc_entity::projectile_26_1_2::BlockPosition::new(1, 64, 2);
+    {
+        let mut inner = registry.lock_session_entities("seed retained arrow block position");
+        let expected = inner.entities.snapshot(arrow_id).expect("arrow exists");
+        let mut next = expected.clone();
+        let state = next
+            .retained
+            .arrow_state
+            .as_mut()
+            .expect("arrow state is ECS-owned");
+        state.in_ground = true;
+        state.last_block_position = Some(embedded_block);
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
+    }
+
+    let queries = registry.tick_entities_and_collect_physics_queries(2);
+
+    assert_eq!(
+        queries[0].kind,
+        EntityPhysicsKind::ArrowProjectile {
+            revision: Some(0),
+            embedded_block: Some(embedded_block)
+        }
+    );
+}
+
+#[test]
+fn arrow_tick_uses_authoritative_water_and_retained_gravity_facts() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "ArrowWaterFacts");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.0, 0.5),
+        Vec3::new(0.0, 0.0, 1.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    {
+        let mut inner = registry.lock_session_entities("set retained arrow gravity fact");
+        let expected = inner.entities.snapshot(arrow_id).expect("arrow exists");
+        let mut next = expected.clone();
+        next.retained
+            .arrow_state
+            .as_mut()
+            .expect("arrow state is ECS-owned")
+            .no_gravity = true;
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
+    }
+
+    registry.apply_entity_physics_with_arrow_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.0, 1.5),
+            velocity: Vec3::new(0.0, 0.0, 1.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+        &[ArrowPhysicsFact {
+            arrow_id,
+            block_hit: None,
+            embedded_in_block: false,
+            current_block_state: mc_world::BlockStateId(9),
+            should_fall: true,
+            fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+            in_water: true,
+            in_water_or_rain: true,
+        }],
+    );
+
+    let arrow = registry
+        .lock_entities("inspect water arrow")
+        .snapshot(arrow_id)
+        .expect("water arrow remains authoritative");
+    assert_eq!(arrow.position, Vec3::new(0.5, 64.0, 1.5));
+    assert_eq!(arrow.velocity, Vec3::new(0.0, 0.0, f64::from(0.6_f32)));
 }
 
 #[test]
@@ -4925,7 +5137,7 @@ fn grounded_zero_velocity_arrow_is_pickup_candidate() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ArrowPickupAlice");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_arrow_legacy_for_test(
+    let spawn_dispatches = registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.0, 0.5),
@@ -4958,7 +5170,7 @@ fn moving_or_airborne_arrow_is_not_pickup_candidate() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ArrowPickupBob");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    registry.spawn_arrow_legacy_for_test(
+    registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.0, 0.5),
@@ -4976,7 +5188,7 @@ fn arrow_pickup_claim_removes_once_and_dispatches_take() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ArrowPickupCarol");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_arrow_legacy_for_test(
+    let spawn_dispatches = registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.0, 0.5),
@@ -4999,12 +5211,12 @@ fn arrow_pickup_claim_removes_once_and_dispatches_take() {
     );
 
     let dispatches = registry
-        .claim_arrow_pickup_legacy_for_test(entity_id, session_id)
+        .claim_arrow_pickup_for_test(entity_id, session_id)
         .unwrap();
 
     assert!(
         registry
-            .claim_arrow_pickup_legacy_for_test(entity_id, session_id)
+            .claim_arrow_pickup_for_test(entity_id, session_id)
             .is_none()
     );
     assert!(registry.server_entity_snapshot(entity_id).is_none());
@@ -5033,7 +5245,8 @@ fn moving_arrow_hit_damages_entity_and_despawns_arrow() {
     );
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
     let cow_id = publish_single_entity_spawn(
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             2,
             "minecraft:cow".to_string(),
             Vec3::new(0.5, 64.0, 1.5),
@@ -5041,7 +5254,7 @@ fn moving_arrow_hit_damages_entity_and_despawns_arrow() {
         &mut rx,
     );
     let arrow_id = publish_single_entity_spawn(
-        registry.spawn_arrow_legacy_for_test(
+        registry.spawn_arrow_for_test(
             Some(session_id),
             1,
             Vec3::new(0.5, 64.75, 0.0),
@@ -5170,7 +5383,8 @@ fn lethal_arrow_hit_spawns_rewards_then_finishes_mob_death_after_twenty_ticks() 
     );
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
     let chicken_id = publish_single_entity_spawn(
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             2,
             "minecraft:chicken".to_string(),
             Vec3::new(0.5, 64.0, 1.5),
@@ -5178,7 +5392,7 @@ fn lethal_arrow_hit_spawns_rewards_then_finishes_mob_death_after_twenty_ticks() 
         &mut rx,
     );
     let arrow_id = publish_single_entity_spawn(
-        registry.spawn_arrow_legacy_for_test(
+        registry.spawn_arrow_for_test(
             Some(session_id),
             1,
             Vec3::new(0.5, 64.75, 0.0),
@@ -5316,7 +5530,8 @@ fn lethal_arrow_hit_on_sheared_sheep_keeps_meat_and_removes_wool() {
     );
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
     let sheep_id = publish_single_entity_spawn(
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             2,
             "minecraft:sheep".to_string(),
             Vec3::new(0.5, 64.0, 1.5),
@@ -5336,11 +5551,11 @@ fn lethal_arrow_hit_on_sheared_sheep_keeps_meat_and_removes_wool() {
         assert!(inner.entities.set_animal_state(sheep_id, animal));
     }
     let first_hit = registry
-        .damage_server_entity_legacy_for_test(sheep_id, ARROW_ENTITY_HIT_DAMAGE)
+        .damage_server_entity_for_test(sheep_id, ARROW_ENTITY_HIT_DAMAGE)
         .expect("first hit damages sheep");
     assert!(!first_hit.killed);
     let arrow_id = publish_single_entity_spawn(
-        registry.spawn_arrow_legacy_for_test(
+        registry.spawn_arrow_for_test(
             Some(session_id),
             1,
             Vec3::new(0.5, 64.75, 0.0),
@@ -5394,7 +5609,8 @@ fn player_attack_contract_distinguishes_rejection_immunity_and_damage() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "AttackContractAlice");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let reachable_id = match &registry.spawn_command_entity_legacy_for_test(
+    let reachable_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         5,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -5404,7 +5620,8 @@ fn player_attack_contract_distinguishes_rejection_immunity_and_damage() {
         OutboundCommand::SpawnEntity(entity) => entity.id,
         other => panic!("expected reachable cow spawn, got {other:?}"),
     };
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         5,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 20.5),
@@ -5497,7 +5714,8 @@ fn lethal_player_attack_spawns_every_simple_entity_loot_pool() {
     );
     let session_id = register_test_session(&registry, "CowLootAlice");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let cow_id = match &registry.spawn_command_entity_legacy_for_test(
+    let cow_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:cow".to_string(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -5560,7 +5778,8 @@ fn explosion_entity_targets_capture_living_entity_geometry() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ExplosionTargetObserver");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let chicken_id = match &registry.spawn_command_entity_legacy_for_test(
+    let chicken_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:chicken".to_string(),
         Vec3::new(1.5, 64.0, 0.5),
@@ -5570,7 +5789,8 @@ fn explosion_entity_targets_capture_living_entity_geometry() {
         OutboundCommand::SpawnEntity(entity) => entity.id,
         other => panic!("expected chicken spawn dispatch, got {other:?}"),
     };
-    let baby_chicken_id = match &registry.spawn_command_entity_legacy_for_test(
+    let baby_chicken_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:chicken".to_string(),
         Vec3::new(2.5, 64.0, 0.5),
@@ -5600,9 +5820,25 @@ fn explosion_entity_targets_capture_living_entity_geometry() {
         .find(|target| target.entity_id == chicken_id)
         .expect("chicken inside explosion radius");
     assert_eq!(target.position, Vec3::new(1.5, 64.0, 0.5));
-    assert_eq!(target.eye_position, Vec3::new(1.5, 64.644, 0.5));
-    assert_eq!(target.aabb_min, Vec3::new(1.3, 64.0, 0.3));
-    assert_eq!(target.aabb_max, Vec3::new(1.7, 64.7, 0.7));
+    let adult_half_width = f64::from(0.2_f32);
+    let adult_height = f64::from(0.7_f32);
+    let adult_eye_height = f64::from(0.644_f32);
+    assert_eq!(
+        target.eye_position,
+        Vec3::new(1.5, 64.0 + adult_eye_height, 0.5)
+    );
+    assert_eq!(
+        target.aabb_min,
+        Vec3::new(1.5 - adult_half_width, 64.0, 0.5 - adult_half_width)
+    );
+    assert_eq!(
+        target.aabb_max,
+        Vec3::new(
+            1.5 + adult_half_width,
+            64.0 + adult_height,
+            0.5 + adult_half_width
+        )
+    );
 
     let baby_target = targets
         .iter()
@@ -5618,7 +5854,8 @@ fn physics_queries_keep_adult_and_baby_geometry_separate() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "BabyPhysicsObserver");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let spawn_chicken = |position| match &registry.spawn_command_entity_legacy_for_test(
+    let spawn_chicken = |position| match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:chicken".to_string(),
         position,
@@ -5650,8 +5887,8 @@ fn physics_queries_keep_adult_and_baby_geometry_separate() {
     assert_eq!(
         aabb(adult_id),
         mc_physics::Aabb {
-            half_width: 0.2,
-            height: 0.7,
+            half_width: f64::from(0.2_f32),
+            height: f64::from(0.7_f32),
         }
     );
     assert_eq!(
@@ -5668,7 +5905,8 @@ fn explosion_entity_impacts_publish_hurt_before_exact_velocity_delta() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "ExplosionObserver");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let chicken_id = match &registry.spawn_command_entity_legacy_for_test(
+    let chicken_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:chicken".to_string(),
         Vec3::new(1.5, 64.0, 0.5),
@@ -5728,7 +5966,8 @@ fn lethal_attack_keeps_dying_entity_until_twentieth_death_tick() {
     let registry = SessionRegistry::new();
     let session_id = register_test_session(&registry, "DeathLifecycleObserver");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let chicken_id = match &registry.spawn_command_entity_legacy_for_test(
+    let chicken_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:chicken".to_string(),
         Vec3::new(1.5, 64.0, 0.5),
@@ -5766,14 +6005,13 @@ fn lethal_attack_keeps_dying_entity_until_twentieth_death_tick() {
             OutboundCommand::DespawnEntity(ref entity) if entity.id == chicken_id
         )
     }));
-    assert_eq!(
-        registry
-            .lock_entities("inspect dying chicken")
-            .snapshot(chicken_id)
-            .expect("dying chicken remains authoritative")
-            .lifecycle,
-        EntityLifecycle::Despawning
-    );
+    let dying = registry
+        .lock_entities("inspect dying chicken")
+        .snapshot(chicken_id)
+        .expect("dying chicken remains authoritative");
+    assert_eq!(dying.lifecycle, EntityLifecycle::Despawning);
+    assert_eq!(dying.retained.last_damage_tick, Some(0));
+    assert_eq!(dying.retained.death_remove_tick, Some(20));
 
     registry.advance_world_time(19);
     assert!(
@@ -5782,6 +6020,15 @@ fn lethal_attack_keeps_dying_entity_until_twentieth_death_tick() {
             .is_empty()
     );
     assert!(registry.server_entity_snapshot(chicken_id).is_some());
+    assert_eq!(
+        registry
+            .lock_entities("inspect pending death deadline")
+            .snapshot(chicken_id)
+            .expect("dying chicken remains before its deadline")
+            .retained
+            .death_remove_tick,
+        Some(20)
+    );
 
     registry.advance_world_time(1);
     let dispatches = registry.tick_dying_entities(&SimulationAuthority::for_test(), 20);
@@ -5846,7 +6093,8 @@ fn lethal_player_attack_on_sheared_sheep_keeps_meat_and_removes_wool() {
     );
     let session_id = register_test_session(&registry, "ShearedSheepLootAlice");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
-    let sheep_id = match &registry.spawn_command_entity_legacy_for_test(
+    let sheep_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:sheep".to_string(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -5950,7 +6198,7 @@ fn moving_arrow_ignores_item_entities() {
     let session_id = register_test_session(&registry, "ArrowHitBob");
     assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
     registry.spawn_item_drop(2, Vec3::new(0.5, 64.0, 1.5), EntityItemStack::new(42, 1));
-    let arrow_id = match &registry.spawn_arrow_legacy_for_test(
+    let arrow_id = match &registry.spawn_arrow_for_test(
         Some(session_id),
         1,
         Vec3::new(0.5, 64.75, 0.0),
@@ -5978,6 +6226,633 @@ fn moving_arrow_ignores_item_entities() {
 }
 
 #[test]
+fn moving_arrow_does_not_hit_entity_behind_authoritative_block_endpoint() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "ArrowBlockEndpointObserver");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let target_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected target spawn dispatch, got {other:?}"),
+    };
+    let target_health = server_entity_health(&registry, target_id);
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 2.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+
+    registry.apply_entity_physics_with_arrow_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+        &[ArrowPhysicsFact {
+            arrow_id,
+            block_hit: Some(ArrowBlockHitFact {
+                arrow_id,
+                block_state: mc_world::BlockStateId(7),
+                block_position: mc_entity::projectile_26_1_2::BlockPosition::new(0, 64, 0),
+                location: Vec3::new(0.5, 64.75, 0.75),
+            }),
+            embedded_in_block: true,
+            current_block_state: mc_world::BlockStateId(7),
+            should_fall: false,
+            fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+            in_water: false,
+            in_water_or_rain: false,
+        }],
+    );
+
+    assert!(registry.server_entity_snapshot(arrow_id).is_some());
+    assert_eq!(server_entity_health(&registry, target_id), target_health);
+}
+
+#[test]
+fn moving_arrow_tied_with_authoritative_block_endpoint_hits_block() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "ArrowBlockTieObserver");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let target_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected target spawn dispatch, got {other:?}"),
+    };
+    let target_health = server_entity_health(&registry, target_id);
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 2.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+
+    registry.apply_entity_physics_with_arrow_facts_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: Vec3::ZERO,
+            on_ground: true,
+            horizontal_collision: false,
+        }],
+        &[ArrowPhysicsFact {
+            arrow_id,
+            block_hit: Some(ArrowBlockHitFact {
+                arrow_id,
+                block_state: mc_world::BlockStateId(7),
+                block_position: mc_entity::projectile_26_1_2::BlockPosition::new(0, 64, 0),
+                // A cow at z=1.5 has an expanded ray intersection at z=0.8.
+                location: Vec3::new(0.5, 64.75, 0.8),
+            }),
+            embedded_in_block: true,
+            current_block_state: mc_world::BlockStateId(7),
+            should_fall: false,
+            fall_velocity_scale: Vec3::new(0.1, 0.1, 0.1),
+            in_water: false,
+            in_water_or_rain: false,
+        }],
+    );
+
+    assert_eq!(server_entity_health(&registry, target_id), target_health);
+    assert_eq!(
+        registry
+            .server_entity_snapshot(arrow_id)
+            .expect("block-hit arrow remains authoritative")
+            .position,
+        Vec3::new(0.5, 64.75, 0.8 - f64::from(0.05_f32))
+    );
+    assert_eq!(
+        registry
+            .lock_entities("inspect tied block arrow state")
+            .snapshot(arrow_id)
+            .and_then(|snapshot| snapshot.retained.arrow_state)
+            .and_then(|state| state.last_block_position),
+        Some(mc_entity::projectile_26_1_2::BlockPosition::new(0, 64, 0))
+    );
+}
+
+#[test]
+fn moving_arrow_deduplicates_complete_chunk_candidates_before_kernel_prepare() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "ArrowDuplicateCandidates");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    assert!(registry.mark_loaded(session_id, (0, 1)).is_empty());
+    let target_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 16.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected target spawn dispatch, got {other:?}"),
+    };
+    for z in [64.5, 80.5] {
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            2,
+            "minecraft:cow".to_string(),
+            Vec3::new(0.5, 64.0, z),
+        );
+    }
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 18.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    let target_health = server_entity_health(&registry, target_id);
+    registry
+        .lock_inner("duplicate arrow candidate across chunks")
+        .entities_by_chunk
+        .entry((0, 0))
+        .or_default()
+        .insert(target_id);
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 18.0),
+            velocity: Vec3::new(0.0, 0.0, 18.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert_eq!(
+        server_entity_health(&registry, target_id),
+        target_health - ARROW_ENTITY_HIT_DAMAGE
+    );
+    assert!(registry.server_entity_snapshot(arrow_id).is_none());
+}
+
+#[test]
+fn piercing_arrow_damages_only_accepted_targets_at_limit_boundary() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "ArrowPiercingOrder");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 0.1),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 0.1),
+            velocity: Vec3::new(0.0, 0.0, 0.1),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+    {
+        let mut inner = registry.lock_session_entities("set arrow piercing regression state");
+        let expected = inner
+            .entities
+            .snapshot(arrow_id)
+            .expect("spawned arrow is owned by the regional ECS");
+        let mut next = expected.clone();
+        next.retained
+            .arrow_state
+            .as_mut()
+            .expect("spawned arrow initializes ECS kernel state")
+            .pierce_level = 1;
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
+    }
+    let first_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected first target spawn dispatch, got {other:?}"),
+    };
+    let second_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 3.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected second target spawn dispatch, got {other:?}"),
+    };
+    let third_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 4.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected third target spawn dispatch, got {other:?}"),
+    };
+
+    registry.apply_entity_physics_and_dispatch(
+        2,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 5.0),
+            velocity: Vec3::new(0.0, 0.0, 4.9),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert_eq!(server_entity_health(&registry, first_id), 6.0);
+    assert_eq!(server_entity_health(&registry, second_id), 6.0);
+    assert_eq!(server_entity_health(&registry, third_id), 10.0);
+    assert!(registry.server_entity_snapshot(arrow_id).is_none());
+}
+
+#[test]
+fn stale_arrow_physics_does_not_commit_or_publish_projectile_work() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(8);
+    let (session_id, _) = registry.register(
+        &profile("StaleArrowPhysics"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let initial_position = Vec3::new(0.5, 64.75, 0.0);
+    let initial_velocity = Vec3::new(0.0, 0.0, 2.0);
+    let spawn_dispatches = registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        initial_position,
+        initial_velocity,
+        Rotation::ZERO,
+    );
+    let arrow_id = match &spawn_dispatches[0].command {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    dispatch_visibility_commands(spawn_dispatches);
+    assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    let expected = [EntityPhysicsQuery {
+        id: arrow_id,
+        position: initial_position,
+        velocity: initial_velocity,
+        aabb: entity_aabb("minecraft:arrow"),
+        on_ground: false,
+        kind: EntityPhysicsKind::ArrowProjectile {
+            revision: Some(99),
+            embedded_block: None,
+        },
+    }];
+
+    registry.apply_entity_physics_if_current_and_dispatch(
+        1,
+        &expected,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: initial_velocity,
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert_eq!(
+        registry
+            .server_entity_snapshot(arrow_id)
+            .expect("stale arrow remains authoritative")
+            .position,
+        initial_position
+    );
+    let received = rx.try_recv();
+    assert!(
+        matches!(received, Err(mpsc::error::TryRecvError::Empty)),
+        "stale arrow physics published {received:?}"
+    );
+}
+
+#[test]
+fn removed_arrow_target_is_not_resolved_from_stale_tracking() {
+    let registry = SessionRegistry::new();
+    let session_id = register_test_session(&registry, "RemovedArrowTarget");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let target_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected target spawn dispatch, got {other:?}"),
+    };
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 2.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    {
+        let mut inner = registry.lock_session_entities("remove stale arrow target");
+        assert!(remove_server_entity_locked(&mut inner, target_id).is_some());
+    }
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: Vec3::new(0.0, 0.0, 2.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert!(registry.server_entity_snapshot(target_id).is_none());
+    assert!(registry.server_entity_snapshot(arrow_id).is_some());
+}
+
+#[test]
+fn arrow_candidate_capacity_rejection_leaves_state_unchanged_and_emits_nothing() {
+    let registry = SessionRegistry::new();
+    let (tx, mut rx) = mpsc::channel(512);
+    let (session_id, _) = registry.register(
+        &profile("ArrowPublicationCapacity"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        tx,
+        PlayerPose::new(0.5, 64.0, 0.5),
+    );
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let mut target_ids = Vec::new();
+    for index in 0..200 {
+        let z = 1.0 + f64::from(index) * 0.05;
+        let spawn_dispatches = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            41,
+            "minecraft:enderman".to_string(),
+            Vec3::new(0.5, 64.0, z),
+        );
+        let target_id = match &spawn_dispatches[0].command {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected enderman spawn dispatch, got {other:?}"),
+        };
+        dispatch_visibility_commands(spawn_dispatches);
+        target_ids.push(target_id);
+    }
+    let initial_position = Vec3::new(0.5, 64.75, 0.0);
+    let initial_velocity = Vec3::new(0.0, 0.0, 12.0);
+    let spawn_dispatches = registry.spawn_arrow_for_test(
+        Some(session_id),
+        1,
+        initial_position,
+        initial_velocity,
+        Rotation::ZERO,
+    );
+    let arrow_id = match &spawn_dispatches[0].command {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    dispatch_visibility_commands(spawn_dispatches);
+    let first_health = server_entity_health(&registry, target_ids[0]);
+    let last_health = server_entity_health(&registry, *target_ids.last().expect("targets exist"));
+    for _ in 0..=target_ids.len() {
+        assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 12.0),
+            velocity: initial_velocity,
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    let arrow = registry
+        .server_entity_snapshot(arrow_id)
+        .expect("capacity rejection retains arrow");
+    assert_eq!(arrow.position, initial_position);
+    assert_eq!(arrow.velocity, initial_velocity);
+    assert_eq!(server_entity_health(&registry, target_ids[0]), first_health);
+    assert_eq!(
+        server_entity_health(&registry, *target_ids.last().expect("targets exist")),
+        last_health
+    );
+    let arrow = registry
+        .lock_entities("inspect rejected arrow state")
+        .snapshot(arrow_id)
+        .expect("capacity rejection retains arrow");
+    assert_eq!(
+        arrow
+            .retained
+            .arrow_state
+            .expect("arrow state remains owned by ECS")
+            .projectile
+            .revision,
+        0
+    );
+    assert!(matches!(
+        rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+fn spawn_separated_arrows(registry: &SessionRegistry, count: usize) -> Vec<EntityId> {
+    let mut inner = registry.lock_session_entities("spawn saturation arrows");
+    (0..count)
+        .map(|index| {
+            spawn_arrow_locked(
+                &mut inner,
+                None,
+                1,
+                Vec3::new(index as f64 * 4.0 + 0.5, 64.0, 0.5),
+                Vec3::new(0.0, 0.0, 0.1),
+                Rotation::ZERO,
+            )
+            .0
+        })
+        .collect()
+}
+
+fn current_arrow_steps(
+    registry: &SessionRegistry,
+    arrow_ids: &[EntityId],
+) -> Vec<EntityPhysicsStep> {
+    let entities = registry.lock_entities("prepare saturation arrow steps");
+    arrow_ids
+        .iter()
+        .map(|&id| {
+            let snapshot = entities.snapshot(id).expect("saturation arrow exists");
+            EntityPhysicsStep {
+                id,
+                position: Vec3::new(
+                    snapshot.position.x + snapshot.velocity.x,
+                    snapshot.position.y + snapshot.velocity.y,
+                    snapshot.position.z + snapshot.velocity.z,
+                ),
+                velocity: snapshot.velocity,
+                on_ground: false,
+                horizontal_collision: false,
+            }
+        })
+        .collect()
+}
+
+fn arrow_revisions(registry: &SessionRegistry, arrow_ids: &[EntityId]) -> Vec<u64> {
+    let entities = registry.lock_entities("inspect saturation arrow revisions");
+    arrow_ids
+        .iter()
+        .map(|&id| {
+            entities
+                .snapshot(id)
+                .and_then(|snapshot| snapshot.retained.arrow_state)
+                .expect("saturation arrow state remains ECS-owned")
+                .projectile
+                .revision
+        })
+        .collect()
+}
+
+#[test]
+fn arrow_batch_at_129_advances_every_arrow() {
+    let registry = SessionRegistry::new();
+    let arrow_ids = spawn_separated_arrows(&registry, 129);
+
+    registry.apply_entity_physics_and_dispatch(1, &current_arrow_steps(&registry, &arrow_ids));
+
+    assert!(
+        arrow_revisions(&registry, &arrow_ids)
+            .iter()
+            .all(|&revision| revision == 1)
+    );
+}
+
+#[test]
+fn arrow_batch_at_130_defers_one_then_services_it() {
+    let registry = SessionRegistry::new();
+    let arrow_ids = spawn_separated_arrows(&registry, 130);
+
+    registry.apply_entity_physics_and_dispatch(1, &current_arrow_steps(&registry, &arrow_ids));
+    let first_revisions = arrow_revisions(&registry, &arrow_ids);
+    assert_eq!(
+        first_revisions
+            .iter()
+            .filter(|&&revision| revision == 1)
+            .count(),
+        129
+    );
+    assert_eq!(
+        first_revisions
+            .iter()
+            .filter(|&&revision| revision == 0)
+            .count(),
+        1
+    );
+
+    registry.apply_entity_physics_and_dispatch(2, &current_arrow_steps(&registry, &arrow_ids));
+
+    assert!(
+        arrow_revisions(&registry, &arrow_ids)
+            .iter()
+            .all(|&revision| revision >= 1)
+    );
+}
+
+#[test]
+fn saturated_arrow_batches_make_bounded_fair_progress() {
+    const ARROW_COUNT: usize = 400;
+    let registry = SessionRegistry::new();
+    let arrow_ids = spawn_separated_arrows(&registry, ARROW_COUNT);
+
+    for tick in 1..=ARROW_COUNT.div_ceil(129) as u64 {
+        let before = arrow_revisions(&registry, &arrow_ids);
+        registry
+            .apply_entity_physics_and_dispatch(tick, &current_arrow_steps(&registry, &arrow_ids));
+        let after = arrow_revisions(&registry, &arrow_ids);
+        let advanced = before
+            .iter()
+            .zip(&after)
+            .filter(|(before, after)| after > before)
+            .count();
+        assert!(
+            (1..=129).contains(&advanced),
+            "tick {tick} advanced {advanced} arrows"
+        );
+    }
+
+    assert!(
+        arrow_revisions(&registry, &arrow_ids)
+            .iter()
+            .all(|&revision| revision >= 1)
+    );
+}
+
+#[test]
 fn moving_arrow_damages_player_target_but_not_owner() {
     let registry = SessionRegistry::new();
     let (owner_tx, mut owner_rx) = mpsc::channel(8);
@@ -6000,7 +6875,17 @@ fn moving_arrow_damages_player_target_but_not_owner() {
     );
     registry.mark_loaded(owner_id, (0, 0));
     registry.mark_loaded(target_id, (0, 0));
-    let arrow_id = match &registry.spawn_arrow_legacy_for_test(
+    registry.register_player_persistence(
+        owner_id,
+        Arc::new(Mutex::new(PlayerPersistedState::new_default(
+            PlayerPose::new(0.5, 64.0, 0.0),
+        ))),
+    );
+    let target_state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
+        PlayerPose::new(0.5, 64.0, 1.5),
+    )));
+    registry.register_player_persistence(target_id, Arc::clone(&target_state));
+    let arrow_id = match &registry.spawn_arrow_for_test(
         Some(owner_id),
         1,
         Vec3::new(0.5, 64.75, 0.0),
@@ -6027,18 +6912,527 @@ fn moving_arrow_damages_player_target_but_not_owner() {
     assert!(registry.server_entity_snapshot(arrow_id).is_none());
     let mut target_damaged = false;
     while let Ok(command) = target_rx.try_recv() {
-        target_damaged |= matches!(
-            command,
-            OutboundCommand::DamagePlayer { damage, .. }
-                if (damage.amount - ARROW_ENTITY_HIT_DAMAGE).abs() < f32::EPSILON
-        );
+        target_damaged |= matches!(command, OutboundCommand::PlayerDamageCommitted { .. });
     }
     let mut owner_damaged = false;
     while let Ok(command) = owner_rx.try_recv() {
-        owner_damaged |= matches!(command, OutboundCommand::DamagePlayer { .. });
+        owner_damaged |= matches!(command, OutboundCommand::PlayerDamageCommitted { .. });
     }
     assert!(target_damaged);
     assert!(!owner_damaged);
+    assert_eq!(
+        target_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .survival
+            .health,
+        SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
+    );
+}
+
+#[test]
+fn shielded_player_hit_commits_shield_and_arrow_state_together() {
+    let registry = SessionRegistry::new();
+    let shield_name = mc_data::Identifier::parse("minecraft:shield").unwrap();
+    let items = Arc::new(mc_data::items::ItemRegistry::from_report(&[
+        mc_data::items::ItemReport {
+            id: shield_name.clone(),
+            protocol_id: 1,
+        },
+    ]));
+    let item_facts = Arc::new(mc_data::item_components::ItemFactsTable::from_entries([(
+        shield_name,
+        mc_data::item_components::ItemFacts {
+            max_damage: Some(336),
+            ..mc_data::item_components::ItemFacts::default()
+        },
+    )]));
+    registry.configure_player_combat(None, None, items, item_facts);
+
+    let (owner_tx, _owner_rx) = mpsc::channel(8);
+    let (target_tx, _target_rx) = mpsc::channel(8);
+    let (owner, _) = registry.register(
+        &profile("ArrowShieldOwner"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        owner_tx,
+        PlayerPose::new(0.5, 64.0, 0.0),
+    );
+    let mut target_pose = PlayerPose::new(0.5, 64.0, 1.5);
+    target_pose.yaw = 180.0;
+    let (target, _) = registry.register(
+        &profile("ArrowShieldTarget"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        target_tx,
+        target_pose,
+    );
+    registry.mark_loaded(owner, (0, 0));
+    registry.mark_loaded(target, (0, 0));
+    let shield_slot = 45;
+    let shield = ItemStack::new(1, 1);
+    let mut persisted = PlayerPersistedState::new_default(target_pose);
+    persisted.inventory.slots[shield_slot] = shield.clone();
+    let target_state = Arc::new(Mutex::new(persisted));
+    registry.register_player_persistence(target, Arc::clone(&target_state));
+    registry.set_active_shield(
+        target,
+        Some(ActiveShield {
+            started_tick: 0,
+            slot: shield_slot,
+            expected_stack: shield,
+        }),
+    );
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(owner),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 2.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    let (target_tx, mut target_rx) = mpsc::channel(8);
+    registry
+        .lock_inner("isolate shielded arrow publications")
+        .sessions
+        .get_mut(&target)
+        .expect("shield target remains registered")
+        .tx = target_tx;
+
+    registry.apply_entity_physics_and_dispatch(
+        10,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: Vec3::new(0.0, 0.0, 2.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert!(registry.server_entity_snapshot(arrow_id).is_some());
+    let state = target_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert_eq!(state.survival.health, SurvivalState::MAX_HEALTH);
+    assert_eq!(
+        state.inventory.slots[shield_slot],
+        ItemStack::new(1, 1).with_damage(5)
+    );
+    drop(state);
+    let command = target_rx
+        .try_recv()
+        .expect("shield commit publishes one authoritative player decision");
+    assert!(
+        matches!(
+            &command,
+            OutboundCommand::PlayerDamageCommitted { publication, .. }
+                if publication.shield_blocked && publication.health == SurvivalState::MAX_HEALTH
+        ),
+        "unexpected shield publication: {command:?}"
+    );
+    assert!(matches!(
+        target_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn stale_player_plan_rejects_arrow_and_prior_entity_targets_atomically() {
+    let registry = Arc::new(SessionRegistry::new());
+    let (owner_tx, _owner_rx) = mpsc::channel(16);
+    let (target_tx, _target_rx) = mpsc::channel(16);
+    let (owner, _) = registry.register(
+        &profile("ArrowAtomicOwner"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        owner_tx,
+        PlayerPose::new(0.5, 64.0, 0.0),
+    );
+    let target_pose = PlayerPose::new(0.5, 64.0, 3.5);
+    let (target, _) = registry.register(
+        &profile("ArrowAtomicTarget"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        target_tx,
+        target_pose,
+    );
+    registry.mark_loaded(owner, (0, 0));
+    registry.mark_loaded(target, (0, 0));
+    let target_state = Arc::new(Mutex::new(PlayerPersistedState::new_default(target_pose)));
+    registry.register_player_persistence(target, Arc::clone(&target_state));
+    let cow_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected cow spawn dispatch, got {other:?}"),
+    };
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(owner),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 5.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    let (arrow_before, cow_health) = {
+        let mut inner = registry.lock_session_entities("seed atomic arrow transaction");
+        let expected = inner.entities.snapshot(arrow_id).expect("spawned arrow");
+        let mut next = expected.clone();
+        next.retained
+            .arrow_state
+            .as_mut()
+            .expect("spawned arrow has ECS kernel state")
+            .pierce_level = 1;
+        assert!(
+            inner
+                .entities
+                .replace_snapshot_if_current(expected, next.clone())
+        );
+        (
+            next,
+            inner.entities.snapshot(cow_id).expect("spawned cow").health,
+        )
+    };
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    registry.install_arrow_transaction_probe(reached_tx, resume_rx);
+    let (owner_tx, mut owner_rx) = mpsc::channel(16);
+    let (target_tx, mut target_rx) = mpsc::channel(16);
+    {
+        let mut inner = registry.lock_inner("isolate rejected arrow publications");
+        inner
+            .sessions
+            .get_mut(&owner)
+            .expect("arrow owner remains registered")
+            .tx = owner_tx;
+        inner
+            .sessions
+            .get_mut(&target)
+            .expect("arrow target remains registered")
+            .tx = target_tx;
+    }
+    let tick_registry = Arc::clone(&registry);
+    let tick = std::thread::spawn(move || {
+        tick_registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 5.0),
+                velocity: Vec3::new(0.0, 0.0, 5.0),
+                on_ground: false,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    reached_rx
+        .recv()
+        .expect("arrow preparation reaches transaction boundary");
+    target_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .survival
+        .apply_damage(1.0);
+    resume_tx.send(()).expect("release arrow transaction");
+    tick.join().expect("arrow transaction worker joins");
+
+    assert_eq!(
+        registry
+            .lock_entities("inspect atomically rejected arrow")
+            .snapshot(arrow_id),
+        Some(arrow_before)
+    );
+    assert_eq!(server_entity_health(&registry, cow_id), cow_health);
+    assert_eq!(
+        target_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .survival
+            .health,
+        SurvivalState::MAX_HEALTH - 1.0
+    );
+    assert!(matches!(
+        owner_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(matches!(
+        target_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn stale_entity_target_cas_rejects_arrow_and_all_target_damage() {
+    let registry = Arc::new(SessionRegistry::new());
+    let (owner_tx, _owner_rx) = mpsc::channel(16);
+    let (owner, _) = registry.register(
+        &profile("ArrowEntityCasOwner"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        owner_tx,
+        PlayerPose::new(0.5, 64.0, 0.0),
+    );
+    assert!(registry.mark_loaded(owner, (0, 0)).is_empty());
+    let first_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected first cow spawn dispatch, got {other:?}"),
+    };
+    let stale_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 3.0),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected stale cow spawn dispatch, got {other:?}"),
+    };
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(owner),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 5.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    let (arrow_before, first_before, stale_before) = {
+        let mut inner = registry.lock_session_entities("seed stale entity CAS transaction");
+        let expected = inner.entities.snapshot(arrow_id).expect("spawned arrow");
+        let mut next = expected.clone();
+        next.retained
+            .arrow_state
+            .as_mut()
+            .expect("spawned arrow has ECS kernel state")
+            .pierce_level = 1;
+        assert!(
+            inner
+                .entities
+                .replace_snapshot_if_current(expected, next.clone())
+        );
+        (
+            next,
+            inner.entities.snapshot(first_id).expect("first cow"),
+            inner.entities.snapshot(stale_id).expect("stale cow"),
+        )
+    };
+    let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    registry.install_arrow_transaction_probe(reached_tx, resume_rx);
+    let (owner_tx, mut owner_rx) = mpsc::channel(16);
+    registry
+        .lock_inner("isolate stale entity CAS publications")
+        .sessions
+        .get_mut(&owner)
+        .expect("arrow owner remains registered")
+        .tx = owner_tx;
+    let tick_registry = Arc::clone(&registry);
+    let tick = std::thread::spawn(move || {
+        tick_registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 5.0),
+                velocity: Vec3::new(0.0, 0.0, 5.0),
+                on_ground: false,
+                horizontal_collision: false,
+            }],
+        );
+    });
+    reached_rx
+        .recv()
+        .expect("arrow preparation reaches entity CAS boundary");
+    {
+        let mut entities = registry.lock_entities("change later arrow target before CAS");
+        let expected = entities.snapshot(stale_id).expect("stale target remains");
+        let mut next = expected.clone();
+        next.health -= 1.0;
+        assert!(entities.replace_snapshot_if_current(expected, next));
+    }
+    resume_tx.send(()).expect("release entity CAS transaction");
+    tick.join().expect("entity CAS transaction worker joins");
+
+    let entities = registry.lock_entities("inspect rejected entity CAS transaction");
+    assert_eq!(entities.snapshot(arrow_id), Some(arrow_before));
+    assert_eq!(entities.snapshot(first_id), Some(first_before));
+    let mut expected_stale = stale_before;
+    expected_stale.health -= 1.0;
+    assert_eq!(entities.snapshot(stale_id), Some(expected_stale));
+    drop(entities);
+    assert!(matches!(
+        owner_rx.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[test]
+fn rejected_player_damage_preserves_projectile_for_invulnerable_targets() {
+    for (name, mode, dead) in [
+        ("ArrowCreativeTarget", GameMode::Creative, false),
+        ("ArrowSpectatorTarget", GameMode::Spectator, false),
+        ("ArrowDeadTarget", GameMode::Survival, true),
+    ] {
+        let registry = SessionRegistry::new();
+        let (owner_tx, _owner_rx) = mpsc::channel(8);
+        let (target_tx, mut target_rx) = mpsc::channel(8);
+        let (owner, _) = registry.register(
+            &profile(&format!("{name}Owner")),
+            (0, 0),
+            2,
+            HashSet::new(),
+            owner_tx,
+            PlayerPose::new(0.5, 64.0, 0.0),
+        );
+        let (target, _) = registry.register(
+            &profile(name),
+            (0, 0),
+            2,
+            HashSet::new(),
+            target_tx,
+            PlayerPose::new(0.5, 64.0, 1.5),
+        );
+        registry.mark_loaded(owner, (0, 0));
+        registry.mark_loaded(target, (0, 0));
+        let mut persisted = PlayerPersistedState::new_default(PlayerPose::new(0.5, 64.0, 1.5));
+        persisted.game_mode = mode;
+        if dead {
+            persisted.survival.apply_damage(SurvivalState::MAX_HEALTH);
+        }
+        let target_state = Arc::new(Mutex::new(persisted));
+        registry.register_player_persistence(target, Arc::clone(&target_state));
+        let arrow_id = match &registry.spawn_arrow_for_test(
+            Some(owner),
+            1,
+            Vec3::new(0.5, 64.75, 0.0),
+            Vec3::new(0.0, 0.0, 2.0),
+            Rotation::ZERO,
+        )[0]
+        .command
+        {
+            OutboundCommand::SpawnEntity(entity) => entity.id,
+            other => panic!("expected arrow spawn dispatch, got {other:?}"),
+        };
+
+        registry.apply_entity_physics_and_dispatch(
+            1,
+            &[EntityPhysicsStep {
+                id: arrow_id,
+                position: Vec3::new(0.5, 64.75, 2.0),
+                velocity: Vec3::new(0.0, 0.0, 2.0),
+                on_ground: false,
+                horizontal_collision: false,
+            }],
+        );
+
+        assert!(
+            registry.server_entity_snapshot(arrow_id).is_some(),
+            "{name}"
+        );
+        assert!(
+            !target_rx.try_recv().is_ok_and(|command| matches!(
+                command,
+                OutboundCommand::PlayerDamageCommitted { .. }
+            )),
+            "{name}"
+        );
+        let state = target_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.game_mode, mode, "{name}");
+        assert_eq!(state.survival.is_dead(), dead, "{name}");
+    }
+}
+
+#[test]
+fn closed_player_publication_queue_does_not_create_false_projectile_rejection() {
+    let registry = SessionRegistry::new();
+    let (owner_tx, _owner_rx) = mpsc::channel(8);
+    let (target_tx, target_rx) = mpsc::channel(1);
+    let (owner, _) = registry.register(
+        &profile("ArrowClosedQueueOwner"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        owner_tx,
+        PlayerPose::new(0.5, 64.0, 0.0),
+    );
+    let (target, _) = registry.register(
+        &profile("ArrowClosedQueueTarget"),
+        (0, 0),
+        2,
+        HashSet::new(),
+        target_tx,
+        PlayerPose::new(0.5, 64.0, 1.5),
+    );
+    drop(target_rx);
+    registry.mark_loaded(owner, (0, 0));
+    registry.mark_loaded(target, (0, 0));
+    let target_state = Arc::new(Mutex::new(PlayerPersistedState::new_default(
+        PlayerPose::new(0.5, 64.0, 1.5),
+    )));
+    registry.register_player_persistence(target, Arc::clone(&target_state));
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(owner),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 2.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 2.0),
+            velocity: Vec3::new(0.0, 0.0, 2.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert!(registry.server_entity_snapshot(arrow_id).is_none());
+    assert_eq!(
+        target_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .survival
+            .health,
+        SurvivalState::MAX_HEALTH - ARROW_ENTITY_HIT_DAMAGE
+    );
 }
 
 #[test]
@@ -6054,7 +7448,7 @@ fn moving_arrow_does_not_hit_owner_without_other_targets() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(owner_id, (0, 0)).is_empty());
-    let arrow_id = match &registry.spawn_arrow_legacy_for_test(
+    let arrow_id = match &registry.spawn_arrow_for_test(
         Some(owner_id),
         1,
         Vec3::new(0.5, 64.75, 0.0),
@@ -6082,6 +7476,102 @@ fn moving_arrow_does_not_hit_owner_without_other_targets() {
     while let Ok(command) = owner_rx.try_recv() {
         assert!(!matches!(command, OutboundCommand::DamagePlayer { .. }));
     }
+}
+
+#[test]
+fn moving_arrow_skips_owner_root_vehicle_before_external_target() {
+    let registry = SessionRegistry::new();
+    let observer = register_test_session(&registry, "ArrowOwnerRootVehicle");
+    assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
+    let owner_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 1.0),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected owner spawn dispatch, got {other:?}"),
+    };
+    let vehicle_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        8,
+        "minecraft:oak_boat".to_string(),
+        Vec3::new(0.5, 64.0, 1.0),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected vehicle spawn dispatch, got {other:?}"),
+    };
+    let target_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        2,
+        "minecraft:cow".to_string(),
+        Vec3::new(0.5, 64.0, 2.5),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected target spawn dispatch, got {other:?}"),
+    };
+    let arrow_id = match &registry.spawn_arrow_for_test(
+        Some(observer),
+        1,
+        Vec3::new(0.5, 64.75, 0.0),
+        Vec3::new(0.0, 0.0, 3.0),
+        Rotation::ZERO,
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected arrow spawn dispatch, got {other:?}"),
+    };
+    {
+        let mut inner = registry.lock_session_entities("install ECS owner vehicle relation");
+        let vehicle = inner.entities.snapshot(vehicle_id).expect("vehicle exists");
+        let mut next_vehicle = vehicle.clone();
+        next_vehicle.vehicle = Some(mc_entity::VehicleState {
+            kind: mc_entity::VehicleKind::Boat,
+            passenger: Some(owner_id),
+        });
+        assert!(
+            inner
+                .entities
+                .replace_snapshot_if_current(vehicle, next_vehicle)
+        );
+        let arrow = inner.entities.snapshot(arrow_id).expect("arrow exists");
+        let mut next_arrow = arrow.clone();
+        next_arrow
+            .retained
+            .arrow_state
+            .as_mut()
+            .expect("arrow state is ECS-owned")
+            .projectile
+            .owner = Some(projectiles::projectile_identity(owner_id));
+        assert!(
+            inner
+                .entities
+                .replace_snapshot_if_current(arrow, next_arrow)
+        );
+    }
+    let vehicle_health = server_entity_health(&registry, vehicle_id);
+
+    registry.apply_entity_physics_and_dispatch(
+        1,
+        &[EntityPhysicsStep {
+            id: arrow_id,
+            position: Vec3::new(0.5, 64.75, 3.0),
+            velocity: Vec3::new(0.0, 0.0, 3.0),
+            on_ground: false,
+            horizontal_collision: false,
+        }],
+    );
+
+    assert_eq!(server_entity_health(&registry, vehicle_id), vehicle_health);
+    assert_eq!(server_entity_health(&registry, target_id), 6.0);
+    assert!(registry.server_entity_snapshot(arrow_id).is_none());
 }
 
 fn registration<'a>(
@@ -6349,12 +7839,12 @@ fn item_pickup_claims_entity_once() {
     let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
 
     let claimed = registry
-        .claim_item_pickup_legacy_for_test(entity_id, alice, 3)
+        .claim_item_pickup_for_test(entity_id, alice, 3)
         .unwrap();
     assert_eq!(claimed.stack, EntityItemStack::new(42, 3));
     assert!(
         registry
-            .claim_item_pickup_legacy_for_test(entity_id, bob, 3)
+            .claim_item_pickup_for_test(entity_id, bob, 3)
             .is_none()
     );
     assert!(
@@ -6378,7 +7868,7 @@ fn concurrent_item_pickup_has_one_claimant_and_exact_stack() {
         let gate = Arc::clone(&gate);
         std::thread::spawn(move || {
             gate.wait();
-            registry.claim_item_pickup_legacy_for_test(entity_id, collector, 3)
+            registry.claim_item_pickup_for_test(entity_id, collector, 3)
         })
     });
 
@@ -6412,7 +7902,7 @@ fn item_pickup_preserves_damage_on_partial_claim() {
     let before_pickup = registry.pressure_snapshot().entity_dispatches;
 
     let claimed = registry
-        .claim_item_pickup_legacy_for_test(entity_id, alice, 1)
+        .claim_item_pickup_for_test(entity_id, alice, 1)
         .unwrap();
     let remaining = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0]
         .item_stack
@@ -6448,7 +7938,7 @@ fn item_pickup_counts_take_and_remove_per_observer() {
     let before_pickup = registry.pressure_snapshot().entity_dispatches;
 
     let claimed = registry
-        .claim_item_pickup_legacy_for_test(entity_id, alice, 3)
+        .claim_item_pickup_for_test(entity_id, alice, 3)
         .unwrap();
     let after_pickup = registry.pressure_snapshot().entity_dispatches;
 
@@ -6471,6 +7961,27 @@ fn item_drop_records_age_and_remaining_pickup_delay() {
 }
 
 #[test]
+fn item_drop_spawn_installs_required_retained_state_in_one_ecs_transaction() {
+    let registry = SessionRegistry::new();
+    registry.reset_entity_owner_requests_for_test();
+
+    registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
+
+    assert_eq!(registry.entity_owner_requests_for_test(), 2);
+    let snapshot = registry
+        .lock_entities("read atomic item spawn")
+        .snapshots_vec()
+        .into_iter()
+        .find(|snapshot| snapshot.item_stack.is_some())
+        .expect("spawned item remains authoritative");
+    assert_eq!(snapshot.retained.spawn_tick, 0);
+    assert_eq!(
+        snapshot.retained.item_pickup_ready_tick,
+        Some(ITEM_PICKUP_DELAY_TICKS)
+    );
+}
+
+#[test]
 fn setting_world_time_does_not_age_item_lifecycle() {
     let registry = SessionRegistry::new();
     registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 3));
@@ -6487,6 +7998,9 @@ fn setting_world_time_does_not_age_item_lifecycle() {
 fn restored_item_respects_remaining_pickup_delay() {
     let registry = SessionRegistry::new();
     let alice = register_test_session(&registry, "RestorePickupAlice");
+    let mut retained = mc_entity::EntityRetainedState::default();
+    retained.spawn_tick = 0;
+    retained.item_pickup_ready_tick = Some(15);
     let record = PersistedEntityRecord {
         snapshot: mc_entity::EntitySnapshot {
             id: mc_entity::EntityId(77),
@@ -6506,18 +8020,23 @@ fn restored_item_respects_remaining_pickup_delay() {
             goal: mc_entity::GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained,
         },
         age: 12,
         pickup_delay: 3,
     };
-    assert_eq!(registry.restore_persisted_entities([record]), 1);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(12, vec![record])),
+        1
+    );
     assert_eq!(
         registry
-            .lock_inner("inspect restored item lifecycle index")
-            .item_spawn_ticks
-            .get(&EntityId(77))
-            .copied(),
-        Some(0)
+            .lock_entities("inspect restored item ECS timing")
+            .snapshot(EntityId(77))
+            .unwrap()
+            .retained
+            .spawn_tick,
+        0
     );
 
     assert!(
@@ -6529,7 +8048,7 @@ fn restored_item_respects_remaining_pickup_delay() {
     let entity_id = registry.nearby_item_entities(Vec3::new(0.5, 64.0, 0.5), 2.25)[0].id;
     assert!(
         registry
-            .claim_item_pickup_legacy_for_test(entity_id, alice, 3)
+            .claim_item_pickup_for_test(entity_id, alice, 3)
             .is_some()
     );
 }
@@ -6537,7 +8056,7 @@ fn restored_item_respects_remaining_pickup_delay() {
 #[test]
 fn persisted_restore_preserves_forward_passenger_links_atomically() {
     let mut passenger_store = mc_entity::EntityStore::with_next_id(1);
-    let passenger_id = passenger_store.spawn_authoritative(mc_entity::SpawnEntity::new(
+    let passenger_id = passenger_store.spawn(mc_entity::SpawnEntity::new(
         4,
         "minecraft:cow",
         Vec3::new(0.5, 64.0, 0.5),
@@ -6548,7 +8067,7 @@ fn persisted_restore_preserves_forward_passenger_links_atomically() {
     assert_eq!(passenger_id, EntityId(2));
 
     let mut vehicle_store = mc_entity::EntityStore::new();
-    let vehicle_id = vehicle_store.spawn_authoritative(mc_entity::SpawnEntity::vehicle(
+    let vehicle_id = vehicle_store.spawn(mc_entity::SpawnEntity::vehicle(
         mc_entity::VehicleKind::Boat,
         8,
         "minecraft:oak_boat",
@@ -6562,18 +8081,21 @@ fn persisted_restore_preserves_forward_passenger_links_atomically() {
 
     let registry = SessionRegistry::new();
     assert_eq!(
-        registry.restore_persisted_entities([
-            PersistedEntityRecord {
-                snapshot: vehicle,
-                age: 0,
-                pickup_delay: 0,
-            },
-            PersistedEntityRecord {
-                snapshot: passenger,
-                age: 0,
-                pickup_delay: 0,
-            },
-        ]),
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            0,
+            vec![
+                PersistedEntityRecord {
+                    snapshot: vehicle,
+                    age: 0,
+                    pickup_delay: 0,
+                },
+                PersistedEntityRecord {
+                    snapshot: passenger,
+                    age: 0,
+                    pickup_delay: 0,
+                },
+            ],
+        )),
         2
     );
     let restored = registry.persisted_entity_records();
@@ -6593,7 +8115,7 @@ fn persisted_restore_preserves_forward_passenger_links_atomically() {
 #[test]
 fn vehicle_crossing_publishes_authoritative_passenger_motion() {
     let mut passenger_store = mc_entity::EntityStore::with_next_id(1);
-    let passenger_id = passenger_store.spawn_authoritative(mc_entity::SpawnEntity::new(
+    let passenger_id = passenger_store.spawn(mc_entity::SpawnEntity::new(
         4,
         "minecraft:cow",
         Vec3::new(127.75, 64.0, 0.5),
@@ -6602,7 +8124,7 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
         .snapshot(passenger_id)
         .expect("passenger snapshot");
     let mut vehicle_store = mc_entity::EntityStore::new();
-    let vehicle_id = vehicle_store.spawn_authoritative(mc_entity::SpawnEntity::vehicle(
+    let vehicle_id = vehicle_store.spawn(mc_entity::SpawnEntity::vehicle(
         mc_entity::VehicleKind::Boat,
         8,
         "minecraft:oak_boat",
@@ -6614,18 +8136,21 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
     vehicle.vehicle.as_mut().expect("vehicle state").passenger = Some(passenger_id);
     let registry = SessionRegistry::new();
     assert_eq!(
-        registry.restore_persisted_entities([
-            PersistedEntityRecord {
-                snapshot: vehicle,
-                age: 0,
-                pickup_delay: 0,
-            },
-            PersistedEntityRecord {
-                snapshot: passenger,
-                age: 0,
-                pickup_delay: 0,
-            },
-        ]),
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            0,
+            vec![
+                PersistedEntityRecord {
+                    snapshot: vehicle,
+                    age: 0,
+                    pickup_delay: 0,
+                },
+                PersistedEntityRecord {
+                    snapshot: passenger,
+                    age: 0,
+                    pickup_delay: 0,
+                },
+            ],
+        )),
         2
     );
 
@@ -6649,6 +8174,7 @@ fn vehicle_crossing_publishes_authoritative_passenger_motion() {
                 horizontal_collision: false,
             },
         ],
+        &[],
     );
 
     assert_eq!(accepted.len(), 2);
@@ -6684,7 +8210,8 @@ fn item_drop_despawns_after_lifetime() {
 fn item_lifecycle_index_tracks_only_item_entities_and_clears_on_remove() {
     let registry = SessionRegistry::new();
     let collector = register_test_session(&registry, "ItemIndexCollector");
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -6699,21 +8226,26 @@ fn item_lifecycle_index_tracks_only_item_entities_and_clears_on_remove() {
         .snapshot
         .id;
 
-    {
-        let inner = registry.lock_inner("inspect item lifecycle index");
-        assert_eq!(inner.item_spawn_ticks, HashMap::from([(item_id, 0)]));
-    }
+    assert_eq!(
+        registry
+            .lock_entities("inspect item ECS timing")
+            .snapshot(item_id)
+            .unwrap()
+            .retained
+            .spawn_tick,
+        0
+    );
     registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
     assert!(
         registry
-            .claim_item_pickup_legacy_for_test(item_id, collector, 1)
+            .claim_item_pickup_for_test(item_id, collector, 1)
             .is_some()
     );
     assert!(
         registry
-            .lock_inner("inspect cleared item lifecycle index")
-            .item_spawn_ticks
-            .is_empty()
+            .lock_entities("inspect removed item ECS row")
+            .snapshot(item_id)
+            .is_none()
     );
 }
 
@@ -6736,7 +8268,7 @@ fn item_despawn_sweep_is_budgeted() {
 }
 
 #[test]
-fn restored_arrow_age_controls_despawn_timer() {
+fn restored_arrow_total_age_does_not_bypass_kernel_grounded_age() {
     let registry = SessionRegistry::new();
     let record = PersistedEntityRecord {
         snapshot: mc_entity::EntitySnapshot {
@@ -6757,16 +8289,23 @@ fn restored_arrow_age_controls_despawn_timer() {
             goal: mc_entity::GoalState::Idle,
             vehicle: None,
             animal: None,
+            retained: mc_entity::EntityRetainedState::default(),
         },
-        age: (ARROW_DESPAWN_AGE_TICKS - 1) as i32,
+        age: mc_entity::projectile_26_1_2::ARROW_DESPAWN_TICKS - 1,
         pickup_delay: 0,
     };
-    assert_eq!(registry.restore_persisted_entities([record]), 1);
+    assert_eq!(
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            mc_entity::projectile_26_1_2::ARROW_DESPAWN_TICKS as u64 - 1,
+            vec![record],
+        )),
+        1
+    );
     registry.advance_world_time(1);
 
     registry.apply_entity_physics_and_dispatch(1, &[]);
 
-    assert!(registry.persisted_entity_records().is_empty());
+    assert_eq!(registry.persisted_entity_records().len(), 1);
 }
 
 #[test]
@@ -6787,7 +8326,7 @@ fn pressure_snapshot_counts_entity_spawn_move_and_pickup_dispatches() {
     assert_eq!(after_spawn.remove, start.remove);
 
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned entity").id
     };
     registry.apply_entity_physics_and_dispatch(
@@ -6806,7 +8345,7 @@ fn pressure_snapshot_counts_entity_spawn_move_and_pickup_dispatches() {
 
     registry.advance_world_time(ITEM_PICKUP_DELAY_TICKS);
     let claimed = registry
-        .claim_item_pickup_legacy_for_test(entity_id, alice, 3)
+        .claim_item_pickup_for_test(entity_id, alice, 3)
         .unwrap();
     assert_eq!(claimed.dispatches.len(), 2);
 
@@ -6861,7 +8400,8 @@ fn boundary_spawn_does_not_send_same_tick_relative_move_to_new_observer() {
     assert!(registry.mark_loaded(alice, (1, 0)).is_empty());
     assert!(
         registry
-            .spawn_command_entity_legacy_for_test(
+            .spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_string(),
                 Vec3::new(0.5, 64.0, 0.5),
@@ -6869,7 +8409,7 @@ fn boundary_spawn_does_not_send_same_tick_relative_move_to_new_observer() {
             .is_empty()
     );
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned entity").id
     };
 
@@ -6900,14 +8440,15 @@ fn planned_spawn_orders_concurrent_entity_movement_before_channel_delivery() {
         tx,
         PlayerPose::new(0.5, 64.0, 0.5),
     );
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     assert!(spawn.is_empty());
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned entity").id
     };
 
@@ -6958,7 +8499,8 @@ fn dropped_planned_spawn_disconnects_without_releasing_entity_movement() {
     );
     assert!(
         registry
-            .spawn_command_entity_legacy_for_test(
+            .spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_string(),
                 Vec3::new(0.5, 64.0, 0.5),
@@ -6966,7 +8508,7 @@ fn dropped_planned_spawn_disconnects_without_releasing_entity_movement() {
             .is_empty()
     );
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned entity").id
     };
     let spawn = registry.mark_loaded(alice, (0, 0));
@@ -7004,7 +8546,8 @@ fn older_physics_movement_keeps_its_order_across_unlocked_fanout() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn = registry.spawn_command_entity_legacy_for_test(
+    let spawn = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -7056,7 +8599,7 @@ fn older_physics_movement_keeps_its_order_across_unlocked_fanout() {
     assert!(matches!(
         rx.try_recv(),
         Ok(OutboundCommand::MoveEntityRelative(movement))
-            if movement.id == entity_id && movement.send_position_rotation
+            if movement.id == entity_id && movement.wire_move.is_some()
     ));
     assert!(matches!(
         rx.try_recv(),
@@ -7081,7 +8624,8 @@ fn one_chunk_crossing_does_not_suppress_other_entity_movement() {
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
     assert!(registry.mark_loaded(alice, (1, 0)).is_empty());
 
-    let crossing_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let crossing_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(15.5, 64.0, 0.5),
@@ -7095,7 +8639,8 @@ fn one_chunk_crossing_does_not_suppress_other_entity_movement() {
         .expect("crossing zombie is visible");
     dispatch_visibility_commands(crossing_dispatches);
 
-    let local_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let local_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -7164,14 +8709,15 @@ fn moving_mobs_send_velocity_with_relative_move() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     dispatch_visibility_commands(spawn_dispatches);
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned entity").id
     };
 
@@ -7206,15 +8752,15 @@ fn unchanged_mob_velocity_is_not_sent_again() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     dispatch_visibility_commands(spawn_dispatches);
     let entity_id = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .next()
         .expect("spawned entity")
@@ -7257,15 +8803,15 @@ fn stopped_mob_sends_zero_velocity_without_position_delta() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     dispatch_visibility_commands(spawn_dispatches);
     let entity_id = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .next()
         .expect("spawned entity")
@@ -7301,7 +8847,7 @@ fn stopped_mob_sends_zero_velocity_without_position_delta() {
     let Ok(OutboundCommand::MoveEntityRelative(stopped)) = rx.try_recv() else {
         panic!("expected zero-velocity transition");
     };
-    assert_eq!(stopped.delta, Vec3::ZERO);
+    assert_eq!(stopped.wire_move, None);
     assert_eq!(stopped.velocity, Vec3::ZERO);
     assert!(stopped.send_velocity);
 }
@@ -7319,15 +8865,15 @@ fn stationary_goal_rotation_survives_physics_commit_and_is_dispatched() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     dispatch_visibility_commands(spawn_dispatches);
     let entity = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .next()
         .expect("spawned entity");
@@ -7338,8 +8884,7 @@ fn stationary_goal_rotation_survives_physics_commit_and_is_dispatched() {
         head_yaw: 90.0,
     };
     registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .apply_kinematics([EntityKinematics {
             id: entity_id,
             position: entity.position,
@@ -7370,7 +8915,14 @@ fn stationary_goal_rotation_survives_physics_commit_and_is_dispatched() {
     let Ok(OutboundCommand::MoveEntityRelative(rotated)) = rx.try_recv() else {
         panic!("expected stationary rotation update");
     };
-    assert_eq!(rotated.delta, Vec3::ZERO);
+    assert_eq!(
+        rotated.wire_move,
+        Some(
+            crate::play::wire_entities::ServerEntityWireMove::PositionRotation {
+                delta: Vec3::ZERO,
+            }
+        )
+    );
     assert_eq!(rotated.rotation, rotation);
 }
 
@@ -7387,7 +8939,8 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
@@ -7402,7 +8955,12 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
     dispatch_visibility_commands(spawn_dispatches);
     assert!(matches!(rx.try_recv(), Ok(OutboundCommand::SpawnEntity(_))));
     let (published_before, chunk_before) = {
-        let inner = registry.inner.lock().expect("session registry poisoned");
+        let mut inner = registry.inner.lock().expect("session registry poisoned");
+        inner
+            .last_sent_entity_states
+            .get_mut(&entity_id)
+            .expect("spawned entity has tracker state")
+            .tracking_update_count = 1;
         (
             inner
                 .published_entity_snapshots
@@ -7424,8 +8982,12 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
         }],
     );
 
-    let (published_after, chunk_after) = {
+    let (published_after, chunk_after, tracker_count, teleport_delay) = {
         let inner = registry.inner.lock().expect("session registry poisoned");
+        let tracker = inner
+            .last_sent_entity_states
+            .get(&entity_id)
+            .expect("spawned entity keeps tracker state");
         (
             inner
                 .published_entity_snapshots
@@ -7433,6 +8995,8 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
                 .cloned()
                 .expect("published zombie snapshot"),
             inner.entity_chunks.get(&entity_id).copied(),
+            tracker.tracking_update_count,
+            tracker.teleport_delay,
         )
     };
     assert_eq!(published_after.position, published_before.position);
@@ -7440,6 +9004,8 @@ fn non_finite_entity_physics_is_rejected_before_visibility_mutation() {
     assert_eq!(published_after.velocity, published_before.velocity);
     assert_eq!(published_after.on_ground, published_before.on_ground);
     assert_eq!(chunk_after, chunk_before);
+    assert_eq!(tracker_count, 1);
+    assert_eq!(teleport_delay, 0);
     assert!(rx.try_recv().is_err());
 }
 
@@ -7456,14 +9022,14 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(alice, (0, 0)).is_empty());
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 0.5),
     );
     let initial = registry
-        .entities
-        .access_for_test()
+        .lock_entities("test entity access")
         .snapshots()
         .next()
         .expect("spawned entity");
@@ -7487,6 +9053,15 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
             horizontal_collision: false,
         }],
     );
+    {
+        let mut inner = registry.lock_inner("prepare stale physics tracker cadence");
+        let tracker = inner
+            .last_sent_entity_states
+            .get_mut(&initial.id)
+            .expect("spawned entity has tracker state");
+        tracker.tracking_update_count = 59;
+        tracker.teleport_delay = 399;
+    }
 
     registry.apply_entity_physics_if_current_and_dispatch(
         2,
@@ -7505,6 +9080,13 @@ fn stale_entity_physics_result_does_not_overwrite_newer_kinematics() {
         .expect("entity remains published");
     assert_eq!(current.position, newer_position);
     assert_eq!(current.velocity, newer_velocity);
+    let inner = registry.lock_inner("verify stale physics tracker cadence");
+    let tracker = inner
+        .last_sent_entity_states
+        .get(&initial.id)
+        .expect("spawned entity keeps tracker state");
+    assert_eq!(tracker.tracking_update_count, 59);
+    assert_eq!(tracker.teleport_delay, 399);
 }
 
 #[test]
@@ -7542,7 +9124,8 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
     );
     registry.mark_loaded(new_observer, (1, 0));
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_string(),
             Vec3::new(15.95, 64.0, 0.5),
@@ -7563,7 +9146,7 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
         .expect("published zombie snapshot")
         .position;
     let expected_chunk = chunk_pos_from_coords(position.x, position.z);
-    assert_eq!(expected_chunk, (1, 0), "fixture must cross the chunk edge");
+    assert_eq!(expected_chunk, (0, 0));
     assert_eq!(inner.entity_chunks.get(&entity_id), Some(&expected_chunk));
     assert!(
         inner
@@ -7574,17 +9157,17 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
     assert!(
         inner
             .entities_by_chunk
-            .get(&(0, 0))
+            .get(&(1, 0))
             .is_none_or(|entities| !entities.contains(&entity_id))
     );
-    assert!(dispatches.iter().any(|dispatch| {
+    assert!(!dispatches.iter().any(|dispatch| {
         dispatch.recipient.id == old_observer
             && matches!(
                 &dispatch.command,
                 OutboundCommand::DespawnEntity(entity) if entity.id == entity_id
             )
     }));
-    assert!(dispatches.iter().any(|dispatch| {
+    assert!(!dispatches.iter().any(|dispatch| {
         dispatch.recipient.id == new_observer
             && matches!(
                 &dispatch.command,
@@ -7596,7 +9179,9 @@ fn player_body_push_keeps_entity_chunk_index_with_authoritative_position() {
             && matches!(
                 &dispatch.command,
                 OutboundCommand::MoveEntityRelative(movement)
-                    if movement.id == entity_id && movement.delta.x > 0.0
+                    if movement.id == entity_id
+                        && movement.wire_move.is_none()
+                        && movement.velocity != Vec3::ZERO
             )
     }));
     assert!(!dispatches.iter().any(|dispatch| {
@@ -7631,7 +9216,12 @@ fn player_body_push_ignores_projectile_entities() {
     registry.mark_loaded(player, (0, 0));
     let initial_position = Vec3::new(5.0, 64.0, 0.5);
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(1, "minecraft:arrow".to_string(), initial_position)
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            1,
+            "minecraft:arrow".to_string(),
+            initial_position,
+        )
         .into_iter()
         .find_map(|dispatch| match dispatch.command {
             OutboundCommand::SpawnEntity(entity) => Some(entity.id),
@@ -7664,7 +9254,8 @@ fn player_body_push_only_visits_nearby_chunk_candidates() {
     );
     registry.mark_loaded(player, (0, 0));
     let near_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_string(),
             Vec3::new(0.6, 64.0, 0.5),
@@ -7676,27 +9267,24 @@ fn player_body_push_only_visits_nearby_chunk_candidates() {
         })
         .expect("near zombie is visible");
     for x in [160.5, 320.5] {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_string(),
             Vec3::new(x, 64.0, 0.5),
         );
     }
-    let initial_position = registry
+    let initial = registry
         .server_entity_snapshot(near_id)
-        .expect("near zombie snapshot")
-        .position;
+        .expect("near zombie snapshot");
 
     let _ = registry.update_pose(player, PlayerPose::new(0.3, 64.0, 0.5));
 
-    assert_ne!(
-        registry
-            .server_entity_snapshot(near_id)
-            .expect("near zombie remains")
-            .position,
-        initial_position,
-        "near overlapping zombie must still be pushed"
-    );
+    let pushed = registry
+        .server_entity_snapshot(near_id)
+        .expect("near zombie remains");
+    assert_eq!(pushed.position, initial.position);
+    assert_ne!(pushed.velocity, initial.velocity);
     assert_eq!(
         registry.player_push_entity_visits.load(Ordering::Relaxed),
         1,
@@ -7728,7 +9316,8 @@ fn accepted_pose_orders_body_push_before_player_movement_and_pickup() {
     );
     registry.mark_loaded(observer, (0, 0));
     let pushed_entity = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.6, 64.0, 0.5),
@@ -7791,7 +9380,8 @@ fn player_body_push_releases_both_locks_before_session_publication() {
     let observer = register_test_session(&registry, "PushCommitLocksObserver");
     let _ = registry.mark_loaded(observer, (0, 0));
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.6, 64.0, 0.5),
@@ -7878,7 +9468,8 @@ fn player_body_push_rejects_removed_same_id_replacement_before_publication() {
     let observer = register_test_session(&registry, "PushReplacementObserver");
     let _ = registry.mark_loaded(observer, (0, 0));
     let entity_id = registry
-        .spawn_command_entity_legacy_for_test(
+        .spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_owned(),
             Vec3::new(0.6, 64.0, 0.5),
@@ -7917,14 +9508,14 @@ fn player_body_push_rejects_removed_same_id_replacement_before_publication() {
         let pushed = entities
             .snapshot(entity_id)
             .expect("body push mutation remains in ECS");
-        assert_ne!(pushed.position, published_before.position);
+        assert_ne!(pushed.velocity, published_before.velocity);
         let removed = entities
             .remove_if_current(pushed)
             .expect("remove body-pushed entity");
         let mut replacement = removed;
         replacement.uuid = uuid::Uuid::from_u128(0xfeed_cafe);
         replacement.position = Vec3::new(4.5, 64.0, 0.5);
-        assert!(entities.insert_authoritative_snapshots_batch([replacement.clone()]));
+        assert!(entities.insert_snapshots_batch([replacement.clone()]));
         replacement
     };
     resume_tx.send(()).expect("release body push publication");
@@ -7968,7 +9559,8 @@ fn moving_mobs_share_one_relative_move_batch_per_observer() {
 
     let mut entity_ids = Vec::new();
     for x in [0.5, 1.5] {
-        let dispatches = registry.spawn_command_entity_legacy_for_test(
+        let dispatches = registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:zombie".to_string(),
             Vec3::new(x, 64.0, 0.5),
@@ -8023,7 +9615,8 @@ fn movement_fanout_skips_visibility_work_when_no_movement_is_published() {
     let registry = SessionRegistry::new();
     assert!(
         registry
-            .spawn_command_entity_legacy_for_test(
+            .spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_owned(),
                 Vec3::new(0.5, 64.0, 0.5),
@@ -8043,6 +9636,12 @@ fn movement_fanout_skips_visibility_work_when_no_movement_is_published() {
             .expect("registered no-op movement observer")
             .visible_entities = Arc::new(HashSet::from([entity_id]));
     }
+    registry
+        .lock_inner("place no-op movement outside tracker refresh cadence")
+        .last_sent_entity_states
+        .get_mut(&entity_id)
+        .expect("spawned entity has tracker state")
+        .tracking_update_count = 1;
 
     entity_simulation::reset_movement_fanout_work();
     registry.apply_entity_physics_and_dispatch(
@@ -8069,7 +9668,8 @@ fn movement_fanout_uses_exhaustive_scan_for_one_dense_movement() {
     let registry = SessionRegistry::new();
     assert!(
         registry
-            .spawn_command_entity_legacy_for_test(
+            .spawn_command_entity(
+                &SimulationAuthority::for_test(),
                 1,
                 "minecraft:zombie".to_owned(),
                 Vec3::new(0.5, 64.0, 0.5),
@@ -8139,7 +9739,8 @@ fn movement_fanout_indexes_sparse_disjoint_current_visibility() {
     for _ in 0..SESSION_COUNT {
         assert!(
             registry
-                .spawn_command_entity_legacy_for_test(
+                .spawn_command_entity(
+                    &SimulationAuthority::for_test(),
                     1,
                     "minecraft:zombie".to_owned(),
                     Vec3::new(0.5, 64.0, 0.5),
@@ -8332,7 +9933,7 @@ fn item_drop_relative_move_does_not_emit_extra_velocity_packet() {
         registry.spawn_item_drop(1, Vec3::new(0.5, 64.0, 0.5), EntityItemStack::new(42, 1));
     dispatch_visibility_commands(spawn_dispatches);
     let entity_id = {
-        let entities = registry.entities.access_for_test();
+        let entities = registry.lock_entities("test entity access");
         entities.snapshots().next().expect("spawned item").id
     };
 
@@ -8531,12 +10132,14 @@ async fn entity_movement_uses_ordered_backlog_when_channel_is_full() {
     let recipient = test_recipient(&registry, 96, tx);
     let movement = |delta_x| ServerEntityMove {
         id: EntityId(42),
-        delta: Vec3::new(delta_x, 0.0, 0.0),
+        wire_move: Some(crate::play::wire_entities::ServerEntityWireMove::Position {
+            delta: Vec3::new(delta_x, 0.0, 0.0),
+        }),
         velocity: Vec3::ZERO,
         rotation: Rotation::ZERO,
         on_ground: true,
-        send_position_rotation: true,
         send_velocity: false,
+        send_head_rotation: false,
     };
 
     dispatch_visibility_commands(vec![
@@ -8559,7 +10162,12 @@ async fn entity_movement_uses_ordered_backlog_when_channel_is_full() {
         for _ in 0..2 {
             match rx.recv().await {
                 Some(OutboundCommand::MoveEntityRelative(movement)) => {
-                    deltas.push(movement.delta.x);
+                    let Some(crate::play::wire_entities::ServerEntityWireMove::Position { delta }) =
+                        movement.wire_move
+                    else {
+                        panic!("expected relative position movement");
+                    };
+                    deltas.push(delta.x);
                 }
                 other => panic!("expected ordered entity movement, got {other:?}"),
             }
@@ -8844,7 +10452,7 @@ fn concurrent_xp_pickup_returns_authoritative_value_once() {
         let gate = Arc::clone(&gate);
         std::thread::spawn(move || {
             gate.wait();
-            registry.claim_experience_pickup_legacy_for_test(entity_id, collector)
+            registry.claim_experience_pickup_for_test(entity_id, collector)
         })
     });
 
@@ -8876,7 +10484,7 @@ fn pickup_claims_reject_entities_outside_player_radius() {
     registry.spawn_xp_orb(99, far_position, 5);
     let xp_id = registry.nearby_experience_entities(far_position, 0.5)[0].id;
 
-    registry.spawn_arrow_legacy_for_test(
+    registry.spawn_arrow_for_test(
         None,
         2,
         far_position,
@@ -8907,17 +10515,17 @@ fn pickup_claims_reject_entities_outside_player_radius() {
 
     assert!(
         registry
-            .claim_item_pickup_legacy_for_test(item_id, player, 1)
+            .claim_item_pickup_for_test(item_id, player, 1)
             .is_none()
     );
     assert!(
         registry
-            .claim_experience_pickup_legacy_for_test(xp_id, player)
+            .claim_experience_pickup_for_test(xp_id, player)
             .is_none()
     );
     assert!(
         registry
-            .claim_arrow_pickup_legacy_for_test(arrow_id, player)
+            .claim_arrow_pickup_for_test(arrow_id, player)
             .is_none()
     );
 }
@@ -8926,32 +10534,166 @@ fn pickup_claims_reject_entities_outside_player_radius() {
 fn damage_server_entity_respects_hurt_invulnerability_ticks() {
     let registry = SessionRegistry::new();
     let entity_id = {
-        let mut entities = registry.entities.access_for_test();
+        let mut entities = registry.lock_entities("test entity access");
         entities.spawn(SpawnEntity::new(1, "minecraft:zombie", Vec3::ZERO))
     };
 
     let first = registry
-        .damage_server_entity_legacy_for_test(entity_id, 5.0)
+        .damage_server_entity_for_test(entity_id, 5.0)
         .unwrap();
     assert_eq!(first.snapshot.health, 15.0);
+    assert_eq!(first.snapshot.retained.last_damage_tick, Some(0));
     assert!(
         registry
-            .damage_server_entity_legacy_for_test(entity_id, 5.0)
+            .damage_server_entity_for_test(entity_id, 5.0)
             .is_none()
     );
 
     registry.advance_world_time(ENTITY_HURT_INVULNERABLE_TICKS - 1);
     assert!(
         registry
-            .damage_server_entity_legacy_for_test(entity_id, 5.0)
+            .damage_server_entity_for_test(entity_id, 5.0)
             .is_none()
     );
 
     registry.advance_world_time(1);
     let second = registry
-        .damage_server_entity_legacy_for_test(entity_id, 5.0)
+        .damage_server_entity_for_test(entity_id, 5.0)
         .unwrap();
     assert_eq!(second.snapshot.health, 10.0);
+    assert_eq!(
+        second.snapshot.retained.last_damage_tick,
+        Some(ENTITY_HURT_INVULNERABLE_TICKS)
+    );
+}
+
+#[test]
+fn late_spawn_restart_preserves_every_retained_tick_decision() {
+    let source = SessionRegistry::new();
+    source.advance_world_time(100);
+    for (type_id, type_name, x) in [
+        (1, "minecraft:zombie", 0.5),
+        (2, "minecraft:chicken", 1.5),
+        (3, "minecraft:sheep", 2.5),
+    ] {
+        source.spawn_command_entity(
+            &SimulationAuthority::for_test(),
+            type_id,
+            type_name.to_owned(),
+            Vec3::new(x, 64.0, 0.5),
+        );
+    }
+    let records = source.persisted_entity_records();
+    let id_for = |type_name: &str| {
+        records
+            .iter()
+            .find(|record| record.snapshot.type_name == type_name)
+            .expect("spawned entity record")
+            .snapshot
+            .id
+    };
+    let hurt_id = id_for("minecraft:zombie");
+    let dying_id = id_for("minecraft:chicken");
+    let sheep_id = id_for("minecraft:sheep");
+    assert!(source.damage_server_entity_for_test(hurt_id, 5.0).is_some());
+    assert!(
+        source
+            .damage_server_entity_for_test(dying_id, 100.0)
+            .is_some_and(|damage| damage.killed)
+    );
+    assert!(source.set_sheep_grazing_ticks_for_test(sheep_id, Some(7)));
+    source.advance_world_time(3);
+
+    let checkpoint = source.persisted_entity_save_snapshot().0;
+    assert_eq!(checkpoint.lifecycle_clock, 103);
+    assert!(checkpoint.records.iter().all(|record| record.age == 3));
+    let restored = SessionRegistry::new();
+    assert_eq!(
+        restored.restore_persisted_entities(checkpoint),
+        3,
+        "restart must restore the checkpoint atomically"
+    );
+    assert_eq!(restored.simulation_tick(), 103);
+    let observer = register_test_session(&restored, "RestartClockObserver");
+    let _ = restored.mark_loaded(observer, (0, 0));
+
+    assert!(
+        restored
+            .damage_server_entity_for_test(hurt_id, 5.0)
+            .is_none(),
+        "three hurt-immunity ticks remain at restart"
+    );
+    for expected_remaining in [6, 5] {
+        restored.advance_world_time(1);
+        let grazing = restored
+            .plan_sheep_grazing(&SimulationAuthority::for_test(), restored.simulation_tick());
+        assert!(grazing.actions.is_empty());
+        assert_eq!(
+            restored
+                .lock_entities("inspect restored grazing countdown")
+                .snapshot(sheep_id)
+                .expect("restored sheep")
+                .retained
+                .sheep_grazing_ticks,
+            Some(expected_remaining)
+        );
+    }
+    assert!(
+        restored
+            .damage_server_entity_for_test(hurt_id, 5.0)
+            .is_none(),
+        "damage remains rejected through tick 105"
+    );
+    restored.advance_world_time(1);
+    let grazing =
+        restored.plan_sheep_grazing(&SimulationAuthority::for_test(), restored.simulation_tick());
+    assert_eq!(grazing.actions.len(), 1);
+    assert_eq!(grazing.actions[0].entity_id, sheep_id);
+    assert!(
+        restored
+            .damage_server_entity_for_test(hurt_id, 5.0)
+            .is_some(),
+        "damage is accepted at the exact restored immunity deadline"
+    );
+
+    restored.advance_world_time(13);
+    assert_eq!(restored.simulation_tick(), 119);
+    assert!(
+        restored
+            .tick_dying_entities(&SimulationAuthority::for_test(), 119)
+            .is_empty()
+    );
+    assert!(restored.server_entity_snapshot(dying_id).is_some());
+    restored.advance_world_time(1);
+    let dispatches = restored.tick_dying_entities(&SimulationAuthority::for_test(), 120);
+    assert!(
+        dispatches.is_empty(),
+        "a despawning entity is not republished to a post-restart observer"
+    );
+    assert!(restored.server_entity_snapshot(dying_id).is_none());
+}
+
+#[test]
+fn empty_restart_restores_clock_and_invalid_clock_leaves_origin_unchanged() {
+    let empty = SessionRegistry::new();
+    assert_eq!(
+        empty.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            777,
+            Vec::<PersistedEntityRecord>::new(),
+        )),
+        0
+    );
+    assert_eq!(empty.simulation_tick(), 777);
+
+    let overflow = SessionRegistry::new();
+    assert_eq!(
+        overflow.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            i64::MAX as u64 + 1,
+            Vec::<PersistedEntityRecord>::new(),
+        )),
+        0
+    );
+    assert_eq!(overflow.simulation_tick(), 0);
 }
 
 #[test]
@@ -8967,7 +10709,8 @@ fn player_melee_knockback_pushes_living_target_away_from_player() {
         PlayerPose::new(0.5, 64.0, 0.5),
     );
     assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
-    let entity_id = match &registry.spawn_command_entity_legacy_for_test(
+    let entity_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_string(),
         Vec3::new(0.5, 64.0, 1.5),
@@ -9206,14 +10949,14 @@ fn owner_blocked_item_does_not_push_pickup_candidate_to_owner() {
     let entity_id = registry.persisted_entity_records()[0].snapshot.id;
     let expires_tick = registry.simulation_tick().saturating_add(10);
     {
-        let mut inner = registry.lock_inner("test owner pickup block");
-        inner.item_pickup_owner_blocks.insert(
-            entity_id,
-            ItemPickupOwnerBlock {
-                owner_session: owner,
-                expires_tick,
-            },
-        );
+        let mut inner = registry.lock_session_entities("test owner pickup block");
+        let expected = inner.entities.snapshot(entity_id).unwrap();
+        let mut next = expected.clone();
+        next.retained.item_pickup_owner_block = Some(mc_entity::EntityItemPickupOwnerBlock {
+            owner_session: owner,
+            expires_tick,
+        });
+        assert!(inner.entities.replace_snapshot_if_current(expected, next));
     }
 
     let owner_dispatches = registry.update_pose(owner, PlayerPose::new(0.6, 64.0, 0.5));
@@ -9238,18 +10981,21 @@ fn owner_blocked_item_does_not_push_pickup_candidate_to_owner() {
 #[test]
 fn nearby_entity_candidates_only_visit_chunks_touched_by_the_radius() {
     let registry = SessionRegistry::new();
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(15.0, 64.0, 0.5),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(16.5, 64.0, 0.5),
     );
     for index in 0..20 {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:cow".to_owned(),
             Vec3::new(160.5 + f64::from(index), 64.0, 160.5),
@@ -9265,18 +11011,21 @@ fn nearby_entity_candidates_only_visit_chunks_touched_by_the_radius() {
 #[test]
 fn arrow_entity_candidates_only_visit_chunks_touched_by_segment() {
     let registry = SessionRegistry::new();
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(15.0, 64.0, 8.0),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:cow".to_owned(),
         Vec3::new(16.5, 64.0, 8.0),
     );
     for index in 0..20 {
-        registry.spawn_command_entity_legacy_for_test(
+        registry.spawn_command_entity(
+            &SimulationAuthority::for_test(),
             1,
             "minecraft:cow".to_owned(),
             Vec3::new(160.5 + f64::from(index) * 16.0, 64.0, 160.5),
@@ -9284,7 +11033,7 @@ fn arrow_entity_candidates_only_visit_chunks_touched_by_segment() {
     }
 
     let inner = registry.lock_session_entities("test arrow entity candidates");
-    let candidates = arrow_entity_candidate_ids_locked(
+    let candidates = arrow_entity_candidate_snapshots_locked(
         &inner,
         Vec3::new(14.5, 64.5, 8.0),
         Vec3::new(17.0, 64.5, 8.0),
@@ -9298,7 +11047,8 @@ fn hostile_entities_are_filtered_by_kind_and_radius() {
     let registry = SessionRegistry::new();
     let observer = register_test_session(&registry, "HostileQueryAlice");
     assert!(registry.mark_loaded(observer, (0, 0)).is_empty());
-    let spawn_dispatches = registry.spawn_command_entity_legacy_for_test(
+    let spawn_dispatches = registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(1.0, 64.0, 1.0),
@@ -9307,40 +11057,46 @@ fn hostile_entities_are_filtered_by_kind_and_radius() {
         OutboundCommand::SpawnEntity(entity) => entity.id,
         other => panic!("expected zombie spawn dispatch, got {other:?}"),
     };
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:cow".to_owned(),
         Vec3::new(1.5, 64.0, 1.0),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(20.0, 64.0, 20.0),
     );
     assert_eq!(
-        registry.restore_persisted_entities([PersistedEntityRecord {
-            snapshot: mc_entity::EntitySnapshot {
-                id: mc_entity::EntityId(777),
-                uuid: uuid::Uuid::nil(),
-                type_id: 1,
-                type_name: "minecraft:zombie".into(),
-                position: Vec3::new(1.25, 64.0, 1.0),
-                rotation: mc_entity::Rotation::ZERO,
-                velocity: Vec3::ZERO,
-                on_ground: true,
-                item_stack: Some(EntityItemStack::new(42, 1)),
-                experience_value: None,
-                block_state: None,
-                lifecycle: mc_entity::EntityLifecycle::Alive,
-                health: 20.0,
-                attributes: mc_entity::AttributeSet::new(),
-                goal: mc_entity::GoalState::Idle,
-                vehicle: None,
-                animal: None,
-            },
-            age: 0,
-            pickup_delay: 0,
-        }]),
+        registry.restore_persisted_entities(PersistedEntityCheckpoint::new(
+            0,
+            vec![PersistedEntityRecord {
+                snapshot: mc_entity::EntitySnapshot {
+                    id: mc_entity::EntityId(777),
+                    uuid: uuid::Uuid::nil(),
+                    type_id: 1,
+                    type_name: "minecraft:zombie".into(),
+                    position: Vec3::new(1.25, 64.0, 1.0),
+                    rotation: mc_entity::Rotation::ZERO,
+                    velocity: Vec3::ZERO,
+                    on_ground: true,
+                    item_stack: Some(EntityItemStack::new(42, 1)),
+                    experience_value: None,
+                    block_state: None,
+                    lifecycle: mc_entity::EntityLifecycle::Alive,
+                    health: 20.0,
+                    attributes: mc_entity::AttributeSet::new(),
+                    goal: mc_entity::GoalState::Idle,
+                    vehicle: None,
+                    animal: None,
+                    retained: mc_entity::EntityRetainedState::default(),
+                },
+                age: 0,
+                pickup_delay: 0,
+            }],
+        )),
         1
     );
 
@@ -9354,12 +11110,14 @@ fn hostile_entities_are_filtered_by_kind_and_radius() {
 #[test]
 fn bed_rest_prevention_uses_vanilla_cuboid() {
     let registry = SessionRegistry::new();
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         1,
         "minecraft:zombie".to_owned(),
         Vec3::new(8.75, 68.5, 8.75),
     );
-    registry.spawn_command_entity_legacy_for_test(
+    registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
         2,
         "minecraft:cow".to_owned(),
         Vec3::new(0.5, 64.0, 0.5),

@@ -1,14 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use mc_entity::{EntityId, EntityLifecycle, SpawnEntity, Vec3};
-use mc_protocol::codec::Identifier;
 use mc_world::BlockStateId;
 
 use crate::play::PlayerPose;
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
-use crate::play::explosions::{
-    PlayerExplosionImpact, PrimedTntFuse, TNT_ENTITY_TYPE_NAME, tnt_explosion_packet,
-};
+use crate::play::explosions::{PlayerExplosionImpact, TNT_ENTITY_TYPE_NAME, tnt_explosion_packet};
 use crate::play::simulation::SimulationAuthority;
 use crate::play::survival::{entity_item_stack, mob_xp_value};
 
@@ -33,9 +30,10 @@ use super::{
 };
 
 pub(in crate::play) struct ExpiredPrimedTnt {
-    pub(in crate::play) fuse: PrimedTntFuse,
+    pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) position: Vec3,
     pub(in crate::play) entity_type_id: i32,
+    pub(in crate::play) air: mc_world::BlockStateId,
     snapshot: ServerEntitySnapshot,
     observer_ids: Vec<SessionId>,
     explosion_targets: Vec<ExplosionPlayerTarget>,
@@ -147,9 +145,7 @@ impl SessionRegistry {
             .filter(|entity| entity.lifecycle == EntityLifecycle::Alive)
             .filter(|entity| distance_sq(entity.position, center) <= radius_sq)
             .filter_map(|entity| {
-                let id = Identifier::parse(entity.type_name.clone()).ok()?;
-                let facts =
-                    mc_data::entity_types::fallback_entity_type_facts(id, entity.type_id as u32);
+                let facts = super::interaction_geometry::canonical_entity_facts(&entity.type_name)?;
                 facts.attributes.max_health?;
                 if entity.type_name == TNT_ENTITY_TYPE_NAME {
                     return None;
@@ -252,17 +248,23 @@ impl SessionRegistry {
     ) -> Vec<ExpiredPrimedTnt> {
         let mut inner = self.lock_session_entities("claim due primed TNT");
         let mut due_ids = inner
-            .primed_tnt
-            .values()
-            .filter(|fuse| fuse.expires_tick <= current_tick)
-            .map(|fuse| fuse.entity_id)
+            .entities
+            .snapshots_vec()
+            .into_iter()
+            .filter(|entity| {
+                entity
+                    .retained
+                    .primed_tnt
+                    .is_some_and(|fuse| fuse.expires_tick <= current_tick)
+            })
+            .map(|entity| entity.id)
             .collect::<Vec<_>>();
         due_ids.sort_unstable();
 
         let claimed = due_ids
             .into_iter()
             .filter_map(|entity_id| {
-                let fuse = inner.primed_tnt.get(&entity_id)?.clone();
+                let retained = inner.entities.snapshot(entity_id)?.retained.primed_tnt?;
                 let snapshot = remove_server_entity_state_locked(&mut inner, entity_id)?;
                 let observer_ids = remove_entity_visibility_locked(&mut inner, entity_id);
                 let center = Vec3::new(
@@ -282,9 +284,10 @@ impl SessionRegistry {
                     })
                     .collect();
                 Some(ExpiredPrimedTnt {
-                    fuse,
+                    entity_id,
                     position: snapshot.position,
                     entity_type_id: snapshot.type_id,
+                    air: mc_world::BlockStateId(retained.air_block_state),
                     snapshot,
                     observer_ids,
                     explosion_targets,
@@ -306,10 +309,20 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn primed_tnt_fuses_for_test(&self) -> Vec<PrimedTntFuse> {
+    pub(in crate::play) fn primed_tnt_fuses_for_test(&self) -> Vec<(EntityId, u64)> {
         let inner = self.lock_session_entities("inspect primed TNT fuses");
-        let mut fuses = inner.primed_tnt.values().cloned().collect::<Vec<_>>();
-        fuses.sort_unstable_by_key(|fuse| fuse.entity_id);
+        let mut fuses = inner
+            .entities
+            .snapshots_vec()
+            .into_iter()
+            .filter_map(|entity| {
+                entity
+                    .retained
+                    .primed_tnt
+                    .map(|fuse| (entity.id, fuse.expires_tick))
+            })
+            .collect::<Vec<_>>();
+        fuses.sort_unstable_by_key(|fuse| fuse.0);
         fuses
     }
 
@@ -346,23 +359,18 @@ pub(super) fn spawn_primed_tnt_locked(
     let mut entity = SpawnEntity::new(entity_type_id, TNT_ENTITY_TYPE_NAME, position);
     entity.velocity = velocity;
     entity.on_ground = false;
-    let entity_id = inner.entities.spawn_authoritative(entity);
-    let lifecycle_tick = inner.entity_lifecycle_tick;
-    inner.entity_spawn_ticks.insert(entity_id, lifecycle_tick);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    entity.retained.primed_tnt = Some(mc_entity::EntityPrimedTntState {
+        expires_tick: inner.entity_lifecycle_tick.saturating_add(fuse_ticks),
+        air_block_state: air.0,
+    });
+    let entity_id = inner.entities.spawn(entity);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
         .or_insert_with(|| entity_aabb(TNT_ENTITY_TYPE_NAME));
     track_entity_chunk_locked(inner, entity_id, position);
     initialize_entity_wire_state_locked(inner, entity_id);
-    inner.primed_tnt.insert(
-        entity_id,
-        PrimedTntFuse {
-            entity_id,
-            expires_tick: lifecycle_tick.saturating_add(fuse_ticks),
-            air,
-        },
-    );
     let dispatches = spawn_entity_visibility_locked(inner, entity_id);
     (entity_id, dispatches)
 }
@@ -403,12 +411,12 @@ fn apply_explosion_knockback_locked(
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: target_id,
-                    delta: Vec3::ZERO,
+                    wire_move: None,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,
                     on_ground: snapshot.on_ground,
-                    send_position_rotation: false,
                     send_velocity: true,
+                    send_head_rotation: false,
                 }),
             })
         })

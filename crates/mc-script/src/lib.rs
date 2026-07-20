@@ -7,8 +7,12 @@
 //! one dedicated host thread, with fixed memory and instruction limits.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::sync::{Arc, RwLock};
+#[cfg(any(test, feature = "lua-runtime"))]
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, RwLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
@@ -23,22 +27,57 @@ pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Semantic version of the stable script API contract.
-pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 5, 0);
-
-/// First script API version that exposes allow-listed entity spawns.
-pub const ENTITY_SPAWN_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 5, 0);
-
-/// First script API version that exposes plugin-owned player commands.
-pub const PLAYER_COMMANDS_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 3, 0);
-
-/// First script API version that exposes operator-only plugin player commands.
-pub const OPERATOR_COMMANDS_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 4, 0);
+pub const SCRIPT_API_VERSION: ScriptApiVersion = ScriptApiVersion::new(0, 6, 0);
 
 /// Maximum entity types one plugin may allow-list for spawning.
 pub const MAX_SPAWN_ENTITY_TYPES: usize = 32;
 
 /// Maximum byte length of a script-visible namespaced resource identifier.
 pub const MAX_SCRIPT_RESOURCE_ID_BYTES: usize = 128;
+
+/// Maximum byte length of a plugin-scoped identifier or request correlation id.
+pub const MAX_SCRIPT_ID_BYTES: usize = 64;
+
+pub const MAX_SCRIPT_PLAYER_UUID_BYTES: usize = 64;
+pub const MAX_SCRIPT_PLAYER_NAME_BYTES: usize = 16;
+pub const MAX_SCRIPT_CHAT_MESSAGE_BYTES: usize = 4_096;
+pub const MAX_SCRIPT_DISCONNECT_REASON_BYTES: usize = 1_024;
+pub const MAX_SCRIPT_CONSOLE_COMMAND_BYTES: usize = 256;
+pub const MAX_SCRIPT_COMMAND_BATCH: usize = 32;
+pub const MAX_SCRIPT_EVENT_QUEUE_CAPACITY: usize = 1_024;
+pub const MAX_SCRIPT_COMMAND_QUEUE_CAPACITY: usize = 256;
+pub const MAX_PLUGIN_ID_BYTES: usize = 64;
+pub const MAX_PLUGIN_DISPLAY_NAME_BYTES: usize = 128;
+pub const MAX_PLUGIN_VERSION_BYTES: usize = 64;
+pub const MAX_MANIFEST_EVENT_SUBSCRIPTIONS: usize = 64;
+pub const MAX_MANIFEST_DEPENDENCIES: usize = 64;
+pub const MAX_MANIFEST_CAPABILITIES: usize = 128;
+pub const MAX_MANIFEST_PERMISSIONS: usize = 64;
+pub const MAX_MANIFEST_FIELD_BYTES: usize = 128;
+
+/// Maximum byte length of a plugin storage key.
+pub const MAX_PLUGIN_STORAGE_KEY_BYTES: usize = 128;
+
+/// Maximum byte length of a plugin storage value.
+pub const MAX_PLUGIN_STORAGE_VALUE_BYTES: usize = 4_096;
+
+/// Maximum number of server-owned menu slots a plugin may describe.
+pub const MAX_INVENTORY_MENU_SLOTS: usize = 54;
+
+/// Maximum atomic inventory and storage mutations in one plugin request.
+pub const MAX_INVENTORY_STORAGE_MUTATIONS: usize = 16;
+
+/// Maximum absolute resource count changed by one inventory delta.
+pub const MAX_INVENTORY_RESOURCE_DELTA: i16 = 64;
+
+/// Maximum byte length of a server-rendered inventory menu title.
+pub const MAX_INVENTORY_MENU_TITLE_BYTES: usize = 128;
+
+/// Maximum byte length of a colony display name.
+pub const MAX_COLONY_NAME_BYTES: usize = 128;
+
+/// Maximum search radius for an ephemeral villager binding request.
+pub const MAX_VILLAGER_BINDING_RADIUS: f64 = 64.0;
 
 /// Maximum absolute horizontal coordinate accepted from Lua.
 pub const SCRIPT_HORIZONTAL_COORDINATE_LIMIT: f64 = 30_000_000.0;
@@ -72,6 +111,16 @@ pub const BUILT_IN_PLAYER_COMMAND_ROOTS: &[&str] = &[
     "tp",
 ];
 
+const fn decimal_u8_len(value: u8) -> usize {
+    if value >= 100 {
+        3
+    } else if value >= 10 {
+        2
+    } else {
+        1
+    }
+}
+
 /// Result of admitting a player command to a plugin-owned root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -80,6 +129,7 @@ pub enum PlayerCommandAdmission {
     Enqueued,
     Dropped,
     PermissionDenied,
+    OwnedRejected { error: ScriptDtoError },
 }
 
 /// Version requested by a script runtime or supported by the server host.
@@ -110,20 +160,12 @@ impl ScriptApiVersion {
     pub const fn patch(&self) -> u16 {
         self.patch
     }
-
-    pub const fn is_supported_by(&self, host: Self) -> bool {
-        if self.major != host.major {
-            return false;
-        }
-        if self.minor < host.minor {
-            return true;
-        }
-        self.minor == host.minor && self.patch <= host.patch
-    }
 }
 
 pub const fn supports_script_api_version(requested: ScriptApiVersion) -> bool {
-    requested.is_supported_by(SCRIPT_API_VERSION)
+    requested.major == SCRIPT_API_VERSION.major
+        && requested.minor == SCRIPT_API_VERSION.minor
+        && requested.patch == SCRIPT_API_VERSION.patch
 }
 
 /// Stable player identifier snapshot for script-visible DTOs.
@@ -185,12 +227,10 @@ impl ScriptPosition {
 /// Immutable server-authoritative player context attached to gameplay events.
 ///
 /// This is a point-in-time value. It deliberately contains no connection or
-/// network-address data and cannot be used to query live server state. Legacy
-/// event constructors retain their signatures but carry unavailable context;
-/// callers must not treat missing values as server authority.
+/// network-address data and cannot be used to query live server state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScriptPlayerContext {
-    snapshot: Option<Box<ScriptPlayerContextSnapshot>>,
+    snapshot: Box<ScriptPlayerContextSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,74 +244,86 @@ struct ScriptPlayerContextSnapshot {
 }
 
 impl ScriptPlayerContext {
+    pub fn try_new(
+        uuid: impl AsRef<str>,
+        username: impl AsRef<str>,
+        operator: bool,
+        x: f64,
+        y: f64,
+        z: f64,
+    ) -> Result<Self, ScriptDtoError> {
+        let uuid = uuid.as_ref();
+        let username = username.as_ref();
+        validate_bounded_nonempty("player uuid", uuid, MAX_SCRIPT_PLAYER_UUID_BYTES)?;
+        validate_bounded_nonempty("player username", username, MAX_SCRIPT_PLAYER_NAME_BYTES)?;
+        validate_player_identity(uuid, username)?;
+        let position = ScriptPosition::try_new(x, y, z).ok_or(ScriptDtoError::InvalidBounds)?;
+        Ok(Self {
+            snapshot: Box::new(ScriptPlayerContextSnapshot {
+                uuid: uuid.to_owned(),
+                username: username.to_owned(),
+                operator,
+                x_bits: position.x_bits,
+                y_bits: position.y_bits,
+                z_bits: position.z_bits,
+            }),
+        })
+    }
+
     #[must_use]
     pub fn new(
-        uuid: impl Into<String>,
-        username: impl Into<String>,
+        uuid: impl AsRef<str>,
+        username: impl AsRef<str>,
         operator: bool,
         x: f64,
         y: f64,
         z: f64,
     ) -> Self {
-        Self {
-            snapshot: Some(Box::new(ScriptPlayerContextSnapshot {
-                uuid: uuid.into(),
-                username: username.into(),
-                operator,
-                x_bits: x.to_bits(),
-                y_bits: y.to_bits(),
-                z_bits: z.to_bits(),
-            })),
-        }
+        Self::try_new(uuid, username, operator, x, y, z)
+            .expect("server-authored script player context must be bounded")
     }
 
     #[must_use]
-    pub fn is_verified(&self) -> bool {
-        self.snapshot.is_some()
+    pub fn uuid(&self) -> &str {
+        &self.snapshot.uuid
     }
 
     #[must_use]
-    pub fn uuid(&self) -> Option<&str> {
-        self.snapshot
-            .as_deref()
-            .map(|snapshot| snapshot.uuid.as_str())
+    pub fn username(&self) -> &str {
+        &self.snapshot.username
     }
 
     #[must_use]
-    pub fn username(&self) -> Option<&str> {
-        self.snapshot
-            .as_deref()
-            .map(|snapshot| snapshot.username.as_str())
+    pub fn operator(&self) -> bool {
+        self.snapshot.operator
     }
 
     #[must_use]
-    pub fn operator(&self) -> Option<bool> {
-        self.snapshot.as_deref().map(|snapshot| snapshot.operator)
+    pub fn x(&self) -> f64 {
+        f64::from_bits(self.snapshot.x_bits)
     }
 
     #[must_use]
-    pub fn x(&self) -> Option<f64> {
-        self.snapshot
-            .as_deref()
-            .map(|snapshot| f64::from_bits(snapshot.x_bits))
+    pub fn y(&self) -> f64 {
+        f64::from_bits(self.snapshot.y_bits)
     }
 
     #[must_use]
-    pub fn y(&self) -> Option<f64> {
-        self.snapshot
-            .as_deref()
-            .map(|snapshot| f64::from_bits(snapshot.y_bits))
+    pub fn z(&self) -> f64 {
+        f64::from_bits(self.snapshot.z_bits)
     }
 
-    #[must_use]
-    pub fn z(&self) -> Option<f64> {
-        self.snapshot
-            .as_deref()
-            .map(|snapshot| f64::from_bits(snapshot.z_bits))
-    }
-
-    fn unavailable() -> Self {
-        Self { snapshot: None }
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        validate_bounded_nonempty("player uuid", self.uuid(), MAX_SCRIPT_PLAYER_UUID_BYTES)?;
+        validate_bounded_nonempty(
+            "player username",
+            self.username(),
+            MAX_SCRIPT_PLAYER_NAME_BYTES,
+        )?;
+        validate_player_identity(self.uuid(), self.username())?;
+        ScriptPosition::try_new(self.x(), self.y(), self.z())
+            .ok_or(ScriptDtoError::InvalidBounds)
+            .map(drop)
     }
 }
 
@@ -288,6 +340,671 @@ impl ScriptEntityId {
     pub const fn value(self) -> u64 {
         self.0
     }
+}
+
+/// Validation failure for a bounded script DTO.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptDtoError {
+    InvalidId {
+        field: &'static str,
+        actual_bytes: usize,
+    },
+    InvalidResourceId {
+        field: &'static str,
+        actual_bytes: usize,
+    },
+    ValueTooLong {
+        field: &'static str,
+        max_bytes: usize,
+        actual_bytes: usize,
+    },
+    EmptyValue {
+        field: &'static str,
+    },
+    InconsistentResult {
+        field: &'static str,
+    },
+    InvalidBounds,
+    InvalidAmount,
+    EmptyTransaction,
+    TooManyEntries {
+        field: &'static str,
+        max: usize,
+    },
+    DuplicateId {
+        field: &'static str,
+        actual_bytes: usize,
+    },
+}
+
+impl fmt::Display for ScriptDtoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidId {
+                field,
+                actual_bytes,
+            } => write!(formatter, "{field}:invalid_id:{actual_bytes}"),
+            Self::InvalidResourceId {
+                field,
+                actual_bytes,
+            } => write!(formatter, "{field}:invalid_resource_id:{actual_bytes}"),
+            Self::ValueTooLong {
+                field,
+                max_bytes,
+                actual_bytes,
+            } => write!(formatter, "{field}:too_long:{actual_bytes}:{max_bytes}"),
+            Self::EmptyValue { field } => write!(formatter, "{field}:empty"),
+            Self::InconsistentResult { field } => write!(formatter, "{field}:inconsistent"),
+            Self::InvalidBounds => formatter.write_str("bounds:invalid"),
+            Self::InvalidAmount => formatter.write_str("amount:invalid"),
+            Self::EmptyTransaction => formatter.write_str("transaction:empty"),
+            Self::TooManyEntries { field, max } => {
+                write!(formatter, "{field}:too_many:{max}")
+            }
+            Self::DuplicateId {
+                field,
+                actual_bytes,
+            } => write!(formatter, "{field}:duplicate:{actual_bytes}"),
+        }
+    }
+}
+
+impl std::error::Error for ScriptDtoError {}
+
+/// A bounded axis-aligned zone definition. The server owns its lifecycle and membership checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptAxisAlignedZone {
+    id: String,
+    dimension: String,
+    minimum: ScriptPosition,
+    maximum: ScriptPosition,
+}
+
+impl ScriptAxisAlignedZone {
+    pub fn try_new(
+        id: impl AsRef<str>,
+        dimension: impl AsRef<str>,
+        minimum: ScriptPosition,
+        maximum: ScriptPosition,
+    ) -> Result<Self, ScriptDtoError> {
+        if minimum.x() > maximum.x() || minimum.y() > maximum.y() || minimum.z() > maximum.z() {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            id: validate_script_id(id.as_ref())?,
+            dimension: validate_contract_resource_id(dimension.as_ref())?,
+            minimum,
+            maximum,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    pub fn minimum(&self) -> ScriptPosition {
+        self.minimum
+    }
+
+    pub fn maximum(&self) -> ScriptPosition {
+        self.maximum
+    }
+}
+
+/// One immutable item descriptor used in a server-owned inventory menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInventoryMenuItem {
+    resource_id: String,
+    count: u8,
+    label: Option<String>,
+}
+
+impl ScriptInventoryMenuItem {
+    pub fn try_new(
+        resource_id: impl AsRef<str>,
+        count: u8,
+        label: Option<String>,
+    ) -> Result<Self, ScriptDtoError> {
+        if count == 0 {
+            return Err(ScriptDtoError::InvalidAmount);
+        }
+        if let Some(label) = &label
+            && label.len() > MAX_INVENTORY_MENU_TITLE_BYTES
+        {
+            return Err(ScriptDtoError::ValueTooLong {
+                field: "inventory menu item label",
+                max_bytes: MAX_INVENTORY_MENU_TITLE_BYTES,
+                actual_bytes: label.len(),
+            });
+        }
+        Ok(Self {
+            resource_id: validate_contract_resource_id(resource_id.as_ref())?,
+            count,
+            label,
+        })
+    }
+
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub const fn count(&self) -> u8 {
+        self.count
+    }
+
+    pub fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+/// One fixed slot in a server-owned inventory menu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInventoryMenuSlot {
+    index: u8,
+    item: ScriptInventoryMenuItem,
+}
+
+impl ScriptInventoryMenuSlot {
+    pub const fn new(index: u8, item: ScriptInventoryMenuItem) -> Self {
+        Self { index, item }
+    }
+
+    pub const fn index(&self) -> u8 {
+        self.index
+    }
+
+    pub fn item(&self) -> &ScriptInventoryMenuItem {
+        &self.item
+    }
+}
+
+/// Immutable menu description requested by a plugin and owned by the server after admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInventoryMenu {
+    id: String,
+    title: String,
+    slots: Vec<ScriptInventoryMenuSlot>,
+}
+
+impl ScriptInventoryMenu {
+    pub fn try_new(
+        id: impl AsRef<str>,
+        title: impl AsRef<str>,
+        slots: Vec<ScriptInventoryMenuSlot>,
+    ) -> Result<Self, ScriptDtoError> {
+        let title = title.as_ref();
+        validate_bounded_nonempty(
+            "inventory menu title",
+            title,
+            MAX_INVENTORY_MENU_TITLE_BYTES,
+        )?;
+        if slots.len() > MAX_INVENTORY_MENU_SLOTS {
+            return Err(ScriptDtoError::TooManyEntries {
+                field: "inventory menu slots",
+                max: MAX_INVENTORY_MENU_SLOTS,
+            });
+        }
+        let mut indexes = BTreeMap::new();
+        for slot in &slots {
+            if usize::from(slot.index) >= MAX_INVENTORY_MENU_SLOTS {
+                return Err(ScriptDtoError::InvalidBounds);
+            }
+            if indexes.insert(slot.index, ()).is_some() {
+                return Err(ScriptDtoError::DuplicateId {
+                    field: "inventory menu slot index",
+                    actual_bytes: decimal_u8_len(slot.index),
+                });
+            }
+        }
+        Ok(Self {
+            id: validate_script_id(id.as_ref())?,
+            title: title.to_owned(),
+            slots,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn slots(&self) -> &[ScriptInventoryMenuSlot] {
+        &self.slots
+    }
+}
+
+/// One logical player-inventory resource delta in an atomic transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInventoryResourceDelta {
+    resource_id: String,
+    delta: i16,
+}
+
+impl ScriptInventoryResourceDelta {
+    pub fn try_new(resource_id: impl AsRef<str>, delta: i16) -> Result<Self, ScriptDtoError> {
+        if delta == 0 || delta.unsigned_abs() > MAX_INVENTORY_RESOURCE_DELTA as u16 {
+            return Err(ScriptDtoError::InvalidAmount);
+        }
+        Ok(Self {
+            resource_id: validate_contract_resource_id(resource_id.as_ref())?,
+            delta,
+        })
+    }
+
+    pub fn resource_id(&self) -> &str {
+        &self.resource_id
+    }
+
+    pub const fn delta(&self) -> i16 {
+        self.delta
+    }
+}
+
+/// One plugin-storage mutation in an atomic inventory and storage transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptStorageMutation {
+    CompareAndSwap {
+        key: String,
+        expected_version: Option<u64>,
+        value: String,
+    },
+    Delete {
+        key: String,
+        expected_version: Option<u64>,
+    },
+}
+
+impl ScriptStorageMutation {
+    pub fn compare_and_swap(
+        key: impl AsRef<str>,
+        expected_version: Option<u64>,
+        value: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        let value = value.as_ref();
+        validate_plugin_storage_value(value)?;
+        Ok(Self::CompareAndSwap {
+            key: validate_plugin_storage_key(key.as_ref())?,
+            expected_version,
+            value: value.to_owned(),
+        })
+    }
+
+    pub fn delete(
+        key: impl AsRef<str>,
+        expected_version: Option<u64>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self::Delete {
+            key: validate_plugin_storage_key(key.as_ref())?,
+            expected_version,
+        })
+    }
+
+    pub fn key(&self) -> &str {
+        match self {
+            Self::CompareAndSwap { key, .. } | Self::Delete { key, .. } => key,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ScriptDtoError> {
+        match self {
+            Self::CompareAndSwap { key, value, .. } => {
+                validate_plugin_storage_key(key)?;
+                validate_plugin_storage_value(value)
+            }
+            Self::Delete { key, .. } => validate_plugin_storage_key(key).map(drop),
+        }
+    }
+}
+
+/// Validated plugin-storage read request used to correlate its targeted result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPluginStorageGetRequest {
+    request_id: String,
+    key: String,
+}
+
+impl ScriptPluginStorageGetRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        key: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            key: validate_plugin_storage_key(key.as_ref())?,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+}
+
+/// Validated plugin-storage compare-and-swap request and result correlation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPluginStorageCompareAndSwapRequest {
+    request_id: String,
+    key: String,
+    expected_version: Option<u64>,
+    value: String,
+}
+
+impl ScriptPluginStorageCompareAndSwapRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        key: impl AsRef<str>,
+        expected_version: Option<u64>,
+        value: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        let value = value.as_ref();
+        validate_plugin_storage_value(value)?;
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            key: validate_plugin_storage_key(key.as_ref())?,
+            expected_version,
+            value: value.to_owned(),
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub const fn expected_version(&self) -> Option<u64> {
+        self.expected_version
+    }
+
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Validated plugin-storage delete request used to correlate its targeted result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPluginStorageDeleteRequest {
+    request_id: String,
+    key: String,
+    expected_version: Option<u64>,
+}
+
+/// Explicit terminal reason for a plugin-storage request that could not run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptPluginStorageFailure {
+    /// This server has no persistent world-backed plugin storage.
+    Unavailable,
+    /// The storage actor stopped after a durable write or synchronization failure.
+    DurabilityFailed,
+}
+
+impl ScriptPluginStorageFailure {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::DurabilityFailed => "durability_failed",
+        }
+    }
+}
+
+impl ScriptPluginStorageDeleteRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        key: impl AsRef<str>,
+        expected_version: Option<u64>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            key: validate_plugin_storage_key(key.as_ref())?,
+            expected_version,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    pub const fn expected_version(&self) -> Option<u64> {
+        self.expected_version
+    }
+}
+
+/// A bounded request the server must commit or reject as one inventory and storage mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptInventoryStorageTransaction {
+    id: String,
+    player_id: ScriptPlayerId,
+    inventory: Vec<ScriptInventoryResourceDelta>,
+    storage: Vec<ScriptStorageMutation>,
+}
+
+impl ScriptInventoryStorageTransaction {
+    pub fn try_new(
+        id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        inventory: Vec<ScriptInventoryResourceDelta>,
+        storage: Vec<ScriptStorageMutation>,
+    ) -> Result<Self, ScriptDtoError> {
+        if inventory.is_empty() || storage.is_empty() {
+            return Err(ScriptDtoError::EmptyTransaction);
+        }
+        if inventory.len() > MAX_INVENTORY_STORAGE_MUTATIONS
+            || storage.len() > MAX_INVENTORY_STORAGE_MUTATIONS
+        {
+            return Err(ScriptDtoError::TooManyEntries {
+                field: "inventory storage transaction",
+                max: MAX_INVENTORY_STORAGE_MUTATIONS,
+            });
+        }
+        let mut inventory_ids = BTreeMap::new();
+        for delta in &inventory {
+            if inventory_ids.insert(delta.resource_id(), ()).is_some() {
+                return Err(ScriptDtoError::DuplicateId {
+                    field: "inventory resource id",
+                    actual_bytes: delta.resource_id().len(),
+                });
+            }
+        }
+        let mut storage_keys = BTreeMap::new();
+        for mutation in &storage {
+            mutation.validate()?;
+            if storage_keys.insert(mutation.key(), ()).is_some() {
+                return Err(ScriptDtoError::DuplicateId {
+                    field: "plugin storage key",
+                    actual_bytes: mutation.key().len(),
+                });
+            }
+        }
+        Ok(Self {
+            id: validate_script_id(id.as_ref())?,
+            player_id,
+            inventory,
+            storage,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub const fn player_id(&self) -> ScriptPlayerId {
+        self.player_id
+    }
+
+    pub fn inventory(&self) -> &[ScriptInventoryResourceDelta] {
+        &self.inventory
+    }
+
+    pub fn storage(&self) -> &[ScriptStorageMutation] {
+        &self.storage
+    }
+}
+
+/// Server-owned colony record requested by a plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptColonyRecord {
+    id: String,
+    name: String,
+    dimension: String,
+    home: ScriptPosition,
+}
+
+impl ScriptColonyRecord {
+    pub fn try_new(
+        id: impl AsRef<str>,
+        name: impl AsRef<str>,
+        dimension: impl AsRef<str>,
+        home: ScriptPosition,
+    ) -> Result<Self, ScriptDtoError> {
+        let name = name.as_ref();
+        validate_bounded_nonempty("colony name", name, MAX_COLONY_NAME_BYTES)?;
+        Ok(Self {
+            id: validate_script_id(id.as_ref())?,
+            name: name.to_owned(),
+            dimension: validate_contract_resource_id(dimension.as_ref())?,
+            home,
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    pub const fn home(&self) -> ScriptPosition {
+        self.home
+    }
+}
+
+/// Validated colony record request used to correlate its targeted result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptColonyRecordRequest {
+    request_id: String,
+    record: ScriptColonyRecord,
+}
+
+impl ScriptColonyRecordRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        record: ScriptColonyRecord,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            record,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub fn record(&self) -> &ScriptColonyRecord {
+        &self.record
+    }
+}
+
+/// Bounded request for the server to bind one nearby villager to a colony.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptVillagerBindingRequest {
+    id: String,
+    colony_id: String,
+    center: ScriptPosition,
+    radius_bits: u64,
+}
+
+impl ScriptVillagerBindingRequest {
+    pub fn try_new(
+        id: impl AsRef<str>,
+        colony_id: impl AsRef<str>,
+        center: ScriptPosition,
+        radius: f64,
+    ) -> Result<Self, ScriptDtoError> {
+        if !radius.is_finite() || radius <= 0.0 || radius > MAX_VILLAGER_BINDING_RADIUS {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            id: validate_script_id(id.as_ref())?,
+            colony_id: validate_script_id(colony_id.as_ref())?,
+            center,
+            radius_bits: radius.to_bits(),
+        })
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn colony_id(&self) -> &str {
+        &self.colony_id
+    }
+
+    pub const fn center(&self) -> ScriptPosition {
+        self.center
+    }
+
+    pub fn radius(&self) -> f64 {
+        f64::from_bits(self.radius_bits)
+    }
+}
+
+/// Ephemeral server-issued villager binding token. It is not an entity handle or pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptVillagerBinding {
+    token: String,
+    expires_at_tick: u64,
+}
+
+impl ScriptVillagerBinding {
+    pub fn try_new(token: impl AsRef<str>, expires_at_tick: u64) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            token: validate_script_id(token.as_ref())?,
+            expires_at_tick,
+        })
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    pub const fn expires_at_tick(&self) -> u64 {
+        self.expires_at_tick
+    }
+}
+
+/// Server-normalized inventory click kind. Plugins never receive slot stacks or packet state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptInventoryClick {
+    Primary,
+    Secondary,
+    ShiftPrimary,
+    ShiftSecondary,
 }
 
 /// Immutable inbound event snapshots visible to script runtimes.
@@ -307,23 +1024,18 @@ impl ScriptEvent {
     }
 
     /// Build a server-stopping event snapshot.
-    pub fn server_stopping(reason: impl Into<String>) -> Self {
+    pub fn server_stopping(reason: impl AsRef<str>) -> Self {
+        let reason = reason.as_ref();
+        validate_bounded_nonempty(
+            "server stopping reason",
+            reason,
+            MAX_SCRIPT_DISCONNECT_REASON_BYTES,
+        )
+        .expect("server-authored stopping reason must be bounded");
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::ServerStopping {
-                reason: reason.into(),
-            },
-        }
-    }
-
-    /// Build a player-joined event snapshot.
-    pub fn player_joined(player_id: ScriptPlayerId, username: impl Into<String>) -> Self {
-        Self {
-            target_plugin_id: None,
-            kind: ScriptEventKind::PlayerJoined {
-                player_id,
-                username: username.into(),
-                context: ScriptPlayerContext::unavailable(),
+                reason: reason.to_owned(),
             },
         }
     }
@@ -333,92 +1045,91 @@ impl ScriptEvent {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
     ) -> Self {
+        context
+            .validate()
+            .expect("server-authored player context must be bounded");
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::PlayerJoined {
                 player_id,
-                username: context
-                    .username()
-                    .expect("player context must include a verified username")
-                    .to_owned(),
+                username: context.username().to_owned(),
                 context,
             },
         }
     }
 
     /// Build a player-left event snapshot.
-    pub fn player_left(player_id: ScriptPlayerId, reason: impl Into<String>) -> Self {
+    pub fn player_left(player_id: ScriptPlayerId, reason: impl AsRef<str>) -> Self {
+        let reason = reason.as_ref();
+        validate_bounded_nonempty(
+            "player-left reason",
+            reason,
+            MAX_SCRIPT_DISCONNECT_REASON_BYTES,
+        )
+        .expect("server-authored player-left reason must be bounded");
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::PlayerLeft {
                 player_id,
-                reason: reason.into(),
+                reason: reason.to_owned(),
             },
         }
-    }
-
-    /// Build a player-chat event snapshot.
-    pub fn player_chat(player_id: ScriptPlayerId, message: impl Into<String>) -> Self {
-        Self::player_chat_with_context(player_id, message, ScriptPlayerContext::unavailable())
     }
 
     /// Build a player-chat event snapshot with server-authoritative context.
     pub fn player_chat_with_context(
         player_id: ScriptPlayerId,
-        message: impl Into<String>,
+        message: impl AsRef<str>,
         context: ScriptPlayerContext,
     ) -> Self {
+        let message = message.as_ref();
+        validate_bounded_nonempty(
+            "player chat message",
+            message,
+            MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+        )
+        .expect("server-authored player chat must be bounded");
+        context
+            .validate()
+            .expect("server-authored player context must be bounded");
         Self {
             target_plugin_id: None,
             kind: ScriptEventKind::PlayerChat {
                 player_id,
-                message: message.into(),
+                message: message.to_owned(),
                 context,
             },
         }
     }
 
-    /// Build a player command event targeted to the plugin that owns its root.
-    pub fn player_command(
-        target_plugin_id: impl Into<String>,
-        player_id: ScriptPlayerId,
-        username: impl Into<String>,
-        root: impl Into<String>,
-        arguments: impl Into<String>,
-    ) -> Self {
-        Self {
-            target_plugin_id: Some(target_plugin_id.into()),
-            kind: ScriptEventKind::PlayerCommand {
-                player_id,
-                username: username.into(),
-                root: root.into(),
-                arguments: arguments.into(),
-                context: ScriptPlayerContext::unavailable(),
-            },
-        }
-    }
-
-    /// Build a player command event with server-authoritative context.
-    pub fn player_command_with_context(
-        target_plugin_id: impl Into<String>,
+    /// Build a bounded player command event with server-authoritative context.
+    pub fn try_player_command_with_context(
+        target_plugin_id: impl AsRef<str>,
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
-        root: impl Into<String>,
-        arguments: impl Into<String>,
-    ) -> Self {
-        Self {
-            target_plugin_id: Some(target_plugin_id.into()),
+        root: impl AsRef<str>,
+        arguments: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        let target_plugin_id = validate_target_plugin_id(target_plugin_id.as_ref())?;
+        let root = root.as_ref();
+        let arguments = arguments.as_ref();
+        validate_bounded_nonempty("player command root", root, MAX_PLAYER_COMMAND_ROOT_BYTES)?;
+        validate_bounded_value(
+            "player command arguments",
+            arguments,
+            MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+        )?;
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: Some(target_plugin_id),
             kind: ScriptEventKind::PlayerCommand {
                 player_id,
-                username: context
-                    .username()
-                    .expect("player context must include a verified username")
-                    .to_owned(),
-                root: root.into(),
-                arguments: arguments.into(),
+                username: context.username().to_owned(),
+                root: root.to_owned(),
+                arguments: arguments.to_owned(),
                 context,
             },
-        }
+        })
     }
 
     /// Build a server-tick event snapshot.
@@ -427,6 +1138,169 @@ impl ScriptEvent {
             target_plugin_id: None,
             kind: ScriptEventKind::ServerTick { tick },
         }
+    }
+
+    /// Build a targeted plugin-storage read result.
+    pub fn plugin_storage_get_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptPluginStorageGetRequest,
+        value: Option<String>,
+        version: Option<u64>,
+    ) -> Result<Self, ScriptDtoError> {
+        if value.is_some() != version.is_some() {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage get value/version",
+            });
+        }
+        if let Some(value) = &value {
+            validate_plugin_storage_value(value)?;
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PluginStorageGetResult {
+                request_id: request.request_id().to_owned(),
+                key: request.key().to_owned(),
+                value,
+                version,
+                failure: None,
+            },
+        })
+    }
+
+    /// Build a targeted plugin-storage compare-and-swap result.
+    pub fn plugin_storage_cas_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptPluginStorageCompareAndSwapRequest,
+        applied: bool,
+        version: Option<u64>,
+    ) -> Result<Self, ScriptDtoError> {
+        if applied && version.is_none() {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage compare-and-swap success/version",
+            });
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PluginStorageCasResult {
+                request_id: request.request_id().to_owned(),
+                key: request.key().to_owned(),
+                applied,
+                version,
+                failure: None,
+            },
+        })
+    }
+
+    /// Build a targeted plugin-storage delete result.
+    pub fn plugin_storage_delete_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptPluginStorageDeleteRequest,
+        deleted: bool,
+        version: Option<u64>,
+    ) -> Result<Self, ScriptDtoError> {
+        if deleted && version.is_none() {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage delete success/version",
+            });
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PluginStorageDeleteResult {
+                request_id: request.request_id().to_owned(),
+                key: request.key().to_owned(),
+                deleted,
+                version,
+                failure: None,
+            },
+        })
+    }
+
+    /// Build a targeted click event for one server-owned inventory menu.
+    pub(crate) fn inventory_menu_clicked(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        menu: &ScriptInventoryMenu,
+        slot: u8,
+        click: ScriptInventoryClick,
+    ) -> Result<Self, ScriptDtoError> {
+        if usize::from(slot) >= MAX_INVENTORY_MENU_SLOTS {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::InventoryMenuClicked {
+                player_id,
+                context,
+                menu_id: menu.id().to_owned(),
+                slot,
+                click,
+            },
+        })
+    }
+
+    /// Build a targeted completion event for an atomic inventory and storage request.
+    pub(crate) fn inventory_storage_transaction_result(
+        target_plugin_id: impl AsRef<str>,
+        transaction: &ScriptInventoryStorageTransaction,
+        committed: bool,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::InventoryStorageTransactionResult {
+                request_id: transaction.id().to_owned(),
+                committed,
+            },
+        })
+    }
+
+    /// Build a targeted zone-entry snapshot owned by the plugin that registered the zone.
+    pub(crate) fn player_zone_entered(
+        target_plugin_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone: &ScriptAxisAlignedZone,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PlayerZoneEntered {
+                player_id,
+                context,
+                zone_id: zone.id().to_owned(),
+            },
+        })
+    }
+
+    /// Build a targeted server-owned colony record completion event.
+    pub(crate) fn colony_record_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptColonyRecordRequest,
+        accepted: bool,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ColonyRecordResult {
+                request_id: request.request_id().to_owned(),
+                colony_id: request.record().id().to_owned(),
+                accepted,
+            },
+        })
+    }
+
+    /// Build a targeted ephemeral villager-binding result without exposing an entity reference.
+    pub(crate) fn colony_villager_binding_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptVillagerBindingRequest,
+        binding: Option<ScriptVillagerBinding>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ColonyVillagerBindingResult {
+                request_id: request.id().to_owned(),
+                colony_id: request.colony_id().to_owned(),
+                binding,
+            },
+        })
     }
 
     /// Return the plugin id for an event that must not be broadcast to other runtimes.
@@ -449,6 +1323,162 @@ impl ScriptEvent {
             ScriptEventKind::PlayerChat { .. } => "player.chat",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
+            ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
+            ScriptEventKind::PluginStorageCasResult { .. } => "plugin.storage.cas_result",
+            ScriptEventKind::PluginStorageDeleteResult { .. } => "plugin.storage.delete_result",
+            ScriptEventKind::InventoryMenuClicked { .. } => "inventory.menu.clicked",
+            ScriptEventKind::InventoryStorageTransactionResult { .. } => {
+                "inventory.storage_transaction.result"
+            }
+            ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
+            ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
+            ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ScriptDtoError> {
+        if let Some(plugin_id) = &self.target_plugin_id {
+            validate_target_plugin_id(plugin_id)?;
+        }
+        match &self.kind {
+            ScriptEventKind::ServerStarted | ScriptEventKind::ServerTick { .. } => Ok(()),
+            ScriptEventKind::ServerStopping { reason }
+            | ScriptEventKind::PlayerLeft { reason, .. } => validate_bounded_nonempty(
+                "event reason",
+                reason,
+                MAX_SCRIPT_DISCONNECT_REASON_BYTES,
+            ),
+            ScriptEventKind::PlayerJoined {
+                username, context, ..
+            } => {
+                validate_bounded_nonempty(
+                    "event username",
+                    username,
+                    MAX_SCRIPT_PLAYER_NAME_BYTES,
+                )?;
+                context.validate()
+            }
+            ScriptEventKind::PlayerChat {
+                message, context, ..
+            } => {
+                validate_bounded_nonempty(
+                    "event chat message",
+                    message,
+                    MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+                )?;
+                context.validate()
+            }
+            ScriptEventKind::PlayerCommand {
+                username,
+                root,
+                arguments,
+                context,
+                ..
+            } => {
+                validate_bounded_nonempty(
+                    "event username",
+                    username,
+                    MAX_SCRIPT_PLAYER_NAME_BYTES,
+                )?;
+                validate_bounded_nonempty(
+                    "event command root",
+                    root,
+                    MAX_PLAYER_COMMAND_ROOT_BYTES,
+                )?;
+                validate_bounded_value(
+                    "event command arguments",
+                    arguments,
+                    MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+                )?;
+                context.validate()
+            }
+            ScriptEventKind::PluginStorageGetResult {
+                request_id,
+                key,
+                value,
+                version,
+                failure,
+            } => {
+                validate_script_id(request_id)?;
+                validate_plugin_storage_key(key)?;
+                if value.is_some() != version.is_some() {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "plugin storage get value/version",
+                    });
+                }
+                if let Some(value) = value {
+                    validate_plugin_storage_value(value)?;
+                }
+                if failure.is_some() && (value.is_some() || version.is_some()) {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "plugin storage get failure/result",
+                    });
+                }
+                Ok(())
+            }
+            ScriptEventKind::PluginStorageCasResult {
+                request_id,
+                key,
+                applied,
+                version,
+                failure,
+            }
+            | ScriptEventKind::PluginStorageDeleteResult {
+                request_id,
+                key,
+                deleted: applied,
+                version,
+                failure,
+            } => {
+                validate_script_id(request_id)?;
+                validate_plugin_storage_key(key)?;
+                if *applied && version.is_none() {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "plugin storage mutation success/version",
+                    });
+                }
+                if failure.is_some() && (*applied || version.is_some()) {
+                    return Err(ScriptDtoError::InconsistentResult {
+                        field: "plugin storage mutation failure/result",
+                    });
+                }
+                Ok(())
+            }
+            ScriptEventKind::InventoryMenuClicked {
+                context,
+                menu_id,
+                slot,
+                ..
+            } => {
+                context.validate()?;
+                validate_script_id(menu_id)?;
+                if usize::from(*slot) >= MAX_INVENTORY_MENU_SLOTS {
+                    return Err(ScriptDtoError::InvalidBounds);
+                }
+                Ok(())
+            }
+            ScriptEventKind::InventoryStorageTransactionResult { request_id, .. } => {
+                validate_script_id(request_id).map(drop)
+            }
+            ScriptEventKind::PlayerZoneEntered {
+                context, zone_id, ..
+            } => {
+                context.validate()?;
+                validate_script_id(zone_id).map(drop)
+            }
+            ScriptEventKind::ColonyRecordResult {
+                request_id,
+                colony_id,
+                ..
+            }
+            | ScriptEventKind::ColonyVillagerBindingResult {
+                request_id,
+                colony_id,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                validate_script_id(colony_id).map(drop)
+            }
         }
     }
 }
@@ -485,12 +1515,65 @@ pub enum ScriptEventKind {
     ServerTick {
         tick: u64,
     },
+    PluginStorageGetResult {
+        request_id: String,
+        key: String,
+        value: Option<String>,
+        version: Option<u64>,
+        failure: Option<ScriptPluginStorageFailure>,
+    },
+    PluginStorageCasResult {
+        request_id: String,
+        key: String,
+        applied: bool,
+        version: Option<u64>,
+        failure: Option<ScriptPluginStorageFailure>,
+    },
+    PluginStorageDeleteResult {
+        request_id: String,
+        key: String,
+        deleted: bool,
+        version: Option<u64>,
+        failure: Option<ScriptPluginStorageFailure>,
+    },
+    InventoryMenuClicked {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        menu_id: String,
+        slot: u8,
+        click: ScriptInventoryClick,
+    },
+    InventoryStorageTransactionResult {
+        request_id: String,
+        committed: bool,
+    },
+    PlayerZoneEntered {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone_id: String,
+    },
+    ColonyRecordResult {
+        request_id: String,
+        colony_id: String,
+        accepted: bool,
+    },
+    ColonyVillagerBindingResult {
+        request_id: String,
+        colony_id: String,
+        binding: Option<ScriptVillagerBinding>,
+    },
 }
 
 /// Outbound command requests emitted by script code.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptCommand {
+    /// A request emitted by a Lua VM and attested by its host. Lua has no API for
+    /// constructing `ScriptCommandProvenance` or selecting another plugin id.
+    HostAttached {
+        provenance: ScriptCommandProvenance,
+        request: Arc<ScriptCommand>,
+    },
     SendChatMessage {
         player_id: ScriptPlayerId,
         message: String,
@@ -510,63 +1593,627 @@ pub enum ScriptCommand {
         entity_type: String,
         position: ScriptPosition,
     },
+    PluginStorageGet {
+        request: ScriptPluginStorageGetRequest,
+    },
+    PluginStorageCompareAndSwap {
+        request: ScriptPluginStorageCompareAndSwapRequest,
+    },
+    PluginStorageDelete {
+        request: ScriptPluginStorageDeleteRequest,
+    },
+    OpenInventoryMenu {
+        player_id: ScriptPlayerId,
+        menu: ScriptInventoryMenu,
+    },
+    CloseInventoryMenu {
+        player_id: ScriptPlayerId,
+        menu_id: String,
+    },
+    InventoryStorageTransaction {
+        transaction: ScriptInventoryStorageTransaction,
+    },
+    UpsertZone {
+        zone: ScriptAxisAlignedZone,
+    },
+    RemoveZone {
+        zone_id: String,
+    },
+    UpsertColony {
+        request: ScriptColonyRecordRequest,
+    },
+    RequestVillagerBinding {
+        request: ScriptVillagerBindingRequest,
+    },
+}
+
+/// Origin attached by the Lua host after a handler returns its bounded commands.
+///
+/// The constructor is crate-private so scripts and external adapters cannot
+/// fabricate an origin. Adapters may inspect the id to route a completion event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptCommandProvenance {
+    plugin_id: Arc<str>,
+    nonce: u64,
+}
+
+impl ScriptCommandProvenance {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    fn for_host_plugin(plugin_id: Arc<str>, nonce: u64) -> Self {
+        Self { plugin_id, nonce }
+    }
+
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+}
+
+#[derive(Debug)]
+struct HostAdmissionRecord {
+    plugin_id: Arc<str>,
+    request: Weak<ScriptCommand>,
+}
+
+#[derive(Debug, Default)]
+struct HostAdmissionLedger {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    next_nonce: AtomicU64,
+    pending: StdMutex<BTreeMap<u64, HostAdmissionRecord>>,
+}
+
+impl HostAdmissionLedger {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    fn issue(
+        &self,
+        plugin_id: Arc<str>,
+        batch: CommandBatch,
+    ) -> Result<Vec<ScriptCommand>, CommandBatch> {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(mut poisoned) => {
+                poisoned.get_mut().clear();
+                return Err(batch);
+            }
+        };
+        if pending.len().saturating_add(batch.commands.len()) > MAX_SCRIPT_COMMAND_QUEUE_CAPACITY {
+            return Err(batch);
+        }
+        let count = match u64::try_from(batch.commands.len()) {
+            Ok(count) => count,
+            Err(_) => return Err(batch),
+        };
+        let first =
+            match self
+                .next_nonce
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                    value.checked_add(count)
+                }) {
+                Ok(first) => first,
+                Err(_) => return Err(batch),
+            };
+        let mut attached = Vec::with_capacity(batch.commands.len());
+        for (offset, request) in (1_u64..=count).zip(batch.commands) {
+            let nonce = first + offset;
+            let request = Arc::new(request);
+            pending.insert(
+                nonce,
+                HostAdmissionRecord {
+                    plugin_id: Arc::clone(&plugin_id),
+                    request: Arc::downgrade(&request),
+                },
+            );
+            attached.push(ScriptCommand::HostAttached {
+                provenance: ScriptCommandProvenance::for_host_plugin(Arc::clone(&plugin_id), nonce),
+                request,
+            });
+        }
+        Ok(attached)
+    }
+
+    fn accept(
+        &self,
+        provenance: ScriptCommandProvenance,
+        request: Arc<ScriptCommand>,
+    ) -> Result<AdmittedScriptCommand, ScriptCommandAcceptanceError> {
+        let mut pending = match self.pending.lock() {
+            Ok(pending) => pending,
+            Err(mut poisoned) => {
+                poisoned.get_mut().clear();
+                return Err(ScriptCommandAcceptanceError::AuthorityPoisoned);
+            }
+        };
+        let Some(record) = pending.remove(&provenance.nonce) else {
+            return Err(ScriptCommandAcceptanceError::UnknownOrConsumed);
+        };
+        if record.plugin_id != provenance.plugin_id
+            || !record.request.ptr_eq(&Arc::downgrade(&request))
+        {
+            return Err(ScriptCommandAcceptanceError::RequestMismatch);
+        }
+        Ok(AdmittedScriptCommand {
+            plugin_id: record.plugin_id,
+            request,
+        })
+    }
+}
+
+/// One exact host-attested plugin request accepted by the server boundary.
+///
+/// The value is intentionally not cloneable. A router must accept the raw
+/// `HostAttached` command through `ScriptBoundary::accept_host_command` before
+/// dispatching any plugin-owned side effect.
+#[derive(Debug, PartialEq, Eq)]
+pub struct AdmittedScriptCommand {
+    plugin_id: Arc<str>,
+    request: Arc<ScriptCommand>,
+}
+
+impl AdmittedScriptCommand {
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn request(&self) -> &ScriptCommand {
+        &self.request
+    }
+
+    pub fn into_request(self) -> ScriptCommand {
+        Arc::try_unwrap(self.request).unwrap_or_else(|request| request.as_ref().clone())
+    }
+
+    pub fn into_open_inventory_menu(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptPlayerId, ScriptInventoryMenu), ScriptDtoError> {
+        let ScriptCommand::OpenInventoryMenu { player_id, menu } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "inventory menu admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            *player_id,
+            menu.clone(),
+        ))
+    }
+
+    pub fn into_upsert_zone(
+        self,
+    ) -> Result<(ScriptPluginTarget, ScriptAxisAlignedZone), ScriptDtoError> {
+        let ScriptCommand::UpsertZone { zone } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "zone admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            zone.clone(),
+        ))
+    }
+
+    pub fn plugin_storage_get_result(
+        self,
+        value: Option<&str>,
+        version: Option<u64>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::PluginStorageGet { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage get admission",
+            });
+        };
+        if let Some(value) = value {
+            validate_plugin_storage_value(value)?;
+        }
+        ScriptEvent::plugin_storage_get_result(
+            &self.plugin_id,
+            request,
+            value.map(str::to_owned),
+            version,
+        )
+    }
+
+    pub fn plugin_storage_cas_result(
+        self,
+        applied: bool,
+        version: Option<u64>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::PluginStorageCompareAndSwap { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage compare-and-swap admission",
+            });
+        };
+        ScriptEvent::plugin_storage_cas_result(&self.plugin_id, request, applied, version)
+    }
+
+    pub fn plugin_storage_delete_result(
+        self,
+        deleted: bool,
+        version: Option<u64>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::PluginStorageDelete { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "plugin storage delete admission",
+            });
+        };
+        ScriptEvent::plugin_storage_delete_result(&self.plugin_id, request, deleted, version)
+    }
+
+    pub fn plugin_storage_failure_result(
+        self,
+        failure: ScriptPluginStorageFailure,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let target_plugin_id = validate_target_plugin_id(&self.plugin_id)?;
+        let kind = match self.request.as_ref() {
+            ScriptCommand::PluginStorageGet { request } => {
+                ScriptEventKind::PluginStorageGetResult {
+                    request_id: request.request_id().to_owned(),
+                    key: request.key().to_owned(),
+                    value: None,
+                    version: None,
+                    failure: Some(failure),
+                }
+            }
+            ScriptCommand::PluginStorageCompareAndSwap { request } => {
+                ScriptEventKind::PluginStorageCasResult {
+                    request_id: request.request_id().to_owned(),
+                    key: request.key().to_owned(),
+                    applied: false,
+                    version: None,
+                    failure: Some(failure),
+                }
+            }
+            ScriptCommand::PluginStorageDelete { request } => {
+                ScriptEventKind::PluginStorageDeleteResult {
+                    request_id: request.request_id().to_owned(),
+                    key: request.key().to_owned(),
+                    deleted: false,
+                    version: None,
+                    failure: Some(failure),
+                }
+            }
+            _ => {
+                return Err(ScriptDtoError::InconsistentResult {
+                    field: "plugin storage failure admission",
+                });
+            }
+        };
+        Ok(ScriptEvent {
+            target_plugin_id: Some(target_plugin_id),
+            kind,
+        })
+    }
+
+    pub fn inventory_storage_transaction_result(
+        self,
+        committed: bool,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::InventoryStorageTransaction { transaction } = self.request.as_ref()
+        else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "inventory-storage transaction admission",
+            });
+        };
+        ScriptEvent::inventory_storage_transaction_result(&self.plugin_id, transaction, committed)
+    }
+
+    pub fn colony_record_result(self, accepted: bool) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::UpsertColony { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "colony record admission",
+            });
+        };
+        ScriptEvent::colony_record_result(&self.plugin_id, request, accepted)
+    }
+
+    pub fn colony_villager_binding_result(
+        self,
+        binding: Option<ScriptVillagerBinding>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::RequestVillagerBinding { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "villager binding admission",
+            });
+        };
+        ScriptEvent::colony_villager_binding_result(&self.plugin_id, request, binding)
+    }
+}
+
+/// Opaque plugin target retained by a production adapter after accepting an
+/// owning menu or zone command. External code cannot fabricate a plugin id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPluginTarget {
+    plugin_id: Arc<str>,
+}
+
+impl ScriptPluginTarget {
+    pub fn plugin_id(&self) -> &str {
+        &self.plugin_id
+    }
+
+    pub fn inventory_menu_clicked(
+        &self,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        menu: &ScriptInventoryMenu,
+        slot: u8,
+        click: ScriptInventoryClick,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        ScriptEvent::inventory_menu_clicked(&self.plugin_id, player_id, context, menu, slot, click)
+    }
+
+    pub fn player_zone_entered(
+        &self,
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        zone: &ScriptAxisAlignedZone,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        ScriptEvent::player_zone_entered(&self.plugin_id, player_id, context, zone)
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptCommandAcceptanceError {
+    NotHostAttached,
+    UnknownOrConsumed,
+    RequestMismatch,
+    AuthorityPoisoned,
 }
 
 impl ScriptCommand {
     /// Return the host capability required before admitting this command.
-    pub fn required_capability(&self) -> Option<ScriptCommandCapability> {
+    pub fn required_capability_kind(&self) -> Option<ScriptCommandCapabilityKind> {
+        self.required_capability()
+            .map(RequiredCommandCapability::kind)
+    }
+
+    fn required_capability(&self) -> Option<RequiredCommandCapability<'_>> {
         match self {
+            Self::HostAttached { request, .. } => request.required_capability(),
             Self::SendChatMessage { .. }
             | Self::BroadcastChatMessage { .. }
             | Self::DisconnectPlayer { .. } => None,
             Self::RunConsoleCommand { command } => {
-                Some(ScriptCommandCapability::RunConsoleCommandRoot {
+                Some(RequiredCommandCapability::RunConsoleCommandRoot {
                     root: console_command_root(command),
                 })
             }
             Self::SpawnEntity { entity_type, .. } => {
-                Some(ScriptCommandCapability::SpawnEntityType {
-                    entity_type: entity_type.clone(),
-                })
+                Some(RequiredCommandCapability::SpawnEntityType { entity_type })
+            }
+            Self::PluginStorageGet { .. }
+            | Self::PluginStorageCompareAndSwap { .. }
+            | Self::PluginStorageDelete { .. } => Some(RequiredCommandCapability::PluginStorage),
+            Self::OpenInventoryMenu { .. } | Self::CloseInventoryMenu { .. } => {
+                Some(RequiredCommandCapability::InventoryMenus)
+            }
+            Self::InventoryStorageTransaction { .. } => {
+                Some(RequiredCommandCapability::InventoryStorageTransactions)
+            }
+            Self::UpsertZone { .. } | Self::RemoveZone { .. } => {
+                Some(RequiredCommandCapability::Zones)
+            }
+            Self::UpsertColony { .. } | Self::RequestVillagerBinding { .. } => {
+                Some(RequiredCommandCapability::Colonies)
+            }
+        }
+    }
+
+    fn validate_contract(&self) -> Result<(), ScriptDtoError> {
+        match self {
+            Self::HostAttached { .. } => Err(ScriptDtoError::InconsistentResult {
+                field: "nested host-attached command",
+            }),
+            Self::SendChatMessage { message, .. } | Self::BroadcastChatMessage { message } => {
+                validate_bounded_nonempty("chat message", message, MAX_SCRIPT_CHAT_MESSAGE_BYTES)
+            }
+            Self::DisconnectPlayer { reason, .. } => validate_bounded_nonempty(
+                "disconnect reason",
+                reason,
+                MAX_SCRIPT_DISCONNECT_REASON_BYTES,
+            ),
+            Self::RunConsoleCommand { command } => {
+                validate_bounded_nonempty(
+                    "console command",
+                    command,
+                    MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
+                )?;
+                let root = console_command_root(command);
+                if root.is_empty() || root.len() > MAX_PLAYER_COMMAND_ROOT_BYTES {
+                    return Err(ScriptDtoError::InvalidId {
+                        field: "console command root",
+                        actual_bytes: root.len(),
+                    });
+                }
+                Ok(())
+            }
+            Self::SpawnEntity {
+                entity_type,
+                position,
+                ..
+            } => {
+                validate_contract_resource_id(entity_type)?;
+                ScriptPosition::try_new(position.x(), position.y(), position.z())
+                    .ok_or(ScriptDtoError::InvalidBounds)
+                    .map(drop)
+            }
+            Self::OpenInventoryMenu { menu, .. } => {
+                ScriptInventoryMenu::try_new(menu.id(), menu.title(), menu.slots().to_vec())
+                    .map(drop)
+            }
+            Self::UpsertZone { zone } => ScriptAxisAlignedZone::try_new(
+                zone.id(),
+                zone.dimension(),
+                zone.minimum(),
+                zone.maximum(),
+            )
+            .map(drop),
+            Self::PluginStorageGet { request } => {
+                ScriptPluginStorageGetRequest::try_new(request.request_id(), request.key())
+                    .map(drop)
+            }
+            Self::PluginStorageCompareAndSwap { request } => {
+                ScriptPluginStorageCompareAndSwapRequest::try_new(
+                    request.request_id(),
+                    request.key(),
+                    request.expected_version(),
+                    request.value(),
+                )
+                .map(drop)
+            }
+            Self::PluginStorageDelete { request } => ScriptPluginStorageDeleteRequest::try_new(
+                request.request_id(),
+                request.key(),
+                request.expected_version(),
+            )
+            .map(drop),
+            Self::CloseInventoryMenu { menu_id, .. } => validate_script_id(menu_id).map(drop),
+            Self::InventoryStorageTransaction { transaction } => {
+                ScriptInventoryStorageTransaction::try_new(
+                    transaction.id(),
+                    transaction.player_id(),
+                    transaction.inventory().to_vec(),
+                    transaction.storage().to_vec(),
+                )
+                .map(drop)
+            }
+            Self::RemoveZone { zone_id } => validate_script_id(zone_id).map(drop),
+            Self::UpsertColony { request } => {
+                ScriptColonyRecordRequest::try_new(request.request_id(), request.record().clone())
+                    .map(drop)
+            }
+            Self::RequestVillagerBinding { request } => {
+                validate_script_id(request.id())?;
+                validate_script_id(request.colony_id())?;
+                Ok(())
             }
         }
     }
 }
 
-/// Error returned when a bounded script queue cannot accept an item.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum ScriptQueueError<T> {
-    Full(T),
-    Closed(T),
+#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "lua-runtime"))]
+pub(crate) struct HostCommandAdmission {
+    plugin_id: Arc<str>,
+    capabilities: Arc<CommandCapabilities>,
 }
 
-impl<T> From<mpsc::error::TrySendError<T>> for ScriptQueueError<T> {
-    fn from(error: mpsc::error::TrySendError<T>) -> Self {
-        match error {
-            mpsc::error::TrySendError::Full(item) => Self::Full(item),
-            mpsc::error::TrySendError::Closed(item) => Self::Closed(item),
+#[cfg(any(test, feature = "lua-runtime"))]
+impl HostCommandAdmission {
+    pub(crate) fn from_manifest(manifest: &ValidatedScriptPluginManifest) -> Self {
+        Self {
+            plugin_id: Arc::from(manifest.plugin_id()),
+            capabilities: Arc::new(manifest.to_command_capabilities()),
         }
     }
+}
+
+/// Bounded state returned when the script event queue cannot accept an item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptQueueError {
+    Full,
+    Closed,
+}
+
+/// Rejection returned by the public raw-command submission path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptCommandSubmissionError {
+    ProvenanceRejected,
+    PermissionDenied {
+        capability: ScriptCommandCapabilityKind,
+    },
+    InvalidCommand {
+        error: ScriptDtoError,
+    },
+    QueueFull,
+    QueueClosed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "lua-runtime"))]
+pub(crate) enum ScriptBatchSubmissionError {
+    Full(CommandBatch),
+    Closed(CommandBatch),
+    Rejected {
+        batch: CommandBatch,
+        error: CommandBatchError,
+    },
 }
 
 /// Server-owned side of the script boundary.
 #[derive(Debug, Clone)]
 pub struct ScriptBoundary {
-    event_tx: mpsc::Sender<ScriptEvent>,
+    event_admission: Arc<ScriptEventAdmission>,
     command_rx: Arc<Mutex<mpsc::Receiver<ScriptCommand>>>,
     player_command_owners: PlayerCommandOwners,
+    host_admissions: Arc<HostAdmissionLedger>,
+}
+
+#[derive(Debug)]
+struct ScriptEventAdmission {
+    closed: AtomicBool,
+    sender: StdMutex<Option<mpsc::Sender<ScriptEvent>>>,
+    weak_sender: mpsc::WeakSender<ScriptEvent>,
+}
+
+impl ScriptEventAdmission {
+    fn sender(&self) -> Option<mpsc::Sender<ScriptEvent>> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let sender = self.weak_sender.upgrade()?;
+        (!self.closed.load(Ordering::Acquire)).then_some(sender)
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        match self.sender.lock() {
+            Ok(mut sender) => {
+                sender.take();
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().take();
+            }
+        }
+    }
 }
 
 impl ScriptBoundary {
     /// Enqueue an immutable event without blocking a server task.
-    pub fn try_enqueue_event(
-        &self,
-        event: ScriptEvent,
-    ) -> Result<(), ScriptQueueError<ScriptEvent>> {
-        self.event_tx
-            .try_send(event)
-            .map_err(ScriptQueueError::from)
+    pub fn try_enqueue_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
+        let Some(event_tx) = self.event_admission.sender() else {
+            return Err(ScriptQueueError::Closed);
+        };
+        event_tx.try_send(event).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => ScriptQueueError::Full,
+            mpsc::error::TrySendError::Closed(_) => ScriptQueueError::Closed,
+        })
+    }
+
+    /// Deliver a targeted owner event, waiting for bounded host-queue capacity.
+    ///
+    /// Result events are constructed from a consumed `AdmittedScriptCommand`,
+    /// so the caller cannot retarget them. This deliberately differs from
+    /// lossy telemetry submitted through [`Self::try_enqueue_event`].
+    pub async fn enqueue_targeted_event(&self, event: ScriptEvent) -> Result<(), ScriptQueueError> {
+        let Some(event_tx) = self.event_admission.sender() else {
+            return Err(ScriptQueueError::Closed);
+        };
+        event_tx
+            .send(event)
+            .await
+            .map_err(|_| ScriptQueueError::Closed)
+    }
+
+    /// Stop accepting new host events while allowing already admitted events to drain.
+    pub fn close_event_admission(&self) {
+        self.event_admission.close();
+        self.player_command_owners.clear();
     }
 
     /// Return a sorted snapshot of currently active plugin command roots.
@@ -579,58 +2226,6 @@ impl ScriptBoundary {
         self.player_command_owners.roots(true)
     }
 
-    /// Route a raw player command to its active plugin owner without blocking.
-    ///
-    /// `Ok(false)` means no plugin owns the root. Queue errors retain the event
-    /// so the caller can apply the existing full/closed backpressure policy.
-    pub fn try_enqueue_player_command(
-        &self,
-        player_id: ScriptPlayerId,
-        username: impl Into<String>,
-        raw: &str,
-    ) -> Result<bool, ScriptQueueError<ScriptEvent>> {
-        match self.try_enqueue_player_command_with_operator(player_id, username, raw, false)? {
-            PlayerCommandAdmission::Enqueued => Ok(true),
-            PlayerCommandAdmission::NotOwned
-            | PlayerCommandAdmission::Dropped
-            | PlayerCommandAdmission::PermissionDenied => Ok(false),
-        }
-    }
-
-    /// Route a raw player command through the legacy compatibility API.
-    ///
-    /// The boolean argument is retained for source compatibility but is not
-    /// authoritative. Operator-only roots always report denial before the bounded
-    /// event queue; callers must use `try_enqueue_player_command_with_context`
-    /// with a verified server context to authorize them.
-    pub fn try_enqueue_player_command_with_operator(
-        &self,
-        player_id: ScriptPlayerId,
-        username: impl Into<String>,
-        raw: &str,
-        _is_operator: bool,
-    ) -> Result<PlayerCommandAdmission, ScriptQueueError<ScriptEvent>> {
-        let Some((root, arguments)) = split_player_command(raw) else {
-            return Ok(PlayerCommandAdmission::NotOwned);
-        };
-        let Some(owner) = self.player_command_owners.owner(root) else {
-            return Ok(PlayerCommandAdmission::NotOwned);
-        };
-        if owner.operator_only {
-            return Ok(PlayerCommandAdmission::PermissionDenied);
-        }
-        let event =
-            ScriptEvent::player_command(owner.plugin_id, player_id, username, root, arguments);
-        match self.try_enqueue_event(event) {
-            Ok(()) => Ok(PlayerCommandAdmission::Enqueued),
-            Err(error @ ScriptQueueError::Full(_)) => Err(error),
-            Err(error @ ScriptQueueError::Closed(_)) => {
-                self.player_command_owners.clear();
-                Err(error)
-            }
-        }
-    }
-
     /// Route a raw player command with the immutable context observed by the server.
     ///
     /// Permission is checked before the bounded event queue so an operator-only
@@ -640,27 +2235,30 @@ impl ScriptBoundary {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
         raw: &str,
-    ) -> Result<PlayerCommandAdmission, ScriptQueueError<ScriptEvent>> {
+    ) -> Result<PlayerCommandAdmission, ScriptQueueError> {
         let Some((root, arguments)) = split_player_command(raw) else {
             return Ok(PlayerCommandAdmission::NotOwned);
         };
         let Some(owner) = self.player_command_owners.owner(root) else {
             return Ok(PlayerCommandAdmission::NotOwned);
         };
-        if owner.operator_only && context.operator() != Some(true) {
+        if owner.operator_only && !context.operator() {
             return Ok(PlayerCommandAdmission::PermissionDenied);
         };
-        let event = ScriptEvent::player_command_with_context(
+        let event = match ScriptEvent::try_player_command_with_context(
             owner.plugin_id,
             player_id,
             context,
             root,
             arguments,
-        );
+        ) {
+            Ok(event) => event,
+            Err(error) => return Ok(PlayerCommandAdmission::OwnedRejected { error }),
+        };
         match self.try_enqueue_event(event) {
             Ok(()) => Ok(PlayerCommandAdmission::Enqueued),
-            Err(error @ ScriptQueueError::Full(_)) => Err(error),
-            Err(error @ ScriptQueueError::Closed(_)) => {
+            Err(error @ ScriptQueueError::Full) => Err(error),
+            Err(error @ ScriptQueueError::Closed) => {
                 self.player_command_owners.clear();
                 Err(error)
             }
@@ -671,6 +2269,21 @@ impl ScriptBoundary {
     pub async fn recv_command(&self) -> Option<ScriptCommand> {
         self.command_rx.lock().await.recv().await
     }
+
+    /// Consume one exact host-issued admission ticket.
+    pub fn accept_host_command(
+        &self,
+        command: ScriptCommand,
+    ) -> Result<AdmittedScriptCommand, ScriptCommandAcceptanceError> {
+        let ScriptCommand::HostAttached {
+            provenance,
+            request,
+        } = command
+        else {
+            return Err(ScriptCommandAcceptanceError::NotHostAttached);
+        };
+        self.host_admissions.accept(provenance, request)
+    }
 }
 
 /// Script-host side of the bounded boundary.
@@ -679,6 +2292,8 @@ pub struct ScriptHostEndpoint {
     event_rx: mpsc::Receiver<ScriptEvent>,
     command_tx: mpsc::Sender<ScriptCommand>,
     player_command_owners: PlayerCommandOwners,
+    #[cfg(any(test, feature = "lua-runtime"))]
+    host_admissions: Arc<HostAdmissionLedger>,
 }
 
 impl ScriptHostEndpoint {
@@ -696,10 +2311,87 @@ impl ScriptHostEndpoint {
     pub fn try_submit_command(
         &self,
         command: ScriptCommand,
-    ) -> Result<(), ScriptQueueError<ScriptCommand>> {
+    ) -> Result<(), ScriptCommandSubmissionError> {
+        if matches!(command, ScriptCommand::HostAttached { .. }) {
+            return Err(ScriptCommandSubmissionError::ProvenanceRejected);
+        }
+        if let Err(error) = command.validate_contract() {
+            return Err(ScriptCommandSubmissionError::InvalidCommand { error });
+        }
+        if let Some(capability) = command.required_capability_kind() {
+            return Err(ScriptCommandSubmissionError::PermissionDenied { capability });
+        }
         self.command_tx
             .try_send(command)
-            .map_err(ScriptQueueError::from)
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => ScriptCommandSubmissionError::QueueFull,
+                mpsc::error::TrySendError::Closed(_) => ScriptCommandSubmissionError::QueueClosed,
+            })
+    }
+
+    /// Attach the currently executing Lua plugin identity before crossing into
+    /// server-owned command handling. This is intentionally unavailable outside
+    /// this crate: a plugin must never choose its own provenance.
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn try_submit_plugin_batch(
+        &self,
+        admission: &HostCommandAdmission,
+        batch: CommandBatch,
+    ) -> Result<(), ScriptBatchSubmissionError> {
+        for command in batch.commands() {
+            if matches!(command, ScriptCommand::HostAttached { .. }) {
+                return Err(ScriptBatchSubmissionError::Rejected {
+                    batch,
+                    error: CommandBatchError::ProvenanceRejected,
+                });
+            }
+            if let Err(error) = command.validate_contract() {
+                return Err(ScriptBatchSubmissionError::Rejected {
+                    batch,
+                    error: CommandBatchError::InvalidCommand { error },
+                });
+            }
+            let denied_capability = command
+                .required_capability()
+                .filter(|capability| !admission.capabilities.allows(*capability))
+                .map(RequiredCommandCapability::kind);
+            if let Some(capability) = denied_capability {
+                return Err(ScriptBatchSubmissionError::Rejected {
+                    batch,
+                    error: CommandBatchError::PermissionDenied { capability },
+                });
+            }
+        }
+
+        let command_count = batch.commands().len();
+        if command_count == 0 {
+            return Ok(());
+        }
+        let permits = match self.command_tx.try_reserve_many(command_count) {
+            Ok(permits) => permits,
+            Err(mpsc::error::TrySendError::Full(())) => {
+                return Err(ScriptBatchSubmissionError::Full(batch));
+            }
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                return Err(ScriptBatchSubmissionError::Closed(batch));
+            }
+        };
+        let attached = match self
+            .host_admissions
+            .issue(Arc::clone(&admission.plugin_id), batch)
+        {
+            Ok(attached) => attached,
+            Err(batch) => {
+                return Err(ScriptBatchSubmissionError::Rejected {
+                    batch,
+                    error: CommandBatchError::AdmissionUnavailable,
+                });
+            }
+        };
+        for (permit, command) in permits.zip(attached) {
+            permit.send(command);
+        }
+        Ok(())
     }
 
     /// Register the player command roots from one validated plugin manifest.
@@ -732,11 +2424,13 @@ pub enum PlayerCommandRegistrationError {
         limit: usize,
         requested: usize,
     },
+    AuthorityPoisoned,
 }
 
 #[derive(Debug, Clone, Default)]
 struct PlayerCommandOwners {
     owners: Arc<RwLock<BTreeMap<String, PlayerCommandOwner>>>,
+    disabled: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,15 +2441,35 @@ struct PlayerCommandOwner {
 
 impl PlayerCommandOwners {
     fn roots(&self, operator_only: bool) -> Vec<String> {
-        self.read()
-            .iter()
-            .filter(|(_, owner)| owner.operator_only == operator_only)
-            .map(|(root, _)| root.clone())
-            .collect()
+        if self.disabled.load(Ordering::Acquire) {
+            return Vec::new();
+        }
+        match self.owners.read() {
+            Ok(owners) => owners
+                .iter()
+                .filter(|(_, owner)| owner.operator_only == operator_only)
+                .map(|(root, _)| root.clone())
+                .collect(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.disable();
+                Vec::new()
+            }
+        }
     }
 
     fn owner(&self, root: &str) -> Option<PlayerCommandOwner> {
-        self.read().get(root).cloned()
+        if self.disabled.load(Ordering::Acquire) {
+            return None;
+        }
+        match self.owners.read() {
+            Ok(owners) => owners.get(root).cloned(),
+            Err(poisoned) => {
+                drop(poisoned);
+                self.disable();
+                None
+            }
+        }
     }
 
     fn register(
@@ -764,7 +2478,17 @@ impl PlayerCommandOwners {
         player_roots: &[String],
         operator_roots: &[String],
     ) -> Result<(), PlayerCommandRegistrationError> {
-        let mut owners = self.write();
+        if self.disabled.load(Ordering::Acquire) {
+            return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+        }
+        let mut owners = match self.owners.write() {
+            Ok(owners) => owners,
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                self.disabled.store(true, Ordering::Release);
+                return Err(PlayerCommandRegistrationError::AuthorityPoisoned);
+            }
+        };
         let requested_roots = player_roots
             .iter()
             .chain(operator_roots)
@@ -807,23 +2531,34 @@ impl PlayerCommandOwners {
     }
 
     fn unregister(&self, plugin_id: &str) {
-        self.write().retain(|_, owner| owner.plugin_id != plugin_id);
+        if self.disabled.load(Ordering::Acquire) {
+            self.clear_poisoned();
+            return;
+        }
+        match self.owners.write() {
+            Ok(mut owners) => owners.retain(|_, owner| owner.plugin_id != plugin_id),
+            Err(poisoned) => {
+                poisoned.into_inner().clear();
+                self.disabled.store(true, Ordering::Release);
+            }
+        }
     }
 
     fn clear(&self) {
-        self.write().clear();
+        self.disabled.store(true, Ordering::Release);
+        self.clear_poisoned();
     }
 
-    fn read(&self) -> std::sync::RwLockReadGuard<'_, BTreeMap<String, PlayerCommandOwner>> {
-        self.owners
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn disable(&self) {
+        self.disabled.store(true, Ordering::Release);
+        self.clear_poisoned();
     }
 
-    fn write(&self) -> std::sync::RwLockWriteGuard<'_, BTreeMap<String, PlayerCommandOwner>> {
-        self.owners
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    fn clear_poisoned(&self) {
+        match self.owners.write() {
+            Ok(mut owners) => owners.clear(),
+            Err(poisoned) => poisoned.into_inner().clear(),
+        }
     }
 }
 
@@ -832,19 +2567,32 @@ pub fn script_boundary_pair(
     event_capacity: NonZeroUsize,
     command_capacity: NonZeroUsize,
 ) -> (ScriptBoundary, ScriptHostEndpoint) {
-    let (event_tx, event_rx) = mpsc::channel(event_capacity.get());
-    let (command_tx, command_rx) = mpsc::channel(command_capacity.get());
+    let event_capacity = event_capacity.get().min(MAX_SCRIPT_EVENT_QUEUE_CAPACITY);
+    let command_capacity = command_capacity
+        .get()
+        .min(MAX_SCRIPT_COMMAND_QUEUE_CAPACITY);
+    let (event_tx, event_rx) = mpsc::channel(event_capacity);
+    let (command_tx, command_rx) = mpsc::channel(command_capacity);
     let player_command_owners = PlayerCommandOwners::default();
+    let host_admissions = Arc::new(HostAdmissionLedger::default());
+    let weak_event_tx = event_tx.downgrade();
     (
         ScriptBoundary {
-            event_tx,
+            event_admission: Arc::new(ScriptEventAdmission {
+                closed: AtomicBool::new(false),
+                sender: StdMutex::new(Some(event_tx)),
+                weak_sender: weak_event_tx,
+            }),
             command_rx: Arc::new(Mutex::new(command_rx)),
             player_command_owners: player_command_owners.clone(),
+            host_admissions: Arc::clone(&host_admissions),
         },
         ScriptHostEndpoint {
             event_rx,
             command_tx,
             player_command_owners,
+            #[cfg(any(test, feature = "lua-runtime"))]
+            host_admissions,
         },
     )
 }
@@ -855,6 +2603,77 @@ pub fn script_boundary_pair(
 pub enum ScriptCommandCapability {
     RunConsoleCommandRoot { root: String },
     SpawnEntityType { entity_type: String },
+    PluginStorage,
+    InventoryMenus,
+    InventoryStorageTransactions,
+    Zones,
+    Colonies,
+}
+
+/// Stable non-owning category used in public command-admission errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptCommandCapabilityKind {
+    RunConsoleCommand,
+    SpawnEntity,
+    PluginStorage,
+    InventoryMenus,
+    InventoryStorageTransactions,
+    Zones,
+    Colonies,
+}
+
+impl ScriptCommandCapabilityKind {
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::RunConsoleCommand => "run_console_command",
+            Self::SpawnEntity => "spawn_entity",
+            Self::PluginStorage => "plugin_storage",
+            Self::InventoryMenus => "inventory_menus",
+            Self::InventoryStorageTransactions => "inventory_storage_transactions",
+            Self::Zones => "zones",
+            Self::Colonies => "colonies",
+        }
+    }
+
+    pub const fn field(self) -> &'static str {
+        match self {
+            Self::RunConsoleCommand => "console command root",
+            Self::SpawnEntity => "spawn entity type",
+            Self::PluginStorage => "plugin storage",
+            Self::InventoryMenus => "inventory menu",
+            Self::InventoryStorageTransactions => "inventory storage transaction",
+            Self::Zones => "zone",
+            Self::Colonies => "colony",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequiredCommandCapability<'a> {
+    RunConsoleCommandRoot { root: &'a str },
+    SpawnEntityType { entity_type: &'a str },
+    PluginStorage,
+    InventoryMenus,
+    InventoryStorageTransactions,
+    Zones,
+    Colonies,
+}
+
+impl RequiredCommandCapability<'_> {
+    const fn kind(self) -> ScriptCommandCapabilityKind {
+        match self {
+            Self::RunConsoleCommandRoot { .. } => ScriptCommandCapabilityKind::RunConsoleCommand,
+            Self::SpawnEntityType { .. } => ScriptCommandCapabilityKind::SpawnEntity,
+            Self::PluginStorage => ScriptCommandCapabilityKind::PluginStorage,
+            Self::InventoryMenus => ScriptCommandCapabilityKind::InventoryMenus,
+            Self::InventoryStorageTransactions => {
+                ScriptCommandCapabilityKind::InventoryStorageTransactions
+            }
+            Self::Zones => ScriptCommandCapabilityKind::Zones,
+            Self::Colonies => ScriptCommandCapabilityKind::Colonies,
+        }
+    }
 }
 
 /// Declarative subscription to one Solaris script event name.
@@ -865,10 +2684,8 @@ pub struct ScriptEventSubscription {
 }
 
 impl ScriptEventSubscription {
-    pub fn new(event_name: impl Into<String>) -> Self {
-        Self {
-            event_name: event_name.into(),
-        }
+    fn new(event_name: String) -> Self {
+        Self { event_name }
     }
 
     pub fn event_name(&self) -> &str {
@@ -903,9 +2720,9 @@ pub struct ScriptPluginDependency {
 }
 
 impl ScriptPluginDependency {
-    pub fn new(plugin_id: impl Into<String>, relation: ScriptPluginDependencyRelation) -> Self {
+    fn new(plugin_id: String, relation: ScriptPluginDependencyRelation) -> Self {
         Self {
-            plugin_id: plugin_id.into(),
+            plugin_id,
             relation,
         }
     }
@@ -934,20 +2751,40 @@ pub struct ScriptPluginManifest {
     player_command_roots: Vec<String>,
     operator_command_roots: Vec<String>,
     declared_permissions: Vec<String>,
+    preflight_error: Option<ScriptPluginManifestError>,
 }
 
 impl ScriptPluginManifest {
     /// Build a script plugin manifest DTO.
     pub fn new(
-        plugin_id: impl Into<String>,
-        display_name: impl Into<String>,
-        version: impl Into<String>,
+        plugin_id: impl AsRef<str>,
+        display_name: impl AsRef<str>,
+        version: impl AsRef<str>,
         requested_api_version: ScriptApiVersion,
     ) -> Self {
+        let mut preflight_error = None;
+        let plugin_id = bounded_manifest_owned(
+            "plugin id",
+            plugin_id.as_ref(),
+            MAX_PLUGIN_ID_BYTES,
+            &mut preflight_error,
+        );
+        let display_name = bounded_manifest_owned(
+            "display name",
+            display_name.as_ref(),
+            MAX_PLUGIN_DISPLAY_NAME_BYTES,
+            &mut preflight_error,
+        );
+        let version = bounded_manifest_owned(
+            "version",
+            version.as_ref(),
+            MAX_PLUGIN_VERSION_BYTES,
+            &mut preflight_error,
+        );
         Self {
-            plugin_id: plugin_id.into(),
-            display_name: display_name.into(),
-            version: version.into(),
+            plugin_id,
+            display_name,
+            version,
             requested_api_version,
             load_phase: ScriptPluginLoadPhase::default(),
             event_subscriptions: Vec::new(),
@@ -956,6 +2793,7 @@ impl ScriptPluginManifest {
             player_command_roots: Vec::new(),
             operator_command_roots: Vec::new(),
             declared_permissions: Vec::new(),
+            preflight_error,
         }
     }
 
@@ -966,55 +2804,192 @@ impl ScriptPluginManifest {
     }
 
     /// Declare interest in one Solaris-native script event name.
-    pub fn subscribe_event(mut self, event_name: impl Into<String>) -> Self {
-        self.event_subscriptions
-            .push(ScriptEventSubscription::new(event_name));
+    pub fn subscribe_event(mut self, event_name: impl AsRef<str>) -> Self {
+        if self.preflight_error.is_some() {
+            return self;
+        }
+        if self.event_subscriptions.len() >= MAX_MANIFEST_EVENT_SUBSCRIPTIONS {
+            self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                field: "event subscriptions",
+                max: MAX_MANIFEST_EVENT_SUBSCRIPTIONS,
+            });
+            return self;
+        }
+        let event_name = bounded_manifest_owned(
+            "event subscription",
+            event_name.as_ref(),
+            MAX_MANIFEST_FIELD_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            self.event_subscriptions
+                .push(ScriptEventSubscription::new(event_name));
+        }
         self
     }
 
     /// Declare a plugin dependency or load-order edge.
     pub fn declare_dependency(
         mut self,
-        plugin_id: impl Into<String>,
+        plugin_id: impl AsRef<str>,
         relation: ScriptPluginDependencyRelation,
     ) -> Self {
-        self.dependencies
-            .push(ScriptPluginDependency::new(plugin_id, relation));
+        if self.preflight_error.is_some() {
+            return self;
+        }
+        if self.dependencies.len() >= MAX_MANIFEST_DEPENDENCIES {
+            self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                field: "dependencies",
+                max: MAX_MANIFEST_DEPENDENCIES,
+            });
+            return self;
+        }
+        let plugin_id = bounded_manifest_owned(
+            "dependency plugin id",
+            plugin_id.as_ref(),
+            MAX_PLUGIN_ID_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            self.dependencies
+                .push(ScriptPluginDependency::new(plugin_id, relation));
+        }
         self
     }
 
     /// Declare that this plugin requests access to a console command root.
-    pub fn declare_console_command_root(mut self, root: impl Into<String>) -> Self {
-        self.declared_command_capabilities
-            .push(ScriptCommandCapability::RunConsoleCommandRoot { root: root.into() });
+    pub fn declare_console_command_root(mut self, root: impl AsRef<str>) -> Self {
+        let root = bounded_manifest_owned(
+            "console command root",
+            root.as_ref(),
+            MAX_PLAYER_COMMAND_ROOT_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            self.push_capability(ScriptCommandCapability::RunConsoleCommandRoot { root });
+        }
         self
     }
 
     /// Declare one exact entity type this plugin may spawn.
-    pub fn declare_spawn_entity_type(mut self, entity_type: impl Into<String>) -> Self {
-        self.declared_command_capabilities
-            .push(ScriptCommandCapability::SpawnEntityType {
-                entity_type: entity_type.into(),
-            });
+    pub fn declare_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
+        let entity_type = bounded_manifest_owned(
+            "spawn entity type",
+            entity_type.as_ref(),
+            MAX_SCRIPT_RESOURCE_ID_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            self.push_capability(ScriptCommandCapability::SpawnEntityType { entity_type });
+        }
+        self
+    }
+
+    /// Declare access to the plugin-owned key/value store.
+    pub fn declare_plugin_storage(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::PluginStorage);
+        self
+    }
+
+    /// Declare access to server-owned inventory menu requests and click events.
+    pub fn declare_inventory_menus(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::InventoryMenus);
+        self
+    }
+
+    /// Declare access to atomic player-inventory and plugin-storage requests.
+    pub fn declare_inventory_storage_transactions(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::InventoryStorageTransactions);
+        self
+    }
+
+    /// Declare access to plugin-owned axis-aligned zones.
+    pub fn declare_zones(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::Zones);
+        self
+    }
+
+    /// Declare access to server-owned colony records and villager binding requests.
+    pub fn declare_colonies(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::Colonies);
         self
     }
 
     /// Declare a literal command root that players may invoke for this plugin.
-    pub fn declare_player_command_root(mut self, root: impl Into<String>) -> Self {
-        self.player_command_roots.push(root.into());
+    pub fn declare_player_command_root(mut self, root: impl AsRef<str>) -> Self {
+        let root = bounded_manifest_owned(
+            "player command root",
+            root.as_ref(),
+            MAX_PLAYER_COMMAND_ROOT_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            if self.player_command_roots.len() >= MAX_PLAYER_COMMAND_ROOTS {
+                self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                    field: "player command roots",
+                    max: MAX_PLAYER_COMMAND_ROOTS,
+                });
+            } else {
+                self.player_command_roots.push(root);
+            }
+        }
         self
     }
 
     /// Declare a literal player command root that only operators may invoke.
-    pub fn declare_operator_command_root(mut self, root: impl Into<String>) -> Self {
-        self.operator_command_roots.push(root.into());
+    pub fn declare_operator_command_root(mut self, root: impl AsRef<str>) -> Self {
+        let root = bounded_manifest_owned(
+            "operator command root",
+            root.as_ref(),
+            MAX_PLAYER_COMMAND_ROOT_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            if self.operator_command_roots.len() >= MAX_PLAYER_COMMAND_ROOTS {
+                self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                    field: "operator command roots",
+                    max: MAX_PLAYER_COMMAND_ROOTS,
+                });
+            } else {
+                self.operator_command_roots.push(root);
+            }
+        }
         self
     }
 
     /// Declare an opaque plugin permission string for a future loader.
-    pub fn declare_permission(mut self, permission: impl Into<String>) -> Self {
-        self.declared_permissions.push(permission.into());
+    pub fn declare_permission(mut self, permission: impl AsRef<str>) -> Self {
+        let permission = bounded_manifest_owned(
+            "permission",
+            permission.as_ref(),
+            MAX_MANIFEST_FIELD_BYTES,
+            &mut self.preflight_error,
+        );
+        if self.preflight_error.is_none() {
+            if self.declared_permissions.len() >= MAX_MANIFEST_PERMISSIONS {
+                self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                    field: "permissions",
+                    max: MAX_MANIFEST_PERMISSIONS,
+                });
+            } else {
+                self.declared_permissions.push(permission);
+            }
+        }
         self
+    }
+
+    fn push_capability(&mut self, capability: ScriptCommandCapability) {
+        if self.preflight_error.is_some() {
+            return;
+        }
+        if self.declared_command_capabilities.len() >= MAX_MANIFEST_CAPABILITIES {
+            self.preflight_error = Some(ScriptPluginManifestError::TooManyEntries {
+                field: "command capabilities",
+                max: MAX_MANIFEST_CAPABILITIES,
+            });
+            return;
+        }
+        self.declared_command_capabilities.push(capability);
     }
 
     pub fn plugin_id(&self) -> &str {
@@ -1063,6 +3038,96 @@ impl ScriptPluginManifest {
 
     /// Validate and normalize this manifest for trusted host-side use.
     pub fn validate(&self) -> Result<ValidatedScriptPluginManifest, ScriptPluginManifestError> {
+        if let Some(error) = &self.preflight_error {
+            return Err(error.clone());
+        }
+        validate_manifest_field("plugin id", &self.plugin_id, MAX_PLUGIN_ID_BYTES, false)?;
+        validate_manifest_field(
+            "display name",
+            &self.display_name,
+            MAX_PLUGIN_DISPLAY_NAME_BYTES,
+            false,
+        )?;
+        validate_manifest_field("version", &self.version, MAX_PLUGIN_VERSION_BYTES, false)?;
+        validate_manifest_count(
+            "event subscriptions",
+            self.event_subscriptions.len(),
+            MAX_MANIFEST_EVENT_SUBSCRIPTIONS,
+        )?;
+        validate_manifest_count(
+            "dependencies",
+            self.dependencies.len(),
+            MAX_MANIFEST_DEPENDENCIES,
+        )?;
+        validate_manifest_count(
+            "command capabilities",
+            self.declared_command_capabilities.len(),
+            MAX_MANIFEST_CAPABILITIES,
+        )?;
+        validate_manifest_count(
+            "player command roots",
+            self.player_command_roots.len(),
+            MAX_PLAYER_COMMAND_ROOTS,
+        )?;
+        validate_manifest_count(
+            "operator command roots",
+            self.operator_command_roots.len(),
+            MAX_PLAYER_COMMAND_ROOTS,
+        )?;
+        validate_manifest_count(
+            "permissions",
+            self.declared_permissions.len(),
+            MAX_MANIFEST_PERMISSIONS,
+        )?;
+        for subscription in &self.event_subscriptions {
+            validate_manifest_field(
+                "event subscription",
+                subscription.event_name(),
+                MAX_MANIFEST_FIELD_BYTES,
+                false,
+            )?;
+        }
+        for dependency in &self.dependencies {
+            validate_manifest_field(
+                "dependency plugin id",
+                dependency.plugin_id(),
+                MAX_PLUGIN_ID_BYTES,
+                false,
+            )?;
+        }
+        for capability in &self.declared_command_capabilities {
+            match capability {
+                ScriptCommandCapability::RunConsoleCommandRoot { root } => {
+                    validate_manifest_field(
+                        "console command root",
+                        root,
+                        MAX_PLAYER_COMMAND_ROOT_BYTES,
+                        false,
+                    )?;
+                }
+                ScriptCommandCapability::SpawnEntityType { entity_type } => {
+                    validate_manifest_field(
+                        "spawn entity type",
+                        entity_type,
+                        MAX_SCRIPT_RESOURCE_ID_BYTES,
+                        false,
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        for permission in &self.declared_permissions {
+            validate_manifest_field("permission", permission, MAX_MANIFEST_FIELD_BYTES, false)?;
+            if !permission.bytes().all(|byte| {
+                byte.is_ascii_lowercase()
+                    || byte.is_ascii_digit()
+                    || matches!(byte, b':' | b'.' | b'_' | b'-' | b'/')
+            }) {
+                return Err(ScriptPluginManifestError::InvalidField {
+                    field: "permission",
+                });
+            }
+        }
         if self.plugin_id.trim().is_empty() {
             return Err(ScriptPluginManifestError::BlankPluginId);
         }
@@ -1072,46 +3137,25 @@ impl ScriptPluginManifest {
                 plugin_id: self.plugin_id.clone(),
             });
         }
+        if self.display_name.trim().is_empty()
+            || self
+                .display_name
+                .chars()
+                .any(|character| character.is_control())
+        {
+            return Err(ScriptPluginManifestError::InvalidField {
+                field: "display name",
+            });
+        }
+        if !is_valid_plugin_version(&self.version) {
+            return Err(ScriptPluginManifestError::InvalidField { field: "version" });
+        }
 
         if !supports_script_api_version(self.requested_api_version) {
             return Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
                 requested: self.requested_api_version,
                 supported: SCRIPT_API_VERSION,
             });
-        }
-
-        if !self.player_command_roots.is_empty()
-            && self.requested_api_version < PLAYER_COMMANDS_API_VERSION
-        {
-            return Err(
-                ScriptPluginManifestError::PlayerCommandsRequireScriptApiVersion {
-                    requested: self.requested_api_version,
-                    minimum: PLAYER_COMMANDS_API_VERSION,
-                },
-            );
-        }
-        if !self.operator_command_roots.is_empty()
-            && self.requested_api_version < OPERATOR_COMMANDS_API_VERSION
-        {
-            return Err(
-                ScriptPluginManifestError::OperatorCommandsRequireScriptApiVersion {
-                    requested: self.requested_api_version,
-                    minimum: OPERATOR_COMMANDS_API_VERSION,
-                },
-            );
-        }
-        if self
-            .declared_command_capabilities
-            .iter()
-            .any(|capability| matches!(capability, ScriptCommandCapability::SpawnEntityType { .. }))
-            && self.requested_api_version < ENTITY_SPAWN_API_VERSION
-        {
-            return Err(
-                ScriptPluginManifestError::SpawnEntitiesRequireScriptApiVersion {
-                    requested: self.requested_api_version,
-                    minimum: ENTITY_SPAWN_API_VERSION,
-                },
-            );
         }
 
         let mut normalized_event_subscriptions = Vec::with_capacity(self.event_subscriptions.len());
@@ -1188,6 +3232,18 @@ impl ScriptPluginManifest {
                     }
                     normalized_capabilities
                         .push(ScriptCommandCapability::SpawnEntityType { entity_type });
+                }
+                ScriptCommandCapability::PluginStorage
+                | ScriptCommandCapability::InventoryMenus
+                | ScriptCommandCapability::InventoryStorageTransactions
+                | ScriptCommandCapability::Zones
+                | ScriptCommandCapability::Colonies => {
+                    if normalized_capabilities.contains(capability) {
+                        return Err(ScriptPluginManifestError::DuplicateCapability {
+                            capability: capability.clone(),
+                        });
+                    }
+                    normalized_capabilities.push(capability.clone());
                 }
             }
         }
@@ -1302,8 +3358,8 @@ impl ValidatedScriptPluginManifest {
 
     /// Trusted host-side conversion from validated manifest declarations to
     /// executable command capabilities.
-    #[cfg(feature = "host-api")]
-    pub fn to_command_capabilities(&self) -> CommandCapabilities {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn to_command_capabilities(&self) -> CommandCapabilities {
         let mut capabilities = CommandCapabilities::none();
         for capability in &self.declared_command_capabilities {
             match capability {
@@ -1312,6 +3368,21 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::SpawnEntityType { entity_type } => {
                     capabilities = capabilities.allow_spawn_entity_type(entity_type);
+                }
+                ScriptCommandCapability::PluginStorage => {
+                    capabilities = capabilities.allow_plugin_storage();
+                }
+                ScriptCommandCapability::InventoryMenus => {
+                    capabilities = capabilities.allow_inventory_menus();
+                }
+                ScriptCommandCapability::InventoryStorageTransactions => {
+                    capabilities = capabilities.allow_inventory_storage_transactions();
+                }
+                ScriptCommandCapability::Zones => {
+                    capabilities = capabilities.allow_zones();
+                }
+                ScriptCommandCapability::Colonies => {
+                    capabilities = capabilities.allow_colonies();
                 }
             }
         }
@@ -1323,6 +3394,20 @@ impl ValidatedScriptPluginManifest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ScriptPluginManifestError {
+    FieldTooLong {
+        field: &'static str,
+        max_bytes: usize,
+    },
+    EmptyField {
+        field: &'static str,
+    },
+    InvalidField {
+        field: &'static str,
+    },
+    TooManyEntries {
+        field: &'static str,
+        max: usize,
+    },
     BlankPluginId,
     InvalidPluginId {
         plugin_id: String,
@@ -1330,18 +3415,6 @@ pub enum ScriptPluginManifestError {
     UnsupportedScriptApiVersion {
         requested: ScriptApiVersion,
         supported: ScriptApiVersion,
-    },
-    PlayerCommandsRequireScriptApiVersion {
-        requested: ScriptApiVersion,
-        minimum: ScriptApiVersion,
-    },
-    OperatorCommandsRequireScriptApiVersion {
-        requested: ScriptApiVersion,
-        minimum: ScriptApiVersion,
-    },
-    SpawnEntitiesRequireScriptApiVersion {
-        requested: ScriptApiVersion,
-        minimum: ScriptApiVersion,
     },
     InvalidEventName {
         event_name: String,
@@ -1365,6 +3438,9 @@ pub enum ScriptPluginManifestError {
     },
     DuplicateCommandRoot {
         root: String,
+    },
+    DuplicateCapability {
+        capability: ScriptCommandCapability,
     },
     InvalidSpawnEntityType {
         entity_type: String,
@@ -1390,28 +3466,70 @@ pub enum ScriptPluginManifestError {
     },
 }
 
+fn validate_manifest_field(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), ScriptPluginManifestError> {
+    if !allow_empty && value.is_empty() {
+        return Err(ScriptPluginManifestError::EmptyField { field });
+    }
+    if value.len() > max_bytes {
+        return Err(ScriptPluginManifestError::FieldTooLong { field, max_bytes });
+    }
+    Ok(())
+}
+
+fn bounded_manifest_owned(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+    error: &mut Option<ScriptPluginManifestError>,
+) -> String {
+    if error.is_some() {
+        return String::new();
+    }
+    if value.is_empty() {
+        *error = Some(ScriptPluginManifestError::EmptyField { field });
+        return String::new();
+    }
+    if value.len() > max_bytes {
+        *error = Some(ScriptPluginManifestError::FieldTooLong { field, max_bytes });
+        return String::new();
+    }
+    value.to_owned()
+}
+
+fn validate_manifest_count(
+    field: &'static str,
+    count: usize,
+    max: usize,
+) -> Result<(), ScriptPluginManifestError> {
+    if count > max {
+        return Err(ScriptPluginManifestError::TooManyEntries { field, max });
+    }
+    Ok(())
+}
+
+fn is_valid_plugin_version(version: &str) -> bool {
+    version.bytes().any(|byte| byte.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+}
+
 /// Allow-list of privileged outbound command capabilities granted by the host.
-///
-/// Default builds expose empty capabilities for script-facing callers. Trusted
-/// host-side crates can enable the `host-api` Cargo feature to construct
-/// non-empty allow-lists.
-#[cfg_attr(
-    not(feature = "host-api"),
-    doc = r#"
-The root-granting builder is absent from the default public API:
-
-```compile_fail
-use mc_script::CommandCapabilities;
-
-let _forged = CommandCapabilities::none().allow_console_command_root("stop");
-```
-"#
-)]
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct CommandCapabilities {
     console_command_roots: Vec<String>,
     spawn_entity_types: Vec<String>,
+    plugin_storage: bool,
+    inventory_menus: bool,
+    inventory_storage_transactions: bool,
+    zones: bool,
+    colonies: bool,
 }
 
 impl CommandCapabilities {
@@ -1420,35 +3538,21 @@ impl CommandCapabilities {
         Self::default()
     }
 
-    /// Trusted host-side builder for allowing console commands with a root token.
-    ///
-    /// Available to unit tests and to crates that opt into the `host-api`
-    /// feature.
-    ///
-    /// ```
-    /// use mc_script::{CommandCapabilities, ScriptCommandCapability};
-    ///
-    /// let capabilities = CommandCapabilities::none().allow_console_command_root("time");
-    /// assert!(capabilities.allows(&ScriptCommandCapability::RunConsoleCommandRoot {
-    ///     root: "time".to_owned(),
-    /// }));
-    /// ```
-    #[cfg(any(test, feature = "host-api"))]
-    pub fn allow_console_command_root(mut self, root: impl AsRef<str>) -> Self {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_console_command_root(mut self, root: impl AsRef<str>) -> Self {
         let root = console_command_root(root.as_ref());
         if !self
             .console_command_roots
             .iter()
-            .any(|allowed| allowed == &root)
+            .any(|allowed| allowed == root)
         {
-            self.console_command_roots.push(root);
+            self.console_command_roots.push(root.to_owned());
         }
         self
     }
 
-    /// Trusted host-side builder for allowing one exact entity type.
-    #[cfg(any(test, feature = "host-api"))]
-    pub fn allow_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_spawn_entity_type(mut self, entity_type: impl AsRef<str>) -> Self {
         let entity_type = entity_type.as_ref().to_owned();
         if !self
             .spawn_entity_types
@@ -1460,17 +3564,53 @@ impl CommandCapabilities {
         self
     }
 
-    /// Return whether this allow-list grants the requested command capability.
-    pub fn allows(&self, capability: &ScriptCommandCapability) -> bool {
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_plugin_storage(mut self) -> Self {
+        self.plugin_storage = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_inventory_menus(mut self) -> Self {
+        self.inventory_menus = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_inventory_storage_transactions(mut self) -> Self {
+        self.inventory_storage_transactions = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_zones(mut self) -> Self {
+        self.zones = true;
+        self
+    }
+
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_colonies(mut self) -> Self {
+        self.colonies = true;
+        self
+    }
+
+    fn allows(&self, capability: RequiredCommandCapability<'_>) -> bool {
         match capability {
-            ScriptCommandCapability::RunConsoleCommandRoot { root } => self
+            RequiredCommandCapability::RunConsoleCommandRoot { root } => self
                 .console_command_roots
                 .iter()
                 .any(|allowed| allowed == root),
-            ScriptCommandCapability::SpawnEntityType { entity_type } => self
+            RequiredCommandCapability::SpawnEntityType { entity_type } => self
                 .spawn_entity_types
                 .iter()
                 .any(|allowed| allowed == entity_type),
+            RequiredCommandCapability::PluginStorage => self.plugin_storage,
+            RequiredCommandCapability::InventoryMenus => self.inventory_menus,
+            RequiredCommandCapability::InventoryStorageTransactions => {
+                self.inventory_storage_transactions
+            }
+            RequiredCommandCapability::Zones => self.zones,
+            RequiredCommandCapability::Colonies => self.colonies,
         }
     }
 }
@@ -1479,8 +3619,17 @@ impl CommandCapabilities {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum CommandBatchError {
-    Full { limit: NonZeroUsize },
-    PermissionDenied { capability: ScriptCommandCapability },
+    Full {
+        limit: NonZeroUsize,
+    },
+    PermissionDenied {
+        capability: ScriptCommandCapabilityKind,
+    },
+    ProvenanceRejected,
+    InvalidCommand {
+        error: ScriptDtoError,
+    },
+    AdmissionUnavailable,
 }
 
 /// Bounded list of commands produced by one script event invocation.
@@ -1493,9 +3642,11 @@ pub struct CommandBatch {
 impl CommandBatch {
     /// Create an empty command batch with a fixed command count limit.
     pub fn new(limit: NonZeroUsize) -> Self {
+        let limit = NonZeroUsize::new(limit.get().min(MAX_SCRIPT_COMMAND_BATCH))
+            .expect("script command batch limit is non-zero");
         Self {
             limit,
-            commands: Vec::with_capacity(limit.get()),
+            commands: Vec::new(),
         }
     }
 
@@ -1516,18 +3667,22 @@ impl CommandBatch {
 
     /// Try to append one command without exceeding the batch limit.
     pub fn try_push(&mut self, command: ScriptCommand) -> Result<(), CommandBatchError> {
-        if let Some(capability) = command.required_capability() {
+        if matches!(command, ScriptCommand::HostAttached { .. }) {
+            return Err(CommandBatchError::ProvenanceRejected);
+        }
+        command
+            .validate_contract()
+            .map_err(|error| CommandBatchError::InvalidCommand { error })?;
+        if let Some(capability) = command.required_capability_kind() {
             return Err(CommandBatchError::PermissionDenied { capability });
         }
-
-        self.try_push_unchecked(command)
+        self.try_push_validated(command)
     }
 
-    fn try_push_unchecked(&mut self, command: ScriptCommand) -> Result<(), CommandBatchError> {
+    fn try_push_validated(&mut self, command: ScriptCommand) -> Result<(), CommandBatchError> {
         if self.commands.len() >= self.limit.get() {
             return Err(CommandBatchError::Full { limit: self.limit });
         }
-
         self.commands.push(command);
         Ok(())
     }
@@ -1538,24 +3693,30 @@ impl CommandBatch {
         command: ScriptCommand,
         capabilities: &CommandCapabilities,
     ) -> Result<(), CommandBatchError> {
-        if let Some(capability) = command.required_capability()
-            && !capabilities.allows(&capability)
-        {
-            return Err(CommandBatchError::PermissionDenied { capability });
+        if matches!(command, ScriptCommand::HostAttached { .. }) {
+            return Err(CommandBatchError::ProvenanceRejected);
         }
-
-        self.try_push_unchecked(command)
+        command
+            .validate_contract()
+            .map_err(|error| CommandBatchError::InvalidCommand { error })?;
+        if let Some(capability) = command.required_capability()
+            && !capabilities.allows(capability)
+        {
+            return Err(CommandBatchError::PermissionDenied {
+                capability: capability.kind(),
+            });
+        }
+        self.try_push_validated(command)
     }
 }
 
-fn console_command_root(command: &str) -> String {
+fn console_command_root(command: &str) -> &str {
     command
         .trim()
         .trim_start_matches('/')
         .split_whitespace()
         .next()
         .unwrap_or_default()
-        .to_owned()
 }
 
 fn normalize_event_name(event_name: &str) -> String {
@@ -1571,6 +3732,14 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.left"
             | "player.chat"
             | "server.tick"
+            | "plugin.storage.get_result"
+            | "plugin.storage.cas_result"
+            | "plugin.storage.delete_result"
+            | "inventory.menu.clicked"
+            | "inventory.storage_transaction.result"
+            | "player.zone_entered"
+            | "colony.record_result"
+            | "colony.villager_binding_result"
     )
 }
 
@@ -1596,9 +3765,11 @@ fn validate_command_root(root: &str) -> Result<String, ScriptPluginManifestError
         return Err(ScriptPluginManifestError::BlankCommandRoot);
     }
     if root.contains('*') {
-        return Err(ScriptPluginManifestError::UnboundedCommandRoot { root });
+        return Err(ScriptPluginManifestError::UnboundedCommandRoot {
+            root: root.to_owned(),
+        });
     }
-    Ok(root)
+    Ok(root.to_owned())
 }
 
 fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManifestError> {
@@ -1626,6 +3797,164 @@ fn validate_script_resource_id(value: &str) -> Result<String, ScriptPluginManife
     {
         return Err(ScriptPluginManifestError::InvalidSpawnEntityType {
             entity_type: value.to_owned(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_script_id(value: &str) -> Result<String, ScriptDtoError> {
+    if value.is_empty() {
+        return Err(ScriptDtoError::EmptyValue { field: "script id" });
+    }
+    if value.len() > MAX_SCRIPT_ID_BYTES {
+        return Err(ScriptDtoError::ValueTooLong {
+            field: "script id",
+            max_bytes: MAX_SCRIPT_ID_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+    }) {
+        return Err(ScriptDtoError::InvalidId {
+            field: "script id",
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_bounded_value(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ScriptDtoError> {
+    if value.len() > max_bytes {
+        return Err(ScriptDtoError::ValueTooLong {
+            field,
+            max_bytes,
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_bounded_nonempty(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), ScriptDtoError> {
+    if value.is_empty() {
+        return Err(ScriptDtoError::EmptyValue { field });
+    }
+    validate_bounded_value(field, value, max_bytes)
+}
+
+fn validate_player_identity(uuid: &str, username: &str) -> Result<(), ScriptDtoError> {
+    if !uuid
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(ScriptDtoError::InvalidId {
+            field: "player uuid",
+            actual_bytes: uuid.len(),
+        });
+    }
+    if !username
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(ScriptDtoError::InvalidId {
+            field: "player username",
+            actual_bytes: username.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_contract_resource_id(value: &str) -> Result<String, ScriptDtoError> {
+    if value.len() > MAX_SCRIPT_RESOURCE_ID_BYTES {
+        return Err(ScriptDtoError::ValueTooLong {
+            field: "resource id",
+            max_bytes: MAX_SCRIPT_RESOURCE_ID_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    let Some((namespace, path)) = value.split_once(':') else {
+        return Err(ScriptDtoError::InvalidResourceId {
+            field: "resource id",
+            actual_bytes: value.len(),
+        });
+    };
+    if namespace.is_empty()
+        || path.is_empty()
+        || path.contains(':')
+        || !namespace.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        })
+        || !path.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/')
+        })
+    {
+        return Err(ScriptDtoError::InvalidResourceId {
+            field: "resource id",
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_plugin_storage_key(value: &str) -> Result<String, ScriptDtoError> {
+    if value.is_empty() {
+        return Err(ScriptDtoError::EmptyValue {
+            field: "plugin storage key",
+        });
+    }
+    if value.len() > MAX_PLUGIN_STORAGE_KEY_BYTES {
+        return Err(ScriptDtoError::ValueTooLong {
+            field: "plugin storage key",
+            max_bytes: MAX_PLUGIN_STORAGE_KEY_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_plugin_storage_value(value: &str) -> Result<(), ScriptDtoError> {
+    if value.is_empty() {
+        return Err(ScriptDtoError::EmptyValue {
+            field: "plugin storage value",
+        });
+    }
+    if value.len() > MAX_PLUGIN_STORAGE_VALUE_BYTES {
+        return Err(ScriptDtoError::ValueTooLong {
+            field: "plugin storage value",
+            max_bytes: MAX_PLUGIN_STORAGE_VALUE_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_target_plugin_id(value: &str) -> Result<String, ScriptDtoError> {
+    if value.is_empty() {
+        return Err(ScriptDtoError::EmptyValue {
+            field: "target plugin id",
+        });
+    }
+    if value.len() > MAX_SCRIPT_ID_BYTES {
+        return Err(ScriptDtoError::ValueTooLong {
+            field: "target plugin id",
+            max_bytes: MAX_SCRIPT_ID_BYTES,
+            actual_bytes: value.len(),
+        });
+    }
+    if !is_valid_plugin_id(value) {
+        return Err(ScriptDtoError::InvalidId {
+            field: "target plugin id",
+            actual_bytes: value.len(),
         });
     }
     Ok(value.to_owned())
@@ -1727,6 +4056,8 @@ pub struct RuntimeContext<'a> {
 impl<'a> RuntimeContext<'a> {
     /// Create a runtime context from host-provided controls and command limit.
     pub fn new(controls: &'a RuntimeControls, command_limit: NonZeroUsize) -> Self {
+        let command_limit = NonZeroUsize::new(command_limit.get().min(MAX_SCRIPT_COMMAND_BATCH))
+            .expect("script command limit is non-zero");
         Self {
             controls,
             command_limit,
@@ -1791,23 +4122,80 @@ mod tests {
         boundary.try_enqueue_event(first.clone()).unwrap();
 
         assert_eq!(
-            boundary.try_enqueue_event(second.clone()),
-            Err(ScriptQueueError::Full(second))
+            boundary.try_enqueue_event(second),
+            Err(ScriptQueueError::Full)
         );
         assert_eq!(endpoint.recv_event_blocking(), Some(first));
     }
 
     #[test]
+    fn closing_event_admission_rejects_new_events_and_drains_buffered_events() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let buffered = ScriptEvent::server_started();
+        boundary.try_enqueue_event(buffered.clone()).unwrap();
+
+        boundary.close_event_admission();
+
+        assert_eq!(
+            boundary.try_enqueue_event(ScriptEvent::server_tick(1)),
+            Err(ScriptQueueError::Closed)
+        );
+        assert_eq!(endpoint.recv_event_blocking(), Some(buffered));
+        assert_eq!(endpoint.recv_event_blocking(), None);
+    }
+
+    #[tokio::test]
+    async fn targeted_event_delivery_waits_for_host_consumer_progress() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        boundary
+            .try_enqueue_event(ScriptEvent::server_started())
+            .unwrap();
+        let request = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
+        let result = ScriptEvent::plugin_storage_get_result("shop", &request, None, None).unwrap();
+
+        let delivery = tokio::spawn({
+            let boundary = boundary.clone();
+            async move { boundary.enqueue_targeted_event(result).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!delivery.is_finished());
+
+        assert!(
+            matches!(endpoint.recv_event().await, Some(event) if event.event_name() == "server.started")
+        );
+        delivery.await.unwrap().unwrap();
+        assert!(
+            matches!(endpoint.recv_event().await, Some(event) if event.event_name() == "plugin.storage.get_result")
+        );
+    }
+
+    #[tokio::test]
+    async fn targeted_event_delivery_exits_when_host_receiver_is_closed() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        drop(endpoint);
+        let request = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
+        let result = ScriptEvent::plugin_storage_get_result("shop", &request, None, None).unwrap();
+
+        assert!(matches!(
+            boundary.enqueue_targeted_event(result).await,
+            Err(ScriptQueueError::Closed)
+        ));
+    }
+
+    #[test]
     fn script_event_queue_errors_stay_below_the_result_size_threshold() {
         assert!(
-            std::mem::size_of::<ScriptQueueError<ScriptEvent>>() <= 128,
-            "queue errors must remain small enough to return directly"
+            std::mem::size_of::<ScriptQueueError>() <= 1,
+            "queue errors must contain only bounded state metadata"
         );
     }
 
     #[test]
     fn event_dtos_are_stable_snapshots_without_host_handles() {
-        let event = ScriptEvent::player_joined(ScriptPlayerId::new(42), "kaiser");
+        let event = ScriptEvent::player_joined_with_context(
+            ScriptPlayerId::new(42),
+            ScriptPlayerContext::new("player-42", "kaiser", false, 0.0, 64.0, 0.0),
+        );
 
         assert!(matches!(
             event.kind(),
@@ -1819,19 +4207,6 @@ mod tests {
         ));
         assert_eq!(ScriptPlayerId::new(42).value(), 42);
         assert_eq!(ScriptEntityId::new(99).value(), 99);
-
-        let source = include_str!("lib.rs");
-        let forbidden = [
-            format!("{}{}", "World", "Handle"),
-            format!("{}{}", "Session", "Registry"),
-            format!("{}{}", "World", "Storage"),
-        ];
-        for name in forbidden {
-            assert!(
-                !source.contains(&name),
-                "script contract must not expose {name}"
-            );
-        }
     }
 
     #[test]
@@ -1860,14 +4235,10 @@ mod tests {
         let ScriptEventKind::PlayerChat { context, .. } = event.kind() else {
             panic!("expected player chat event");
         };
-        assert!(context.is_verified());
-        assert_eq!(context.uuid(), Some("123e4567-e89b-12d3-a456-426614174000"));
-        assert_eq!(context.username(), Some("kaiser"));
-        assert_eq!(context.operator(), Some(true));
-        assert_eq!(
-            (context.x(), context.y(), context.z()),
-            (Some(12.25), Some(70.0), Some(-4.5))
-        );
+        assert_eq!(context.uuid(), "123e4567-e89b-12d3-a456-426614174000");
+        assert_eq!(context.username(), "kaiser");
+        assert!(context.operator());
+        assert_eq!((context.x(), context.y(), context.z()), (12.25, 70.0, -4.5));
     }
 
     #[test]
@@ -1899,9 +4270,7 @@ mod tests {
         assert_eq!(
             batch.try_push_authorized(denied, &CommandCapabilities::default()),
             Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapability::RunConsoleCommandRoot {
-                    root: "stop".to_owned(),
-                },
+                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
             })
         );
         assert!(batch.commands().is_empty());
@@ -1912,9 +4281,7 @@ mod tests {
         assert_eq!(
             batch.try_push(raw_denied),
             Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapability::RunConsoleCommandRoot {
-                    root: "stop".to_owned(),
-                },
+                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
             })
         );
         assert!(batch.commands().is_empty());
@@ -1925,10 +4292,8 @@ mod tests {
         };
 
         assert_eq!(
-            allowed.required_capability(),
-            Some(ScriptCommandCapability::RunConsoleCommandRoot {
-                root: "time".to_owned(),
-            })
+            allowed.required_capability_kind(),
+            Some(ScriptCommandCapabilityKind::RunConsoleCommand)
         );
         batch
             .try_push_authorized(allowed.clone(), &capabilities)
@@ -1947,7 +4312,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unsupported_requested_api_version() {
-        let requested = ScriptApiVersion::new(0, 6, 0);
+        let requested = ScriptApiVersion::new(0, 7, 0);
         let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested)
             .declare_console_command_root("time");
 
@@ -1961,24 +4326,24 @@ mod tests {
     }
 
     #[test]
-    fn entity_spawn_api_is_available_at_0_5_0() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 5, 0));
+    fn extended_plugin_contract_is_available_at_0_6_0() {
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
+        for event_name in [
+            "plugin.storage.get_result",
+            "plugin.storage.cas_result",
+            "plugin.storage.delete_result",
+            "inventory.menu.clicked",
+            "inventory.storage_transaction.result",
+            "player.zone_entered",
+            "colony.record_result",
+            "colony.villager_binding_result",
+        ] {
+            assert!(is_supported_event_name(event_name), "missing {event_name}");
+        }
     }
 
     #[test]
     fn spawn_entity_capability_is_exact_and_manifest_bounded() {
-        let legacy = ScriptPluginManifest::new(
-            "spawn-test",
-            "Spawn Test",
-            "0.1.0",
-            ScriptApiVersion::new(0, 4, 0),
-        )
-        .declare_spawn_entity_type("minecraft:pig");
-        assert!(matches!(
-            legacy.validate(),
-            Err(ScriptPluginManifestError::SpawnEntitiesRequireScriptApiVersion { .. })
-        ));
-
         let invalid =
             ScriptPluginManifest::new("spawn-test", "Spawn Test", "0.1.0", SCRIPT_API_VERSION)
                 .declare_spawn_entity_type("pig");
@@ -1999,6 +4364,10 @@ mod tests {
             assert!(matches!(
                 invalid.validate(),
                 Err(ScriptPluginManifestError::InvalidSpawnEntityType { .. })
+                    | Err(ScriptPluginManifestError::FieldTooLong {
+                        field: "spawn entity type",
+                        ..
+                    })
             ));
         }
 
@@ -2036,10 +4405,8 @@ mod tests {
         let mut batch = CommandBatch::new(nonzero(2));
 
         assert_eq!(
-            pig.required_capability(),
-            Some(ScriptCommandCapability::SpawnEntityType {
-                entity_type: "minecraft:pig".to_owned(),
-            })
+            pig.required_capability_kind(),
+            Some(ScriptCommandCapabilityKind::SpawnEntity)
         );
         batch
             .try_push_authorized(pig.clone(), &capabilities)
@@ -2047,9 +4414,7 @@ mod tests {
         assert_eq!(
             batch.try_push_authorized(cow, &capabilities),
             Err(CommandBatchError::PermissionDenied {
-                capability: ScriptCommandCapability::SpawnEntityType {
-                    entity_type: "minecraft:cow".to_owned(),
-                },
+                capability: ScriptCommandCapabilityKind::SpawnEntity,
             })
         );
         assert_eq!(batch.commands(), std::slice::from_ref(&pig));
@@ -2135,8 +4500,8 @@ mod tests {
                 .declare_player_command_root(&over_limit_root);
         assert_eq!(
             over_limit.validate(),
-            Err(ScriptPluginManifestError::PlayerCommandRootTooLong {
-                root: over_limit_root,
+            Err(ScriptPluginManifestError::FieldTooLong {
+                field: "player command root",
                 max_bytes: MAX_PLAYER_COMMAND_ROOT_BYTES,
             })
         );
@@ -2144,7 +4509,7 @@ mod tests {
 
     #[test]
     fn manifest_validation_rejects_unsafe_and_reserved_player_command_roots() {
-        for root in ["Hello", "/hello", "hello there", "hello.world", ""] {
+        for root in ["Hello", "/hello", "hello there", "hello.world"] {
             let manifest =
                 ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
                     .declare_player_command_root(root);
@@ -2156,6 +4521,14 @@ mod tests {
                 })
             );
         }
+        assert_eq!(
+            ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
+                .declare_player_command_root("")
+                .validate(),
+            Err(ScriptPluginManifestError::EmptyField {
+                field: "player command root",
+            })
+        );
 
         for root in ["gamemode", "defaultgamemode", "tp", "teleport"] {
             let manifest =
@@ -2173,13 +4546,14 @@ mod tests {
 
     #[test]
     fn player_command_event_is_an_immutable_targeted_snapshot() {
-        let event = ScriptEvent::player_command(
+        let event = ScriptEvent::try_player_command_with_context(
             "greetings",
             ScriptPlayerId::new(42),
-            "Alex",
+            ScriptPlayerContext::new("player-42", "Alex", false, 0.0, 64.0, 0.0),
             "hello",
             "one  two ",
-        );
+        )
+        .unwrap();
 
         assert_eq!(event.event_name(), "player.command");
         assert_eq!(event.target_plugin_id(), Some("greetings"));
@@ -2199,7 +4573,7 @@ mod tests {
     }
 
     #[test]
-    fn player_command_boundary_routes_one_owner_and_retains_queue_full_policy() {
+    fn player_command_boundary_reports_full_and_closed_without_retaining_events() {
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
         let manifest =
             ScriptPluginManifest::new("greetings", "Greetings", "0.1.0", SCRIPT_API_VERSION)
@@ -2209,67 +4583,141 @@ mod tests {
         endpoint.register_player_commands(&manifest).unwrap();
 
         assert_eq!(boundary.player_command_roots(), vec!["hello".to_owned()]);
+        let context = || ScriptPlayerContext::new("player-7", "Alex", false, 0.0, 64.0, 0.0);
         assert_eq!(
-            boundary.try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "missing arg"),
-            Ok(false)
-        );
-        assert_eq!(
-            boundary.try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "/hello one  two "),
-            Ok(true)
-        );
-        let full = boundary
-            .try_enqueue_player_command(ScriptPlayerId::new(7), "Alex", "hello later")
-            .unwrap_err();
-        assert!(matches!(
-            full,
-            ScriptQueueError::Full(event)
-                if event.target_plugin_id() == Some("greetings")
-                    && matches!(
-                        event.kind(),
-                        ScriptEventKind::PlayerCommand { root, arguments, .. }
-                            if root == "hello" && arguments == "later"
-                    )
-        ));
-        assert_eq!(
-            endpoint.recv_event_blocking(),
-            Some(ScriptEvent::player_command(
-                "greetings",
+            boundary.try_enqueue_player_command_with_context(
                 ScriptPlayerId::new(7),
-                "Alex",
-                "hello",
-                "one  two ",
-            ))
+                context(),
+                "missing arg",
+            ),
+            Ok(PlayerCommandAdmission::NotOwned)
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                context(),
+                "/hello one  two ",
+            ),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                context(),
+                "hello later",
+            ),
+            Err(ScriptQueueError::Full)
+        );
+        assert!(matches!(
+            endpoint.recv_event_blocking(),
+            Some(ScriptEvent {
+                kind: ScriptEventKind::PlayerCommand { username, root, arguments, .. },
+                ..
+            }) if username == "Alex" && root == "hello" && arguments == "one  two "
+        ));
+        drop(endpoint);
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                context(),
+                "hello after-close",
+            ),
+            Err(ScriptQueueError::Closed)
+        );
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                context(),
+                "hello after-clear",
+            ),
+            Ok(PlayerCommandAdmission::NotOwned)
+        );
+    }
+
+    #[test]
+    fn owned_player_command_arguments_are_bounded_without_panicking_or_queuing_rejections() {
+        let (boundary, mut endpoint) = script_boundary_pair(nonzero(4), nonzero(1));
+        let manifest = ScriptPluginManifest::new("owner", "Owner", "0.1.0", SCRIPT_API_VERSION)
+            .declare_player_command_root("owned")
+            .validate()
+            .unwrap();
+        endpoint.register_player_commands(&manifest).unwrap();
+        let context =
+            ScriptPlayerContext::try_new("player-7", "Alex", false, 0.0, 64.0, 0.0).unwrap();
+
+        let accepted = format!("owned {}", "a".repeat(MAX_SCRIPT_CHAT_MESSAGE_BYTES));
+        assert_eq!(
+            boundary.try_enqueue_player_command_with_context(
+                ScriptPlayerId::new(7),
+                context.clone(),
+                &accepted,
+            ),
+            Ok(PlayerCommandAdmission::Enqueued)
+        );
+        let event = endpoint.recv_event_blocking().unwrap();
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerCommand { arguments, .. }
+                if arguments.len() == MAX_SCRIPT_CHAT_MESSAGE_BYTES
+        ));
+
+        for rejected_len in [MAX_SCRIPT_CHAT_MESSAGE_BYTES + 1, 32_767] {
+            let rejected = format!("owned {}", "b".repeat(rejected_len));
+            assert_eq!(
+                boundary.try_enqueue_player_command_with_context(
+                    ScriptPlayerId::new(7),
+                    context.clone(),
+                    &rejected,
+                ),
+                Ok(PlayerCommandAdmission::OwnedRejected {
+                    error: ScriptDtoError::ValueTooLong {
+                        field: "player command arguments",
+                        max_bytes: MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+                        actual_bytes: rejected_len,
+                    },
+                })
+            );
+
+            assert_eq!(
+                boundary.try_enqueue_player_command_with_context(
+                    ScriptPlayerId::new(7),
+                    context.clone(),
+                    "owned sentinel",
+                ),
+                Ok(PlayerCommandAdmission::Enqueued)
+            );
+            let event = endpoint.recv_event_blocking().unwrap();
+            assert!(matches!(
+                event.kind(),
+                ScriptEventKind::PlayerCommand { arguments, .. } if arguments == "sentinel"
+            ));
+        }
+
+        let constructor_error = ScriptEvent::try_player_command_with_context(
+            "owner",
+            ScriptPlayerId::new(7),
+            context,
+            "owned",
+            "x".repeat(MAX_SCRIPT_CHAT_MESSAGE_BYTES + 1),
+        )
+        .unwrap_err();
+        assert_eq!(
+            constructor_error,
+            ScriptDtoError::ValueTooLong {
+                field: "player command arguments",
+                max_bytes: MAX_SCRIPT_CHAT_MESSAGE_BYTES,
+                actual_bytes: MAX_SCRIPT_CHAT_MESSAGE_BYTES + 1,
+            }
         );
     }
 
     #[test]
     fn operator_player_commands_require_verified_context_and_are_denied_before_a_full_queue() {
-        let api_0_3 = ScriptPluginManifest::new(
-            "admin-day",
-            "Admin Day",
-            "0.1.0",
-            ScriptApiVersion::new(0, 3, 0),
-        )
-        .declare_operator_command_root("adminday");
-        assert_eq!(
-            api_0_3.validate(),
-            Err(
-                ScriptPluginManifestError::OperatorCommandsRequireScriptApiVersion {
-                    requested: ScriptApiVersion::new(0, 3, 0),
-                    minimum: OPERATOR_COMMANDS_API_VERSION,
-                }
-            )
-        );
-
-        let manifest = ScriptPluginManifest::new(
-            "admin-day",
-            "Admin Day",
-            "0.1.0",
-            ScriptApiVersion::new(0, 4, 0),
-        )
-        .declare_operator_command_root("adminday")
-        .validate()
-        .unwrap();
+        let manifest =
+            ScriptPluginManifest::new("admin-day", "Admin Day", "0.1.0", SCRIPT_API_VERSION)
+                .declare_operator_command_root("adminday")
+                .validate()
+                .unwrap();
         assert!(manifest.player_command_roots().is_empty());
         assert_eq!(manifest.operator_command_roots(), ["adminday"]);
         let (boundary, mut endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
@@ -2279,11 +4727,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            boundary.try_enqueue_player_command_with_operator(
+            boundary.try_enqueue_player_command_with_context(
                 ScriptPlayerId::new(7),
-                "Alex",
+                ScriptPlayerContext::new("player-7", "Alex", false, 0.0, 64.0, 0.0),
                 "adminday",
-                false,
             ),
             Ok(PlayerCommandAdmission::PermissionDenied)
         );
@@ -2291,15 +4738,6 @@ mod tests {
             endpoint.recv_event_blocking(),
             Some(ScriptEvent::server_started()),
             "denied command must not be enqueued behind a full queue"
-        );
-        assert_eq!(
-            boundary.try_enqueue_player_command_with_operator(
-                ScriptPlayerId::new(7),
-                "Alex",
-                "adminday",
-                true,
-            ),
-            Ok(PlayerCommandAdmission::PermissionDenied)
         );
         assert_eq!(
             boundary.try_enqueue_player_command_with_context(
@@ -2364,17 +4802,23 @@ mod tests {
         assert_eq!(
             validated.event_subscriptions(),
             &[
-                ScriptEventSubscription::new("player.chat"),
-                ScriptEventSubscription::new("server.tick"),
+                ScriptEventSubscription::new("player.chat".to_owned()),
+                ScriptEventSubscription::new("server.tick".to_owned()),
             ]
         );
         assert_eq!(
             validated.dependencies(),
             &[
-                ScriptPluginDependency::new("economy", ScriptPluginDependencyRelation::Required),
-                ScriptPluginDependency::new("chat-tools", ScriptPluginDependencyRelation::Optional),
                 ScriptPluginDependency::new(
-                    "spawn-protect",
+                    "economy".to_owned(),
+                    ScriptPluginDependencyRelation::Required
+                ),
+                ScriptPluginDependency::new(
+                    "chat-tools".to_owned(),
+                    ScriptPluginDependencyRelation::Optional
+                ),
+                ScriptPluginDependency::new(
+                    "spawn-protect".to_owned(),
                     ScriptPluginDependencyRelation::LoadBefore,
                 ),
             ]
@@ -2444,7 +4888,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "host-api")]
     #[test]
     fn trusted_host_derives_command_capabilities_from_validated_manifest() {
         let manifest = ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", SCRIPT_API_VERSION)
@@ -2452,15 +4895,14 @@ mod tests {
         let validated = manifest.validate().unwrap();
         let capabilities = validated.to_command_capabilities();
 
-        let time = ScriptCommand::RunConsoleCommand {
+        let time_command = ScriptCommand::RunConsoleCommand {
             command: "/time set day".to_owned(),
-        }
-        .required_capability()
-        .unwrap();
-        assert!(capabilities.allows(&time));
+        };
+        let time = time_command.required_capability().unwrap();
+        assert!(capabilities.allows(time));
         assert!(
             !capabilities.allows(
-                &ScriptCommand::RunConsoleCommand {
+                ScriptCommand::RunConsoleCommand {
                     command: "/stop".to_owned(),
                 }
                 .required_capability()
@@ -2511,7 +4953,11 @@ mod tests {
 
         let controls = RuntimeControls::unrestricted();
         let context = RuntimeContext::new(&controls, nonzero(1));
-        let event = ScriptEvent::player_chat(ScriptPlayerId::new(7), "hello");
+        let event = ScriptEvent::player_chat_with_context(
+            ScriptPlayerId::new(7),
+            "hello",
+            ScriptPlayerContext::new("player-7", "Alex", false, 0.0, 64.0, 0.0),
+        );
 
         let commands = EchoRuntime
             .handle_event(&event, context)
@@ -2534,45 +4980,730 @@ mod tests {
     }
 
     #[test]
-    fn script_api_version_accepts_current_and_older_minor_only() {
-        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 5, 0));
-        assert!(supports_script_api_version(SCRIPT_API_VERSION));
-        assert!(supports_script_api_version(ScriptApiVersion::new(0, 2, 0)));
-        assert!(supports_script_api_version(ScriptApiVersion::new(0, 2, 99)));
-        assert!(supports_script_api_version(ScriptApiVersion::new(0, 1, 0)));
-        assert!(supports_script_api_version(ScriptApiVersion::new(0, 0, 0)));
-        assert!(supports_script_api_version(ScriptApiVersion::new(0, 3, 1)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 5, 1)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(0, 6, 0)));
-        assert!(!supports_script_api_version(ScriptApiVersion::new(1, 0, 0)));
-    }
-
-    #[test]
-    fn manifest_without_player_commands_remains_compatible_with_api_0_2() {
-        let manifest =
-            ScriptPluginManifest::new("legacy", "Legacy", "0.1.0", ScriptApiVersion::new(0, 2, 0));
-
-        assert!(manifest.validate().is_ok());
-    }
-
-    #[test]
-    fn manifest_player_commands_require_api_0_3() {
-        let manifest = ScriptPluginManifest::new(
-            "legacy-commands",
-            "Legacy Commands",
-            "0.1.0",
-            ScriptApiVersion::new(0, 2, 0),
-        )
-        .declare_player_command_root("hello");
+    fn plugin_capabilities_reject_undeclared_storage_and_transaction_requests() {
+        let mut batch = CommandBatch::new(nonzero(2));
+        let storage = ScriptCommand::PluginStorageGet {
+            request: ScriptPluginStorageGetRequest::try_new("read-balance", "balance:player-7")
+                .unwrap(),
+        };
+        let transaction = ScriptCommand::InventoryStorageTransaction {
+            transaction: ScriptInventoryStorageTransaction::try_new(
+                "buy-1",
+                ScriptPlayerId::new(7),
+                vec![ScriptInventoryResourceDelta::try_new("minecraft:apple", 1).unwrap()],
+                vec![
+                    ScriptStorageMutation::compare_and_swap("balance:player-7", Some(2), "9")
+                        .unwrap(),
+                ],
+            )
+            .unwrap(),
+        };
 
         assert_eq!(
-            manifest.validate(),
-            Err(
-                ScriptPluginManifestError::PlayerCommandsRequireScriptApiVersion {
-                    requested: ScriptApiVersion::new(0, 2, 0),
-                    minimum: PLAYER_COMMANDS_API_VERSION,
-                }
-            )
+            batch.try_push_authorized(storage, &CommandCapabilities::none()),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapabilityKind::PluginStorage,
+            })
         );
+        assert_eq!(
+            batch.try_push_authorized(transaction, &CommandCapabilities::none()),
+            Err(CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapabilityKind::InventoryStorageTransactions,
+            })
+        );
+        assert!(batch.commands().is_empty());
+    }
+
+    #[test]
+    fn transaction_revalidates_directly_constructed_storage_mutations() {
+        for mutation in [
+            ScriptStorageMutation::CompareAndSwap {
+                key: String::new(),
+                expected_version: None,
+                value: "value".to_owned(),
+            },
+            ScriptStorageMutation::CompareAndSwap {
+                key: "key".to_owned(),
+                expected_version: None,
+                value: String::new(),
+            },
+            ScriptStorageMutation::Delete {
+                key: "x".repeat(MAX_PLUGIN_STORAGE_KEY_BYTES + 1),
+                expected_version: None,
+            },
+        ] {
+            assert!(
+                ScriptInventoryStorageTransaction::try_new(
+                    "transaction",
+                    ScriptPlayerId::new(7),
+                    vec![ScriptInventoryResourceDelta::try_new("minecraft:apple", 1).unwrap(),],
+                    vec![mutation],
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn public_command_submission_denies_privileged_raw_commands_and_provenance_replay() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(2), nonzero(2));
+        assert!(
+            endpoint
+                .try_submit_command(ScriptCommand::PluginStorageGet {
+                    request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+                })
+                .is_err()
+        );
+
+        let replay = ScriptCommand::HostAttached {
+            provenance: ScriptCommandProvenance::for_host_plugin(Arc::from("owner"), 1),
+            request: Arc::new(ScriptCommand::BroadcastChatMessage {
+                message: "owned".to_owned(),
+            }),
+        };
+        let mut forged_batch = CommandBatch::new(nonzero(1));
+        assert_eq!(
+            forged_batch.try_push(replay.clone()),
+            Err(CommandBatchError::ProvenanceRejected)
+        );
+        assert!(endpoint.try_submit_command(replay).is_err());
+        assert!(matches!(
+            boundary.command_rx.try_lock().unwrap().try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn sealed_admission_rechecks_manifest_capabilities_and_rejects_the_whole_batch() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(2));
+        let manifest = ScriptPluginManifest::new("plain", "Plain", "0.1.0", SCRIPT_API_VERSION)
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let forged_capabilities = CommandCapabilities::none().allow_plugin_storage();
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(
+                ScriptCommand::PluginStorageGet {
+                    request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+                },
+                &forged_capabilities,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            endpoint.try_submit_plugin_batch(&admission, batch),
+            Err(ScriptBatchSubmissionError::Rejected {
+                error: CommandBatchError::PermissionDenied {
+                    capability: ScriptCommandCapabilityKind::PluginStorage,
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            boundary.command_rx.try_lock().unwrap().try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn saturated_command_queue_rejects_an_atomic_batch_without_publishing_a_prefix() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(2));
+        let existing = ScriptCommand::BroadcastChatMessage {
+            message: "existing".to_owned(),
+        };
+        endpoint.try_submit_command(existing.clone()).unwrap();
+
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let capabilities = manifest.to_command_capabilities();
+        let mut batch = CommandBatch::new(nonzero(2));
+        for request_id in ["first", "second"] {
+            batch
+                .try_push_authorized(
+                    ScriptCommand::PluginStorageGet {
+                        request: ScriptPluginStorageGetRequest::try_new(request_id, "balance")
+                            .unwrap(),
+                    },
+                    &capabilities,
+                )
+                .unwrap();
+        }
+
+        assert!(matches!(
+            endpoint.try_submit_plugin_batch(&admission, batch),
+            Err(ScriptBatchSubmissionError::Full(rejected))
+                if rejected.commands().len() == 2
+        ));
+        let mut command_rx = boundary.command_rx.try_lock().unwrap();
+        assert_eq!(command_rx.try_recv(), Ok(existing));
+        assert_eq!(command_rx.try_recv(), Err(mpsc::error::TryRecvError::Empty));
+    }
+
+    #[test]
+    fn bounded_dtos_reject_oversized_ids_values_invalid_bounds_and_resources() {
+        let oversized_id = "x".repeat(MAX_SCRIPT_ID_BYTES + 1);
+        assert!(matches!(
+            ScriptAxisAlignedZone::try_new(
+                &oversized_id,
+                "minecraft:overworld",
+                ScriptPosition::try_new(0.0, 0.0, 0.0).unwrap(),
+                ScriptPosition::try_new(1.0, 1.0, 1.0).unwrap(),
+            ),
+            Err(ScriptDtoError::ValueTooLong { .. })
+        ));
+        assert!(matches!(
+            ScriptStorageMutation::compare_and_swap(
+                "balance",
+                None,
+                "x".repeat(MAX_PLUGIN_STORAGE_VALUE_BYTES + 1),
+            ),
+            Err(ScriptDtoError::ValueTooLong { .. })
+        ));
+        assert!(matches!(
+            ScriptAxisAlignedZone::try_new(
+                "shop",
+                "minecraft:Overworld",
+                ScriptPosition::try_new(2.0, 0.0, 0.0).unwrap(),
+                ScriptPosition::try_new(1.0, 1.0, 1.0).unwrap(),
+            ),
+            Err(ScriptDtoError::InvalidBounds)
+        ));
+        assert!(matches!(
+            ScriptInventoryMenuItem::try_new("invalid", 1, None),
+            Err(ScriptDtoError::InvalidResourceId { .. })
+        ));
+        assert!(matches!(
+            ScriptVillagerBindingRequest::try_new(
+                "bind",
+                "colony",
+                ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
+                MAX_VILLAGER_BINDING_RADIUS + 1.0,
+            ),
+            Err(ScriptDtoError::InvalidBounds)
+        ));
+    }
+
+    #[test]
+    fn targeted_results_validate_correlation_fields_and_coherent_outcomes() {
+        assert!(matches!(
+            ScriptPluginStorageGetRequest::try_new("", "balance"),
+            Err(ScriptDtoError::EmptyValue { .. })
+        ));
+        assert!(matches!(
+            ScriptPluginStorageCompareAndSwapRequest::try_new("write", "balance", None, ""),
+            Err(ScriptDtoError::EmptyValue { .. })
+        ));
+        let get = ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap();
+        let cas =
+            ScriptPluginStorageCompareAndSwapRequest::try_new("write", "balance", Some(3), "9")
+                .unwrap();
+        let delete =
+            ScriptPluginStorageDeleteRequest::try_new("delete", "balance", Some(3)).unwrap();
+        assert!(matches!(
+            ScriptEvent::plugin_storage_get_result("owner", &get, Some("9".into()), None),
+            Err(ScriptDtoError::InconsistentResult { .. })
+        ));
+        assert!(matches!(
+            ScriptEvent::plugin_storage_get_result(
+                "owner",
+                &get,
+                Some("x".repeat(MAX_PLUGIN_STORAGE_VALUE_BYTES + 1)),
+                Some(1),
+            ),
+            Err(ScriptDtoError::ValueTooLong { .. })
+        ));
+        assert!(matches!(
+            ScriptEvent::plugin_storage_cas_result("owner", &cas, true, None),
+            Err(ScriptDtoError::InconsistentResult { .. })
+        ));
+        assert!(matches!(
+            ScriptEvent::plugin_storage_delete_result("owner", &delete, true, None),
+            Err(ScriptDtoError::InconsistentResult { .. })
+        ));
+        let colony_record = ScriptColonyRecord::try_new(
+            "colony",
+            "Colony",
+            "minecraft:overworld",
+            ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
+        )
+        .unwrap();
+        let colony = ScriptColonyRecordRequest::try_new("record", colony_record).unwrap();
+        assert!(matches!(
+            ScriptEvent::colony_record_result("invalid owner", &colony, false),
+            Err(ScriptDtoError::InvalidId { .. })
+        ));
+
+        let event =
+            ScriptEvent::plugin_storage_get_result("owner.plugin", &get, Some("9".into()), Some(4))
+                .unwrap();
+        assert_eq!(event.target_plugin_id(), Some("owner.plugin"));
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PluginStorageGetResult {
+                request_id,
+                key,
+                value: Some(value),
+                version: Some(4),
+                failure: None,
+            } if request_id == "read" && key == "balance" && value == "9"
+        ));
+    }
+
+    #[test]
+    fn inventory_menu_and_transaction_reject_duplicate_ids_and_saturation() {
+        let item = ScriptInventoryMenuItem::try_new("minecraft:apple", 1, None).unwrap();
+        assert!(matches!(
+            ScriptInventoryMenu::try_new(
+                "catalog",
+                "Catalog",
+                vec![
+                    ScriptInventoryMenuSlot::new(0, item.clone()),
+                    ScriptInventoryMenuSlot::new(0, item),
+                ],
+            ),
+            Err(ScriptDtoError::DuplicateId { .. })
+        ));
+
+        let mut inventory = Vec::new();
+        for index in 0..=MAX_INVENTORY_STORAGE_MUTATIONS {
+            inventory.push(
+                ScriptInventoryResourceDelta::try_new(format!("minecraft:item_{index}"), 1)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            ScriptInventoryStorageTransaction::try_new(
+                "saturated",
+                ScriptPlayerId::new(7),
+                inventory,
+                vec![ScriptStorageMutation::compare_and_swap("balance", None, "0").unwrap()],
+            ),
+            Err(ScriptDtoError::TooManyEntries { .. })
+        ));
+        let duplicate = ScriptInventoryStorageTransaction::try_new(
+            "duplicate",
+            ScriptPlayerId::new(7),
+            vec![
+                ScriptInventoryResourceDelta::try_new("minecraft:apple", 1).unwrap(),
+                ScriptInventoryResourceDelta::try_new("minecraft:apple", -1).unwrap(),
+            ],
+            vec![ScriptStorageMutation::compare_and_swap("balance", None, "0").unwrap()],
+        );
+        assert!(matches!(duplicate, Err(ScriptDtoError::DuplicateId { .. })));
+    }
+
+    #[tokio::test]
+    async fn host_attaches_plugin_provenance_to_lua_command_submissions() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(
+                ScriptCommand::PluginStorageGet {
+                    request: ScriptPluginStorageGetRequest::try_new("read", "balance:player-7")
+                        .unwrap(),
+                },
+                &manifest.to_command_capabilities(),
+            )
+            .unwrap();
+        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+
+        let Some(ScriptCommand::HostAttached {
+            provenance,
+            request,
+        }) = boundary.recv_command().await
+        else {
+            panic!("host-attached command missing");
+        };
+        assert_eq!(provenance.plugin_id(), "shop");
+        assert!(matches!(*request, ScriptCommand::PluginStorageGet { .. }));
+    }
+
+    #[test]
+    fn raw_command_admission_rejects_every_unbounded_string_variant() {
+        let (_boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(8));
+        for command in [
+            ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(1),
+                message: "x".repeat(MAX_SCRIPT_CHAT_MESSAGE_BYTES + 1),
+            },
+            ScriptCommand::BroadcastChatMessage {
+                message: "x".repeat(MAX_SCRIPT_CHAT_MESSAGE_BYTES + 1),
+            },
+            ScriptCommand::DisconnectPlayer {
+                player_id: ScriptPlayerId::new(1),
+                reason: "x".repeat(MAX_SCRIPT_DISCONNECT_REASON_BYTES + 1),
+            },
+            ScriptCommand::RunConsoleCommand {
+                command: "x".repeat(MAX_SCRIPT_CONSOLE_COMMAND_BYTES + 1),
+            },
+            ScriptCommand::SpawnEntity {
+                actor: ScriptPlayerId::new(1),
+                entity_type: "x".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES + 1),
+                position: ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
+            },
+            ScriptCommand::CloseInventoryMenu {
+                player_id: ScriptPlayerId::new(1),
+                menu_id: "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
+            },
+            ScriptCommand::RemoveZone {
+                zone_id: "x".repeat(MAX_SCRIPT_ID_BYTES + 1),
+            },
+        ] {
+            assert!(matches!(
+                endpoint.try_submit_command(command),
+                Err(ScriptCommandSubmissionError::InvalidCommand { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn public_validation_errors_do_not_retain_or_render_rejected_input() {
+        let rejected = "secret".repeat(200_000);
+        let dto_error = ScriptPluginStorageGetRequest::try_new(&rejected, "balance").unwrap_err();
+        let dto_debug = format!("{dto_error:?}");
+        assert!(dto_debug.len() < 256);
+        assert!(!dto_debug.contains("secret"));
+
+        let (_boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let command_error = endpoint
+            .try_submit_command(ScriptCommand::BroadcastChatMessage { message: rejected })
+            .unwrap_err();
+        let command_debug = format!("{command_error:?}");
+        assert!(command_debug.len() < 256);
+        assert!(!command_debug.contains("secret"));
+
+        let denied_root = "secret_console_root";
+        let denied = endpoint
+            .try_submit_command(ScriptCommand::RunConsoleCommand {
+                command: denied_root.to_owned(),
+            })
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            ScriptCommandSubmissionError::PermissionDenied {
+                capability: ScriptCommandCapabilityKind::RunConsoleCommand,
+            }
+        );
+        assert!(!format!("{denied:?}").contains(denied_root));
+
+        let denied_entity = "minecraft:secret_entity";
+        let mut batch = CommandBatch::new(nonzero(1));
+        let denied = batch
+            .try_push_authorized(
+                ScriptCommand::SpawnEntity {
+                    actor: ScriptPlayerId::new(1),
+                    entity_type: denied_entity.to_owned(),
+                    position: ScriptPosition::try_new(0.0, 64.0, 0.0).unwrap(),
+                },
+                &CommandCapabilities::none(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            denied,
+            CommandBatchError::PermissionDenied {
+                capability: ScriptCommandCapabilityKind::SpawnEntity,
+            }
+        );
+        assert!(!format!("{denied:?}").contains(denied_entity));
+    }
+
+    #[test]
+    fn manifest_preflight_rejects_oversized_identity_and_collections() {
+        assert!(matches!(
+            ScriptPluginManifest::new(
+                "x".repeat(MAX_PLUGIN_ID_BYTES + 1),
+                "Plugin",
+                "0.1.0",
+                SCRIPT_API_VERSION,
+            )
+            .validate(),
+            Err(ScriptPluginManifestError::FieldTooLong {
+                field: "plugin id",
+                ..
+            })
+        ));
+
+        let mut manifest =
+            ScriptPluginManifest::new("bounded", "Plugin", "0.1.0", SCRIPT_API_VERSION);
+        for index in 0..=MAX_MANIFEST_EVENT_SUBSCRIPTIONS {
+            manifest = manifest.subscribe_event(format!("event.{index}"));
+        }
+        assert!(matches!(
+            manifest.validate(),
+            Err(ScriptPluginManifestError::TooManyEntries {
+                field: "event subscriptions",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn host_admission_ticket_is_exact_and_one_shot() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(
+                ScriptCommand::PluginStorageGet {
+                    request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+                },
+                &manifest.to_command_capabilities(),
+            )
+            .unwrap();
+        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+
+        let command = boundary.recv_command().await.unwrap();
+        let replay = command.clone();
+        let admitted = boundary.accept_host_command(command).unwrap();
+        assert_eq!(admitted.plugin_id(), "shop");
+        let result = admitted
+            .plugin_storage_get_result(Some("9"), Some(1))
+            .unwrap();
+        assert_eq!(result.target_plugin_id(), Some("shop"));
+        assert!(matches!(
+            boundary.accept_host_command(replay),
+            Err(ScriptCommandAcceptanceError::UnknownOrConsumed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn admitted_storage_failures_are_explicit_for_every_request_variant() {
+        let commands = [
+            ScriptCommand::PluginStorageGet {
+                request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+            },
+            ScriptCommand::PluginStorageCompareAndSwap {
+                request: ScriptPluginStorageCompareAndSwapRequest::try_new(
+                    "write", "balance", None, "9",
+                )
+                .unwrap(),
+            },
+            ScriptCommand::PluginStorageDelete {
+                request: ScriptPluginStorageDeleteRequest::try_new("delete", "balance", Some(1))
+                    .unwrap(),
+            },
+        ];
+
+        for (index, command) in commands.into_iter().enumerate() {
+            let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+            let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+                .declare_plugin_storage()
+                .validate()
+                .unwrap();
+            let admission = HostCommandAdmission::from_manifest(&manifest);
+            let mut batch = CommandBatch::new(nonzero(1));
+            batch
+                .try_push_authorized(command, &manifest.to_command_capabilities())
+                .unwrap();
+            endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+
+            let admitted = boundary
+                .accept_host_command(boundary.recv_command().await.unwrap())
+                .unwrap();
+            let event = admitted
+                .plugin_storage_failure_result(ScriptPluginStorageFailure::Unavailable)
+                .unwrap();
+            assert_eq!(event.target_plugin_id(), Some("shop"));
+            assert!(matches!(
+                (index, event.kind()),
+                (
+                    0,
+                    ScriptEventKind::PluginStorageGetResult {
+                        value: None,
+                        version: None,
+                        failure: Some(ScriptPluginStorageFailure::Unavailable),
+                        ..
+                    },
+                ) | (
+                    1,
+                    ScriptEventKind::PluginStorageCasResult {
+                        applied: false,
+                        version: None,
+                        failure: Some(ScriptPluginStorageFailure::Unavailable),
+                        ..
+                    },
+                ) | (
+                    2,
+                    ScriptEventKind::PluginStorageDeleteResult {
+                        deleted: false,
+                        version: None,
+                        failure: Some(ScriptPluginStorageFailure::Unavailable),
+                        ..
+                    },
+                )
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn host_admission_rejects_request_substitution_and_consumes_the_ticket() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("shop", "Shop", "0.1.0", SCRIPT_API_VERSION)
+            .declare_plugin_storage()
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let mut batch = CommandBatch::new(nonzero(1));
+        batch
+            .try_push_authorized(
+                ScriptCommand::PluginStorageGet {
+                    request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+                },
+                &manifest.to_command_capabilities(),
+            )
+            .unwrap();
+        endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+        let original = boundary.recv_command().await.unwrap();
+        let ScriptCommand::HostAttached { provenance, .. } = original.clone() else {
+            panic!("host-attached command missing");
+        };
+        let substituted = ScriptCommand::HostAttached {
+            provenance,
+            request: Arc::new(ScriptCommand::PluginStorageGet {
+                request: ScriptPluginStorageGetRequest::try_new("read", "balance").unwrap(),
+            }),
+        };
+
+        assert_eq!(
+            boundary.accept_host_command(substituted),
+            Err(ScriptCommandAcceptanceError::RequestMismatch)
+        );
+        assert_eq!(
+            boundary.accept_host_command(original),
+            Err(ScriptCommandAcceptanceError::UnknownOrConsumed)
+        );
+    }
+
+    #[tokio::test]
+    async fn unconsumed_host_tickets_are_bounded_and_recover_after_exact_acceptance() {
+        let (boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(256));
+        let manifest = ScriptPluginManifest::new("bounded", "Bounded", "0.1.0", SCRIPT_API_VERSION)
+            .validate()
+            .unwrap();
+        let admission = HostCommandAdmission::from_manifest(&manifest);
+        let mut unconsumed = Vec::new();
+        for batch_index in 0..8 {
+            let mut batch = CommandBatch::new(nonzero(32));
+            for command_index in 0..32 {
+                batch
+                    .try_push(ScriptCommand::BroadcastChatMessage {
+                        message: format!("{batch_index}:{command_index}"),
+                    })
+                    .unwrap();
+            }
+            endpoint.try_submit_plugin_batch(&admission, batch).unwrap();
+            for _ in 0..32 {
+                unconsumed.push(boundary.recv_command().await.unwrap());
+            }
+        }
+
+        let mut overflow = CommandBatch::new(nonzero(1));
+        overflow
+            .try_push(ScriptCommand::BroadcastChatMessage {
+                message: "overflow".to_owned(),
+            })
+            .unwrap();
+        assert!(matches!(
+            endpoint.try_submit_plugin_batch(&admission, overflow),
+            Err(ScriptBatchSubmissionError::Rejected {
+                error: CommandBatchError::AdmissionUnavailable,
+                ..
+            })
+        ));
+
+        boundary
+            .accept_host_command(unconsumed.pop().unwrap())
+            .unwrap();
+        let mut recovered = CommandBatch::new(nonzero(1));
+        recovered
+            .try_push(ScriptCommand::BroadcastChatMessage {
+                message: "recovered".to_owned(),
+            })
+            .unwrap();
+        endpoint
+            .try_submit_plugin_batch(&admission, recovered)
+            .unwrap();
+    }
+
+    #[test]
+    fn poisoned_player_command_authority_is_cleared_and_permanently_disabled() {
+        let (_boundary, endpoint) = script_boundary_pair(nonzero(1), nonzero(1));
+        let manifest = ScriptPluginManifest::new("owner", "Owner", "0.1.0", SCRIPT_API_VERSION)
+            .declare_player_command_root("owned")
+            .validate()
+            .unwrap();
+        endpoint.register_player_commands(&manifest).unwrap();
+        let owners = endpoint.player_command_owners.clone();
+        std::thread::spawn(move || {
+            let _guard = owners.owners.write().unwrap();
+            panic!("poison player-command authority");
+        })
+        .join()
+        .unwrap_err();
+
+        assert!(endpoint.player_command_owners.roots(false).is_empty());
+        assert_eq!(
+            endpoint.register_player_commands(&manifest),
+            Err(PlayerCommandRegistrationError::AuthorityPoisoned)
+        );
+        assert!(endpoint.player_command_owners.owner("owned").is_none());
+    }
+
+    #[test]
+    fn player_context_rejects_oversized_identity_and_nonfinite_coordinates() {
+        assert!(matches!(
+            ScriptPlayerContext::try_new(
+                "x".repeat(MAX_SCRIPT_PLAYER_UUID_BYTES + 1),
+                "Alex",
+                false,
+                0.0,
+                64.0,
+                0.0,
+            ),
+            Err(ScriptDtoError::ValueTooLong {
+                field: "player uuid",
+                ..
+            })
+        ));
+        assert!(matches!(
+            ScriptPlayerContext::try_new("uuid", "Alex", false, f64::NAN, 64.0, 0.0),
+            Err(ScriptDtoError::InvalidBounds)
+        ));
+    }
+
+    #[test]
+    fn script_api_version_requires_the_current_contract_version() {
+        assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
+        assert!(supports_script_api_version(SCRIPT_API_VERSION));
+        for requested in [
+            ScriptApiVersion::new(0, 0, 0),
+            ScriptApiVersion::new(0, 4, 9),
+            ScriptApiVersion::new(0, 5, 1),
+            ScriptApiVersion::new(0, 6, 1),
+            ScriptApiVersion::new(0, 7, 0),
+            ScriptApiVersion::new(1, 0, 0),
+        ] {
+            assert!(!supports_script_api_version(requested));
+            assert_eq!(
+                ScriptPluginManifest::new("daytime", "Daytime", "0.1.0", requested).validate(),
+                Err(ScriptPluginManifestError::UnsupportedScriptApiVersion {
+                    requested,
+                    supported: SCRIPT_API_VERSION,
+                })
+            );
+        }
     }
 }

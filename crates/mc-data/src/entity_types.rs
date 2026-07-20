@@ -1,12 +1,22 @@
 //! Loader for the vanilla entity type registry slice of `registries.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use thiserror::Error;
 
 use crate::Identifier;
+use crate::entity_contract_26_1_2;
+
+pub use crate::entity_contract_26_1_2::{
+    DefaultAttributeTemplateIdentity, ENTITY_TYPE_COUNT, EntityArchetype, EntityBehaviorContract,
+    EntityInstanceCategory, EntityInstanceContract, EntityTypeContract, EntityTypeFlags,
+    MINECRAFT_VERSION, MetadataSchemaIdentity, MobCategory, PhysicalSimulationClass,
+    ProjectileKind, SpawnDataCategory, VehiclePassengerCapabilities,
+    ender_dragon_part_instance_contract_26_1_2, entity_type_contract_26_1_2_by_name,
+    entity_type_contract_26_1_2_by_protocol_id,
+};
 
 const REQUIRED_REGISTRIES: &str = include_str!("../data/required_registries.json");
 
@@ -51,10 +61,31 @@ pub fn load_entity_types_report(
         .collect()
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityTypeReport {
     pub id: Identifier,
     pub protocol_id: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EntityTypeRegistryValidationError {
+    #[error("entity type {name} has out-of-range protocol ID {protocol_id}")]
+    ProtocolIdOutOfRange { protocol_id: u32, name: Identifier },
+    #[error("duplicate entity type protocol ID {protocol_id}")]
+    DuplicateProtocolId { protocol_id: u32 },
+    #[error("duplicate entity type name {name}")]
+    DuplicateName { name: Identifier },
+    #[error("entity type protocol ID {protocol_id} is {actual_name}, expected {expected_name}")]
+    NameMismatch {
+        protocol_id: u32,
+        expected_name: Identifier,
+        actual_name: Identifier,
+    },
+    #[error("missing entity type protocol ID {protocol_id} ({expected_name})")]
+    MissingProtocolId {
+        protocol_id: u32,
+        expected_name: Identifier,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +115,7 @@ pub struct EntityDimensions {
     pub width: f64,
     pub height: f64,
     pub eye_height: Option<f64>,
+    pub spawn_dimensions_scale: f64,
 }
 
 impl EntityDimensions {
@@ -93,6 +125,7 @@ impl EntityDimensions {
             width,
             height,
             eye_height,
+            spawn_dimensions_scale: 1.0,
         }
     }
 
@@ -115,30 +148,39 @@ pub struct EntityTypeFacts {
     pub id: Identifier,
     pub protocol_id: u32,
     pub category: EntityCategory,
+    pub mob_category: Option<MobCategory>,
     pub dimensions: EntityDimensions,
     pub tracking_range: Option<u32>,
+    pub update_interval: Option<u32>,
+    pub flags: Option<EntityTypeFlags>,
     pub attributes: EntityAttributeFacts,
     pub loot_table: Option<Identifier>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EntityTypeRegistry {
     by_name: BTreeMap<Identifier, EntityTypeFacts>,
 }
 
 impl EntityTypeRegistry {
-    #[must_use]
-    pub fn from_report(report: &[EntityTypeReport]) -> Self {
+    /// Validates and constructs a complete Java Edition 26.1.2 registry.
+    pub fn try_from_report_26_1_2(
+        report: &[EntityTypeReport],
+    ) -> Result<Self, EntityTypeRegistryValidationError> {
+        validate_report_26_1_2(report)?;
+
         let by_name = report
             .iter()
             .map(|entry| {
+                let contract = entity_contract_26_1_2::by_protocol_id(entry.protocol_id)
+                    .expect("validated 26.1.2 report has an exact contract row");
                 (
                     entry.id.clone(),
-                    fallback_entity_type_facts(entry.id.clone(), entry.protocol_id),
+                    canonical_entity_type_facts(entry.id.clone(), entry.protocol_id, contract),
                 )
             })
             .collect();
-        Self { by_name }
+        Ok(Self { by_name })
     }
 
     #[must_use]
@@ -162,6 +204,66 @@ impl EntityTypeRegistry {
     }
 }
 
+fn validate_report_26_1_2(
+    report: &[EntityTypeReport],
+) -> Result<(), EntityTypeRegistryValidationError> {
+    let mut seen_protocol_ids = [false; ENTITY_TYPE_COUNT];
+    let mut seen_names = BTreeSet::new();
+
+    for entry in report {
+        let index = usize::try_from(entry.protocol_id).map_err(|_| {
+            EntityTypeRegistryValidationError::ProtocolIdOutOfRange {
+                protocol_id: entry.protocol_id,
+                name: entry.id.clone(),
+            }
+        })?;
+        if index >= ENTITY_TYPE_COUNT {
+            return Err(EntityTypeRegistryValidationError::ProtocolIdOutOfRange {
+                protocol_id: entry.protocol_id,
+                name: entry.id.clone(),
+            });
+        }
+        if seen_protocol_ids[index] {
+            return Err(EntityTypeRegistryValidationError::DuplicateProtocolId {
+                protocol_id: entry.protocol_id,
+            });
+        }
+        if !seen_names.insert(&entry.id) {
+            return Err(EntityTypeRegistryValidationError::DuplicateName {
+                name: entry.id.clone(),
+            });
+        }
+
+        let contract = entity_contract_26_1_2::by_protocol_id(entry.protocol_id)
+            .expect("range-checked protocol ID has an exact contract row");
+        if entry.id.as_str() != contract.name {
+            return Err(EntityTypeRegistryValidationError::NameMismatch {
+                protocol_id: entry.protocol_id,
+                expected_name: contract_identifier(contract.name),
+                actual_name: entry.id.clone(),
+            });
+        }
+        seen_protocol_ids[index] = true;
+    }
+
+    for (index, seen) in seen_protocol_ids.into_iter().enumerate() {
+        if !seen {
+            let contract = entity_contract_26_1_2::by_protocol_id(index as u32)
+                .expect("dense exact contract contains every in-range protocol ID");
+            return Err(EntityTypeRegistryValidationError::MissingProtocolId {
+                protocol_id: index as u32,
+                expected_name: contract_identifier(contract.name),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn contract_identifier(name: &'static str) -> Identifier {
+    Identifier::parse(name).expect("exact entity contract names are valid identifiers")
+}
+
 /// Repo-owned entity type slice used when `registries.json` is absent.
 #[must_use]
 pub fn solaris_required_entity_types() -> EntityTypeRegistry {
@@ -179,45 +281,61 @@ pub fn solaris_required_entity_types() -> EntityTypeRegistry {
             protocol_id: body.protocol_id,
         })
         .collect();
-    EntityTypeRegistry::from_report(&report)
+    EntityTypeRegistry::try_from_report_26_1_2(&report)
+        .expect("embedded required entity types match the exact 26.1.2 registry")
 }
 
-#[must_use]
-pub fn fallback_entity_category(id: &str) -> EntityCategory {
+fn canonical_entity_type_facts(
+    id: Identifier,
+    protocol_id: u32,
+    contract: EntityTypeContract,
+) -> EntityTypeFacts {
+    let category = entity_category_for_contract(id.as_str(), contract.category);
+    let (attributes, loot_table) = independently_sourced_attributes_and_loot(&id);
+    EntityTypeFacts {
+        id,
+        protocol_id,
+        category,
+        mob_category: Some(contract.category),
+        dimensions: canonical_dimensions(contract),
+        tracking_range: Some(u32::from(contract.tracking_range)),
+        update_interval: Some(contract.update_interval),
+        flags: Some(contract.flags),
+        attributes,
+        loot_table,
+    }
+}
+
+fn canonical_dimensions(contract: EntityTypeContract) -> EntityDimensions {
+    EntityDimensions {
+        width: f64::from(contract.dimensions.width),
+        height: f64::from(contract.dimensions.height),
+        eye_height: Some(f64::from(contract.dimensions.eye_height)),
+        spawn_dimensions_scale: f64::from(contract.dimensions.spawn_dimensions_scale),
+    }
+}
+
+fn entity_category_for_contract(id: &str, mob_category: MobCategory) -> EntityCategory {
     match id {
-        "minecraft:chicken" | "minecraft:pig" | "minecraft:sheep" | "minecraft:cow" => {
-            EntityCategory::Passive
-        }
-        "minecraft:zombie" | "minecraft:skeleton" | "minecraft:spider" => EntityCategory::Hostile,
-        "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => EntityCategory::Water,
         "minecraft:item" => EntityCategory::Item,
-        "minecraft:experience_orb" | "minecraft:xp_orb" => EntityCategory::Experience,
-        _ => EntityCategory::Other,
+        "minecraft:experience_orb" => EntityCategory::Experience,
+        _ => match mob_category {
+            MobCategory::Monster => EntityCategory::Hostile,
+            MobCategory::Creature | MobCategory::Ambient => EntityCategory::Passive,
+            MobCategory::Axolotls
+            | MobCategory::UndergroundWaterCreature
+            | MobCategory::WaterCreature
+            | MobCategory::WaterAmbient => EntityCategory::Water,
+            MobCategory::Misc => EntityCategory::Other,
+        },
     }
 }
 
-#[must_use]
-pub fn fallback_entity_dimensions(id: &str, is_baby: bool) -> Option<EntityDimensions> {
-    match (id, is_baby) {
-        ("minecraft:chicken", false) => Some(EntityDimensions::new(0.4, 0.7, Some(0.644))),
-        ("minecraft:chicken", true) => Some(EntityDimensions::new(0.3, 0.4, Some(0.28))),
-        ("minecraft:cow", false) => Some(EntityDimensions::new(0.9, 1.4, Some(1.3))),
-        ("minecraft:cow", true) => Some(EntityDimensions::new(0.45, 0.7, Some(0.665))),
-        ("minecraft:pig", false) => Some(EntityDimensions::new(0.9, 0.9, Some(0.765))),
-        ("minecraft:pig", true) => Some(EntityDimensions::new(0.45, 0.45, Some(0.3825))),
-        ("minecraft:sheep", false) => Some(EntityDimensions::new(0.9, 1.3, Some(1.235))),
-        ("minecraft:sheep", true) => Some(EntityDimensions::new(0.45, 0.65, Some(0.6175))),
-        _ => None,
-    }
-}
-
-#[must_use]
-pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTypeFacts {
-    let category = fallback_entity_category(id.as_str());
-    let (dimensions, tracking_range, attributes, loot_table) = match id.as_str() {
+fn independently_sourced_attributes_and_loot(
+    id: &Identifier,
+) -> (EntityAttributeFacts, Option<Identifier>) {
+    match id.as_str() {
         "minecraft:chicken" => (
-            EntityDimensions::new(0.4, 0.7, Some(0.644)),
-            Some(10),
             EntityAttributeFacts {
                 max_health: Some(4.0),
                 movement_speed: Some(0.25),
@@ -227,8 +345,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/chicken"),
         ),
         "minecraft:pig" => (
-            EntityDimensions::new(0.9, 0.9, Some(0.765)),
-            Some(10),
             EntityAttributeFacts {
                 max_health: Some(10.0),
                 movement_speed: Some(0.25),
@@ -238,8 +354,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/pig"),
         ),
         "minecraft:sheep" => (
-            EntityDimensions::new(0.9, 1.3, Some(1.235)),
-            Some(10),
             EntityAttributeFacts {
                 max_health: Some(8.0),
                 movement_speed: Some(0.23),
@@ -249,8 +363,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/sheep"),
         ),
         "minecraft:cow" => (
-            EntityDimensions::new(0.9, 1.4, Some(1.3)),
-            Some(10),
             EntityAttributeFacts {
                 max_health: Some(10.0),
                 movement_speed: Some(0.2),
@@ -260,8 +372,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/cow"),
         ),
         "minecraft:zombie" => (
-            EntityDimensions::new(0.6, 1.95, Some(1.74)),
-            Some(8),
             EntityAttributeFacts {
                 max_health: Some(20.0),
                 movement_speed: Some(0.23),
@@ -271,8 +381,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/zombie"),
         ),
         "minecraft:skeleton" => (
-            EntityDimensions::new(0.6, 1.99, Some(1.74)),
-            Some(8),
             EntityAttributeFacts {
                 max_health: Some(20.0),
                 movement_speed: Some(0.25),
@@ -282,8 +390,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/skeleton"),
         ),
         "minecraft:spider" => (
-            EntityDimensions::new(1.4, 0.9, Some(0.65)),
-            Some(8),
             EntityAttributeFacts {
                 max_health: Some(16.0),
                 movement_speed: Some(0.3),
@@ -293,8 +399,6 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             static_id("minecraft:entities/spider"),
         ),
         "minecraft:cod" | "minecraft:salmon" | "minecraft:tropical_fish" => (
-            EntityDimensions::new(0.5, 0.3, Some(0.195)),
-            Some(4),
             EntityAttributeFacts {
                 max_health: Some(3.0),
                 movement_speed: Some(0.7),
@@ -303,50 +407,7 @@ pub fn fallback_entity_type_facts(id: Identifier, protocol_id: u32) -> EntityTyp
             },
             static_id(&format!("minecraft:entities/{}", id.path())),
         ),
-        "minecraft:item" => (
-            EntityDimensions::new(0.25, 0.25, None),
-            Some(6),
-            EntityAttributeFacts::default(),
-            None,
-        ),
-        "minecraft:experience_orb" | "minecraft:xp_orb" => (
-            EntityDimensions::new(0.5, 0.5, None),
-            Some(6),
-            EntityAttributeFacts::default(),
-            None,
-        ),
-        "minecraft:falling_block" => (
-            EntityDimensions::new(0.98, 0.98, None),
-            Some(10),
-            EntityAttributeFacts::default(),
-            None,
-        ),
-        "minecraft:arrow" | "minecraft:spectral_arrow" | "minecraft:tipped_arrow" => (
-            EntityDimensions::new(0.5, 0.5, None),
-            Some(4),
-            EntityAttributeFacts::default(),
-            None,
-        ),
-        _ => (
-            EntityDimensions::new(0.9, 1.4, Some(1.3)),
-            None,
-            EntityAttributeFacts {
-                max_health: Some(20.0),
-                movement_speed: Some(0.25),
-                follow_range: Some(16.0),
-                attack_damage: Some(0.0),
-            },
-            None,
-        ),
-    };
-    EntityTypeFacts {
-        id,
-        protocol_id,
-        category,
-        dimensions,
-        tracking_range,
-        attributes,
-        loot_table,
+        _ => (EntityAttributeFacts::default(), None),
     }
 }
 
@@ -376,46 +437,24 @@ mod tests {
 
     #[test]
     fn registry_resolves_entity_type_ids() {
-        let registry = EntityTypeRegistry::from_report(&[
-            EntityTypeReport {
-                id: Identifier::parse("minecraft:cow").unwrap(),
-                protocol_id: 30,
-            },
-            EntityTypeReport {
-                id: Identifier::parse("minecraft:zombie").unwrap(),
-                protocol_id: 147,
-            },
-        ]);
+        let registry = solaris_required_entity_types();
 
         assert_eq!(
             registry.id_of(&Identifier::parse("minecraft:cow").unwrap()),
             Some(30)
         );
-        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.len(), ENTITY_TYPE_COUNT);
     }
 
     #[test]
     fn registry_exposes_m32_entity_facts() {
-        let registry = EntityTypeRegistry::from_report(&[
-            EntityTypeReport {
-                id: Identifier::parse("minecraft:chicken").unwrap(),
-                protocol_id: 10,
-            },
-            EntityTypeReport {
-                id: Identifier::parse("minecraft:skeleton").unwrap(),
-                protocol_id: 20,
-            },
-            EntityTypeReport {
-                id: Identifier::parse("minecraft:item").unwrap(),
-                protocol_id: 30,
-            },
-        ]);
+        let registry = solaris_required_entity_types();
 
         let chicken = registry
             .facts_of(&Identifier::parse("minecraft:chicken").unwrap())
             .unwrap();
         assert_eq!(chicken.category, EntityCategory::Passive);
-        assert_eq!(chicken.dimensions.width, 0.4);
+        assert_eq!(chicken.dimensions.width, f64::from(0.4_f32));
         assert_eq!(chicken.attributes.max_health, Some(4.0));
         assert_eq!(
             chicken.loot_table.as_ref().map(Identifier::as_str),
@@ -433,81 +472,5 @@ mod tests {
             .unwrap();
         assert_eq!(item.category, EntityCategory::Item);
         assert_eq!(item.dimensions.height, 0.25);
-    }
-
-    #[test]
-    fn fallback_category_matches_full_facts_without_identifier_input() {
-        for name in [
-            "minecraft:cow",
-            "minecraft:zombie",
-            "minecraft:skeleton",
-            "minecraft:spider",
-            "minecraft:cod",
-            "minecraft:item",
-            "minecraft:experience_orb",
-            "minecraft:arrow",
-            "minecraft:unknown",
-        ] {
-            let facts = fallback_entity_type_facts(Identifier::parse(name).unwrap(), 0);
-            assert_eq!(fallback_entity_category(name), facts.category, "{name}");
-        }
-    }
-
-    #[test]
-    fn livestock_dimensions_match_vanilla_for_adults_and_babies() {
-        let cases = [
-            (
-                "minecraft:chicken",
-                false,
-                EntityDimensions::new(0.4, 0.7, Some(0.644)),
-            ),
-            (
-                "minecraft:chicken",
-                true,
-                EntityDimensions::new(0.3, 0.4, Some(0.28)),
-            ),
-            (
-                "minecraft:cow",
-                false,
-                EntityDimensions::new(0.9, 1.4, Some(1.3)),
-            ),
-            (
-                "minecraft:cow",
-                true,
-                EntityDimensions::new(0.45, 0.7, Some(0.665)),
-            ),
-            (
-                "minecraft:pig",
-                false,
-                EntityDimensions::new(0.9, 0.9, Some(0.765)),
-            ),
-            (
-                "minecraft:pig",
-                true,
-                EntityDimensions::new(0.45, 0.45, Some(0.3825)),
-            ),
-            (
-                "minecraft:sheep",
-                false,
-                EntityDimensions::new(0.9, 1.3, Some(1.235)),
-            ),
-            (
-                "minecraft:sheep",
-                true,
-                EntityDimensions::new(0.45, 0.65, Some(0.6175)),
-            ),
-        ];
-
-        for (id, is_baby, expected) in cases {
-            assert_eq!(
-                fallback_entity_dimensions(id, is_baby),
-                Some(expected),
-                "{id}"
-            );
-            if !is_baby {
-                let facts = fallback_entity_type_facts(Identifier::parse(id).unwrap(), 0);
-                assert_eq!(facts.dimensions, expected, "adult facts for {id}");
-            }
-        }
     }
 }

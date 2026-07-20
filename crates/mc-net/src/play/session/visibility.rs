@@ -6,6 +6,7 @@ use mc_entity::{EntityId, EntityLifecycle, EntitySnapshot, Rotation, Vec3};
 use mc_protocol::packets::play::MoveEntityPosRot;
 
 use crate::play::PlayerPose;
+use crate::play::wire_entities::ServerEntityWireMove;
 
 use super::outbound::{
     OutboundCommand, PlayerEntitySnapshot, ServerEntityMove, ServerEntitySnapshot,
@@ -40,6 +41,27 @@ pub(super) struct LastSentEntityState {
     pub(super) velocity: Vec3,
     pub(super) rotation: Rotation,
     pub(super) on_ground: bool,
+    pub(super) tracking_update_count: u64,
+    pub(super) teleport_delay: u16,
+}
+
+const ENTITY_POSITION_DIRTY_THRESHOLD_SQUARED: f64 = 7.629_394_531_25e-6;
+const ENTITY_POSITION_REFRESH_UPDATES: u64 = 60;
+const ENTITY_ABSOLUTE_REFRESH_UPDATES: u16 = 400;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum EntityPositionUpdate {
+    None,
+    Relative(Vec3),
+    Absolute,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct EntityTrackerUpdate {
+    pub(super) wire_move: Option<ServerEntityWireMove>,
+    pub(super) send_velocity: bool,
+    pub(super) send_head_rotation: bool,
 }
 
 pub(super) fn quantized_entity_delta(current: Vec3, previous: Vec3) -> Vec3 {
@@ -56,6 +78,143 @@ pub(super) fn quantized_entity_delta(current: Vec3, previous: Vec3) -> Vec3 {
         axis(current.y, previous.y),
         axis(current.z, previous.z),
     )
+}
+
+fn relative_entity_delta_fits(delta: Vec3) -> bool {
+    [delta.x, delta.y, delta.z].into_iter().all(|axis| {
+        let encoded = axis * 4096.0;
+        encoded >= f64::from(i16::MIN) && encoded <= f64::from(i16::MAX)
+    })
+}
+
+fn entity_displacement_is_dirty(last_sent: &LastSentEntityState, position: Vec3) -> bool {
+    let dx = position.x - last_sent.position.x;
+    let dy = position.y - last_sent.position.y;
+    let dz = position.z - last_sent.position.z;
+    dx * dx + dy * dy + dz * dz >= ENTITY_POSITION_DIRTY_THRESHOLD_SQUARED
+}
+
+fn entity_position_is_dirty(last_sent: &LastSentEntityState, position: Vec3) -> bool {
+    entity_displacement_is_dirty(last_sent, position)
+        || last_sent
+            .tracking_update_count
+            .is_multiple_of(ENTITY_POSITION_REFRESH_UPDATES)
+}
+
+fn choose_entity_position_update(
+    last_sent: &LastSentEntityState,
+    position: Vec3,
+    on_ground: bool,
+    position_dirty: bool,
+) -> EntityPositionUpdate {
+    let delta = quantized_entity_delta(position, last_sent.position);
+    if last_sent.on_ground != on_ground
+        || last_sent.teleport_delay > ENTITY_ABSOLUTE_REFRESH_UPDATES
+        || !relative_entity_delta_fits(delta)
+    {
+        return EntityPositionUpdate::Absolute;
+    }
+    if position_dirty {
+        return EntityPositionUpdate::Relative(delta);
+    }
+    EntityPositionUpdate::None
+}
+
+pub(super) fn plan_entity_position_update(
+    last_sent: &mut LastSentEntityState,
+    position: Vec3,
+    on_ground: bool,
+) -> EntityPositionUpdate {
+    last_sent.teleport_delay = last_sent.teleport_delay.saturating_add(1);
+    let position_dirty = entity_position_is_dirty(last_sent, position);
+    let update = choose_entity_position_update(last_sent, position, on_ground, position_dirty);
+
+    match update {
+        EntityPositionUpdate::Relative(_) => {
+            last_sent.position = position;
+            last_sent.on_ground = on_ground;
+        }
+        EntityPositionUpdate::Absolute => {
+            last_sent.position = position;
+            last_sent.on_ground = on_ground;
+            last_sent.teleport_delay = 0;
+        }
+        EntityPositionUpdate::None => {}
+    }
+    last_sent.tracking_update_count = last_sent.tracking_update_count.wrapping_add(1);
+    update
+}
+
+pub(super) fn entity_wire_move(
+    position_update: EntityPositionUpdate,
+    body_rotation_changed: bool,
+    position: Vec3,
+) -> Option<ServerEntityWireMove> {
+    entity_wire_move_for_kind(position_update, body_rotation_changed, position, false)
+}
+
+pub(super) fn entity_wire_move_for_kind(
+    position_update: EntityPositionUpdate,
+    body_rotation_changed: bool,
+    position: Vec3,
+    is_arrow: bool,
+) -> Option<ServerEntityWireMove> {
+    match (position_update, body_rotation_changed, is_arrow) {
+        (EntityPositionUpdate::Absolute, _, _) => Some(ServerEntityWireMove::Absolute { position }),
+        (EntityPositionUpdate::Relative(delta), true, _)
+        | (EntityPositionUpdate::Relative(delta), false, true) => {
+            Some(ServerEntityWireMove::PositionRotation { delta })
+        }
+        (EntityPositionUpdate::Relative(delta), false, false) => {
+            Some(ServerEntityWireMove::Position { delta })
+        }
+        (EntityPositionUpdate::None, true, true) => {
+            Some(ServerEntityWireMove::PositionRotation { delta: Vec3::ZERO })
+        }
+        (EntityPositionUpdate::None, true, false) => Some(ServerEntityWireMove::Rotation),
+        (EntityPositionUpdate::None, false, _) => None,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn advance_entity_tracker_update(
+    last_sent: &mut LastSentEntityState,
+    position: Vec3,
+    velocity: Vec3,
+    rotation: Rotation,
+    on_ground: bool,
+    sends_velocity: bool,
+) -> EntityTrackerUpdate {
+    let body_rotation_changed = packed_rotation_changed(last_sent.rotation, rotation);
+    let send_head_rotation = packed_head_yaw_changed(last_sent.rotation, rotation);
+    let send_velocity = sends_velocity && entity_velocity_changed(last_sent.velocity, velocity);
+    let position_update = plan_entity_position_update(last_sent, position, on_ground);
+    let wire_move = entity_wire_move(position_update, body_rotation_changed, position);
+
+    if matches!(
+        wire_move,
+        Some(
+            ServerEntityWireMove::Rotation
+                | ServerEntityWireMove::PositionRotation { .. }
+                | ServerEntityWireMove::Absolute { .. }
+        )
+    ) {
+        last_sent.rotation.yaw = rotation.yaw;
+        last_sent.rotation.pitch = rotation.pitch;
+        last_sent.on_ground = on_ground;
+    }
+    if send_head_rotation {
+        last_sent.rotation.head_yaw = rotation.head_yaw;
+    }
+    if send_velocity {
+        last_sent.velocity = velocity;
+    }
+
+    EntityTrackerUpdate {
+        wire_move,
+        send_velocity,
+        send_head_rotation,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +276,10 @@ pub(super) fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEn
 }
 
 pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> ServerEntitySnapshot {
+    let has_living_health = super::interaction_geometry::canonical_entity_facts(&entity.type_name)
+        .is_some_and(|facts| facts.category.is_living())
+        // ArmorStand extends LivingEntity but is registered in the MISC mob category.
+        || entity.type_name == "minecraft:armor_stand";
     ServerEntitySnapshot {
         id: entity.id,
         uuid: entity.uuid,
@@ -126,6 +289,7 @@ pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> Se
         rotation: entity.rotation,
         velocity: entity.velocity,
         on_ground: entity.on_ground,
+        health: has_living_health.then_some(entity.health),
         item_stack: entity.item_stack,
         experience_value: entity.experience_value,
         block_state: entity.block_state,
@@ -174,13 +338,25 @@ pub(super) fn publish_entity_movement_locked(
         initialize_entity_wire_state_from_snapshot_locked(inner, snapshot);
         return Vec::new();
     };
-    let delta = quantized_entity_delta(position, last_sent.position);
-    if delta == Vec3::ZERO {
+    let position_update = choose_entity_position_update(
+        &last_sent,
+        position,
+        snapshot.on_ground,
+        entity_displacement_is_dirty(&last_sent, position),
+    );
+    if position_update == EntityPositionUpdate::None {
         return Vec::new();
     }
     if let Some(sent) = inner.last_sent_entity_states.get_mut(&entity_id) {
         sent.position = position;
+        sent.on_ground = snapshot.on_ground;
+        if position_update == EntityPositionUpdate::Absolute {
+            sent.rotation.yaw = snapshot.rotation.yaw;
+            sent.rotation.pitch = snapshot.rotation.pitch;
+            sent.teleport_delay = 0;
+        }
     }
+    let wire_move = entity_wire_move(position_update, false, position);
     let dispatches = old_observers
         .intersection(new_observers)
         .filter_map(|observer_id| {
@@ -189,12 +365,12 @@ pub(super) fn publish_entity_movement_locked(
                 recipient: ordered_session_recipient(*observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: entity_id,
-                    delta,
+                    wire_move,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,
                     on_ground: snapshot.on_ground,
-                    send_position_rotation: true,
                     send_velocity: false,
+                    send_head_rotation: false,
                 }),
             })
         })
@@ -458,6 +634,8 @@ pub(super) fn initialize_entity_wire_state_locked(
             velocity: entity.velocity,
             rotation: entity.rotation,
             on_ground: entity.on_ground,
+            tracking_update_count: 0,
+            teleport_delay: 0,
         },
     );
 }
@@ -473,6 +651,8 @@ pub(super) fn initialize_entity_wire_state_from_snapshot_locked(
             velocity: entity.velocity,
             rotation: entity.rotation,
             on_ground: entity.on_ground,
+            tracking_update_count: 0,
+            teleport_delay: 0,
         },
     );
 }
@@ -532,8 +712,11 @@ pub(super) fn packed_rotation_changed(previous: Rotation, current: Rotation) -> 
     MoveEntityPosRot::pack_degrees(previous.yaw) != MoveEntityPosRot::pack_degrees(current.yaw)
         || MoveEntityPosRot::pack_degrees(previous.pitch)
             != MoveEntityPosRot::pack_degrees(current.pitch)
-        || MoveEntityPosRot::pack_degrees(previous.head_yaw)
-            != MoveEntityPosRot::pack_degrees(current.head_yaw)
+}
+
+pub(super) fn packed_head_yaw_changed(previous: Rotation, current: Rotation) -> bool {
+    MoveEntityPosRot::pack_degrees(previous.head_yaw)
+        != MoveEntityPosRot::pack_degrees(current.head_yaw)
 }
 
 pub(super) fn entity_velocity_changed(previous: Vec3, current: Vec3) -> bool {

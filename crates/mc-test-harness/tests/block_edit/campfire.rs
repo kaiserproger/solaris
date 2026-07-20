@@ -18,33 +18,66 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let air = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .expect("air block")
+        .default;
+    let dirt = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt block")
+        .default;
+    let surface_y = top_non_air_y(&mut storage, 0, 0, air).expect("spawn terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 2,
+                y: surface_y,
+                z: 2,
+            },
+            dirt,
+        )
+        .expect("seed campfire support");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 2,
+                y: surface_y + 1,
+                z: 2,
+            },
+            air,
+        )
+        .expect("clear campfire target");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
-    let cooked_porkchop_id = items
-        .id_of(&cooked_porkchop)
-        .expect("cooked porkchop item");
+    let cooked_porkchop_id = items.id_of(&cooked_porkchop).expect("cooked porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
@@ -105,12 +138,14 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -121,7 +156,12 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -134,7 +174,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, campfire_y, campfire_z),
+            position: pack_block_pos(campfire_x, campfire_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -145,7 +185,7 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
         })
         .await
         .expect("start campfire cooking");
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
     let mut item_entity_id = None;
@@ -154,7 +194,9 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !(saw_cooked_stack && saw_empty_visual) {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("campfire cooked output");
         if handle_keepalive(&mut client, frame.id, &frame.body).await {
@@ -172,8 +214,8 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
             }
         } else if frame.id == ClientboundSetEntityData::ID {
             let mut body = frame.body;
-            let pkt = ClientboundSetEntityData::decode(&mut body)
-                .expect("decode campfire item metadata");
+            let pkt =
+                ClientboundSetEntityData::decode(&mut body).expect("decode campfire item metadata");
             if Some(pkt.entity_id) == item_entity_id {
                 saw_cooked_stack = pkt.values.iter().any(|value| {
                     matches!(
@@ -189,7 +231,8 @@ async fn survival_campfire_cooks_held_input_into_item_entity() {
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body)
                 .expect("decode campfire pickup slot");
-            saw_cooked_stack = pkt.item_stack.item_id == cooked_porkchop_id && pkt.item_stack.count >= 1;
+            saw_cooked_stack =
+                pkt.item_stack.item_id == cooked_porkchop_id && pkt.item_stack.count >= 1;
         } else if frame.id == ClientboundBlockEntityData::ID {
             let mut body = frame.body;
             let pkt = ClientboundBlockEntityData::decode(&mut body)
@@ -221,33 +264,38 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let surface_y = seed_campfire_placement_site(&mut storage, &blocks);
     let world = Arc::new(tokio::sync::Mutex::new(storage));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
-    let cooked_porkchop_id = items
-        .id_of(&cooked_porkchop)
-        .expect("cooked porkchop item");
+    let cooked_porkchop_id = items.id_of(&cooked_porkchop).expect("cooked porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
@@ -311,12 +359,14 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -327,7 +377,12 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -337,7 +392,7 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
         .expect("give porkchop");
     wait_for_slot_stack(&mut client, porkchop_id, 1).await;
 
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -355,7 +410,7 @@ async fn survival_unlit_campfire_does_not_finish_cooking() {
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
     let campfire_block_pos = mc_world::BlockPos {
-        x: 0,
+        x: campfire_x,
         y: campfire_y,
         z: campfire_z,
     };
@@ -443,11 +498,12 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
 
-    let storage =
+    let mut storage =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)
             .expect("disk world opens")
             .with_generator(generator)
             .with_item_registry(Arc::clone(&items));
+    let surface_y = seed_campfire_placement_site(&mut storage, &blocks);
     let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
     let world = Some(Arc::clone(&world_handle));
 
@@ -455,9 +511,14 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
@@ -492,7 +553,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         items: Arc::clone(&items),
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -517,12 +578,14 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -533,7 +596,12 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -543,7 +611,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         .expect("give porkchop");
     wait_for_slot_stack(&mut client, porkchop_id, 1).await;
 
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -571,7 +639,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
             .expect("reopen disk world")
             .with_item_registry(items);
     let campfire_block_pos = mc_world::BlockPos {
-        x: 0,
+        x: campfire_x,
         y: campfire_y,
         z: campfire_z,
     };
@@ -591,7 +659,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         Some("minecraft:campfire"),
         "persistent campfire block entity should keep its type id"
     );
-    assert_eq!(compound_int(&tag, "x"), Some(0));
+    assert_eq!(compound_int(&tag, "x"), Some(campfire_x));
     assert_eq!(compound_int(&tag, "y"), Some(campfire_y));
     assert_eq!(compound_int(&tag, "z"), Some(campfire_z));
     assert!(
@@ -641,22 +709,26 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
-    let cooked_porkchop_id = items
-        .id_of(&cooked_porkchop)
-        .expect("cooked porkchop item");
+    let cooked_porkchop_id = items.id_of(&cooked_porkchop).expect("cooked porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
@@ -677,12 +749,13 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         },
     }]);
 
-    let first_world = Arc::new(tokio::sync::Mutex::new(
+    let mut first_storage =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)
             .expect("disk world opens")
             .with_generator(Arc::clone(&generator))
-            .with_item_registry(Arc::clone(&items)),
-    ));
+            .with_item_registry(Arc::clone(&items));
+    let surface_y = seed_campfire_placement_site(&mut first_storage, &blocks);
+    let first_world = Arc::new(tokio::sync::Mutex::new(first_storage));
     let first_shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -722,12 +795,14 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -738,7 +813,12 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -748,7 +828,7 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
         .expect("give porkchop");
     wait_for_slot_stack(&mut client, porkchop_id, 1).await;
 
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -767,7 +847,9 @@ async fn survival_campfire_in_flight_state_resumes_after_reopen() {
 
     {
         let mut storage = first_world.lock().await;
-        storage.flush_dirty().expect("flush in-flight campfire state");
+        storage
+            .flush_dirty()
+            .expect("flush in-flight campfire state");
     }
 
     drop(client);
@@ -851,33 +933,38 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let surface_y = seed_campfire_placement_site(&mut storage, &blocks);
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
-    let cooked_porkchop_id = items
-        .id_of(&cooked_porkchop)
-        .expect("cooked porkchop item");
+    let cooked_porkchop_id = items.id_of(&cooked_porkchop).expect("cooked porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
@@ -940,12 +1027,14 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -956,7 +1045,12 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -966,7 +1060,7 @@ async fn survival_campfire_finishes_while_no_clients_are_connected() {
         .expect("give porkchop");
     wait_for_slot_stack(&mut client, porkchop_id, 1).await;
 
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -1032,22 +1126,26 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
     let porkchop = ident("minecraft:porkchop");
     let cooked_porkchop = ident("minecraft:cooked_porkchop");
-    let campfire_state_id =
-        i32::try_from(blocks.block(&campfire_id).expect("campfire block").default.0)
-            .expect("campfire state id fits i32");
+    let campfire_state_id = i32::try_from(
+        blocks
+            .block(&campfire_id)
+            .expect("campfire block")
+            .default
+            .0,
+    )
+    .expect("campfire state id fits i32");
     let campfire_item_id = items.id_of(&campfire_id).expect("campfire item");
     let porkchop_id = items.id_of(&porkchop).expect("porkchop item");
-    let cooked_porkchop_id = items
-        .id_of(&cooked_porkchop)
-        .expect("cooked porkchop item");
+    let cooked_porkchop_id = items.id_of(&cooked_porkchop).expect("cooked porkchop item");
     let porkchop_name = porkchop.as_str().to_string();
     let item_entity_type = entity_types
         .id_of(&ident("minecraft:item"))
@@ -1068,12 +1166,13 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         },
     }]);
 
-    let first_world = Arc::new(tokio::sync::Mutex::new(
+    let mut first_storage =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)
             .expect("disk world opens")
             .with_generator(Arc::clone(&generator))
-            .with_item_registry(Arc::clone(&items)),
-    ));
+            .with_item_registry(Arc::clone(&items));
+    let surface_y = seed_campfire_placement_site(&mut first_storage, &blocks);
+    let first_world = Arc::new(tokio::sync::Mutex::new(first_storage));
     let first_shutdown = mc_net::ShutdownHandle::default();
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
@@ -1113,12 +1212,14 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
     wait_for_slot_stack(&mut client, campfire_item_id, 1).await;
 
     let support_y = sync.y.floor() as i32 - 2;
+    assert_eq!(support_y, surface_y, "seeded spawn terrain");
+    let campfire_x = 2;
     let campfire_y = support_y + 1;
     let campfire_z = 2;
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, campfire_z),
+            position: pack_block_pos(campfire_x, support_y, campfire_z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -1129,7 +1230,12 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         })
         .await
         .expect("place campfire");
-    wait_for_block_update(&mut client, (0, campfire_y, campfire_z), campfire_state_id).await;
+    wait_for_block_update(
+        &mut client,
+        (campfire_x, campfire_y, campfire_z),
+        campfire_state_id,
+    )
+    .await;
 
     client
         .write_packet(&ServerboundChatCommand {
@@ -1139,7 +1245,7 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         .expect("give porkchop");
     wait_for_slot_stack(&mut client, porkchop_id, 1).await;
 
-    let campfire_pos = pack_block_pos(0, campfire_y, campfire_z);
+    let campfire_pos = pack_block_pos(campfire_x, campfire_y, campfire_z);
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -1228,6 +1334,42 @@ async fn survival_campfire_finishes_after_restart_before_any_client_reconnects()
         .expect("second server serve result");
 }
 
+fn seed_campfire_placement_site(
+    storage: &mut mc_world::WorldStorage,
+    blocks: &mc_world::BlockRegistry,
+) -> i32 {
+    let air = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .expect("air block")
+        .default;
+    let dirt = blocks
+        .block(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt block")
+        .default;
+    let surface_y = top_non_air_y(storage, 0, 0, air).expect("spawn terrain");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 2,
+                y: surface_y,
+                z: 2,
+            },
+            dirt,
+        )
+        .expect("seed campfire support");
+    storage
+        .set_block_at(
+            mc_world::BlockPos {
+                x: 2,
+                y: surface_y + 1,
+                z: 2,
+            },
+            air,
+        )
+        .expect("clear campfire target");
+    surface_y
+}
+
 async fn wait_for_additional_simulation_ticks(
     ticks: &mut tokio::sync::watch::Receiver<u64>,
     additional: u64,
@@ -1259,7 +1401,9 @@ async fn wait_for_campfire_input_visual_and_slot(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while !(saw_slot_empty && saw_input_visual) {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("campfire input visual");
         if handle_keepalive(client, frame.id, &frame.body).await {
@@ -1275,8 +1419,11 @@ async fn wait_for_campfire_input_visual_and_slot(
             let pkt = ClientboundBlockEntityData::decode(&mut body)
                 .expect("decode campfire input BlockEntityData");
             if pkt.position == campfire_pos {
-                saw_input_visual = campfire_items(&pkt.nbt)
-                    .is_some_and(|items| items.iter().any(|item| campfire_item_matches(item, input_item)));
+                saw_input_visual = campfire_items(&pkt.nbt).is_some_and(|items| {
+                    items
+                        .iter()
+                        .any(|item| campfire_item_matches(item, input_item))
+                });
             }
         }
     }
@@ -1298,7 +1445,9 @@ async fn wait_for_campfire_cooked_output(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     while !(saw_target_chunk && saw_cooked_stack && saw_empty_visual) {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("campfire cooked output after restart");
         if handle_keepalive(client, frame.id, &frame.body).await {
@@ -1306,15 +1455,14 @@ async fn wait_for_campfire_cooked_output(
         }
         if frame.id == LevelChunkWithLight::ID {
             let mut body = frame.body;
-            let pkt = LevelChunkWithLight::decode(&mut body)
-                .expect("decode restarted campfire chunk");
+            let pkt =
+                LevelChunkWithLight::decode(&mut body).expect("decode restarted campfire chunk");
             if (pkt.chunk_x, pkt.chunk_z) == target_chunk {
                 saw_target_chunk = true;
                 saw_empty_visual |= pkt.block_entities.iter().any(|block_entity| {
                     block_entity.packed_xz == packed_xz
                         && i32::from(block_entity.y) == campfire_y
-                        && campfire_items(&block_entity.nbt)
-                            .is_some_and(|items| items.is_empty())
+                        && campfire_items(&block_entity.nbt).is_some_and(|items| items.is_empty())
                 });
             }
         } else if frame.id == AddEntity::ID {
@@ -1343,7 +1491,8 @@ async fn wait_for_campfire_cooked_output(
             let mut body = frame.body;
             let pkt = ClientboundContainerSetSlot::decode(&mut body)
                 .expect("decode restarted campfire pickup slot");
-            saw_cooked_stack = pkt.item_stack.item_id == cooked_item_id && pkt.item_stack.count >= 1;
+            saw_cooked_stack =
+                pkt.item_stack.item_id == cooked_item_id && pkt.item_stack.count >= 1;
         } else if frame.id == ClientboundBlockEntityData::ID {
             let mut body = frame.body;
             let pkt = ClientboundBlockEntityData::decode(&mut body)
@@ -1366,7 +1515,9 @@ async fn wait_for_cooked_item_entity(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let frame = client
-            .read_frame_with_timeout(deadline.saturating_duration_since(tokio::time::Instant::now()))
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
             .await
             .expect("cooked item entity after zero-client campfire ticking");
         if handle_keepalive(client, frame.id, &frame.body).await {
@@ -1511,7 +1662,8 @@ async fn assert_not_cooked_campfire_frame(
         }
     } else if frame.id == ClientboundBlockEntityData::ID {
         let mut body = frame.body;
-        let pkt = ClientboundBlockEntityData::decode(&mut body).expect("decode campfire clear data");
+        let pkt =
+            ClientboundBlockEntityData::decode(&mut body).expect("decode campfire clear data");
         assert!(
             pkt.position != campfire_pos
                 || !campfire_items(&pkt.nbt).is_some_and(|items| items.is_empty()),

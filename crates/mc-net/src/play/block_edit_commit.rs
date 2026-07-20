@@ -350,18 +350,6 @@ where
     Ok(outcome)
 }
 
-pub(super) async fn apply_player_block_edit_batch<W>(
-    state: &mut InteractionState,
-    writer: &mut W,
-    sequence: i32,
-    edits: &[BlockEdit],
-) -> Result<BlockEditBatchOutcome, ConnectionError>
-where
-    W: AsyncWriteExt + Unpin,
-{
-    apply_player_block_edit_batch_conditionally(state, writer, sequence, edits, &[], &[]).await
-}
-
 pub(super) async fn apply_player_block_edit_batch_conditionally<W>(
     state: &mut InteractionState,
     writer: &mut W,

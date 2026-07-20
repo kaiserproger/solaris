@@ -5,7 +5,9 @@ use mc_data::Identifier;
 use mc_data::worldgen_ores::{
     HeightAnchor, HeightRange, OreFeature, OrePlacement, OrePlacementCount, OreTarget,
 };
-use mc_world::{BlockRegistry, BlockStateId, Chunk, ChunkGenerator, ChunkPos, MAX_Y};
+use mc_world::{
+    BlockRegistry, BlockStateId, Chunk, ChunkGenerator, ChunkPos, MAX_Y, OVERWORLD_GEOMETRY,
+};
 use mc_worldgen::{
     BiomeRules, BiomeScope, OreRule, OreRules, OreSpacing, TerrainGenerator, YRange,
 };
@@ -334,9 +336,15 @@ fn sidecar_ore_rules_preserve_vein_shape_parameters() {
         ],
     };
 
-    let rules = OreRules::from_features(registry.as_ref(), &biomes, &[feature], None)
-        .unwrap()
-        .unwrap();
+    let rules = OreRules::from_features(
+        registry.as_ref(),
+        &biomes,
+        &[feature],
+        None,
+        OVERWORLD_GEOMETRY,
+    )
+    .unwrap()
+    .unwrap();
     let rule = &rules.rules()[0];
     assert_eq!(rule.size, 11);
     assert_eq!(rule.discard_chance_on_air_exposure, 0.75);

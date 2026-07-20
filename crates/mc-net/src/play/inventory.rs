@@ -6,6 +6,8 @@ use mc_protocol::packets::play::ItemStack;
 use super::InteractionState;
 use super::survival::max_tool_damage_for_path;
 
+static EMPTY_STACK: ItemStack = ItemStack::EMPTY;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ArmorStats {
     pub(crate) armor: f32,
@@ -29,6 +31,7 @@ pub(crate) struct PlayerInventory {
 impl PlayerInventory {
     /// Slot index where the hotbar begins on the wire.
     pub(crate) const HOTBAR_BASE: usize = 36;
+    const HOTBAR_LEN: usize = 9;
     pub(crate) const OFFHAND_SLOT: usize = 45;
 
     pub(crate) fn empty() -> Self {
@@ -37,16 +40,38 @@ impl PlayerInventory {
         }
     }
 
-    pub(crate) fn held(&self, hotbar_slot: u8) -> &ItemStack {
-        &self.slots[Self::HOTBAR_BASE + hotbar_slot as usize]
+    pub(crate) fn held(&self, hotbar_slot: u8) -> Option<&ItemStack> {
+        let slot = Self::hotbar_index(hotbar_slot)?;
+        let stack = &self.slots[slot];
+        if stack.is_empty() {
+            Some(&EMPTY_STACK)
+        } else {
+            Some(stack)
+        }
     }
 
-    pub(crate) fn held_mut(&mut self, hotbar_slot: u8) -> &mut ItemStack {
-        &mut self.slots[Self::HOTBAR_BASE + hotbar_slot as usize]
+    pub(crate) fn held_mut(&mut self, hotbar_slot: u8) -> Option<&mut ItemStack> {
+        let slot = Self::hotbar_index(hotbar_slot)?;
+        let stack = &mut self.slots[slot];
+        canonicalize_empty(stack);
+        Some(stack)
     }
 
-    pub(crate) fn set_hotbar(&mut self, hotbar_slot: u8, stack: ItemStack) {
-        self.slots[Self::HOTBAR_BASE + hotbar_slot as usize] = stack;
+    pub(crate) fn set_hotbar(
+        &mut self,
+        hotbar_slot: u8,
+        stack: ItemStack,
+    ) -> Result<(), ItemStack> {
+        let Some(slot) = Self::hotbar_index(hotbar_slot) else {
+            return Err(stack);
+        };
+        self.slots[slot] = canonical_stack(stack);
+        Ok(())
+    }
+
+    fn hotbar_index(hotbar_slot: u8) -> Option<usize> {
+        (usize::from(hotbar_slot) < Self::HOTBAR_LEN)
+            .then_some(Self::HOTBAR_BASE + usize::from(hotbar_slot))
     }
 
     pub(crate) fn merge_stack(
@@ -55,22 +80,32 @@ impl PlayerInventory {
         max_stack: i32,
     ) -> (ItemStack, Vec<(usize, ItemStack)>) {
         let mut changed = Vec::new();
+        canonicalize_empty(&mut stack);
         if stack.is_empty() {
             return (ItemStack::EMPTY, changed);
+        }
+        if max_stack <= 0 {
+            return (stack, changed);
         }
 
         for slot in 9..=44 {
             let current = &mut self.slots[slot];
-            if current.is_empty()
-                || current.item_id != stack.item_id
-                || current.damage != stack.damage
-                || current.count >= max_stack
-            {
+            canonicalize_empty(current);
+            if !can_stack(current, &stack) || current.count >= max_stack {
                 continue;
             }
-            let moved = (max_stack - current.count).min(stack.count);
-            current.count += moved;
-            stack.count -= moved;
+            let Some(capacity) = max_stack.checked_sub(current.count) else {
+                continue;
+            };
+            let moved = capacity.min(stack.count);
+            let Some(next_count) = current.count.checked_add(moved) else {
+                continue;
+            };
+            let Some(remaining) = stack.count.checked_sub(moved) else {
+                continue;
+            };
+            current.count = next_count;
+            stack.count = remaining;
             changed.push((slot, current.clone()));
             if stack.count <= 0 {
                 return (ItemStack::EMPTY, changed);
@@ -78,6 +113,7 @@ impl PlayerInventory {
         }
 
         for slot in 9..=44 {
+            canonicalize_empty(&mut self.slots[slot]);
             if !self.slots[slot].is_empty() {
                 continue;
             }
@@ -85,7 +121,7 @@ impl PlayerInventory {
             let mut moved_stack = stack.clone();
             moved_stack.count = moved;
             self.slots[slot] = moved_stack;
-            stack.count -= moved;
+            stack.count = stack.count.checked_sub(moved).unwrap_or_default();
             changed.push((slot, self.slots[slot].clone()));
             if stack.count <= 0 {
                 return (ItemStack::EMPTY, changed);
@@ -97,33 +133,69 @@ impl PlayerInventory {
 
     pub(crate) fn merge_pickup_stack(
         &mut self,
+        stack: ItemStack,
+        max_stack: i32,
+        selected_hotbar_slot: u8,
+    ) -> Option<(ItemStack, Vec<(usize, ItemStack)>)> {
+        let selected_slot = Self::hotbar_index(selected_hotbar_slot)?;
+        Some(self.merge_pickup_stack_partial(stack, max_stack, selected_slot))
+    }
+
+    fn merge_pickup_stack_partial(
+        &mut self,
         mut stack: ItemStack,
         max_stack: i32,
+        selected_slot: usize,
     ) -> (ItemStack, Vec<(usize, ItemStack)>) {
         let mut changed = Vec::new();
+        canonicalize_empty(&mut stack);
         if stack.is_empty() {
             return (ItemStack::EMPTY, changed);
         }
+        if max_stack <= 0 {
+            return (stack, changed);
+        }
 
-        for slot in 9..=44 {
+        let mut merge_order = Vec::with_capacity(37);
+        merge_order.push(selected_slot);
+        merge_order.push(Self::OFFHAND_SLOT);
+        merge_order.extend(
+            (Self::HOTBAR_BASE..Self::HOTBAR_BASE + Self::HOTBAR_LEN)
+                .filter(|slot| *slot != selected_slot),
+        );
+        merge_order.extend(9..=35);
+        for slot in merge_order {
             let current = &mut self.slots[slot];
-            if current.is_empty()
-                || current.item_id != stack.item_id
-                || current.damage != stack.damage
-                || current.count >= max_stack
-            {
+            canonicalize_empty(current);
+            if !can_stack(current, &stack) || current.count >= max_stack {
                 continue;
             }
-            let moved = (max_stack - current.count).min(stack.count);
-            current.count += moved;
-            stack.count -= moved;
+            let Some(capacity) = max_stack.checked_sub(current.count) else {
+                continue;
+            };
+            let moved = capacity.min(stack.count);
+            let Some(next_count) = current.count.checked_add(moved) else {
+                continue;
+            };
+            let Some(remaining) = stack.count.checked_sub(moved) else {
+                continue;
+            };
+            current.count = next_count;
+            stack.count = remaining;
             changed.push((slot, current.clone()));
             if stack.count <= 0 {
                 return (ItemStack::EMPTY, changed);
             }
         }
 
-        for slot in 36..=44 {
+        let empty_order = std::iter::once(selected_slot)
+            .chain(
+                (Self::HOTBAR_BASE..Self::HOTBAR_BASE + Self::HOTBAR_LEN)
+                    .filter(|slot| *slot != selected_slot),
+            )
+            .chain(9..=35);
+        for slot in empty_order {
+            canonicalize_empty(&mut self.slots[slot]);
             if !self.slots[slot].is_empty() {
                 continue;
             }
@@ -131,22 +203,7 @@ impl PlayerInventory {
             let mut moved_stack = stack.clone();
             moved_stack.count = moved;
             self.slots[slot] = moved_stack;
-            stack.count -= moved;
-            changed.push((slot, self.slots[slot].clone()));
-            if stack.count <= 0 {
-                return (ItemStack::EMPTY, changed);
-            }
-        }
-
-        for slot in 9..=35 {
-            if !self.slots[slot].is_empty() {
-                continue;
-            }
-            let moved = stack.count.min(max_stack);
-            let mut moved_stack = stack.clone();
-            moved_stack.count = moved;
-            self.slots[slot] = moved_stack;
-            stack.count -= moved;
+            stack.count = stack.count.checked_sub(moved).unwrap_or_default();
             changed.push((slot, self.slots[slot].clone()));
             if stack.count <= 0 {
                 return (ItemStack::EMPTY, changed);
@@ -157,7 +214,7 @@ impl PlayerInventory {
     }
 
     pub(crate) fn as_wire_list(&self) -> Vec<ItemStack> {
-        self.slots.to_vec()
+        self.slots.iter().cloned().map(canonical_stack).collect()
     }
 
     pub(crate) fn merge_stack_into_ranges(
@@ -166,19 +223,37 @@ impl PlayerInventory {
         ranges: &[std::ops::RangeInclusive<usize>],
         max_stack: i32,
     ) -> ItemStack {
+        canonicalize_empty(&mut stack);
         if stack.is_empty() {
             return ItemStack::EMPTY;
+        }
+        if max_stack <= 0
+            || ranges
+                .iter()
+                .any(|range| !range.is_empty() && *range.end() >= self.slots.len())
+        {
+            return stack;
         }
 
         for range in ranges {
             for slot in range.clone() {
                 let current = &mut self.slots[slot];
+                canonicalize_empty(current);
                 if !can_stack(current, &stack) || current.count >= max_stack {
                     continue;
                 }
-                let moved = (max_stack - current.count).min(stack.count);
-                current.count += moved;
-                stack.count -= moved;
+                let Some(capacity) = max_stack.checked_sub(current.count) else {
+                    continue;
+                };
+                let moved = capacity.min(stack.count);
+                let Some(next_count) = current.count.checked_add(moved) else {
+                    continue;
+                };
+                let Some(remaining) = stack.count.checked_sub(moved) else {
+                    continue;
+                };
+                current.count = next_count;
+                stack.count = remaining;
                 if stack.count <= 0 {
                     return ItemStack::EMPTY;
                 }
@@ -187,6 +262,7 @@ impl PlayerInventory {
 
         for range in ranges {
             for slot in range.clone() {
+                canonicalize_empty(&mut self.slots[slot]);
                 if !self.slots[slot].is_empty() {
                     continue;
                 }
@@ -194,7 +270,7 @@ impl PlayerInventory {
                 let mut moved_stack = stack.clone();
                 moved_stack.count = moved;
                 self.slots[slot] = moved_stack;
-                stack.count -= moved;
+                stack.count = stack.count.checked_sub(moved).unwrap_or_default();
                 if stack.count <= 0 {
                     return ItemStack::EMPTY;
                 }
@@ -205,11 +281,41 @@ impl PlayerInventory {
     }
 }
 
+fn canonicalize_empty(stack: &mut ItemStack) {
+    if stack.is_empty() {
+        *stack = ItemStack::EMPTY;
+    }
+}
+
+fn canonical_stack(mut stack: ItemStack) -> ItemStack {
+    canonicalize_empty(&mut stack);
+    stack
+}
+
 pub(crate) fn can_stack(left: &ItemStack, right: &ItemStack) -> bool {
     !left.is_empty()
         && !right.is_empty()
         && left.item_id == right.item_id
         && left.damage == right.damage
+        && left.custom_name == right.custom_name
+        && enchantments_equal_in_canonical_order(&left.enchantments, &right.enchantments)
+}
+
+fn enchantments_equal_in_canonical_order(
+    left: &[mc_data::ItemEnchantment],
+    right: &[mc_data::ItemEnchantment],
+) -> bool {
+    if left == right {
+        return true;
+    }
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut left = left.iter().collect::<Vec<_>>();
+    let mut right = right.iter().collect::<Vec<_>>();
+    left.sort_unstable();
+    right.sort_unstable();
+    left == right
 }
 
 pub(crate) fn item_max_stack(
@@ -258,13 +364,14 @@ pub(crate) fn item_max_stack(
 }
 
 pub(crate) fn take_from_slot(slot: &mut ItemStack, count: i32) -> ItemStack {
+    canonicalize_empty(slot);
     if slot.is_empty() || count <= 0 {
         return ItemStack::EMPTY;
     }
     let moved = slot.count.min(count);
     let mut out = slot.clone();
     out.count = moved;
-    slot.count -= moved;
+    slot.count = slot.count.checked_sub(moved).unwrap_or_default();
     if slot.count <= 0 {
         *slot = ItemStack::EMPTY;
     }
@@ -272,10 +379,12 @@ pub(crate) fn take_from_slot(slot: &mut ItemStack, count: i32) -> ItemStack {
 }
 
 pub(crate) fn decrement_cursor(cursor: &mut ItemStack) {
-    cursor.count -= 1;
-    if cursor.count <= 0 {
+    canonicalize_empty(cursor);
+    if cursor.count <= 1 {
         *cursor = ItemStack::EMPTY;
+        return;
     }
+    cursor.count = cursor.count.checked_sub(1).unwrap_or_default();
 }
 
 pub(crate) fn hotbar_swap_slot(button: i8) -> Option<usize> {
@@ -289,6 +398,7 @@ pub(crate) fn player_swap_slot(button: i8) -> Option<usize> {
 }
 
 pub(crate) fn take_throw_stack(slot: &mut ItemStack, button: i8) -> Option<ItemStack> {
+    canonicalize_empty(slot);
     match button {
         0 => (!slot.is_empty()).then(|| take_from_slot(slot, 1)),
         1 => (!slot.is_empty()).then(|| std::mem::take(slot)),
@@ -312,12 +422,17 @@ pub(crate) fn pickup_click_max_stack(
 
 pub(crate) fn apply_regular_pickup_slot(
     carried_item: &mut ItemStack,
-    slot_stack: ItemStack,
+    mut slot_stack: ItemStack,
     button: i8,
     max_stack: i32,
     can_place_carried: bool,
 ) -> Option<ItemStack> {
+    canonicalize_empty(carried_item);
+    canonicalize_empty(&mut slot_stack);
     if !(button == 0 || button == 1) {
+        return None;
+    }
+    if max_stack <= 0 {
         return None;
     }
 
@@ -338,13 +453,13 @@ pub(crate) fn apply_regular_pickup_slot(
             return Some(cursor);
         }
         if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
-            let moved = (max_stack - slot_stack.count).min(cursor.count);
+            let moved = max_stack.checked_sub(slot_stack.count)?.min(cursor.count);
             if moved <= 0 {
                 return None;
             }
             let mut new_slot = slot_stack;
-            new_slot.count += moved;
-            carried_item.count -= moved;
+            new_slot.count = new_slot.count.checked_add(moved)?;
+            carried_item.count = carried_item.count.checked_sub(moved)?;
             if carried_item.count <= 0 {
                 *carried_item = ItemStack::EMPTY;
             }
@@ -358,11 +473,11 @@ pub(crate) fn apply_regular_pickup_slot(
         if slot_stack.is_empty() {
             return None;
         }
-        let moved = (slot_stack.count + 1) / 2;
+        let moved = slot_stack.count / 2 + (slot_stack.count & 1);
         let mut new_cursor = slot_stack.clone();
         new_cursor.count = moved;
         let mut remaining = slot_stack;
-        remaining.count -= moved;
+        remaining.count = remaining.count.checked_sub(moved)?;
         if remaining.count <= 0 {
             remaining = ItemStack::EMPTY;
         }
@@ -380,7 +495,7 @@ pub(crate) fn apply_regular_pickup_slot(
     }
     if can_stack(&slot_stack, &cursor) && slot_stack.count < max_stack {
         let mut new_slot = slot_stack;
-        new_slot.count += 1;
+        new_slot.count = new_slot.count.checked_add(1)?;
         decrement_cursor(carried_item);
         return Some(new_slot);
     }
@@ -409,6 +524,7 @@ pub(crate) fn apply_outside_pickup_click(
     carried_item: &mut ItemStack,
     button: i8,
 ) -> Option<ItemStack> {
+    canonicalize_empty(carried_item);
     if carried_item.is_empty() {
         return None;
     }
@@ -425,6 +541,7 @@ pub(crate) fn apply_outside_pickup_click(
 }
 
 pub(crate) fn can_place_in_player_slot(
+    item_facts: &ItemFactsTable,
     items: &ItemRegistry,
     slot: usize,
     stack: &ItemStack,
@@ -433,18 +550,26 @@ pub(crate) fn can_place_in_player_slot(
         return true;
     }
     match slot {
-        5..=8 => armor_entry_for_item(items, stack.item_id)
-            .is_some_and(|entry| armor_slot_for_kind(entry.slot) == slot),
+        5..=8 => equippable_slot_for_item(item_facts, items, stack.item_id) == Some(slot),
         _ => true,
     }
 }
 
-pub(crate) fn armor_slot_for_kind(kind: mc_data::armor::ArmorSlot) -> usize {
-    match kind {
-        mc_data::armor::ArmorSlot::Head => 5,
-        mc_data::armor::ArmorSlot::Chest => 6,
-        mc_data::armor::ArmorSlot::Legs => 7,
-        mc_data::armor::ArmorSlot::Feet => 8,
+pub(crate) fn equippable_slot_for_item(
+    item_facts: &ItemFactsTable,
+    items: &ItemRegistry,
+    item_id: u32,
+) -> Option<usize> {
+    match item_facts
+        .get(items.name_of(item_id)?)?
+        .equippable_slot
+        .as_deref()?
+    {
+        "head" => Some(5),
+        "chest" => Some(6),
+        "legs" => Some(7),
+        "feet" => Some(8),
+        _ => None,
     }
 }
 

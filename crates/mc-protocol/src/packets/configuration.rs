@@ -25,7 +25,10 @@ use super::{ClientInformation, CustomPayload, Packet, ResourcePackStatus};
 use crate::codec::{Identifier, ReadMc, WriteMc};
 use crate::error::CodecError;
 
-const MAX_KNOWN_PACKS: usize = 1_024;
+const MAX_CLIENTBOUND_KNOWN_PACKS: usize = 1_024;
+const MAX_SERVERBOUND_KNOWN_PACKS: usize = 64;
+const MAX_KNOWN_PACK_STRING: usize = 32_767;
+const MIN_KNOWN_PACK_ENTRY_BYTES: usize = 3;
 const MAX_REGISTRY_ENTRIES: usize = 65_536;
 const MAX_TAG_REGISTRIES: usize = 1_024;
 const MAX_TAGS_PER_REGISTRY: usize = 65_536;
@@ -67,23 +70,59 @@ pub struct KnownPackEntry {
 fn write_known_pack_array<B: BufMut>(
     buf: &mut B,
     entries: &[KnownPackEntry],
+    max: usize,
 ) -> Result<(), CodecError> {
-    write_count(buf, entries.len(), MAX_KNOWN_PACKS)?;
+    if entries.len() > max {
+        return Err(CodecError::StringTooLong {
+            len: entries.len(),
+            max,
+        });
+    }
     for entry in entries {
-        buf.write_string(&entry.namespace, 32_767)?;
-        buf.write_string(&entry.id, 32_767)?;
-        buf.write_string(&entry.version, 32_767)?;
+        validate_known_pack_string(&entry.namespace)?;
+        validate_known_pack_string(&entry.id)?;
+        validate_known_pack_string(&entry.version)?;
+    }
+
+    write_count(buf, entries.len(), max)?;
+    for entry in entries {
+        buf.write_string(&entry.namespace, MAX_KNOWN_PACK_STRING)?;
+        buf.write_string(&entry.id, MAX_KNOWN_PACK_STRING)?;
+        buf.write_string(&entry.version, MAX_KNOWN_PACK_STRING)?;
     }
     Ok(())
 }
 
-fn read_known_pack_array<B: Buf>(buf: &mut B) -> Result<Vec<KnownPackEntry>, CodecError> {
-    let count = read_count(buf, MAX_KNOWN_PACKS)?;
+fn validate_known_pack_string(value: &str) -> Result<(), CodecError> {
+    let len = value.encode_utf16().count();
+    if len > MAX_KNOWN_PACK_STRING {
+        return Err(CodecError::StringTooLong {
+            len,
+            max: MAX_KNOWN_PACK_STRING,
+        });
+    }
+    Ok(())
+}
+
+fn read_known_pack_array<B: Buf>(
+    buf: &mut B,
+    max: usize,
+) -> Result<Vec<KnownPackEntry>, CodecError> {
+    let count = read_count(buf, max)?;
+    let minimum_body_bytes = count * MIN_KNOWN_PACK_ENTRY_BYTES;
+    let available = buf.remaining();
+    if available < minimum_body_bytes {
+        return Err(CodecError::Underflow {
+            needed: minimum_body_bytes - available,
+            available,
+        });
+    }
+
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        let namespace = buf.read_string(32_767)?;
-        let id = buf.read_string(32_767)?;
-        let version = buf.read_string(32_767)?;
+        let namespace = buf.read_string(MAX_KNOWN_PACK_STRING)?;
+        let id = buf.read_string(MAX_KNOWN_PACK_STRING)?;
+        let version = buf.read_string(MAX_KNOWN_PACK_STRING)?;
         entries.push(KnownPackEntry {
             namespace,
             id,
@@ -106,12 +145,12 @@ impl Packet for ClientboundKnownPacks {
     const ID: i32 = 0x0E;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        write_known_pack_array(buf, &self.packs)
+        write_known_pack_array(buf, &self.packs, MAX_CLIENTBOUND_KNOWN_PACKS)
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            packs: read_known_pack_array(buf)?,
+            packs: read_known_pack_array(buf, MAX_CLIENTBOUND_KNOWN_PACKS)?,
         })
     }
 }
@@ -149,12 +188,12 @@ impl Packet for ServerboundKnownPacks {
     const ID: i32 = 0x07;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        write_known_pack_array(buf, &self.packs)
+        write_known_pack_array(buf, &self.packs, MAX_SERVERBOUND_KNOWN_PACKS)
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            packs: read_known_pack_array(buf)?,
+            packs: read_known_pack_array(buf, MAX_SERVERBOUND_KNOWN_PACKS)?,
         })
     }
 }
@@ -193,12 +232,12 @@ impl Packet for ServerboundCustomPayload {
     const ID: i32 = 0x02;
 
     fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
-        self.payload.encode(buf)
+        self.payload.encode_serverbound(buf)
     }
 
     fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
         Ok(Self {
-            payload: CustomPayload::decode(buf)?,
+            payload: CustomPayload::decode_serverbound(buf)?,
         })
     }
 }
@@ -449,6 +488,9 @@ mod tests {
             packs: vec![sample_pack()],
         });
         round_trip(ClientboundKnownPacks { packs: vec![] });
+        round_trip(ClientboundKnownPacks {
+            packs: vec![sample_pack(); 65],
+        });
     }
 
     #[test]
@@ -479,23 +521,130 @@ mod tests {
 
     #[test]
     fn serverbound_known_packs_round_trip() {
+        round_trip(ServerboundKnownPacks { packs: Vec::new() });
         round_trip(ServerboundKnownPacks {
             packs: vec![sample_pack(), sample_pack()],
         });
     }
 
     #[test]
-    fn known_packs_rejects_oversized_count_before_allocation() {
+    fn serverbound_known_packs_accepts_exact_vanilla_maximum() {
+        round_trip(ServerboundKnownPacks {
+            packs: vec![sample_pack(); 64],
+        });
+    }
+
+    #[test]
+    fn serverbound_known_packs_rejects_maximum_plus_one_on_encode_and_decode() {
+        let mut encoded = vec![0xAA, 0x55];
+        let error = ServerboundKnownPacks {
+            packs: vec![sample_pack(); 65],
+        }
+        .encode(&mut encoded)
+        .unwrap_err();
+        assert_eq!(error, CodecError::StringTooLong { len: 65, max: 64 });
+        assert_eq!(encoded, [0xAA, 0x55]);
+
         let mut buf = Vec::new();
-        buf.write_varint(1_025);
+        buf.write_varint(65);
+        let error = ServerboundKnownPacks::decode(&mut buf.as_slice()).unwrap_err();
+        assert_eq!(error, CodecError::StringTooLong { len: 65, max: 64 });
+    }
+
+    #[test]
+    fn serverbound_known_packs_rejects_absurd_count_before_allocation() {
+        let mut buf = Vec::new();
+        buf.write_varint(i32::MAX);
         let error = ServerboundKnownPacks::decode(&mut buf.as_slice()).unwrap_err();
         assert_eq!(
             error,
             CodecError::StringTooLong {
-                len: 1_025,
-                max: 1_024,
+                len: i32::MAX as usize,
+                max: 64,
             }
         );
+    }
+
+    #[test]
+    fn serverbound_known_packs_rejects_truncated_count() {
+        let error = ServerboundKnownPacks::decode(&mut [0x80].as_slice()).unwrap_err();
+        assert_eq!(
+            error,
+            CodecError::Underflow {
+                needed: 1,
+                available: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn serverbound_known_packs_rejects_negative_and_overlong_counts() {
+        let mut negative = Vec::new();
+        negative.write_varint(-1);
+        assert_eq!(
+            ServerboundKnownPacks::decode(&mut negative.as_slice()).unwrap_err(),
+            CodecError::NegativeLength(-1)
+        );
+
+        let mut overlong = [0x80, 0x80, 0x80, 0x80, 0x80, 0x00].as_slice();
+        assert_eq!(
+            ServerboundKnownPacks::decode(&mut overlong).unwrap_err(),
+            CodecError::VarIntTooLong
+        );
+    }
+
+    #[test]
+    fn serverbound_known_packs_checks_minimum_entry_bytes_before_reserving() {
+        let mut encoded = Vec::new();
+        encoded.write_varint(64);
+
+        assert_eq!(
+            ServerboundKnownPacks::decode(&mut encoded.as_slice()).unwrap_err(),
+            CodecError::Underflow {
+                needed: 64 * 3,
+                available: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn serverbound_known_packs_accepts_exact_nested_string_maximum() {
+        let maximum = "x".repeat(32_767);
+        round_trip(ServerboundKnownPacks {
+            packs: vec![KnownPackEntry {
+                namespace: maximum.clone(),
+                id: maximum.clone(),
+                version: maximum,
+            }],
+        });
+    }
+
+    #[test]
+    fn known_pack_encode_preflights_every_nested_string() {
+        let oversized = "x".repeat(32_768);
+
+        for field in 0..3 {
+            let mut invalid = sample_pack();
+            match field {
+                0 => invalid.namespace = oversized.clone(),
+                1 => invalid.id = oversized.clone(),
+                2 => invalid.version = oversized.clone(),
+                _ => unreachable!(),
+            }
+
+            let packet = ServerboundKnownPacks {
+                packs: vec![sample_pack(), invalid],
+            };
+            let mut encoded = vec![0xAA, 0x55];
+            assert_eq!(
+                packet.encode(&mut encoded).unwrap_err(),
+                CodecError::StringTooLong {
+                    len: 32_768,
+                    max: 32_767,
+                }
+            );
+            assert_eq!(encoded, [0xAA, 0x55], "field {field} wrote a packet prefix");
+        }
     }
 
     fn sample_client_information() -> ClientInformation {
@@ -563,6 +712,73 @@ mod tests {
             packet
         );
         assert!(cursor.is_empty());
+    }
+
+    #[test]
+    fn serverbound_brand_payload_preflights_string_before_configuration_output() {
+        round_trip(ServerboundCustomPayload {
+            payload: CustomPayload::Brand("x".repeat(32_767)),
+        });
+
+        let oversized = ServerboundCustomPayload {
+            payload: CustomPayload::Brand("x".repeat(32_768)),
+        };
+        let mut encoded = vec![0xA5, 0x5A];
+        assert_eq!(
+            oversized.encode(&mut encoded).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 32_768,
+                max: 32_767,
+            }
+        );
+        assert_eq!(encoded, [0xA5, 0x5A]);
+    }
+
+    #[test]
+    fn serverbound_custom_payload_enforces_unknown_body_limit_symmetrically() {
+        let channel = Identifier::parse("solaris:test").unwrap();
+        let packet = ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: channel.clone(),
+                payload: vec![0xAB; 32_767],
+            },
+        };
+        round_trip(packet);
+
+        let oversized = ServerboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel,
+                payload: vec![0xAB; 32_768],
+            },
+        };
+        assert_eq!(
+            oversized.encode(&mut Vec::new()).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 32_768,
+                max: 32_767,
+            }
+        );
+
+        let mut buf = Vec::new();
+        buf.write_identifier(oversized.payload.channel()).unwrap();
+        buf.resize(buf.len() + 32_768, 0xAB);
+        assert_eq!(
+            ServerboundCustomPayload::decode(&mut buf.as_slice()).unwrap_err(),
+            CodecError::StringTooLong {
+                len: 32_768,
+                max: 32_767,
+            }
+        );
+    }
+
+    #[test]
+    fn clientbound_custom_payload_does_not_use_serverbound_body_limit() {
+        round_trip(ClientboundCustomPayload {
+            payload: CustomPayload::Unknown {
+                channel: Identifier::parse("solaris:test").unwrap(),
+                payload: vec![0xCD; 32_768],
+            },
+        });
     }
 
     #[test]

@@ -52,13 +52,15 @@ is a gameplay rule, not a worker allocation knob.
 `mc_net::RuntimeControlPlane::observe` accepts a snapshot with:
 
 - `tick_ms`
-- `queued_chunks` and `queue_capacity`
-- `active_workers` and `worker_capacity`
 - `memory_used_mb` and `memory_limit_mb`
-- `first_chunk_ms`
 
-Pressure is classified as one of tick time, chunk queue, worker
-saturation, memory, or first-chunk SLA. The returned
+Chunk streams push source-owned queue saturation and first-chunk SLA changes
+through the bounded runtime-control signal cell. First-chunk latency is measured
+at the successful packet write against `target_first_chunk_ms`; it is not a
+periodic snapshot field. Slow-client sheds are pushed through the same channel.
+
+Pressure is classified as tick time, chunk queue, slow-client shed, memory, or
+first-chunk SLA. The returned
 `AutoscaleDecision` includes action, pressure source, bounded limits, and
 a reason string suitable for logs/status output.
 

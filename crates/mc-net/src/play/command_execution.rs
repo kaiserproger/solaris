@@ -9,6 +9,7 @@ use mc_protocol::packets::play::{
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
+use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::control_plane::{autoscale_action_label, autoscale_pressure_label};
 use crate::error::ConnectionError;
 use crate::server::ServerConfig;
@@ -64,6 +65,7 @@ pub(super) async fn execute_player_command<W>(
     mut interaction: Option<&mut InteractionState>,
     player_pose: &mut PlayerPose,
     runtime_control: Option<&RuntimeControlHandle>,
+    chunk_pipeline_resources: &ChunkPipelineResources,
     chunk_stream: &mut Option<ChunkStreamState>,
     next_teleport_id: &mut i32,
     pending_teleport: &mut Option<PendingTeleport>,
@@ -144,25 +146,13 @@ where
             }
         }
         AdminCommand::Stop => {
-            let report = crate::server::request_stop_after_save(
+            crate::server::request_stop(
                 &config.shutdown,
                 runtime_control,
-                crate::server::save_all_after_simulation_barrier(
-                    "player stop",
-                    config,
-                    sessions,
-                    simulation,
-                ),
-            )
-            .await;
-            if report.is_ok() {
-                send_command_feedback(writer, compression, "Saved all state; stopping server")
-                    .await?;
-            } else {
-                warn!(errors = report.errors.len(), "stop command save-all failed");
-                send_command_feedback(writer, compression, "Stop aborted; save-all failed").await?;
-            }
-            Ok(())
+                chunk_pipeline_resources,
+                sessions,
+            );
+            send_command_feedback(writer, compression, "Stopping server").await
         }
         AdminCommand::Status => {
             send_command_feedback(
@@ -498,7 +488,10 @@ where
                 ItemStack::new(item_id, count.min(i32::from(u8::MAX)))
             };
             let mut inventory = state.inventory.clone();
-            inventory.set_hotbar(hotbar_slot, stack.clone());
+            if inventory.set_hotbar(hotbar_slot, stack.clone()).is_err() {
+                debug!(hotbar_slot, %item, "debug give ignored - invalid hotbar slot");
+                return Ok(());
+            }
             let expected_inventory = state.inventory.clone();
             state.inventory = inventory;
             if !commit_player_inventory_candidate(

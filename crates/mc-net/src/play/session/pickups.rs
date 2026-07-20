@@ -16,7 +16,10 @@ use crate::play::campfire::PendingCampfireOutput;
 use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
 use crate::play::simulation::SimulationAuthority;
-use mc_entity::{EntityId, EntityItemStack, EntityLifecycle, EntitySnapshot, SpawnEntity, Vec3};
+use mc_entity::{
+    EntityId, EntityItemPickupOwnerBlock, EntityItemStack, EntityLifecycle, EntitySnapshot,
+    SpawnEntity, Vec3,
+};
 use mc_protocol::packets::play::ItemStack;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -26,12 +29,6 @@ use tracing::warn;
 pub(in crate::play) const ENTITY_PICKUP_RADIUS: f64 = 2.25;
 pub(in crate::play) const ITEM_PICKUP_DELAY_TICKS: u64 = 4;
 const PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS: u64 = 100;
-
-#[derive(Debug, Clone, Copy)]
-pub(super) struct ItemPickupOwnerBlock {
-    pub(super) owner_session: SessionId,
-    pub(super) expires_tick: u64,
-}
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -123,6 +120,7 @@ impl SessionRegistry {
             return Vec::new();
         }
         let radius_sq = ENTITY_PICKUP_RADIUS * ENTITY_PICKUP_RADIUS;
+        let lifecycle_tick = self.simulation_tick();
         let snapshots = {
             let entities = self.lock_entities("snapshot pickup candidates");
             #[cfg(test)]
@@ -142,13 +140,30 @@ impl SessionRegistry {
                                     && entity.on_ground
                                     && entity.velocity == Vec3::ZERO)
                         })
+                        .filter(|entity| {
+                            if entity.item_stack.is_none() {
+                                return true;
+                            }
+                            let blocked =
+                                entity
+                                    .retained
+                                    .item_pickup_owner_block
+                                    .is_some_and(|block| {
+                                        block.owner_session == session_id
+                                            && lifecycle_tick < block.expires_tick
+                                    });
+                            entity
+                                .retained
+                                .item_pickup_ready_tick
+                                .is_none_or(|ready_tick| lifecycle_tick >= ready_tick)
+                                && !blocked
+                        })
                         .map(server_entity_snapshot_from)
                         .collect::<Vec<_>>();
                     (session_id, candidates)
                 })
                 .collect::<Vec<_>>()
         };
-        let lifecycle_tick = self.simulation_tick();
         let inner = self.lock_inner("publish pickup candidates");
         snapshots
             .into_iter()
@@ -163,20 +178,6 @@ impl SessionRegistry {
                 let candidates = candidates
                     .into_iter()
                     .filter(|entity| distance_sq(entity.position, current_position) <= radius_sq)
-                    .filter(|entity| {
-                        if entity.item_stack.is_none() {
-                            return true;
-                        }
-                        let item_is_blocked_for_session = inner
-                            .item_pickup_owner_blocks
-                            .get(&entity.id)
-                            .is_some_and(|block| {
-                                block.owner_session == session_id
-                                    && lifecycle_tick < block.expires_tick
-                            });
-                        item_pickup_ready_locked(&inner, entity.id, lifecycle_tick)
-                            && !item_is_blocked_for_session
-                    })
                     .collect::<Vec<_>>();
                 (!candidates.is_empty()).then_some(VisibilityDispatch {
                     recipient,
@@ -205,6 +206,52 @@ impl SessionRegistry {
         spawn_item_drop_locked(&mut inner, entity_type_id, position, stack)
     }
 
+    pub(in crate::play) fn try_spawn_item_drop_batch_owned(
+        &self,
+        _authority: &SimulationAuthority,
+        drops: impl IntoIterator<Item = (i32, Vec3, EntityItemStack)>,
+    ) -> Result<Vec<VisibilityDispatch>, mc_entity::RegionOwnerLaneError> {
+        let drops = drops.into_iter().collect::<Vec<_>>();
+        if drops.is_empty() {
+            return Ok(Vec::new());
+        }
+        if drops.iter().any(|(entity_type_id, position, stack)| {
+            *entity_type_id < 0 || !position.is_finite() || stack.is_empty()
+        }) {
+            return Err(mc_entity::RegionOwnerLaneError::InvalidMutation);
+        }
+
+        let mut inner = self.lock_session_entities("spawn item drop batch");
+        let lifecycle_tick = inner.entity_lifecycle_tick;
+        let entities = drops.iter().map(|(entity_type_id, position, stack)| {
+            let mut entity = SpawnEntity::new(*entity_type_id, "minecraft:item", *position);
+            entity.velocity = item_drop_velocity(*position, stack, lifecycle_tick);
+            entity.item_stack = Some(stack.clone());
+            entity.retained.spawn_tick = lifecycle_tick;
+            entity.retained.item_pickup_ready_tick =
+                Some(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
+            entity
+        });
+        let ids = inner.entities.try_spawn_batch(entities)?;
+        assert_eq!(
+            ids.len(),
+            drops.len(),
+            "regional entity owner returned a partial successful spawn batch"
+        );
+
+        let mut dispatches = Vec::new();
+        for (id, (entity_type_id, position, _)) in ids.into_iter().zip(drops) {
+            inner
+                .entity_type_aabbs
+                .entry(entity_type_id)
+                .or_insert_with(|| entity_aabb("minecraft:item"));
+            track_entity_chunk_locked(&mut inner, id, position);
+            initialize_entity_wire_state_locked(&mut inner, id);
+            dispatches.extend(spawn_entity_visibility_locked(&mut inner, id));
+        }
+        Ok(dispatches)
+    }
+
     pub(in crate::play) fn materialize_pending_campfire_outputs_owned(
         &self,
         _authority: &SimulationAuthority,
@@ -227,9 +274,12 @@ impl SessionRegistry {
             entity.uuid = Some(output.uuid);
             entity.velocity = item_drop_velocity(drop_position, &output.stack, lifecycle_tick);
             entity.item_stack = Some(output.stack.clone());
+            entity.retained.spawn_tick = lifecycle_tick;
+            entity.retained.item_pickup_ready_tick =
+                Some(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
             entity
         });
-        inner.entities.spawn_unique_authoritative_batch(candidates);
+        inner.entities.spawn_unique_batch(candidates);
 
         let expected_uuids = outputs
             .iter()
@@ -244,23 +294,11 @@ impl SessionRegistry {
         snapshots.sort_unstable_by_key(|snapshot| snapshot.uuid.as_u128());
         for snapshot in &snapshots {
             inner
-                .entity_spawn_ticks
-                .entry(snapshot.id)
-                .or_insert(lifecycle_tick);
-            inner
-                .item_spawn_ticks
-                .entry(snapshot.id)
-                .or_insert(lifecycle_tick);
-            inner
                 .entity_type_aabbs
                 .entry(snapshot.type_id)
                 .or_insert_with(|| entity_aabb("minecraft:item"));
             track_entity_chunk_locked(&mut inner, snapshot.id, snapshot.position);
             initialize_entity_wire_state_locked(&mut inner, snapshot.id);
-            inner
-                .item_pickup_ready_ticks
-                .entry(snapshot.id)
-                .or_insert(lifecycle_tick.saturating_add(ITEM_PICKUP_DELAY_TICKS));
         }
         snapshots
     }
@@ -333,17 +371,6 @@ impl SessionRegistry {
         dispatches
     }
 
-    #[cfg(test)]
-    pub(in crate::play) fn claim_item_pickup(
-        &self,
-        _authority: &SimulationAuthority,
-        entity_id: EntityId,
-        collector_session: SessionId,
-        max_count: i32,
-    ) -> Option<ClaimedPickup> {
-        self.claim_item_pickup_owned(entity_id, collector_session, max_count)
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(in crate::play) fn pickup_item_into_inventory(
         &self,
@@ -364,7 +391,7 @@ impl SessionRegistry {
             if snapshot.lifecycle != EntityLifecycle::Alive {
                 return None;
             }
-            let stack = snapshot.item_stack?;
+            let stack = snapshot.item_stack.clone()?;
             if stack.count <= 0
                 || stack.item_id != expected_item_id
                 || stack.damage != expected_damage
@@ -396,14 +423,26 @@ impl SessionRegistry {
                 count: stack.count,
                 damage: stack.damage,
                 enchantments: stack.enchantments.clone(),
+                custom_name: None,
             };
-            let (remaining, changed_slots) = inventory.merge_pickup_stack(probe, max_stack);
-            let credited_count = stack.count.saturating_sub(remaining.count);
+            let (remaining, changed_slots) = inventory.merge_pickup_stack(
+                probe,
+                max_stack,
+                player_state.selected_hotbar_slot,
+            )?;
+            let remaining_count = if remaining.is_empty() {
+                0
+            } else {
+                remaining.count
+            };
+            let credited_count = stack.count.checked_sub(remaining_count)?;
             if credited_count <= 0 || changed_slots.is_empty() {
                 return None;
             }
+            #[cfg(test)]
+            self.pause_after_item_pickup_plan_for_test();
             let parts =
-                claim_item_pickup_locked(&mut inner, entity_id, collector_session, credited_count)?;
+                claim_item_pickup_locked(&mut inner, snapshot, collector_session, credited_count)?;
             debug_assert_eq!(parts.picked.count, credited_count);
             player_state.replace_inventory(inventory.clone());
             (parts, inventory, changed_slots)
@@ -418,13 +457,60 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn claim_item_pickup_legacy_for_test(
+    pub(in crate::play) fn claim_item_pickup_for_test(
         &self,
         entity_id: EntityId,
         collector_session: SessionId,
         max_count: i32,
     ) -> Option<ClaimedPickup> {
         self.claim_item_pickup_owned(entity_id, collector_session, max_count)
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn install_item_pickup_plan_probe_for_test(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .item_pickup_plan_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(super::ItemPickupPlanProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_after_item_pickup_plan_for_test(&self) {
+        let probe = self
+            .item_pickup_plan_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("item pickup plan probe receiver");
+            probe.resume.recv().expect("item pickup plan probe release");
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::play) fn replace_item_stack_after_pickup_plan_for_test(
+        &self,
+        entity_id: EntityId,
+        stack: EntityItemStack,
+    ) -> bool {
+        let Some(snapshot) =
+            super::entity_owner::owner_result(self.entities.handle.snapshot(entity_id))
+        else {
+            return false;
+        };
+        super::entity_owner::owner_result(
+            self.entities
+                .handle
+                .set_item_stack_if_current(snapshot, Some(stack)),
+        )
     }
 
     #[cfg(test)]
@@ -439,7 +525,8 @@ impl SessionRegistry {
         }
         let parts = {
             let mut inner = self.lock_session_entities("remove dead entity");
-            claim_item_pickup_locked(&mut inner, entity_id, collector_session, max_count)?
+            let snapshot = inner.entities.snapshot(entity_id)?;
+            claim_item_pickup_locked(&mut inner, snapshot, collector_session, max_count)?
         };
         let (stack, dispatches) = into_claimed_pickup(entity_id, parts);
         Some(ClaimedPickup { stack, dispatches })
@@ -485,8 +572,11 @@ impl SessionRegistry {
                 return None;
             }
             let mut inventory = player_state.inventory.clone();
-            let (remaining, changed_slots) =
-                inventory.merge_pickup_stack(ItemStack::new(arrow_item_id, 1), max_stack);
+            let (remaining, changed_slots) = inventory.merge_pickup_stack(
+                ItemStack::new(arrow_item_id, 1),
+                max_stack,
+                player_state.selected_hotbar_slot,
+            )?;
             if !remaining.is_empty() || changed_slots.is_empty() {
                 return None;
             }
@@ -503,17 +593,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn claim_arrow_pickup(
-        &self,
-        _authority: &SimulationAuthority,
-        entity_id: EntityId,
-        collector_session: SessionId,
-    ) -> Option<Vec<VisibilityDispatch>> {
-        self.claim_arrow_pickup_owned(entity_id, collector_session)
-    }
-
-    #[cfg(test)]
-    pub(in crate::play) fn claim_arrow_pickup_legacy_for_test(
+    pub(in crate::play) fn claim_arrow_pickup_for_test(
         &self,
         entity_id: EntityId,
         collector_session: SessionId,
@@ -596,7 +676,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(in crate::play) fn claim_experience_pickup_legacy_for_test(
+    pub(in crate::play) fn claim_experience_pickup_for_test(
         &self,
         entity_id: EntityId,
         collector_session: SessionId,
@@ -627,13 +707,15 @@ pub(super) fn block_item_pickup_for_owner_locked(
     let expires_tick = inner
         .entity_lifecycle_tick
         .saturating_add(PLAYER_ITEM_OWNER_PICKUP_BLOCK_TICKS);
-    inner.item_pickup_owner_blocks.insert(
-        entity_id,
-        ItemPickupOwnerBlock {
-            owner_session,
-            expires_tick,
-        },
-    );
+    let Some(expected) = inner.entities.snapshot(entity_id) else {
+        return;
+    };
+    let mut next = expected.clone();
+    next.retained.item_pickup_owner_block = Some(EntityItemPickupOwnerBlock {
+        owner_session,
+        expires_tick,
+    });
+    let _ = inner.entities.replace_snapshot_if_current(expected, next);
 }
 
 pub(super) fn spawn_item_drop_locked(
@@ -684,24 +766,23 @@ fn spawn_item_drop_entity_locked_inner(
     let mut entity = SpawnEntity::new(entity_type_id, "minecraft:item", position);
     entity.velocity = item_drop_velocity(position, &stack, inner.entity_lifecycle_tick);
     entity.item_stack = Some(stack);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    entity.retained.item_pickup_ready_tick = Some(
+        inner
+            .entity_lifecycle_tick
+            .saturating_add(ITEM_PICKUP_DELAY_TICKS),
+    );
     let id = if journal_commit {
-        inner.entities.spawn_authoritative(entity)
+        inner.entities.spawn(entity)
     } else {
-        inner.entities.spawn_authoritative_deferred_journal(entity)
+        inner.entities.spawn_deferred_journal(entity)
     };
-    let lifecycle_tick = inner.entity_lifecycle_tick;
-    inner.entity_spawn_ticks.insert(id, lifecycle_tick);
-    inner.item_spawn_ticks.insert(id, lifecycle_tick);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
         .or_insert_with(|| entity_aabb("minecraft:item"));
     track_entity_chunk_locked(inner, id, position);
     initialize_entity_wire_state_locked(inner, id);
-    let ready_tick = inner
-        .entity_lifecycle_tick
-        .saturating_add(ITEM_PICKUP_DELAY_TICKS);
-    inner.item_pickup_ready_ticks.insert(id, ready_tick);
     Some(id)
 }
 
@@ -731,9 +812,8 @@ pub(super) fn spawn_xp_orb_locked(
     let mut entity = SpawnEntity::new(entity_type_id, "minecraft:experience_orb", position);
     entity.experience_value = Some(value);
     entity.velocity = Vec3::new(0.0, 0.08, 0.0);
-    let id = inner.entities.spawn_authoritative(entity);
-    let lifecycle_tick = inner.entity_lifecycle_tick;
-    inner.entity_spawn_ticks.insert(id, lifecycle_tick);
+    entity.retained.spawn_tick = inner.entity_lifecycle_tick;
+    let id = inner.entities.spawn(entity);
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -757,14 +837,14 @@ fn collector_within_pickup_radius_locked(
 
 fn claim_item_pickup_locked(
     inner: &mut SessionEntityGuards<'_>,
-    entity_id: EntityId,
+    snapshot: EntitySnapshot,
     collector_session: SessionId,
     max_count: i32,
 ) -> Option<ClaimedPickupParts> {
     if max_count <= 0 {
         return None;
     }
-    let snapshot = inner.entities.snapshot(entity_id)?;
+    let entity_id = snapshot.id;
     if snapshot.lifecycle != EntityLifecycle::Alive {
         return None;
     }
@@ -806,15 +886,17 @@ fn claim_item_pickup_locked(
             recipients,
         })
     } else {
+        let mut published = server_entity_snapshot_from(snapshot.clone());
+        published.item_stack = Some(stack.clone());
         if !inner
             .entities
             .set_item_stack_if_current(snapshot, Some(stack.clone()))
         {
             return None;
         }
-        let snapshot = inner.published_entity_snapshots.get_mut(&entity_id)?;
-        snapshot.item_stack = Some(stack);
-        let snapshot = snapshot.clone();
+        inner
+            .published_entity_snapshots
+            .insert(entity_id, published.clone());
         let recipients =
             session_recipients(inner, visible_entity_observers_locked(inner, entity_id));
         inner.entity_dispatches.data += recipients.len() as u64;
@@ -822,7 +904,7 @@ fn claim_item_pickup_locked(
             picked,
             update_entity: true,
             collector_entity_id: 0,
-            snapshot,
+            snapshot: published,
             recipients,
         })
     }
@@ -934,14 +1016,15 @@ fn into_claimed_arrow(entity_id: EntityId, parts: ClaimedArrowParts) -> Vec<Visi
 }
 
 pub(super) fn item_pickup_ready_locked(
-    inner: &SessionRegistryInner,
+    inner: &SessionEntityGuards<'_>,
     entity_id: EntityId,
     lifecycle_tick: u64,
 ) -> bool {
     inner
-        .item_pickup_ready_ticks
-        .get(&entity_id)
-        .is_none_or(|ready_tick| lifecycle_tick >= *ready_tick)
+        .entities
+        .snapshot(entity_id)
+        .and_then(|entity| entity.retained.item_pickup_ready_tick)
+        .is_none_or(|ready_tick| lifecycle_tick >= ready_tick)
 }
 
 fn item_pickup_owner_blocked_locked(
@@ -949,11 +1032,16 @@ fn item_pickup_owner_blocked_locked(
     entity_id: EntityId,
     collector_session: SessionId,
 ) -> bool {
-    let Some(block) = inner.item_pickup_owner_blocks.get(&entity_id).copied() else {
+    let Some(expected) = inner.entities.snapshot(entity_id) else {
+        return false;
+    };
+    let Some(block) = expected.retained.item_pickup_owner_block else {
         return false;
     };
     if inner.entity_lifecycle_tick >= block.expires_tick {
-        inner.item_pickup_owner_blocks.remove(&entity_id);
+        let mut next = expected.clone();
+        next.retained.item_pickup_owner_block = None;
+        let _ = inner.entities.replace_snapshot_if_current(expected, next);
         return false;
     }
     block.owner_session == collector_session

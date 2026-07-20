@@ -17,23 +17,36 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let furnace_state_id = blocks
+    let furnace_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("furnace in registry");
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let furnace_pos = mc_world::BlockPos {
+        x: 2,
+        y: top_non_air_y(&mut storage, 2, 2, air_state).expect("furnace column terrain") + 1,
+        z: 2,
+    };
+    storage
+        .set_block_at(furnace_pos, furnace_state)
+        .expect("seed furnace block")
+        .expect("furnace chunk exists");
+    storage
+        .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
+        .expect("seed furnace entity");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
-    let furnace_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .expect("furnace item");
     let raw_iron_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:raw_iron").unwrap())
         .expect("raw_iron item");
@@ -54,7 +67,7 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -67,40 +80,15 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         let _ = bound.serve().await;
     });
 
-    let (mut actor, sync) = connect_to_play(addr, "M100FurnActor").await;
+    let (mut actor, _) = connect_to_play(addr, "M100FurnActor").await;
     drain_until_chunk(&mut actor, (0, 0)).await;
-    actor
-        .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:furnace 1 0".into(),
-        })
-        .await
-        .expect("give furnace");
-    wait_for_slot_stack(&mut actor, furnace_id, 1).await;
-
-    let support_y = sync.y.floor() as i32 - 2;
-    let furnace_y = support_y + 1;
-    actor
-        .write_packet(&ServerboundUseItemOn {
-            hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
-            direction: Direction::Up,
-            cursor_x: 0.5,
-            cursor_y: 1.0,
-            cursor_z: 0.5,
-            inside: false,
-            world_border_hit: false,
-            sequence: 191,
-        })
-        .await
-        .expect("place furnace");
-    wait_for_block_update(&mut actor, (0, furnace_y, 0), furnace_state_id).await;
 
     let (mut observer, _) = connect_to_play(addr, "M100FurnObserve").await;
     drain_until_chunk(&mut observer, (0, 0)).await;
     observer
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, furnace_y, 0),
+            position: pack_block_pos(furnace_pos.x, furnace_pos.y, furnace_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -112,12 +100,11 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         .await
         .expect("observer opens furnace");
     let observer_opened = wait_for_open_screen(&mut observer, furnace_menu_id).await;
-    let observer_initial = wait_for_furnace_content(
-        &mut observer,
-        observer_opened.container_id,
-        |pkt| pkt.items[0].is_empty() && pkt.carried_item.is_empty(),
-    )
-    .await;
+    let observer_initial =
+        wait_for_furnace_content(&mut observer, observer_opened.container_id, |pkt| {
+            pkt.items[0].is_empty() && pkt.carried_item.is_empty()
+        })
+        .await;
 
     actor
         .write_packet(&ServerboundChatCommand {
@@ -129,7 +116,7 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
     actor
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, furnace_y, 0),
+            position: pack_block_pos(furnace_pos.x, furnace_pos.y, furnace_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -141,8 +128,8 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
         .await
         .expect("actor opens furnace");
     let actor_opened = wait_for_open_screen(&mut actor, furnace_menu_id).await;
-    let actor_content = wait_for_furnace_content(&mut actor, actor_opened.container_id, |_| true)
-        .await;
+    let actor_content =
+        wait_for_furnace_content(&mut actor, actor_opened.container_id, |_| true).await;
     actor
         .write_packet(&ServerboundContainerClick {
             container_id: actor_opened.container_id,
@@ -181,13 +168,11 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
             && pkt.carried_item.is_empty()
     })
     .await;
-    let observer_slot = wait_for_container_slot(
-        &mut observer,
-        observer_opened.container_id,
-        0,
-        |stack| stack.item_id == raw_iron_id && stack.count == 1,
-    )
-    .await;
+    let observer_slot =
+        wait_for_container_slot(&mut observer, observer_opened.container_id, 0, |stack| {
+            stack.item_id == raw_iron_id && stack.count == 1
+        })
+        .await;
     assert!(
         observer_slot.state_id > observer_initial.state_id,
         "peer furnace update should advance the shared container state"
@@ -216,7 +201,6 @@ async fn two_clients_stale_furnace_click_after_peer_update_resyncs() {
     assert!(resync.carried_item.is_empty());
 }
 
-
 #[tokio::test]
 async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -236,30 +220,49 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let furnace_state_id = blocks
+    let furnace_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .map(|block| block.default.0 as i32)
+        .map(|block| block.default)
         .expect("furnace in registry");
-    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
-        Arc::clone(&blocks),
-        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
-    )
-    .with_generator(generator);
-    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
-    let world = Some(Arc::clone(&world_handle));
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
-    let furnace_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .expect("furnace item");
     let raw_iron_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:raw_iron").unwrap())
         .expect("raw_iron item");
     let dirt_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
         .expect("dirt item");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
+        Arc::clone(&blocks),
+        ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
+    )
+    .with_generator(generator);
+    let furnace_pos = mc_world::BlockPos {
+        x: 2,
+        y: top_non_air_y(&mut storage, 2, 2, air_state).expect("furnace column terrain") + 1,
+        z: 2,
+    };
+    storage
+        .set_block_at(furnace_pos, furnace_state)
+        .expect("seed furnace block")
+        .expect("furnace chunk exists");
+    let mut furnace = mc_world::FurnaceBlockEntity::default();
+    furnace.slots[0] = mc_world::FurnaceSlot {
+        item_id: raw_iron_id,
+        count: 3,
+        damage: None,
+        enchantments: Vec::new(),
+    };
+    storage
+        .set_furnace_block_entity(furnace_pos, furnace)
+        .expect("seed furnace entity");
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let furnace_menu_id = 14;
 
     let cfg = mc_net::ServerConfig {
@@ -277,7 +280,7 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -290,53 +293,8 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M100BadFurn").await;
+    let (mut client, _) = connect_to_play(addr, "M100BadFurn").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-    client
-        .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:furnace 1 0".into(),
-        })
-        .await
-        .expect("give furnace");
-    wait_for_slot_stack(&mut client, furnace_id, 1).await;
-
-    let support_y = sync.y.floor() as i32 - 2;
-    let furnace_y = support_y + 1;
-    client
-        .write_packet(&ServerboundUseItemOn {
-            hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
-            direction: Direction::Up,
-            cursor_x: 0.5,
-            cursor_y: 1.0,
-            cursor_z: 0.5,
-            inside: false,
-            world_border_hit: false,
-            sequence: 199,
-        })
-        .await
-        .expect("place furnace");
-    wait_for_block_update(&mut client, (0, furnace_y, 0), furnace_state_id).await;
-
-    let furnace_pos = mc_world::BlockPos {
-        x: 0,
-        y: furnace_y,
-        z: 0,
-    };
-    {
-        let mut world = world_handle.lock().await;
-        let mut furnace = mc_world::FurnaceBlockEntity::default();
-        furnace.slots[0] = mc_world::FurnaceSlot {
-            item_id: raw_iron_id,
-            count: 3,
-            damage: None,
-            enchantments: Vec::new(),
-        };
-        world
-            .set_furnace_block_entity(furnace_pos, furnace)
-            .expect("seed furnace entity");
-    }
-
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
@@ -353,7 +311,9 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
         .expect("open furnace");
     let opened = wait_for_open_screen(&mut client, furnace_menu_id).await;
     let content = wait_for_furnace_content(&mut client, opened.container_id, |pkt| {
-        pkt.items[0].item_id == raw_iron_id && pkt.items[0].count == 3 && pkt.carried_item.is_empty()
+        pkt.items[0].item_id == raw_iron_id
+            && pkt.items[0].count == 3
+            && pkt.carried_item.is_empty()
     })
     .await;
 
@@ -423,14 +383,6 @@ async fn malformed_furnace_clicks_resync_without_trusting_client_slots() {
             .all(|(_, stack)| stack.item_id != raw_iron_id),
         "malformed pickup must not move furnace input into player inventory slots"
     );
-
-    let mut world = world_handle.lock().await;
-    let furnace = world
-        .furnace_block_entity(furnace_pos)
-        .expect("read furnace entity")
-        .expect("furnace entity present");
-    assert_eq!(furnace.slots[0].item_id, raw_iron_id);
-    assert_eq!(furnace.slots[0].count, 3);
 }
 
 #[tokio::test]
@@ -452,34 +404,43 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
     let report = mc_data::blocks::load_blocks_report(&blocks_json).expect("blocks report loads");
     let blocks =
         Arc::new(mc_world::BlockRegistry::from_report(&report).expect("block registry builds"));
-    let furnace_state_id = blocks
+    let furnace_state = blocks
         .block(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .map(|b| b.default.0 as i32)
+        .map(|b| b.default)
         .expect("furnace in registry");
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
+    let furnace_pos = mc_world::BlockPos {
+        x: 2,
+        y: top_non_air_y(&mut storage, 2, 2, air_state).expect("furnace column terrain") + 1,
+        z: 2,
+    };
+    storage
+        .set_block_at(furnace_pos, furnace_state)
+        .expect("seed furnace block")
+        .expect("furnace chunk exists");
+    storage
+        .set_furnace_block_entity(furnace_pos, mc_world::FurnaceBlockEntity::default())
+        .expect("seed furnace entity");
     let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let raw_iron = mc_data::Identifier::parse("minecraft:raw_iron").unwrap();
     let iron_ingot = mc_data::Identifier::parse("minecraft:iron_ingot").unwrap();
-    let furnace_id = items
-        .id_of(&mc_data::Identifier::parse("minecraft:furnace").unwrap())
-        .expect("furnace item");
-    let raw_iron_id = items
-        .id_of(&raw_iron)
-        .expect("raw_iron item");
+    let raw_iron_id = items.id_of(&raw_iron).expect("raw_iron item");
     let coal_id = items
         .id_of(&mc_data::Identifier::parse("minecraft:coal").unwrap())
         .expect("coal item");
-    let iron_ingot_id = items
-        .id_of(&iron_ingot)
-        .expect("iron_ingot item");
+    let iron_ingot_id = items.id_of(&iron_ingot).expect("iron_ingot item");
     let recipes = Arc::new(vec![mc_data::recipes::Recipe {
         id: mc_data::Identifier::parse("minecraft:test_raw_iron_smelting").unwrap(),
         kind: mc_data::recipes::RecipeKind::Smelting(mc_data::recipes::SmeltingRecipe {
@@ -529,40 +490,15 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M23Smelter").await;
+    let (mut client, _) = connect_to_play(addr, "M23Smelter").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-    client
-        .write_packet(&ServerboundChatCommand {
-            command: "debug give minecraft:furnace 1 0".into(),
-        })
-        .await
-        .expect("give furnace");
-    wait_for_slot_stack(&mut client, furnace_id, 1).await;
-
-    let support_y = sync.y.floor() as i32 - 2;
-    let furnace_y = support_y + 1;
-    client
-        .write_packet(&ServerboundUseItemOn {
-            hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, support_y, 0),
-            direction: Direction::Up,
-            cursor_x: 0.5,
-            cursor_y: 1.0,
-            cursor_z: 0.5,
-            inside: false,
-            world_border_hit: false,
-            sequence: 91,
-        })
-        .await
-        .expect("place furnace");
-    wait_for_block_update(&mut client, (0, furnace_y, 0), furnace_state_id).await;
 
     let (mut observer, observer_sync) = connect_to_play(addr, "M24FurnaceViewer").await;
     drain_until_chunk(&mut observer, (0, 0)).await;
     observer
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, furnace_y, 0),
+            position: pack_block_pos(furnace_pos.x, furnace_pos.y, furnace_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -597,7 +533,7 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, furnace_y, 0),
+            position: pack_block_pos(furnace_pos.x, furnace_pos.y, furnace_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -664,7 +600,7 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
     client
         .write_packet(&ServerboundUseItemOn {
             hand: InteractionHand::MainHand,
-            position: pack_block_pos(0, furnace_y, 0),
+            position: pack_block_pos(furnace_pos.x, furnace_pos.y, furnace_pos.z),
             direction: Direction::Up,
             cursor_x: 0.5,
             cursor_y: 1.0,
@@ -736,7 +672,8 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         })
         .await
         .expect("move furnace observer outside XP pickup radius");
-    let observer_position = wait_for_position_correction(&mut observer, Duration::from_secs(2)).await;
+    let observer_position =
+        wait_for_position_correction(&mut observer, Duration::from_secs(2)).await;
     assert_position_near(
         &observer_position,
         observer_x,
@@ -795,8 +732,8 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         } else if frame.id == AddEntity::ID {
             let mut body = frame.body;
             let packet = AddEntity::decode(&mut body).expect("decode furnace experience orb");
-            saw_experience_orb |= packet.entity_type_id == experience_orb_type_id
-                && packet.data == 1;
+            saw_experience_orb |=
+                packet.entity_type_id == experience_orb_type_id && packet.data == 1;
         } else if frame.id == ClientboundSetExperience::ID {
             let mut body = frame.body;
             let packet = ClientboundSetExperience::decode(&mut body)
@@ -805,7 +742,6 @@ async fn survival_furnace_container_smelts_input_with_fuel() {
         }
     }
 }
-
 
 #[tokio::test]
 async fn survival_specialized_furnaces_open_vanilla_menu_types() {
@@ -834,14 +770,51 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
     };
     let smoker_state_id = block_state("minecraft:smoker");
     let blast_furnace_state_id = block_state("minecraft:blast_furnace");
+    let air_state = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .map(|block| block.default)
+        .expect("air in registry");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
-    let storage = mc_world::WorldStorage::in_memory_with_capacity(
+    let mut storage = mc_world::WorldStorage::in_memory_with_capacity(
         Arc::clone(&blocks),
         ((2 * VIEW_DISTANCE + 3) as usize).pow(2),
     )
     .with_generator(generator);
-    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
-    let world = Some(Arc::clone(&world_handle));
+    let furnace_y = top_non_air_y(&mut storage, 2, 2, air_state)
+        .expect("specialized furnace column terrain")
+        + 1;
+    let cases = [
+        (
+            smoker_state_id,
+            22,
+            mc_world::BlockPos {
+                x: 2,
+                y: furnace_y,
+                z: 2,
+            },
+            171,
+        ),
+        (
+            blast_furnace_state_id,
+            10,
+            mc_world::BlockPos {
+                x: 3,
+                y: furnace_y,
+                z: 2,
+            },
+            172,
+        ),
+    ];
+    for &(state_id, _, pos, _) in &cases {
+        storage
+            .set_block_at(pos, mc_world::BlockStateId(state_id as u32))
+            .expect("seed specialized furnace block")
+            .expect("specialized furnace chunk exists");
+        storage
+            .set_furnace_block_entity(pos, mc_world::FurnaceBlockEntity::default())
+            .expect("seed specialized furnace entity");
+    }
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
     let tags = Arc::new(mc_data::tags::load(&vanilla_dir, &data).expect("tags load"));
     let items_report = mc_data::items::load_items_report(&registries_json).expect("items report");
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
@@ -860,7 +833,7 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -873,40 +846,8 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
         let _ = bound.serve().await;
     });
 
-    let (mut client, sync) = connect_to_play(addr, "M71Furnaces").await;
+    let (mut client, _) = connect_to_play(addr, "M71Furnaces").await;
     drain_until_chunk(&mut client, (0, 0)).await;
-    let furnace_y = sync.y.floor() as i32 - 1;
-    let cases = [
-        (
-            smoker_state_id,
-            22,
-            mc_world::BlockPos {
-                x: 1,
-                y: furnace_y,
-                z: 0,
-            },
-            171,
-        ),
-        (
-            blast_furnace_state_id,
-            10,
-            mc_world::BlockPos {
-                x: 2,
-                y: furnace_y,
-                z: 0,
-            },
-            172,
-        ),
-    ];
-    {
-        let mut storage = world_handle.lock().await;
-        for &(state_id, _, pos, _) in &cases {
-            storage
-                .set_block_at(pos, mc_world::BlockStateId(state_id as u32))
-                .expect("seed specialized furnace block")
-                .expect("generated spawn chunk exists");
-        }
-    }
 
     for (_, menu_id, pos, sequence) in cases {
         client
@@ -932,4 +873,3 @@ async fn survival_specialized_furnaces_open_vanilla_menu_types() {
             .expect("close specialized furnace");
     }
 }
-

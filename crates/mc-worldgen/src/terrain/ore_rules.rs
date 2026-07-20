@@ -1,7 +1,7 @@
 use mc_data::Identifier;
 use mc_data::biomes::BiomeWorldgenData;
 use mc_data::worldgen_ores::{HeightAnchor, OreFeature, OrePlacementCount, OreTarget};
-use mc_world::chunk::{MAX_Y, MIN_Y};
+use mc_world::chunk::ChunkGeometry;
 use mc_world::{BlockRegistry, BlockStateId};
 
 use super::{biome_rules::BiomeRules, resolve_block_or};
@@ -173,6 +173,7 @@ impl OreRules {
         biomes: &BiomeRules,
         features: &[OreFeature],
         biome_data: Option<&BiomeWorldgenData>,
+        geometry: ChunkGeometry,
     ) -> Result<Option<Self>, OreRulesError> {
         if features.len() > MAX_ORE_RULES {
             return Err(OreRulesError::TooManyRules {
@@ -188,12 +189,9 @@ impl OreRules {
             let Some(height) = &feature.placement.height else {
                 continue;
             };
-            let min = height_anchor_y(height.min).clamp(MIN_Y, MAX_Y - 1);
-            let max = height_anchor_y(height.max).clamp(MIN_Y, MAX_Y - 1);
-            if min > max {
+            let Some(y) = resolve_height_range(height.min, height.max, geometry) else {
                 continue;
-            }
-            let y = YRange::new(min, max);
+            };
             let spacing = ore_spacing(&feature.placement, y);
             let feature_biomes = biome_data
                 .map(|data| data.biomes_for_feature(&feature.placed_feature))
@@ -354,20 +352,38 @@ fn ore_targets(
     Some((normal?, deepslate?))
 }
 
-fn height_anchor_y(anchor: HeightAnchor) -> i32 {
+fn resolve_height_range(
+    min: HeightAnchor,
+    max: HeightAnchor,
+    geometry: ChunkGeometry,
+) -> Option<YRange> {
+    let min = height_anchor_y(min, geometry).max(i64::from(geometry.min_y()));
+    let max = height_anchor_y(max, geometry).min(i64::from(geometry.max_y()) - 1);
+    if min > max {
+        return None;
+    }
+    Some(YRange::new(
+        i32::try_from(min).ok()?,
+        i32::try_from(max).ok()?,
+    ))
+}
+
+fn height_anchor_y(anchor: HeightAnchor, geometry: ChunkGeometry) -> i64 {
     match anchor {
-        HeightAnchor::Absolute(y) => y,
-        HeightAnchor::AboveBottom(offset) => MIN_Y + offset,
-        HeightAnchor::BelowTop(offset) => MAX_Y - offset,
+        HeightAnchor::Absolute(y) => i64::from(y),
+        HeightAnchor::AboveBottom(offset) => i64::from(geometry.min_y()) + i64::from(offset),
+        HeightAnchor::BelowTop(offset) => i64::from(geometry.max_y()) - 1 - i64::from(offset),
     }
 }
 
 fn ore_spacing(placement: &mc_data::worldgen_ores::OrePlacement, y: YRange) -> OreSpacing {
     let count = match placement.count {
-        Some(OrePlacementCount::Constant(count)) => count.max(1),
-        Some(OrePlacementCount::Uniform { min, max }) => ((min + max) / 2).max(1),
+        Some(OrePlacementCount::Constant(count)) => u64::from(count.max(1)),
+        Some(OrePlacementCount::Uniform { min, max }) => {
+            ((u64::from(min) + u64::from(max)) / 2).max(1)
+        }
         None => 1,
-    } as u64;
+    };
     let density = count.saturating_mul(7).max(1);
     let base = 512u64.saturating_div(density).max(5);
     if placement
@@ -375,7 +391,9 @@ fn ore_spacing(placement: &mc_data::worldgen_ores::OrePlacement, y: YRange) -> O
         .as_ref()
         .is_some_and(|height| height.kind.as_str() == "minecraft:trapezoid")
     {
-        OreSpacing::peaked((y.min + y.max) / 2, base, base * 3)
+        let midpoint = (i64::from(y.min) + i64::from(y.max)) / 2;
+        let peak_y = i32::try_from(midpoint).unwrap_or(y.min);
+        OreSpacing::peaked(peak_y, base, base * 3)
     } else {
         OreSpacing::Fixed(base)
     }
@@ -389,9 +407,11 @@ fn peaked_spacing(
     min_spacing: u64,
     range: u64,
 ) -> u64 {
-    let max_distance = (peak_y - min_y).abs().max((max_y - peak_y).abs()).max(1) as f64;
-    let distance = (y - peak_y).abs() as f64 / max_distance;
-    min_spacing + (distance * range as f64).round() as u64
+    let distance_from_min = (i64::from(peak_y) - i64::from(min_y)).unsigned_abs();
+    let distance_from_max = (i64::from(max_y) - i64::from(peak_y)).unsigned_abs();
+    let max_distance = distance_from_min.max(distance_from_max).max(1) as f64;
+    let distance = (i64::from(y) - i64::from(peak_y)).unsigned_abs() as f64 / max_distance;
+    min_spacing.saturating_add((distance * range as f64).round() as u64)
 }
 
 #[cfg(test)]

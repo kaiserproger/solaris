@@ -22,9 +22,10 @@ async fn survival_random_tick_grows_visible_vertical_plant_columns() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let sand = crop_test_state(&blocks, "minecraft:sand", &[]);
     let water = crop_test_state(&blocks, "minecraft:water", &[]);

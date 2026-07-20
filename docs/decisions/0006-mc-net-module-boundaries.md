@@ -158,6 +158,22 @@ Other accepted concrete boundaries in this staged migration are:
   cancellation entry, so an early return cannot leave a permanent sequence
   hole. Overflow fails closed through the existing slow-client disconnect
   path.
+  Wire position state follows the 26.1.2 `ServerEntity` tracking contract.
+  Position is dirty when unquantized displacement squared is at least
+  `7.62939453125E-6` or the global tracking-update count is divisible by 60;
+  only the resulting relative delta uses quantized absolute endpoints. Each
+  scheduled tracker update advances that count and the teleport delay once,
+  including when a stale physics proposal is rejected; that update plans from
+  the current authoritative motion instead of the rejected proposal.
+  Signed-short overflow, an `on_ground` transition, or the incremented
+  teleport delay exceeding 400 selects absolute `EntityPositionSync`, which
+  is the only event that resets the delay. Opportunistic body-push publication
+  updates the global baseline without advancing either counter. Wire selection
+  distinguishes position, body rotation, combined position/body rotation,
+  absolute sync, and independently packed head yaw. Arrow relative/body
+  updates use the vanilla combined position/body packet shape. Selected motion
+  precedes movement, and head rotation follows it. The state lives with the visibility
+  mirror and adds no timer, polling loop, lock, or operator tuning.
 - `play::session::projectiles` owns arrow spawn/expiry, hit resolution,
   knockback, projectile candidate scans, and segment/AABB geometry. It receives
   the existing `SessionEntityGuards` from `session.rs`; it does not acquire a
@@ -452,7 +468,12 @@ transaction boundary.
   explicit-import `authority` child owns feed, shear, breeding, and grazing
   commits. It adds no lock and keeps mutation in the session/entity authority.
 - `play::session::entity_simulation::persistence_projection` owns pure entity
-  save/restore timing projection.
+  save/restore timing projection. Entity NBT keeps vanilla `Motion` in
+  blocks/tick; the persistence boundary converts to and from Solaris's internal
+  blocks/second velocity exactly once. `solaris/entities.dat` must carry
+  `SolarisEntityFormatVersion = 2`. Missing, duplicate, malformed, or unknown
+  versions fail closed instead of guessing units or preserving an unreleased
+  Solaris persistence schema.
 - `connection_driver` owns the concrete Handshake -> Status or
   Login/Transfer -> Configuration -> Play socket sequence. `server.rs` retains
   listener supervision and service construction. This is orchestration only;

@@ -65,7 +65,7 @@ async fn place_recipe_crafts_torch_from_authoritative_inventory() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -233,7 +233,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
         items,
         item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
         block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
-        entity_types: std::sync::Arc::new(mc_data::entity_types::EntityTypeRegistry::default()),
+        entity_types: std::sync::Arc::new(mc_data::entity_types::solaris_required_entity_types()),
         biome_spawns: std::sync::Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
         chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
         random_tick: mc_net::RandomTickPolicy::default(),
@@ -356,9 +356,7 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
             slot_num: -999,
             button_num: 6,
             container_input: ContainerInput::QuickCraft,
-            changed_slots: (1..=4)
-                .map(|slot| (slot, hashed_planks(1)))
-                .collect(),
+            changed_slots: (1..=4).map(|slot| (slot, hashed_planks(1))).collect(),
             carried_item: HashedStack::Empty,
         })
         .await
@@ -373,7 +371,6 @@ async fn place_recipe_crafts_tag_based_planks_sticks_and_table() {
     })
     .await;
 }
-
 
 #[tokio::test]
 async fn inventory_recipe_rejects_three_by_three_tool_without_crafting_table() {
@@ -421,4 +418,3 @@ async fn inventory_recipe_rejects_three_by_three_tool_without_crafting_table() {
         .expect("place wooden_pickaxe inventory recipe");
     assert_no_slot_stack_for(&mut client, wooden_pickaxe_id).await;
 }
-

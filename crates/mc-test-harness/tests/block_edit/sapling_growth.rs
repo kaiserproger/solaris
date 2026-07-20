@@ -29,9 +29,10 @@ async fn survival_bonemeal_grows_oak_sapling_into_tree() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let oak_sapling = sapling_test_state(&blocks, "minecraft:oak_sapling", &[]);
     let grown_oak_sapling = sapling_test_state(&blocks, "minecraft:oak_sapling", &[("stage", "1")]);
@@ -186,9 +187,10 @@ async fn survival_bonemeal_stage_one_oak_replaces_existing_canopy_leaf() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let oak_sapling = sapling_test_state(&blocks, "minecraft:oak_sapling", &[]);
     let stage_one_oak_sapling =
@@ -351,9 +353,10 @@ async fn survival_bonemeal_does_not_consume_on_single_dark_oak() {
     let items = Arc::new(mc_data::items::ItemRegistry::from_report(&items_report));
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let dark_oak = sapling_test_state(&blocks, "minecraft:dark_oak_sapling", &[("stage", "1")]);
     let dirt = sapling_test_state(&blocks, "minecraft:dirt", &[]);
@@ -809,9 +812,10 @@ async fn start_mega_sapling_wire_fixture(
     let bone_meal_item_id = items.id_of(&bone_meal).expect("bone meal item");
     let entity_report =
         mc_data::entity_types::load_entity_types_report(&registries_json).expect("entity report");
-    let entity_types = Arc::new(mc_data::entity_types::EntityTypeRegistry::from_report(
-        &entity_report,
-    ));
+    let entity_types = Arc::new(
+        mc_data::entity_types::EntityTypeRegistry::try_from_report_26_1_2(&entity_report)
+            .expect("exact 26.1.2 entity registry"),
+    );
 
     let cfg = mc_net::ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),

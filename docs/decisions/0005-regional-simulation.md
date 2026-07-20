@@ -125,12 +125,10 @@ with global entity-id, UUID, and location indexes. Epoch leases fence access,
 and exact per-lane acknowledgements fence phase completion. Vehicle/passenger
 references remain co-located. `FollowTarget` may cross a region boundary and
 uses an immutable target snapshot captured for that goal batch.
-`SessionRegistry` now owns a `RegionalEntityAuthority` backed by those physical
-stores. The compatibility adapter runs short fenced phases on lane 0, preserves
-the production entity-id sequence, restores persisted batches atomically, and
-moves ordinary entities between stores at region boundaries. This removes the
-single global `EntityStore` as production authority, but the adapter is still
-behind one mutex and lanes do not execute concurrently. No speedup is claimed.
+`SessionRegistry` owns the persistent regional entity owner runtime directly.
+Physical `EntityStore` values live only on their assigned owner lanes; the
+coordinator retains ownership indexes, transfer metadata, and phase sequencing,
+not a second mutable entity store.
 The first R3 primitive uses stable `TransferId` prepare/decision/apply records
 inside the coordinator-owned store. Source authority remains visible until
 commit, commit preserves id and UUID, reject leaves the source unchanged, and
@@ -203,23 +201,16 @@ publish global indexes only after every physical store accepts its group.
 EntityStore batch restore inserts all snapshots before rebuilding vehicle
 links, so forward passenger references survive and invalid passenger graphs
 fail instead of being silently sanitized. References to an entity already in
-transfer are also rejected before insertion. Shadow comparisons can now run
-inside independent lane-owned `EntityStore` instances and return mergeable
-region batches. The coordinator reduces those batches in `RegionKey` order,
-records one logical comparison, preserves the first divergence across calls,
-and never reopens the physical stores. Current comparison coverage travels in
-the result instead of being inferred from cumulative saturating counters.
-Production wiring is complete only for the single-lane compatibility stage.
+transfer are also rejected before insertion.
 Vehicle/passenger groups now migrate atomically, while followers stay in their
 own region and consume fenced remote target snapshots. Regional goal compute
 and dense local physics mutation now use autoscaled parallel paths, but real
 region-owned command workers, removal of the global authority mutex, durable
 recovery, cross-region interaction fanout, and measured throughput evidence
-remain before a full multicore claim. Production deliberately does not keep a
-second legacy shadow authority.
+remain before a full multicore claim.
 
-The first persistent owner-lane runtime now exists below the production
-adapter. Bounded push queues wake long-lived workers that physically own
+The persistent owner-lane runtime uses bounded push queues to wake long-lived
+workers that physically own
 multiple `EntityStore` values. A coordinator consumes `RegionalEntityStore`,
 keeps only ownership/global indexes/transfer metadata, and moves the physical
 stores to deterministic lanes without duplicating authority. Reads use exact
@@ -252,8 +243,8 @@ snapshot at the target owner in one coordinator phase; location changes publish
 only after finalization. A stale source aborts an already-prepared target with
 no duplicate or movement. Vehicle/passenger and referenced-goal crossings are
 rejected until their group protocol moves to owner lanes. Every touched store
-also checkpoints pending, published, and legacy-expected semantic event queue
-lengths. Rollback restores state first and then truncates speculative events,
+also checkpoints pending and published semantic event queue lengths. Rollback
+restores state first and then truncates speculative events,
 so insert/remove/damage rollback cannot leak plugin or wire-visible output.
 Damage uses complete-snapshot CAS and returns the authoritative post-finalize
 health/lifecycle result; stale damage is a zero-mutation rejection. This runtime
@@ -280,25 +271,22 @@ does not transfer coordinator ownership until thread creation succeeds, and
 joined shutdown returns the recovered regional store. This removes the need
 for a caller-side store mutex once the complete production command surface is
 routed through the handle.
-The handle also provides ID-filtered reads, a scalar entity/lane/shadow status
-projection, and complete-snapshot conditional remove. Conditional remove
+The handle also provides ID-filtered reads, lane status, and complete-snapshot
+conditional remove. Conditional remove
 updates coordinator ID, UUID, and location indexes only after owner finalize;
 stale input leaves both the physical store and indexes unchanged. Owner runtime
 construction preserves the configured entity-ID allocation watermark needed by
 the production server protocol range. Selected reads reject disagreement with
-coordinator location or UUID indexes. Shadow comparison executes on every
-physical lane, merges region outcomes deterministically, and updates aggregate
-statistics once per logical comparison rather than once per lane.
-`SessionRegistry` now owns this runtime directly. The production
-`Mutex<RegionalEntityAuthority>` has been removed; direct and combined session
-guards carry a cloned owner handle rather than a borrowed store. Complete
+coordinator location or UUID indexes.
+`SessionRegistry` owns this runtime directly without a
+`Mutex<RegionalEntityAuthority>`; direct and combined session guards carry a
+cloned owner handle rather than a borrowed store. Complete
 snapshot CAS protects partial pickup and removal. Split owner/session
 publication rechecks exact snapshots before updating the published projection,
 so delayed player push, breeding, grazing, or hostile-arrow output cannot
 overwrite a newer owner mutation. ID-filtered reads are grouped into one
 request per lane, breeding uses owner-maintained indexes, UUID checks use the
-coordinator index, and physics reuses a batch-prefetched snapshot set. The
-legacy entity-lock metric was removed instead of reporting permanent zeroes.
+coordinator index, and physics reuses a batch-prefetched snapshot set.
 Owner lanes now support live scale-up and scale-down. At an idle owner-command
 boundary, the source lane detaches the physical store, the coordinator advances
 the region lease epoch, and the target lane installs that same store. A failed
@@ -307,6 +295,73 @@ lanes are joined only after every region has moved. The runtime control-plane
 pushes its changed CPU admission limit to `SessionRegistry`, so chunk admission
 and owner-lane count change from the same autoscale decision; production startup
 uses that same automatic CPU limit instead of a separate worker percentage.
+Push pressure uses one fixed-size coalescing state cell, not an event backlog.
+Each chunk stream owns separate queue-saturation and first-chunk-SLA tokens.
+Queue pressure changes at the profile's `queue_pressure_percent` threshold.
+First-chunk pressure is measured from stream creation or replan to the first
+successful chunk packet write and compared with `target_first_chunk_ms`; tick
+observations do not guess it. Completion, write failure, replan, and `Drop`
+recover only that stream's active tokens exactly once.
+
+The shared cell tracks current source counts plus one pending peak for each
+pressure kind. This remains fixed-size while preserving a short
+`active -> recovered` transition when both edges occur before the consumer
+runs: the peak is delivered first and the current recovery second. One stream's
+recovery therefore cannot clear another stream's queue or first-chunk pressure.
+State mutation, pending flags, peaks, and the `Notify` wake happen under one
+mutex, and the receiver registers its notification before checking the state.
+This closes both the full-to-drained parking race and terminal-edge loss without
+polling or an unbounded overflow queue. Slow-client shed events coalesce in a
+separate fixed pending flag and are pushed from the outbound pressure
+notification path.
+
+The controller retains active queue and first-chunk pressure until matching
+source recovery. Ordinary zero-depth tick observations therefore continue the
+pressure hysteresis while any token remains active; recovery of one kind keeps
+the other kind active. Only event-driven recovery of the last source permits
+healthy observations to begin scale-up hysteresis.
+
+`RuntimeControlHandle` has no production decision-only `observe`,
+`observe_work`, or `request_drain` method. Its crate-internal mutation surface
+is one `apply(RuntimeControlOperation, applicator)` transaction. The operation
+is a tick observation, pushed pressure signal, completed work observation, or
+drain request; the result is a typed autoscale or work-budget outcome. The
+handle owns the controller mutex while it derives that outcome, snapshots the
+complete proposed controller state, invokes the applicator, and records the
+applicator result. CPU admission and entity-owner lane reconfiguration therefore
+linearize with the decision that requested them. A drain that linearizes first
+causes every later observation to produce `Hold`, but the `Hold` still passes
+through the applicator while the same mutex is held. No pre-drain decision can
+apply permits or reconfigure lanes after the drain application.
+
+The applicator returns `RuntimeControlApplyError::Rejected` only when it made no
+externally visible change or restored its prior resources. That outcome restores
+the exact prior controller state and permits an exact retry. If CPU admission or
+lane application may have partially completed, the applicator returns
+`ControlledStop`; the controller restores its prior policy state, records
+`application_stop_reason`, and rejects every later mutation without calling an
+applicator. An applicator panic follows the same rollback and fence before the
+panic resumes. The caller must turn `ControlledStop` into process shutdown; it
+must not retry an outcome-unknown resource change. Test-only decision helpers
+remain under `cfg(test)` for isolated policy tests and are absent from production
+and downstream public APIs.
+
+Focused in-module regressions cover exact rejection rollback for throughput and
+work budgets, drain followed by an applied `Hold` with equal CPU/lane targets,
+two concurrent observations with callback ordering inside the controller lock,
+outcome-unknown fencing, and panic rollback. Compile-fail examples on
+`RuntimeControlHandle` cover the removed public decision-only methods. These
+are API and controller-ordering checks, not gameplay, soak, performance, or
+replacement-readiness evidence.
+
+On 2026-07-20,
+`cargo test -p mc-net --lib control_plane::tests -- --nocapture` passed all 32
+focused tests, and `cargo check -p mc-net --tests` completed with five existing
+dead-code warnings outside `control_plane.rs`. Production `mc-net` check and
+strict Clippy are not evidence for this slice yet: the separately owned
+`server.rs` still calls the removed decision-only and compatibility methods and
+must move to `apply` before those gates can compile the non-test target.
+
 Mutation phases now derive their participant set from non-empty lane batches.
 A local mutation no longer sends empty prepare/commit/finalize barriers through
 every configured owner lane. Prepare and commit are still sent to all touched
@@ -341,8 +396,8 @@ through the production journal, rolls back safe journal failures, and
 fail-stops on unknown outcomes before finalize. Save, reconfiguration, journal
 clear, and shutdown take the exclusive side of the mutation gate. Global index
 changes, cross-region commands, and cache misses remain coordinator-owned.
-Coordinator snapshot, selected-snapshot, breeding, goal-prepare, and shadow
-reads also take that exclusive side, so they cannot publish direct lane state
+Coordinator snapshot, selected-snapshot, breeding, and goal-prepare reads also
+take that exclusive side, so they cannot publish direct lane state
 before journal durability or after a safe rollback. Cached direct reads remain
 lock-free with respect to distinct lane commits, but accept a result only after
 an acquire load observes zero active writers followed by an unchanged state
@@ -450,6 +505,17 @@ Only after entity ownership is stable, move chunk and block-entity mutation to
 the same region owners. Multi-region structures and transactions use ordered
 region messages; they never acquire two region stores at once.
 
+Chunk streaming now receives the already-created `WorldReadView` and
+`WorldMutationView` from `ConnectionWorld`. An already-resident chunk is read,
+lit, conditionally published, and encoded without acquiring the global
+`WorldStorage` mutex. Light publication first compares every neighbourhood
+source token, then installs only while the same resident snapshots remain
+current. There is no constructor `try_lock` fallback: disk misses, generation,
+LRU admission, pressure flush, and other storage work keep the global writer,
+while the resident delivery path has its owner handles before work starts. A
+push-driven regression creates the stream while that writer is already held
+and requires packet delivery before releasing it; its timeout is failure-only.
+
 The first production R4 path covers random block ticks whose complete read and
 edit footprint stays inside one 8 by 8 chunk region. Planning uses immutable
 published snapshots. Commit uses exact block-state and mutation-token
@@ -500,7 +566,39 @@ append. A rejected resident preflight records a durable empty decision for its
 reserved journal ID before any coordinator fallback, preventing reservation
 holes from poisoning later appends. Comparator-containing batches and hopper
 transfers crossing an 8 by 8 boundary still use the exact coordinator claim and
-ordered legacy block-entity path.
+ordered block-entity path. Button, leaf, and stale-entry batches that cross an
+8 by 8 boundary use an ordered resident-owner transaction without reacquiring
+the global `WorldStorage` writer. Prepare records immutable expected-present
+snapshots and expected-absent optional neighbour chunks, then builds every
+post-state image in unpublished memory.
+
+Reservation, push-driven append-turn waiting, source verification, durability,
+and publication run in one synchronous blocking-worker closure. Aborting or
+dropping the async caller cannot cancel that closure after reservation. Before
+the WAL append, the transaction takes exclusive resident mutation admission;
+ordinary region mutations take shared admission. It rechecks every expected
+present snapshot by identity and rejects every absent-to-present neighbour race.
+The transaction owns the exclusive publication admission guard through source
+verification, WAL append, and publication. Readers and ordinary mutators block
+on the shared side of that `RwLock`; OS lock wakeup, not polling, resumes them
+after the writer unlocks. After append success, publication makes the generation
+odd, installs each owner while holding exactly one region lock, updates the read
+and scheduled-tick views, returns the generation to even with release ordering,
+and unlocks. An incomplete publication guard marks the state fail-stopped and
+restores even parity before unlocking; every later reader or mutator rejects
+that state, so an unwind cannot expose a partial publication as reusable state.
+Because durability precedes installation, these chunks need no pending-LSN
+flush fence and there is no installed state to roll back.
+
+A stale or missing source appends a durable empty decision. Snapshot validation
+or encoding errors are typed known-before-append failures; they return through
+the journal snapshot API without unwinding. A known pre-append or append failure
+must append that empty decision before the reservation is released. After that
+closure is durable, the scheduled-block handler returns a rejected no-op and
+continues. Failure to close is fail-stop. An outcome-unknown append never
+publishes live state, poisons the journal, and requests controlled shutdown.
+Restart repair and replay inspect the WAL bytes and choose exactly the recorded
+outcome; runtime code never guesses whether the attempted decision reached disk.
 
 Active furnace ticks retain their full `(block state, furnace snapshot)` CAS
 under the resident region lock and now stamp every changed chunk with one
@@ -610,7 +708,7 @@ in force.
 - One thread per region.
 - Parallel mutation of one hot region.
 - Configurable worker percentages or manual subsystem budgets.
-- A second shadow authority kept in production.
+- A second mutable ECS authority kept in production.
 - Claiming a speedup from routing scaffolding or a single-lane test.
 
 ## Consequences

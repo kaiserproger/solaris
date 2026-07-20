@@ -7,9 +7,13 @@ use super::player_state::{
     apply_player_survival_plan_locked, player_attack_cost_plan_matches,
     player_survival_plan_matches,
 };
+use super::sleep::{
+    SleepWakeReason, SleepingPlayer, defer_staged_sleep_dispatches_locked, stage_sleep_wake_locked,
+};
 use super::{
     CommittedPlayerAttackCosts, EntityAttackOutcome, PlayerAttackResult, ServerEntityPlayerAttack,
-    SessionId, SessionRegistry, player_aabb, session_recipients, visible_observers_locked,
+    SessionEntityGuards, SessionId, SessionRegistry, player_aabb, session_recipients,
+    visible_observers_locked,
 };
 use crate::play::combat::{
     ActiveShield, PlayerDamageKind, PlayerDamageRequest, PlayerHurtResolution,
@@ -255,19 +259,21 @@ impl SessionRegistry {
             xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
             position: target_position,
         };
-        let Some((mut committed, committed_attacker_costs)) = self.commit_player_attack(
-            authority,
-            PlayerAttackCommit {
-                attacker_session,
-                target_session,
-                expected_attacker_mode: authoritative_mode,
-                attacker_costs: if damage_applied { attacker_costs } else { None },
-                expected_shield: active_shield,
-                shield_after_block,
-                next_resistance,
-                target_plan: &target_plan,
-            },
-        ) else {
+        let Some((mut committed, committed_attacker_costs, staged_damage_wake)) = self
+            .commit_player_attack(
+                authority,
+                PlayerAttackCommit {
+                    attacker_session,
+                    target_session,
+                    expected_attacker_mode: authoritative_mode,
+                    attacker_costs: if damage_applied { attacker_costs } else { None },
+                    expected_shield: active_shield,
+                    shield_after_block,
+                    next_resistance,
+                    target_plan: &target_plan,
+                },
+            )
+        else {
             return committed_player_attack_without_damage(target_session);
         };
 
@@ -341,6 +347,10 @@ impl SessionRegistry {
                     }),
             );
         }
+        if let Some(sleeper) = staged_damage_wake {
+            self.defer_staged_sleep_dispatches(target_session, &mut dispatches);
+            dispatches = self.completed_sleep_dispatches(vec![sleeper], None);
+        }
         PlayerAttackResult::Damaged(Box::new(EntityAttackOutcome::PlayerDamaged {
             target_session,
             dispatches,
@@ -356,6 +366,7 @@ impl SessionRegistry {
     ) -> Option<(
         crate::play::simulation::CommittedPlayerSurvival,
         Option<CommittedPlayerAttackCosts>,
+        Option<SleepingPlayer>,
     )> {
         let PlayerAttackCommit {
             attacker_session,
@@ -422,6 +433,13 @@ impl SessionRegistry {
             return None;
         }
 
+        let staged_damage_wake = (target_plan.updated_survival.health
+            < target_plan.expected_survival.health)
+            .then(|| {
+                self.stage_sleep_wake_locked(&mut inner, target_session, SleepWakeReason::Damage)
+            })
+            .flatten();
+
         let committed_attacker = attacker_costs.map(|costs| {
             let mut effective = costs.clone();
             effective.expected_survival = attacker_state.survival;
@@ -454,7 +472,7 @@ impl SessionRegistry {
         drop(attacker_state);
         drop(inner);
         self.append_spawned_xp_pickup_candidates(&mut committed_target.dispatches);
-        Some((committed_target, committed_attacker))
+        Some((committed_target, committed_attacker, staged_damage_wake))
     }
 }
 
@@ -515,6 +533,314 @@ fn active_shield_blocks_player_damage(
     )
 }
 
+pub(super) enum ProjectilePlayerDamagePreview {
+    Accepted(PreparedProjectilePlayerDamage),
+    Rejected(Option<PreparedProjectilePlayerDamage>),
+}
+
+pub(super) struct PreparedProjectilePlayerDamage {
+    target_session: SessionId,
+    expected_shield: Option<ActiveShield>,
+    shield_after_block: Option<ShieldAfterBlock>,
+    next_resistance: Option<crate::play::combat::PlayerHurtResistance>,
+    target_plan: PlayerSurvivalPlan,
+    damage_applied: bool,
+    fresh_hurt: bool,
+    shield_blocked: bool,
+    source_origin: Option<Vec3>,
+}
+
+impl PreparedProjectilePlayerDamage {
+    pub(super) fn kills_player(&self) -> bool {
+        !self.target_plan.expected_survival.is_dead() && self.target_plan.updated_survival.is_dead()
+    }
+}
+
+pub(super) fn prepare_projectile_player_damage_locked(
+    inner: &SessionEntityGuards<'_>,
+    target_session: SessionId,
+    current_tick: u64,
+    damage: PlayerDamageRequest,
+) -> ProjectilePlayerDamagePreview {
+    let Some(target) = inner.sessions.get(&target_session) else {
+        return ProjectilePlayerDamagePreview::Rejected(None);
+    };
+    let target_pose = target.pose;
+    let target_position = Vec3::new(target_pose.x, target_pose.y, target_pose.z);
+    let Some(target_state) = inner.player_persistence.get(&target_session).cloned() else {
+        return ProjectilePlayerDamagePreview::Rejected(None);
+    };
+    let wait_started = Instant::now();
+    let target_state = target_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let target_state = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::PlayerPersistence,
+        "prepare projectile player damage",
+        wait_started,
+        target_state,
+    );
+    if matches!(
+        target_state.game_mode,
+        GameMode::Creative | GameMode::Spectator
+    ) || target_state.survival.is_dead()
+    {
+        return ProjectilePlayerDamagePreview::Rejected(None);
+    }
+
+    let active_shield = inner.active_shields.get(&target_session).cloned();
+    let combat_resources = &inner.player_combat;
+    let items = combat_resources.items.as_ref();
+    let shield_blocks = damage.kind.can_be_blocked_by_shield()
+        && active_shield.as_ref().is_some_and(|shield| {
+            active_shield_blocks_player_damage(
+                target_pose,
+                damage.source_origin,
+                current_tick,
+                shield,
+                items,
+                &target_state.inventory,
+            )
+        });
+    let mut updated_inventory = target_state.inventory.clone();
+    let mut updated_survival = target_state.survival;
+    let (damage_applied, fresh_hurt, next_resistance, shield_after_block) = if shield_blocks {
+        let shield = active_shield.as_ref().expect("shield was checked above");
+        let shield_after_block = match damage_active_shield_slot(
+            items,
+            &combat_resources.item_facts,
+            &mut updated_inventory.slots,
+            shield.slot,
+            &shield.expected_stack,
+            damage.amount,
+        ) {
+            Some((_, _, true)) => Some(ShieldAfterBlock::Remove),
+            Some((_, updated_stack, false)) => {
+                let mut refreshed = shield.clone();
+                refreshed.expected_stack = updated_stack;
+                Some(ShieldAfterBlock::Refresh(refreshed))
+            }
+            None => Some(ShieldAfterBlock::Refresh(shield.clone())),
+        };
+        (false, false, None, shield_after_block)
+    } else {
+        let current_resistance = inner
+            .player_hurt_resistance
+            .get(&target_session)
+            .copied()
+            .unwrap_or_default();
+        let (resolution, next_resistance) = current_resistance.preview(current_tick, damage.amount);
+        let PlayerHurtResolution::Apply {
+            amount: resolved_damage,
+            fresh_hurt,
+        } = resolution
+        else {
+            return ProjectilePlayerDamagePreview::Rejected(None);
+        };
+        let armor_damage =
+            inventory_damage_after_armor(items, &target_state.inventory, resolved_damage);
+        let applied_damage =
+            inventory_damage_after_protection(items, &target_state.inventory, armor_damage);
+        if applied_damage <= 0.0 {
+            return ProjectilePlayerDamagePreview::Rejected(None);
+        }
+        updated_survival.apply_damage(applied_damage);
+        if damage.kind.damages_armor() {
+            damage_inventory_armor(items, &mut updated_inventory, resolved_damage);
+        }
+        (true, fresh_hurt, Some(next_resistance), None)
+    };
+
+    let target_plan = PlayerSurvivalPlan {
+        expected_survival: target_state.survival,
+        updated_survival,
+        expected_inventory: target_state.inventory.clone(),
+        updated_inventory,
+        expected_carried_item: target_state.carried_item.clone(),
+        expected_xp: target_state.xp.clone(),
+        updated_xp: target_state.xp.clone(),
+        active_shield: None,
+        enchanting_table_input: None,
+        item_entity_type_id: combat_resources.item_entity_type_id,
+        xp_orb_entity_type_id: combat_resources.xp_orb_entity_type_id,
+        position: target_position,
+    };
+    let prepared = PreparedProjectilePlayerDamage {
+        target_session,
+        expected_shield: active_shield,
+        shield_after_block,
+        next_resistance,
+        target_plan,
+        damage_applied,
+        fresh_hurt,
+        shield_blocked: shield_blocks,
+        source_origin: damage.source_origin,
+    };
+    if damage_applied {
+        ProjectilePlayerDamagePreview::Accepted(prepared)
+    } else {
+        ProjectilePlayerDamagePreview::Rejected(Some(prepared))
+    }
+}
+
+pub(super) fn commit_projectile_player_damage_locked(
+    inner: &mut SessionEntityGuards<'_>,
+    prepared: PreparedProjectilePlayerDamage,
+    commit_entities: impl FnOnce(&mut SessionEntityGuards<'_>) -> bool,
+    dispatches: &mut Vec<VisibilityDispatch>,
+) -> bool {
+    let PreparedProjectilePlayerDamage {
+        target_session,
+        expected_shield,
+        shield_after_block,
+        next_resistance,
+        target_plan,
+        damage_applied,
+        fresh_hurt,
+        shield_blocked,
+        source_origin,
+    } = prepared;
+    let Some(target) = inner.sessions.get(&target_session) else {
+        return false;
+    };
+    let target_pose = target.pose;
+    let target_entity_id = target.entity_id;
+    if inner.active_shields.get(&target_session) != expected_shield.as_ref() {
+        return false;
+    }
+    let Some(target_state) = inner.player_persistence.get(&target_session).cloned() else {
+        return false;
+    };
+    let wait_started = Instant::now();
+    let target_state = target_state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut target_state = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::PlayerPersistence,
+        "commit projectile player damage",
+        wait_started,
+        target_state,
+    );
+    if !player_survival_plan_matches(&target_state, &target_plan) {
+        return false;
+    }
+    if !commit_entities(inner) {
+        return false;
+    }
+    let staged_damage_wake = (target_plan.updated_survival.health
+        < target_plan.expected_survival.health)
+        .then(|| stage_sleep_wake_locked(inner, target_session, SleepWakeReason::Damage))
+        .flatten();
+    let mut committed = apply_player_survival_plan_locked(inner, &mut target_state, &target_plan);
+    if let Some(shield_after_block) = shield_after_block {
+        match shield_after_block {
+            ShieldAfterBlock::Refresh(shield) => {
+                inner.active_shields.insert(target_session, shield);
+            }
+            ShieldAfterBlock::Remove => {
+                inner.active_shields.remove(&target_session);
+            }
+        }
+    }
+    if let Some(next_resistance) = next_resistance {
+        inner
+            .player_hurt_resistance
+            .insert(target_session, next_resistance);
+    }
+    let publication = PlayerDamagePublication {
+        expected_health: target_plan.expected_survival.health,
+        health: committed.survival.health,
+        inventory: target_plan
+            .expected_inventory
+            .slots
+            .iter()
+            .zip(&committed.inventory.slots)
+            .enumerate()
+            .filter(|(_, (expected, updated))| expected != updated)
+            .map(|(slot, (expected, updated))| PlayerInventorySlotDelta {
+                slot,
+                expected: expected.clone(),
+                updated: updated.clone(),
+            })
+            .collect(),
+        carried_item: (target_plan.expected_carried_item != committed.carried_item).then(|| {
+            PlayerCarriedItemDelta {
+                expected: target_plan.expected_carried_item.clone(),
+                updated: committed.carried_item,
+            }
+        }),
+        xp: (target_plan.expected_xp != committed.xp).then(|| PlayerXpDelta {
+            expected: target_plan.expected_xp.clone(),
+            updated: committed.xp,
+        }),
+        died: committed.died,
+        fresh_hurt: damage_applied && fresh_hurt,
+        shield_blocked,
+        knockback: source_origin.and_then(|source| {
+            if shield_blocked {
+                shield_block_knockback(
+                    target_pose.x,
+                    target_pose.z,
+                    target_pose.flags.on_ground,
+                    source,
+                )
+            } else if damage_applied && fresh_hurt {
+                melee_knockback(
+                    target_pose.x,
+                    target_pose.z,
+                    target_pose.flags.on_ground,
+                    source,
+                )
+            } else {
+                None
+            }
+        }),
+    };
+    let mut damage_dispatches = std::mem::take(&mut committed.dispatches);
+    let target = inner
+        .sessions
+        .get(&target_session)
+        .expect("validated projectile target remains under the session guard");
+    let target_recipient = SessionRecipient::unordered(
+        target_session,
+        target.tx.clone(),
+        Arc::clone(&target.pressure),
+    );
+    let hurt_event = PlayerHurtEvent {
+        entity_id: target_entity_id,
+    };
+    let hurt_observers = session_recipients(inner, visible_observers_locked(inner, target_session));
+    damage_dispatches.push(VisibilityDispatch {
+        recipient: target_recipient.clone(),
+        command: OutboundCommand::PlayerDamageCommitted {
+            publication: Box::new(publication),
+            hurt_event,
+        },
+    });
+    if damage_applied && fresh_hurt {
+        damage_dispatches.extend(
+            hurt_observers
+                .into_iter()
+                .map(|recipient| VisibilityDispatch {
+                    recipient,
+                    command: OutboundCommand::EntityEvent {
+                        entity_id: target_entity_id,
+                        event_id: 2,
+                    },
+                }),
+        );
+    }
+    if let Some(sleeper) = staged_damage_wake {
+        defer_staged_sleep_dispatches_locked(inner, target_session, &mut damage_dispatches);
+        damage_dispatches.push(VisibilityDispatch {
+            recipient: target_recipient,
+            command: OutboundCommand::WakeFromBed { bed: sleeper.bed },
+        });
+    }
+    dispatches.append(&mut damage_dispatches);
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
@@ -526,7 +852,11 @@ mod tests {
     use mc_protocol::packets::play::{InteractionHand, ItemStack};
     use tokio::sync::mpsc;
 
-    use super::{PlayerAttackCommit, ShieldAfterBlock};
+    use super::{
+        EntityAttackOutcome, EntityId, OutboundCommand, PlayerAttackCommit, PlayerAttackResult,
+        PlayerEntityAttack, PreparedProjectilePlayerDamage, ShieldAfterBlock, VisibilityDispatch,
+        commit_projectile_player_damage_locked,
+    };
     use crate::login::LoggedInProfile;
     use crate::play::combat::{
         ActiveShield, ShieldUseState, damage_active_shield_slot, damage_active_shield_slots,
@@ -766,5 +1096,129 @@ mod tests {
                 .active_shields
                 .contains_key(&target)
         );
+    }
+
+    #[test]
+    fn pvp_damage_defers_publication_until_the_sleeping_bed_is_released() {
+        let registry = SessionRegistry::new();
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let attacker = register_player(
+            &registry,
+            "SleepingPvpAttacker",
+            attacker_pose,
+            PlayerPersistedState::new_default(attacker_pose),
+        );
+        let target = register_player(
+            &registry,
+            "SleepingPvpTarget",
+            target_pose,
+            PlayerPersistedState::new_default(target_pose),
+        );
+        let target_entity = {
+            let inner = registry.lock_inner("read PvP target entity id");
+            EntityId(inner.sessions[&target].entity_id)
+        };
+        let bed = mc_world::BlockPos { x: 1, y: 64, z: 0 };
+        registry.set_world_time(13_000);
+        assert!(matches!(
+            registry.begin_sleep_at(target, bed),
+            crate::play::session::SleepOutcome::Waiting { .. }
+        ));
+
+        let result = registry.player_attack_entity(
+            &SimulationAuthority::for_test(),
+            PlayerEntityAttack {
+                attacker_session: attacker,
+                entity_id: target_entity,
+                amount: 2.0,
+                attacker_costs: None,
+            },
+        );
+        let PlayerAttackResult::Damaged(outcome) = result else {
+            panic!("in-range PvP damage must commit");
+        };
+        let EntityAttackOutcome::PlayerDamaged { dispatches, .. } = *outcome else {
+            panic!("player target must use player damage publication");
+        };
+        assert!(matches!(
+            dispatches.as_slice(),
+            [VisibilityDispatch {
+                command: OutboundCommand::WakeFromBed { bed: wake_bed },
+                ..
+            }] if *wake_bed == bed
+        ));
+
+        let token = registry
+            .claim_sleep_wake(target, bed)
+            .expect("committed damage must stage an exact wake token");
+        let completed = registry
+            .complete_sleep_wake(token)
+            .expect("confirmed bed release completes the staged wake");
+        assert!(completed.dispatches.iter().any(|dispatch| matches!(
+            &dispatch.command,
+            OutboundCommand::PlayerDamageCommitted { .. }
+        )));
+    }
+
+    #[test]
+    fn projectile_damage_defers_publication_until_the_sleeping_bed_is_released() {
+        let registry = SessionRegistry::new();
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let target_state = PlayerPersistedState::new_default(target_pose);
+        let target = register_player(
+            &registry,
+            "SleepingProjectileTarget",
+            target_pose,
+            target_state.clone(),
+        );
+        let bed = mc_world::BlockPos { x: 1, y: 64, z: 0 };
+        registry.set_world_time(13_000);
+        assert!(matches!(
+            registry.begin_sleep_at(target, bed),
+            crate::play::session::SleepOutcome::Waiting { .. }
+        ));
+
+        let mut target_plan =
+            survival_plan(&target_state, target_state.inventory.clone(), target_pose);
+        target_plan.updated_survival.apply_damage(2.0);
+        let prepared = PreparedProjectilePlayerDamage {
+            target_session: target,
+            expected_shield: None,
+            shield_after_block: None,
+            next_resistance: None,
+            target_plan,
+            damage_applied: true,
+            fresh_hurt: true,
+            shield_blocked: false,
+            source_origin: Some(mc_entity::Vec3::new(0.5, 64.0, 0.5)),
+        };
+        let mut dispatches = Vec::new();
+        let mut inner = registry.lock_session_entities("commit projectile damage test");
+        assert!(commit_projectile_player_damage_locked(
+            &mut inner,
+            prepared,
+            |_| true,
+            &mut dispatches,
+        ));
+        drop(inner);
+
+        assert!(matches!(
+            dispatches.as_slice(),
+            [VisibilityDispatch {
+                command: OutboundCommand::WakeFromBed { bed: wake_bed },
+                ..
+            }] if *wake_bed == bed
+        ));
+        let token = registry
+            .claim_sleep_wake(target, bed)
+            .expect("committed projectile damage must stage an exact wake token");
+        let completed = registry
+            .complete_sleep_wake(token)
+            .expect("confirmed bed release completes projectile damage wake");
+        assert!(completed.dispatches.iter().any(|dispatch| matches!(
+            &dispatch.command,
+            OutboundCommand::PlayerDamageCommitted { .. }
+        )));
     }
 }

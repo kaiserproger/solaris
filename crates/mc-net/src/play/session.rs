@@ -1,16 +1,15 @@
 use super::combat::{ActiveShield, PlayerHurtResistance};
-use super::explosions::PrimedTntFuse;
 use super::persistence::PlayerPersistedState;
 #[cfg(test)]
 use super::simulation::PlayerStateEvent;
 use super::simulation::SimulationAuthority;
 use super::*;
-use mc_entity::{
-    EntityKinematics, EntityMotionState, EntitySnapshot, RegionalOwnerHandle, RegionalOwnerRuntime,
-    RegionalOwnerStatus, VersionedEntitySnapshots,
-};
 #[cfg(test)]
-use mc_entity::{RegionKey, ShadowComparisonStats, ShadowDivergence, ShadowStage};
+use mc_entity::RegionKey;
+use mc_entity::{
+    EntityDamageRequest, EntityKinematics, EntityMotionState, EntitySnapshot, RegionalOwnerHandle,
+    RegionalOwnerRuntime, RegionalOwnerStatus, VersionedEntitySnapshots,
+};
 use std::cell::RefCell;
 use std::ops::{Deref, DerefMut};
 #[cfg(test)]
@@ -41,8 +40,13 @@ mod player_pose_adapter;
 mod player_pose_authority;
 mod player_state;
 mod player_state_adapter;
+#[cfg(test)]
+mod position_sync_tests;
 mod prepared_chunks;
 mod projectiles;
+mod script_menu_endpoint;
+#[cfg(test)]
+mod script_menu_endpoint_tests;
 mod session_lifecycle;
 mod sleep;
 mod survival_action_authority;
@@ -102,46 +106,45 @@ pub(super) use outbound::{
 };
 #[cfg(test)]
 pub(super) use outbound::{PlayerInventorySlotDelta, SessionRecipient};
+pub(in crate::play) use passive_mobs::SHEEP_GRAZING_ANIMATION_TICKS;
 pub(super) use passive_mobs::SheepGrazingCandidate;
 #[cfg(test)]
 pub(super) use passive_mobs::sheep_grazing_starts_on_tick;
 #[cfg(test)]
 use passive_mobs::{
-    BreedingAnimal, GrazingSheep, SHEEP_GRAZING_ACTION_TICK, SHEEP_GRAZING_ANIMATION_TICKS,
-    advance_sheep_grazing, plan_breeding,
+    BreedingAnimal, GrazingSheep, SHEEP_GRAZING_ACTION_TICK, advance_sheep_grazing, plan_breeding,
 };
 #[cfg(test)]
 use passive_mobs::{sheep_breeding_color, sheep_recipe_mix};
 use pathing::*;
 #[cfg(test)]
 pub(in crate::play) use pickups::ITEM_PICKUP_DELAY_TICKS;
-#[cfg(test)]
-pub(in crate::play) use pickups::{ClaimedExperience, ClaimedPickup};
 pub(in crate::play) use pickups::{
     CreditedArrowPickup, CreditedExperiencePickup, CreditedItemPickup, ENTITY_PICKUP_RADIUS,
 };
-use pickups::{
-    ItemPickupOwnerBlock, item_pickup_ready_locked, spawn_item_drop_locked, spawn_xp_orb_locked,
-};
+use pickups::{item_pickup_ready_locked, spawn_item_drop_locked, spawn_xp_orb_locked};
 pub(super) use player_combat::PlayerEntityAttack;
 use player_pose_authority::filter_current_expected_entity_snapshots;
+use projectiles::resolve_arrow_entity_hits_locked;
 #[cfg(test)]
 use projectiles::{
-    arrow_entity_candidate_ids_locked, segment_aabb_intersection_t, spawn_arrow_locked,
+    arrow_entity_candidate_snapshots_locked, segment_aabb_intersection_t, spawn_arrow_locked,
 };
-use projectiles::{despawn_expired_arrows_locked, resolve_arrow_entity_hits_locked};
+pub(in crate::play) use script_menu_endpoint::{
+    ScriptMenuCloseRequest, ScriptMenuOpenRequest, publish_script_menu_click,
+};
 pub(super) use sleep::SleepOutcome;
 #[cfg(test)]
 use sleep::{DEEP_SLEEP_TICKS, sleepers_needed};
 use sleep::{DEFAULT_PLAYERS_SLEEPING_PERCENTAGE, SleepingState};
 pub(super) use transactions::*;
-use visibility::LastSentEntityState;
 pub(super) use visibility::server_entity_snapshot_from;
+use visibility::{EntityPositionUpdate, LastSentEntityState};
 use visibility::{
     entity_event_dispatches_locked, entity_velocity_changed,
     initialize_entity_wire_state_from_snapshot_locked, initialize_entity_wire_state_locked,
     install_committed_entity_publications_locked, ordered_session_recipient,
-    packed_rotation_changed, publish_server_entity_snapshot_locked, quantized_entity_delta,
+    packed_rotation_changed, plan_entity_position_update, publish_server_entity_snapshot_locked,
     refresh_entity_target_visibility_locked, session_recipients,
     spawn_entity_visibility_from_snapshot_locked, spawn_entity_visibility_locked,
     spawned_xp_observer_ids, visibility_dispatches, visible_entity_observers_locked,
@@ -150,7 +153,7 @@ use visibility::{
 
 pub(super) type SessionId = u64;
 
-const ENTITY_DEATH_TICKS: u64 = 20;
+pub(in crate::play) const ENTITY_DEATH_TICKS: u64 = 20;
 const ENTITY_EVENT_DEATH: i8 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SessionAdmissionError {
@@ -287,17 +290,7 @@ struct SessionRegistryInner {
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     terrain_pathing_entities: HashSet<EntityId>,
     last_sent_entity_states: HashMap<EntityId, LastSentEntityState>,
-    last_entity_damage_ticks: HashMap<EntityId, u64>,
-    item_pickup_ready_ticks: HashMap<EntityId, u64>,
-    item_pickup_owner_blocks: HashMap<EntityId, ItemPickupOwnerBlock>,
-    entity_spawn_ticks: HashMap<EntityId, u64>,
-    item_spawn_ticks: HashMap<EntityId, u64>,
-    arrow_spawn_ticks: HashMap<EntityId, u64>,
-    arrow_owner_sessions: HashMap<EntityId, SessionId>,
-    arrow_owner_entities: HashMap<EntityId, EntityId>,
-    primed_tnt: HashMap<EntityId, PrimedTntFuse>,
-    dying_entity_remove_ticks: HashMap<EntityId, u64>,
-    sheep_grazing_ticks: HashMap<EntityId, u8>,
+    arrow_tick_scratch: projectiles::ArrowTickScratch,
     spawned_entity_chunks: HashSet<(i32, i32)>,
     pending_hostile_spawns: BTreeMap<(i32, i32), Vec<HerdSpawn>>,
     player_persistence: HashMap<SessionId, Arc<Mutex<PlayerPersistedState>>>,
@@ -405,6 +398,8 @@ pub(crate) struct SessionRegistry {
     #[cfg(test)]
     physics_owner_apply_probe: Mutex<Option<EntityApplyReleaseProbe>>,
     #[cfg(test)]
+    arrow_transaction_probe: Mutex<Option<ArrowTransactionProbe>>,
+    #[cfg(test)]
     breeding_plan_probe: Mutex<Option<BreedingPlanProbe>>,
     #[cfg(test)]
     breeding_commit_probe: Mutex<Option<BreedingCommitProbe>>,
@@ -424,6 +419,8 @@ pub(crate) struct SessionRegistry {
     player_push_commit_probe: Mutex<Option<PlayerPushCommitProbe>>,
     #[cfg(test)]
     pickup_snapshot_probe: Mutex<Option<PickupSnapshotProbe>>,
+    #[cfg(test)]
+    item_pickup_plan_probe: Mutex<Option<ItemPickupPlanProbe>>,
     #[cfg(test)]
     server_container_dispatch_probe: Mutex<Option<ServerContainerDispatchProbe>>,
     #[cfg(test)]
@@ -476,6 +473,13 @@ struct EntityApplyReleaseProbe {
 
 #[cfg(test)]
 #[derive(Debug)]
+struct ArrowTransactionProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
 struct BreedingPlanProbe {
     reached: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
@@ -512,6 +516,13 @@ struct PlayerPushCommitProbe {
 #[cfg(test)]
 #[derive(Debug)]
 struct PickupSnapshotProbe {
+    reached: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct ItemPickupPlanProbe {
     reached: std::sync::mpsc::Sender<()>,
     resume: std::sync::mpsc::Receiver<()>,
 }
@@ -651,6 +662,8 @@ impl SessionRegistry {
             #[cfg(test)]
             physics_owner_apply_probe: Mutex::new(None),
             #[cfg(test)]
+            arrow_transaction_probe: Mutex::new(None),
+            #[cfg(test)]
             breeding_plan_probe: Mutex::new(None),
             #[cfg(test)]
             breeding_commit_probe: Mutex::new(None),
@@ -670,6 +683,8 @@ impl SessionRegistry {
             player_push_commit_probe: Mutex::new(None),
             #[cfg(test)]
             pickup_snapshot_probe: Mutex::new(None),
+            #[cfg(test)]
+            item_pickup_plan_probe: Mutex::new(None),
             #[cfg(test)]
             server_container_dispatch_probe: Mutex::new(None),
             #[cfg(test)]
@@ -737,6 +752,10 @@ impl SessionRegistry {
 
     pub(crate) fn report_world_chunk_journal_failure(&self) {
         self.world_chunk_journal_failure.send_replace(true);
+    }
+
+    pub(crate) fn world_chunk_journal_failure_reporter(&self) -> tokio::sync::watch::Sender<bool> {
+        self.world_chunk_journal_failure.clone()
     }
 
     #[must_use]
@@ -881,6 +900,38 @@ impl SessionRegistry {
                 .resume
                 .recv()
                 .expect("physics owner apply probe release");
+        }
+    }
+
+    #[cfg(test)]
+    fn install_arrow_transaction_probe(
+        &self,
+        reached: std::sync::mpsc::Sender<()>,
+        resume: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self
+            .arrow_transaction_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(ArrowTransactionProbe { reached, resume });
+    }
+
+    #[cfg(test)]
+    fn pause_before_arrow_transaction_for_test(&self) {
+        let probe = self
+            .arrow_transaction_probe
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(probe) = probe {
+            probe
+                .reached
+                .send(())
+                .expect("arrow transaction probe receiver");
+            probe
+                .resume
+                .recv()
+                .expect("arrow transaction probe release");
         }
     }
 
@@ -1188,7 +1239,7 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
-    pub(super) fn spawn_arrow_legacy_for_test(
+    pub(super) fn spawn_arrow_for_test(
         &self,
         owner_session: Option<SessionId>,
         entity_type_id: i32,
@@ -1271,6 +1322,15 @@ impl SessionRegistry {
     }
 
     #[cfg(test)]
+    pub(crate) fn authoritative_entity_snapshot(
+        &self,
+        entity_id: EntityId,
+    ) -> Option<EntitySnapshot> {
+        self.lock_entities("authoritative entity snapshot test API")
+            .snapshot(entity_id)
+    }
+
+    #[cfg(test)]
     pub(super) fn apply_player_melee_knockback_legacy_for_test(
         &self,
         entity_id: EntityId,
@@ -1289,10 +1349,9 @@ impl SessionRegistry {
 }
 
 fn apply_entity_facts(entity: &mut SpawnEntity) {
-    let Ok(id) = mc_data::Identifier::parse(entity.type_name.clone()) else {
+    let Some(facts) = interaction_geometry::canonical_entity_facts(&entity.type_name) else {
         return;
     };
-    let facts = mc_data::entity_types::fallback_entity_type_facts(id, entity.type_id as u32);
     if let Some(value) = facts.attributes.max_health {
         entity.attributes.set_base(AttributeKind::MaxHealth, value);
     }
@@ -1326,11 +1385,16 @@ fn apply_entity_facts(entity: &mut SpawnEntity) {
 
 fn despawn_expired_items_locked(inner: &mut SessionEntityGuards<'_>) -> Vec<VisibilityDispatch> {
     let expired = inner
-        .item_spawn_ticks
-        .iter()
-        .filter_map(|(&entity_id, &spawn_tick)| {
-            (inner.entity_lifecycle_tick.saturating_sub(spawn_tick) >= ITEM_DESPAWN_AGE_TICKS)
-                .then_some(entity_id)
+        .entities
+        .snapshots_vec()
+        .into_iter()
+        .filter_map(|entity| {
+            (entity.item_stack.is_some()
+                && inner
+                    .entity_lifecycle_tick
+                    .saturating_sub(entity.retained.spawn_tick)
+                    >= ITEM_DESPAWN_AGE_TICKS)
+                .then_some(entity.id)
         })
         .take(ITEM_DESPAWN_SWEEP_BUDGET)
         .collect::<Vec<_>>();
@@ -1424,12 +1488,12 @@ fn apply_player_melee_knockback_locked(
                 recipient: ordered_session_recipient(observer_id, observer),
                 command: OutboundCommand::MoveEntityRelative(ServerEntityMove {
                     id: target_id,
-                    delta: Vec3::ZERO,
+                    wire_move: None,
                     velocity: snapshot.velocity,
                     rotation: snapshot.rotation,
                     on_ground: snapshot.on_ground,
-                    send_position_rotation: false,
                     send_velocity: true,
+                    send_head_rotation: false,
                 }),
             })
         })
@@ -1454,7 +1518,9 @@ fn record_entity_dispatches_locked(
     for dispatch in dispatches {
         match &dispatch.command {
             OutboundCommand::SpawnEntity(_) => inner.entity_dispatches.spawn += 1,
-            OutboundCommand::UpdateEntityData(_) => inner.entity_dispatches.data += 1,
+            OutboundCommand::UpdateEntityData(_) | OutboundCommand::UpdateEntityHealth(_) => {
+                inner.entity_dispatches.data += 1;
+            }
             OutboundCommand::MoveEntityRelative(_) => inner.entity_dispatches.move_relative += 1,
             OutboundCommand::MoveEntitiesRelative(movements) => {
                 inner.entity_dispatches.move_relative += movements.len() as u64;

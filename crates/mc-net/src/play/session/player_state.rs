@@ -1,3 +1,4 @@
+use super::sleep::SleepWakeReason;
 use super::{
     PlayerInventoryCommitError, SessionEntityGuards, SessionId, SessionRegistry,
     spawn_item_drop_locked, spawn_xp_orb_locked,
@@ -265,6 +266,11 @@ impl SessionRegistry {
             ));
         }
         let respawned = plan.expected_survival.is_dead() && !plan.updated_survival.is_dead();
+        let staged_damage_wake = (plan.updated_survival.health < plan.expected_survival.health)
+            .then(|| {
+                self.stage_sleep_wake_locked(&mut inner, actor_session, SleepWakeReason::Damage)
+            })
+            .flatten();
         let mut committed = apply_player_survival_plan_locked(&mut inner, &mut player_state, plan);
         if let Some(transition) = &plan.active_shield {
             if let Some(shield) = &transition.updated {
@@ -279,6 +285,12 @@ impl SessionRegistry {
         drop(player_state);
         drop(inner);
         self.append_spawned_xp_pickup_candidates(&mut committed.dispatches);
+        if let Some(sleeper) = staged_damage_wake {
+            self.defer_staged_sleep_dispatches(actor_session, &mut committed.dispatches);
+            let mut dispatches = self.completed_sleep_dispatches(vec![sleeper], None);
+            dispatches.append(&mut committed.dispatches);
+            committed.dispatches = dispatches;
+        }
         Some(PlayerSurvivalCommitOutcome::Committed(committed))
     }
 }

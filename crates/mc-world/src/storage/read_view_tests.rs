@@ -8,6 +8,45 @@ use crate::chunk::{
 use mc_data::Identifier;
 
 #[test]
+fn consistent_reader_waits_for_publication_writer_unlock() {
+    let publication = Arc::new(ResidentPublicationState::new());
+    let transaction = publication.transaction();
+    let publishing = publication.begin_publish(transaction);
+    let reader_publication = Arc::clone(&publication);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        started_tx.send(()).unwrap();
+        let value = reader_publication.read_consistent(|| 7);
+        completed_tx.send(value).unwrap();
+    });
+
+    started_rx.recv().unwrap();
+    assert!(matches!(
+        completed_rx.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    publishing.complete();
+
+    assert_eq!(completed_rx.recv().unwrap(), 7);
+    reader.join().unwrap();
+}
+
+#[test]
+fn dropped_publication_guard_restores_even_generation() {
+    let publication = ResidentPublicationState::new();
+    let transaction = publication.transaction();
+    drop(publication.begin_publish(transaction));
+
+    assert_eq!(publication.generation.load(Ordering::Acquire) & 1, 0);
+    assert!(publication.fail_stopped.load(Ordering::Acquire));
+    assert!(
+        std::panic::catch_unwind(|| publication.read_consistent(|| 7)).is_err(),
+        "an incomplete publication must reject later readers"
+    );
+}
+
+#[test]
 fn chunk_source_view_tracks_generator_and_resident_chunks() {
     struct StubGenerator;
 
@@ -22,12 +61,12 @@ fn chunk_source_view_tracks_generator_and_resident_chunks() {
     }
 
     let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
-    let mut world = WorldStorage::in_memory(Arc::clone(&registry));
+    let world = WorldStorage::in_memory(Arc::clone(&registry));
     let source = world.chunk_source_view();
     let position = ChunkPos { x: 2, z: -3 };
     assert_eq!(source.source_for(position), ChunkPrepareSource::Absent);
 
-    world.set_generator(Some(Arc::new(StubGenerator)));
+    let mut world = world.with_generator(Arc::new(StubGenerator));
     assert_eq!(source.source_for(position), ChunkPrepareSource::Generator);
 
     world
