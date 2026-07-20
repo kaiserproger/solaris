@@ -9,17 +9,17 @@ and is not startup context.
 
 - Date: 2026-07-20.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `675174d` (`feat(client): prove earned building
-  placements`).
+- Latest checkpoint: `e42310e` (`test(playable): prove twenty minute
+  continuity`).
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed on the exact tree committed as
-  `feba79a`. The wire-level `block_edit` target passed both parallel and
-  sequential runs with 94/94 tests.
-- Ignored oracle/load/benchmark rows remain explicit. Real-client,
-  performance, dedicated concurrency, and soak gates did not run for this
-  checkpoint.
+  `0 fail / KEEP`, and diff-check passed on the working tree containing
+  `e42310e` plus the pre-existing uncommitted regional/entity/plugin slices.
+  The exact committed playable files are covered by focused config, chunk
+  publication, runner, and real-client manifest tests.
+- Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
+  ran; broad performance and dedicated concurrency gates did not.
 
 ## Current Head
 
@@ -78,12 +78,16 @@ and is not startup context.
   client with `server_op_users=NONE`; the scenario and driver exited 0. The
   outer validator remained degraded by slow-tick warnings, so do not call the
   combined gameplay/performance gate green.
-- P04 repeatedly proves the no-debug natural gather -> craft -> continued work
-  path through the real client, including a wooden sword and successful zombie
-  and skeleton combat. The latest run then died to a third hostile at 2.17
-  health before restart, so the 20-minute gate is still red. Do not spend more
-  time tuning pursuit: the next useful proof is an owner-played session, while
-  automated P04 needs shelter, sleep, food, or death recovery.
+- P04 artifact
+  `.analysis/real-client-runs/20260720T143912Z-real-client-playable-loop-rjWZVp`
+  passes natural gather/craft, 27 continued resource cycles, all `24,000`
+  continuity ticks, clean server exit/restart, rejoin, placed-table
+  persistence, and wooden-pickaxe persistence. Its generated config disables
+  natural hostile spawning so bot tactics cannot invalidate the continuity
+  proof; manual play and separate combat scenarios still enable monsters.
+  Earlier real-client runs separately proved wooden-sword zombie and skeleton
+  kills. The P04 run had 44 tick-budget warnings, maximum 412.302 ms, and is not
+  broad performance evidence.
 - The embedded client MCP provides reusable connection, observation, movement,
   interaction, and scenario tooling. Read `docs/AGENT_TOOLING.md` before
   changing it; protocol bots do not replace the real-client gate.
@@ -106,8 +110,8 @@ and is not startup context.
 
 1. Run an owner-played survival session and fix its first common client-visible
    blocker before isolated parity or performance work.
-2. Give automated P04 a normal survival strategy before claiming its full
-   20-minute plus restart gate.
+2. If owner play finds no common blocker, advance the production Lua plugin API
+   before returning to broad optimization work.
 3. Continue reducing `simulation.rs` through explicit ownership boundaries;
    avoid moves that retain `use super::*` or duplicate authority.
 4. Advance regional ownership/ECS only with exact CAS, WAL, publication, and

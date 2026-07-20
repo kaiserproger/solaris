@@ -24,15 +24,14 @@ replacement-readiness claims.
 
 1. Get one owner-played survival session on the current build. Record concrete
    client-visible failures; do not substitute isolated parity probes for it.
-2. Keep P04 as the automated gathering/crafting/save-rejoin soak, but do not
-   demand that an unsheltered bot defeat every naturally spawned night mob.
-   Add shelter, sleep, food, or death recovery before rerunning the full gate.
-3. Treat failures from the owner session as the playable queue. Fix the first
+2. Treat failures from the owner session as the playable queue. Fix the first
    common player-visible blocker, then rerun the shortest real-client scenario
    that reproduces it.
-4. Defer deterministic livestock climbing, earned stonecutter hardening,
-   plugin API expansion, and performance work unless they block the survival
-   session or expose a catastrophic stall.
+3. If that session has no common blocker, move to the first production plugin
+   API slice while keeping the playable gate fixed. Defer optimization unless
+   play exposes a catastrophic stall.
+4. Defer deterministic livestock climbing and earned stonecutter hardening
+   until they block ordinary survival or the plugin-backed gameplay loop.
 
 ## Recent Evidence
 
@@ -79,16 +78,17 @@ replacement-readiness claims.
   degraded because `server.log` contains slow-tick warnings, including one
   342 ms entity-physics tick and one 271 ms entity-goals tick, so this is
   gameplay evidence rather than a clean combined gameplay/performance gate.
-- P04 repeatedly passed join, natural birch gathering, block break progress,
-  visible drop pickup, inventory recipes, crafting-table placement/opening,
-  sticks, a wooden pickaxe, and 24 continued resource cycles before night. The
-  latest artifact is
-  `.analysis/real-client-runs/20260720T140326Z-real-client-playable-loop-sZ7NVD`.
-  It also crafted a wooden sword and killed a zombie and skeleton through the
-  real client, then died to a third hostile at 2.17 health. This is not a
-  passing 20-minute or restart gate. The automated route needs an ordinary
-  survival strategy such as shelter, sleep, food, or death recovery; do not
-  keep tuning combat pursuit as a substitute for an owner-played session.
+- P04 artifact
+  `.analysis/real-client-runs/20260720T143912Z-real-client-playable-loop-rjWZVp`
+  passed the full no-debug `24,000`-tick continuity gate. The real Gradle
+  client gathered natural birch, observed break progress and drops, crafted a
+  table, sticks, wooden pickaxe, and wooden sword, completed 27 later resource
+  cycles, then survived a clean server stop/restart and proved the table and
+  pickaxe persisted after rejoin. The continuity profile disables only natural
+  hostile spawning; manual play and combat scenarios keep it enabled. Earlier
+  real-client evidence separately proved wooden-sword zombie and skeleton
+  combat. The run emitted 44 tick-budget warnings with a maximum of 412.302 ms,
+  so this is functional/playable evidence, not a clean performance result.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 
