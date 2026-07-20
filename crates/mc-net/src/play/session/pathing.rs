@@ -20,47 +20,57 @@ enum PathingCollisionShape<'a> {
     Voxel(&'a [mc_data::collision_shapes::CollisionBox]),
 }
 
-fn canonical_pathing_state_fact(state: u32) -> Option<&'static CanonicalPathingStateFact> {
+fn canonical_pathing_state_facts() -> &'static [Option<CanonicalPathingStateFact>] {
     static FACTS: std::sync::OnceLock<Box<[Option<CanonicalPathingStateFact>]>> =
         std::sync::OnceLock::new();
-    FACTS
-        .get_or_init(|| {
-            let reports = mc_data::blocks::solaris_required_blocks_report();
-            let max_state = reports
-                .iter()
-                .flat_map(|block| block.states.iter().map(|state| state.id))
-                .max()
-                .unwrap_or(0);
-            let mut facts = (0..=max_state).map(|_| None).collect::<Vec<_>>();
-            let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
-            for block in reports {
-                for state in block.states {
-                    let properties = block
-                        .properties
-                        .keys()
-                        .map(|name| {
-                            (
-                                name.clone(),
-                                state.properties.get(name).cloned().unwrap_or_default(),
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice();
-                    if collision_shapes
-                        .get_for_state(state.id, &block.id, properties.as_ref())
-                        .is_some()
-                    {
-                        facts[state.id as usize] = Some(CanonicalPathingStateFact {
-                            block: block.id.clone(),
-                            properties,
-                        });
-                    }
+    FACTS.get_or_init(|| {
+        let reports = mc_data::blocks::solaris_required_blocks_report();
+        let max_state = reports
+            .iter()
+            .flat_map(|block| block.states.iter().map(|state| state.id))
+            .max()
+            .unwrap_or(0);
+        let mut facts = (0..=max_state).map(|_| None).collect::<Vec<_>>();
+        let collision_shapes = mc_data::collision_shapes::vanilla_collision_shapes();
+        for block in reports {
+            for state in block.states {
+                let properties = block
+                    .properties
+                    .keys()
+                    .map(|name| {
+                        (
+                            name.clone(),
+                            state.properties.get(name).cloned().unwrap_or_default(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                if collision_shapes
+                    .get_for_state(state.id, &block.id, properties.as_ref())
+                    .is_some()
+                {
+                    facts[state.id as usize] = Some(CanonicalPathingStateFact {
+                        block: block.id.clone(),
+                        properties,
+                    });
                 }
             }
-            facts.into_boxed_slice()
-        })
+        }
+        facts.into_boxed_slice()
+    })
+}
+
+fn canonical_pathing_state_fact(state: u32) -> Option<&'static CanonicalPathingStateFact> {
+    canonical_pathing_state_facts()
         .get(state as usize)
         .and_then(Option::as_ref)
+}
+
+pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {
+    canonical_pathing_state_facts()
+        .iter()
+        .filter(|fact| fact.is_some())
+        .count()
 }
 
 pub(super) struct LoadedChunkPathingProbe<'a> {

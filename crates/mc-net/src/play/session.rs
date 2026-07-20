@@ -56,6 +56,10 @@ mod survival_action_authority;
 mod transactions;
 mod visibility;
 
+pub(super) fn prewarm_canonical_pathing_state_facts() -> usize {
+    pathing::prewarm_canonical_pathing_state_facts()
+}
+
 #[cfg(test)]
 use super::simulation::{PlayerSurvivalCommitOutcome, PlayerSurvivalPlan};
 #[cfg(test)]

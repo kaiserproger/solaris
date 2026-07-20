@@ -141,9 +141,14 @@ replacement-readiness claims.
   reported actor `p50 5.107 ms` and `p99 6.400 ms`. A real 26.1.2 client
   observed all 31 persisted passive entities
   through 255 client ticks; warned dispatch samples were `4.814`, `10.640`, and
-  `2.913 ms`, rather than the earlier repeated `300+ ms` stalls. That run still
-  exposed separate first-use spikes of `282.512 ms` in physics and `316.242 ms`
-  in goals, so the combined performance gate remains degraded.
+  `2.913 ms`, rather than the earlier repeated `300+ ms` stalls. Canonical
+  pathing and collision tables now prewarm before the entity ticker starts. A
+  fresh real-client rerun built 5,436 pathing facts before listening, kept all
+  32 client-visible entities across 255 ticks, and no longer reproduced the
+  earlier `282.512 ms` physics or `316.242 ms` goals first-use stalls. Its only
+  warned tick was `56.709 ms`, with goals at `9.575 ms`, physics at `1.264 ms`,
+  and dispatch at `11.671 ms`. This closes the catastrophic cold-table stall;
+  it is not a replacement for a longer performance soak.
 
 ## Manual And Agent Gates
 

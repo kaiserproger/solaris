@@ -206,6 +206,10 @@ entity while retaining the single-entity low-latency path and the batch CAS
 fence. Deterministic tests count one physics schedule run for 76 same-region
 entities, one per region for same-lane and multi-lane updates, zero on stale
 rejection, and prove journal-failure rollback restores the complete batch.
+Collision-backed canonical pathing facts are initialized synchronously before
+the entity ticker is spawned. The prewarm returns a non-zero readiness value
+that is moved into the ticker task, so first-use table construction cannot land
+inside a simulation tick. Startup logs expose the initialized state count.
 Cross-region batch spawn and restore now share an all-input preflight and
 publish global indexes only after every physical store accepts its group.
 EntityStore batch restore inserts all snapshots before rebuilding vehicle

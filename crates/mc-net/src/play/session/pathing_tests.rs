@@ -314,6 +314,11 @@ fn canonical_double_slab_is_a_strict_table_backed_full_cube() {
 }
 
 #[test]
+fn pathing_table_prewarm_materializes_canonical_state_facts() {
+    assert!(prewarm_canonical_pathing_state_facts() > 0);
+}
+
+#[test]
 fn unloaded_collision_contact_remains_fail_closed() {
     let active_chunks = HashSet::new();
     let terrain_pathing_entities = HashSet::new();

@@ -817,10 +817,12 @@ impl BoundServer {
     /// this future succeeds. An error inside a connection task is logged but
     /// does not stop the listener.
     pub async fn serve(self) -> std::io::Result<()> {
+        let prewarmed_entity_pathing_states = play::prewarm_entity_pathing_tables();
         info!(
             addr = %self.local_addr()?,
             registries = self.config.data.registry_count(),
             entries = self.config.data.entry_count(),
+            pathing_states = prewarmed_entity_pathing_states.get(),
             "Solaris is listening"
         );
         let config = self.config;
@@ -945,6 +947,7 @@ impl BoundServer {
         }
         let (entity_shutdown, mut entity_shutdown_requested) = tokio::sync::oneshot::channel();
         let mut entity_ticker = tokio::spawn(async move {
+            let _pathing_tables_ready = prewarmed_entity_pathing_states;
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let metrics_policy = RuntimeMetricsPolicy::default().normalized();
