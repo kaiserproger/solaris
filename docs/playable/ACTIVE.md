@@ -100,6 +100,14 @@ replacement-readiness claims.
   pose, while health packets remain limited to visible food or saturation
   changes. The repeat after review emitted no tick-budget or slow-tick
   warnings. This is focused gameplay evidence, not a broad performance result.
+- The first live Lua gameplay adapter now connects admitted `upsert_zone` and
+  `remove_zone` commands to initial/accepted player poses and disconnect
+  cleanup. A wire client waits for a plugin readiness message, enters the zone
+  through a normal movement packet, and receives the owning plugin's targeted
+  `player.zone_entered` reply. Changed bounds do not repeat entry while the
+  player remains inside. Workspace tests, strict Clippy, fmt, code-health and
+  the 94-test `block_edit` target pass; inventory menus and atomic
+  inventory/storage transactions remain future production slices.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 

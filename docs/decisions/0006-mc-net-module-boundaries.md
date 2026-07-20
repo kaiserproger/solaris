@@ -409,6 +409,14 @@ Other accepted concrete boundaries in this staged migration are:
   entity lock helpers. Direct publication releases the registry lock before
   dispatch; direct, all-session and missing-recipient behavior has focused
   coverage.
+- `script::zone` owns the bounded plugin-zone registry, per-player membership
+  snapshots, monotonic observation fencing and targeted entry-event creation.
+  One adapter is created at server bind and shared with the admitted script
+  command router and play connections. The router alone mutates zone
+  definitions; an accepted absolute player movement pushes a pose observation;
+  session cleanup forgets the player. The registry mutex is released before
+  targeted event delivery awaits queue admission. Lua never receives session,
+  entity or registry handles, and rejected movement cannot publish zone entry.
 - `play::player_damage_adapter` owns fall/contact/general player damage
   orchestration, publication projection, melee-knockback conversion and its
   concrete request/result DTOs. Damage and shield rules remain in `combat`;

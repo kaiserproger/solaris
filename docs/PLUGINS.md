@@ -4,9 +4,10 @@ Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
 other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
-`mc-net` provides the `0.6.0` plugin-storage adapter. Menu, transaction, zone,
-colony, and villager adapters do not exist yet. The examples are contract-tested
-fixtures, not live plugins.
+`mc-net` provides the `0.6.0` plugin-storage and zone adapters. Menu,
+transaction, colony, and villager adapters do not exist yet. The examples are
+contract-tested fixtures; zone entry is the first live gameplay event they can
+use.
 
 ## Package And Manifest
 
@@ -199,9 +200,17 @@ solaris.remove_zone("catalog-square")
 ```
 
 All six coordinates must be finite, within the existing script coordinate
-limits, and ordered minimum-to-maximum on every axis. A future zone adapter will
-own membership tracking and publish `player.zone_entered` only to the plugin
-that owns the zone.
+limits, and ordered minimum-to-maximum on every axis. The zone adapter owns
+membership tracking and publishes `player.zone_entered` only to the plugin that
+owns the zone. It observes the initial player pose and every accepted absolute
+movement; rejected movement cannot create an entry. Disconnect removes the
+player immediately. Changing a zone keeps an existing membership when the
+player remains inside, so an edit cannot repeat entry side effects.
+
+The process admits at most 4,096 zones, 256 zones per plugin, 16,384 tracked
+players, and 262,144 memberships. A request beyond a bound is rejected without
+partial mutation and logged by the production router. These bounds are server
+admission limits, not operator-configured worker percentages.
 
 Colonies are bounded records, not world/entity access:
 

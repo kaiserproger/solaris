@@ -392,6 +392,7 @@ async fn initial_play_sync_sends_recipe_update_once_before_recipe_book_packets()
         Vec::new(),
         None,
         None,
+        None,
     )
     .await;
     assert!(matches!(result, Err(ConnectionError::Eof)));
@@ -1327,6 +1328,7 @@ async fn play_loop_closes_session_when_outbound_write_stalls() {
             None,
             PlayerId::new(0),
             None,
+            None,
         ),
     )
     .await
@@ -1407,6 +1409,7 @@ async fn play_loop_closes_session_when_direct_response_write_stalls() {
             None,
             PlayerId::new(0),
             None,
+            None,
         ),
     )
     .await
@@ -1472,6 +1475,7 @@ async fn play_loop_exits_when_outbound_channel_closes() {
             "ClosedOutbound".to_string(),
             None,
             PlayerId::new(0),
+            None,
             None,
         ),
     )
@@ -1552,6 +1556,7 @@ async fn play_loop_sheds_slow_client_when_outbound_queue_stays_full_before_write
             "PressureWriter".to_string(),
             None,
             PlayerId::new(0),
+            None,
             None,
         ),
     )
@@ -13969,7 +13974,8 @@ async fn cancelled_connection_cleanup_retains_owner_state_for_checkpoint() {
         Poll::Ready(())
     })
     .await;
-    let cleanup = RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id, None, None);
+    let cleanup =
+        RegisteredSessionCleanup::new(Arc::clone(&sessions), session_id, None, None, None);
     drop(cleanup);
     tokio::time::timeout(Duration::from_secs(1), save_requested)
         .await
@@ -14017,6 +14023,7 @@ async fn periodic_checkpoint_persists_cancelled_connection_owner_state() {
     drop(RegisteredSessionCleanup::new(
         Arc::clone(&sessions),
         session_id,
+        None,
         None,
         None,
     ));

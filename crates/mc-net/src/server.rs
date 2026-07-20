@@ -48,7 +48,7 @@ use crate::runtime_tick_metrics::{
     RuntimeTickMetricsHandle, RuntimeTickMetricsWindow, RuntimeTickPercentiles, RuntimeTickSample,
     spawn_runtime_tick_metrics_worker,
 };
-use crate::script::{PluginStorageHandle, ScriptRouter, ScriptRouterExit};
+use crate::script::{PluginStorageHandle, PluginZoneAdapter, ScriptRouter, ScriptRouterExit};
 use crate::{
     ChunkPipelinePolicy, RuntimeControlHandle, RuntimeControlInput, RuntimeWorkBudgets,
     RuntimeWorkInput,
@@ -328,6 +328,7 @@ pub struct BoundServer {
     extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
     script_storage: Option<PluginStorageHandle>,
+    script_zones: Option<PluginZoneAdapter>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -838,6 +839,7 @@ impl BoundServer {
         let extension = self.extension;
         let scripts = self.scripts;
         let script_storage = self.script_storage;
+        let script_zones = self.script_zones;
         let shutdown = config.shutdown.clone();
         let connection_services = ConnectionServices {
             config: Arc::clone(&config),
@@ -850,6 +852,7 @@ impl BoundServer {
             simulation: simulation.clone(),
             extension: extension.clone(),
             scripts: scripts.clone(),
+            script_zones: script_zones.clone(),
         };
         if let Some(scripts) = scripts.as_ref() {
             scripts.enqueue_event(ScriptEvent::server_started());
@@ -1751,6 +1754,9 @@ impl BoundServer {
             let script_simulation = simulation.clone();
             let script_chunk_pipeline_resources = chunk_pipeline_resources.clone();
             let script_shutdown = shutdown.clone();
+            let script_zones = script_zones
+                .clone()
+                .expect("script boundary and zone adapter are created together");
             command_tasks.spawn(async move {
                 run_script_commands(ScriptCommandTask {
                     scripts: script_commands,
@@ -1761,6 +1767,7 @@ impl BoundServer {
                     simulation: script_simulation,
                     chunk_pipeline_resources: script_chunk_pipeline_resources,
                     shutdown: script_shutdown,
+                    zones: script_zones,
                 })
                 .await;
                 "script command"
@@ -2181,6 +2188,7 @@ struct ScriptCommandTask {
     simulation: play::SimulationHandle,
     chunk_pipeline_resources: ChunkPipelineResources,
     shutdown: ShutdownHandle,
+    zones: PluginZoneAdapter,
 }
 
 async fn run_script_commands(task: ScriptCommandTask) {
@@ -2193,8 +2201,9 @@ async fn run_script_commands(task: ScriptCommandTask) {
         simulation,
         chunk_pipeline_resources,
         shutdown,
+        zones,
     } = task;
-    let router = ScriptRouter::new(scripts.clone(), storage);
+    let router = ScriptRouter::new_with_zones(scripts.clone(), storage, zones);
     let mut shutdown_observed = shutdown.is_requested();
     loop {
         tokio::select! {
@@ -2202,7 +2211,7 @@ async fn run_script_commands(task: ScriptCommandTask) {
             command = scripts.recv_command() => {
                 let Some(command) = command else {
                     debug!("script command queue closed; stopping command drain");
-                    return;
+                    break;
                 };
                 if router.route(
                     command,
@@ -2220,7 +2229,7 @@ async fn run_script_commands(task: ScriptCommandTask) {
             }
             () = router.wait_for_storage_stop() => {
                 debug!("plugin storage actor stopped; stopping script command drain");
-                return;
+                break;
             }
             () = shutdown.notified(), if !shutdown_observed => {
                 shutdown_observed = true;
@@ -2228,6 +2237,7 @@ async fn run_script_commands(task: ScriptCommandTask) {
             }
         }
     }
+    let _ = router.zones().close();
 }
 
 pub(crate) fn resolve_script_entity_type(config: &ServerConfig, entity_type: &str) -> Option<i32> {
@@ -3681,6 +3691,9 @@ async fn bind_internal(
         ),
         _ => None,
     };
+    let script_zones = scripts
+        .as_ref()
+        .map(|scripts| PluginZoneAdapter::new(scripts.clone()));
     let (sessions, pending_entity_commits) = if let Some(root) = entity_world_root.as_deref() {
         let (journal, pending) = play::persistence::FileRegionalDecisionJournal::open(root)
             .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
@@ -3867,6 +3880,7 @@ async fn bind_internal(
         extension,
         scripts,
         script_storage,
+        script_zones,
     })
 }
 
@@ -4709,6 +4723,7 @@ mod tests {
 
         run_script_commands(ScriptCommandTask {
             scripts: scripts.clone(),
+            zones: PluginZoneAdapter::new(scripts.clone()),
             storage: None,
             config,
             sessions: Arc::new(play::SessionRegistry::new()),
@@ -4773,6 +4788,7 @@ end
         scripts.enqueue_event(ScriptEvent::server_started());
         let command_task = tokio::spawn(run_script_commands(ScriptCommandTask {
             scripts: scripts.clone(),
+            zones: PluginZoneAdapter::new(scripts.clone()),
             storage: None,
             config,
             sessions,

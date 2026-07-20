@@ -1,8 +1,9 @@
 use mc_script::{AdmittedScriptCommand, ScriptCommand, ScriptPluginStorageFailure};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
 use super::storage::PluginStorageHandle;
+use super::zone::PluginZoneAdapter;
 use crate::RuntimeControlHandle;
 use crate::chunk_pipeline::ChunkPipelineResources;
 use crate::play;
@@ -30,11 +31,30 @@ pub(crate) struct ScriptRouterContext<'a> {
 pub(crate) struct ScriptRouter {
     scripts: ScriptEventSink,
     storage: Option<PluginStorageHandle>,
+    zones: PluginZoneAdapter,
 }
 
 impl ScriptRouter {
+    #[cfg(test)]
     pub(crate) fn new(scripts: ScriptEventSink, storage: Option<PluginStorageHandle>) -> Self {
-        Self { scripts, storage }
+        let zones = PluginZoneAdapter::new(scripts.clone());
+        Self::new_with_zones(scripts, storage, zones)
+    }
+
+    pub(crate) fn new_with_zones(
+        scripts: ScriptEventSink,
+        storage: Option<PluginStorageHandle>,
+        zones: PluginZoneAdapter,
+    ) -> Self {
+        Self {
+            scripts,
+            storage,
+            zones,
+        }
+    }
+
+    pub(crate) fn zones(&self) -> PluginZoneAdapter {
+        self.zones.clone()
     }
 
     pub(crate) fn context<'a>(
@@ -188,9 +208,13 @@ impl ScriptRouter {
                 }
                 ScriptRouterExit::Continue
             }
+            ScriptCommand::UpsertZone { .. } | ScriptCommand::RemoveZone { .. } => {
+                if let Err(error) = self.zones.route_admitted(admitted) {
+                    warn!(?error, "admitted script zone command rejected");
+                }
+                ScriptRouterExit::Continue
+            }
             ScriptCommand::InventoryStorageTransaction { .. }
-            | ScriptCommand::UpsertZone { .. }
-            | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::UpsertColony { .. }
             | ScriptCommand::RequestVillagerBinding { .. } => {
                 debug!("admitted script command has no production adapter in slice A");

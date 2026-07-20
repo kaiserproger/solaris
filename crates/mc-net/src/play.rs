@@ -89,6 +89,7 @@ use crate::configuration::ConfigurationCustomPayload;
 use crate::connection::{read_frame, write_packet};
 use crate::error::ConnectionError;
 use crate::login::LoggedInProfile;
+use crate::script::PluginZoneAdapter;
 use crate::server::{ExtensionEventSink, ScriptEventSink, ServerConfig, WorldHandle};
 use crate::{
     ChunkPipelinePolicy, ChunkPipelineStopReason, ChunkPriority, ChunkRequest, ChunkScheduler,
@@ -584,6 +585,7 @@ struct RegisteredSessionCleanup {
     extension: Option<ExtensionEventSink>,
     extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
+    script_zones: Option<PluginZoneAdapter>,
     active: bool,
 }
 
@@ -593,6 +595,7 @@ impl RegisteredSessionCleanup {
         session_id: SessionId,
         extension: Option<ExtensionEventSink>,
         scripts: Option<ScriptEventSink>,
+        script_zones: Option<PluginZoneAdapter>,
     ) -> Self {
         Self {
             sessions,
@@ -600,6 +603,7 @@ impl RegisteredSessionCleanup {
             extension,
             extension_player_id: PlayerId::new(session_id),
             scripts,
+            script_zones,
             active: true,
         }
     }
@@ -628,6 +632,15 @@ impl RegisteredSessionCleanup {
                 ScriptPlayerId::new(self.session_id),
                 "disconnected",
             ));
+        }
+        if let Some(zones) = self.script_zones.as_ref()
+            && let Err(error) = zones.forget_player(ScriptPlayerId::new(self.session_id))
+        {
+            debug!(
+                ?error,
+                session_id = self.session_id,
+                "script zone cleanup rejected"
+            );
         }
     }
 }
@@ -1281,6 +1294,43 @@ fn script_player_context_from_values(
     ScriptPlayerContext::new(uuid, username, permissions.op, pose.x, pose.y, pose.z)
 }
 
+struct ScriptZoneObserver {
+    zones: PluginZoneAdapter,
+    player_id: ScriptPlayerId,
+    uuid: String,
+    username: String,
+    permissions: CommandPermissions,
+    dimension: String,
+    revision: u64,
+}
+
+impl ScriptZoneObserver {
+    async fn observe(&mut self, pose: PlayerPose) {
+        let Some(revision) = self.revision.checked_add(1) else {
+            warn!(
+                player_id = self.player_id.value(),
+                "script zone observation revision exhausted"
+            );
+            return;
+        };
+        self.revision = revision;
+        let context =
+            script_player_context_from_values(&self.uuid, &self.username, self.permissions, pose);
+        if let Err(error) = self
+            .zones
+            .observe_player(self.player_id, revision, &self.dimension, context)
+            .await
+        {
+            debug!(
+                ?error,
+                player_id = self.player_id.value(),
+                revision,
+                "script zone observation rejected"
+            );
+        }
+    }
+}
+
 fn load_player_state_for_login(
     world_root: &std::path::Path,
     uuid: uuid::Uuid,
@@ -1314,6 +1364,7 @@ pub(crate) async fn handle<R, W>(
     configuration_custom_payloads: Vec<ConfigurationCustomPayload>,
     extension: Option<ExtensionEventSink>,
     scripts: Option<ScriptEventSink>,
+    script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -1419,6 +1470,7 @@ where
         session_id,
         extension.clone(),
         scripts.clone(),
+        script_zones.clone(),
     );
     if let Some(extension) = extension.as_ref() {
         extension.enqueue_event(InboundEvent::PlayerJoined {
@@ -1807,6 +1859,7 @@ where
             extension,
             extension_player_id,
             scripts,
+            script_zones,
         )
         .await;
         if let Some(state) = interaction.as_mut() {
@@ -10756,6 +10809,7 @@ async fn handle_accepted_absolute_movement<W>(
     interaction: &mut Option<&mut InteractionState>,
     chunk_stream: &mut Option<ChunkStreamState>,
     simulation: &SimulationHandle,
+    script_zone_observer: &mut Option<ScriptZoneObserver>,
     survival_state: &mut SurvivalState,
     xp_state: &mut XpState,
     game_mode: GameMode,
@@ -10806,6 +10860,9 @@ where
     };
     let committed_pose =
         commit_authoritative_player_movement(simulation, *player_pose, exhaustion).await?;
+    if let Some(observer) = script_zone_observer.as_mut() {
+        observer.observe(*player_pose).await;
+    }
     if game_mode == GameMode::Survival {
         committed_pose.apply_resources_to(survival_state);
         if committed_pose.resources_changed {
@@ -11270,6 +11327,7 @@ async fn play_loop<R, W>(
     extension: Option<ExtensionEventSink>,
     extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
+    script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -11302,6 +11360,7 @@ where
         extension,
         extension_player_id,
         scripts,
+        script_zones,
     )
     .await;
 
@@ -11346,6 +11405,7 @@ async fn play_loop_inner<R, W>(
     extension: Option<ExtensionEventSink>,
     extension_player_id: PlayerId,
     scripts: Option<ScriptEventSink>,
+    script_zones: Option<PluginZoneAdapter>,
 ) -> Result<(), ConnectionError>
 where
     R: AsyncReadExt + Unpin,
@@ -11362,6 +11422,18 @@ where
     world_time_ticker.tick().await;
 
     let mut keepalive = KeepAliveTracker::new();
+    let mut script_zone_observer = script_zones.map(|zones| ScriptZoneObserver {
+        zones,
+        player_id: ScriptPlayerId::new(session_id),
+        uuid: player_uuid.clone(),
+        username: player_name.clone(),
+        permissions,
+        dimension: respawn.dimension_name.to_string(),
+        revision: 0,
+    });
+    if let Some(observer) = script_zone_observer.as_mut() {
+        observer.observe(player_pose).await;
+    }
     let mut food_tick_timer: u32 = 0;
     let mut next_teleport_id: i32 = 2;
     let mut pending_teleport = Some(PendingTeleport::new(1, sessions.simulation_tick()));
@@ -11942,6 +12014,7 @@ where
                         &mut interaction,
                         &mut chunk_stream,
                         &simulation,
+                        &mut script_zone_observer,
                         &mut survival_state,
                         &mut xp_state,
                         game_mode,
@@ -11973,6 +12046,7 @@ where
                         &mut interaction,
                         &mut chunk_stream,
                         &simulation,
+                        &mut script_zone_observer,
                         &mut survival_state,
                         &mut xp_state,
                         game_mode,

@@ -6,8 +6,8 @@ use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
     ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, CommandNodeKind,
-    ConfirmTeleportation, GameEvent, GameMode, ServerboundChat, ServerboundChatCommand,
-    SetCenterChunk, SynchronizePlayerPosition,
+    ConfirmTeleportation, GameEvent, GameMode, MovePlayerFlags, ServerboundChat,
+    ServerboundChatCommand, ServerboundMovePlayerPos, SetCenterChunk, SynchronizePlayerPosition,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -313,6 +313,111 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
     assert_eq!(
         next_system_chat_text(&mut client).await,
         "You do not have permission to use that command"
+    );
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("spawn-zone");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "spawn-zone"
+            name = "Spawn Zone"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined", "player.zone_entered"]
+            capabilities = ["zones"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_joined(event)
+                solaris.upsert_zone("market", "minecraft:alpha", 2, -60, 0, 4, -58, 2)
+                solaris.send_message(event.player_id, "zone-ready")
+            end
+
+            function on_player_zone_entered(event)
+                solaris.send_message(event.player_id, "entered:" .. event.zone_id .. ":" .. event.username)
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua zone wire test".into(),
+        max_players: 1,
+        view_distance: 2,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, "ZonePlayer").await.expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    assert_eq!(next_system_chat_text(&mut client).await, "zone-ready");
+    client
+        .write_packet(&ServerboundMovePlayerPos {
+            x: 3.0,
+            y: -59.0,
+            z: 1.0,
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("enter plugin zone");
+
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "entered:market:ZonePlayer"
     );
 
     drop(client);
