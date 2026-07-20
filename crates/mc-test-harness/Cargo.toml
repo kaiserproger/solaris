@@ -47,3 +47,4 @@ mc-net = { path = "../mc-net" }
 mc-script = { path = "../mc-script", features = ["lua-runtime"] }
 mc-world = { path = "../mc-world" }
 mc-worldgen = { path = "../mc-worldgen" }
+toml = { workspace = true }

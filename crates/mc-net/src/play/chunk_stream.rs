@@ -89,6 +89,7 @@ pub(super) struct ChunkStreamState {
     passive_herd_passable: Arc<Vec<BlockStateId>>,
     passive_spawn_rules: Arc<mc_data::biomes::BiomeSpawnRules>,
     entity_types: Arc<mc_data::entity_types::EntityTypeRegistry>,
+    spawn_monsters: bool,
     compression: Compression,
     sessions: Arc<SessionRegistry>,
     simulation: Option<SimulationHandle>,
@@ -947,6 +948,7 @@ impl ChunkStreamState {
             passive_herd_passable,
             passive_spawn_rules,
             entity_types,
+            spawn_monsters: true,
             compression,
             sessions,
             simulation: None,
@@ -1036,6 +1038,11 @@ impl ChunkStreamState {
 
     pub(super) fn with_world_read(mut self, world_read: Option<mc_world::WorldReadView>) -> Self {
         self.world_read = world_read;
+        self
+    }
+
+    pub(super) fn with_spawn_monsters(mut self, spawn_monsters: bool) -> Self {
+        self.spawn_monsters = spawn_monsters;
         self
     }
 
@@ -2050,9 +2057,10 @@ impl ChunkStreamState {
                 }
                 #[cfg(test)]
                 let mut visibility = visibility;
+                let herd_spawns =
+                    natural_spawns_for_policy(&prepared.herd_spawns, self.spawn_monsters);
                 if let Some(simulation) = self.simulation.as_ref() {
-                    if let Err(error) =
-                        simulation.ensure_chunk_herd((cx, cz), prepared.herd_spawns.clone())
+                    if let Err(error) = simulation.ensure_chunk_herd((cx, cz), herd_spawns.clone())
                     {
                         warn!(?error, cx, cz, "simulation chunk herd request rejected");
                     }
@@ -2061,7 +2069,7 @@ impl ChunkStreamState {
                     {
                         visibility.extend(
                             self.sessions
-                                .ensure_chunk_herd_legacy_for_test((cx, cz), &prepared.herd_spawns),
+                                .ensure_chunk_herd_legacy_for_test((cx, cz), &herd_spawns),
                         );
                     }
                     #[cfg(not(test))]
@@ -2343,6 +2351,20 @@ impl ChunkStreamState {
             "chunk stream finished",
         );
     }
+}
+
+pub(super) fn natural_spawns_for_policy(
+    spawns: &[HerdSpawn],
+    spawn_monsters: bool,
+) -> Vec<HerdSpawn> {
+    if spawn_monsters {
+        return spawns.to_vec();
+    }
+    spawns
+        .iter()
+        .filter(|spawn| !spawn.hostile)
+        .cloned()
+        .collect()
 }
 
 impl Drop for ChunkStreamState {
@@ -4193,6 +4215,108 @@ mod tests {
         assert_eq!(cached.write_timing.frame_ms, 0);
         assert_eq!(cached.write_timing.socket_write_ms, 0);
         assert_eq!(cached.write_timing.framed_bytes, 17);
+    }
+
+    #[tokio::test]
+    async fn disabled_monsters_filters_cached_spawn_plan_before_publication() {
+        let registry = Arc::new(BlockRegistry::from_report(&[]).expect("empty registry builds"));
+        let world = Arc::new(Mutex::new(WorldStorage::in_memory_with_capacity(
+            Arc::clone(&registry),
+            1,
+        )));
+        let sessions = Arc::new(SessionRegistry::new());
+        let (tx, _rx) = mpsc::channel(8);
+        let desired = desired_chunk_set(0, 0, 0);
+        let (session_id, _) = sessions.register(
+            &LoggedInProfile {
+                uuid: uuid::Uuid::nil(),
+                name: "spawn-policy-player".to_owned(),
+            },
+            (0, 0),
+            0,
+            desired,
+            tx,
+            PlayerPose::new(0.5, DEFAULT_SPAWN_Y, 0.5),
+        );
+        let mut stream = ChunkStreamState::new(
+            Arc::clone(&world),
+            Arc::new(test_biome_registry()),
+            Arc::clone(&registry),
+            None,
+            Arc::new(ItemRegistry::from_report(&[])),
+            Arc::new(TagsData::default()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::block_entity_types::BlockEntityTypeRegistry::default()),
+            None,
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(Vec::new()),
+            Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+            Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+            Compression::Disabled,
+            Arc::clone(&sessions),
+            session_id,
+            0,
+            0,
+            0.0,
+            0,
+            ChunkPipelineResources::with_limits(1, 1),
+            ChunkPipelinePolicy::default(),
+        )
+        .with_spawn_monsters(false);
+        let request = stream.scheduler.poll_next().expect("chunk request");
+        stream.accept_result(ChunkPrepareResult {
+            request,
+            prepare_claim: None,
+            fetch_ms: 0,
+            pressure_flush: PressureFlushTiming::default(),
+            staged: Vec::new(),
+            outcome: ChunkPrepareOutcome::Ready(Box::new(PreparedChunkFrame {
+                frame: Bytes::from_static(b"chunk-frame"),
+                light: None,
+                herd_spawns: vec![
+                    HerdSpawn {
+                        chunk: (0, 0),
+                        slot: 0,
+                        entity_type_id: 1,
+                        entity_type_name: "minecraft:cow".to_owned(),
+                        position: Vec3::new(1.5, 64.0, 1.5),
+                        hostile: false,
+                        sheep_color: None,
+                    },
+                    HerdSpawn {
+                        chunk: (0, 0),
+                        slot: 1,
+                        entity_type_id: 2,
+                        entity_type_name: "minecraft:zombie".to_owned(),
+                        position: Vec3::new(2.5, 64.0, 2.5),
+                        hostile: true,
+                        sheep_color: None,
+                    },
+                ],
+                hydrated_campfires: Vec::new(),
+                packet_data_len: 0,
+                build_timing: ChunkBuildTiming::default(),
+                write_timing: ChunkWriteTiming::default(),
+            })),
+        });
+        let mut writer = tokio::io::sink();
+        let mut light_cache = LightCache::new();
+
+        assert_eq!(
+            stream
+                .emit_next_ready(&mut writer, &mut light_cache)
+                .await
+                .unwrap(),
+            EmitReadyResult::SentPacket
+        );
+        let entities = sessions.persisted_entity_records();
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].snapshot.type_name, "minecraft:cow");
+        sessions.set_world_time_and_update_sleep(NIGHT_START_TICK);
+        let entities_after_night = sessions.persisted_entity_records();
+        assert_eq!(entities_after_night.len(), 1);
+        assert_eq!(entities_after_night[0].snapshot.type_name, "minecraft:cow");
     }
 
     #[tokio::test]

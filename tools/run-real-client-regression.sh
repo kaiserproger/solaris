@@ -347,19 +347,32 @@ real_client_operator_list() {
 }
 
 write_real_client_server_config() {
-  local source_config target_config world_dir operators
+  local source_config target_config world_dir operators spawn_monsters_override
   source_config="$1"
   target_config="$2"
   world_dir="$3"
   operators="$(real_client_operator_list)"
-  if [[ -n "$world_dir" ]]; then
+  case "$AGENT_SCENARIO" in
+    playable-04-twenty-minute-survival-loop)
+      spawn_monsters_override="false"
+      ;;
+    playable-*)
+      spawn_monsters_override="true"
+      ;;
+    *)
+      spawn_monsters_override=""
+      ;;
+  esac
+  if [[ -n "$world_dir" && "$MODE" == "run" ]]; then
     mkdir -p "$world_dir"
   fi
-  awk -v world_dir="$world_dir" -v operators="$operators" '
+  awk -v world_dir="$world_dir" -v operators="$operators" -v spawn_monsters_override="$spawn_monsters_override" '
     BEGIN {
       section = ""
       seen_admin = 0
+      seen_simulation = 0
       wrote_admin_operators = 0
+      wrote_spawn_monsters = 0
       replaced_world_dir = 0
       escaped_world_dir = world_dir
       gsub(/\\/, "\\\\", escaped_world_dir)
@@ -371,13 +384,23 @@ write_real_client_server_config() {
         wrote_admin_operators = 1
       }
     }
+    function emit_spawn_monsters_if_needed() {
+      if (section == "simulation" && spawn_monsters_override != "" && wrote_spawn_monsters == 0) {
+        print "spawn_monsters = " spawn_monsters_override
+        wrote_spawn_monsters = 1
+      }
+    }
     /^[[:space:]]*\[[^]]+\][[:space:]]*$/ {
       emit_admin_operators_if_needed()
+      emit_spawn_monsters_if_needed()
       section = $0
       gsub(/^[[:space:]]*\[/, "", section)
       gsub(/\][[:space:]]*$/, "", section)
       if (section == "admin") {
         seen_admin = 1
+      }
+      if (section == "simulation") {
+        seen_simulation = 1
       }
       print
       next
@@ -392,9 +415,15 @@ write_real_client_server_config() {
       wrote_admin_operators = 1
       next
     }
+    section == "simulation" && spawn_monsters_override != "" && /^[[:space:]]*spawn_monsters[[:space:]]*=/ {
+      print "spawn_monsters = " spawn_monsters_override
+      wrote_spawn_monsters = 1
+      next
+    }
     { print }
     END {
       emit_admin_operators_if_needed()
+      emit_spawn_monsters_if_needed()
       if (seen_admin == 0) {
         print ""
         print "[admin]"
@@ -403,6 +432,11 @@ write_real_client_server_config() {
       if (world_dir != "" && replaced_world_dir == 0) {
         print "error: server config has no data.world_dir setting" > "/dev/stderr"
         exit 1
+      }
+      if (spawn_monsters_override != "" && seen_simulation == 0) {
+        print ""
+        print "[simulation]"
+        print "spawn_monsters = " spawn_monsters_override
       }
     }
   ' "$source_config" > "$target_config"
@@ -1021,17 +1055,37 @@ PY
 }
 
 validate_server_log() {
-  local server_log observations matches slow_matches
+  local server_log observations matches catastrophic_tick_matches slow_matches
   server_log="$1"
   observations="$2"
   matches="$(
     grep -En \
-      'runtime tick exceeded|lock wait exceeded.*lock="chunk_prepare"|degraded_delivery=true|teleport confirmation id mismatch|WARN .*dirty chunk cache pressure|dirty pressure flush failed|region changed before replace|chunk preparation abandoned after repeated dirty chunk cache pressure' \
+      'lock wait exceeded.*lock="chunk_prepare"|degraded_delivery=true|teleport confirmation id mismatch|WARN .*dirty chunk cache pressure|dirty pressure flush failed|region changed before replace|chunk preparation abandoned after repeated dirty chunk cache pressure' \
       "$server_log" || true
   )"
   if [[ -n "$matches" ]]; then
     printf 'error: server.log contains playable degradation warning(s)\n' >&2
     sed -n '1,20p' <<< "$matches" >&2
+    exit 1
+  fi
+
+  catastrophic_tick_matches="$(python3 - "$server_log" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+threshold_us = 500_000
+for line_number, line in enumerate(Path(sys.argv[1]).read_text(encoding="utf-8").splitlines(), 1):
+    if "runtime tick exceeded performance budget" not in line:
+        continue
+    match = re.search(r"(?:^|\s)tick_us=(\d+)(?:\s|$)", line)
+    if match is None or int(match.group(1)) >= threshold_us:
+        print(f"{line_number}:{line}")
+PY
+)"
+  if [[ -n "$catastrophic_tick_matches" ]]; then
+    printf 'error: server.log contains catastrophic runtime tick(s) at or above 500000 us\n' >&2
+    sed -n '1,20p' <<< "$catastrophic_tick_matches" >&2
     exit 1
   fi
 
@@ -1071,7 +1125,23 @@ fi
 if [[ "$MODE" == "prepare" ]]; then
   configure_primary_agent_bridge
   configure_second_agent_bridge
-  prepare_run_dir
+  SCENARIO_NO_DEBUG="$(requested_scenario_no_debug 2>/dev/null || printf '1\n')"
+  run_dir="$(prepare_run_dir)"
+  server_config_source="$(server_config_path)"
+  server_config="$run_dir/server.toml"
+  fresh_world_dir=""
+  if [[ "$FRESH_WORLD" == "1" || "$AGENT_SCENARIO" == "playable-46-generated-ruin-cache" ]]; then
+    fresh_world_dir="$run_dir/world"
+  fi
+  write_real_client_server_config "$server_config_source" "$server_config" "$fresh_world_dir"
+  {
+    printf 'server_config_source=%s\n' "$server_config_source"
+    printf 'server_config_effective=%s\n' "$server_config"
+    if [[ -n "$fresh_world_dir" ]]; then
+      printf 'server_world_dir=%s\n' "$fresh_world_dir"
+    fi
+  } >> "$run_dir/automation-driver.txt"
+  printf '%s\n' "$run_dir"
   exit 0
 fi
 

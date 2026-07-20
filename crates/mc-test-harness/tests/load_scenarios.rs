@@ -3320,6 +3320,7 @@ async fn start_load_server_with_options(options: LoadServerOptions) -> LoadServe
             chunk_budget: 8,
             fluid_tick_budget: 64,
             save_interval_ticks: 20,
+            spawn_monsters: true,
             seed: 0,
         },
         command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), true),

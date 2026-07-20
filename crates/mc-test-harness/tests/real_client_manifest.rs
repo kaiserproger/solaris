@@ -245,6 +245,53 @@ fn real_client_runner_rejects_a_scenario_missing_from_the_manifest() {
 }
 
 #[test]
+fn real_client_prepare_denies_operators_when_scenario_policy_is_unknown() {
+    let repo_root = repo_root();
+    let manifest_dir = tempfile::tempdir().expect("create manifest directory");
+    let manifest_path = manifest_dir.path().join("single-scenario.json");
+    let run_root = tempfile::tempdir().expect("create prepare run root");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "schema_version": 1,
+  "pack_id": "prepare-policy-test",
+  "quality_label": "test-only",
+  "scenarios": [{"id": "declared-scenario"}]
+}"#,
+    )
+    .expect("write manifest fixture");
+
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--prepare")
+        .env("SOLARIS_REAL_CLIENT_MANIFEST", manifest_path)
+        .env("SOLARIS_REAL_CLIENT_AGENT_SCENARIO", "undeclared-scenario")
+        .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
+        .output()
+        .expect("prepare undeclared scenario");
+
+    assert!(
+        output.status.success(),
+        "prepare may remain manifest-agnostic but must fail closed on privileges\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
+    let effective_config =
+        std::fs::read_to_string(Path::new(run_dir_text.trim()).join("server.toml"))
+            .expect("prepared server config exists");
+    let effective_config: toml::Value =
+        toml::from_str(&effective_config).expect("prepared server config parses");
+    assert_eq!(
+        effective_config["admin"]["operators"]
+            .as_array()
+            .map(Vec::len),
+        Some(0),
+        "unknown scenario policy must not grant operator privileges"
+    );
+}
+
+#[test]
 fn core_replay_real_client_gate_checks_structured_pack_with_gradle_runner() {
     let repo_root = repo_root();
     let pack_path =
@@ -347,6 +394,15 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
         automation_driver.contains("client_agent_scenario=playable-04-twenty-minute-survival-loop"),
         "prepared playable gate must default to the full loop scenario\n{automation_driver}"
     );
+    let effective_server_config = std::fs::read_to_string(run_dir.join("server.toml"))
+        .expect("prepared playable gate writes its effective server config");
+    let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
+        .expect("prepared playable server config parses as TOML");
+    assert_eq!(
+        effective_server_config["simulation"]["spawn_monsters"].as_bool(),
+        Some(false),
+        "the continuity soak must isolate natural hostile pressure from its separate combat gate"
+    );
     assert!(
         automation_driver
             .contains("client_gate=agent-run real-client configured: gradle-runclient")
@@ -365,6 +421,42 @@ fn playable_real_client_prepare_uses_playable_manifest_config_and_scenario() {
     .expect("parse prepared playable manifest");
     assert_eq!(manifest["pack_id"], "playable-real-client-loop");
     assert_eq!(manifest["quality_label"], "playable-spike");
+}
+
+#[test]
+fn playable_combat_prepare_keeps_natural_monsters_enabled() {
+    let repo_root = repo_root();
+    let runner_path = repo_root.join("tools/run-playable-client-gate.sh");
+    let run_root = tempfile::tempdir().expect("create playable combat run root");
+
+    let output = Command::new("bash")
+        .arg(&runner_path)
+        .arg("--prepare")
+        .env("SOLARIS_REAL_CLIENT_RUN_ROOT", run_root.path())
+        .env(
+            "SOLARIS_REAL_CLIENT_AGENT_SCENARIO",
+            "playable-21-earned-tool-zombie-combat",
+        )
+        .output()
+        .expect("prepare playable combat gate");
+
+    assert!(
+        output.status.success(),
+        "playable combat prepare failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run_dir_text = String::from_utf8(output.stdout).expect("run dir stdout is utf-8");
+    let run_dir = Path::new(run_dir_text.trim());
+    let effective_server_config = std::fs::read_to_string(run_dir.join("server.toml"))
+        .expect("prepared combat gate writes its effective server config");
+    let effective_server_config: toml::Value = toml::from_str(&effective_server_config)
+        .expect("prepared combat server config parses as TOML");
+    assert_eq!(
+        effective_server_config["simulation"]["spawn_monsters"].as_bool(),
+        Some(true),
+        "combat scenarios must retain natural hostile spawning"
+    );
 }
 
 #[test]
@@ -2148,6 +2240,94 @@ fn validate_run_rejects_playable_server_log_degradation_warnings() {
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("server.log"),
         "validator error should name server.log\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_run_accepts_subsecond_tick_budget_warnings() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-01-join-rejoin-chunks-movement",
+                "result": "passed",
+                "screenshots": ["screenshots/m94-01-join-rejoin-chunks-movement.png"]
+            }]
+        }),
+    );
+    std::fs::write(
+        run_dir
+            .path()
+            .join("screenshots/m94-01-join-rejoin-chunks-movement.png"),
+        valid_png_320x180(),
+    )
+    .expect("write valid screenshot");
+    std::fs::write(
+        run_dir.path().join("server.log"),
+        "WARN mc_net::server: runtime tick exceeded performance budget tick_us=412302\n",
+    )
+    .expect("write subsecond tick warning");
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        output.status.success(),
+        "functional real-client evidence must not fail on a subsecond budget warning\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_run_rejects_half_second_tick_stall() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    write_validate_run_artifacts(
+        run_dir.path(),
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "stabilization",
+            "result": "passed",
+            "scenarios": [{
+                "id": "m94-01-join-rejoin-chunks-movement",
+                "result": "passed",
+                "screenshots": ["screenshots/m94-01-join-rejoin-chunks-movement.png"]
+            }]
+        }),
+    );
+    std::fs::write(
+        run_dir
+            .path()
+            .join("screenshots/m94-01-join-rejoin-chunks-movement.png"),
+        valid_png_320x180(),
+    )
+    .expect("write valid screenshot");
+    std::fs::write(
+        run_dir.path().join("server.log"),
+        "WARN mc_net::server: runtime tick exceeded performance budget tick_us=500000\n",
+    )
+    .expect("write catastrophic tick warning");
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "real-client validator accepted a half-second server stall\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("catastrophic runtime tick"),
+        "validator must name the catastrophic tick threshold\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

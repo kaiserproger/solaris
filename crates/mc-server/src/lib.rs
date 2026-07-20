@@ -182,6 +182,8 @@ pub struct SimulationSection {
     pub random_tick_speed: u32,
     #[serde(default = "default_save_interval_ticks")]
     pub save_interval_ticks: u64,
+    #[serde(default = "default_spawn_monsters")]
+    pub spawn_monsters: bool,
 }
 
 /// Optional directory containing server-side Lua plugins.
@@ -347,6 +349,7 @@ impl Default for SimulationSection {
         Self {
             random_tick_speed: policy.random_tick_speed,
             save_interval_ticks: policy.save_interval_ticks,
+            spawn_monsters: policy.spawn_monsters,
         }
     }
 }
@@ -362,6 +365,7 @@ impl SimulationSection {
             chunk_budget: defaults.chunk_budget,
             fluid_tick_budget: defaults.fluid_tick_budget,
             save_interval_ticks: self.save_interval_ticks.max(1),
+            spawn_monsters: self.spawn_monsters,
             seed: seed as u64,
         }
     }
@@ -455,6 +459,10 @@ fn default_random_tick_speed() -> u32 {
 
 fn default_save_interval_ticks() -> u64 {
     mc_net::RandomTickPolicy::default().save_interval_ticks
+}
+
+fn default_spawn_monsters() -> bool {
+    mc_net::RandomTickPolicy::default().spawn_monsters
 }
 
 fn default_allow_local_dev_operators() -> bool {
@@ -601,6 +609,7 @@ mod tests {
         assert!(!cfg.admin.allow_local_dev_operators);
         assert_eq!(cfg.simulation.random_tick_speed, 5);
         assert_eq!(cfg.simulation.save_interval_ticks, 1200);
+        assert!(cfg.simulation.spawn_monsters);
         assert_eq!(cfg.chunk_pipeline.chunk_send_rate, 8);
         assert_eq!(cfg.chunk_pipeline.chunk_load_rate, 16);
         assert_eq!(cfg.chunk_pipeline.chunk_generate_rate, 16);
@@ -634,6 +643,7 @@ mod tests {
         assert_eq!(cfg.chunk_pipeline.chunk_prepare_batch_size, 8);
         assert_eq!(cfg.simulation.random_tick_speed, 3);
         assert_eq!(cfg.simulation.save_interval_ticks, 20);
+        assert!(cfg.simulation.spawn_monsters);
         assert!(cfg.data.vanilla_data_dir.is_none());
         assert_eq!(cfg.data.worldgen_mode, WorldgenMode::VanillaLike);
         assert_eq!(
@@ -984,11 +994,13 @@ mod tests {
             [simulation]
             random_tick_speed = 7
             save_interval_ticks = 40
+            spawn_monsters = false
         "#;
         let cfg: ServerConfig = toml::from_str(toml_src).expect("parse");
 
         assert_eq!(cfg.simulation.random_tick_speed, 7);
         assert_eq!(cfg.simulation.save_interval_ticks, 40);
+        assert!(!cfg.simulation.spawn_monsters);
     }
 
     #[test]
@@ -1086,6 +1098,7 @@ mod tests {
         let section = SimulationSection {
             random_tick_speed: 0,
             save_interval_ticks: 0,
+            spawn_monsters: false,
         };
         let policy = section.to_network(42, 5);
 
@@ -1094,6 +1107,7 @@ mod tests {
         assert_eq!(policy.chunk_budget, 64);
         assert_eq!(policy.fluid_tick_budget, 256);
         assert_eq!(policy.save_interval_ticks, 1);
+        assert!(!policy.spawn_monsters);
         assert_eq!(policy.seed, 42);
     }
 

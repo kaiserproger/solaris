@@ -704,6 +704,7 @@ pub struct RandomTickPolicy {
     pub chunk_budget: usize,
     pub fluid_tick_budget: usize,
     pub save_interval_ticks: u64,
+    pub spawn_monsters: bool,
     pub seed: u64,
 }
 
@@ -715,6 +716,7 @@ impl Default for RandomTickPolicy {
             chunk_budget: 64,
             fluid_tick_budget: DEFAULT_FLUID_TICK_BUDGET,
             save_interval_ticks: 20,
+            spawn_monsters: true,
             seed: 0,
         }
     }
@@ -731,6 +733,7 @@ impl RandomTickPolicy {
             chunk_budget: self.chunk_budget.max(1),
             fluid_tick_budget: self.fluid_tick_budget.max(1),
             save_interval_ticks: self.save_interval_ticks.max(1),
+            spawn_monsters: self.spawn_monsters,
             seed: self.seed,
         }
     }
@@ -1676,6 +1679,7 @@ where
                 chunk_pipeline_resources.clone(),
                 config.chunk_pipeline,
             )
+            .with_spawn_monsters(config.random_tick.spawn_monsters)
             .with_world_read(world_read.clone())
             .with_world_mutation(world_mutation.clone())
             .with_chunk_source(chunk_source)
