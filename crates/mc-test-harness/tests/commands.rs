@@ -5,9 +5,11 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    ClientboundCommands, ClientboundSetTime, ClientboundSystemChat, CommandNodeKind,
-    ConfirmTeleportation, GameEvent, GameMode, MovePlayerFlags, ServerboundChat,
-    ServerboundChatCommand, ServerboundMovePlayerPos, SetCenterChunk, SynchronizePlayerPosition,
+    ClientboundCommands, ClientboundContainerSetContent, ClientboundOpenScreen, ClientboundSetTime,
+    ClientboundSystemChat, CommandNodeKind, ConfirmTeleportation, ContainerInput, GameEvent,
+    GameMode, HashedStack, HashedStackComponentHashes, MovePlayerFlags, ServerboundChat,
+    ServerboundChatCommand, ServerboundContainerClick, ServerboundMovePlayerPos, SetCenterChunk,
+    SynchronizePlayerPosition,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -434,6 +436,233 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
 }
 
 #[tokio::test]
+async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("catalog");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "catalog"
+            name = "Catalog"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined", "inventory.menu.clicked"]
+            capabilities = ["inventory_menus"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            function on_player_joined(event)
+                solaris.send_message(event.player_id, "menu-command-ready")
+                solaris.open_inventory_menu(event.player_id, "market", "Market", {
+                    {slot = 0, resource = "minecraft:apple", count = 1}
+                })
+            end
+
+            function on_inventory_menu_clicked(event)
+                solaris.send_message(
+                    event.player_id,
+                    "clicked:" .. event.menu_id .. ":" .. event.slot .. ":" .. event.click
+                )
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let observer = plugins.path().join("observer");
+    std::fs::create_dir(&observer).expect("create observer plugin directory");
+    std::fs::write(
+        observer.join("plugin.toml"),
+        r#"
+            id = "observer"
+            name = "Observer"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["inventory.menu.clicked"]
+            player_commands = ["menu-fence"]
+        "#,
+    )
+    .expect("write observer manifest");
+    std::fs::write(
+        observer.join("main.lua"),
+        r#"
+            function on_inventory_menu_clicked(event)
+                solaris.send_message(event.player_id, "leaked-menu-click")
+            end
+
+            function on_player_command(event)
+                solaris.send_message(event.player_id, "observer-fence")
+            end
+        "#,
+    )
+    .expect("write observer source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let apple_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:apple").unwrap())
+        .expect("embedded apple item");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 49)
+        .with_item_registry(Arc::clone(&items))
+        .with_generator(generator);
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua inventory menu wire test".into(),
+        max_players: 1,
+        view_distance: 2,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks,
+        world: Some(Arc::new(tokio::sync::Mutex::new(world))),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client.drive_login(addr, "MenuPlayer").await.expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let sync: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    client
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: sync.teleport_id,
+        })
+        .await
+        .expect("ack teleport");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "menu-command-ready"
+    );
+
+    let open = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundOpenScreen::ID,
+            Duration::from_secs(5),
+            LATENCY_SENSITIVE_FRAME_WAIT_LIMITS,
+        )
+        .await
+        .expect("script menu open frame");
+    let screen = ClientboundOpenScreen::decode(&mut open.frame.body.clone())
+        .expect("decode script OpenScreen");
+    assert_eq!(screen.menu_type, 0);
+    assert_eq!(literal_text_component_text(&screen.title_nbt), "Market");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let content = loop {
+        let frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("script menu content frame");
+        if frame.id != ClientboundContainerSetContent::ID {
+            continue;
+        }
+        let content = ClientboundContainerSetContent::decode(&mut frame.body.clone())
+            .expect("decode script menu content");
+        if content.container_id == screen.container_id {
+            break content;
+        }
+    };
+    assert_eq!(content.items.len(), 45);
+    assert_eq!(content.items[0].item_id, apple_id);
+    assert_eq!(content.items[0].count, 1);
+    assert_eq!(content.items[0].custom_name, None);
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: content.container_id,
+            state_id: content.state_id + 1,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(0, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: apple_id,
+                count: 1,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("send stale script menu click");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "menu-fence".to_owned(),
+        })
+        .await
+        .expect("fence stale menu click delivery");
+    assert_eq!(next_system_chat_text(&mut client).await, "observer-fence");
+
+    client
+        .write_packet(&ServerboundContainerClick {
+            container_id: content.container_id,
+            state_id: content.state_id,
+            slot_num: 0,
+            button_num: 0,
+            container_input: ContainerInput::Pickup,
+            changed_slots: vec![(0, HashedStack::empty())],
+            carried_item: HashedStack::Actual {
+                item_id: apple_id,
+                count: 1,
+                components: HashedStackComponentHashes::empty(),
+            },
+        })
+        .await
+        .expect("click script menu item");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "clicked:market:0:primary"
+    );
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "menu-fence".to_owned(),
+        })
+        .await
+        .expect("fence targeted menu click delivery");
+    assert_eq!(next_system_chat_text(&mut client).await, "observer-fence");
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
 async fn lua_operator_command_is_hidden_from_non_operators_and_routes_for_operators() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("admin-day");
@@ -760,7 +989,11 @@ async fn next_system_chat_text(client: &mut Client) -> String {
 }
 
 fn text_component_text(packet: &ClientboundSystemChat) -> String {
-    let mut bytes = Bytes::copy_from_slice(&packet.content_nbt);
+    literal_text_component_text(&packet.content_nbt)
+}
+
+fn literal_text_component_text(component: &[u8]) -> String {
+    let mut bytes = Bytes::copy_from_slice(component);
     let tag = mc_nbt::read_network(&mut bytes).expect("read text component nbt");
     let mc_nbt::Tag::Compound(fields) = tag else {
         panic!("system chat component root must be a compound");

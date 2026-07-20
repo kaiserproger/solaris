@@ -106,8 +106,13 @@ replacement-readiness claims.
   through a normal movement packet, and receives the owning plugin's targeted
   `player.zone_entered` reply. Changed bounds do not repeat entry while the
   player remains inside. Workspace tests, strict Clippy, fmt, code-health and
-  the 94-test `block_edit` target pass; inventory menus and atomic
-  inventory/storage transactions remain future production slices.
+  the 94-test `block_edit` target pass.
+- Lua inventory menus now have an end-to-end wire gate in an embedded playable
+  world. The test proves admitted Lua open, the client `OpenScreen` and fixed
+  content, stale-state rejection, a normal predicted primary click, and the
+  plugin's response. A second subscribed plugin plus a later targeted command
+  fence proves `inventory.menu.clicked` did not leak beyond the menu owner.
+  Atomic inventory/storage transactions remain the next production slice.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 

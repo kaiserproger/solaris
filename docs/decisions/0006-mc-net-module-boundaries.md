@@ -417,6 +417,14 @@ Other accepted concrete boundaries in this staged migration are:
   session cleanup forgets the player. The registry mutex is released before
   targeted event delivery awaits queue admission. Lua never receives session,
   entity or registry handles, and rejected movement cannot publish zone entry.
+- `play::containers::script_menu` owns the immutable plugin-menu layout,
+  item resolution, fixed-slot click classification and plugin/menu/player
+  identity fence. `play::session::script_menu_endpoint` consumes admitted Lua
+  commands and routes open/close requests through the target session's ordered
+  reliable lane. `play.rs` remains the packet coordinator and holds the active
+  window in the connection-owned interaction state. Rejected or stale clicks
+  only resync content; accepted clicks publish a typed event to the retained
+  plugin owner. The wire harness covers the full Lua-to-client-to-Lua path.
 - `play::player_damage_adapter` owns fall/contact/general player damage
   orchestration, publication projection, melee-knockback conversion and its
   concrete request/result DTOs. Damage and shield rules remain in `combat`;

@@ -4,10 +4,9 @@ Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
 other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
-`mc-net` provides the `0.6.0` plugin-storage and zone adapters. Menu,
-transaction, colony, and villager adapters do not exist yet. The examples are
-contract-tested fixtures; zone entry is the first live gameplay event they can
-use.
+`mc-net` provides the `0.6.0` plugin-storage, zone, and inventory-menu adapters.
+Inventory/storage transaction, colony, and villager adapters do not exist yet.
+The examples remain fail-closed where one of those adapters is required.
 
 ## Package And Manifest
 
@@ -161,9 +160,9 @@ requests are consumed into explicit failure results. Later submissions either
 receive the same explicit failure after that drain or stop command orchestration
 if their queue is closed during shutdown.
 
-A future inventory adapter will own menus after admission. Plugins describe
-fixed display slots but will not receive container, slot-stack, NBT, or
-click-packet state:
+The inventory adapter owns menus after admission. Plugins describe fixed
+display slots but do not receive container, slot-stack, NBT, or click-packet
+state:
 
 ```lua
 solaris.open_inventory_menu(player_id, menu_id, title, {
@@ -174,7 +173,15 @@ solaris.close_inventory_menu(player_id, menu_id)
 
 Menu ids use the same 64-byte id rule, titles and labels are at most 128 bytes,
 and a menu has at most 54 unique slots. `click` is one of `primary`, `secondary`,
-`shift_primary`, or `shift_secondary`.
+`shift_primary`, or `shift_secondary`. The connected player's ordered reliable
+session lane carries open and close commands. The active window rejects stale
+state, empty/player-inventory slots, unsupported click modes, and forged
+container ids with an authoritative content resync; focused classifier tests
+cover those reject branches. Accepted fixed-slot clicks publish
+`inventory.menu.clicked` only to the plugin that opened the menu. A wire test
+covers Lua admission, exact title/item/count content, stale-state rejection, a
+normal predicted client click, targeted Lua delivery, a second subscribed
+plugin proving non-delivery, and the owning plugin response.
 
 A future transaction adapter will treat each inventory/storage request as one
 commit. Positive inventory `delta` grants a resource and negative `delta`
