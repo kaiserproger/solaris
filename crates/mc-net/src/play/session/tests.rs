@@ -9405,7 +9405,12 @@ fn player_body_push_releases_both_locks_before_session_publication() {
     let updated_pose = PlayerPose::new(0.3, 64.0, 0.5);
     let update_registry = Arc::clone(&registry);
     let update = std::thread::spawn(move || {
-        update_registry.commit_player_pose(&SimulationAuthority::for_test(), player, updated_pose)
+        update_registry.commit_player_pose(
+            &SimulationAuthority::for_test(),
+            player,
+            updated_pose,
+            0.0,
+        )
     });
     reached_rx
         .recv_timeout(Duration::from_secs(1))
@@ -9429,7 +9434,8 @@ fn player_body_push_releases_both_locks_before_session_publication() {
     let pose_dispatches = update
         .join()
         .expect("player pose update worker")
-        .expect("accepted player pose commit");
+        .expect("accepted player pose commit")
+        .0;
 
     assert!(
         session_available,

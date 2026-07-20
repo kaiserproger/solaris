@@ -7,7 +7,7 @@ use mc_entity::EntityId;
 use tracing::{debug, warn};
 
 use crate::play::PlayerPose;
-use crate::play::simulation::{SimulationAuthority, SimulationRequestError};
+use crate::play::simulation::{CommittedPlayerPose, SimulationAuthority, SimulationRequestError};
 
 use super::outbound::VisibilityDispatch;
 use super::player_pose_authority::{
@@ -25,8 +25,9 @@ impl SessionRegistry {
         _authority: &SimulationAuthority,
         id: SessionId,
         pose: PlayerPose,
-    ) -> Result<Vec<VisibilityDispatch>, SimulationRequestError> {
-        let accepted = {
+        exhaustion: f32,
+    ) -> Result<(Vec<VisibilityDispatch>, CommittedPlayerPose), SimulationRequestError> {
+        let (accepted, committed) = {
             let mut inner = self.lock_inner("accept player pose");
             if !inner.sessions.contains_key(&id) {
                 return Err(SimulationRequestError::StaleSession);
@@ -51,6 +52,13 @@ impl SessionRegistry {
                 guard,
             );
             player_state.pose = pose;
+            let resources_changed = player_state.survival.add_exhaustion(exhaustion);
+            let committed = CommittedPlayerPose {
+                food: player_state.survival.food,
+                saturation: player_state.survival.saturation,
+                exhaustion: player_state.survival.exhaustion,
+                resources_changed,
+            };
             drop(player_state);
             let accepted = accept_player_pose_locked(&mut inner, id, pose)
                 .expect("accepted session remains present under its session lock");
@@ -59,9 +67,12 @@ impl SessionRegistry {
                 id,
                 accepted.old_prewarm_frontier(),
             );
-            accepted
+            (accepted, committed)
         };
-        Ok(self.publish_accepted_player_pose(id, pose, accepted))
+        Ok((
+            self.publish_accepted_player_pose(id, pose, accepted),
+            committed,
+        ))
     }
 
     #[cfg(test)]

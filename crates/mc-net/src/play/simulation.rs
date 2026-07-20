@@ -324,6 +324,7 @@ pub(super) enum SimulationCommand {
     CommitPlayerPose {
         actor_session: SessionId,
         pose: super::PlayerPose,
+        exhaustion: f32,
     },
     CommitPlayerStateEvent {
         actor_session: SessionId,
@@ -435,7 +436,7 @@ pub(super) enum SimulationResponse {
     AnimalFeed(Result<Option<Box<CommittedAnimalFeed>>, SimulationRequestError>),
     SheepShear(Result<Option<Box<CommittedSheepShear>>, SimulationRequestError>),
     PlayerSurvival(Result<Option<Box<PlayerSurvivalCommitOutcome>>, SimulationRequestError>),
-    PlayerPose(Result<(), SimulationRequestError>),
+    PlayerPose(Result<CommittedPlayerPose, SimulationRequestError>),
     PlayerStateEvent(Result<(), SimulationRequestError>),
     PlayerInventory(Box<Result<PlayerInventoryCommitOutcome, SimulationRequestError>>),
     BowRelease(Result<Option<Box<CommittedBowRelease>>, SimulationRequestError>),
@@ -445,6 +446,22 @@ pub(super) enum SimulationResponse {
     OpaqueBlockEntity(Result<bool, SimulationRequestError>),
     CampfireUse(Result<Option<Box<CommittedCampfireUse>>, SimulationRequestError>),
     TntIgnition(Result<Option<Box<CommittedTntIgnition>>, SimulationRequestError>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct CommittedPlayerPose {
+    pub(super) food: i32,
+    pub(super) saturation: f32,
+    pub(super) exhaustion: f32,
+    pub(super) resources_changed: bool,
+}
+
+impl CommittedPlayerPose {
+    pub(super) fn apply_resources_to(self, survival: &mut SurvivalState) {
+        survival.food = self.food;
+        survival.saturation = self.saturation;
+        survival.exhaustion = self.exhaustion;
+    }
 }
 
 #[derive(Debug)]
@@ -2251,12 +2268,14 @@ impl SimulationHandle {
     pub(super) async fn commit_player_pose(
         &self,
         pose: super::PlayerPose,
-    ) -> Result<(), SimulationRequestError> {
+        exhaustion: f32,
+    ) -> Result<CommittedPlayerPose, SimulationRequestError> {
         let actor_session = self.session_id()?;
         let receiver = self
             .enqueue_player_command_wait(SimulationCommand::CommitPlayerPose {
                 actor_session,
                 pose,
+                exhaustion,
             })
             .await?;
         match receiver.await {
@@ -5246,10 +5265,14 @@ impl SimulationOwner {
                 SimulationCommand::CommitPlayerPose {
                     actor_session,
                     pose,
+                    exhaustion,
                 } => {
                     let result = sessions
-                        .commit_player_pose(&self.authority, *actor_session, *pose)
-                        .map(dispatch_visibility_commands);
+                        .commit_player_pose(&self.authority, *actor_session, *pose, *exhaustion)
+                        .map(|(dispatches, committed)| {
+                            dispatch_visibility_commands(dispatches);
+                            committed
+                        });
                     SimulationResponse::PlayerPose(result)
                 }
                 SimulationCommand::CommitPlayerStateEvent {
@@ -7734,6 +7757,7 @@ mod tests {
                 &SimulationAuthority::for_test(),
                 bob,
                 PlayerPose::new(20.5, 64.0, 0.5),
+                0.0,
             )
             .expect("move target out of melee range");
         let mut request = Box::pin(
@@ -7877,6 +7901,7 @@ mod tests {
                 &SimulationAuthority::for_test(),
                 alice,
                 PlayerPose::new(20.5, 64.0, 0.5),
+                0.0,
             )
             .expect("move attacker away from target");
         let mut authoritative_pose = Box::pin(
@@ -8087,11 +8112,19 @@ mod tests {
         pose.pitch = -12.0;
         pose.flags = mc_protocol::packets::play::MovePlayerFlags::new(true, false);
         pose.sprinting = true;
-        let mut request = Box::pin(session_handle.commit_player_pose(pose));
+        let mut request = Box::pin(session_handle.commit_player_pose(pose, 0.25));
 
         assert_request_enqueued(request.as_mut(), &handle).await;
         assert_eq!(owner.process_tick(&registry, 1).processed, 1);
-        assert_eq!(request.await, Ok(()));
+        assert_eq!(
+            request.await,
+            Ok(CommittedPlayerPose {
+                food: 20,
+                saturation: 5.0,
+                exhaustion: 0.25,
+                resources_changed: false,
+            })
+        );
 
         let session_pose = registry.player_pose(session).expect("active player pose");
         assert_eq!(session_pose.x, pose.x);
@@ -8110,6 +8143,37 @@ mod tests {
         assert_eq!(persisted_pose.pitch, pose.pitch);
         assert_eq!(persisted_pose.flags, pose.flags);
         assert_eq!(persisted_pose.sprinting, pose.sprinting);
+        assert_eq!(persisted.lock().unwrap().survival.exhaustion, 0.25);
+
+        let mut threshold = Box::pin(session_handle.commit_player_pose(pose, 3.75));
+        assert_request_enqueued(threshold.as_mut(), &handle).await;
+        assert_eq!(owner.process_tick(&registry, 2).processed, 1);
+        assert_eq!(
+            threshold.await,
+            Ok(CommittedPlayerPose {
+                food: 20,
+                saturation: 4.0,
+                exhaustion: 0.0,
+                resources_changed: true,
+            })
+        );
+        assert_eq!(persisted.lock().unwrap().survival.saturation, 4.0);
+
+        let mut local = SurvivalState {
+            health: 7.0,
+            ..SurvivalState::FULL
+        };
+        CommittedPlayerPose {
+            food: 19,
+            saturation: 0.0,
+            exhaustion: 1.5,
+            resources_changed: true,
+        }
+        .apply_resources_to(&mut local);
+        assert_eq!(local.health, 7.0);
+        assert_eq!(local.food, 19);
+        assert_eq!(local.saturation, 0.0);
+        assert_eq!(local.exhaustion, 1.5);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -8121,7 +8185,7 @@ mod tests {
         let (handle, mut owner) = simulation_channel_with_capacity(1);
         let session_handle = handle.for_session(session);
         let mut request =
-            Box::pin(session_handle.commit_player_pose(PlayerPose::new(40.5, 70.0, 40.5)));
+            Box::pin(session_handle.commit_player_pose(PlayerPose::new(40.5, 70.0, 40.5), 0.25));
 
         assert_request_enqueued(request.as_mut(), &handle).await;
         let _ = registry.unregister(session);

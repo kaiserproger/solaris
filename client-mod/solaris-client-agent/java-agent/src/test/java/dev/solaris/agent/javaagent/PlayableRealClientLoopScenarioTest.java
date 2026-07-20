@@ -3737,21 +3737,6 @@ final class PlayableRealClientLoopScenarioTest {
     }
 
     @Test
-    void realClientHungerDrainJumpsInPlaceInsteadOfSteeringInCircles() throws Exception {
-        String source = Files.readString(Path.of(
-            "src/main/java/dev/solaris/agent/javaagent/MinecraftScenarioClient.java"
-        ));
-        String method = source.substring(
-            source.indexOf("public boolean drainHungerBySprinting("),
-            source.indexOf("public ScenarioFoodUseResult eatSelectedFood(")
-        );
-
-        assertTrue(method.contains("minecraft.options.keyJump.setDown(true)"));
-        assertTrue(method.contains("minecraft.options.keyUp.setDown(false)"));
-        assertFalse(method.contains("setYRot"));
-    }
-
-    @Test
     void minecraftScenarioPlayerVisibilityFiltersByRequestedPlayerName() throws Exception {
         String source = Files.readString(Path.of(
             "src/main/java/dev/solaris/agent/javaagent/MinecraftScenarioClient.java"

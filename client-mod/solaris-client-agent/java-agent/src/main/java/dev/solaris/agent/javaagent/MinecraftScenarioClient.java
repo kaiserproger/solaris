@@ -1555,30 +1555,44 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     @Override
     public boolean drainHungerBySprinting(Duration timeout) throws Exception {
         long deadlineNanos = System.nanoTime() + timeout.toNanos();
+        List<int[]> waypoints = executor.callOnClientThread(
+            MinecraftScenarioClient::safeHungerDrainWaypointsOnClientThread
+        );
+        if (waypoints.isEmpty()) {
+            return false;
+        }
+        int nextWaypoint = 0;
         try {
-            do {
-                long observedVersion = ClientStateEvents.tickVersion();
+            while (true) {
                 boolean foodBelowFull = executor.callOnClientThread(() -> {
                     Minecraft minecraft = requireInPlay();
-                    if (minecraft.player.getFoodData().getFoodLevel() < 20) {
-                        return true;
-                    }
-                    minecraft.options.keyUp.setDown(false);
-                    minecraft.options.keySprint.setDown(false);
-                    minecraft.options.keyJump.setDown(true);
-                    return false;
+                    return minecraft.player.getFoodData().getFoodLevel() < 20;
                 });
                 if (foodBelowFull) {
                     return true;
                 }
-                if (!awaitClientTick(observedVersion, deadlineNanos)) {
-                    break;
+
+                long remainingNanos = deadlineNanos - System.nanoTime();
+                if (remainingNanos <= 0L) {
+                    return false;
                 }
-            } while (true);
-            return executor.callOnClientThread(() -> {
-                Minecraft minecraft = requireInPlay();
-                return minecraft.player.getFoodData().getFoodLevel() < 20;
-            });
+                long legNanos = Math.min(remainingNanos, Duration.ofSeconds(12).toNanos());
+                int[] waypoint = waypoints.get(nextWaypoint);
+                boolean reached = approachPosition(
+                    waypoint[0],
+                    waypoint[1],
+                    Duration.ofNanos(legNanos)
+                );
+                if (reached) {
+                    nextWaypoint = (nextWaypoint + 1) % waypoints.size();
+                } else {
+                    waypoints.remove(nextWaypoint);
+                    if (waypoints.isEmpty()) {
+                        return false;
+                    }
+                    nextWaypoint %= waypoints.size();
+                }
+            }
         } finally {
             executor.callOnClientThread(() -> {
                 Minecraft minecraft = Minecraft.getInstance();
@@ -3298,6 +3312,87 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         }
         BlockState state = minecraft.level.getBlockState(pos);
         return (state.isAir() || !state.blocksMotion()) && minecraft.level.getFluidState(pos).isEmpty();
+    }
+
+    private static List<int[]> safeHungerDrainWaypointsOnClientThread() {
+        Minecraft minecraft = requireInPlay();
+        BlockPos origin = minecraft.player.blockPosition();
+        List<int[]> waypoints = new ArrayList<>();
+        if (!safeHungerDrainColumn(minecraft, origin)) {
+            return waypoints;
+        }
+        for (Direction direction : HORIZONTAL_DIRECTIONS) {
+            BlockPos endpoint = safeHungerDrainEndpoint(minecraft, origin, direction);
+            if (endpoint != null) {
+                waypoints.add(new int[] {endpoint.getX(), endpoint.getZ()});
+                waypoints.add(new int[] {origin.getX(), origin.getZ()});
+            }
+        }
+        return waypoints;
+    }
+
+    private static BlockPos safeHungerDrainEndpoint(
+        Minecraft minecraft,
+        BlockPos origin,
+        Direction direction
+    ) {
+        BlockPos previous = origin;
+        int[] verticalOffsets = {0, 1, -1};
+        for (int distance = 1; distance <= 6; distance++) {
+            BlockPos horizontal = origin.relative(direction, distance);
+            BlockPos next = null;
+            for (int verticalOffset : verticalOffsets) {
+                BlockPos candidate = new BlockPos(
+                    horizontal.getX(),
+                    previous.getY() + verticalOffset,
+                    horizontal.getZ()
+                );
+                if (safeHungerDrainColumn(minecraft, candidate)) {
+                    next = candidate;
+                    break;
+                }
+            }
+            if (next == null) {
+                return null;
+            }
+            previous = next;
+        }
+        return previous;
+    }
+
+    private static boolean safeHungerDrainColumn(Minecraft minecraft, BlockPos feet) {
+        BlockPos head = feet.above();
+        BlockPos support = feet.below();
+        if (!minecraft.level.isLoaded(feet)
+            || !minecraft.level.isLoaded(head)
+            || !minecraft.level.isLoaded(support)) {
+            return false;
+        }
+        BlockState feetState = minecraft.level.getBlockState(feet);
+        BlockState headState = minecraft.level.getBlockState(head);
+        BlockState supportState = minecraft.level.getBlockState(support);
+        return (feetState.isAir() || !feetState.blocksMotion())
+            && minecraft.level.getFluidState(feet).isEmpty()
+            && !isDamagingHungerDrainBlock(feetState)
+            && (headState.isAir() || !headState.blocksMotion())
+            && minecraft.level.getFluidState(head).isEmpty()
+            && !isDamagingHungerDrainBlock(headState)
+            && !supportState.isAir()
+            && supportState.blocksMotion()
+            && minecraft.level.getFluidState(support).isEmpty()
+            && !isDamagingHungerDrainBlock(supportState);
+    }
+
+    private static boolean isDamagingHungerDrainBlock(BlockState state) {
+        return state.is(Blocks.CACTUS)
+            || state.is(Blocks.CAMPFIRE)
+            || state.is(Blocks.FIRE)
+            || state.is(Blocks.MAGMA_BLOCK)
+            || state.is(Blocks.POWDER_SNOW)
+            || state.is(Blocks.SOUL_CAMPFIRE)
+            || state.is(Blocks.SOUL_FIRE)
+            || state.is(Blocks.SWEET_BERRY_BUSH)
+            || state.is(Blocks.WITHER_ROSE);
     }
 
     private static boolean dropsAsDirt(String blockId) {

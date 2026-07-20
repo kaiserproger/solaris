@@ -195,8 +195,8 @@ pub(in crate::play) use session::{ENTITY_PICKUP_RADIUS, ITEM_PICKUP_DELAY_TICKS}
 pub(crate) use simulation::simulation_channel;
 use simulation::{
     ActiveShieldTransition, AnimalFeedPlan, AnimalFeedTargets, AuthoritativePlayerStateSnapshot,
-    BowReleasePlan, FoodUsePlan, PlayerSurvivalCommitOutcome, PlayerSurvivalPlan,
-    SelectedItemDropPlan, SheepShearPlan,
+    BowReleasePlan, CommittedPlayerPose, FoodUsePlan, PlayerSurvivalCommitOutcome,
+    PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
 pub(crate) use simulation::{
@@ -10799,7 +10799,19 @@ where
     }
 
     *player_pose = new_pose;
-    commit_authoritative_player_pose(simulation, *player_pose).await?;
+    let exhaustion = if game_mode == GameMode::Survival {
+        movement_exhaustion(old_pose, *player_pose)
+    } else {
+        0.0
+    };
+    let committed_pose =
+        commit_authoritative_player_movement(simulation, *player_pose, exhaustion).await?;
+    if game_mode == GameMode::Survival {
+        committed_pose.apply_resources_to(survival_state);
+        if committed_pose.resources_changed {
+            write_packet(writer, &survival_state.as_packet(), compression).await?;
+        }
+    }
     if game_mode == GameMode::Survival
         && let Some(state) = interaction.as_deref_mut()
     {
@@ -10816,29 +10828,6 @@ where
             *player_pose,
         )
         .await?;
-        let exhaustion = movement_exhaustion(old_pose, *player_pose);
-        let mut updated_survival = *survival_state;
-        if exhaustion > 0.0 && updated_survival.add_exhaustion(exhaustion) {
-            if let Some(state) = interaction.as_deref_mut() {
-                let expected_inventory = state.inventory.clone();
-                commit_player_survival_update(
-                    state,
-                    writer,
-                    survival_state,
-                    xp_state,
-                    expected_inventory,
-                    updated_survival,
-                    xp_state.clone(),
-                    None,
-                    true,
-                    *player_pose,
-                )
-                .await?;
-            } else {
-                *survival_state = updated_survival;
-                write_packet(writer, &survival_state.as_packet(), compression).await?;
-            }
-        }
     }
     let new_center = player_pose.chunk_pos();
     replan_after_movement(
@@ -10858,12 +10847,25 @@ async fn commit_authoritative_player_pose(
     simulation: &SimulationHandle,
     pose: PlayerPose,
 ) -> Result<(), ConnectionError> {
-    simulation.commit_player_pose(pose).await.map_err(|error| {
-        warn!(?error, "simulation player pose commit failed");
-        ConnectionError::RuntimeUnavailable {
-            operation: "committing player pose",
-        }
-    })
+    commit_authoritative_player_movement(simulation, pose, 0.0)
+        .await
+        .map(drop)
+}
+
+async fn commit_authoritative_player_movement(
+    simulation: &SimulationHandle,
+    pose: PlayerPose,
+    exhaustion: f32,
+) -> Result<CommittedPlayerPose, ConnectionError> {
+    simulation
+        .commit_player_pose(pose, exhaustion)
+        .await
+        .map_err(|error| {
+            warn!(?error, "simulation player pose commit failed");
+            ConnectionError::RuntimeUnavailable {
+                operation: "committing player pose",
+            }
+        })
 }
 
 #[cfg(test)]

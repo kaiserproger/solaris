@@ -89,6 +89,17 @@ replacement-readiness claims.
   real-client evidence separately proved wooden-sword zombie and skeleton
   combat. The run emitted 44 tick-budget warnings with a maximum of 412.302 ms,
   so this is functional/playable evidence, not a clean performance result.
+- P11 artifact
+  `.analysis/real-client-runs/20260720T155306Z-real-client-playable-loop-YAMHzs`
+  passed the no-debug food loop. The real client killed a natural chicken,
+  collected its drop, sprinted until food fell from 20 to 19, then consumed the
+  earned chicken and observed food return to 20 while the stack fell from one
+  to zero. The failed predecessor exposed that fractional movement exhaustion
+  was discarded before reaching the 4.0 threshold. Accepted movement now adds
+  every positive exhaustion increment in the same owner turn that commits the
+  pose, while health packets remain limited to visible food or saturation
+  changes. The repeat after review emitted no tick-budget or slow-tick
+  warnings. This is focused gameplay evidence, not a broad performance result.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 
