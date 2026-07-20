@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use crate::block::BlockRegistry;
 use crate::chunk::{Chunk, ChunkPos};
 
 use super::read_view::ChunkSnapshot;
-use super::{REGION_AXIS_CHUNKS, WorldError, WorldStorage, make_cached_chunk_mut, region_of};
+use super::{REGION_AXIS_CHUNKS, WorldError, WorldStorage, region_of};
 
 const DIRTY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -24,6 +24,7 @@ static REGION_TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 pub struct DirtyFlushPlan {
     regions: Vec<DirtyFlushRegionPlan>,
     chunks: usize,
+    dirty_chunks_at_capture: usize,
     registry: Arc<BlockRegistry>,
     item_registry: Option<Arc<ItemRegistry>>,
     unix_time: u32,
@@ -51,32 +52,89 @@ struct PlannedChunkPayload {
     current_tick: u64,
     dirty_generation: u64,
     snapshot: ChunkSnapshot,
-    #[cfg(test)]
-    snapshot_token: ChunkSnapshotToken,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DirtyFlushCommit {
     regions: Vec<DirtyFlushRegionCommit>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+pub struct DirtyFlushInstall {
+    regions: Vec<DirtyFlushInstalledRegion>,
+    installed_chunks: usize,
+}
+
+#[derive(Debug)]
+pub struct DirtyFlushSynced {
+    regions: Vec<DirtyFlushInstalledRegion>,
+    installed_chunks: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirtyFlushFinalize {
+    installed_chunks: usize,
+    cleaned_chunks: usize,
+}
+
+#[derive(Debug)]
 struct DirtyFlushRegionCommit {
     region: (i32, i32),
+    region_path: PathBuf,
+    expected_version: Option<RegionFileVersion>,
+    tmp_path: PathBuf,
     chunks: Vec<CommittedChunkPayload>,
+}
+
+#[derive(Debug)]
+struct DirtyFlushInstalledRegion {
+    region_path: PathBuf,
+    chunks: Vec<CommittedChunkPayload>,
+}
+
+impl Drop for DirtyFlushRegionCommit {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.tmp_path);
+    }
+}
+
+impl DirtyFlushInstall {
+    pub fn sync(self) -> Result<DirtyFlushSynced, WorldError> {
+        let mut synced_parents = HashSet::new();
+        for region in &self.regions {
+            let parent = region
+                .region_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .to_path_buf();
+            if synced_parents.insert(parent) {
+                sync_parent_dir(&region.region_path)?;
+            }
+        }
+        Ok(DirtyFlushSynced {
+            regions: self.regions,
+            installed_chunks: self.installed_chunks,
+        })
+    }
+}
+
+impl DirtyFlushFinalize {
+    #[must_use]
+    pub fn installed_chunks(self) -> usize {
+        self.installed_chunks
+    }
+
+    #[must_use]
+    pub fn cleaned_chunks(self) -> usize {
+        self.cleaned_chunks
+    }
 }
 
 #[derive(Debug, Clone)]
 struct CommittedChunkPayload {
     pos: ChunkPos,
-    current_tick: u64,
     dirty_generation: u64,
     snapshot: ChunkSnapshot,
-    #[cfg(test)]
-    snapshot_token: ChunkSnapshotToken,
-    #[cfg(test)]
-    payload_digest: u64,
-    uncompressed_nbt: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -85,16 +143,6 @@ type ChunkSnapshotToken = usize;
 #[cfg(test)]
 fn chunk_snapshot_token(chunk: &ChunkSnapshot) -> ChunkSnapshotToken {
     Arc::as_ptr(chunk) as ChunkSnapshotToken
-}
-
-#[cfg(test)]
-fn payload_digest(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash
 }
 
 #[cfg(test)]
@@ -123,16 +171,6 @@ fn encode_dirty_flush_chunk_payload(
         .map_err(WorldError::from)
 }
 
-fn can_fast_clean_chunk(
-    chunk: &ChunkSnapshot,
-    planned_generation: u64,
-    planned_snapshot: &ChunkSnapshot,
-) -> bool {
-    planned_generation != 0
-        && chunk.dirty_generation == planned_generation
-        && Arc::ptr_eq(chunk, planned_snapshot)
-}
-
 impl DirtyFlushPlan {
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -142,6 +180,16 @@ impl DirtyFlushPlan {
     #[must_use]
     pub fn chunk_count(&self) -> usize {
         self.chunks
+    }
+
+    #[must_use]
+    pub fn dirty_chunks_at_capture(&self) -> usize {
+        self.dirty_chunks_at_capture
+    }
+
+    #[must_use]
+    pub fn captures_all_dirty_chunks(&self) -> bool {
+        self.chunks == self.dirty_chunks_at_capture
     }
 
     pub fn write(self) -> Result<DirtyFlushCommit, WorldError> {
@@ -193,28 +241,21 @@ impl DirtyFlushPlan {
                 by_slot.insert((payload.local_x, payload.local_z), payload.clone());
                 committed_chunks.push(CommittedChunkPayload {
                     pos: planned.pos,
-                    current_tick: planned.current_tick,
                     dirty_generation: planned.dirty_generation,
                     snapshot: planned.snapshot,
-                    #[cfg(test)]
-                    snapshot_token: planned.snapshot_token,
-                    #[cfg(test)]
-                    payload_digest: payload_digest(&payload.uncompressed_nbt),
-                    uncompressed_nbt: payload.uncompressed_nbt,
                 });
             }
 
             let mut payloads: Vec<ChunkPayload> = by_slot.into_values().collect();
             payloads.sort_by_key(|p| (p.local_z, p.local_x));
 
-            replace_region_file(
-                &region.region_path,
-                &payloads,
-                region.expected_version.as_ref(),
-            )?;
+            let tmp_path = write_unique_region_tmp(&region.region_path, &payloads)?;
 
             commits.push(DirtyFlushRegionCommit {
                 region: region.region,
+                region_path: region.region_path,
+                expected_version: region.expected_version,
+                tmp_path,
                 chunks: committed_chunks,
             });
         }
@@ -228,9 +269,9 @@ impl DirtyFlushPlan {
     }
 }
 
-fn replace_region_file(
+fn install_region_file(
     region_path: &Path,
-    payloads: &[ChunkPayload],
+    tmp_path: &Path,
     expected_version: Option<&RegionFileVersion>,
 ) -> Result<(), WorldError> {
     if region_file_version(region_path)?.as_ref() != expected_version {
@@ -248,13 +289,11 @@ fn replace_region_file(
         }));
     }
 
-    let tmp_path = write_unique_region_tmp(region_path, payloads)?;
     if expected_version.is_some() {
-        install_existing_region_file(region_path, &tmp_path, expected_version)?;
+        install_existing_region_file(region_path, tmp_path, expected_version)?;
     } else {
-        install_new_region_file(region_path, &tmp_path)?;
+        install_new_region_file(region_path, tmp_path)?;
     }
-    sync_parent_dir(region_path)?;
     Ok(())
 }
 
@@ -393,12 +432,7 @@ impl WorldStorage {
         current_tick: u64,
         max_chunks: usize,
     ) -> Result<DirtyFlushPlan, WorldError> {
-        let mut dirty_snapshots: Vec<(ChunkPos, ChunkSnapshot)> = self
-            .resident
-            .flushable_snapshots()
-            .into_iter()
-            .filter(|(_, chunk)| chunk.dirty)
-            .collect();
+        let (dirty_chunks_at_capture, mut dirty_snapshots) = self.resident.dirty_flush_snapshot();
         dirty_snapshots.sort_by_key(|(pos, _)| {
             (
                 pos.x.div_euclid(REGION_AXIS_CHUNKS),
@@ -412,6 +446,7 @@ impl WorldStorage {
             return Ok(DirtyFlushPlan {
                 regions: Vec::new(),
                 chunks: 0,
+                dirty_chunks_at_capture,
                 registry: Arc::clone(&self.registry),
                 item_registry: self.item_registry.as_ref().map(Arc::clone),
                 unix_time: 0,
@@ -444,8 +479,6 @@ impl WorldStorage {
                     current_tick,
                     dirty_generation: chunk.dirty_generation,
                     snapshot: Arc::clone(&chunk),
-                    #[cfg(test)]
-                    snapshot_token: chunk_snapshot_token(&chunk),
                 });
                 chunks += 1;
             }
@@ -456,10 +489,12 @@ impl WorldStorage {
                 dirty_payloads,
             });
         }
+        regions.sort_by_key(|region| region.region);
 
         Ok(DirtyFlushPlan {
             regions,
             chunks,
+            dirty_chunks_at_capture,
             registry: Arc::clone(&self.registry),
             item_registry: self.item_registry.as_ref().map(Arc::clone),
             unix_time: now,
@@ -478,59 +513,130 @@ impl WorldStorage {
     /// matches the payload that was written. Chunks changed after planning
     /// remain dirty.
     pub fn commit_dirty_flush(&mut self, commit: DirtyFlushCommit) -> Result<usize, WorldError> {
-        let mut cleaned = 0usize;
-        let mut written_regions = Vec::new();
-        for region in commit.regions {
-            written_regions.push(region.region);
-            for planned in region.chunks {
-                let CommittedChunkPayload {
-                    pos,
-                    current_tick,
-                    dirty_generation,
-                    snapshot,
-                    uncompressed_nbt,
-                    ..
-                } = planned;
-                let registry = Arc::clone(&self.registry);
-                let item_registry = self.item_registry.clone();
-                let cleaned_chunk = self
-                    .resident
-                    .mutate_snapshot(pos, move |chunk| {
-                        if !chunk.dirty {
-                            return Ok(false);
-                        }
-                        if dirty_generation != 0 && chunk.dirty_generation != dirty_generation {
-                            return Ok(false);
-                        }
-                        let matches = if can_fast_clean_chunk(chunk, dirty_generation, &snapshot) {
-                            true
-                        } else {
-                            let current = chunk_to_payload_with_items_at_tick(
-                                chunk,
-                                &registry,
-                                item_registry.as_deref(),
-                                0,
-                                current_tick,
-                            )?;
-                            current.uncompressed_nbt == uncompressed_nbt
-                        };
-                        if matches {
-                            drop(snapshot);
-                            make_cached_chunk_mut(chunk).dirty = false;
-                        }
-                        Ok::<_, WorldError>(matches)
-                    })
-                    .transpose()?
-                    .unwrap_or(false);
-                cleaned += usize::from(cleaned_chunk);
-            }
-        }
-        for region in written_regions {
-            self.regions.remove(&region);
-            self.region_lru.retain(|&k| k != region);
-        }
+        let installed = self.install_dirty_flush(commit)?;
+        let synced = installed.sync()?;
+        Ok(self.finalize_dirty_flush(synced).cleaned_chunks())
+    }
 
-        Ok(cleaned)
+    /// Install the exact planned region image for an externally serialized
+    /// save barrier. Chunks changed after that barrier stay dirty in memory.
+    pub fn commit_dirty_flush_snapshot(
+        &mut self,
+        commit: DirtyFlushCommit,
+    ) -> Result<usize, WorldError> {
+        let installed = self.install_dirty_flush_snapshot(commit)?;
+        let synced = installed.sync()?;
+        Ok(self.finalize_dirty_flush(synced).installed_chunks())
+    }
+
+    pub fn install_dirty_flush(
+        &mut self,
+        commit: DirtyFlushCommit,
+    ) -> Result<DirtyFlushInstall, WorldError> {
+        self.install_dirty_flush_with_mode(commit, false)
+    }
+
+    pub fn install_dirty_flush_snapshot(
+        &mut self,
+        commit: DirtyFlushCommit,
+    ) -> Result<DirtyFlushInstall, WorldError> {
+        self.install_dirty_flush_with_mode(commit, true)
+    }
+
+    fn install_dirty_flush_with_mode(
+        &mut self,
+        mut commit: DirtyFlushCommit,
+        barrier_snapshot: bool,
+    ) -> Result<DirtyFlushInstall, WorldError> {
+        let mut installed_regions = Vec::with_capacity(commit.regions.len());
+        let mut installed_chunks = 0usize;
+        for mut region in commit.regions.drain(..) {
+            let chunks = std::mem::take(&mut region.chunks);
+            let planned = chunks
+                .iter()
+                .map(|chunk| {
+                    (
+                        chunk.pos,
+                        chunk.dirty_generation,
+                        Arc::clone(&chunk.snapshot),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let install_result = if barrier_snapshot {
+                self.resident
+                    .install_region_snapshot_flush(&planned, || {
+                        install_region_file(
+                            &region.region_path,
+                            &region.tmp_path,
+                            region.expected_version.as_ref(),
+                        )
+                    })
+                    .map(|()| true)
+            } else {
+                self.resident.install_region_flush(&planned, || {
+                    install_region_file(
+                        &region.region_path,
+                        &region.tmp_path,
+                        region.expected_version.as_ref(),
+                    )
+                })
+            };
+            let current = match install_result {
+                Ok(current) => current,
+                Err(error) => {
+                    self.recover_partial_dirty_flush_install(installed_regions, installed_chunks)?;
+                    return Err(error);
+                }
+            };
+            if !current {
+                self.recover_partial_dirty_flush_install(installed_regions, installed_chunks)?;
+                return Err(WorldError::StaleRegion(region.region_path.clone()));
+            }
+            installed_chunks += chunks.len();
+            installed_regions.push(DirtyFlushInstalledRegion {
+                region_path: region.region_path.clone(),
+                chunks,
+            });
+            self.regions.remove(&region.region);
+            self.region_lru.retain(|&key| key != region.region);
+        }
+        Ok(DirtyFlushInstall {
+            regions: installed_regions,
+            installed_chunks,
+        })
+    }
+
+    fn recover_partial_dirty_flush_install(
+        &mut self,
+        regions: Vec<DirtyFlushInstalledRegion>,
+        installed_chunks: usize,
+    ) -> Result<(), WorldError> {
+        if regions.is_empty() {
+            return Ok(());
+        }
+        let synced = DirtyFlushInstall {
+            regions,
+            installed_chunks,
+        }
+        .sync()?;
+        let _ = self.finalize_dirty_flush(synced);
+        Ok(())
+    }
+
+    pub fn finalize_dirty_flush(&mut self, synced: DirtyFlushSynced) -> DirtyFlushFinalize {
+        let mut cleaned_chunks = 0usize;
+        for region in synced.regions {
+            let planned = region
+                .chunks
+                .into_iter()
+                .map(|chunk| (chunk.pos, chunk.dirty_generation, chunk.snapshot))
+                .collect::<Vec<_>>();
+            cleaned_chunks += self.resident.finalize_region_flush(planned);
+        }
+        DirtyFlushFinalize {
+            installed_chunks: synced.installed_chunks,
+            cleaned_chunks,
+        }
     }
 
     /// M6.b: write every dirty chunk in the cache back to its
@@ -553,12 +659,21 @@ impl WorldStorage {
         let mut stale_retries = 0usize;
         loop {
             let plan = self.plan_dirty_flush_at_tick(current_tick)?;
+            if !plan.captures_all_dirty_chunks() {
+                return Err(WorldError::JournalPendingDirtyChunks {
+                    dirty_chunks: plan.dirty_chunks_at_capture(),
+                    flushable_chunks: plan.chunk_count(),
+                });
+            }
             if plan.is_empty() {
                 return Ok(0);
             }
             pre_write(&plan);
-            match plan.write() {
-                Ok(commit) => return self.commit_dirty_flush(commit),
+            match plan
+                .write()
+                .and_then(|commit| self.commit_dirty_flush(commit))
+            {
+                Ok(cleaned) => return Ok(cleaned),
                 Err(WorldError::StaleRegion(_))
                     if stale_retries < DIRTY_FLUSH_STALE_REGION_RETRIES =>
                 {

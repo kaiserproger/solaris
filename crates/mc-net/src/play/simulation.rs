@@ -276,6 +276,7 @@ pub(super) enum SimulationCommand {
         entity_id: EntityId,
         damage: f32,
         attacker_costs: Option<Box<PlayerSurvivalPlan>>,
+        cooldown_tick: u64,
     },
     ApplyServerEntityEffect(Box<ServerEntityEffectCommand>),
     #[cfg(test)]
@@ -1795,7 +1796,7 @@ impl SimulationHandle {
         entity_id: EntityId,
         damage: f32,
     ) -> Result<PlayerAttackResult, SimulationRequestError> {
-        self.player_attack_server_entity_inner(entity_id, damage, None)
+        self.player_attack_server_entity_inner(entity_id, damage, None, 0)
             .await
     }
 
@@ -1804,9 +1805,15 @@ impl SimulationHandle {
         entity_id: EntityId,
         damage: f32,
         attacker_costs: PlayerSurvivalPlan,
+        cooldown_tick: u64,
     ) -> Result<PlayerAttackResult, SimulationRequestError> {
-        self.player_attack_server_entity_inner(entity_id, damage, Some(Box::new(attacker_costs)))
-            .await
+        self.player_attack_server_entity_inner(
+            entity_id,
+            damage,
+            Some(Box::new(attacker_costs)),
+            cooldown_tick,
+        )
+        .await
     }
 
     async fn player_attack_server_entity_inner(
@@ -1814,6 +1821,7 @@ impl SimulationHandle {
         entity_id: EntityId,
         damage: f32,
         attacker_costs: Option<Box<PlayerSurvivalPlan>>,
+        cooldown_tick: u64,
     ) -> Result<PlayerAttackResult, SimulationRequestError> {
         let attacker_session = self.session_id()?;
         let receiver = self
@@ -1822,6 +1830,7 @@ impl SimulationHandle {
                 entity_id,
                 damage,
                 attacker_costs,
+                cooldown_tick,
             })
             .await?;
         match receiver.await {
@@ -4597,7 +4606,9 @@ impl SimulationOwner {
                     entity_id,
                     damage,
                     attacker_costs,
+                    cooldown_tick,
                 } => {
+                    let authority_tick = sessions.simulation_tick();
                     let mut result = sessions.player_attack_entity(
                         &self.authority,
                         PlayerEntityAttack {
@@ -4605,6 +4616,7 @@ impl SimulationOwner {
                             entity_id: *entity_id,
                             amount: *damage,
                             attacker_costs: attacker_costs.as_deref(),
+                            authority_tick,
                         },
                     );
                     if let PlayerAttackResult::Damaged(outcome) = &mut result
@@ -4612,6 +4624,14 @@ impl SimulationOwner {
                             &mut **outcome
                     {
                         dispatch_visibility_commands(std::mem::take(dispatches));
+                    }
+                    if !matches!(result, PlayerAttackResult::ValidationRejected) {
+                        sessions.publish_player_attack(
+                            *attacker_session,
+                            entity_id.0,
+                            *cooldown_tick,
+                            authority_tick,
+                        );
                     }
                     SimulationResponse::PlayerAttack(result)
                 }
@@ -7652,6 +7672,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn reciprocal_player_attacks_commit_without_connection_loop_progress() {
         let registry = SessionRegistry::new();
+        let mut attacks = registry.subscribe_player_attacks();
         let (alice, _alice_rx) = register_test_session_at_with_outbound(
             &registry,
             "ReciprocalAlice",
@@ -7689,11 +7710,13 @@ mod tests {
             EntityId(i32::try_from(bob).unwrap()),
             4.0,
             attack_costs(Vec3::new(0.5, 64.0, 0.5)),
+            7,
         ));
         let mut bob_attack = Box::pin(bob_handle.player_attack_server_entity_with_costs(
             EntityId(i32::try_from(alice).unwrap()),
             4.0,
             attack_costs(Vec3::new(0.5, 64.0, 2.5)),
+            8,
         ));
 
         std::future::poll_fn(|cx| {
@@ -7704,6 +7727,23 @@ mod tests {
         .await;
         assert_eq!(handle.snapshot().depth, 2);
         assert_eq!(owner.process_tick(&registry, 2).processed, 2);
+        let first = attacks.try_recv().expect("first authority observation");
+        let second = attacks.try_recv().expect("second authority observation");
+        assert_eq!(
+            (first.attacker_session_id, first.target_entity_id),
+            (alice, i32::try_from(bob).unwrap())
+        );
+        assert_eq!(
+            (second.attacker_session_id, second.target_entity_id),
+            (bob, i32::try_from(alice).unwrap())
+        );
+        assert_eq!((first.cooldown_tick, second.cooldown_tick), (7, 8));
+        assert_eq!((first.authority_tick, second.authority_tick), (0, 0));
+        assert_eq!(
+            (first.authority_sequence, second.authority_sequence),
+            (1, 2)
+        );
+        assert!(attacks.try_recv().is_err());
         assert!(matches!(
             alice_attack.await.expect("Alice attack owner response"),
             PlayerAttackResult::Damaged(_)

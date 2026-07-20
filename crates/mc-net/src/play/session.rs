@@ -391,6 +391,8 @@ pub(crate) struct SessionRegistry {
     players_sleeping_percentage: AtomicU32,
     entity_lifecycle_tick: AtomicU64,
     simulation_tick_sender: tokio::sync::watch::Sender<u64>,
+    player_attack_sender: tokio::sync::broadcast::Sender<PlayerAttackObservation>,
+    player_attack_sequence: AtomicU64,
     active_session_sender: tokio::sync::watch::Sender<usize>,
     session_empty_generation: AtomicU64,
     session_became_empty: tokio::sync::Notify,
@@ -637,6 +639,7 @@ impl SessionRegistry {
         journal: Option<Box<dyn mc_entity::RegionalDecisionJournal>>,
     ) -> Self {
         let (simulation_tick_sender, _) = tokio::sync::watch::channel(0);
+        let (player_attack_sender, _) = tokio::sync::broadcast::channel(64);
         let (active_session_sender, _) = tokio::sync::watch::channel(0);
         let pressure_observation = Arc::new(SessionPressureObservation::default());
         Self {
@@ -657,6 +660,8 @@ impl SessionRegistry {
             players_sleeping_percentage: AtomicU32::new(DEFAULT_PLAYERS_SLEEPING_PERCENTAGE),
             entity_lifecycle_tick: AtomicU64::new(0),
             simulation_tick_sender,
+            player_attack_sender,
+            player_attack_sequence: AtomicU64::new(0),
             active_session_sender,
             session_empty_generation: AtomicU64::new(0),
             session_became_empty: tokio::sync::Notify::new(),
@@ -1155,6 +1160,33 @@ impl SessionRegistry {
 
     pub(crate) fn subscribe_simulation_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
         self.simulation_tick_sender.subscribe()
+    }
+
+    pub(crate) fn subscribe_player_attacks(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<PlayerAttackObservation> {
+        self.player_attack_sender.subscribe()
+    }
+
+    pub(crate) fn publish_player_attack(
+        &self,
+        attacker_session_id: SessionId,
+        target_entity_id: i32,
+        cooldown_tick: u64,
+        authority_tick: u64,
+    ) {
+        let authority_sequence = self
+            .player_attack_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        let observation = PlayerAttackObservation {
+            attacker_session_id,
+            target_entity_id,
+            cooldown_tick,
+            authority_tick,
+            authority_sequence,
+        };
+        let _ = self.player_attack_sender.send(observation);
     }
 
     pub(super) fn player_pose(&self, id: SessionId) -> Option<PlayerPose> {

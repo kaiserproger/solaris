@@ -37,7 +37,9 @@ mod read_view;
 #[cfg(test)]
 mod test_support;
 
-pub use dirty_flush::{DirtyFlushCommit, DirtyFlushPlan};
+pub use dirty_flush::{
+    DirtyFlushCommit, DirtyFlushFinalize, DirtyFlushInstall, DirtyFlushPlan, DirtyFlushSynced,
+};
 pub(crate) use read_view::ResidentPublicationState;
 pub use read_view::{
     ChunkDiskLoadPlan, ChunkPrepareSource, ChunkSnapshot, ChunkSnapshotPlan, ChunkSourceView,
@@ -71,6 +73,13 @@ pub enum WorldError {
     Nbt(#[from] mc_nbt::NbtError),
     #[error("region changed before replace: {0}")]
     StaleRegion(PathBuf),
+    #[error(
+        "dirty flush captured {dirty_chunks} dirty chunks but only {flushable_chunks} were journal-ready"
+    )]
+    JournalPendingDirtyChunks {
+        dirty_chunks: usize,
+        flushable_chunks: usize,
+    },
 }
 
 /// Handle to a world's chunk data, generated chunks, and dirty flush state.
@@ -3314,16 +3323,19 @@ mod tests {
         let registry = air_stone_registry();
         let mut world = WorldStorage::in_memory(Arc::clone(&registry));
         let position = ChunkPos { x: 0, z: 0 };
-        world
-            .insert_generated_chunk(
-                position,
-                Chunk::empty(
-                    position,
-                    BlockStateId(0),
-                    Identifier::parse("minecraft:plains").unwrap(),
-                ),
-            )
-            .unwrap();
+        let flushable = ChunkPos { x: 1, z: 0 };
+        for chunk_position in [position, flushable] {
+            world
+                .insert_generated_chunk(
+                    chunk_position,
+                    Chunk::empty(
+                        chunk_position,
+                        BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+        }
 
         let (result, touched) = world
             .mutation_view()
@@ -3345,8 +3357,18 @@ mod tests {
             crate::ResidentBlockEditBatchResult::Applied(ref applied) if applied.len() == 1
         ));
         assert_eq!(touched, vec![position]);
-        assert!(world.plan_dirty_flush().unwrap().is_empty());
-        assert_eq!(world.dirty_count(), 1);
+        let plan = world.plan_dirty_flush().unwrap();
+        assert_eq!(plan.chunk_count(), 1);
+        assert_eq!(plan.dirty_chunks_at_capture(), 2);
+        assert!(!plan.captures_all_dirty_chunks());
+        assert!(matches!(
+            world.flush_dirty(),
+            Err(WorldError::JournalPendingDirtyChunks {
+                dirty_chunks: 2,
+                flushable_chunks: 1,
+            })
+        ));
+        assert_eq!(world.dirty_count(), 2);
     }
 
     #[test]

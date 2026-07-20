@@ -209,6 +209,20 @@ use simulation::{
     PlayerSurvivalPlan, SelectedItemDropPlan, SheepShearPlan,
 };
 pub use simulation::{EntityEffectHandle, EntityEffectRequestError};
+
+/// One accepted attack as observed by the simulation authority.
+///
+/// Observations are emitted in `authority_sequence` order. The subscription is
+/// bounded telemetry: slow receivers get `RecvError::Lagged` rather than a
+/// silent gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlayerAttackObservation {
+    pub attacker_session_id: u64,
+    pub target_entity_id: i32,
+    pub cooldown_tick: u64,
+    pub authority_tick: u64,
+    pub authority_sequence: u64,
+}
 pub(crate) use simulation::{
     SIMULATION_COMMAND_BATCH_LIMIT, SimulationHandle, SimulationOwner, SimulationSaveSnapshot,
     simulation_channel_with_explosion_seed,
@@ -5996,30 +6010,12 @@ where
     else {
         return Ok(());
     };
-    let attack = match state
+    let result = match state
         .simulation
-        .player_attack_server_entity_with_costs(entity_id, damage, attacker_costs)
+        .player_attack_server_entity_with_costs(entity_id, damage, attacker_costs, current_tick)
         .await
     {
-        Ok(PlayerAttackResult::ValidationRejected) => {
-            debug!(
-                entity_id = packet.entity_id,
-                "entity attack ignored for invalid target"
-            );
-            return Ok(());
-        }
-        Ok(PlayerAttackResult::AcceptedNoDamage) => {
-            state.last_entity_attack_tick = Some(current_tick);
-            debug!(
-                entity_id = packet.entity_id,
-                "reachable entity attack accepted without damage"
-            );
-            return Ok(());
-        }
-        Ok(PlayerAttackResult::Damaged(outcome)) => {
-            state.last_entity_attack_tick = Some(current_tick);
-            *outcome
-        }
+        Ok(result) => result,
         Err(error) => {
             debug!(
                 ?error,
@@ -6027,6 +6023,27 @@ where
                 "simulation entity attack request rejected"
             );
             return Ok(());
+        }
+    };
+    let attack = match result {
+        PlayerAttackResult::ValidationRejected => {
+            debug!(
+                entity_id = packet.entity_id,
+                "entity attack ignored for invalid target"
+            );
+            return Ok(());
+        }
+        PlayerAttackResult::AcceptedNoDamage => {
+            state.last_entity_attack_tick = Some(current_tick);
+            debug!(
+                entity_id = packet.entity_id,
+                "reachable entity attack accepted without damage"
+            );
+            return Ok(());
+        }
+        PlayerAttackResult::Damaged(outcome) => {
+            state.last_entity_attack_tick = Some(current_tick);
+            *outcome
         }
     };
     dispatch_visibility_commands(state.sessions.broadcast_player_animation(state.session_id));

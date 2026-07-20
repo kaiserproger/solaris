@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::io::{BufRead, ErrorKind};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -68,7 +68,6 @@ type PhysicsMaterialCache = HashMap<
 static PHYSICS_MATERIAL_CACHE: OnceLock<std::sync::Mutex<PhysicsMaterialCache>> = OnceLock::new();
 const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ENTITY_TICKER_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const FINAL_DIRTY_FLUSH_MAX_ATTEMPTS: usize = 4;
 const DIRTY_ONLY_FLUSH_MAX_CHUNKS: usize = 64;
 const DIRTY_ONLY_FLUSH_STALE_REGION_RETRIES: usize = 3;
 const SLOW_SIMULATION_ATTRIBUTION_LIMIT: usize = 8;
@@ -155,6 +154,8 @@ pub struct ShutdownHandle {
     requested: Arc<AtomicBool>,
     notify: Arc<Notify>,
     save_coordinator: Arc<Mutex<()>>,
+    dirty_tail_generation: Arc<AtomicU64>,
+    dirty_tail_notify: Arc<Notify>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,6 +214,27 @@ impl ShutdownHandle {
 
     fn save_coordinator(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.save_coordinator)
+    }
+
+    fn mark_dirty_tail_progress(&self) {
+        self.dirty_tail_generation.fetch_add(1, Ordering::Release);
+        self.dirty_tail_notify.notify_waiters();
+    }
+
+    fn dirty_tail_generation(&self) -> u64 {
+        self.dirty_tail_generation.load(Ordering::Acquire)
+    }
+
+    async fn wait_for_dirty_tail_progress(&self, observed: u64) {
+        loop {
+            let notified = self.dirty_tail_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.dirty_tail_generation() != observed {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -383,6 +405,17 @@ impl RuntimeTelemetryHandle {
     #[must_use]
     pub fn subscribe_simulation_ticks(&self) -> tokio::sync::watch::Receiver<u64> {
         self.sessions.subscribe_simulation_ticks()
+    }
+
+    /// Subscribe to accepted attacks in authority order.
+    ///
+    /// The channel is bounded. A slow receiver gets `RecvError::Lagged` and
+    /// must treat the missing observations as a failed telemetry sample.
+    #[must_use]
+    pub fn subscribe_player_attacks(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<play::PlayerAttackObservation> {
+        self.sessions.subscribe_player_attacks()
     }
 
     /// Subscribe to exact play-session register and unregister notifications.
@@ -932,6 +965,7 @@ impl BoundServer {
             periodic_save_requests.as_ref(),
         ) {
             let dirty_flush = dirty_flush.clone();
+            let dirty_tail_progress = entity_config.shutdown.clone();
             let storage = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::WorldStorage,
                 "dirty flush notification install",
@@ -939,6 +973,7 @@ impl BoundServer {
                 world.lock().await,
             );
             storage.set_dirty_high_water_notifier(Arc::new(move || {
+                dirty_tail_progress.mark_dirty_tail_progress();
                 dirty_flush.request_dirty_flush();
             }));
         }
@@ -2081,15 +2116,34 @@ async fn flush_dirty_chunks_only(
             }
             Err(error) => return Err(format!("dirty-only flush write failed: {error}")),
         };
+        let install = {
+            let mut storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::SaveAllFlush,
+                "dirty-only flush install",
+                Instant::now(),
+                world.lock().await,
+            );
+            match storage.install_dirty_flush(commit) {
+                Ok(install) => install,
+                Err(mc_world::WorldError::StaleRegion(_))
+                    if stale_retries < DIRTY_ONLY_FLUSH_STALE_REGION_RETRIES =>
+                {
+                    stale_retries += 1;
+                    continue;
+                }
+                Err(error) => return Err(format!("dirty-only flush install failed: {error}")),
+            }
+        };
+        let synced = crate::dirty_flush::sync_dirty_flush_install_blocking_typed(install)
+            .await
+            .map_err(|error| format!("dirty-only flush sync failed: {error}"))?;
         let mut storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::SaveAllFlush,
-            "dirty-only flush commit",
+            "dirty-only flush finalize",
             Instant::now(),
             world.lock().await,
         );
-        let flushed_chunks = storage
-            .commit_dirty_flush(commit)
-            .map_err(|error| format!("dirty-only flush commit failed: {error}"))?;
+        let flushed_chunks = storage.finalize_dirty_flush(synced).cleaned_chunks();
         return Ok(DirtyOnlyFlushReport {
             planned_chunks,
             flushed_chunks,
@@ -3988,22 +4042,47 @@ pub(crate) async fn save_all_after_simulation_barrier(
     let _save_guard = coordinator.lock().await;
     let coordinator_us = elapsed_us(queue_started);
     let barrier_started = Instant::now();
-    let snapshot = match simulation.save_barrier(config.world.is_some()).await {
-        Ok(snapshot) => snapshot,
-        Err(error) => {
-            let elapsed = elapsed_us(total_started);
-            return SaveAllReport {
-                players_saved: 0,
-                entities_saved: 0,
-                chunks_flushed: 0,
-                world_metadata_saved: false,
-                timings: SaveAllTimings {
-                    queued_us: coordinator_us.saturating_add(elapsed_us(barrier_started)),
-                    total_us: elapsed,
-                    ..SaveAllTimings::default()
-                },
-                errors: vec![format!("simulation barrier failed: {error:?}")],
-            };
+    let mut journal_failure = sessions.subscribe_world_chunk_journal_failure();
+    let snapshot = loop {
+        let dirty_tail_generation = config.shutdown.dirty_tail_generation();
+        let snapshot = match simulation.save_barrier(config.world.is_some()).await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return save_barrier_error_report(
+                    total_started,
+                    coordinator_us.saturating_add(elapsed_us(barrier_started)),
+                    format!("simulation barrier failed: {error:?}"),
+                );
+            }
+        };
+        let captures_all_dirty_chunks = snapshot
+            .world_flush_plan
+            .as_ref()
+            .is_none_or(mc_world::DirtyFlushPlan::captures_all_dirty_chunks);
+        if captures_all_dirty_chunks {
+            break snapshot;
+        }
+        if *journal_failure.borrow() {
+            return save_barrier_error_report(
+                total_started,
+                coordinator_us.saturating_add(elapsed_us(barrier_started)),
+                "world chunk journal failed while completing save barrier".to_string(),
+            );
+        }
+
+        tokio::select! {
+            () = config
+                .shutdown
+                .wait_for_dirty_tail_progress(dirty_tail_generation) => {}
+            changed = journal_failure.changed() => {
+                if changed.is_err() || *journal_failure.borrow() {
+                    return save_barrier_error_report(
+                        total_started,
+                        coordinator_us.saturating_add(elapsed_us(barrier_started)),
+                        "world chunk journal failed while completing save barrier".to_string(),
+                    );
+                }
+            }
         }
     };
     let barrier_us = elapsed_us(barrier_started);
@@ -4017,6 +4096,25 @@ pub(crate) async fn save_all_after_simulation_barrier(
         total_started,
     )
     .await
+}
+
+fn save_barrier_error_report(
+    total_started: Instant,
+    queued_us: u64,
+    error: String,
+) -> SaveAllReport {
+    SaveAllReport {
+        players_saved: 0,
+        entities_saved: 0,
+        chunks_flushed: 0,
+        world_metadata_saved: false,
+        timings: SaveAllTimings {
+            queued_us,
+            total_us: elapsed_us(total_started),
+            ..SaveAllTimings::default()
+        },
+        errors: vec![error],
+    }
 }
 
 #[cfg(test)]
@@ -4060,6 +4158,7 @@ async fn save_all_with_context_snapshot_locked(
     queued_us: u64,
     total_started: Instant,
 ) -> SaveAllReport {
+    let barrier_snapshot = snapshot.is_some();
     let mut report = SaveAllReport {
         players_saved: 0,
         entities_saved: 0,
@@ -4123,13 +4222,10 @@ async fn save_all_with_context_snapshot_locked(
         }
     };
 
-    let max_flush_attempts = if require_clean_dirty_flush {
-        FINAL_DIRTY_FLUSH_MAX_ATTEMPTS
-    } else {
-        1
-    };
     let mut world_flush_clean = false;
-    for attempt in 1..=max_flush_attempts {
+    let mut attempt = 0usize;
+    loop {
+        attempt = attempt.saturating_add(1);
         let started = Instant::now();
         let storage = crate::lock_metrics::timed_guard(
             crate::lock_metrics::LockMetricKind::SaveAllFlush,
@@ -4151,6 +4247,7 @@ async fn save_all_with_context_snapshot_locked(
                 }
             }
         };
+        let flushable_before = storage.has_flushable_dirty_chunks();
         drop(storage);
         report.timings.flush_plan_us = report
             .timings
@@ -4159,7 +4256,7 @@ async fn save_all_with_context_snapshot_locked(
 
         let planned_chunks = flush_plan.chunk_count();
         let flush_started = Instant::now();
-        let remaining_dirty = if flush_plan.is_empty() {
+        let (remaining_dirty, has_flushable_dirty) = if flush_plan.is_empty() {
             info!(
                 attempt,
                 flushed = 0usize,
@@ -4174,7 +4271,7 @@ async fn save_all_with_context_snapshot_locked(
                 %context,
                 "world storage save pressure"
             );
-            storage_before.dirty_chunks
+            (storage_before.dirty_chunks, flushable_before)
         } else {
             let started = Instant::now();
             let commit = match crate::dirty_flush::write_dirty_flush_blocking(flush_plan).await {
@@ -4196,18 +4293,25 @@ async fn save_all_with_context_snapshot_locked(
                 .saturating_add(elapsed_us(started));
 
             let started = Instant::now();
-            let mut storage = crate::lock_metrics::timed_guard(
-                crate::lock_metrics::LockMetricKind::SaveAllFlush,
-                "save-all dirty flush commit",
-                Instant::now(),
-                world.lock().await,
-            );
-            let flushed = match storage.commit_dirty_flush(commit) {
-                Ok(flushed) => flushed,
+            let install = {
+                let mut storage = crate::lock_metrics::timed_guard(
+                    crate::lock_metrics::LockMetricKind::SaveAllFlush,
+                    "save-all dirty flush install",
+                    Instant::now(),
+                    world.lock().await,
+                );
+                if barrier_snapshot {
+                    storage.install_dirty_flush_snapshot(commit)
+                } else {
+                    storage.install_dirty_flush(commit)
+                }
+            };
+            let install = match install {
+                Ok(install) => install,
                 Err(err) => {
                     report
                         .errors
-                        .push(format!("dirty chunks: flush commit failed: {err}"));
+                        .push(format!("dirty chunks: flush install failed: {err}"));
                     report.timings.flush_commit_us = report
                         .timings
                         .flush_commit_us
@@ -4215,8 +4319,35 @@ async fn save_all_with_context_snapshot_locked(
                     break;
                 }
             };
+            let synced =
+                match crate::dirty_flush::sync_dirty_flush_install_blocking_typed(install).await {
+                    Ok(synced) => synced,
+                    Err(err) => {
+                        report
+                            .errors
+                            .push(format!("dirty chunks: flush sync failed: {err}"));
+                        report.timings.flush_commit_us = report
+                            .timings
+                            .flush_commit_us
+                            .saturating_add(elapsed_us(started));
+                        break;
+                    }
+                };
+            let mut storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::SaveAllFlush,
+                "save-all dirty flush finalize",
+                Instant::now(),
+                world.lock().await,
+            );
+            let finalized = storage.finalize_dirty_flush(synced);
+            let flushed = if barrier_snapshot {
+                finalized.installed_chunks()
+            } else {
+                finalized.cleaned_chunks()
+            };
             report.chunks_flushed = report.chunks_flushed.saturating_add(flushed);
             let storage_after = storage.stats();
+            let has_flushable_dirty = storage.has_flushable_dirty_chunks();
             info!(
                 attempt,
                 flushed,
@@ -4235,18 +4366,19 @@ async fn save_all_with_context_snapshot_locked(
                 .timings
                 .flush_commit_us
                 .saturating_add(elapsed_us(started));
-            storage_after.dirty_chunks
+            (storage_after.dirty_chunks, has_flushable_dirty)
         };
 
         if remaining_dirty == 0 {
             world_flush_clean = true;
-        }
-        if !require_clean_dirty_flush || remaining_dirty == 0 {
             break;
         }
-        if attempt == max_flush_attempts {
+        if !require_clean_dirty_flush {
+            break;
+        }
+        if !has_flushable_dirty {
             report.errors.push(format!(
-                "dirty chunks: final flush left {remaining_dirty} dirty chunks after {attempt} attempts"
+                "dirty chunks: final flush found {remaining_dirty} journal-pending chunks after producer drain"
             ));
             break;
         }
@@ -7453,6 +7585,7 @@ end
             .unwrap();
         let save_report = save.await;
         assert!(save_report.is_ok(), "save errors: {:?}", save_report.errors);
+        assert_eq!(save_report.chunks_flushed, 1);
 
         let mut reopened = WorldStorage::open(tmp.path(), blocks).unwrap();
         assert_eq!(
@@ -7465,6 +7598,154 @@ end
             Some(mc_world::BlockStateId(0)),
             "post-barrier mutation must remain live and dirty"
         );
+    }
+
+    #[tokio::test]
+    async fn active_save_waits_for_the_exact_world_journal_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(
+            BlockRegistry::from_report(&[report("minecraft:air", &[], &[(0, true, &[])])]).unwrap(),
+        );
+        let items = Arc::new(mc_data::items::ItemRegistry::default());
+        let config = save_all_test_config(
+            tmp.path(),
+            Arc::clone(&blocks),
+            items,
+            canonical_entity_types(),
+        );
+        let world = config.world.as_ref().unwrap();
+        let position = mc_world::ChunkPos { x: 0, z: 0 };
+        let mutation = {
+            let mut storage = world.lock().await;
+            storage
+                .insert_generated_chunk(
+                    position,
+                    mc_world::Chunk::empty(
+                        position,
+                        mc_world::BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            assert!(matches!(
+                storage.stamp_cached_chunks_for_world_journal(41, &[position]),
+                mc_world::JournalStampResult::Stamped(_)
+            ));
+            storage.mutation_view()
+        };
+        let dirty_tail_progress = config.shutdown.clone();
+        world
+            .lock()
+            .await
+            .set_dirty_high_water_notifier(Arc::new(move || {
+                dirty_tail_progress.mark_dirty_tail_progress();
+            }));
+
+        let sessions = play::SessionRegistry::new();
+        let (simulation, mut owner) = play::simulation_channel();
+        let mut save = std::pin::pin!(save_all_after_simulation_barrier(
+            "journal-fenced save test",
+            &config,
+            &sessions,
+            &simulation,
+        ));
+        let command_ready = tokio::select! {
+            report = &mut save => panic!("save completed before owner barrier: {report:?}"),
+            ready = owner.wait_for_command() => ready,
+        };
+        assert!(command_ready);
+        assert_eq!(
+            owner
+                .process_tick_with_world(&sessions, config.world.as_ref(), None, 1)
+                .processed,
+            1
+        );
+
+        assert_eq!(
+            mutation.clear_journal_pending_conditionally(40, &[position]),
+            0,
+            "a different journal decision must not release the save"
+        );
+        std::future::poll_fn(|context| {
+            assert!(
+                std::future::Future::poll(save.as_mut(), context).is_pending(),
+                "save acknowledged a journal-fenced dirty chunk"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+
+        assert_eq!(
+            mutation.clear_journal_pending_conditionally(41, &[position]),
+            1
+        );
+        let command_ready = tokio::select! {
+            report = &mut save => panic!("save completed before the replacement barrier: {report:?}"),
+            ready = owner.wait_for_command() => ready,
+        };
+        assert!(
+            command_ready,
+            "fence release must request a new owner barrier"
+        );
+        assert_eq!(
+            owner
+                .process_tick_with_world(&sessions, config.world.as_ref(), None, 2)
+                .processed,
+            1
+        );
+        let report = save.await;
+        assert!(report.is_ok(), "save errors: {:?}", report.errors);
+        assert_eq!(report.chunks_flushed, 1);
+        assert_eq!(world.lock().await.dirty_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn final_save_rejects_an_orphaned_world_journal_fence() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+        let blocks = Arc::new(
+            BlockRegistry::from_report(&[report("minecraft:air", &[], &[(0, true, &[])])]).unwrap(),
+        );
+        let config = save_all_test_config(
+            tmp.path(),
+            blocks,
+            Arc::new(mc_data::items::ItemRegistry::default()),
+            canonical_entity_types(),
+        );
+        let world = config.world.as_ref().unwrap();
+        let position = mc_world::ChunkPos { x: 0, z: 0 };
+        {
+            let mut storage = world.lock().await;
+            storage
+                .insert_generated_chunk(
+                    position,
+                    mc_world::Chunk::empty(
+                        position,
+                        mc_world::BlockStateId(0),
+                        Identifier::parse("minecraft:plains").unwrap(),
+                    ),
+                )
+                .unwrap();
+            assert!(matches!(
+                storage.stamp_cached_chunks_for_world_journal(52, &[position]),
+                mc_world::JournalStampResult::Stamped(_)
+            ));
+        }
+
+        let sessions = play::SessionRegistry::new();
+        let report =
+            save_all_after_drain_with_context("orphaned journal fence test", &config, &sessions)
+                .await;
+
+        assert!(!report.is_ok());
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| { error.contains("journal-pending chunks after producer drain") })
+        );
+        assert_eq!(world.lock().await.dirty_count(), 1);
     }
 
     #[tokio::test]

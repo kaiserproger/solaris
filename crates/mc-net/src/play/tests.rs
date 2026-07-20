@@ -18927,6 +18927,7 @@ async fn authoritative_pvp_shield_block_refreshes_local_identity_before_retry() 
                 entity_id: EntityId(i32::try_from(session_id).unwrap()),
                 amount: 4.0,
                 attacker_costs: None,
+                authority_tick: sessions.simulation_tick(),
             },
         );
         assert!(matches!(

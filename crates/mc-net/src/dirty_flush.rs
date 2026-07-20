@@ -47,6 +47,16 @@ pub(crate) async fn write_dirty_flush_blocking_typed(
     }
 }
 
+pub(crate) async fn sync_dirty_flush_install_blocking_typed(
+    install: mc_world::storage::DirtyFlushInstall,
+) -> Result<mc_world::storage::DirtyFlushSynced, DirtyFlushWriteError> {
+    match tokio::task::spawn_blocking(move || install.sync()).await {
+        Ok(Ok(synced)) => Ok(synced),
+        Ok(Err(err)) => Err(DirtyFlushWriteError::World(err)),
+        Err(err) => Err(DirtyFlushWriteError::Join(err)),
+    }
+}
+
 #[derive(Default)]
 struct DirtyFlushState {
     dirty_flush: bool,

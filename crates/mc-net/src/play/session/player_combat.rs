@@ -35,6 +35,7 @@ pub(in crate::play) struct PlayerEntityAttack<'a> {
     pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) amount: f32,
     pub(in crate::play) attacker_costs: Option<&'a PlayerSurvivalPlan>,
+    pub(in crate::play) authority_tick: u64,
 }
 
 struct PlayerAttackCommit<'a> {
@@ -64,6 +65,7 @@ impl SessionRegistry {
             entity_id,
             amount,
             attacker_costs,
+            authority_tick,
         } = attack;
         if !amount.is_finite() || amount <= 0.0 {
             return PlayerAttackResult::ValidationRejected;
@@ -223,7 +225,7 @@ impl SessionRegistry {
         } else {
             shield_after_block = None;
             let (resolution, resolved_resistance) =
-                current_resistance.preview(self.simulation_tick(), damage.amount);
+                current_resistance.preview(authority_tick, damage.amount);
             let PlayerHurtResolution::Apply {
                 amount: resolved_damage,
                 fresh_hurt: resolved_fresh_hurt,
@@ -1133,6 +1135,7 @@ mod tests {
                 entity_id: target_entity,
                 amount: 2.0,
                 attacker_costs: None,
+                authority_tick: registry.simulation_tick(),
             },
         );
         let PlayerAttackResult::Damaged(outcome) = result else {
@@ -1159,6 +1162,56 @@ mod tests {
             &dispatch.command,
             OutboundCommand::PlayerDamageCommitted { .. }
         )));
+    }
+
+    #[test]
+    fn pvp_hurt_resistance_uses_the_supplied_authority_tick() {
+        let registry = SessionRegistry::new();
+        let attacker_pose = PlayerPose::new(0.5, 64.0, 0.5);
+        let target_pose = PlayerPose::new(1.0, 64.0, 0.5);
+        let attacker = register_player(
+            &registry,
+            "AuthorityTickAttacker",
+            attacker_pose,
+            PlayerPersistedState::new_default(attacker_pose),
+        );
+        let target = register_player(
+            &registry,
+            "AuthorityTickTarget",
+            target_pose,
+            PlayerPersistedState::new_default(target_pose),
+        );
+        let (target_entity, target_state) = {
+            let inner = registry.lock_inner("read authority tick target");
+            (
+                EntityId(inner.sessions[&target].entity_id),
+                Arc::clone(&inner.player_persistence[&target]),
+            )
+        };
+
+        for authority_tick in [100, 110] {
+            assert!(matches!(
+                registry.player_attack_entity(
+                    &SimulationAuthority::for_test(),
+                    PlayerEntityAttack {
+                        attacker_session: attacker,
+                        entity_id: target_entity,
+                        amount: 1.0,
+                        attacker_costs: None,
+                        authority_tick,
+                    },
+                ),
+                PlayerAttackResult::Damaged(_)
+            ));
+        }
+
+        let health = target_state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .survival
+            .health;
+        assert_eq!(health, 18.0);
+        assert_eq!(registry.simulation_tick(), 0);
     }
 
     #[test]

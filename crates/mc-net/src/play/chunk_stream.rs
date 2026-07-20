@@ -3052,16 +3052,38 @@ async fn flush_dirty_chunks_for_pressure(
         };
         timing.write_ms += write_started.elapsed().as_millis() as u64;
         let commit_started = Instant::now();
-        let flushed = {
+        let install = {
             let mut storage = crate::lock_metrics::timed_guard(
                 crate::lock_metrics::LockMetricKind::ChunkPrepare,
-                "chunk pressure flush commit",
+                "chunk pressure flush install",
                 Instant::now(),
                 world.lock().await,
             );
-            storage
-                .commit_dirty_flush(commit)
-                .map_err(|err| err.to_string())?
+            storage.install_dirty_flush(commit)
+        };
+        let install = match install {
+            Ok(install) => install,
+            Err(mc_world::WorldError::StaleRegion(_))
+                if stale_retries < PRESSURE_FLUSH_STALE_REGION_RETRIES =>
+            {
+                stale_retries += 1;
+                timing.runs += 1;
+                timing.commit_ms += commit_started.elapsed().as_millis() as u64;
+                continue;
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let synced = crate::dirty_flush::sync_dirty_flush_install_blocking_typed(install)
+            .await
+            .map_err(|error| error.to_string())?;
+        let flushed = {
+            let mut storage = crate::lock_metrics::timed_guard(
+                crate::lock_metrics::LockMetricKind::ChunkPrepare,
+                "chunk pressure flush finalize",
+                Instant::now(),
+                world.lock().await,
+            );
+            storage.finalize_dirty_flush(synced).cleaned_chunks()
         };
         let commit_ms = commit_started.elapsed().as_millis() as u64;
         timing.runs += 1;

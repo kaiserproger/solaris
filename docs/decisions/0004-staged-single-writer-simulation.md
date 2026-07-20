@@ -275,9 +275,24 @@ ordered owner turn, the barrier captures immutable player, entity, world-time,
 and simulation-tick snapshots after every lower-sequence command. Disk IO uses
 those returned snapshots instead of rereading live session state. A dedicated
 post-drain save API covers final shutdown after the owner channel has closed.
-Dirty chunk planning and commit remain protected by world mutation tokens and
-may include later world changes, so this is an ordered simulation snapshot, not
-a global atomic disk transaction.
+The barrier also records the dirty-chunk count at that owner turn. If a journal
+fence excludes any dirty chunk from its flush plan, save waits for the exact
+producer notification that releases or fails that fence and then captures a
+new complete owner snapshot. It never acknowledges a partial plan based on a
+retry count or elapsed time.
+
+Dirty region writes produce temporary files outside world ownership. A normal
+background flush validates the resident snapshot before replacing the region
+file and replans stale work. An active barrier save instead installs the exact
+planned region image; chunks changed after the barrier remain dirty in memory
+and are covered by their later journal records. The final post-drain save must
+reach zero dirty chunks. A remaining journal-pending chunk is an invariant
+error because no producer remains to release it. Region installation itself is
+still serialized with resident publication. Directory sync runs on a blocking
+worker after releasing resident and world locks; a short finalization turn then
+marks only snapshots that still match as clean. This is an ordered world and
+simulation snapshot, not a global transaction across playerdata, entity data,
+region files, and every journal.
 
 Prompt 04 introduced a standalone `bevy_ecs 0.18.1` runtime inside
 `EntityStore`. The dependency is pinned below the 0.19 line because Solaris is

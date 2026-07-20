@@ -16,9 +16,9 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
     )]));
     let bound = mc_net::bind(config).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
-    let mut simulation_ticks = bound
-        .runtime_telemetry_handle()
-        .subscribe_simulation_ticks();
+    let runtime_telemetry = bound.runtime_telemetry_handle();
+    let mut simulation_ticks = runtime_telemetry.subscribe_simulation_ticks();
+    let mut player_attacks = runtime_telemetry.subscribe_player_attacks();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -56,13 +56,13 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         .await
         .expect("send post-attack command fence");
 
-    let (full_hit_health, ()) = tokio::join!(
+    let (full_hit_health, (), first_hit) = tokio::join!(
         wait_for_fresh_pvp_target_outcome(&mut bob, bob_identity),
         wait_for_pvp_hurt_and_attacker_health_fence(&mut alice, alice_identity, bob_identity,),
+        wait_for_pvp_attack(&mut player_attacks, alice_identity as u64, bob_identity),
     );
     assert_eq!(full_hit_health, 19.0);
 
-    let post_first_hit_tick = *simulation_ticks.borrow_and_update();
     let sword_id = embedded_item_id(&data, "minecraft:stone_sword");
     alice
         .write_packet(&ServerboundChatCommand {
@@ -72,7 +72,7 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         .expect("give PvP sword");
     wait_for_slot_stack(&mut alice, sword_id, 1).await;
 
-    wait_for_pvp_simulation_tick(&mut simulation_ticks, post_first_hit_tick + 6).await;
+    wait_for_pvp_simulation_tick(&mut simulation_ticks, first_hit.cooldown_tick + 6).await;
     alice
         .write_packet(&mc_protocol::packets::play::ServerboundAttack {
             entity_id: bob_identity,
@@ -86,17 +86,19 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         .await
         .expect("send partial-attack command fence");
 
-    let (partial_hit_health, ()) = tokio::join!(
+    let (partial_hit_health, (), partial_hit) = tokio::join!(
         wait_for_exact_pvp_health(&mut bob),
         wait_for_rejected_pvp_attacker_fence_without_hurt(
             &mut alice,
             alice_identity,
             bob_identity,
         ),
+        wait_for_pvp_attack(&mut player_attacks, alice_identity as u64, bob_identity),
     );
+    let expected_health = expected_resistant_sword_hit_health(&first_hit, &partial_hit);
     assert!(
-        (partial_hit_health - 17.918_4).abs() < 0.000_1,
-        "six-tick sword hit must use the +0.5 sample and apply only the hurt-resistance difference; health={partial_hit_health}"
+        (partial_hit_health - expected_health).abs() < 0.000_1,
+        "sword hit must use its observed processing tick and apply only the hurt-resistance difference; expected={expected_health} actual={partial_hit_health}"
     );
     alice
         .write_packet(&mc_protocol::packets::play::ServerboundAttack {
@@ -136,6 +138,65 @@ async fn melee_pvp_damages_only_the_observed_target_player_over_wire() {
         ),
         wait_for_rejected_pvp_attacker_fence_without_hurt(&mut alice, alice_identity, bob_identity,),
     );
+}
+
+async fn wait_for_pvp_attack(
+    player_attacks: &mut tokio::sync::broadcast::Receiver<mc_net::PlayerAttackObservation>,
+    attacker_session_id: u64,
+    target_entity_id: i32,
+) -> mc_net::PlayerAttackObservation {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let observation = player_attacks
+                .recv()
+                .await
+                .expect("player attack publisher remains active");
+            if observation.attacker_session_id == attacker_session_id
+                && observation.target_entity_id == target_entity_id
+            {
+                return observation;
+            }
+        }
+    })
+        .await
+        .expect("accepted PvP attack observation")
+}
+
+fn expected_resistant_sword_hit_health(
+    first_hit: &mc_net::PlayerAttackObservation,
+    partial_hit: &mc_net::PlayerAttackObservation,
+) -> f32 {
+    assert!(
+        partial_hit.authority_sequence > first_hit.authority_sequence,
+        "second attack must follow the first in authority order"
+    );
+    let elapsed_ticks = partial_hit
+        .cooldown_tick
+        .saturating_sub(first_hit.cooldown_tick);
+    assert!(
+        (6..12).contains(&elapsed_ticks),
+        "partial sword hit must remain partially recharged; first={} partial={}",
+        first_hit.cooldown_tick,
+        partial_hit.cooldown_tick,
+    );
+    let authority_elapsed = partial_hit
+        .authority_tick
+        .saturating_sub(first_hit.authority_tick);
+    assert!(
+        authority_elapsed < 10,
+        "partial sword hit must remain inside hurt resistance; first={} partial={}",
+        first_hit.authority_tick,
+        partial_hit.authority_tick,
+    );
+    match elapsed_ticks {
+        6 => 17.918_4,
+        7 => 17.56,
+        8 => 17.150_4,
+        9 => 16.689_6,
+        10 => 16.177_6,
+        11 => 15.614_4,
+        _ => unreachable!("partial recharge range asserted above"),
+    }
 }
 
 async fn wait_for_pvp_simulation_tick(

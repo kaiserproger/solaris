@@ -259,7 +259,7 @@ impl ResidentChunkStore {
     }
 
     #[must_use]
-    pub(crate) fn flushable_snapshots(&self) -> Vec<(ChunkPos, ChunkSnapshot)> {
+    pub(crate) fn dirty_flush_snapshot(&self) -> (usize, Vec<(ChunkPos, ChunkSnapshot)>) {
         self.read_view.publication_state().read_consistent(|| {
             let regions: Vec<_> = self
                 .regions
@@ -268,20 +268,23 @@ impl ResidentChunkStore {
                 .values()
                 .cloned()
                 .collect();
-            let mut snapshots = Vec::new();
+            let mut dirty_chunks = 0usize;
+            let mut flushable = Vec::new();
             for region in regions {
                 let region = region
                     .read()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                snapshots.extend(
-                    region
-                        .chunks
-                        .iter()
-                        .filter(|(position, _)| !region.pending_journal_lsn.contains_key(position))
-                        .map(|(&position, chunk)| (position, Arc::clone(chunk))),
-                );
+                for (&position, chunk) in &region.chunks {
+                    if !chunk.dirty {
+                        continue;
+                    }
+                    dirty_chunks += 1;
+                    if !region.pending_journal_lsn.contains_key(&position) {
+                        flushable.push((position, Arc::clone(chunk)));
+                    }
+                }
             }
-            snapshots
+            (dirty_chunks, flushable)
         })
     }
 
@@ -449,25 +452,167 @@ impl ResidentChunkStore {
         Some(result)
     }
 
-    pub(crate) fn mutate_snapshot<R>(
+    pub(crate) fn install_region_flush<E>(
         &self,
-        position: ChunkPos,
-        update: impl FnOnce(&mut ChunkSnapshot) -> R,
-    ) -> Option<R> {
+        planned: &[(ChunkPos, u64, ChunkSnapshot)],
+        install: impl FnOnce() -> Result<(), E>,
+    ) -> Result<bool, E> {
+        if planned.is_empty() {
+            return Ok(false);
+        }
         let publication = self.read_view.publication_state();
         let _mutation = publication.mutation();
-        let region = self.region(position)?;
-        let mut region = region
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let chunk = region.chunks.get_mut(&position)?;
-        let result = self
-            .read_view
-            .update_chunk_snapshot(position, chunk, update);
-        self.read_view.publish_furnaces(position, chunk);
-        self.scheduled_tick_view
-            .publish_chunk(position, chunk, &self.registry);
-        Some(result)
+        let mut region_keys = planned
+            .iter()
+            .map(|(position, _, _)| region_of(*position))
+            .collect::<Vec<_>>();
+        region_keys.sort_unstable();
+        region_keys.dedup();
+        let region_handles = {
+            let regions = self
+                .regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let Some(handles) = region_keys
+                .iter()
+                .map(|key| regions.get(key).cloned())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(false);
+            };
+            handles
+        };
+        let regions = region_handles
+            .iter()
+            .map(|region| {
+                region
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
+        let current = planned
+            .iter()
+            .all(|(position, dirty_generation, snapshot)| {
+                let region_index = region_keys
+                    .binary_search(&region_of(*position))
+                    .expect("planned resident region is locked");
+                let region = &regions[region_index];
+                !region.pending_journal_lsn.contains_key(position)
+                    && region.chunks.get(position).is_some_and(|chunk| {
+                        chunk.dirty
+                            && (*dirty_generation == 0
+                                || chunk.dirty_generation == *dirty_generation)
+                            && Arc::ptr_eq(chunk, snapshot)
+                    })
+            });
+        if !current {
+            return Ok(false);
+        }
+
+        install()?;
+        Ok(true)
+    }
+
+    pub(crate) fn install_region_snapshot_flush<E>(
+        &self,
+        planned: &[(ChunkPos, u64, ChunkSnapshot)],
+        install: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        if planned.is_empty() {
+            return Ok(());
+        }
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
+        let mut region_keys = planned
+            .iter()
+            .map(|(position, _, _)| region_of(*position))
+            .collect::<Vec<_>>();
+        region_keys.sort_unstable();
+        region_keys.dedup();
+        let region_handles = {
+            let regions = self
+                .regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            region_keys
+                .iter()
+                .filter_map(|key| regions.get(key).cloned())
+                .collect::<Vec<_>>()
+        };
+        let _regions = region_handles
+            .iter()
+            .map(|region| {
+                region
+                    .write()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+            })
+            .collect::<Vec<_>>();
+        install()
+    }
+
+    pub(crate) fn finalize_region_flush(
+        &self,
+        planned: Vec<(ChunkPos, u64, ChunkSnapshot)>,
+    ) -> usize {
+        if planned.is_empty() {
+            return 0;
+        }
+        let publication = self.read_view.publication_state();
+        let _mutation = publication.mutation();
+        let mut region_keys = planned
+            .iter()
+            .map(|(position, _, _)| region_of(*position))
+            .collect::<Vec<_>>();
+        region_keys.sort_unstable();
+        region_keys.dedup();
+        let region_handles = {
+            let regions = self
+                .regions
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            region_keys
+                .iter()
+                .map(|key| regions.get(key).cloned())
+                .collect::<Vec<_>>()
+        };
+        let mut regions = region_handles
+            .iter()
+            .map(|region| {
+                region.as_ref().map(|region| {
+                    region
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut cleaned = 0usize;
+        for (position, dirty_generation, snapshot) in planned {
+            let region_index = region_keys
+                .binary_search(&region_of(position))
+                .expect("planned resident region is represented");
+            let Some(region) = regions[region_index].as_mut() else {
+                continue;
+            };
+            if region.pending_journal_lsn.contains_key(&position) {
+                continue;
+            }
+            let Some(chunk) = region.chunks.get_mut(&position) else {
+                continue;
+            };
+            if !chunk.dirty
+                || (dirty_generation != 0 && chunk.dirty_generation != dirty_generation)
+                || !Arc::ptr_eq(chunk, &snapshot)
+            {
+                continue;
+            }
+            drop(snapshot);
+            self.read_view
+                .update_chunk_snapshot(position, chunk, |chunk| {
+                    Arc::make_mut(chunk).dirty = false;
+                });
+            cleaned += 1;
+        }
+        cleaned
     }
 
     #[must_use]

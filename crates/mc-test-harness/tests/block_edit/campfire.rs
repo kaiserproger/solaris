@@ -504,8 +504,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
             .with_generator(generator)
             .with_item_registry(Arc::clone(&items));
     let surface_y = seed_campfire_placement_site(&mut storage, &blocks);
-    let world_handle = Arc::new(tokio::sync::Mutex::new(storage));
-    let world = Some(Arc::clone(&world_handle));
+    let world = Some(Arc::new(tokio::sync::Mutex::new(storage)));
 
     let ident = |value: &str| mc_data::Identifier::parse(value).unwrap();
     let campfire_id = ident("minecraft:campfire");
@@ -562,6 +561,7 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
     };
     let bound = mc_net::bind(cfg).await.expect("bind");
     let addr = bound.local_addr().expect("local_addr");
+    let save = bound.save_handle();
     tokio::spawn(async move {
         let _ = bound.serve().await;
     });
@@ -628,11 +628,12 @@ async fn survival_campfire_in_flight_state_flushes_to_disk() {
         .expect("start campfire cooking");
     wait_for_campfire_input_visual_and_slot(&mut client, campfire_pos, &porkchop_name).await;
 
-    {
-        let mut storage = world_handle.lock().await;
-        let flushed = storage.flush_dirty().expect("flush dirty world");
-        assert!(flushed > 0, "in-flight campfire state should dirty a chunk");
-    }
+    let report = save.save_all().await;
+    assert!(report.is_ok(), "save errors: {:?}", report.errors);
+    assert!(
+        report.chunks_flushed > 0,
+        "in-flight campfire state should dirty a chunk"
+    );
 
     let mut reopened =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 128)

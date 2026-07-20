@@ -98,8 +98,9 @@ fn region_replace_rejects_stale_expected_version() {
     use std::io::Write as _;
     file.write_all(&[0]).unwrap();
 
+    let tmp_path = write_unique_region_tmp(&region_path, &payloads).unwrap();
     let Err(WorldError::StaleRegion(path)) =
-        replace_region_file(&region_path, &payloads, expected.as_ref())
+        install_region_file(&region_path, &tmp_path, expected.as_ref())
     else {
         panic!("stale region version must reject replacement");
     };
@@ -316,6 +317,7 @@ fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
 
     let edit_pos = BlockPos { x: 3, y: 0, z: 5 };
     world.get_block(edit_pos).unwrap().unwrap();
+    assert_eq!(world.flush_dirty().unwrap(), 1);
     world
         .set_block_at(edit_pos, BlockStateId(2))
         .unwrap()
@@ -328,17 +330,63 @@ fn dirty_flush_commit_preserves_chunks_changed_after_planning() {
         .unwrap()
         .unwrap();
     let commit = plan.write().unwrap();
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(_))
+    ));
     assert_eq!(world.dirty_count(), 1);
 
     let mut fresh =
         WorldStorage::open_with_capacity(tmp_world.path(), Arc::clone(&registry), 16).unwrap();
-    assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(2)));
+    assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(1)));
 
     assert_eq!(world.flush_dirty().unwrap(), 1);
     assert_eq!(world.dirty_count(), 0);
     let mut fresh = WorldStorage::open_with_capacity(tmp_world.path(), registry, 16).unwrap();
     assert_eq!(fresh.get_block(edit_pos).unwrap(), Some(BlockStateId(1)));
+}
+
+#[test]
+fn multi_region_commit_recovers_installed_prefix_before_later_stale_region() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
+    let registry = air_stone_registry();
+    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 2).unwrap();
+    let biome = Identifier::parse("minecraft:plains").unwrap();
+    let first = ChunkPos { x: 0, z: 0 };
+    let second = ChunkPos { x: 32, z: 0 };
+    for position in [first, second] {
+        world
+            .insert_generated_chunk(
+                position,
+                Chunk::empty(position, BlockStateId(0), biome.clone()),
+            )
+            .unwrap();
+    }
+
+    let commit = world.plan_dirty_flush().unwrap().write().unwrap();
+    world
+        .set_block_at(
+            BlockPos {
+                x: second.x * 16,
+                y: 0,
+                z: 0,
+            },
+            BlockStateId(1),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(path)) if path.ends_with("r.1.0.mca")
+    ));
+    assert_eq!(world.dirty_count(), 1);
+    assert_eq!(world.plan_dirty_flush().unwrap().chunk_count(), 1);
+    assert!(tmp.path().join("region/r.0.0.mca").is_file());
+    assert!(!tmp.path().join("region/r.1.0.mca").exists());
+
+    let mut reopened = WorldStorage::open_with_capacity(tmp.path(), registry, 2).unwrap();
+    assert!(reopened.get_chunk(first).unwrap().is_some());
 }
 
 #[test]
@@ -444,7 +492,7 @@ fn dirty_flush_does_not_overwrite_newer_region_with_stale_cached_snapshot() {
 }
 
 #[test]
-fn dirty_flush_plan_tracks_retained_snapshot_token_without_payload_encoding() {
+fn dirty_flush_plan_retains_the_live_snapshot_without_payload_encoding() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = single_air_registry();
@@ -460,7 +508,6 @@ fn dirty_flush_plan_tracks_retained_snapshot_token_without_payload_encoding() {
     let snapshot = world.resident.snapshot(cpos).unwrap();
 
     assert!(Arc::ptr_eq(&planned.snapshot, &snapshot));
-    assert_eq!(planned.snapshot_token, chunk_snapshot_token(&snapshot));
 }
 
 #[test]
@@ -539,44 +586,10 @@ fn dirty_flush_write_carries_retained_snapshot_fast_path_metadata_into_commit() 
     let plan = world.plan_dirty_flush().unwrap();
     let planned = &plan.regions[0].dirty_payloads[0];
     let expected_snapshot = Arc::clone(&planned.snapshot);
-    let expected_snapshot_token = planned.snapshot_token;
     let commit = plan.write().unwrap();
     let committed = &commit.regions[0].chunks[0];
 
     assert!(Arc::ptr_eq(&committed.snapshot, &expected_snapshot));
-    assert_eq!(committed.snapshot_token, expected_snapshot_token);
-    assert_eq!(
-        committed.payload_digest,
-        payload_digest(&committed.uncompressed_nbt)
-    );
-}
-
-#[test]
-fn dirty_flush_fast_path_requires_matching_snapshot_generation_and_identity() {
-    let cpos = ChunkPos { x: 0, z: 0 };
-    let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.mark_dirty();
-    let snapshot = Arc::new(chunk);
-
-    assert!(can_fast_clean_chunk(
-        &snapshot,
-        snapshot.dirty_generation,
-        &snapshot,
-    ));
-    assert!(!can_fast_clean_chunk(&snapshot, 0, &snapshot,));
-
-    let other_snapshot = Arc::new((*snapshot).clone());
-    assert!(!can_fast_clean_chunk(
-        &snapshot,
-        snapshot.dirty_generation,
-        &other_snapshot,
-    ));
-    assert!(!can_fast_clean_chunk(
-        &snapshot,
-        snapshot.dirty_generation + 1,
-        &snapshot,
-    ));
 }
 
 #[test]
@@ -610,11 +623,6 @@ fn dirty_flush_mutable_fork_after_plan_bumps_generation() {
         BlockStateId(0)
     );
     assert_eq!(live_snapshot.get_block(1, 0, 1).unwrap(), BlockStateId(1));
-    assert!(!can_fast_clean_chunk(
-        &live_snapshot,
-        planned_generation,
-        &planned_snapshot,
-    ));
 }
 
 #[test]
@@ -640,7 +648,10 @@ fn dirty_flush_mutable_alias_after_plan_invalidates_planned_generation() {
 
     let commit = plan.write().unwrap();
 
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(_))
+    ));
     assert_eq!(world.dirty_count(), 1);
 }
 
@@ -663,9 +674,8 @@ fn dirty_flush_commit_cleans_unchanged_nonzero_generation_snapshot_fast_path() {
     let commit = plan.write().unwrap();
 
     assert_ne!(planned_generation, 0);
-    assert!(can_fast_clean_chunk(
+    assert!(Arc::ptr_eq(
         &world.resident.snapshot(cpos).unwrap(),
-        planned_generation,
         &planned_snapshot,
     ));
     assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
@@ -696,7 +706,7 @@ fn dirty_flush_commit_fast_path_clears_without_copying_unchanged_chunk() {
 }
 
 #[test]
-fn dirty_flush_commit_falls_back_to_payload_compare_for_defensive_snapshot_change() {
+fn dirty_flush_commit_rejects_a_defensive_snapshot_change() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = air_stone_registry();
@@ -725,47 +735,10 @@ fn dirty_flush_commit_falls_back_to_payload_compare_for_defensive_snapshot_chang
     assert!(!Arc::ptr_eq(&live_snapshot, &planned_snapshot));
     assert_eq!(planned_snapshot.highest_opaque_y(1, 1), None);
     assert_eq!(live_snapshot.highest_opaque_y(1, 1), Some(0));
-    assert!(!can_fast_clean_chunk(
-        &live_snapshot,
-        planned_generation,
-        &planned_snapshot,
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(_))
     ));
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
-    assert_eq!(world.dirty_count(), 0);
-}
-
-#[test]
-fn dirty_flush_commit_keeps_matching_nonzero_generation_dirty_on_payload_mismatch() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-    let registry = air_stone_registry();
-    let table = BlockLightTable::from_arrays("test", vec![0, 0], vec![0, 15], vec![true, false]);
-    let cpos = ChunkPos { x: 0, z: 0 };
-    let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.set_block(1, 0, 1, BlockStateId(1));
-    chunk.mark_dirty();
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
-    world.insert_chunk(cpos, chunk).unwrap();
-
-    let plan = world.plan_dirty_flush().unwrap();
-    let planned = &plan.regions[0].dirty_payloads[0];
-    let planned_generation = planned.dirty_generation;
-    let planned_snapshot = Arc::clone(&planned.snapshot);
-    let mut fork = (*world.resident.snapshot(cpos).unwrap()).clone();
-    fork.update_highest_opaque_column(1, 1, &table);
-    world.resident.replace_for_test(cpos, Arc::new(fork));
-    let live_snapshot = world.resident.snapshot(cpos).unwrap();
-    let mut commit = plan.write().unwrap();
-    commit.regions[0].chunks[0].uncompressed_nbt.clear();
-
-    assert_eq!(live_snapshot.dirty_generation, planned_generation);
-    assert!(!can_fast_clean_chunk(
-        &live_snapshot,
-        planned_generation,
-        &planned_snapshot,
-    ));
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
     assert_eq!(world.dirty_count(), 1);
 }
 
@@ -792,7 +765,10 @@ fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
 
     let commit = plan.write().unwrap();
 
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(_))
+    ));
     assert_eq!(world.dirty_count(), 1);
     assert_eq!(
         world.get_block(BlockPos { x: 1, y: 0, z: 1 }).unwrap(),
@@ -801,7 +777,7 @@ fn dirty_flush_commit_keeps_post_plan_unmarked_chunk_mutation_dirty() {
 }
 
 #[test]
-fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty_even_if_payload_matches() {
+fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join("region")).unwrap();
     let registry = single_air_registry();
@@ -814,45 +790,11 @@ fn dirty_flush_commit_keeps_nonzero_generation_mismatch_dirty_even_if_payload_ma
 
     let plan = world.plan_dirty_flush().unwrap();
     world.get_chunk_mut(cpos).unwrap().unwrap().mark_dirty();
-    let matching_payload = crate::anvil::chunk_to_payload_with_items(
-        &world.resident.snapshot(cpos).unwrap(),
-        &registry,
-        world.item_registry.as_deref(),
-        0,
-    )
-    .unwrap()
-    .uncompressed_nbt;
-    let mut commit = plan.write().unwrap();
-    commit.regions[0].chunks[0].uncompressed_nbt = matching_payload;
+    let commit = plan.write().unwrap();
 
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 0);
+    assert!(matches!(
+        world.commit_dirty_flush(commit),
+        Err(WorldError::StaleRegion(_))
+    ));
     assert_eq!(world.dirty_count(), 1);
-}
-
-#[test]
-fn dirty_flush_commit_uses_payload_fallback_for_legacy_zero_generation_dirty() {
-    let tmp = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(tmp.path().join("region")).unwrap();
-    let registry = single_air_registry();
-    let cpos = ChunkPos { x: 0, z: 0 };
-    let biome = Identifier::parse("minecraft:plains").unwrap();
-    let mut chunk = Chunk::empty(cpos, BlockStateId(0), biome);
-    chunk.dirty = true;
-    let mut world = WorldStorage::open_with_capacity(tmp.path(), Arc::clone(&registry), 4).unwrap();
-    world.insert_chunk(cpos, chunk).unwrap();
-
-    let plan = world.plan_dirty_flush().unwrap();
-    let matching_payload = crate::anvil::chunk_to_payload_with_items(
-        &world.resident.snapshot(cpos).unwrap(),
-        &registry,
-        world.item_registry.as_deref(),
-        0,
-    )
-    .unwrap()
-    .uncompressed_nbt;
-    let mut commit = plan.write().unwrap();
-    commit.regions[0].chunks[0].uncompressed_nbt = matching_payload;
-
-    assert_eq!(world.commit_dirty_flush(commit).unwrap(), 1);
-    assert_eq!(world.dirty_count(), 0);
 }
