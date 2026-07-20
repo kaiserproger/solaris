@@ -196,6 +196,16 @@ smaller than 257 states stay inline, matching the existing physics-compute
 threshold, and autoscaler scale-down to one CPU disables extra workers. The
 global authority mutex still excludes unrelated point mutations during this
 phase, so this is concurrent regional mutation but not final region ownership.
+The actor-side cached kinematics path groups multi-entity updates into one
+`SetKinematicsBatchIfCurrent` mutation per affected region. If every cached
+standalone route belongs to the same owner lane, that lane commits the batch
+directly, so independent lanes retain cross-call concurrency. A multi-lane or
+uncached update falls back to the coordinator's equivalent regional grouping.
+This prevents the ECS `PhysicsApply` schedule from traversing a region once per
+entity while retaining the single-entity low-latency path and the batch CAS
+fence. Deterministic tests count one physics schedule run for 76 same-region
+entities, one per region for same-lane and multi-lane updates, zero on stale
+rejection, and prove journal-failure rollback restores the complete batch.
 Cross-region batch spawn and restore now share an all-input preflight and
 publish global indexes only after every physical store accepts its group.
 EntityStore batch restore inserts all snapshots before rebuilding vehicle

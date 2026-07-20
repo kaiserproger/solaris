@@ -1222,6 +1222,11 @@ impl EntityStore {
         self.runtime.input_ai_stage_runs()
     }
 
+    #[cfg(test)]
+    fn physics_apply_stage_runs_for_test(&self) -> usize {
+        self.runtime.physics_apply_stage_runs()
+    }
+
     fn insert_runtime_snapshot(&mut self, mut snapshot: EntitySnapshot) -> bool {
         snapshot.vehicle =
             self.sanitized_snapshot_vehicle(snapshot.id, snapshot.lifecycle, snapshot.vehicle);

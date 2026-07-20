@@ -295,6 +295,8 @@ pub struct EntityRuntime {
     schedules: EntitySchedules,
     #[cfg(test)]
     input_ai_stage_runs: usize,
+    #[cfg(test)]
+    physics_apply_stage_runs: usize,
 }
 
 impl fmt::Debug for EntityRuntime {
@@ -338,6 +340,8 @@ impl EntityRuntime {
             schedules: EntitySchedules::new(),
             #[cfg(test)]
             input_ai_stage_runs: 0,
+            #[cfg(test)]
+            physics_apply_stage_runs: 0,
         }
     }
 
@@ -988,7 +992,13 @@ impl EntityRuntime {
             EntityStage::SnapshotRequest => {
                 self.schedules.snapshot_request.run(&mut self.world);
             }
-            EntityStage::PhysicsApply => self.schedules.physics_apply.run(&mut self.world),
+            EntityStage::PhysicsApply => {
+                #[cfg(test)]
+                {
+                    self.physics_apply_stage_runs = self.physics_apply_stage_runs.saturating_add(1);
+                }
+                self.schedules.physics_apply.run(&mut self.world);
+            }
             EntityStage::CombatLifecycle => {
                 self.schedules.combat_lifecycle.run(&mut self.world);
             }
@@ -1001,6 +1011,11 @@ impl EntityRuntime {
     #[cfg(test)]
     pub(crate) fn input_ai_stage_runs(&self) -> usize {
         self.input_ai_stage_runs
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physics_apply_stage_runs(&self) -> usize {
+        self.physics_apply_stage_runs
     }
 
     pub fn take_snapshot_output(&mut self) -> Vec<EntitySnapshot> {

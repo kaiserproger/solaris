@@ -131,6 +131,19 @@ replacement-readiness claims.
   gameplay evidence, not a broad survival or readiness gate.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
+- Multi-entity physics dispatch no longer sends one cached owner mutation per
+  entity, each of which ran the complete ECS `PhysicsApply` schedule. The actor
+  groups cached same-lane updates by region without serializing unrelated
+  lanes; multi-lane work uses the coordinator's equivalent grouping.
+  Deterministic tests prove 76 same-region entities run one schedule, same-lane
+  and multi-lane regions run one each, stale input runs none, and journal
+  failure rolls the whole batch back. The existing 512-entity debug benchmark
+  reported actor `p50 5.107 ms` and `p99 6.400 ms`. A real 26.1.2 client
+  observed all 31 persisted passive entities
+  through 255 client ticks; warned dispatch samples were `4.814`, `10.640`, and
+  `2.913 ms`, rather than the earlier repeated `300+ ms` stalls. That run still
+  exposed separate first-use spikes of `282.512 ms` in physics and `316.242 ms`
+  in goals, so the combined performance gate remains degraded.
 
 ## Manual And Agent Gates
 

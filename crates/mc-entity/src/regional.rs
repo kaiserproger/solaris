@@ -983,6 +983,18 @@ struct DirectSelectedReadPermit {
     active: Arc<AtomicUsize>,
 }
 
+fn cached_mutation_expected_snapshots<'a>(
+    fallback: &'a EntitySnapshot,
+    mutation: &'a RegionOwnerMutation,
+) -> &'a [EntitySnapshot] {
+    match mutation {
+        RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, .. }
+        | RegionOwnerMutation::ApplyGoalBatch { expected, .. } => expected,
+        RegionOwnerMutation::RemoveSnapshotsIfCurrent(expected) => expected,
+        _ => std::slice::from_ref(fallback),
+    }
+}
+
 impl DirectSelectedReadPermit {
     fn try_acquire(active: Arc<AtomicUsize>) -> Option<Self> {
         active
@@ -1912,28 +1924,45 @@ impl RegionalOwnerHandle {
             .selected_read_routes
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let mut routes = Vec::with_capacity(expected_mutations.len());
-        for (expected, _) in &expected_mutations {
-            let Some(key) = RegionKey::from_position(expected.position) else {
+        let mut routes = BTreeMap::new();
+        let mut mutation_leases = Vec::with_capacity(expected_mutations.len());
+        let mut selected_lane = None;
+        for (fallback, mutation) in &expected_mutations {
+            let expected = cached_mutation_expected_snapshots(fallback, mutation);
+            if expected.first() != Some(fallback) {
+                return Some(Err(RegionOwnerLaneError::InvalidMutation));
+            }
+            let mut mutation_lease = None;
+            for snapshot in expected {
+                let Some(key) = RegionKey::from_position(snapshot.position) else {
+                    return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                };
+                let route = cached.get(&snapshot.id)?.clone();
+                if route.lease.key != key || route.uuid != snapshot.uuid {
+                    return None;
+                }
+                if require_standalone && !route.standalone {
+                    return None;
+                }
+                if selected_lane.is_some_and(|lane| lane != route.lease.lane) {
+                    return None;
+                }
+                if mutation_lease.is_some_and(|lease| lease != route.lease) {
+                    return None;
+                }
+                if routes.insert(snapshot.id, route.clone()).is_some() {
+                    return Some(Err(RegionOwnerLaneError::InvalidMutation));
+                }
+                selected_lane = Some(route.lease.lane);
+                mutation_lease = Some(route.lease);
+            }
+            let Some(mutation_lease) = mutation_lease else {
                 return Some(Err(RegionOwnerLaneError::InvalidMutation));
             };
-            let route = cached.get(&expected.id)?.clone();
-            if route.lease.key != key || route.uuid != expected.uuid {
-                return None;
-            }
-            if require_standalone && !route.standalone {
-                return None;
-            }
-            if routes
-                .first()
-                .is_some_and(|first: &CachedEntityReadRoute| first.lease.lane != route.lease.lane)
-            {
-                return None;
-            }
-            routes.push(route);
+            mutation_leases.push(mutation_lease);
         }
         drop(cached);
-        let owner = routes[0].owner.clone();
+        let owner = routes.values().next()?.owner.clone();
         Some((|| {
             let _lane_admission = owner
                 .admission()
@@ -1947,25 +1976,21 @@ impl RegionalOwnerHandle {
                 .commit_state
                 .reserve_sequences(expected_mutations.len())?;
             let phase = self.commit_state.reserve_phase()?;
-            let expected_post = expected_mutations
+            let expected_post = routes
                 .iter()
-                .zip(&routes)
-                .map(|((expected, _), route)| (expected.id, (route.lease, route.uuid)))
+                .map(|(&entity, route)| (entity, (route.lease, route.uuid)))
                 .collect::<BTreeMap<_, _>>();
-            if expected_post.len() != expected_mutations.len() {
-                return Err(RegionOwnerLaneError::InvalidMutation);
-            }
             let requested = expected_post
                 .iter()
                 .map(|(&entity, &(lease, _))| (lease, entity))
                 .collect::<Vec<_>>();
             let mutations = expected_mutations
                 .into_iter()
-                .zip(&routes)
+                .zip(mutation_leases)
                 .enumerate()
-                .map(|(offset, ((_, mutation), route))| SequencedRegionMutation {
+                .map(|(offset, ((_, mutation), lease))| SequencedRegionMutation {
                     sequence: first_sequence + offset as u64 + 1,
-                    lease: route.lease,
+                    lease,
                     mutation,
                 })
                 .collect();
@@ -2100,7 +2125,6 @@ impl RegionalOwnerHandle {
         let expected_count = states.len();
         let mut ids = HashSet::with_capacity(expected_count);
         let mut direct_eligible = true;
-        let mut direct = Vec::with_capacity(expected_count);
         for (expected, state) in &states {
             let source = RegionKey::from_position(expected.position)
                 .ok_or(RegionOwnerLaneError::InvalidMutation)?;
@@ -2108,21 +2132,43 @@ impl RegionalOwnerHandle {
                 return Err(RegionOwnerLaneError::InvalidMutation);
             }
             direct_eligible &= RegionKey::from_position(state.position) == Some(source);
-            direct.push((
-                expected.clone(),
-                RegionOwnerMutation::SetKinematicsIfCurrent {
-                    expected: Box::new(expected.clone()),
-                    state: *state,
-                },
-            ));
         }
-        if direct_eligible
-            && let Some(result) = self.try_commit_cached_standalone_snapshot_mutations_with_journal(
+        if direct_eligible {
+            let direct = if expected_count == 1 {
+                let (expected, state) = &states[0];
+                vec![(
+                    expected.clone(),
+                    RegionOwnerMutation::SetKinematicsIfCurrent {
+                        expected: Box::new(expected.clone()),
+                        state: *state,
+                    },
+                )]
+            } else {
+                let mut states_by_region =
+                    BTreeMap::<RegionKey, (Vec<EntitySnapshot>, Vec<EntityKinematics>)>::new();
+                for (expected, state) in &states {
+                    let source = RegionKey::from_position(expected.position)
+                        .ok_or(RegionOwnerLaneError::InvalidMutation)?;
+                    let (expected_batch, state_batch) = states_by_region.entry(source).or_default();
+                    expected_batch.push(expected.clone());
+                    state_batch.push(*state);
+                }
+                states_by_region
+                    .into_values()
+                    .map(|(expected, states)| {
+                        (
+                            expected[0].clone(),
+                            RegionOwnerMutation::SetKinematicsBatchIfCurrent { expected, states },
+                        )
+                    })
+                    .collect()
+            };
+            if let Some(result) = self.try_commit_cached_standalone_snapshot_mutations_with_journal(
                 direct,
                 journal_commit,
-            )
-        {
-            return result.map(|snapshots| snapshots.len() == expected_count);
+            ) {
+                return result.map(|snapshots| snapshots.len() == expected_count);
+            }
         }
 
         let (reply, result) = channel();
@@ -10814,6 +10860,341 @@ mod tests {
                 .expect("updated cow snapshot")
                 .position,
             next.position
+        );
+
+        drop(handle);
+        runtime.shutdown().expect("runtime shutdown");
+    }
+
+    #[test]
+    fn cached_multi_entity_kinematics_bypass_the_coordinator_actor() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+            ])
+            .expect("same-region cows");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let expected = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm selected routes");
+        let states = expected.into_iter().map(|snapshot| {
+            let target = movement(
+                snapshot.id,
+                Vec3::new(
+                    snapshot.position.x + 0.25,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                ),
+            );
+            (snapshot, target)
+        });
+
+        let (coordinator_entered, coordinator_entered_rx) = mpsc::channel();
+        let (coordinator_release, coordinator_release_rx) = mpsc::channel();
+        handle
+            .hold_coordinator_for_test(coordinator_entered, coordinator_release_rx)
+            .expect("queue coordinator hold");
+        coordinator_entered_rx
+            .recv()
+            .expect("coordinator entered hold");
+
+        let (mutation_complete, mutation_complete_rx) = mpsc::channel();
+        let mutation_handle = handle.clone();
+        let mutation = std::thread::spawn(move || {
+            mutation_complete
+                .send(mutation_handle.apply_kinematics_if_current(states))
+                .expect("publish direct kinematics batch");
+        });
+        let direct = mutation_complete_rx.recv_timeout(Duration::from_secs(1));
+        coordinator_release.send(()).expect("release coordinator");
+        mutation.join().expect("join kinematics batch");
+        assert!(
+            direct
+                .expect("cached kinematics batch must not wait for coordinator")
+                .expect("direct kinematics batch")
+        );
+
+        drop(handle);
+        let store = runtime.shutdown().expect("runtime shutdown");
+        assert_eq!(
+            store.stores[&RegionKey::new(0, 0)].physics_apply_stage_runs_for_test(),
+            1
+        );
+    }
+
+    #[test]
+    fn multi_entity_kinematics_run_physics_once_per_region() {
+        const ENTITY_COUNT: usize = 76;
+
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch((0..ENTITY_COUNT).map(|index| {
+                cow(Vec3::new(
+                    0.5 + (index % 16) as f64,
+                    64.0,
+                    0.5 + (index / 16) as f64,
+                ))
+            }))
+            .expect("same-region cows");
+        let active = ids.iter().copied().collect::<HashSet<_>>();
+        let expected = handle
+            .snapshots_for_ids(&active)
+            .expect("warm selected routes");
+        let states = expected.into_iter().map(|snapshot| {
+            let target = movement(
+                snapshot.id,
+                Vec3::new(
+                    snapshot.position.x + 0.01,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                ),
+            );
+            (snapshot, target)
+        });
+
+        assert!(
+            handle
+                .apply_kinematics_if_current(states)
+                .expect("batched kinematics")
+        );
+
+        drop(handle);
+        let store = runtime.shutdown().expect("runtime shutdown");
+        let region = store
+            .stores
+            .get(&RegionKey::new(0, 0))
+            .expect("spawn region");
+        assert_eq!(region.physics_apply_stage_runs_for_test(), 1);
+    }
+
+    #[test]
+    fn multi_region_kinematics_run_physics_once_in_each_region() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+                cow(Vec3::new(129.5, 64.0, 0.5)),
+            ])
+            .expect("two-region cows");
+        let active = ids.iter().copied().collect::<HashSet<_>>();
+        let states = handle
+            .snapshots_for_ids(&active)
+            .expect("warm selected routes")
+            .into_iter()
+            .map(|snapshot| {
+                let target = movement(
+                    snapshot.id,
+                    Vec3::new(
+                        snapshot.position.x + 0.01,
+                        snapshot.position.y,
+                        snapshot.position.z,
+                    ),
+                );
+                (snapshot, target)
+            });
+
+        assert!(
+            handle
+                .apply_kinematics_if_current(states)
+                .expect("batched kinematics")
+        );
+
+        drop(handle);
+        let store = runtime.shutdown().expect("runtime shutdown");
+        assert_eq!(
+            store.stores[&RegionKey::new(0, 0)].physics_apply_stage_runs_for_test(),
+            1
+        );
+        assert_eq!(
+            store.stores[&RegionKey::new(1, 0)].physics_apply_stage_runs_for_test(),
+            1
+        );
+    }
+
+    #[test]
+    fn multi_lane_kinematics_run_physics_once_in_each_region() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 2)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+                cow(Vec3::new(128.5, 64.0, 0.5)),
+                cow(Vec3::new(129.5, 64.0, 0.5)),
+            ])
+            .expect("two-lane cows");
+        let active = ids.iter().copied().collect::<HashSet<_>>();
+        let states = handle
+            .snapshots_for_ids(&active)
+            .expect("warm selected routes")
+            .into_iter()
+            .map(|snapshot| {
+                let target = movement(
+                    snapshot.id,
+                    Vec3::new(
+                        snapshot.position.x + 0.01,
+                        snapshot.position.y,
+                        snapshot.position.z,
+                    ),
+                );
+                (snapshot, target)
+            });
+
+        assert!(
+            handle
+                .apply_kinematics_if_current(states)
+                .expect("multi-lane kinematics")
+        );
+
+        drop(handle);
+        let store = runtime.shutdown().expect("runtime shutdown");
+        assert_ne!(
+            store
+                .ownership
+                .lease(RegionKey::new(0, 0))
+                .expect("west lease")
+                .lane,
+            store
+                .ownership
+                .lease(RegionKey::new(1, 0))
+                .expect("east lease")
+                .lane
+        );
+        assert_eq!(
+            store.stores[&RegionKey::new(0, 0)].physics_apply_stage_runs_for_test(),
+            1
+        );
+        assert_eq!(
+            store.stores[&RegionKey::new(1, 0)].physics_apply_stage_runs_for_test(),
+            1
+        );
+    }
+
+    #[test]
+    fn multi_entity_kinematics_reject_one_stale_snapshot_atomically() {
+        let runtime = super::RegionalOwnerRuntime::from_store(RegionalEntityStore::new(), 1)
+            .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+            ])
+            .expect("same-region cows");
+        let first = ids[0];
+        let second = ids[1];
+        let selected = HashSet::from([first, second]);
+        let expected = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm selected routes");
+        handle
+            .set_goal(
+                second,
+                GoalState::FollowPosition {
+                    target: Vec3::new(4.5, 64.0, 0.5),
+                    speed: 0.25,
+                },
+            )
+            .expect("make second snapshot stale");
+        let states = expected.into_iter().map(|snapshot| {
+            let target = movement(
+                snapshot.id,
+                Vec3::new(
+                    snapshot.position.x + 1.0,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                ),
+            );
+            (snapshot, target)
+        });
+
+        assert!(
+            !handle
+                .apply_kinematics_if_current(states)
+                .expect("stale batch compare")
+        );
+        let snapshots = handle
+            .snapshots_for_ids(&selected)
+            .expect("unchanged authoritative snapshots");
+        let first_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == first)
+            .expect("first cow");
+        let second_snapshot = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == second)
+            .expect("second cow");
+        assert_eq!(first_snapshot.position, Vec3::new(0.5, 64.0, 0.5));
+        assert_eq!(second_snapshot.position, Vec3::new(1.5, 64.0, 0.5));
+        assert_eq!(
+            second_snapshot.goal,
+            GoalState::FollowPosition {
+                target: Vec3::new(4.5, 64.0, 0.5),
+                speed: 0.25,
+            }
+        );
+
+        drop(handle);
+        let store = runtime.shutdown().expect("runtime shutdown");
+        assert_eq!(
+            store.stores[&RegionKey::new(0, 0)].physics_apply_stage_runs_for_test(),
+            0
+        );
+    }
+
+    #[test]
+    fn cached_kinematics_batch_rolls_back_safe_journal_failure() {
+        let journal = Arc::new(Mutex::new(TestDecisionJournalState::default()));
+        let runtime = super::RegionalOwnerRuntime::from_store_with_journal(
+            RegionalEntityStore::new(),
+            1,
+            Box::new(TestDecisionJournal(Arc::clone(&journal))),
+        )
+        .expect("owner runtime");
+        let handle = runtime.handle();
+        let ids = handle
+            .spawn_batch([
+                cow(Vec3::new(0.5, 64.0, 0.5)),
+                cow(Vec3::new(1.5, 64.0, 0.5)),
+            ])
+            .expect("same-region cows");
+        let selected = ids.iter().copied().collect::<HashSet<_>>();
+        let expected = handle
+            .snapshots_for_ids(&selected)
+            .expect("warm selected routes");
+        let states = expected.iter().cloned().map(|snapshot| {
+            let target = movement(
+                snapshot.id,
+                Vec3::new(
+                    snapshot.position.x + 1.0,
+                    snapshot.position.y,
+                    snapshot.position.z,
+                ),
+            );
+            (snapshot, target)
+        });
+        journal.lock().expect("journal state").fail_record = true;
+
+        assert_eq!(
+            handle.apply_kinematics_if_current(states),
+            Err(super::RegionOwnerLaneError::Journal)
+        );
+        assert_eq!(
+            handle
+                .snapshots_for_ids(&selected)
+                .expect("rolled back batch"),
+            expected
         );
 
         drop(handle);
