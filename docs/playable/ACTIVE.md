@@ -129,6 +129,14 @@ replacement-readiness claims.
   labels `owned 0 -> 1 -> 0`, and both plugin messages. A stale slot click after
   closing the menu was rejected before packet dispatch. This is focused plugin
   gameplay evidence, not a broad survival or readiness gate.
+- Admitted Lua colony upserts now reach a bounded owner-scoped production
+  registry and publish a correlated `colony.record_result` only to the owning
+  plugin. Unit coverage proves replacement at total capacity, independent
+  per-plugin limits, wrong-command rejection, and closed-publication behavior;
+  a TCP client wire gate observes the real Lua host response. Records are
+  intentionally in-memory and plugin storage remains the durable intent source.
+  Villager binding is still fail-closed pending a bounded region-owner query
+  and authoritative expiring token.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 - Multi-entity physics dispatch no longer sends one cached owner mutation per

@@ -1,8 +1,11 @@
+mod colony;
 mod events;
 mod router;
 mod storage;
 mod zone;
 
+#[cfg(test)]
+mod colony_tests;
 #[cfg(test)]
 mod storage_tests;
 #[cfg(test)]

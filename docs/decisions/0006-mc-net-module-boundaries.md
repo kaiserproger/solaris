@@ -417,6 +417,13 @@ Other accepted concrete boundaries in this staged migration are:
   session cleanup forgets the player. The registry mutex is released before
   targeted event delivery awaits queue admission. Lua never receives session,
   entity or registry handles, and rejected movement cannot publish zone entry.
+- `script::colony` owns the bounded, owner-scoped in-memory colony registry and
+  correlated `colony.record_result` publication. Registry keys include the
+  host-attached plugin identity, replacements remain possible at capacity, and
+  rejected admissions cannot mutate state. The registry mutex is released
+  before targeted delivery awaits queue admission. Villager binding remains
+  outside this adapter until entity ownership provides a bounded
+  region-targeted search and authoritative expiring-token lifecycle.
 - `play::containers::script_menu` owns the immutable plugin-menu layout,
   item resolution, fixed-slot click classification and plugin/menu/player
   identity fence. `play::session::script_menu_endpoint` consumes admitted Lua

@@ -4,9 +4,9 @@ Solaris exposes one Lua plugin contract: API `0.6.0`. A manifest requesting any
 other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
-`mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu, and
-inventory/storage transaction adapters. Colony and villager adapters do not
-exist yet. Their example remains fail-closed.
+`mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
+inventory/storage transaction, and colony-record adapters. Villager binding
+does not have a production adapter yet and remains fail-closed.
 
 ## Package And Manifest
 
@@ -250,6 +250,21 @@ search radius must be finite, positive, and no greater than 64. The result token
 is ephemeral; it is not an entity id, pointer, or durable villager capability.
 There is deliberately no Lua API for villager goals, pathing, memory, inventory,
 or direct entity mutation.
+
+Colony records are scoped by the host-attached plugin id and kept in a bounded
+in-memory registry. The process admits at most 4,096 records and 256 records per
+plugin. Replacing an owned record remains possible at capacity. A new record
+beyond either bound returns `colony.record_result` with `accepted = false` and
+does not mutate the registry. While event publication remains open, every
+admitted upsert returns its correlated result only to the owning plugin; queue
+closure or shutdown stops the router instead of fabricating delivery. The
+registry is not durable, so plugins that need restart continuity must persist
+their intent through plugin storage.
+
+`bind_nearest_villager` is validated and admitted by the Lua host, but the
+production router currently rejects it without mutation or a fabricated
+result. It remains fail-closed until the entity owner exposes a bounded
+region-targeted search and an authoritative expiring binding token.
 
 ## Isolation And Limits
 

@@ -1,8 +1,8 @@
 -- Script API 0.6 acceptance fixture.
 --
--- FAIL-CLOSED PRODUCTION GAP: mc-net currently has no adapters for UpsertZone,
--- UpsertColony, RequestVillagerBinding, player.zone_entered,
--- colony.record_result, or colony.villager_binding_result. API 0.6 also has no
+-- Production supports UpsertZone/player.zone_entered and
+-- UpsertColony/colony.record_result. RequestVillagerBinding and
+-- colony.villager_binding_result remain fail-closed. API 0.6 also has no
 -- villager task, role, order, pathfinding, memory, inventory, or durable entity
 -- handle command. This fixture persists bounded colony intent, but never claims
 -- that a stored role/order was applied to a villager.

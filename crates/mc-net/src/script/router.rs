@@ -1,6 +1,7 @@
 use mc_script::{AdmittedScriptCommand, ScriptCommand, ScriptPluginStorageFailure};
 use tracing::{debug, warn};
 
+use super::colony::{ColonyAdapterError, PluginColonyAdapter};
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
 use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::zone::PluginZoneAdapter;
@@ -32,6 +33,7 @@ pub(crate) struct ScriptRouter {
     scripts: ScriptEventSink,
     storage: Option<PluginStorageHandle>,
     zones: PluginZoneAdapter,
+    colonies: PluginColonyAdapter,
 }
 
 impl ScriptRouter {
@@ -46,10 +48,12 @@ impl ScriptRouter {
         storage: Option<PluginStorageHandle>,
         zones: PluginZoneAdapter,
     ) -> Self {
+        let colonies = PluginColonyAdapter::new(scripts.clone());
         Self {
             scripts,
             storage,
             zones,
+            colonies,
         }
     }
 
@@ -216,8 +220,7 @@ impl ScriptRouter {
                 ScriptRouterExit::Continue
             }
             ScriptCommand::UpsertColony { .. } | ScriptCommand::RequestVillagerBinding { .. } => {
-                debug!("admitted script command has no production adapter in slice A");
-                ScriptRouterExit::Continue
+                self.route_colony_admitted(admitted).await
             }
             ScriptCommand::HostAttached { .. }
             | ScriptCommand::PluginStorageGet { .. }
@@ -229,6 +232,27 @@ impl ScriptRouter {
             }
             _ => {
                 debug!("unknown admitted script command rejected");
+                ScriptRouterExit::Continue
+            }
+        }
+    }
+
+    pub(super) async fn route_colony_admitted(
+        &self,
+        admitted: AdmittedScriptCommand,
+    ) -> ScriptRouterExit {
+        if matches!(
+            admitted.request(),
+            ScriptCommand::RequestVillagerBinding { .. }
+        ) {
+            debug!("admitted villager binding has no production adapter");
+            return ScriptRouterExit::Continue;
+        }
+        match self.colonies.route_admitted(admitted).await {
+            Ok(_) => ScriptRouterExit::Continue,
+            Err(ColonyAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
+            Err(error) => {
+                warn!(?error, "admitted colony record command rejected");
                 ScriptRouterExit::Continue
             }
         }

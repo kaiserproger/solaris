@@ -440,6 +440,110 @@ async fn lua_zone_entry_reaches_the_owning_plugin_from_normal_player_movement() 
 }
 
 #[tokio::test]
+async fn lua_colony_upsert_reaches_the_owning_plugin_with_correlated_result() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    let plugin = plugins.path().join("colony-owner");
+    std::fs::create_dir(&plugin).expect("create plugin directory");
+    std::fs::write(
+        plugin.join("plugin.toml"),
+        r#"
+            id = "colony-owner"
+            name = "Colony Owner"
+            version = "0.1.0"
+            api = "0.6.0"
+            events = ["player.joined"]
+            capabilities = ["colonies"]
+        "#,
+    )
+    .expect("write plugin manifest");
+    std::fs::write(
+        plugin.join("main.lua"),
+        r#"
+            local joined_player = nil
+
+            function on_player_joined(event)
+                joined_player = event.player_id
+                solaris.upsert_colony(
+                    "register-starter",
+                    "starter",
+                    "Starter Colony",
+                    "minecraft:alpha",
+                    3,
+                    -59,
+                    1
+                )
+            end
+
+            function on_colony_record_result(event)
+                solaris.send_message(
+                    joined_player,
+                    "colony-result:" .. event.request_id .. ":" .. event.colony_id .. ":" .. tostring(event.accepted)
+                )
+            end
+        "#,
+    )
+    .expect("write plugin source");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start Lua host");
+    assert_eq!(host.loaded_plugins(), 1);
+
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Lua colony wire test".into(),
+        max_players: 1,
+        view_distance: 2,
+        data: Arc::new(mc_data::testing::stub()),
+        blocks: Arc::new(mc_world::BlockRegistry::from_report(&[]).unwrap()),
+        world: None,
+        tags: Arc::new(mc_data::tags::TagsData::default()),
+        recipes: Arc::new(Vec::new()),
+        loot: Arc::new(mc_data::loot::LootTables::default()),
+        block_light: None,
+        items: Arc::new(mc_data::items::ItemRegistry::default()),
+        item_facts: Arc::new(mc_data::item_components::ItemFactsTable::default()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::default()),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::BiomeSpawnRules::default()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(Vec::<String>::new(), false),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind scripted server");
+    let addr = bound.local_addr().expect("local_addr");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut client = Client::connect(addr).await.expect("client connect");
+    let _ = client
+        .drive_login(addr, "ColonyPlayer")
+        .await
+        .expect("login");
+    client.drive_configuration().await.expect("configuration");
+    let _ = client.read_play_login().await.expect("play entry");
+    let _: ClientboundCommands = client.read_typed().await.expect("Commands");
+    let _: SynchronizePlayerPosition = client.read_typed().await.expect("SyncPlayerPos");
+    assert_eq!(
+        next_system_chat_text(&mut client).await,
+        "colony-result:register-starter:starter:true"
+    );
+
+    drop(client);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
 async fn lua_inventory_menu_opens_on_the_client_and_routes_click_to_its_owner() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("catalog");
