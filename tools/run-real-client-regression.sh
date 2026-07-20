@@ -924,15 +924,14 @@ validate_automation_driver_for_observations() {
       printf 'error: automation-driver.txt must record a graceful server_stop_phase for after-restart observations\n' >&2
       exit 1
     fi
+    if ! grep -Eq '^server_exit_phase=.* status=0$' "$automation_driver"; then
+      printf 'error: automation-driver.txt must record server_exit_phase with status=0 for after-restart observations\n' >&2
+      exit 1
+    fi
     if ! grep -Eq '^server_start_phase=.*after' "$automation_driver"; then
       printf 'error: automation-driver.txt must record an after-restart server_start_phase for after-restart observations\n' >&2
       exit 1
     fi
-  fi
-  if [[ "$observations" == *'"id":"playable-46-generated-ruin-cache-after"'* ]] \
-    && ! grep -Fxq 'server_exit_phase=playable-46-before-restart status=0' "$automation_driver"; then
-    printf 'error: playable-46 after observations require server_exit_phase=playable-46-before-restart status=0\n' >&2
-    exit 1
   fi
   if [[ "$observations" == *'"id":"playable-46-generated-ruin-cache-'* ]] \
     && ! grep -Eq '^server_world_dir=.+/world$' "$automation_driver"; then
@@ -1467,7 +1466,7 @@ PY
       run_agent_driver_phase "m94-06-save-restart-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "m94-06-before-restart"
+        stop_server_gracefully "m94-06-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "m94-06-after-restart"
@@ -1499,7 +1498,7 @@ PY
       run_agent_driver_phase "playable-03-save-restart-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-03-before-restart"
+        stop_server_gracefully "playable-03-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-03-after-restart"
@@ -1510,7 +1509,7 @@ PY
       run_agent_driver_phase "playable-04-twenty-minute-survival-loop"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-04-before-restart"
+        stop_server_gracefully "playable-04-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-04-after-restart"
@@ -1521,7 +1520,7 @@ PY
       run_agent_driver_phase "playable-06-stone-tool-save-restart-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-06-before-restart"
+        stop_server_gracefully "playable-06-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-06-after-restart"
@@ -1532,7 +1531,7 @@ PY
       run_agent_driver_phase "playable-13-chest-storage-save-restart-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-13-before-restart"
+        stop_server_gracefully "playable-13-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-13-after-restart"
@@ -1543,7 +1542,7 @@ PY
       run_agent_driver_phase "playable-25-iron-sword-save-restart-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-25-before-restart"
+        stop_server_gracefully "playable-25-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-25-after-restart"
@@ -1554,7 +1553,7 @@ PY
       run_agent_driver_phase "playable-29-iron-chestplate-save-restart-mitigation-before"
       driver_status="$agent_phase_status"
       if [[ "$driver_status" -eq 0 ]]; then
-        stop_server_gracefully "playable-29-before-restart"
+        stop_server_gracefully "playable-29-before-restart" 1
         server_restart_count=1
         printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
         start_server "playable-29-after-restart"
@@ -1570,7 +1569,7 @@ PY
             --secondary-secret="$SECOND_AGENT_SECRET"
           driver_status="$agent_phase_status"
           if [[ "$driver_status" -eq 0 ]]; then
-            stop_server_gracefully "playable-45-before-restart"
+            stop_server_gracefully "playable-45-before-restart" 1
             server_restart_count=1
             printf 'server_restart_count=%s\n' "$server_restart_count" >> "$run_dir/automation-driver.txt"
             start_server "playable-45-after-restart"

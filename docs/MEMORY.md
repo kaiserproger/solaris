@@ -9,8 +9,8 @@ and is not startup context.
 
 - Date: 2026-07-20.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `feba79a` (`feat(core): checkpoint playable parity
-  runtime`).
+- Latest checkpoint: `675174d` (`feat(client): prove earned building
+  placements`).
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
@@ -78,6 +78,12 @@ and is not startup context.
   client with `server_op_users=NONE`; the scenario and driver exited 0. The
   outer validator remained degraded by slow-tick warnings, so do not call the
   combined gameplay/performance gate green.
+- P04 repeatedly proves the no-debug natural gather -> craft -> continued work
+  path through the real client, including a wooden sword and successful zombie
+  and skeleton combat. The latest run then died to a third hostile at 2.17
+  health before restart, so the 20-minute gate is still red. Do not spend more
+  time tuning pursuit: the next useful proof is an owner-played session, while
+  automated P04 needs shelter, sleep, food, or death recovery.
 - The embedded client MCP provides reusable connection, observation, movement,
   interaction, and scenario tooling. Read `docs/AGENT_TOOLING.md` before
   changing it; protocol bots do not replace the real-client gate.
@@ -98,10 +104,10 @@ and is not startup context.
 
 ## Active Risks
 
-1. Make the P44 climb observation deterministic, then rerun the focused
-   real-client movement pack.
-2. Replace P47 debug-seeded stonecutter setup with earned input and rejected
-   invalid input.
+1. Run an owner-played survival session and fix its first common client-visible
+   blocker before isolated parity or performance work.
+2. Give automated P04 a normal survival strategy before claiming its full
+   20-minute plus restart gate.
 3. Continue reducing `simulation.rs` through explicit ownership boundaries;
    avoid moves that retain `use super::*` or duplicate authority.
 4. Advance regional ownership/ECS only with exact CAS, WAL, publication, and

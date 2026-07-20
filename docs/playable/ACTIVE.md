@@ -22,14 +22,17 @@ replacement-readiness claims.
 
 ## Current Queue
 
-1. Make P44 select or observe livestock that actually encounters a one-block
-   rise, then rerun it. Do not treat flat-terrain wandering as a climb failure.
-2. Replace the debug-seeded P47 stonecutter setup with earned survival input,
-   then add rejected invalid input. The existing run proves the menu path only.
-3. Keep terrain navigation and item pickup stable across farmland, fences,
-   slabs, stairs, one-block rises, and chunk boundaries without guessed jumps.
-4. Add the next high-value survival content slice only after the above red
-   client-visible paths are understood.
+1. Get one owner-played survival session on the current build. Record concrete
+   client-visible failures; do not substitute isolated parity probes for it.
+2. Keep P04 as the automated gathering/crafting/save-rejoin soak, but do not
+   demand that an unsheltered bot defeat every naturally spawned night mob.
+   Add shelter, sleep, food, or death recovery before rerunning the full gate.
+3. Treat failures from the owner session as the playable queue. Fix the first
+   common player-visible blocker, then rerun the shortest real-client scenario
+   that reproduces it.
+4. Defer deterministic livestock climbing, earned stonecutter hardening,
+   plugin API expansion, and performance work unless they block the survival
+   session or expose a catastrophic stall.
 
 ## Recent Evidence
 
@@ -76,6 +79,18 @@ replacement-readiness claims.
   degraded because `server.log` contains slow-tick warnings, including one
   342 ms entity-physics tick and one 271 ms entity-goals tick, so this is
   gameplay evidence rather than a clean combined gameplay/performance gate.
+- P04 repeatedly passed join, natural birch gathering, block break progress,
+  visible drop pickup, inventory recipes, crafting-table placement/opening,
+  sticks, a wooden pickaxe, and 24 continued resource cycles before night. The
+  latest artifact is
+  `.analysis/real-client-runs/20260720T140326Z-real-client-playable-loop-sZ7NVD`.
+  It also crafted a wooden sword and killed a zombie and skeleton through the
+  real client, then died to a third hostile at 2.17 health. This is not a
+  passing 20-minute or restart gate. The automated route needs an ordinary
+  survival strategy such as shelter, sleep, food, or death recovery; do not
+  keep tuning combat pursuit as a substitute for an owner-played session.
+- Restart evidence now requires the stopped server process to exit with status
+  0. A recorded interrupt without a clean exit can no longer pass validation.
 
 ## Manual And Agent Gates
 

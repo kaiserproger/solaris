@@ -220,6 +220,8 @@ final class PlayableRealClientLoopScenario {
     private static final double LIVESTOCK_MAX_HORIZONTAL_SPEED = 0.25;
     private static final double LIVESTOCK_MAX_YAW_DELTA = 15.0;
     private static final float IRON_CHESTPLATE_MAX_ZOMBIE_HIT_DAMAGE = 2.75F;
+    private static final float SURVIVAL_CHASE_MIN_HEALTH = 15.0F;
+    private static final long DAY_LENGTH_TICKS = 24_000L;
     private static final long NIGHT_START_DAY_TIME = 12_542L;
     private static final Map<String, PlanksRecipe> PLANKS_BY_LOG = Map.ofEntries(
         Map.entry("minecraft:acacia_log", new PlanksRecipe("minecraft:acacia_log", "minecraft:acacia_planks", 0)),
@@ -5065,6 +5067,52 @@ final class PlayableRealClientLoopScenario {
         return new ClientScenarioReport("passed", id, observations);
     }
 
+    private ClientScenarioReport craftWoodenSwordInOpenTable(
+        String id,
+        List<String> observations,
+        ScenarioClient client,
+        String planksItemId
+    ) throws Exception {
+        int containerId = client.activeContainerId();
+        int planksCount = client.inventoryCount(planksItemId);
+        int stickCount = client.inventoryCount("minecraft:stick");
+        int swordCount = client.inventoryCount("minecraft:wooden_sword");
+        if (planksCount < 2 || stickCount < 1) {
+            observations.add("wooden sword recipe: failed missing planks or stick");
+            return new ClientScenarioReport("failed", id, observations);
+        }
+
+        int recipeDisplayId = client.recipeDisplayIdForResult("minecraft:wooden_sword");
+        client.placeRecipe(containerId, recipeDisplayId, false);
+        boolean planksConsumed = client.waitForInventoryCount(
+            planksItemId,
+            planksCount - 2,
+            INVENTORY_TIMEOUT
+        );
+        boolean stickConsumed = client.waitForInventoryCount(
+            "minecraft:stick",
+            stickCount - 1,
+            INVENTORY_TIMEOUT
+        );
+        boolean swordCreated = client.waitForInventoryCount(
+            "minecraft:wooden_sword",
+            swordCount + 1,
+            INVENTORY_TIMEOUT
+        );
+        boolean closed = client.closeCurrentScreen(INVENTORY_TIMEOUT);
+        boolean passed = planksConsumed && stickConsumed && swordCreated && closed;
+        observations.add(
+            "wooden sword recipe: " + (passed ? "passed" : "failed")
+                + " container_id=" + containerId
+                + " recipe_display_id=" + recipeDisplayId
+                + " planks_count_matched=" + planksConsumed
+                + " stick_count_matched=" + stickConsumed
+                + " wooden_sword_count_matched=" + swordCreated
+                + " screen_closed=" + closed
+        );
+        return new ClientScenarioReport(passed ? "passed" : "failed", id, observations);
+    }
+
     private ClientScenarioReport mineCobblestoneWithWoodenPickaxe(
         String id,
         List<String> observations,
@@ -5606,9 +5654,9 @@ final class PlayableRealClientLoopScenario {
         long soakMillis = survivalSoakDuration.toMillis();
         long soakTicks = Math.max(1L, (soakMillis + 49L) / 50L);
         observations.add("20-minute survival soak: started duration_millis=" + soakMillis);
-        ScenarioHeldItem weapon = client.selectHotbarItem("minecraft:wooden_pickaxe", 1, HOTBAR_TIMEOUT);
-        if (!weapon.matches("minecraft:wooden_pickaxe", 1)) {
-            observations.add("20-minute survival soak: failed wooden_pickaxe_selectable=false");
+        ScenarioHeldItem weapon = client.selectHotbarItem("minecraft:wooden_sword", 1, HOTBAR_TIMEOUT);
+        if (!weapon.matches("minecraft:wooden_sword", 1)) {
+            observations.add("20-minute survival soak: failed wooden_sword_selectable=false");
             return new ClientScenarioReport("failed", id, observations);
         }
 
@@ -5648,10 +5696,17 @@ final class PlayableRealClientLoopScenario {
             currentServerTime = nextServerTime;
             completedTicks = currentServerTime - startServerTime;
 
+            boolean night = isNightTime(currentServerTime);
             ScenarioEntityObservation hostile = client.visibleEntity(
                 HOSTILE_ENTITY_IDS,
                 ScenarioReach.WITHIN_SURVIVAL_REACH
             );
+            if (hostile == null && night && health >= SURVIVAL_CHASE_MIN_HEALTH) {
+                hostile = client.visibleEntity(
+                    HOSTILE_ENTITY_IDS,
+                    ScenarioReach.OUTSIDE_SURVIVAL_REACH
+                );
+            }
             if (hostile != null) {
                 boolean approached = client.approachEntity(hostile, APPROACH_TIMEOUT);
                 boolean gone = approached && client.attackEntityUntilRemoved(hostile, ENTITY_ATTACK_TIMEOUT);
@@ -5675,6 +5730,10 @@ final class PlayableRealClientLoopScenario {
                 continue;
             }
 
+            if (night) {
+                continue;
+            }
+
             String planksItemId = availablePlanksItem(client);
             String workItemId = weapon.itemId();
             if (planksItemId != null) {
@@ -5695,6 +5754,12 @@ final class PlayableRealClientLoopScenario {
                 false,
                 false
             );
+            if (client.playerHealth() <= 0.0F) {
+                observations.add(
+                    "20-minute survival soak: failed player_died=true completed_ticks=" + completedTicks
+                );
+                return new ClientScenarioReport("failed", id, observations);
+            }
             if ("passed".equals(resourceWork.report().result())) {
                 resourceRuns++;
                 consecutiveResourceBlocks = 0;
@@ -5720,9 +5785,9 @@ final class PlayableRealClientLoopScenario {
                 observations.add("survival resource work: failed completed_ticks=" + completedTicks);
                 return new ClientScenarioReport("failed", id, observations);
             }
-            weapon = client.selectHotbarItem("minecraft:wooden_pickaxe", 1, HOTBAR_TIMEOUT);
-            if (!weapon.matches("minecraft:wooden_pickaxe", 1)) {
-                observations.add("20-minute survival soak: failed wooden_pickaxe_selectable_after_work=false");
+            weapon = client.selectHotbarItem("minecraft:wooden_sword", 1, HOTBAR_TIMEOUT);
+            if (!weapon.matches("minecraft:wooden_sword", 1)) {
+                observations.add("20-minute survival soak: failed wooden_sword_selectable_after_work=false");
                 return new ClientScenarioReport("failed", id, observations);
             }
         }
@@ -5741,6 +5806,10 @@ final class PlayableRealClientLoopScenario {
         );
         observations.add("runner-managed restart: pending clean server restart and post-restart rejoin check");
         return new ClientScenarioReport(inventoryStillPresent ? "passed" : "failed", id, observations);
+    }
+
+    static boolean isNightTime(long gameTime) {
+        return Math.floorMod(gameTime, DAY_LENGTH_TICKS) >= NIGHT_START_DAY_TIME;
     }
 
     private static String availablePlanksItem(ScenarioClient client) throws Exception {
@@ -5772,15 +5841,27 @@ final class PlayableRealClientLoopScenario {
         if (!"passed".equals(table.report().result())) {
             return table.report();
         }
+        boolean prepareForLongSurvival = TWENTY_MINUTE_ID.equals(id);
         ClientScenarioReport tool = craftWoodenPickaxeInOpenTable(
             id,
             observations,
             client,
             planks.planks().planksItemId(),
-            true
+            !prepareForLongSurvival
         );
         if (!"passed".equals(tool.result())) {
             return tool;
+        }
+        if (prepareForLongSurvival) {
+            ClientScenarioReport sword = craftWoodenSwordInOpenTable(
+                id,
+                observations,
+                client,
+                planks.planks().planksItemId()
+            );
+            if (!"passed".equals(sword.result())) {
+                return sword;
+            }
         }
 
         writeMarker(saveRestartMarkerPath(screenshotsDir), table.tableTarget());

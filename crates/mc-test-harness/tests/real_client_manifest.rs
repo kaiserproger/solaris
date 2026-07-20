@@ -1495,6 +1495,7 @@ fn validate_run_accepts_playable_save_restart_phase_observations() {
         format!(
             "{}client_agent_phase_exit_status_playable-03-save-restart-before=0\n\
 server_stop_phase=playable-03-before-restart signal=INT\n\
+server_exit_phase=playable-03-before-restart status=0\n\
 server_restart_count=1\n\
 server_start_phase=playable-03-after-restart\n\
 client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
@@ -1518,6 +1519,74 @@ client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
     assert!(
         output.status.success(),
         "validator rejected playable save/restart phase observations\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn validate_run_rejects_playable_restart_when_server_stop_is_nonzero() {
+    let repo_root = repo_root();
+    let run_dir = tempfile::tempdir().expect("create run dir");
+    let manifest_path = repo_root.join("docs/playable/real-client-playable-loop.json");
+    let manifest = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|err| panic!("read {}: {err}", manifest_path.display()));
+    write_validate_run_artifacts_with_manifest(
+        run_dir.path(),
+        &manifest,
+        json!({
+            "schema": "solaris.real_client_observations.v1",
+            "client_gate": "agent-run-real-client",
+            "quality_label": "playable-spike",
+            "result": "passed",
+            "scenarios": [
+                {
+                    "id": "playable-04-twenty-minute-survival-loop",
+                    "result": "passed",
+                    "screenshots": ["screenshots/playable-04-twenty-minute-survival-loop.png"]
+                },
+                {
+                    "id": "playable-03-save-restart-after",
+                    "result": "passed",
+                    "screenshots": ["screenshots/playable-03-save-restart-after.png"]
+                }
+            ]
+        }),
+    );
+    std::fs::write(
+        run_dir.path().join("automation-driver.txt"),
+        format!(
+            "{}client_agent_phase_exit_status_playable-04-twenty-minute-survival-loop=0\n\
+server_stop_phase=playable-04-before-restart signal=INT\n\
+server_exit_phase=playable-04-before-restart status=5\n\
+server_restart_count=1\n\
+server_start_phase=playable-04-after-restart\n\
+client_agent_phase_exit_status_playable-03-save-restart-after=0\n",
+            gradle_automation_driver_fixture()
+        ),
+    )
+    .expect("write non-clean restart automation driver");
+    for screenshot in [
+        "playable-04-twenty-minute-survival-loop.png",
+        "playable-03-save-restart-after.png",
+    ] {
+        std::fs::write(
+            run_dir.path().join("screenshots").join(screenshot),
+            valid_png_320x180(),
+        )
+        .expect("write valid screenshot");
+    }
+
+    let output = validate_run(&repo_root, run_dir.path());
+
+    assert!(
+        !output.status.success(),
+        "validator accepted restart evidence after a nonzero server stop"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("server_exit_phase")
+            && String::from_utf8_lossy(&output.stderr).contains("status=0"),
+        "validator must require a clean stop before all restart evidence\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1717,6 +1786,7 @@ fn validate_run_accepts_two_client_shared_chest_restart_observations() {
         format!(
             "{}client_agent_phase_exit_status_playable-45-two-client-shared-chest-save-restart-before=0\n\
 server_stop_phase=playable-45-before-restart signal=INT\n\
+server_exit_phase=playable-45-before-restart status=0\n\
 server_restart_count=1\n\
 server_start_phase=playable-45-after-restart\n\
 client_agent_phase_exit_status_playable-45-two-client-shared-chest-save-restart-after=0\n",

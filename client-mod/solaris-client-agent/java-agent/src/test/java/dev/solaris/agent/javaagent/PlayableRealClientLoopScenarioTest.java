@@ -136,6 +136,10 @@ final class PlayableRealClientLoopScenarioTest {
             report.observations().stream().anyMatch(entry -> entry.contains("survival resource work: passed")),
             "the long playable loop must perform useful work instead of standing AFK"
         );
+        assertTrue(
+            report.observations().stream().anyMatch(entry -> entry.contains("wooden sword recipe: passed")),
+            "the long survival loop must prepare a basic combat weapon before night"
+        );
     }
 
     @Test
@@ -173,6 +177,58 @@ final class PlayableRealClientLoopScenarioTest {
             client.operations.contains("attackEntityUntilRemoved:minecraft:spider:199"),
             "the long survival gate must defend against the spider that attacks the player"
         );
+    }
+
+    @Test
+    void fullLoopEngagesVisibleHostileBeforeItReachesAttackRangeAtNight() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.clientTicks = 12_522L;
+        client.visibleHostileOutsideReachDuringSoak = true;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-distant-hostile-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertTrue(
+            client.operations.contains("visibleEntity:minecraft:zombie|minecraft:skeleton|minecraft:spider:outside-survival-reach"),
+            "the long survival gate must scan beyond melee reach once night begins"
+        );
+        assertTrue(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("attackEntityUntilRemoved:")),
+            "the long survival gate must engage the distant hostile before waiting for damage"
+        );
+    }
+
+    @Test
+    void fullLoopDoesNotChaseDistantHostileWhileBadlyInjured() throws Exception {
+        FakeScenarioClient client = new FakeScenarioClient();
+        client.clientTicks = 12_522L;
+        client.healthAfterHostileCombat = 6.0F;
+        client.visibleHostileOutsideReachDuringSoak = true;
+
+        ClientScenarioReport report = new PlayableRealClientLoopScenario(Duration.ofMillis(1)).run(
+            "playable-04-twenty-minute-survival-loop",
+            Path.of("build/tmp/playable-04-injured-test/screenshots"),
+            client
+        );
+
+        assertEquals("passed", report.result(), () -> String.join("\n", report.observations()));
+        assertFalse(
+            client.operations.stream().anyMatch(operation -> operation.startsWith("attackEntityUntilRemoved:")),
+            "an injured survival player must not charge a hostile outside melee reach"
+        );
+    }
+
+    @Test
+    void survivalSoakTreatsVanillaNightAsUnsafeForLongResourceWork() {
+        assertFalse(PlayableRealClientLoopScenario.isNightTime(12_541L));
+        assertTrue(PlayableRealClientLoopScenario.isNightTime(12_542L));
+        assertTrue(PlayableRealClientLoopScenario.isNightTime(23_999L));
+        assertFalse(PlayableRealClientLoopScenario.isNightTime(24_000L));
+        assertTrue(PlayableRealClientLoopScenario.isNightTime(36_542L));
     }
 
     @Test
@@ -4327,6 +4383,7 @@ final class PlayableRealClientLoopScenarioTest {
         int sticks = 0;
         int craftingTables = 0;
         int woodenPickaxes = 0;
+        int woodenSwords = 0;
         int woodenHoes = 0;
         int cobblestones = 0;
         int cobblestoneSlabs = 0;
@@ -4367,6 +4424,7 @@ final class PlayableRealClientLoopScenarioTest {
         int foodLevel = 20;
         float healthAfterHostileCombat = 20.0F;
         boolean visibleHostileDuringSoak = false;
+        boolean visibleHostileOutsideReachDuringSoak = false;
         String visibleHostileTypeDuringSoak = "minecraft:zombie";
         boolean tickProgressDuringSoak = true;
         long clientTicks = 0L;
@@ -4480,6 +4538,9 @@ final class PlayableRealClientLoopScenarioTest {
             }
             if ("minecraft:wooden_pickaxe".equals(itemId)) {
                 return woodenPickaxes;
+            }
+            if ("minecraft:wooden_sword".equals(itemId)) {
+                return woodenSwords;
             }
             if ("minecraft:wooden_hoe".equals(itemId)) {
                 return woodenHoes;
@@ -4861,6 +4922,15 @@ final class PlayableRealClientLoopScenarioTest {
         }
 
         @Override
+        public int recipeDisplayIdForResult(String itemId) {
+            operations.add("recipeForResult:" + itemId);
+            if ("minecraft:wooden_sword".equals(itemId)) {
+                return 32;
+            }
+            throw new IllegalArgumentException("unsupported test recipe result " + itemId);
+        }
+
+        @Override
         public void placeRecipe(int containerId, int recipeDisplayId, boolean useMaxItems) {
             operations.add("recipe:" + containerId + ":" + recipeDisplayId + ":" + useMaxItems);
             if (recipeDisplayId == planksRecipeDisplayId()) {
@@ -4882,6 +4952,12 @@ final class PlayableRealClientLoopScenarioTest {
                     oakPlanks -= 3;
                     sticks -= 2;
                     woodenPickaxes += 1;
+                }
+            } else if (recipeDisplayId == 32) {
+                if (oakPlanks >= 2 && sticks >= 1) {
+                    oakPlanks -= 2;
+                    sticks -= 1;
+                    woodenSwords += 1;
                 }
             } else if (recipeDisplayId == 30) {
                 if (oakPlanks >= 2 && sticks >= 2) {
@@ -4999,6 +5075,9 @@ final class PlayableRealClientLoopScenarioTest {
             }
             if ("minecraft:wooden_pickaxe".equals(itemId)) {
                 return woodenPickaxes;
+            }
+            if ("minecraft:wooden_sword".equals(itemId)) {
+                return woodenSwords;
             }
             if ("minecraft:wooden_hoe".equals(itemId)) {
                 return woodenHoes;
@@ -5261,8 +5340,12 @@ final class PlayableRealClientLoopScenarioTest {
         @Override
         public ScenarioEntityObservation visibleEntity(List<String> entityTypeIds, ScenarioReach reach) {
             operations.add("visibleEntity:" + String.join("|", entityTypeIds) + ":" + reach.label());
-            if (visibleHostileDuringSoak && reach == ScenarioReach.WITHIN_SURVIVAL_REACH) {
+            boolean shouldReturnHostile = visibleHostileDuringSoak && reach == ScenarioReach.WITHIN_SURVIVAL_REACH;
+            shouldReturnHostile |= visibleHostileOutsideReachDuringSoak
+                && reach == ScenarioReach.OUTSIDE_SURVIVAL_REACH;
+            if (shouldReturnHostile) {
                 visibleHostileDuringSoak = false;
+                visibleHostileOutsideReachDuringSoak = false;
                 if (!entityTypeIds.contains(visibleHostileTypeDuringSoak)) {
                     return null;
                 }
