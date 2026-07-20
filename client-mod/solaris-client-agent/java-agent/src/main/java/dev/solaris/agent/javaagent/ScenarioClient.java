@@ -34,9 +34,36 @@ interface ScenarioClient {
         return findPlaceablePair(reach);
     }
 
+    default ScenarioBlockPair findHorizontalPlaceablePair(ScenarioReach reach) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support horizontal placement scans");
+    }
+
+    default ScenarioBlockPair findVerticalPlaceablePair(ScenarioReach reach) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support vertical placement scans");
+    }
+
+    default ScenarioBlockPair findHorizontalAttachmentPair(
+        ScenarioBlockTarget support,
+        ScenarioReach reach
+    ) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support attachment scans");
+    }
+
     ScenarioHeldItem giveAndSelect(String itemId, int count, int hotbarSlot, Duration timeout) throws Exception;
 
     ScenarioUseResult useItemOn(ScenarioBlockTarget clicked, ScenarioHeldItem heldItem) throws Exception;
+
+    default ScenarioUseResult useItemOnAtHeight(
+        ScenarioBlockTarget clicked,
+        ScenarioHeldItem heldItem,
+        double cursorHeight
+    ) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support placement cursor heights");
+    }
+
+    default boolean waitForUseAcknowledgement(ScenarioUseResult use, Duration timeout) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support block-change acknowledgements");
+    }
 
     boolean waitForBlock(ScenarioBlockTarget target, String blockId, Duration duration) throws Exception;
 
@@ -77,6 +104,10 @@ interface ScenarioClient {
 
     default void placeRecipe(int containerId, int recipeDisplayId, boolean useMaxItems) throws Exception {
         throw new UnsupportedOperationException("scenario client does not support recipe placement");
+    }
+
+    default int recipeDisplayIdForResult(String itemId) throws Exception {
+        throw new UnsupportedOperationException("scenario client does not support recipe result lookup");
     }
 
     default int inventoryCount(String itemId) throws Exception {

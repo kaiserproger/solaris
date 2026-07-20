@@ -12,10 +12,12 @@ public final class ClientStateEvents {
     private static final Condition STATE_CHANGED = LOCK.newCondition();
     private static final Condition TICK_CHANGED = LOCK.newCondition();
     private static final Condition SERVER_TIME_CHANGED = LOCK.newCondition();
+    private static final Condition BLOCK_CHANGE_ACKED = LOCK.newCondition();
     private static final Map<ScenarioItemDropIdentity, Integer> ITEM_TAKEN_BY = new LinkedHashMap<>();
     private static long stateVersion;
     private static long tickVersion;
     private static long serverTimeVersion;
+    private static long blockChangeAckVersion;
     private static long serverGameTime = Long.MIN_VALUE;
 
     private ClientStateEvents() {
@@ -43,6 +45,15 @@ public final class ClientStateEvents {
         LOCK.lock();
         try {
             return serverTimeVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static long blockChangeAckVersion() {
+        LOCK.lock();
+        try {
+            return blockChangeAckVersion;
         } finally {
             LOCK.unlock();
         }
@@ -83,6 +94,16 @@ public final class ClientStateEvents {
             serverGameTime = gameTime;
             serverTimeVersion += 1;
             SERVER_TIME_CHANGED.signalAll();
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static void publishBlockChangeAck() {
+        LOCK.lock();
+        try {
+            blockChangeAckVersion += 1;
+            BLOCK_CHANGE_ACKED.signalAll();
         } finally {
             LOCK.unlock();
         }
@@ -162,6 +183,20 @@ public final class ClientStateEvents {
                 remainingNanos = SERVER_TIME_CHANGED.awaitNanos(remainingNanos);
             }
             return serverTimeVersion != observedVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static boolean awaitBlockChangeAck(long observedVersion, Duration timeout)
+        throws InterruptedException {
+        long remainingNanos = timeout.toNanos();
+        LOCK.lockInterruptibly();
+        try {
+            while (blockChangeAckVersion == observedVersion && remainingNanos > 0L) {
+                remainingNanos = BLOCK_CHANGE_ACKED.awaitNanos(remainingNanos);
+            }
+            return blockChangeAckVersion != observedVersion;
         } finally {
             LOCK.unlock();
         }

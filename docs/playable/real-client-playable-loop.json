@@ -1464,6 +1464,26 @@
         "Secondary receives exactly the item stored by primary before restart through the normal container path.",
         "Primary observes the persisted shared slot empty after the secondary withdrawal, and both clients remain in Play."
       ]
+    },
+    {
+      "id": "playable-48-wall-torch-stairs-slabs",
+      "status": "manual-pending",
+      "bounded_time_minutes": 12,
+      "screenshots_required": true,
+      "no_debug_commands": true,
+      "steps": [
+        "Connect one repo-native Gradle real client to a fresh playable.toml world without operator privileges.",
+        "Gather natural logs, craft and place a crafting table, then earn charcoal, sticks, torches, and enough matching planks for stairs and slabs.",
+        "Craft matching wooden stairs and slabs through the normal crafting screen and recipe book.",
+        "Place a wall torch, bottom stairs, bottom slab, and top slab; merge two matching slabs and attempt a wall torch against unsupported bottom-slab side support.",
+        "Capture the final client state and screenshot."
+      ],
+      "expected_observations": [
+        "No debug give, summon, teleport, or command setup is available to the client.",
+        "Accepted placements publish a block-change acknowledgement, the expected block state and orientation, and exactly one inventory debit.",
+        "The bottom-slab side rejects wall-torch attachment without consuming the torch.",
+        "Matching slabs merge into a double slab while the client remains in Play."
+      ]
     }
   ]
 }

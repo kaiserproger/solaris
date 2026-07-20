@@ -171,6 +171,7 @@ fn playable_real_client_manifest_tracks_no_debug_twenty_minute_loop() {
     assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart"));
     assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart-before"));
     assert!(scenario_ids.contains("playable-45-two-client-shared-chest-save-restart-after"));
+    assert!(scenario_ids.contains("playable-48-wall-torch-stairs-slabs"));
 }
 
 #[test]
@@ -196,6 +197,51 @@ fn playable_real_client_runner_check_selects_gradle_adapter() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("scenario policy: no-debug, no operator privileges"),
+        "playable runner must deny operator privileges for its no-debug scenario\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn real_client_runner_rejects_a_scenario_missing_from_the_manifest() {
+    let repo_root = repo_root();
+    let manifest_dir = tempfile::tempdir().expect("create manifest directory");
+    let manifest_path = manifest_dir.path().join("single-scenario.json");
+    std::fs::write(
+        &manifest_path,
+        r#"{
+  "schema_version": 1,
+  "pack_id": "runner-scenario-membership-test",
+  "quality_label": "test-only",
+  "scenarios": [{"id": "declared-scenario"}]
+}"#,
+    )
+    .expect("write manifest fixture");
+
+    let output = Command::new("bash")
+        .arg(repo_root.join("tools/run-real-client-regression.sh"))
+        .arg("--check")
+        .env("SOLARIS_REAL_CLIENT_MANIFEST", manifest_path)
+        .env("SOLARIS_REAL_CLIENT_AGENT_SCENARIO", "undeclared-scenario")
+        .output()
+        .expect("check undeclared scenario");
+
+    assert!(
+        !output.status.success(),
+        "runner accepted a scenario outside its evidence manifest\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("missing from manifest"),
+        "runner must explain the scenario/manifest mismatch\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -213,6 +259,7 @@ fn core_replay_real_client_gate_checks_structured_pack_with_gradle_runner() {
         "tools/core-replay-scenarios/core-actions-seed-81.json"
     );
     assert_eq!(pack["scenarios"][0]["id"], "core-actions-seed-81");
+    assert_eq!(pack["scenarios"][0]["no_debug_commands"], true);
     assert_eq!(pack["scenarios"][0]["screenshots_required"], true);
 
     let wrapper_path = repo_root.join("tools/run-core-replay-client-gate.sh");

@@ -985,6 +985,9 @@ public final class MinecraftClientFacade implements ClientFacade {
     @Override
     public ClientScenarioReport runScenario(String id, Path screenshotsDir) {
         ScenarioClient client = new MinecraftScenarioClient(new MinecraftClientExecutor());
+        if (PlayableBuildingPlacementScenario.supports(id)) {
+            return new PlayableBuildingPlacementScenario().run(id, screenshotsDir, client);
+        }
         if (PlayableRealClientLoopScenario.supports(id)) {
             return new PlayableRealClientLoopScenario().run(id, screenshotsDir, client);
         }

@@ -29,6 +29,7 @@ SECOND_AGENT_PORT="${SOLARIS_REAL_CLIENT_SECOND_AGENT_PORT:-}"
 SECOND_AGENT_BRIDGE_URL="${SOLARIS_REAL_CLIENT_SECOND_AGENT_BRIDGE_URL:-}"
 MODE="prepare"
 VALIDATE_RUN_DIR=""
+SCENARIO_NO_DEBUG="0"
 
 usage() {
   cat <<'EOF'
@@ -145,6 +146,48 @@ if not isinstance(quality_label, str) or not quality_label:
     print("error: manifest quality_label must be a non-empty string", file=sys.stderr)
     sys.exit(1)
 print(quality_label)
+PY
+}
+
+requested_scenario_no_debug() {
+  require_file "$MANIFEST"
+  python3 - "$MANIFEST" "$AGENT_SCENARIO" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1])
+scenario_id = sys.argv[2]
+manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+scenarios = manifest.get("scenarios")
+if not isinstance(scenarios, list):
+    print("error: manifest scenarios must be a list", file=sys.stderr)
+    sys.exit(1)
+matches = [
+    scenario
+    for scenario in scenarios
+    if isinstance(scenario, dict) and scenario.get("id") == scenario_id
+]
+if not matches:
+    print(
+        f"error: requested scenario {scenario_id!r} is missing from manifest {manifest_path}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+if len(matches) != 1:
+    print(
+        f"error: requested scenario {scenario_id!r} is duplicated in manifest {manifest_path}",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+no_debug = matches[0].get("no_debug_commands")
+if not isinstance(no_debug, bool):
+    print(
+        f"error: requested scenario {scenario_id!r} must declare boolean no_debug_commands",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+print("1" if no_debug else "0")
 PY
 }
 
@@ -296,7 +339,7 @@ client_game_dir_for_label() {
 }
 
 real_client_operator_list() {
-  if [[ "$AGENT_SCENARIO" == "playable-46-generated-ruin-cache" ]]; then
+  if [[ "$SCENARIO_NO_DEBUG" == "1" ]]; then
     printf '[]\n'
     return
   fi
@@ -1007,9 +1050,18 @@ validate_server_log() {
   fi
 }
 
+if [[ "$MODE" == "check" || "$MODE" == "run" ]]; then
+  SCENARIO_NO_DEBUG="$(requested_scenario_no_debug)"
+fi
+
 if [[ "$MODE" == "check" ]]; then
   client_adapter_status
-  exit $?
+  if [[ "$SCENARIO_NO_DEBUG" == "1" ]]; then
+    printf 'scenario policy: no-debug, no operator privileges\n'
+  else
+    printf 'scenario policy: debug commands allowed by manifest\n'
+  fi
+  exit 0
 fi
 
 if [[ "$MODE" == "validate-run" ]]; then
@@ -1059,7 +1111,7 @@ PY
     printf 'server_config_source=%s\n' "$server_config_source"
     printf 'server_config_effective=%s\n' "$server_config"
     printf 'server_command_effective=%s\n' "cargo run --bin mc-server -- --config $server_config"
-    if [[ "$AGENT_SCENARIO" == "playable-46-generated-ruin-cache" ]]; then
+    if [[ "$SCENARIO_NO_DEBUG" == "1" ]]; then
       printf 'server_op_users=NONE\n'
     else
       printf 'server_op_users=%s,%s\n' "$(client_username_for_label primary)" "$(client_username_for_label secondary)"

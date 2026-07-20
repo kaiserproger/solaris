@@ -42,9 +42,15 @@ the operation. Every timeout is failure, not a success condition.
 
 The current bridge also provides push-driven motion and entity-removal waits
 over the virtual-thread transport. Canonical interaction checks fence reach,
-raycast, and authoritative world state before reporting success. The focused
-bridge/java/client-mod gate passed after adding test-only client dependencies;
-`runClient` has not been run, so this is tooling-path evidence only.
+raycast, and authoritative world state before reporting success. Focused bridge,
+Java, and client-mod tests are tooling-path evidence only. Actual `runClient`
+evidence and its remaining gameplay gaps are tracked in
+`docs/playable/ACTIVE.md`.
+
+The regression runner is fail-closed on scenario provenance. For `--check` and
+`--run`, `SOLARIS_REAL_CLIENT_AGENT_SCENARIO` must name exactly one scenario in
+`SOLARIS_REAL_CLIENT_MANIFEST`; an implemented but undeclared debug scenario is
+not valid evidence for a no-debug playable manifest.
 
 ## Useful External Candidates
 

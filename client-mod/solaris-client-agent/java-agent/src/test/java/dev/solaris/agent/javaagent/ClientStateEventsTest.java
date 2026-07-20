@@ -111,4 +111,25 @@ final class ClientStateEventsTest {
         assertTrue(waiter.get(1, TimeUnit.SECONDS));
         assertEquals(42L, ClientStateEvents.serverGameTime());
     }
+
+    @Test
+    void blockChangeAcknowledgementWakesDedicatedWaiter() throws Exception {
+        long observedVersion = ClientStateEvents.blockChangeAckVersion();
+        CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return ClientStateEvents.awaitBlockChangeAck(
+                    observedVersion,
+                    Duration.ofSeconds(1)
+                );
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(error);
+            }
+        });
+
+        ClientStateEvents.publishBlockChangeAck();
+
+        assertTrue(waiter.get(1, TimeUnit.SECONDS));
+        assertEquals(observedVersion + 1, ClientStateEvents.blockChangeAckVersion());
+    }
 }

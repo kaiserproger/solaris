@@ -26,6 +26,7 @@ import net.minecraft.world.inventory.ContainerInput;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.DyeColor;
 import net.minecraft.world.item.crafting.display.RecipeDisplayId;
+import net.minecraft.world.item.crafting.display.SlotDisplayContext;
 import net.minecraft.world.level.LightLayer;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.BlockEntity;
@@ -159,6 +160,28 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     }
 
     @Override
+    public ScenarioBlockPair findHorizontalPlaceablePair(ScenarioReach reach) throws Exception {
+        return executor.callOnClientThread(() ->
+            findPlaceablePairOnClientThread(reach, true, false, HORIZONTAL_DIRECTIONS)
+        );
+    }
+
+    @Override
+    public ScenarioBlockPair findVerticalPlaceablePair(ScenarioReach reach) throws Exception {
+        return executor.callOnClientThread(() ->
+            findPlaceablePairOnClientThread(reach, true, false, new Direction[] { Direction.UP })
+        );
+    }
+
+    @Override
+    public ScenarioBlockPair findHorizontalAttachmentPair(
+        ScenarioBlockTarget support,
+        ScenarioReach reach
+    ) throws Exception {
+        return executor.callOnClientThread(() -> findHorizontalAttachmentPairOnClientThread(support, reach));
+    }
+
+    @Override
     public ScenarioHeldItem giveAndSelect(String itemId, int count, int hotbarSlot, Duration timeout)
         throws Exception {
         executor.callOnClientThread(() -> {
@@ -190,6 +213,7 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     public ScenarioUseResult useItemOn(ScenarioBlockTarget clicked, ScenarioHeldItem heldItem) throws Exception {
         return executor.callOnClientThread(() -> {
             Minecraft minecraft = requireInPlay();
+            long ackVersion = ClientStateEvents.blockChangeAckVersion();
             BlockHitResult hit = hitResult(clicked);
             minecraft.hitResult = hit;
             minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, hit.getLocation());
@@ -199,8 +223,42 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                 hit
             );
             minecraft.player.swing(InteractionHand.MAIN_HAND);
-            return new ScenarioUseResult(result.toString());
+            return new ScenarioUseResult(result.toString(), ackVersion);
         });
+    }
+
+    @Override
+    public ScenarioUseResult useItemOnAtHeight(
+        ScenarioBlockTarget clicked,
+        ScenarioHeldItem heldItem,
+        double cursorHeight
+    ) throws Exception {
+        if (cursorHeight < 0.0 || cursorHeight > 1.0) {
+            throw new IllegalArgumentException("cursor height must be between 0 and 1");
+        }
+        return executor.callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            long ackVersion = ClientStateEvents.blockChangeAckVersion();
+            BlockHitResult hit = hitResult(clicked, cursorHeight);
+            minecraft.hitResult = hit;
+            minecraft.player.lookAt(EntityAnchorArgument.Anchor.EYES, hit.getLocation());
+            InteractionResult result = minecraft.gameMode.useItemOn(
+                minecraft.player,
+                InteractionHand.MAIN_HAND,
+                hit
+            );
+            minecraft.player.swing(InteractionHand.MAIN_HAND);
+            return new ScenarioUseResult(result.toString(), ackVersion);
+        });
+    }
+
+    @Override
+    public boolean waitForUseAcknowledgement(ScenarioUseResult use, Duration timeout)
+        throws InterruptedException {
+        if (use.blockChangeAckVersionBeforeUse() < 0L) {
+            return false;
+        }
+        return ClientStateEvents.awaitBlockChangeAck(use.blockChangeAckVersionBeforeUse(), timeout);
     }
 
     @Override
@@ -358,6 +416,29 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                 useMaxItems
             ));
             return null;
+        });
+    }
+
+    @Override
+    public int recipeDisplayIdForResult(String itemId) throws Exception {
+        return executor.callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            var context = SlotDisplayContext.fromLevel(minecraft.level);
+            for (var collection : minecraft.player.getRecipeBook().getCollections()) {
+                for (var entry : collection.getRecipes()) {
+                    boolean matches = entry.resultItems(context).stream().anyMatch(stack ->
+                        !stack.isEmpty()
+                            && Objects.equals(
+                                BuiltInRegistries.ITEM.getKey(stack.getItem()).toString(),
+                                itemId
+                            )
+                    );
+                    if (matches) {
+                        return entry.id().index();
+                    }
+                }
+            }
+            return -1;
         });
     }
 
@@ -2735,6 +2816,20 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         boolean requireDryTarget,
         boolean requirePlayerClearance
     ) {
+        return findPlaceablePairOnClientThread(
+            reach,
+            requireDryTarget,
+            requirePlayerClearance,
+            PLACE_DIRECTIONS
+        );
+    }
+
+    private static ScenarioBlockPair findPlaceablePairOnClientThread(
+        ScenarioReach reach,
+        boolean requireDryTarget,
+        boolean requirePlayerClearance,
+        Direction[] directions
+    ) {
         Minecraft minecraft = requireInPlay();
         BlockPos origin = minecraft.player.blockPosition();
         Vec3 eye = minecraft.player.getEyePosition();
@@ -2751,7 +2846,8 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                             eye,
                             reach,
                             requireDryTarget,
-                            requirePlayerClearance
+                            requirePlayerClearance,
+                            directions
                         );
                         if (pair != null) {
                             return pair;
@@ -2759,6 +2855,55 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                     }
                 }
             }
+        }
+        return null;
+    }
+
+    private static ScenarioBlockPair findHorizontalAttachmentPairOnClientThread(
+        ScenarioBlockTarget support,
+        ScenarioReach reach
+    ) {
+        Minecraft minecraft = requireInPlay();
+        BlockPos supportPos = pos(support);
+        if (!minecraft.level.isLoaded(supportPos) || minecraft.level.getBlockState(supportPos).isAir()) {
+            return null;
+        }
+        Vec3 eye = minecraft.player.getEyePosition();
+        for (Direction direction : HORIZONTAL_DIRECTIONS) {
+            BlockPos target = supportPos.relative(direction);
+            if (!isEmptyLoaded(target) || isPlayerSpace(target) || !isFluidNeighbourhoodEmpty(target)) {
+                continue;
+            }
+            double distance = eye.distanceToSqr(Vec3.atLowerCornerWithOffset(
+                supportPos,
+                cursorX(direction),
+                0.5,
+                cursorZ(direction)
+            ));
+            if (reach == ScenarioReach.WITHIN_SURVIVAL_REACH && distance > SURVIVAL_REACH_SQUARED) {
+                continue;
+            }
+            if (reach == ScenarioReach.OUTSIDE_SURVIVAL_REACH && distance <= FAR_REACH_SQUARED) {
+                continue;
+            }
+            return new ScenarioBlockPair(
+                new ScenarioBlockTarget(
+                    support.x(),
+                    support.y(),
+                    support.z(),
+                    direction.getName(),
+                    "horizontal-attachment-support",
+                    blockIdAt(support)
+                ),
+                new ScenarioBlockTarget(
+                    target.getX(),
+                    target.getY(),
+                    target.getZ(),
+                    direction.getOpposite().getName(),
+                    "horizontal-attachment-target",
+                    blockIdAt(target)
+                )
+            );
         }
         return null;
     }
@@ -3075,7 +3220,8 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         Vec3 eye,
         ScenarioReach reach,
         boolean requireDryTarget,
-        boolean requirePlayerClearance
+        boolean requirePlayerClearance,
+        Direction[] directions
     ) {
         if (!isSolidLoaded(clicked)) {
             return null;
@@ -3084,7 +3230,7 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         if (!dropsAsDirt(clickedBlockId)) {
             return null;
         }
-        for (Direction direction : PLACE_DIRECTIONS) {
+        for (Direction direction : directions) {
             BlockPos target = clicked.relative(direction);
             if (!isEmptyLoaded(target) || isPlayerSpace(target)) {
                 continue;
@@ -3740,6 +3886,16 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         Direction direction = direction(target.face());
         return new BlockHitResult(
             Vec3.atLowerCornerWithOffset(pos(target), cursorX(direction), cursorY(direction), cursorZ(direction)),
+            direction,
+            pos(target),
+            false
+        );
+    }
+
+    private static BlockHitResult hitResult(ScenarioBlockTarget target, double cursorHeight) {
+        Direction direction = direction(target.face());
+        return new BlockHitResult(
+            Vec3.atLowerCornerWithOffset(pos(target), cursorX(direction), cursorHeight, cursorZ(direction)),
             direction,
             pos(target),
             false

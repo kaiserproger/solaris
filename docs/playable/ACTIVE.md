@@ -22,34 +22,60 @@ replacement-readiness claims.
 
 ## Current Queue
 
-1. Rerun the P44 livestock movement/performance pack without the old CPU cap.
-   Inspect chicken yaw and rare slow ticks, and keep cow/sheep climbing checks.
-2. Run a real-client building check for wall torches, stairs, and slabs. Record
-   placement state, rejected support behavior, inventory debit, and reconnect.
-3. Prove the stonecutter menu with a real 26.1.2 client, including selection,
-   normal take, shift-click, close/reopen, and rejected invalid input.
-4. Keep terrain navigation and item pickup stable across farmland, fences,
+1. Make P44 select or observe livestock that actually encounters a one-block
+   rise, then rerun it. Do not treat flat-terrain wandering as a climb failure.
+2. Replace the debug-seeded P47 stonecutter setup with earned survival input,
+   then add rejected invalid input. The existing run proves the menu path only.
+3. Keep terrain navigation and item pickup stable across farmland, fences,
    slabs, stairs, one-block rises, and chunk boundaries without guessed jumps.
-5. Add the next high-value survival content slice only after the above red
+4. Add the next high-value survival content slice only after the above red
    client-visible paths are understood.
 
 ## Recent Evidence
 
-- Checkpoint `24223dc` passes full workspace tests, workspace all-target strict
-  Clippy, fmt, code-health `0 fail / KEEP`, and diff-check.
+- Checkpoint `feba79a` passes full workspace tests, workspace all-target strict
+  Clippy, fmt, code-health `0 fail / KEEP`, and diff-check. The `block_edit`
+  target also passes both parallel and sequential runs with 94/94 tests.
 - Ordinary wall torches have registry-backed tests for four horizontal facings,
   standing `UP`, rejected `DOWN`, and partial support. Raw TCP proves one debit
   after accepted update/ack and unchanged held-stack resync before rejected ack.
-- Stair facing/half and slab top/bottom use the inspected local 26.1.2 rule.
-  Slab merging and stair neighbour-shape selection remain open.
+- Stair facing/half, slab top/bottom, matching-slab merge, and waterlogging use
+  the inspected local 26.1.2 rule. Stair neighbour-shape selection remains open.
 - The regional mutation extraction is architecture-only and makes no gameplay
   or performance claim.
 - Latest P44 artifact is
-  `.analysis/real-client-runs/20260718T111008Z-m94-regression-pack-4X1iF7`.
-  Cow and sheep passed; chicken failed smooth yaw. Its old two-CPU performance
-  result is stale now that new runs may use normal CPU capacity.
-- Stonecutter focused server tests pass, but the real-client menu gate remains
-  open.
+  `.analysis/real-client-runs/20260720T120018Z-real-client-playable-loop-UJtsgc`.
+  Sheep and chicken passed, including chicken yaw. The selected cow moved 2.69
+  blocks on a flat Y=78 surface but never encountered a rise, so the scenario
+  failed its 0.8-block climb condition. The prior artifact
+  `.analysis/real-client-runs/20260718T111008Z-m94-regression-pack-4X1iF7`
+  already observed a real-client cow climb of 1.0 block. P44 therefore needs a
+  deterministic climb candidate before another run can be strong evidence.
+- The unrestricted P44 run exposed a 3.47-second entity-journal checkpoint
+  stall. The journal now releases the regional commit mutex after queueing the
+  ordered replacement and before waiting for disk completion; the focused
+  durable-mutation concurrency regression passes. This is not a broad
+  performance claim.
+- P47 artifact
+  `.analysis/real-client-runs/20260720T122329Z-real-client-playable-loop-Dbzfoj`
+  passed stonecutter placement, menu open, normal take (1 input to 2 slabs),
+  close/reopen conservation, and shift-click (3 inputs to 6 slabs). The outer
+  runner returned degraded because startup emitted 350 ms and 52 ms slow-tick
+  warnings; the client scenario itself exited 0. Its setup used three
+  `giveAndSelect` debug commands, so this is real-client wire/menu evidence,
+  not earned-survival gameplay evidence. Earned setup and rejected invalid
+  input remain open.
+- P48 artifact
+  `.analysis/real-client-runs/20260720T124754Z-real-client-playable-loop-l8eWbc`
+  passed the no-debug, no-op real-client building scenario. The client earned
+  wood, stone, a furnace, charcoal, torches, and matching planks; crafted
+  stairs and slabs; then proved wall-torch facing, stair facing/half, bottom
+  and top slabs, matching-slab merge, exact inventory debits, and rejected
+  bottom-slab wall-torch support without a debit. The scenario and driver
+  exited successfully and produced a valid screenshot. The outer gate remains
+  degraded because `server.log` contains slow-tick warnings, including one
+  342 ms entity-physics tick and one 271 ms entity-goals tick, so this is
+  gameplay evidence rather than a clean combined gameplay/performance gate.
 
 ## Manual And Agent Gates
 

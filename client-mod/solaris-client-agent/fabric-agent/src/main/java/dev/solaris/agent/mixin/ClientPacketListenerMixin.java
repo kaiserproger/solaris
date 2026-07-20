@@ -4,6 +4,7 @@ import dev.solaris.agent.javaagent.ClientStateEvents;
 import dev.solaris.agent.javaagent.ScenarioItemDropIdentity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTimePacket;
 import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.world.entity.Entity;
@@ -15,6 +16,14 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 
 @Mixin(ClientPacketListener.class)
 abstract class ClientPacketListenerMixin {
+    @Inject(method = "handleBlockChangedAck", at = @At("RETURN"))
+    private void solaris$publishBlockChangeAck(
+        ClientboundBlockChangedAckPacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        ClientStateEvents.publishBlockChangeAck();
+    }
+
     @Inject(method = "handleTakeItemEntity", at = @At("HEAD"))
     private void solaris$publishTakenItemIdentity(
         ClientboundTakeItemEntityPacket packet,

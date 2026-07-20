@@ -36,6 +36,7 @@
     {
       "id": "core-actions-seed-81",
       "status": "manual-pending",
+      "no_debug_commands": true,
       "bounded_time_minutes": 3,
       "screenshots_required": true,
       "steps": [

@@ -7,35 +7,40 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-19.
+- Date: 2026-07-20.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `02cf22a` (`refactor: split gameplay and core domain
-  modules`).
+- Latest checkpoint: `feba79a` (`feat(core): checkpoint playable parity
+  runtime`).
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
-- Last recorded full workspace tests, workspace all-target strict Clippy, fmt,
-  code-health `0 fail / KEEP`, and diff-check passed at `24223dc`. The later
-  `02cf22a` checkpoint and current entity wave still need a fresh full baseline.
+- Full workspace tests, workspace all-target strict Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check passed on the exact tree committed as
+  `feba79a`. The wire-level `block_edit` target passed both parallel and
+  sequential runs with 94/94 tests.
 - Ignored oracle/load/benchmark rows remain explicit. Real-client,
-  performance, concurrency, and soak gates did not run for that checkpoint.
+  performance, dedicated concurrency, and soak gates did not run for this
+  checkpoint.
 
 ## Current Head
 
 ### Core And Ownership
 
-- `play.rs` is 12,589 lines, `session.rs` 1,507, and `simulation.rs` 15,488.
-  The migration is staged, not complete.
+- `play.rs` is 13,108 lines, `session.rs` 1,571, `simulation.rs` 15,855,
+  `server.rs` 8,356, and `chunk_stream.rs` 8,221. The migration is staged, not
+  complete.
 - `simulation/queue.rs` owns bounded admission, accounting, pushed wakeup,
   batching, shutdown, and channel construction.
 - `simulation/regional_mutation.rs` owns the existing regional block/container
   mutation lane behind explicit imports and code-health tripwires. The parent
   still owns classification, batching, world access, lighting/publication, and
   `SimulationOwner`.
-- `EntityStore` uses the ECS runtime and the old vector comparison state,
-  `Shadow*` API, aliases, and `shadow-compare` feature are deleted. The current
-  cutover is still moving gameplay-significant temporal state and projectile
-  transactions out of `mc-net` side maps, so broad sole-authority readiness is
-  not yet established. ADR 0004/0005 are the authority source of truth.
+- `EntityStore` is the production ECS runtime; the old vector comparison state,
+  `Shadow*` API, aliases, and `shadow-compare` feature are deleted. Exact
+  26.1.2 modules now cover entity contracts, attributes, effects, equipment,
+  living damage, navigation, projectiles, synced data, and runtime transactions.
+  Gameplay-significant side maps and live-scale propagation still need removal
+  or explicit authority fences, so broad sole-authority readiness is not yet
+  established. ADR 0004/0005 are the authority source of truth.
 - Runtime work control has no operator worker-percentage knobs. Capacity is
   derived once; pushed measurements and bounded admissions drive allocation.
 - Serverbound protocol collections/strings/blobs have a complete bounded
@@ -45,24 +50,34 @@ and is not startup context.
   arithmetic, and the default Overworld path has a deterministic serialized-NBT
   fingerprint. The algorithm remains Solaris-owned rather than Mojang
   NoiseRouter parity.
-- Lua API 0.6 has bounded DTO/files/batches and one-shot host admission. The
-  attested `mc-net` router plus storage/menu/zones/colonies adapters are active
-  implementation work, not a completed production surface.
+- Lua API 0.6 has bounded DTO/files/batches, one-shot host admission, an
+  attested `mc-net` router, and durable plugin storage. Menu, transaction,
+  zones, colonies, and villager adapters remain incomplete production work.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 
 ### Playable And Client-Visible
 
 - Stair facing/half, slab top/bottom, adjacent matching-slab merge, and
-  waterlogging follow the inspected local 26.1.2 rule. The focused executable
-  gate must be refreshed after the concurrent ECS slice; stair neighbour shapes
-  remain open.
+  waterlogging follow the inspected local 26.1.2 rule. The focused wire gate is
+  current at `feba79a`; stair neighbour shapes remain open.
 - Ordinary torches place as wall torches on horizontal conservative full-cube
   supports, remain standing on `UP`, and reject `DOWN` or known partial
   supports. Irregular sturdy-face parity and neighbour break cascades remain
   open.
-- Stonecutter server behavior has focused coverage; a real 26.1.2 client menu
-  gate remains open.
+- P47 real-client artifact
+  `.analysis/real-client-runs/20260720T122329Z-real-client-playable-loop-Dbzfoj`
+  passed stonecutter placement, menu open, normal take, close/reopen
+  conservation, and shift-click conservation. The scenario exited 0; the outer
+  runner was degraded by two startup slow-tick warnings. Setup used three
+  `giveAndSelect` debug commands, so this proves the real-client menu/wire path,
+  not earned survival. Earned setup and rejected invalid input remain open.
+- P48 real-client artifact
+  `.analysis/real-client-runs/20260720T124754Z-real-client-playable-loop-l8eWbc`
+  passed earned wall-torch, stair, and slab building through a no-debug Gradle
+  client with `server_op_users=NONE`; the scenario and driver exited 0. The
+  outer validator remained degraded by slow-tick warnings, so do not call the
+  combined gameplay/performance gate green.
 - The embedded client MCP provides reusable connection, observation, movement,
   interaction, and scenario tooling. Read `docs/AGENT_TOOLING.md` before
   changing it; protocol bots do not replace the real-client gate.
@@ -70,18 +85,23 @@ and is not startup context.
 ### Known Runtime Evidence
 
 - Latest P44 artifact:
-  `.analysis/real-client-runs/20260718T111008Z-m94-regression-pack-4X1iF7`.
-  Cow and sheep passed. Chicken moved but failed smooth yaw with a 79.2-degree
-  minimum delta. The old two-CPU run reported 24 slow ticks, about 69.7 ms
-  average slow tick and 102.7 ms maximum. This is diagnostic, not green.
-- The owner has removed the CPU cap for new runs. Do not treat the old bounded
-  result as current unrestricted performance evidence.
+  `.analysis/real-client-runs/20260720T120018Z-real-client-playable-loop-UJtsgc`.
+  Sheep and chicken passed, including chicken yaw. The selected cow moved 2.69
+  blocks on flat terrain and did not satisfy the climb condition. The preceding
+  P44 artifact observed a 1.0-block cow climb, so this is a nondeterministic
+  candidate-selection gap rather than evidence that step physics regressed.
+- The unrestricted run exposed a 3.47-second checkpoint stall caused by waiting
+  for entity-journal replacement while holding the regional journal mutex. The
+  working tree queues replacement under the mutex, releases it, and then waits;
+  the focused durable-mutation concurrency regression is green. Broader gates
+  remain pending.
 
 ## Active Risks
 
-1. Rerun the focused real-client movement/performance pack without the old CPU
-   cap and inspect rare stalls, not only aggregate medians.
-2. Refresh focused and real-client wall torch, stair, and slab placement gates.
+1. Make the P44 climb observation deterministic, then rerun the focused
+   real-client movement pack.
+2. Replace P47 debug-seeded stonecutter setup with earned input and rejected
+   invalid input.
 3. Continue reducing `simulation.rs` through explicit ownership boundaries;
    avoid moves that retain `use super::*` or duplicate authority.
 4. Advance regional ownership/ECS only with exact CAS, WAL, publication, and
