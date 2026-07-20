@@ -41,10 +41,12 @@ separate tick notification is used only when tick progression itself drives
 the operation. Every timeout is failure, not a success condition.
 
 The current bridge also provides push-driven motion and entity-removal waits
-over the virtual-thread transport. Canonical interaction checks fence reach,
-raycast, and authoritative world state before reporting success. Focused bridge,
-Java, and client-mod tests are tooling-path evidence only. Actual `runClient`
-evidence and its remaining gameplay gaps are tracked in
+over the virtual-thread transport. Ordinary primary/secondary container-slot
+clicks wait for an applied server container update, so plugin inventory menus
+can be exercised without coordinate clicks. Canonical interaction checks fence
+reach, raycast, and authoritative world state before reporting success. Focused
+bridge, Java, and client-mod tests are tooling-path evidence only. Actual
+`runClient` evidence and its remaining gameplay gaps are tracked in
 `docs/playable/ACTIVE.md`.
 
 The regression runner is fail-closed on scenario provenance. For `--check` and

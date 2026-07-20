@@ -101,6 +101,8 @@ public interface ClientFacade {
 
     JsonObject quickMoveContainerSlot(int slot, Duration timeout) throws Exception;
 
+    JsonObject clickContainerSlot(int slot, String button, Duration timeout) throws Exception;
+
     JsonObject clickContainerButton(int buttonId, Duration timeout) throws Exception;
 
     void sendChat(String message, boolean command);

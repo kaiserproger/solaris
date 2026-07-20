@@ -132,4 +132,29 @@ final class ClientStateEventsTest {
         assertTrue(waiter.get(1, TimeUnit.SECONDS));
         assertEquals(observedVersion + 1, ClientStateEvents.blockChangeAckVersion());
     }
+
+    @Test
+    void appliedContainerPacketWakesOnlyDedicatedContainerWaiter() throws Exception {
+        long observedVersion = ClientStateEvents.containerPacketVersion();
+        CompletableFuture<Boolean> waiter = CompletableFuture.supplyAsync(() -> {
+            try {
+                return ClientStateEvents.awaitContainerPacket(
+                    observedVersion,
+                    Duration.ofSeconds(1)
+                );
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(error);
+            }
+        });
+
+        ClientStateEvents.publishState();
+        assertEquals(observedVersion, ClientStateEvents.containerPacketVersion());
+        assertFalse(waiter.isDone());
+
+        ClientStateEvents.publishContainerPacket();
+
+        assertTrue(waiter.get(1, TimeUnit.SECONDS));
+        assertEquals(observedVersion + 1, ClientStateEvents.containerPacketVersion());
+    }
 }

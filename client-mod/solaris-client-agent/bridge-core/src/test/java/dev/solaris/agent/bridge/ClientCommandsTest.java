@@ -890,15 +890,23 @@ final class ClientCommandsTest {
             "quick_move_container_slot",
             "{\"slot\":37,\"timeout_seconds\":8.0}"
         ));
+        JsonObject click = registry.find("click_container_slot").orElseThrow().execute(request(
+            "click_container_slot",
+            "{\"slot\":3,\"button\":\"secondary\",\"timeout_seconds\":7.0}"
+        ));
         JsonObject button = registry.find("click_container_button").orElseThrow().execute(request(
             "click_container_button",
             "{\"button_id\":2,\"timeout_seconds\":9.0}"
         ));
 
         assertTrue(quickMove.get("confirmed").getAsBoolean());
+        assertTrue(click.get("confirmed").getAsBoolean());
         assertTrue(button.get("confirmed").getAsBoolean());
         assertEquals(37, client.quickMovedContainerSlot);
         assertEquals(Duration.ofSeconds(8), client.quickMoveContainerTimeout);
+        assertEquals(3, client.clickedContainerSlot);
+        assertEquals("secondary", client.containerSlotButton);
+        assertEquals(Duration.ofSeconds(7), client.containerSlotTimeout);
         assertEquals(2, client.clickedContainerButton);
         assertEquals(Duration.ofSeconds(9), client.containerButtonTimeout);
         assertEquals(0, executor.calls, "facade owns the packet-event wait");
@@ -906,6 +914,24 @@ final class ClientCommandsTest {
         assertThrows(IllegalArgumentException.class, () ->
             registry.find("quick_move_container_slot").orElseThrow().execute(request(
                 "quick_move_container_slot",
+                "{\"slot\":32768}"
+            ))
+        );
+        assertThrows(IllegalArgumentException.class, () ->
+            registry.find("click_container_slot").orElseThrow().execute(request(
+                "click_container_slot",
+                "{\"slot\":0,\"button\":\"middle\"}"
+            ))
+        );
+        assertThrows(IllegalArgumentException.class, () ->
+            registry.find("click_container_slot").orElseThrow().execute(request(
+                "click_container_slot",
+                "{\"slot\":0}"
+            ))
+        );
+        assertThrows(IllegalArgumentException.class, () ->
+            registry.find("click_container_slot").orElseThrow().execute(request(
+                "click_container_slot",
                 "{\"slot\":32768}"
             ))
         );
@@ -988,6 +1014,9 @@ final class ClientCommandsTest {
         Duration dropTimeout;
         int quickMovedContainerSlot = -1;
         Duration quickMoveContainerTimeout;
+        int clickedContainerSlot = -1;
+        String containerSlotButton;
+        Duration containerSlotTimeout;
         int clickedContainerButton = -1;
         Duration containerButtonTimeout;
         String selectedItemId;
@@ -1232,6 +1261,16 @@ final class ClientCommandsTest {
         public JsonObject quickMoveContainerSlot(int slot, Duration timeout) {
             quickMovedContainerSlot = slot;
             quickMoveContainerTimeout = timeout;
+            JsonObject result = new JsonObject();
+            result.addProperty("confirmed", true);
+            return result;
+        }
+
+        @Override
+        public JsonObject clickContainerSlot(int slot, String button, Duration timeout) {
+            clickedContainerSlot = slot;
+            containerSlotButton = button;
+            containerSlotTimeout = timeout;
             JsonObject result = new JsonObject();
             result.addProperty("confirmed", true);
             return result;

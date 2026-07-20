@@ -47,6 +47,7 @@ final class ClientMcpToolsTest {
             "minecraft_close_screen",
             "minecraft_respawn",
             "minecraft_quick_move_container_slot",
+            "minecraft_click_container_slot",
             "minecraft_click_container_button",
             "minecraft_send_chat",
             "minecraft_drop_selected_item",
@@ -113,6 +114,10 @@ final class ClientMcpToolsTest {
         JsonObject quickMove = properties(find(
             ClientMcpTools.definitions(),
             "minecraft_quick_move_container_slot"
+        ));
+        JsonObject containerSlot = properties(find(
+            ClientMcpTools.definitions(),
+            "minecraft_click_container_slot"
         ));
         JsonObject containerButton = properties(find(
             ClientMcpTools.definitions(),
@@ -232,6 +237,18 @@ final class ClientMcpToolsTest {
         assertEquals(120.0, respawn.get("timeout_seconds").getAsJsonObject().get("maximum").getAsDouble());
         assertEquals(10.0, respawn.get("timeout_seconds").getAsJsonObject().get("default").getAsDouble());
         assertEquals(32_767, quickMove.get("slot").getAsJsonObject().get("maximum").getAsInt());
+        assertEquals(32_767, containerSlot.get("slot").getAsJsonObject().get("maximum").getAsInt());
+        assertEquals(
+            List.of("primary", "secondary"),
+            containerSlot.get("button").getAsJsonObject().getAsJsonArray("enum")
+                .asList().stream().map(value -> value.getAsString()).toList()
+        );
+        assertEquals(
+            List.of("slot", "button"),
+            find(ClientMcpTools.definitions(), "minecraft_click_container_slot")
+                .inputSchema().getAsJsonArray("required")
+                .asList().stream().map(value -> value.getAsString()).toList()
+        );
         assertEquals(
             Integer.MAX_VALUE,
             containerButton.get("button_id").getAsJsonObject().get("maximum").getAsInt()
@@ -285,6 +302,7 @@ final class ClientMcpToolsTest {
         assertTrue(find(tools, "minecraft_attack_entity_until_drop_collected").destructive());
         assertTrue(find(tools, "minecraft_drop_selected_item").destructive());
         assertTrue(find(tools, "minecraft_quick_move_container_slot").destructive());
+        assertTrue(find(tools, "minecraft_click_container_slot").destructive());
         assertTrue(find(tools, "minecraft_click_container_button").destructive());
         assertTrue(find(tools, "minecraft_run_scenario").destructive());
         assertTrue(find(tools, "minecraft_observe").openWorld());

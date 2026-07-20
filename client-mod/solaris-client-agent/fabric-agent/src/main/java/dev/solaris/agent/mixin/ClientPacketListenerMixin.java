@@ -5,6 +5,11 @@ import dev.solaris.agent.javaagent.ScenarioItemDropIdentity;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.protocol.game.ClientboundBlockChangedAckPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerClosePacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetContentPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetDataPacket;
+import net.minecraft.network.protocol.game.ClientboundContainerSetSlotPacket;
+import net.minecraft.network.protocol.game.ClientboundOpenScreenPacket;
 import net.minecraft.network.protocol.game.ClientboundSetTimePacket;
 import net.minecraft.network.protocol.game.ClientboundTakeItemEntityPacket;
 import net.minecraft.world.entity.Entity;
@@ -49,5 +54,42 @@ abstract class ClientPacketListenerMixin {
     @Inject(method = "handleSetTime", at = @At("RETURN"))
     private void solaris$publishServerTime(ClientboundSetTimePacket packet, CallbackInfo callbackInfo) {
         ClientStateEvents.publishServerTime(packet.gameTime());
+    }
+
+    @Inject(method = "handleOpenScreen", at = @At("RETURN"))
+    private void solaris$publishOpenScreen(ClientboundOpenScreenPacket packet, CallbackInfo callbackInfo) {
+        ClientStateEvents.publishContainerPacket();
+    }
+
+    @Inject(method = "handleContainerSetSlot", at = @At("RETURN"))
+    private void solaris$publishContainerSlot(
+        ClientboundContainerSetSlotPacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        ClientStateEvents.publishContainerPacket();
+    }
+
+    @Inject(method = "handleContainerContent", at = @At("RETURN"))
+    private void solaris$publishContainerContent(
+        ClientboundContainerSetContentPacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        ClientStateEvents.publishContainerPacket();
+    }
+
+    @Inject(method = "handleContainerSetData", at = @At("RETURN"))
+    private void solaris$publishContainerData(
+        ClientboundContainerSetDataPacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        ClientStateEvents.publishContainerPacket();
+    }
+
+    @Inject(method = "handleContainerClose", at = @At("RETURN"))
+    private void solaris$publishContainerClose(
+        ClientboundContainerClosePacket packet,
+        CallbackInfo callbackInfo
+    ) {
+        ClientStateEvents.publishContainerPacket();
     }
 }

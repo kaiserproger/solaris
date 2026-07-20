@@ -254,6 +254,19 @@ public final class ClientMcpTools {
             )
         ),
         mutating(
+            "minecraft_click_container_slot",
+            "Primary- or secondary-click one visible menu slot and wait for a server-confirmed container update.",
+            "click_container_slot",
+            objectSchema(
+                properties(
+                    "slot", integer(0, Short.MAX_VALUE),
+                    "button", enumString(List.of("primary", "secondary")),
+                    "timeout_seconds", number(0.1, 120.0, 8.0)
+                ),
+                List.of("slot", "button")
+            )
+        ),
+        mutating(
             "minecraft_click_container_button",
             "Click one menu button and wait for the server-confirmed container state update.",
             "click_container_button",

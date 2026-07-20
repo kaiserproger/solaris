@@ -101,9 +101,11 @@ Controls:
   `minecraft_look_at_block`, `minecraft_use_item_on`.
 - Input: `minecraft_press_inputs`, `minecraft_wait_ticks`,
   `minecraft_close_screen`, `minecraft_send_chat`.
-- Containers: `minecraft_quick_move_container_slot` and
-  `minecraft_click_container_button`; both return only after an applied server
-  packet advances the active container state id.
+- Containers: `minecraft_quick_move_container_slot`,
+  `minecraft_click_container_slot`, and `minecraft_click_container_button`;
+  ordinary clicks accept primary or secondary input and also confirm a
+  server-side close/reopen, while quick moves and buttons require the active
+  container state ID to advance.
 - Regression: `minecraft_run_scenario` runs an existing deterministic
   in-client scenario and returns its structured report through MCP.
 - Optional visual context: `minecraft_screenshot`.

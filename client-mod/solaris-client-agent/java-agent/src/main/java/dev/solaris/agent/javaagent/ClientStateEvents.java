@@ -13,11 +13,13 @@ public final class ClientStateEvents {
     private static final Condition TICK_CHANGED = LOCK.newCondition();
     private static final Condition SERVER_TIME_CHANGED = LOCK.newCondition();
     private static final Condition BLOCK_CHANGE_ACKED = LOCK.newCondition();
+    private static final Condition CONTAINER_PACKET_APPLIED = LOCK.newCondition();
     private static final Map<ScenarioItemDropIdentity, Integer> ITEM_TAKEN_BY = new LinkedHashMap<>();
     private static long stateVersion;
     private static long tickVersion;
     private static long serverTimeVersion;
     private static long blockChangeAckVersion;
+    private static long containerPacketVersion;
     private static long serverGameTime = Long.MIN_VALUE;
 
     private ClientStateEvents() {
@@ -54,6 +56,15 @@ public final class ClientStateEvents {
         LOCK.lock();
         try {
             return blockChangeAckVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static long containerPacketVersion() {
+        LOCK.lock();
+        try {
+            return containerPacketVersion;
         } finally {
             LOCK.unlock();
         }
@@ -104,6 +115,16 @@ public final class ClientStateEvents {
         try {
             blockChangeAckVersion += 1;
             BLOCK_CHANGE_ACKED.signalAll();
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static void publishContainerPacket() {
+        LOCK.lock();
+        try {
+            containerPacketVersion += 1;
+            CONTAINER_PACKET_APPLIED.signalAll();
         } finally {
             LOCK.unlock();
         }
@@ -197,6 +218,20 @@ public final class ClientStateEvents {
                 remainingNanos = BLOCK_CHANGE_ACKED.awaitNanos(remainingNanos);
             }
             return blockChangeAckVersion != observedVersion;
+        } finally {
+            LOCK.unlock();
+        }
+    }
+
+    public static boolean awaitContainerPacket(long observedVersion, Duration timeout)
+        throws InterruptedException {
+        long remainingNanos = timeout.toNanos();
+        LOCK.lockInterruptibly();
+        try {
+            while (containerPacketVersion == observedVersion && remainingNanos > 0L) {
+                remainingNanos = CONTAINER_PACKET_APPLIED.awaitNanos(remainingNanos);
+            }
+            return containerPacketVersion != observedVersion;
         } finally {
             LOCK.unlock();
         }

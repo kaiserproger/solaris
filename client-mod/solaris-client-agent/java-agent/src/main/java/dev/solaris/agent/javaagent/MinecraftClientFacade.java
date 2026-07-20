@@ -849,6 +849,20 @@ public final class MinecraftClientFacade implements ClientFacade {
     }
 
     @Override
+    public JsonObject clickContainerSlot(int slot, String button, java.time.Duration timeout) throws Exception {
+        boolean confirmed = new MinecraftScenarioClient(new MinecraftClientExecutor())
+            .clickContainerSlot(slot, button, timeout);
+        if (!confirmed) {
+            throw new TimeoutException("server did not confirm " + button + " click for container slot " + slot);
+        }
+        JsonObject result = new JsonObject();
+        result.addProperty("confirmed", true);
+        result.addProperty("slot", slot);
+        result.addProperty("button", button);
+        return result;
+    }
+
+    @Override
     public JsonObject clickContainerButton(int buttonId, java.time.Duration timeout) throws Exception {
         boolean confirmed = new MinecraftScenarioClient(new MinecraftClientExecutor())
             .clickContainerButton(buttonId, timeout);

@@ -120,6 +120,15 @@ replacement-readiness claims.
   stale/quota rejection, definite write failure, and unknown-sync replay. The
   runtime transaction excludes concurrent player inventory mutation, but the
   plugin WAL and vanilla playerdata are not yet one crash-recovery log.
+- The embedded 26.1.2 client MCP now exposes ordinary primary and secondary
+  container-slot clicks and waits for an applied server update instead of a
+  guessed delay. An agent-run client on a fresh local world entered the catalog
+  zone, received the inventory menu, bought two apples for three emeralds, and
+  refunded them. Structured observations proved exact `64 -> 61 -> 64`
+  emerald and `0 -> 2 -> 0` apple counts, menu reopen IDs `1 -> 2 -> 3`, ledger
+  labels `owned 0 -> 1 -> 0`, and both plugin messages. A stale slot click after
+  closing the menu was rejected before packet dispatch. This is focused plugin
+  gameplay evidence, not a broad survival or readiness gate.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 

@@ -2,6 +2,7 @@ package dev.solaris.agent.javaagent;
 
 import dev.solaris.agent.client.ClientTaskExecutor;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.client.gui.components.ChatComponent;
 import net.minecraft.client.gui.screens.DeathScreen;
@@ -804,6 +805,44 @@ public final class MinecraftScenarioClient implements ScenarioClient {
         return waitForContainerStateAdvance(checkpoint, System.nanoTime() + duration.toNanos());
     }
 
+    public boolean clickContainerSlot(int containerSlot, String button, Duration duration) throws Exception {
+        if (containerSlot < 0 || containerSlot > Short.MAX_VALUE) {
+            throw new IllegalArgumentException("container slot must be between 0 and " + Short.MAX_VALUE);
+        }
+        int mouseButton = switch (button) {
+            case "primary" -> 0;
+            case "secondary" -> 1;
+            default -> throw new IllegalArgumentException("button must be primary or secondary");
+        };
+        ContainerClickCheckpoint checkpoint = executor.callOnClientThread(() -> {
+            Minecraft minecraft = requireInPlay();
+            AbstractContainerMenu menu = minecraft.player.containerMenu;
+            if (!(minecraft.screen instanceof AbstractContainerScreen<?> screen)
+                || screen.getMenu() != menu) {
+                throw new IllegalStateException("no visible container menu is open");
+            }
+            if (containerSlot >= menu.slots.size()) {
+                throw new IllegalArgumentException(
+                    "container slot " + containerSlot + " is outside menu size " + menu.slots.size()
+                );
+            }
+            ContainerClickCheckpoint before = new ContainerClickCheckpoint(
+                menu.containerId,
+                menu.getStateId(),
+                ClientStateEvents.containerPacketVersion()
+            );
+            minecraft.gameMode.handleContainerInput(
+                menu.containerId,
+                containerSlot,
+                mouseButton,
+                ContainerInput.PICKUP,
+                minecraft.player
+            );
+            return before;
+        });
+        return waitForContainerUpdate(checkpoint, System.nanoTime() + duration.toNanos());
+    }
+
     @Override
     public int findContainerSlot(String itemId, int count) throws Exception {
         return executor.callOnClientThread(() -> {
@@ -869,6 +908,31 @@ public final class MinecraftScenarioClient implements ScenarioClient {
                 return true;
             }
             if (!awaitClientStateChange(observedVersion, deadlineNanos)) {
+                return false;
+            }
+        } while (true);
+    }
+
+    private boolean waitForContainerUpdate(
+        ContainerClickCheckpoint checkpoint,
+        long deadlineNanos
+    ) throws Exception {
+        do {
+            long currentPacketVersion = ClientStateEvents.containerPacketVersion();
+            boolean updated = executor.callOnClientThread(() -> {
+                Minecraft minecraft = requireInPlay();
+                AbstractContainerMenu menu = minecraft.player.containerMenu;
+                return menu.containerId != checkpoint.containerId()
+                    || menu.getStateId() != checkpoint.stateId();
+            });
+            if (currentPacketVersion != checkpoint.containerPacketVersion() && updated) {
+                return true;
+            }
+            long remainingNanos = deadlineNanos - System.nanoTime();
+            if (remainingNanos <= 0L || !ClientStateEvents.awaitContainerPacket(
+                currentPacketVersion,
+                Duration.ofNanos(remainingNanos)
+            )) {
                 return false;
             }
         } while (true);
@@ -4055,6 +4119,13 @@ public final class MinecraftScenarioClient implements ScenarioClient {
     }
 
     private record ContainerUpdateCheckpoint(int containerId, int stateId) {
+    }
+
+    private record ContainerClickCheckpoint(
+        int containerId,
+        int stateId,
+        long containerPacketVersion
+    ) {
     }
 
     private record ContainerClickAttempt(

@@ -22,6 +22,7 @@ public final class ClientCommands {
         "down", "up", "north", "south", "west", "east"
     );
     private static final Set<String> ENTITY_INTERACTION_HANDS = Set.of("main_hand", "off_hand");
+    private static final Set<String> CONTAINER_CLICK_BUTTONS = Set.of("primary", "secondary");
 
     private ClientCommands() {
     }
@@ -289,6 +290,14 @@ public final class ClientCommands {
                 eventTimeout(payload)
             );
         });
+        registry.register("click_container_slot", request -> {
+            JsonObject payload = request.payload();
+            return client.clickContainerSlot(
+                boundedInt(payload, "slot", 0, Short.MAX_VALUE),
+                containerClickButton(payload),
+                eventTimeout(payload)
+            );
+        });
         registry.register("click_container_button", request -> {
             JsonObject payload = request.payload();
             return client.clickContainerButton(
@@ -475,6 +484,14 @@ public final class ClientCommands {
             throw new IllegalArgumentException("hand must be main_hand or off_hand");
         }
         return hand;
+    }
+
+    private static String containerClickButton(JsonObject payload) {
+        String button = boundedString(payload, "button", 9);
+        if (!CONTAINER_CLICK_BUTTONS.contains(button)) {
+            throw new IllegalArgumentException("button must be primary or secondary");
+        }
+        return button;
     }
 
     private static int boundedInt(JsonObject payload, String key, int minimum, int maximum) {
