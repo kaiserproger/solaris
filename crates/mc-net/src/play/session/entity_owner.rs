@@ -76,8 +76,19 @@ impl mc_entity::RegionalDecisionJournal for TrackedEntityDecisionJournal {
         self.inner.clear_commits(phases)
     }
 
+    fn clear_commit_identities(
+        &mut self,
+        identities: &[(mc_entity::RegionPhase, u64, u64)],
+    ) -> Result<(), mc_entity::RegionalDecisionJournalError> {
+        self.inner.clear_commit_identities(identities)
+    }
+
     fn pending_phases(&self) -> Vec<mc_entity::RegionPhase> {
         self.inner.pending_phases()
+    }
+
+    fn pending_commit_identities(&self) -> Vec<(mc_entity::RegionPhase, u64, u64)> {
+        self.inner.pending_commit_identities()
     }
 
     fn recovery_watermark(&self) -> (mc_entity::RegionPhase, u64) {

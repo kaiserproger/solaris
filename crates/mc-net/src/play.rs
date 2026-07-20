@@ -13194,8 +13194,29 @@ mod campfire_output_recovery_tests {
         assert!(world_pending.is_empty());
         let (_, entity_pending) =
             persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
-        assert!(entity_pending.is_empty());
+        assert_eq!(
+            entity_pending.len(),
+            1,
+            "entity checkpoint cleanup stays memory-only"
+        );
+        let checkpoint = persistence::load_persisted_entities(
+            tmp.path(),
+            runtime.config.items.as_ref(),
+            runtime.config.entity_types.as_ref(),
+        )
+        .unwrap();
+        let replayed = persistence::replay_regional_commit_decisions(checkpoint, &entity_pending)
+            .expect("entity checkpoint watermark filters old campfire output");
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].snapshot.uuid, expected.uuid);
         drop(runtime);
+
+        let (_, entity_pending) =
+            persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        assert!(
+            entity_pending.is_empty(),
+            "normal shutdown compacts checkpointed entity WAL"
+        );
 
         let (restarted, recovered) = reopen_campfire_runtime(tmp.path()).await;
         assert_eq!(recovered, 0);

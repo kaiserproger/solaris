@@ -96,6 +96,15 @@ arbitrary tick count.
   is neither skipped nor hit twice.
 - Save barriers collect immutable snapshots from every lane for the same
   completed phase. Disk IO remains outside lane ownership.
+- Entity checkpoint acknowledgement is memory-only. The saved checkpoint's
+  lifecycle and owner-sequence watermark makes older append-only WAL records
+  replay-safe, so checkpoint cleanup removes their exact identities from the
+  in-memory pending set without queueing a rewrite or `fsync`. New durable
+  mutations therefore append directly instead of waiting behind checkpoint
+  compaction. Normal journal shutdown compacts the retained pending set before
+  stopping and joining the single FIFO writer. A failed shutdown compaction may
+  leave replay-safe old records on disk but cannot invalidate already durable
+  appends.
 - Disconnect and shutdown close queues, reject unapplied player commands, and
   wait for exact lane completion before the final save snapshot.
 

@@ -54,9 +54,12 @@ replacement-readiness claims.
   already observed a real-client cow climb of 1.0 block. P44 therefore needs a
   deterministic climb candidate before another run can be strong evidence.
 - The unrestricted P44 run exposed a 3.47-second entity-journal checkpoint
-  stall. The journal now releases the regional commit mutex after queueing the
-  ordered replacement and before waiting for disk completion; the focused
-  durable-mutation concurrency regression passes. This is not a broad
+  stall. Entity checkpoint acknowledgement is now memory-only after the durable
+  world checkpoint: older append-only WAL records are filtered by the saved
+  lifecycle/sequence watermark, and physical compaction runs on normal journal
+  shutdown. A production-journal regression proves the next mutation queues an
+  `Append`, not a checkpoint `Replace`; crash-before-compaction replay and
+  shutdown compaction both have focused coverage. This is not a broad
   performance claim.
 - P47 artifact
   `.analysis/real-client-runs/20260720T122329Z-real-client-playable-loop-Dbzfoj`
@@ -131,12 +134,14 @@ replacement-readiness claims.
   gameplay evidence, not a broad survival or readiness gate.
 - Admitted Lua colony upserts now reach a bounded owner-scoped production
   registry and publish a correlated `colony.record_result` only to the owning
-  plugin. Unit coverage proves replacement at total capacity, independent
-  per-plugin limits, wrong-command rejection, and closed-publication behavior;
-  a TCP client wire gate observes the real Lua host response. Records are
-  intentionally in-memory and plugin storage remains the durable intent source.
-  Villager binding is still fail-closed pending a bounded region-owner query
-  and authoritative expiring token.
+  plugin. Villager binding now validates colony ownership and the current
+  overworld dimension, then uses the bounded regional-owner query to install an
+  atomic 600-tick opaque claim without scanning session snapshots. Missing,
+  foreign, out-of-dimension, capacity-exhausted, and no-villager requests return
+  a targeted empty result; broken owner availability remains fatal. Unit
+  coverage includes the real Lua admission path, and a TCP client wire gate
+  observes colony upsert. Records remain in-memory and plugin storage is the
+  durable intent source.
 - Restart evidence now requires the stopped server process to exit with status
   0. A recorded interrupt without a clean exit can no longer pass validation.
 - Multi-entity physics dispatch no longer sends one cached owner mutation per

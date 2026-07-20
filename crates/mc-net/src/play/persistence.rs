@@ -130,6 +130,7 @@ impl TryFrom<EncodedRegionalCommitDecision> for RegionalCommitDecision {
 pub(crate) struct FileRegionalDecisionJournal {
     path: PathBuf,
     pending: Vec<RegionalCommitDecision>,
+    needs_compaction: bool,
     requests: std::sync::mpsc::SyncSender<RegionalJournalWriteRequest>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -189,6 +190,7 @@ impl FileRegionalDecisionJournal {
         let journal = Self {
             path,
             pending: pending.clone(),
+            needs_compaction: false,
             requests,
             worker: Some(worker),
         };
@@ -230,6 +232,12 @@ impl FileRegionalDecisionJournal {
 
 impl Drop for FileRegionalDecisionJournal {
     fn drop(&mut self) {
+        // The world checkpoint watermark makes acknowledged records replay-safe.
+        // Compact only at this exact shutdown event so gameplay appends never queue
+        // behind a checkpoint rewrite and its fsync.
+        if self.needs_compaction {
+            let _ = self.persist();
+        }
         let (reply, completion) = std::sync::mpsc::channel();
         let _ = self
             .requests
@@ -830,10 +838,9 @@ impl RegionalDecisionJournal for FileRegionalDecisionJournal {
             .filter(|decision| !identities.contains(&decision.identity()))
             .cloned()
             .collect::<Vec<_>>();
-        let previous = std::mem::replace(&mut self.pending, retained);
-        if self.persist().is_err() {
-            self.pending = previous;
-            return Err(RegionalDecisionJournalError::SAFE);
+        if retained.len() != self.pending.len() {
+            self.pending = retained;
+            self.needs_compaction = true;
         }
         Ok(())
     }
@@ -2977,6 +2984,85 @@ mod tests {
     }
 
     #[test]
+    fn regional_decision_checkpoint_cleanup_does_not_queue_a_rewrite_before_next_append() {
+        let checkpointed =
+            RegionalCommitDecision::from_parts(RegionPhase(11), 41, Vec::new(), Vec::new())
+                .expect("checkpointed decision");
+        let later = RegionalCommitDecision::from_parts(RegionPhase(12), 42, Vec::new(), Vec::new())
+            .expect("later decision");
+        let expected_later = later.clone();
+        let (requests, receiver) = std::sync::mpsc::sync_channel(2);
+        let writer = std::thread::spawn(move || {
+            match receiver.recv().expect("first writer request after cleanup") {
+                RegionalJournalWriteRequest::Append { decisions, reply } => {
+                    assert_eq!(decisions, vec![expected_later]);
+                    reply.send(Ok(())).expect("append completion");
+                }
+                RegionalJournalWriteRequest::Replace { reply, .. } => {
+                    reply.send(Ok(())).expect("rewrite completion");
+                    panic!("checkpoint cleanup queued a WAL rewrite before the next append");
+                }
+                RegionalJournalWriteRequest::Shutdown { reply } => {
+                    reply.send(()).expect("shutdown completion");
+                    panic!("checkpoint cleanup shut down the writer");
+                }
+            }
+        });
+        let mut journal = FileRegionalDecisionJournal {
+            path: PathBuf::from("memory-only-checkpoint-cleanup"),
+            pending: vec![checkpointed.clone()],
+            needs_compaction: false,
+            requests,
+            worker: None,
+        };
+
+        journal
+            .clear_commit_identities(&[checkpointed.identity()])
+            .expect("acknowledge durable checkpoint");
+        journal
+            .record_commit(&later)
+            .expect("append later decision");
+        writer.join().expect("writer assertion");
+    }
+
+    #[test]
+    fn crash_before_shutdown_compaction_replays_old_wal_through_checkpoint_watermark() {
+        let tmp = tempfile::tempdir().unwrap();
+        let decision =
+            RegionalCommitDecision::from_parts(RegionPhase(11), 41, Vec::new(), Vec::new())
+                .expect("checkpointed decision");
+        let (mut journal, _) = FileRegionalDecisionJournal::open(tmp.path()).expect("open journal");
+        journal.record_commit(&decision).expect("append decision");
+        journal
+            .clear_commit_identities(&[decision.identity()])
+            .expect("acknowledge durable checkpoint");
+
+        let worker = journal.worker.take().expect("journal writer");
+        let (reply, completion) = std::sync::mpsc::channel();
+        journal
+            .requests
+            .send(RegionalJournalWriteRequest::Shutdown { reply })
+            .expect("stop writer without compaction");
+        completion.recv().expect("writer stopped");
+        worker.join().expect("join writer");
+        drop(journal);
+
+        let (reopened, pending) =
+            FileRegionalDecisionJournal::open(tmp.path()).expect("reopen uncompacted journal");
+        assert_eq!(pending, vec![decision]);
+        let checkpoint = PersistedEntityCheckpoint::new_at_owner_sequence(
+            41,
+            41,
+            Vec::<PersistedEntityRecord>::new(),
+        );
+        let replayed = replay_regional_commit_decisions(checkpoint, &pending)
+            .expect("checkpoint watermark ignores old WAL record");
+        assert!(replayed.records.is_empty());
+        assert_eq!(replayed.regional_sequence_watermark, 41);
+        drop(reopened);
+    }
+
+    #[test]
     fn regional_decision_journal_group_commit_persists_every_decision() {
         let tmp = tempfile::tempdir().unwrap();
         let decisions = [
@@ -3016,6 +3102,7 @@ mod tests {
         let mut journal = FileRegionalDecisionJournal {
             path,
             pending: Vec::new(),
+            needs_compaction: false,
             requests,
             worker: Some(worker),
         };

@@ -7073,36 +7073,53 @@ end
         assert!(pending[1].phase() > decision.phase());
         assert!(pending[1].sequence_watermark() > decision.sequence_watermark());
 
-        let mut save = std::pin::pin!(save_all_after_simulation_barrier(
-            "recovered journal checkpoint test",
-            &bound.config,
-            &bound.sessions,
-            &bound.simulation,
-        ));
-        let command_ready = tokio::select! {
-            report = &mut save => panic!("save completed before owner snapshot: {report:?}"),
-            ready = bound.simulation_owner.wait_for_command() => ready,
+        let report = {
+            let mut save = std::pin::pin!(save_all_after_simulation_barrier(
+                "recovered journal checkpoint test",
+                &bound.config,
+                &bound.sessions,
+                &bound.simulation,
+            ));
+            let command_ready = tokio::select! {
+                report = &mut save => panic!("save completed before owner snapshot: {report:?}"),
+                ready = bound.simulation_owner.wait_for_command() => ready,
+            };
+            assert!(command_ready, "simulation command channel closed");
+            assert_eq!(
+                bound
+                    .simulation_owner
+                    .process_tick_with_world(
+                        &bound.sessions,
+                        bound.config.world.as_ref(),
+                        bound.config.block_light.as_deref(),
+                        1,
+                    )
+                    .processed,
+                1
+            );
+            save.as_mut().await
         };
-        assert!(command_ready, "simulation command channel closed");
-        assert_eq!(
-            bound
-                .simulation_owner
-                .process_tick_with_world(
-                    &bound.sessions,
-                    bound.config.world.as_ref(),
-                    bound.config.block_light.as_deref(),
-                    1,
-                )
-                .processed,
-            1
-        );
-        let report = save.as_mut().await;
         assert!(report.is_ok(), "save failed: {:?}", report.errors);
+        let (_, pending) =
+            play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
+        assert_eq!(pending.len(), 2, "checkpoint cleanup stays memory-only");
+        let checkpoint = play::persistence::load_persisted_entities(
+            tmp.path(),
+            bound.config.items.as_ref(),
+            bound.config.entity_types.as_ref(),
+        )
+        .unwrap();
+        let replayed = play::persistence::replay_regional_commit_decisions(checkpoint, &pending)
+            .expect("saved owner snapshot filters checkpointed WAL records");
+        assert_eq!(replayed.records.len(), 1);
+        assert_eq!(replayed.records[0].snapshot, snapshot);
+
+        drop(bound);
         let (_, pending) =
             play::persistence::FileRegionalDecisionJournal::open(tmp.path()).unwrap();
         assert!(
             pending.is_empty(),
-            "saved owner snapshot checkpoints replay"
+            "normal shutdown compacts checkpointed WAL"
         );
     }
 

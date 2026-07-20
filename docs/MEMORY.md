@@ -102,9 +102,11 @@ and is not startup context.
   candidate-selection gap rather than evidence that step physics regressed.
 - The unrestricted run exposed a 3.47-second checkpoint stall caused by waiting
   for entity-journal replacement while holding the regional journal mutex. The
-  working tree queues replacement under the mutex, releases it, and then waits;
-  the focused durable-mutation concurrency regression is green. Broader gates
-  remain pending.
+  checkpoint now acknowledges exact identities in memory after the durable
+  world watermark; gameplay appends never queue behind a replacement `fsync`.
+  Old replay-safe records are compacted on normal journal shutdown. Focused
+  append-order, crash-replay, and shutdown-compaction regressions and the full
+  workspace baseline are green.
 
 ## Active Risks
 
