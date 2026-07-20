@@ -421,9 +421,17 @@ Other accepted concrete boundaries in this staged migration are:
   correlated `colony.record_result` publication. Registry keys include the
   host-attached plugin identity, replacements remain possible at capacity, and
   rejected admissions cannot mutate state. The registry mutex is released
-  before targeted delivery awaits queue admission. Villager binding remains
-  outside this adapter until entity ownership provides a bounded
-  region-targeted search and authoritative expiring-token lifecycle.
+  before targeted delivery awaits queue admission. It also validates binding
+  ownership and the current single-world dimension, generates opaque random
+  tokens, and publishes correlated binding results. The separate
+  `play::session::script_colony_endpoint` moves the synchronous owner request
+  off the async router worker and calls only the bounded regional claim command;
+  it never scans session snapshots. Entity selection, duplicate exclusion and
+  simulation-tick expiry remain owned by `mc-entity`. Deterministic request
+  rejection, owner busy state, and claim-capacity exhaustion publish an empty
+  result and keep the router alive; broken owner availability still stops it.
+  Forced cancellation can orphan an already committed opaque claim, bounded by
+  the same 600-tick expiry; cooperative shutdown drains the active route.
 - `play::containers::script_menu` owns the immutable plugin-menu layout,
   item resolution, fixed-slot click classification and plugin/menu/player
   identity fence. `play::session::script_menu_endpoint` consumes admitted Lua

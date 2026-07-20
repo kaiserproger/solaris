@@ -5,8 +5,7 @@ other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
-inventory/storage transaction, and colony-record adapters. Villager binding
-does not have a production adapter yet and remains fail-closed.
+inventory/storage transaction, colony-record, and villager-binding adapters.
 
 ## Package And Manifest
 
@@ -261,10 +260,20 @@ closure or shutdown stops the router instead of fabricating delivery. The
 registry is not durable, so plugins that need restart continuity must persist
 their intent through plugin storage.
 
-`bind_nearest_villager` is validated and admitted by the Lua host, but the
-production router currently rejects it without mutation or a fabricated
-result. It remains fail-closed until the entity owner exposes a bounded
-region-targeted search and an authoritative expiring binding token.
+`bind_nearest_villager` requires a colony record owned by the admitted plugin.
+The current single-world adapter accepts only `minecraft:overworld` colonies;
+other dimensions return an unsuccessful targeted result without querying or
+mutating entity ownership. Eligible requests run on a blocking endpoint outside
+the async router worker, then ask the regional entity owner for an atomic claim.
+No session snapshot scan is used. A successful claim returns a random 128-bit
+lowercase hexadecimal token and its simulation-tick expiry. An absent villager
+returns an unsuccessful targeted result. Invalid coordinates, a random token
+collision, transient owner busy state, or global claim-capacity exhaustion also
+return an unsuccessful result without shutting down the server. A closed or
+failed owner, token generation failure, or result-queue closure stops the router
+instead of fabricating delivery. A claim committed before publication failure
+or forced task cancellation remains reserved until its normal simulation-tick
+expiry; normal cooperative shutdown drains the active route.
 
 ## Isolation And Limits
 

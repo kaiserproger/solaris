@@ -5,7 +5,9 @@ use mc_script::{
     AdmittedScriptCommand, LuaHostConfig, ScriptEvent, ScriptEventKind, start_lua_host,
 };
 
-use super::colony::{ColonyAdapterError, ColonyLimits, PluginColonyAdapter};
+use super::colony::{
+    ColonyAdapterError, ColonyLimits, PluginColonyAdapter, classify_binding_claim,
+};
 use super::{ScriptRouter, ScriptRouterExit};
 use crate::server::ScriptEventSink;
 
@@ -302,16 +304,22 @@ async fn router_stops_when_colony_result_publication_is_closed() {
     );
     drop(events);
     let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
 
     assert_eq!(
-        router.route_colony_admitted(admitted).await,
+        router.route_colony_admitted(admitted, &sessions).await,
         ScriptRouterExit::Stop
     );
 }
 
 #[tokio::test]
-async fn router_keeps_villager_binding_fail_closed_without_a_result() {
-    let admitted = admitted_colony_command(
+async fn router_binds_nearest_villager_through_the_regional_owner() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 0, 64, 0)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
         "owner",
         r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
     )
@@ -321,11 +329,250 @@ async fn router_keeps_villager_binding_fail_closed_without_a_result() {
         NonZeroUsize::new(1).unwrap(),
     );
     let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
+    sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
 
     assert_eq!(
-        router.route_colony_admitted(admitted).await,
+        router.route_colony_admitted(upsert, &sessions).await,
         ScriptRouterExit::Continue
     );
-    drop(router);
-    assert!(events.recv_event().await.is_none());
+    let _ = events.recv_event().await.expect("colony upsert result");
+    assert_eq!(
+        router.route_colony_admitted(binding, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    let result = events.recv_event().await.expect("villager binding result");
+    assert_eq!(result.target_plugin_id(), Some("owner"));
+    match result.kind() {
+        ScriptEventKind::ColonyVillagerBindingResult {
+            request_id,
+            colony_id,
+            binding: Some(binding),
+        } => {
+            assert_eq!(request_id, "bind");
+            assert_eq!(colony_id, "starter");
+            assert_eq!(binding.token().len(), 32);
+            assert_eq!(binding.expires_at_tick(), 600);
+        }
+        other => panic!("unexpected binding result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn router_rejects_binding_to_another_plugins_colony_without_owner_mutation() {
+    let upsert = admitted_colony_command(
+        "owner-a",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 0, 64, 0)"#,
+    )
+    .await;
+    let foreign_binding = admitted_colony_command(
+        "owner-b",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let owner_binding = admitted_colony_command(
+        "owner-a",
+        r#"solaris.bind_nearest_villager("bind-owner", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (boundary, mut events) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
+    sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert_eq!(
+        router.route_colony_admitted(upsert, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    let _ = events.recv_event().await.expect("colony upsert result");
+    assert_eq!(
+        router
+            .route_colony_admitted(foreign_binding, &sessions)
+            .await,
+        ScriptRouterExit::Continue
+    );
+    assert!(matches!(
+        events
+            .recv_event()
+            .await
+            .expect("foreign binding result")
+            .kind(),
+        ScriptEventKind::ColonyVillagerBindingResult { binding: None, .. }
+    ));
+
+    assert_eq!(
+        router.route_colony_admitted(owner_binding, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    assert!(matches!(
+        events
+            .recv_event()
+            .await
+            .expect("owner binding result")
+            .kind(),
+        ScriptEventKind::ColonyVillagerBindingResult {
+            binding: Some(_),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn router_publishes_empty_binding_when_no_villager_is_in_range() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 0, 64, 0)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (boundary, mut events) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
+
+    assert_eq!(
+        router.route_colony_admitted(upsert, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    let _ = events.recv_event().await.expect("colony upsert result");
+    assert_eq!(
+        router.route_colony_admitted(binding, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    assert!(matches!(
+        events.recv_event().await.expect("binding result").kind(),
+        ScriptEventKind::ColonyVillagerBindingResult { binding: None, .. }
+    ));
+}
+
+#[tokio::test]
+async fn router_rejects_non_overworld_colony_without_reserving_the_villager() {
+    let nether_upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("nether", "starter", "Starter", "minecraft:the_nether", 0, 64, 0)"#,
+    )
+    .await;
+    let rejected = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("nether-bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let overworld_upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("overworld", "starter", "Starter", "minecraft:overworld", 0, 64, 0)"#,
+    )
+    .await;
+    let accepted = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("overworld-bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (boundary, mut events) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
+    sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert_eq!(
+        router.route_colony_admitted(nether_upsert, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    let _ = events.recv_event().await.expect("nether colony result");
+    assert_eq!(
+        router.route_colony_admitted(rejected, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    assert!(matches!(
+        events
+            .recv_event()
+            .await
+            .expect("nether binding result")
+            .kind(),
+        ScriptEventKind::ColonyVillagerBindingResult { binding: None, .. }
+    ));
+
+    assert_eq!(
+        router
+            .route_colony_admitted(overworld_upsert, &sessions)
+            .await,
+        ScriptRouterExit::Continue
+    );
+    let _ = events.recv_event().await.expect("overworld colony result");
+    assert_eq!(
+        router.route_colony_admitted(accepted, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    assert!(matches!(
+        events
+            .recv_event()
+            .await
+            .expect("overworld binding result")
+            .kind(),
+        ScriptEventKind::ColonyVillagerBindingResult {
+            binding: Some(_),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn router_stops_when_committed_binding_result_cannot_be_published() {
+    let upsert = admitted_colony_command(
+        "owner",
+        r#"solaris.upsert_colony("register", "starter", "Starter", "minecraft:overworld", 0, 64, 0)"#,
+    )
+    .await;
+    let binding = admitted_colony_command(
+        "owner",
+        r#"solaris.bind_nearest_villager("bind", "starter", 0, 64, 0, 16)"#,
+    )
+    .await;
+    let (boundary, mut events) = mc_script::script_boundary_pair(
+        NonZeroUsize::new(8).unwrap(),
+        NonZeroUsize::new(1).unwrap(),
+    );
+    let router = ScriptRouter::new(ScriptEventSink::new(boundary), None);
+    let sessions = crate::play::SessionRegistry::new();
+    sessions.spawn_script_villager_for_test(mc_entity::Vec3::new(3.0, 64.0, 0.0));
+
+    assert_eq!(
+        router.route_colony_admitted(upsert, &sessions).await,
+        ScriptRouterExit::Continue
+    );
+    let _ = events.recv_event().await.expect("colony upsert result");
+    drop(events);
+
+    assert_eq!(
+        router.route_colony_admitted(binding, &sessions).await,
+        ScriptRouterExit::Stop
+    );
+}
+
+#[test]
+fn binding_claim_classification_separates_rejection_from_owner_failure() {
+    for rejection in [
+        mc_entity::RegionOwnerLaneError::InvalidQuery,
+        mc_entity::RegionOwnerLaneError::BindingTokenCollision,
+        mc_entity::RegionOwnerLaneError::BindingCapacityExceeded,
+        mc_entity::RegionOwnerLaneError::Busy,
+    ] {
+        assert_eq!(classify_binding_claim(Err(rejection)), Ok(None));
+    }
+    assert_eq!(
+        classify_binding_claim(Err(mc_entity::RegionOwnerLaneError::Closed)),
+        Err(ColonyAdapterError::BindingOwner(
+            mc_entity::RegionOwnerLaneError::Closed
+        ))
+    );
 }

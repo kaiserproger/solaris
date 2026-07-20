@@ -220,7 +220,7 @@ impl ScriptRouter {
                 ScriptRouterExit::Continue
             }
             ScriptCommand::UpsertColony { .. } | ScriptCommand::RequestVillagerBinding { .. } => {
-                self.route_colony_admitted(admitted).await
+                self.route_colony_admitted(admitted, context.sessions).await
             }
             ScriptCommand::HostAttached { .. }
             | ScriptCommand::PluginStorageGet { .. }
@@ -240,19 +240,27 @@ impl ScriptRouter {
     pub(super) async fn route_colony_admitted(
         &self,
         admitted: AdmittedScriptCommand,
+        sessions: &play::SessionRegistry,
     ) -> ScriptRouterExit {
-        if matches!(
-            admitted.request(),
-            ScriptCommand::RequestVillagerBinding { .. }
-        ) {
-            debug!("admitted villager binding has no production adapter");
-            return ScriptRouterExit::Continue;
-        }
-        match self.colonies.route_admitted(admitted).await {
+        let result = match admitted.request() {
+            ScriptCommand::UpsertColony { .. } => self.colonies.route_admitted(admitted).await,
+            ScriptCommand::RequestVillagerBinding { .. } => {
+                self.colonies
+                    .route_binding_admitted(admitted, sessions)
+                    .await
+            }
+            _ => Err(ColonyAdapterError::WrongCommand),
+        };
+        match result {
             Ok(_) => ScriptRouterExit::Continue,
-            Err(ColonyAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
+            Err(
+                ColonyAdapterError::PublicationClosed
+                | ColonyAdapterError::BindingOwner(_)
+                | ColonyAdapterError::TokenUnavailable
+                | ColonyAdapterError::InvalidResult(_),
+            ) => ScriptRouterExit::Stop,
             Err(error) => {
-                warn!(?error, "admitted colony record command rejected");
+                warn!(?error, "admitted colony command rejected");
                 ScriptRouterExit::Continue
             }
         }

@@ -44,6 +44,7 @@ mod player_state_adapter;
 mod position_sync_tests;
 mod prepared_chunks;
 mod projectiles;
+mod script_colony_endpoint;
 mod script_inventory_transaction_endpoint;
 #[cfg(test)]
 mod script_inventory_transaction_endpoint_tests;
