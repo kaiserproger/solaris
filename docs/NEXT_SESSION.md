@@ -19,8 +19,17 @@ independently revertible slice. Apply this order:
 
 1. A red real-client or wire-level playable regression.
 2. A common gameplay path missing authoritative mutation or sad-path coverage.
-3. A measured multiplayer, lock, queue, persistence, or autoscale bottleneck.
-4. A bounded module extraction that removes a real ownership backedge.
+3. A production Lua plugin API or gameplay-adapter slice after the common
+   playable loop is green.
+4. A measured multiplayer, lock, queue, persistence, regional, ECS, or
+   autoscale bottleneck.
+5. A bounded module extraction that removes a real ownership backedge.
+6. Rare error-path hardening or uncommon parity edges.
+
+Do not continue a lower item merely because it was open before compaction.
+Record its remaining non-blocking debt, then resume the highest unfinished
+item. In particular, do not return to deferred save `fsync` interleavings while
+common vanilla gameplay or production plugin API work remains.
 
 Prefer a complete vertical path:
 

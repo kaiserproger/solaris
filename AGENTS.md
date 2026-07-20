@@ -47,6 +47,19 @@ rare cases while the next critical gameplay or core-architecture path is still
 missing. Stop a hardening pass once its dominant risks are proved and move the
 main objective forward.
 
+Until the owner changes it, the delivery order is fixed:
+
+1. Prove and improve common vanilla-client gameplay and multiplayer behavior.
+2. Build the production Lua plugin API and gameplay adapters.
+3. Optimize measured bottlenecks and advance regional/ECS/autoscale work.
+4. Harden rare error interleavings and uncommon parity edges.
+
+Do not promote item 3 or 4 because its code is already open, a review found a
+non-blocking issue, or a focused test suggests more hardening. Record such work
+as deferred debt and return to the highest unfinished item. A blocker may move
+ahead only when it breaks the common playable loop, corrupts ordinary saves, or
+prevents plugin API progress.
+
 The `superpowers` Codex plugin is intentionally left alone. Do not add
 project instructions that require extra local plugin layers unless the
 owner explicitly asks.

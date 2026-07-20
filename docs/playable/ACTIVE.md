@@ -22,6 +22,10 @@ replacement-readiness claims.
 
 ## Current Queue
 
+This queue is binding across context compaction: common vanilla gameplay first,
+then production plugin API, then measured optimization, and only then rare
+hardening. An already-open lower-priority diff does not override this order.
+
 1. Get one owner-played survival session on the current build. Record concrete
    client-visible failures; do not substitute isolated parity probes for it.
 2. Treat failures from the owner session as the playable queue. Fix the first
@@ -32,9 +36,17 @@ replacement-readiness claims.
    play exposes a catastrophic stall.
 4. Defer deterministic livestock climbing and earned stonecutter hardening
    until they block ordinary survival or the plugin-backed gameplay loop.
+5. Keep the rare multi-region save recovery `fsync`/metrics issue documented
+   but deferred. Do not resume it unless it becomes ordinary save corruption or
+   blocks the playable or plugin path.
 
 ## Recent Evidence
 
+- Checkpoint `5ea197b` makes the active save install its exact simulation
+  barrier snapshot and makes accepted PvP attacks observable from the
+  simulation owner. Full workspace tests, strict workspace Clippy, fmt,
+  code-health `0 fail / KEEP`, and diff-check pass. The broad `block_edit` gate
+  passes `94/94`.
 - Checkpoint `feba79a` passes full workspace tests, workspace all-target strict
   Clippy, fmt, code-health `0 fail / KEEP`, and diff-check. The `block_edit`
   target also passes both parallel and sequential runs with 94/94 tests.
@@ -61,6 +73,28 @@ replacement-readiness claims.
   `Append`, not a checkpoint `Replace`; crash-before-compaction replay and
   shutdown compaction both have focused coverage. This is not a broad
   performance claim.
+- The PvP wire oracle now waits on an accepted attack event published by the
+  simulation owner instead of assuming TCP ingress lands on a chosen tick. The
+  event separates cooldown and hurt-resistance clocks and carries owner-order
+  sequence and attacker identity. Focused wire runs, the authority-clock unit,
+  the reciprocal concurrent-owner test, full `mc-net`, and `sol high` review
+  pass. The first broad `block_edit` run found the separate persistence failure
+  below, so this is focused PvP evidence rather than a broad gate claim.
+- The persistence barrier defect found by broad validation is fixed locally.
+  Background flush now validates the resident region before install and
+  replans stale work. Active save installs its exact owner-barrier snapshot,
+  leaves post-barrier mutations dirty, and waits for the exact journal-fence
+  release before recapturing an incomplete snapshot. Final post-drain save
+  rejects an orphaned fence instead of retrying a fixed number of times or
+  acknowledging it. Focused `mc-world` dirty-flush tests pass `20/20`, active
+  save tests pass `4/4`, the orphan-fence sad path passes, and the parallel
+  `mc-net` passes `1534/1534` runnable tests, and a fresh parallel `block_edit`
+  gate passes `94/94`, including restart persistence and in-flight campfire
+  state. Full workspace passes. A second independent `sol high` review found no
+  blocker or high-severity issue. It found only a rare multi-region recovery
+  path that can `fsync` an installed prefix under the world mutex and omit that
+  prefix from aggregate metrics; this is explicitly deferred behind common
+  gameplay and production plugin work.
 - P47 artifact
   `.analysis/real-client-runs/20260720T122329Z-real-client-playable-loop-Dbzfoj`
   passed stonecutter placement, menu open, normal take (1 input to 2 slabs),
@@ -103,6 +137,16 @@ replacement-readiness claims.
   pose, while health packets remain limited to visible food or saturation
   changes. The repeat after review emitted no tick-budget or slow-tick
   warnings. This is focused gameplay evidence, not a broad performance result.
+- An interactive embedded-MCP run on the isolated world under
+  `.analysis/mcp-smoke-ZZm7qf` passed
+  `playable-05-stone-tool-progression` in 25.7 seconds after connection. The
+  real 26.1.2 client mined three natural birch logs, crafted planks, a table,
+  sticks, and a wooden pickaxe, mined three natural stone blocks into collected
+  cobblestone, reopened the earned table, and crafted a stone pickaxe without
+  debug commands. The structured MCP response proved exact inventory and world
+  transitions. Server output had two boundary tick warnings at 56.150 and
+  54.209 ms, but no multi-second journal stall. This is focused gameplay
+  evidence, not a broad performance result.
 - The first live Lua gameplay adapter now connects admitted `upsert_zone` and
   `remove_zone` commands to initial/accepted player poses and disconnect
   cleanup. A wire client waits for a plugin readiness message, enters the zone

@@ -16,7 +16,9 @@ unless the owner explicitly asks for readiness or ledger work.
 - Full parity.
 - Redstone.
 - Vehicles.
-- Plugin API.
+- Broad plugin API expansion before the baseline loop is stable. Once common
+  gameplay is green, the first production plugin slice comes before
+  optimization and rare hardening.
 - Autoscale.
 - Broad ledger updates.
 

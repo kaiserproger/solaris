@@ -7,19 +7,35 @@ and is not startup context.
 
 ## Current Checkpoint
 
-- Date: 2026-07-20.
+- Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `e42310e` (`test(playable): prove twenty minute
-  continuity`).
+- Latest checkpoint: `5ea197b` (`fix(server): close playable save and pvp
+  races`).
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed on the working tree containing
-  `e42310e` plus the pre-existing uncommitted regional/entity/plugin slices.
-  The exact committed playable files are covered by focused config, chunk
-  publication, runner, and real-client manifest tests.
+  `0 fail / KEEP`, and diff-check passed immediately before `5ea197b`. The
+  worktree also contained pre-existing uncommitted entity-scale work, which was
+  not staged. The committed save/PvP files additionally pass focused dirty
+  flush, active-save, `mc-net`, and `block_edit 94/94` gates.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
+
+## Delivery Priority Lock
+
+After compaction, resume in this order unless the owner explicitly changes it:
+
+1. Common vanilla-client gameplay and multiplayer parity.
+2. Production Lua plugin API and its gameplay adapters.
+3. Measured optimization, regional ownership, ECS, and autoscaling.
+4. Rare error-path hardening and uncommon parity edges.
+
+The current multi-region save recovery has a narrow deferred error path: a
+later-region install failure can synchronously `fsync` the already-installed
+prefix while the caller still holds the world mutex, and that recovered prefix
+is not included in aggregate flush metrics. The normal save path and ordinary
+crash-safety fences are covered. Do not resume this hardening before the first
+two priorities unless it becomes a common-play blocker or corruption risk.
 
 ## Current Head
 
@@ -114,13 +130,12 @@ and is not startup context.
    blocker before isolated parity or performance work.
 2. If owner play finds no common blocker, advance the production Lua plugin API
    before returning to broad optimization work.
-3. Continue reducing `simulation.rs` through explicit ownership boundaries;
+3. Only after those two priorities, continue reducing `simulation.rs` through explicit ownership boundaries;
    avoid moves that retain `use super::*` or duplicate authority.
-4. Advance regional ownership/ECS only with exact CAS, WAL, publication, and
+4. Then advance regional ownership/ECS only with exact CAS, WAL, publication, and
    cross-region failure fences.
-5. Finish the attested Lua storage/menu/zones/colony production adapters.
-6. Broaden playable progression by the Pareto rule before polishing rare parity
-   edges.
+5. Broaden playable progression by the Pareto rule before polishing rare parity
+   or save-error edges.
 
 ## Canonical Routes
 
