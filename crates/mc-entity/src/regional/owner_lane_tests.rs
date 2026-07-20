@@ -6,13 +6,18 @@ use crate::living_26_1_2::DamageContext;
 use crate::runtime_26_1_2::TargetKind;
 use crate::{
     AnimalBreedingState, EntityDamageRequest, EntityEffectOperation, EntityEffectRejection,
-    EntityEffectRequest, EntityEffectResult, EntityId, EntityRetainedState, EntityStore, GoalState,
-    PathingBudget, PathingProbe, PathingProbeResult, SpawnEntity, Vec3,
+    EntityEffectRequest, EntityEffectResult, EntityId, EntityLifecycle, EntityRetainedState,
+    EntityStore, GoalState, PathingBudget, PathingProbe, PathingProbeResult, SpawnEntity, Vec3,
 };
+use std::collections::HashSet;
 use uuid::Uuid;
 
 fn cow(position: Vec3) -> SpawnEntity {
     SpawnEntity::new(4, "minecraft:cow", position)
+}
+
+fn villager(position: Vec3) -> SpawnEntity {
+    SpawnEntity::new(119, "minecraft:villager", position)
 }
 
 fn heal_request(amount: f32) -> EntityEffectRequest {
@@ -114,7 +119,7 @@ fn effect_only_mutation_invalidates_full_snapshot_cas() {
 #[test]
 fn regional_owner_effect_rollback_restores_active_effect_checkpoint() {
     let lease = super::RegionLease {
-        key: RegionKey::new(0, 0),
+        key: RegionKey::new(1, 0),
         epoch: RegionEpoch::INITIAL,
         lane: 0,
     };
@@ -359,6 +364,286 @@ fn selected_lane_reads_reject_unfinalized_phase_state() {
         Vec3::new(0.25, 0.0, 0.0)
     );
     lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_filters_type_lifecycle_vertical_distance_radius_and_unrequested_stores() {
+    let requested = super::RegionLease {
+        key: RegionKey::new(1, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let unrequested = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let center = Vec3::new(128.0, 64.0, 0.0);
+    let mut requested_store = EntityStore::new();
+    requested_store.spawn(cow(Vec3::new(128.25, 64.0, 0.0)));
+    let despawning_id = requested_store.spawn(villager(Vec3::new(128.5, 64.0, 0.0)));
+    let despawning = requested_store
+        .damage(
+            despawning_id,
+            EntityDamageRequest {
+                amount: 20.0,
+                tick: 1,
+                death_remove_tick: 21,
+            },
+        )
+        .expect("damage despawning fixture");
+    assert_eq!(despawning.snapshot.lifecycle, EntityLifecycle::Despawning);
+    requested_store.spawn(villager(Vec3::new(128.0, 66.1, 0.0)));
+    requested_store.spawn(villager(Vec3::new(130.1, 64.0, 0.0)));
+    let boundary_id = requested_store.spawn(villager(Vec3::new(130.0, 64.0, 0.0)));
+    let boundary = requested_store
+        .snapshot(boundary_id)
+        .expect("spawned boundary villager");
+    let mut unrequested_store = EntityStore::new();
+    unrequested_store.spawn(villager(Vec3::new(127.9, 64.0, 0.0)));
+    let lane = super::RegionalOwnerLane::spawn(
+        0,
+        [
+            (requested, requested_store),
+            (unrequested, unrequested_store),
+        ],
+    )
+    .expect("owner lane");
+
+    assert_eq!(
+        lane.request_nearest_villager(vec![requested], center, 4.0, HashSet::new(),)
+            .expect("nearest villager request")
+            .recv()
+            .expect("nearest villager response"),
+        Ok(Some(boundary))
+    );
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_uses_lowest_entity_id_to_break_equal_distance_ties() {
+    let west = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let east = super::RegionLease {
+        key: RegionKey::new(1, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut west_store = EntityStore::new();
+    assert!(west_store.insert_snapshot(super::snapshot_from_spawn(
+        EntityId(9),
+        Uuid::from_u128(109),
+        villager(Vec3::new(-1.0, 64.0, 0.0)),
+    )));
+    let mut east_store = EntityStore::new();
+    let lowest = super::snapshot_from_spawn(
+        EntityId(3),
+        Uuid::from_u128(1030),
+        villager(Vec3::new(1.0, 64.0, 0.0)),
+    );
+    assert!(east_store.insert_snapshot(lowest.clone()));
+    let lane = super::RegionalOwnerLane::spawn(0, [(west, west_store), (east, east_store)])
+        .expect("owner lane");
+
+    assert_eq!(
+        lane.request_nearest_villager(
+            vec![west, east],
+            Vec3::new(0.0, 64.0, 0.0),
+            1.0,
+            HashSet::new(),
+        )
+        .expect("nearest villager request")
+        .recv()
+        .expect("nearest villager response"),
+        Ok(Some(lowest))
+    );
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_skips_excluded_entities() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    let excluded = super::snapshot_from_spawn(
+        EntityId(3),
+        Uuid::from_u128(203),
+        villager(Vec3::new(0.5, 64.0, 0.0)),
+    );
+    let available = super::snapshot_from_spawn(
+        EntityId(9),
+        Uuid::from_u128(209),
+        villager(Vec3::new(1.0, 64.0, 0.0)),
+    );
+    assert!(store.insert_snapshots_batch([excluded.clone(), available.clone()]));
+    let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
+
+    assert_eq!(
+        lane.request_nearest_villager(
+            vec![lease],
+            Vec3::new(0.0, 64.0, 0.0),
+            4.0,
+            HashSet::from([excluded.id]),
+        )
+        .expect("nearest villager request")
+        .recv()
+        .expect("nearest villager response"),
+        Ok(Some(available))
+    );
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_rejects_pending_and_committed_phase_state() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    let id = store.spawn(villager(Vec3::new(0.5, 64.0, 0.0)));
+    let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
+    let phase = super::RegionPhase(1);
+    assert_eq!(
+        lane.prepare(super::RegionOwnerBatch {
+            phase,
+            sequence_watermark: 1,
+            mutations: vec![super::SequencedRegionMutation {
+                sequence: 1,
+                lease,
+                mutation: super::RegionOwnerMutation::SetVelocity {
+                    entity: id,
+                    velocity: Vec3::new(0.25, 0.0, 0.0),
+                },
+            }],
+        })
+        .expect("prepare phase")
+        .recv()
+        .expect("prepare completion"),
+        Ok(phase)
+    );
+    assert_eq!(
+        lane.request_nearest_villager(vec![lease], Vec3::new(0.0, 64.0, 0.0), 4.0, HashSet::new(),)
+            .expect("pending query request")
+            .recv()
+            .expect("pending query response"),
+        Err(super::RegionOwnerLaneError::Busy)
+    );
+    lane.commit(phase)
+        .expect("commit phase")
+        .recv()
+        .expect("commit completion")
+        .expect("committed phase");
+    assert_eq!(
+        lane.request_nearest_villager(vec![lease], Vec3::new(0.0, 64.0, 0.0), 4.0, HashSet::new(),)
+            .expect("committed query request")
+            .recv()
+            .expect("committed query response"),
+        Err(super::RegionOwnerLaneError::Busy)
+    );
+    lane.finalize(phase)
+        .expect("finalize phase")
+        .recv()
+        .expect("finalize completion")
+        .expect("finalized phase");
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_validates_every_requested_lease_before_scanning() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let mut store = EntityStore::new();
+    store.spawn(villager(Vec3::new(0.5, 64.0, 0.0)));
+    let lane = super::RegionalOwnerLane::spawn(0, [(lease, store)]).expect("owner lane");
+    let stale = super::RegionLease {
+        epoch: RegionEpoch(2),
+        ..lease
+    };
+    let wrong_lane = super::RegionLease { lane: 1, ..lease };
+
+    assert_eq!(
+        lane.request_nearest_villager(
+            vec![lease, stale],
+            Vec3::new(0.0, 64.0, 0.0),
+            4.0,
+            HashSet::new(),
+        )
+        .expect("stale lease query request")
+        .recv()
+        .expect("stale lease query response"),
+        Err(super::RegionOwnerLaneError::StaleLease)
+    );
+    assert_eq!(
+        lane.request_nearest_villager(
+            vec![lease, wrong_lane],
+            Vec3::new(0.0, 64.0, 0.0),
+            4.0,
+            HashSet::new(),
+        )
+        .expect("wrong lane query request")
+        .recv()
+        .expect("wrong lane query response"),
+        Err(super::RegionOwnerLaneError::WrongLane)
+    );
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_rejects_invalid_geometry() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let lane =
+        super::RegionalOwnerLane::spawn(0, [(lease, EntityStore::new())]).expect("owner lane");
+    for (center, radius_squared) in [
+        (Vec3::new(f64::NAN, 64.0, 0.0), 4.0),
+        (Vec3::new(0.0, 64.0, 0.0), -1.0),
+        (Vec3::new(0.0, 64.0, 0.0), f64::INFINITY),
+    ] {
+        assert_eq!(
+            lane.request_nearest_villager(vec![lease], center, radius_squared, HashSet::new(),)
+                .expect("invalid query request")
+                .recv()
+                .expect("invalid query response"),
+            Err(super::RegionOwnerLaneError::InvalidQuery)
+        );
+    }
+    lane.shutdown().expect("owner lane shutdown");
+}
+
+#[test]
+fn nearest_villager_reader_reports_closed_owner_lane() {
+    let lease = super::RegionLease {
+        key: RegionKey::new(0, 0),
+        epoch: RegionEpoch::INITIAL,
+        lane: 0,
+    };
+    let lane =
+        super::RegionalOwnerLane::spawn(0, [(lease, EntityStore::new())]).expect("owner lane");
+    let reader = lane.reader();
+    lane.shutdown().expect("owner lane shutdown");
+
+    assert!(matches!(
+        reader.request_nearest_villager(
+            vec![lease],
+            Vec3::new(0.0, 64.0, 0.0),
+            4.0,
+            HashSet::new(),
+        ),
+        Err(super::RegionOwnerLaneError::Closed)
+    ));
 }
 
 #[test]

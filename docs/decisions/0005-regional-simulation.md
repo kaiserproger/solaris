@@ -239,6 +239,17 @@ coordinator shutdown drains every lane before returning full or explicitly
 partial recovered state. Tests cover reverse arrival, same-phase corrected
 retry, cross-phase replay rejection, commit rollback, cross-lane stale-lease
 abort, clean round-trip, empty-world region install/spawn, and startup recovery.
+Lua villager binding discovery is an owner command, not a session-snapshot
+scan. A validated radius of at most 64 blocks intersects at most four 128-block
+regions; the coordinator sends every relevant lane request before receiving
+results, and each lane scans only the requested stores. Selection requires an
+alive exact `minecraft:villager`, a full three-dimensional squared-distance
+match, and a deterministic entity-ID tie-break. The same coordinator turn
+installs a bounded opaque claim and reverse entity index, so concurrent callers
+cannot bind one villager twice. Claims expire after 600 simulation ticks and
+are purged by the pushed lifecycle-epoch command, with no timer, polling, or
+wall-clock wait. Claims are ephemeral and are deliberately omitted from world
+persistence and owner shutdown snapshots.
 New regions use a stable least-loaded-lane assignment. The worker creates the
 empty physical store after an exact install message, and authoritative spawn
 publishes coordinator ID/UUID/location indexes only after prepare, commit, and

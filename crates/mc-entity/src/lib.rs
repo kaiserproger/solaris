@@ -26,6 +26,7 @@ mod runtime;
 pub mod runtime_26_1_2;
 pub mod synced_data_26_1_2;
 
+pub use regional::VillagerBindingClaim;
 pub use regional::{
     REGION_SIZE_CHUNKS, RegionEntityStoreError, RegionEpoch, RegionKey, RegionLease,
     RegionOwnerBatch, RegionOwnerCompletion, RegionOwnerLaneError, RegionOwnerLaneStartError,

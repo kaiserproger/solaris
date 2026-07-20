@@ -17,6 +17,8 @@ use crate::{
 mod owner_lane;
 #[cfg(test)]
 mod owner_lane_tests;
+#[cfg(test)]
+mod villager_binding_tests;
 
 use owner_lane::RegionalOwnerLaneReader;
 pub use owner_lane::{
@@ -26,6 +28,10 @@ pub use owner_lane::{
 
 pub const REGION_SIZE_CHUNKS: i32 = 8;
 const CHUNK_SIZE_BLOCKS: f64 = 16.0;
+const REGION_SIZE_BLOCKS: f64 = REGION_SIZE_CHUNKS as f64 * CHUNK_SIZE_BLOCKS;
+const MAX_VILLAGER_BINDING_RADIUS: f64 = 64.0;
+const MAX_ACTIVE_VILLAGER_BINDINGS: usize = 4_096;
+const VILLAGER_BINDING_TTL_TICKS: u64 = 600;
 const PARALLEL_KINEMATICS_MIN_STATES: usize = 257;
 const DIRECT_SELECTED_READ_LIMIT: usize = 16;
 static NEXT_REGIONAL_AUTHORITY_ID: AtomicU64 = AtomicU64::new(1);
@@ -75,6 +81,93 @@ impl RegionKey {
             return None;
         }
         Some(Self::from_chunk(chunk_x as i32, chunk_z as i32))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VillagerBindingClaim {
+    token: String,
+    expires_at_tick: u64,
+}
+
+impl VillagerBindingClaim {
+    #[must_use]
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    #[must_use]
+    pub const fn expires_at_tick(&self) -> u64 {
+        self.expires_at_tick
+    }
+}
+
+fn validate_villager_binding_query(
+    center: Vec3,
+    radius: f64,
+    token: &str,
+) -> Result<(), RegionOwnerLaneError> {
+    let valid_token = !token.is_empty()
+        && token.len() <= 64
+        && token.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-' | b'.')
+        });
+    if !center.is_finite()
+        || !radius.is_finite()
+        || radius <= 0.0
+        || radius > MAX_VILLAGER_BINDING_RADIUS
+        || !valid_token
+    {
+        return Err(RegionOwnerLaneError::InvalidQuery);
+    }
+    Ok(())
+}
+
+fn region_intersects_horizontal_radius(key: RegionKey, center: Vec3, radius_squared: f64) -> bool {
+    let min_x = f64::from(key.x) * REGION_SIZE_BLOCKS;
+    let min_z = f64::from(key.z) * REGION_SIZE_BLOCKS;
+    let max_x = min_x + REGION_SIZE_BLOCKS;
+    let max_z = min_z + REGION_SIZE_BLOCKS;
+    let dx = if center.x < min_x {
+        min_x - center.x
+    } else if center.x > max_x {
+        center.x - max_x
+    } else {
+        0.0
+    };
+    let dz = if center.z < min_z {
+        min_z - center.z
+    } else if center.z > max_z {
+        center.z - max_z
+    } else {
+        0.0
+    };
+    dx.mul_add(dx, dz * dz) <= radius_squared
+}
+
+fn villager_distance_squared(snapshot: &EntitySnapshot, center: Vec3) -> f64 {
+    let dx = snapshot.position.x - center.x;
+    let dy = snapshot.position.y - center.y;
+    let dz = snapshot.position.z - center.z;
+    dx.mul_add(dx, dy.mul_add(dy, dz * dz))
+}
+
+fn nearer_villager(
+    current: Option<EntitySnapshot>,
+    candidate: EntitySnapshot,
+    center: Vec3,
+) -> Option<EntitySnapshot> {
+    let Some(current) = current else {
+        return Some(candidate);
+    };
+    let current_key = (villager_distance_squared(&current, center), current.id);
+    let candidate_key = (villager_distance_squared(&candidate, center), candidate.id);
+    if candidate_key.0 < current_key.0
+        || (candidate_key.0 == current_key.0 && candidate_key.1 < current_key.1)
+    {
+        Some(candidate)
+    } else {
+        Some(current)
     }
 }
 
@@ -786,10 +879,17 @@ pub struct RegionalOwnerCoordinator {
     passenger_vehicles: HashMap<EntityId, EntityId>,
     transfers: BTreeMap<TransferId, PreparedTransfer>,
     in_flight_transfers: BTreeMap<EntityId, TransferId>,
+    villager_bindings: HashMap<String, VillagerBindingAuthority>,
+    villager_binding_by_entity: HashMap<EntityId, String>,
 
     next_id: i32,
     lanes: BTreeMap<usize, RegionalOwnerLane>,
     commit_state: Arc<RegionalOwnerCommitState>,
+}
+
+struct VillagerBindingAuthority {
+    entity: EntityId,
+    expires_at_tick: u64,
 }
 
 struct MutationExecution {
@@ -1097,6 +1197,12 @@ enum RegionalOwnerCommand {
     BreedingTickSnapshots {
         reply: std::sync::mpsc::Sender<Result<Vec<EntitySnapshot>, RegionOwnerLaneError>>,
     },
+    ClaimNearestVillager {
+        center: Vec3,
+        radius: f64,
+        token: String,
+        reply: std::sync::mpsc::Sender<Result<Option<VillagerBindingClaim>, RegionOwnerLaneError>>,
+    },
     Status {
         reply: std::sync::mpsc::Sender<Result<RegionalOwnerStatus, RegionOwnerLaneError>>,
     },
@@ -1267,6 +1373,7 @@ impl RegionalOwnerCommand {
                     | Self::Snapshots { .. }
                     | Self::SnapshotsForIds { .. }
                     | Self::BreedingTickSnapshots { .. }
+                    | Self::ClaimNearestVillager { .. }
                     | Self::PrepareGoalTick { .. }
                     | Self::ReconfigureLanes { .. }
                     | Self::SaveBarrier { .. }
@@ -1296,6 +1403,26 @@ impl RegionalOwnerHandle {
         let (reply, result) = channel();
         self.sender
             .send(RegionalOwnerCommand::Snapshots { reply })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
+    }
+
+    pub fn claim_nearest_villager(
+        &self,
+        center: Vec3,
+        radius: f64,
+        token: impl Into<String>,
+    ) -> Result<Option<VillagerBindingClaim>, RegionOwnerLaneError> {
+        let token = token.into();
+        validate_villager_binding_query(center, radius, &token)?;
+        let (reply, result) = channel();
+        self.sender
+            .send(RegionalOwnerCommand::ClaimNearestVillager {
+                center,
+                radius,
+                token,
+                reply,
+            })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         result.recv().map_err(|_| RegionOwnerLaneError::Closed)?
     }
@@ -2551,6 +2678,14 @@ fn run_regional_owner_runtime(
             RegionalOwnerCommand::BreedingTickSnapshots { reply } => {
                 let _ = reply.send(coordinator.breeding_tick_snapshots());
             }
+            RegionalOwnerCommand::ClaimNearestVillager {
+                center,
+                radius,
+                token,
+                reply,
+            } => {
+                let _ = reply.send(coordinator.claim_nearest_villager(center, radius, token));
+            }
             RegionalOwnerCommand::Status { reply } => {
                 let _ = reply.send(
                     coordinator
@@ -2576,22 +2711,26 @@ fn run_regional_owner_runtime(
                 lifecycle_epoch,
                 reply,
             } => {
-                let _ = reply.send(
-                    coordinator
-                        .commit_state
-                        .advance_lifecycle_epoch(lifecycle_epoch),
-                );
+                let result = coordinator
+                    .commit_state
+                    .advance_lifecycle_epoch(lifecycle_epoch);
+                if result.is_ok() {
+                    coordinator.purge_expired_villager_bindings(lifecycle_epoch);
+                }
+                let _ = reply.send(result);
             }
             RegionalOwnerCommand::RestoreCheckpointBoundary {
                 lifecycle_epoch,
                 sequence_watermark,
                 reply,
             } => {
-                let _ = reply.send(
-                    coordinator
-                        .commit_state
-                        .restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark),
-                );
+                let result = coordinator
+                    .commit_state
+                    .restore_checkpoint_boundary(lifecycle_epoch, sequence_watermark);
+                if result.is_ok() {
+                    coordinator.purge_expired_villager_bindings(lifecycle_epoch);
+                }
+                let _ = reply.send(result);
             }
             RegionalOwnerCommand::Spawn {
                 entity,
@@ -3085,6 +3224,8 @@ impl RegionalOwnerCoordinator {
             passenger_vehicles,
             transfers,
             in_flight_transfers,
+            villager_bindings: HashMap::new(),
+            villager_binding_by_entity: HashMap::new(),
 
             next_id,
             lanes,
@@ -3231,6 +3372,118 @@ impl RegionalOwnerCoordinator {
             .get(&lease.lane)
             .ok_or(RegionOwnerLaneError::WrongLane)?
             .snapshot(lease, entity)
+    }
+
+    fn intersecting_villager_query_leases(
+        &self,
+        center: Vec3,
+        radius: f64,
+    ) -> Result<BTreeMap<usize, Vec<RegionLease>>, RegionOwnerLaneError> {
+        let min =
+            RegionKey::from_position(Vec3::new(center.x - radius, center.y, center.z - radius))
+                .ok_or(RegionOwnerLaneError::InvalidQuery)?;
+        let max =
+            RegionKey::from_position(Vec3::new(center.x + radius, center.y, center.z + radius))
+                .ok_or(RegionOwnerLaneError::InvalidQuery)?;
+        let radius_squared = radius * radius;
+        let mut by_lane = BTreeMap::<usize, Vec<RegionLease>>::new();
+        for x in min.x..=max.x {
+            for z in min.z..=max.z {
+                let key = RegionKey::new(x, z);
+                if !region_intersects_horizontal_radius(key, center, radius_squared) {
+                    continue;
+                }
+                if let Some(lease) = self.ownership.lease(key) {
+                    by_lane.entry(lease.lane).or_default().push(lease);
+                }
+            }
+        }
+        Ok(by_lane)
+    }
+
+    pub fn claim_nearest_villager(
+        &mut self,
+        center: Vec3,
+        radius: f64,
+        token: String,
+    ) -> Result<Option<VillagerBindingClaim>, RegionOwnerLaneError> {
+        validate_villager_binding_query(center, radius, &token)?;
+        self.commit_state.ensure_committed_state()?;
+        let current_tick = self.commit_state.lifecycle_epoch();
+        if self.villager_bindings.contains_key(&token) {
+            return Err(RegionOwnerLaneError::BindingTokenCollision);
+        }
+        if self.villager_bindings.len() >= MAX_ACTIVE_VILLAGER_BINDINGS {
+            return Err(RegionOwnerLaneError::BindingCapacityExceeded);
+        }
+        let expires_at_tick = current_tick
+            .checked_add(VILLAGER_BINDING_TTL_TICKS)
+            .ok_or(RegionOwnerLaneError::InvalidQuery)?;
+        let by_lane = self.intersecting_villager_query_leases(center, radius)?;
+        let excluded = self
+            .villager_binding_by_entity
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
+        let mut pending = Vec::with_capacity(by_lane.len());
+        for (lane, leases) in by_lane {
+            let owner = self
+                .lanes
+                .get(&lane)
+                .ok_or(RegionOwnerLaneError::WrongLane)?;
+            pending.push(owner.request_nearest_villager(
+                leases,
+                center,
+                radius * radius,
+                excluded.clone(),
+            )?);
+        }
+        let mut nearest = None;
+        for completion in pending {
+            if let Some(candidate) = completion
+                .recv()
+                .map_err(|_| RegionOwnerLaneError::Closed)??
+            {
+                nearest = nearer_villager(nearest, candidate, center);
+            }
+        }
+        let Some(nearest) = nearest else {
+            return Ok(None);
+        };
+        self.villager_binding_by_entity
+            .insert(nearest.id, token.clone());
+        self.villager_bindings.insert(
+            token.clone(),
+            VillagerBindingAuthority {
+                entity: nearest.id,
+                expires_at_tick,
+            },
+        );
+        Ok(Some(VillagerBindingClaim {
+            token,
+            expires_at_tick,
+        }))
+    }
+
+    fn purge_expired_villager_bindings(&mut self, current_tick: u64) {
+        let expired = self
+            .villager_bindings
+            .iter()
+            .filter(|(_, binding)| current_tick >= binding.expires_at_tick)
+            .map(|(token, _)| token.clone())
+            .collect::<Vec<_>>();
+        for token in expired {
+            let Some(binding) = self.villager_bindings.remove(&token) else {
+                continue;
+            };
+            if self
+                .villager_binding_by_entity
+                .get(&binding.entity)
+                .is_some_and(|current| current == &token)
+            {
+                self.villager_binding_by_entity.remove(&binding.entity);
+            }
+        }
     }
 
     pub fn snapshots(&self) -> Result<Vec<EntitySnapshot>, RegionOwnerLaneError> {
@@ -5259,6 +5512,8 @@ impl RegionalOwnerCoordinator {
             passenger_vehicles: _,
             transfers,
             in_flight_transfers,
+            villager_bindings: _,
+            villager_binding_by_entity: _,
 
             next_id,
             lanes,

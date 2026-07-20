@@ -103,6 +103,9 @@ pub enum RegionOwnerLaneError {
     WorkerPanicked,
     SpawnFailed,
     InvalidLaneCount,
+    InvalidQuery,
+    BindingTokenCollision,
+    BindingCapacityExceeded,
     EmptyStore,
     Busy,
     DuplicateRegion,
@@ -177,6 +180,13 @@ enum RegionOwnerLaneMessage {
     AliveKinematicsForIds {
         entities: Vec<(RegionLease, EntityId)>,
         reply: std::sync::mpsc::Sender<Result<Vec<EntityKinematics>, RegionOwnerLaneError>>,
+    },
+    NearestVillager {
+        leases: Vec<RegionLease>,
+        center: Vec3,
+        radius_squared: f64,
+        excluded: HashSet<EntityId>,
+        reply: std::sync::mpsc::Sender<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>,
     },
     BreedingTickSnapshots {
         reply: std::sync::mpsc::Sender<Vec<EntitySnapshot>>,
@@ -326,6 +336,28 @@ impl RegionalOwnerLaneReader {
             .send(RegionOwnerLaneMessage::AliveKinematicsForIds { entities, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         Ok(states)
+    }
+
+    #[cfg(test)]
+    pub(super) fn request_nearest_villager(
+        &self,
+        leases: Vec<RegionLease>,
+        center: Vec3,
+        radius_squared: f64,
+        excluded: HashSet<EntityId>,
+    ) -> Result<Receiver<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let (reply, snapshot) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::NearestVillager {
+                leases,
+                center,
+                radius_squared,
+                excluded,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        Ok(snapshot)
     }
 
     pub(super) fn finalize(
@@ -655,6 +687,27 @@ impl RegionalOwnerLane {
             .send(RegionOwnerLaneMessage::ExistingSnapshotsForIds { entities, reply })
             .map_err(|_| RegionOwnerLaneError::Closed)?;
         Ok(snapshots)
+    }
+
+    pub(super) fn request_nearest_villager(
+        &self,
+        leases: Vec<RegionLease>,
+        center: Vec3,
+        radius_squared: f64,
+        excluded: HashSet<EntityId>,
+    ) -> Result<Receiver<Result<Option<EntitySnapshot>, RegionOwnerLaneError>>, RegionOwnerLaneError>
+    {
+        let (reply, snapshot) = channel();
+        self.sender
+            .send(RegionOwnerLaneMessage::NearestVillager {
+                leases,
+                center,
+                radius_squared,
+                excluded,
+                reply,
+            })
+            .map_err(|_| RegionOwnerLaneError::Closed)?;
+        Ok(snapshot)
     }
 
     pub(super) fn request_breeding_tick_snapshots(
@@ -996,6 +1049,76 @@ fn run_region_owner_lane(
                 let _ = reply.send(match error {
                     Some(error) => Err(error),
                     None => Ok(states),
+                });
+            }
+            RegionOwnerLaneMessage::NearestVillager {
+                leases,
+                center,
+                radius_squared,
+                excluded,
+                reply,
+            } => {
+                let mut error = (pending.is_some() || committed.is_some())
+                    .then_some(RegionOwnerLaneError::Busy);
+                if error.is_none() && (!center.is_finite() || !radius_squared.is_finite()) {
+                    error = Some(RegionOwnerLaneError::InvalidQuery);
+                }
+                if error.is_none() && radius_squared < 0.0 {
+                    error = Some(RegionOwnerLaneError::InvalidQuery);
+                }
+                if error.is_none() {
+                    for lease in &leases {
+                        if lease.lane != lane {
+                            error = Some(RegionOwnerLaneError::WrongLane);
+                            break;
+                        }
+                        let Some((current, _)) = regions.get(&lease.key) else {
+                            error = Some(RegionOwnerLaneError::UnknownRegion);
+                            break;
+                        };
+                        if current != lease {
+                            error = Some(RegionOwnerLaneError::StaleLease);
+                            break;
+                        }
+                    }
+                }
+                let mut nearest = None::<(f64, EntitySnapshot)>;
+                if error.is_none() {
+                    for lease in leases {
+                        let store = &regions
+                            .get(&lease.key)
+                            .expect("validated nearest-villager region route")
+                            .1;
+                        for snapshot in store.snapshots() {
+                            if snapshot.type_name != "minecraft:villager"
+                                || snapshot.lifecycle != crate::EntityLifecycle::Alive
+                                || excluded.contains(&snapshot.id)
+                            {
+                                continue;
+                            }
+                            let dx = snapshot.position.x - center.x;
+                            let dy = snapshot.position.y - center.y;
+                            let dz = snapshot.position.z - center.z;
+                            let distance_squared = dx * dx + dy * dy + dz * dz;
+                            if distance_squared > radius_squared {
+                                continue;
+                            }
+                            let replace = nearest.as_ref().is_none_or(
+                                |(nearest_distance, nearest_snapshot)| {
+                                    distance_squared < *nearest_distance
+                                        || (distance_squared == *nearest_distance
+                                            && snapshot.id < nearest_snapshot.id)
+                                },
+                            );
+                            if replace {
+                                nearest = Some((distance_squared, snapshot));
+                            }
+                        }
+                    }
+                }
+                let _ = reply.send(match error {
+                    Some(error) => Err(error),
+                    None => Ok(nearest.map(|(_, snapshot)| snapshot)),
                 });
             }
             RegionOwnerLaneMessage::BreedingTickSnapshots { reply } => {
