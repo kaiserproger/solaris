@@ -5,9 +5,9 @@ other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
-inventory/storage transaction, colony-record, villager-binding, and bounded
-villager-order adapters. It also publishes committed player block breaks and
-owner-targeted zone membership transitions.
+inventory/storage transaction, player-teleport, colony-record,
+villager-binding, and bounded villager-order adapters. It also publishes
+committed player block breaks and owner-targeted zone membership transitions.
 
 ## Package And Manifest
 
@@ -59,6 +59,7 @@ capabilities, 64 permissions, and 128 player or operator command roots.
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
 | `zones` | `upsert_zone`, `remove_zone`, owned zone entry/exit events |
 | `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
+| `player_teleport` | `teleport_player` |
 
 An undeclared privileged call fails synchronously in Lua before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
@@ -93,6 +94,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `inventory.storage_transaction.result` | `on_inventory_storage_transaction_result` | `request_id`, `committed` |
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
 | `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
+| `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
 | `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
 | `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
 | `colony.villager_order_result` | `on_colony_villager_order_result` | `request_id`, `colony_id`, `order`, `accepted` |
@@ -341,6 +343,37 @@ The process admits at most 4,096 zones, 256 zones per plugin, 16,384 tracked
 players, and 262,144 memberships. A request beyond a bound is rejected without
 partial mutation and logged by the production router. These bounds are server
 admission limits, not operator-configured worker percentages.
+
+Player teleports are same-dimension authoritative mutations:
+
+```lua
+solaris.teleport_player("warp-home", player_id, 40, 70, 1)
+```
+
+The request id follows the 64-byte script-id rule. Coordinates must be finite
+and within the existing script coordinate limits. The API deliberately has no
+dimension argument; cross-dimension transfer is not part of API `0.6.0`.
+
+The router sends the request through the connected player's reliable session
+lane. A pending vanilla position confirmation rejects the request without
+mutation as `teleport_pending`. A missing, disconnected, cancelled-before-
+commit, or stale session returns `player_unavailable`. A closed or failed
+simulation owner returns `runtime_unavailable`.
+
+Success means the simulation owner committed the exact pose. It does not mean
+the client confirmed the teleport, received every destination chunk, or
+completed a socket write. After commit, the connection coordinator clears
+active and delayed breaking, pending item use, and shield use; installs a new
+pending teleport id; sends the position synchronization packet; replans the
+chunk center; and observes zone membership at the committed pose. Cancellation
+after owner commit cannot turn the targeted result into a failure.
+
+`player.teleport_result` is delivered only to the plugin that issued the
+request. It echoes the exact request/player/coordinates, sets `committed` from
+the owner outcome, and uses `failure = nil` on success. Zone transition and
+teleport-result events come from separate producers and have no relative-order
+guarantee; plugins must correlate the teleport result by `request_id` instead
+of using a zone event as its completion fence.
 
 Colonies are bounded records, not world/entity access:
 

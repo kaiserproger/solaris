@@ -45,6 +45,18 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `c82c344` adds production Lua same-dimension player teleports
+  through the exact reliable session and authoritative simulation owner. The
+  result distinguishes unavailable/stale players, an outstanding vanilla
+  teleport confirmation, and runtime failure; success cannot become failure if
+  the session waiter is cancelled after owner commit. The real TCP/Lua gate
+  proves pending rejection, exact cross-chunk position and center publication,
+  zone observation, targeted non-leak, repeated pending rejection, and the
+  authoritative follow-up pose. A direct queue test proves the post-commit
+  cancellation case. Full workspace tests, strict workspace Clippy, fmt,
+  code-health `0 fail / KEEP`, and diff-check pass. A `sol high` re-review found
+  no blocker. No manual-client or vanilla-oracle gate was run for this
+  plugin-only slice.
 - Checkpoint `0969620` completes the production Lua zone membership lifecycle
   with owner-targeted `player.zone_exited` snapshots. Accepted absolute movement
   publishes deterministic exits before entries with the authoritative new pose;

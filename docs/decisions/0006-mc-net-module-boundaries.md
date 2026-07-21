@@ -608,6 +608,16 @@ transaction boundary.
   batching, world access, lighting/publication helpers, and `SimulationOwner`
   remain in `simulation.rs`; this extraction does not claim the regional or ECS
   migration complete and adds no task, lock, config, sleep, or polling.
+- `script::teleport` owns admission routing and targeted Lua result publication.
+  `play::session::script_teleport_endpoint` resolves the exact reliable session
+  and carries the correlation token. That token moves into
+  `SimulationCommand::CommitPlayerPose`, so the simulation owner publishes the
+  mutation outcome before waking the connection waiter; cancellation cannot
+  report failure after an authoritative commit. `play::player_teleport` is an
+  explicit connection coordinator rather than a pure domain module: it updates
+  `InteractionState`, pending teleport confirmation, socket publication, chunk
+  replanning, and zone observation after the owner commit. It contains no
+  authoritative player mutation and makes no client-confirmation claim.
 
 The existing `play::block_placement` boundary also selects stair facing and
 stair/slab top or bottom state from the player yaw and target-relative hit Y.

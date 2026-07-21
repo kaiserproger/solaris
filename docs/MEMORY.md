@@ -9,18 +9,21 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `0969620` (`feat(plugins): publish zone exit events`).
+- Latest checkpoint: `c82c344` (`feat(plugins): add authoritative player
+  teleports`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
-- `0969620` completes owner-targeted Lua zone membership events. Accepted
-  absolute movement now publishes deterministic exits before entries with the
-  authoritative new pose. Stale, rejected, no-op, disconnect, and zone-removal
-  paths publish nothing. The production TCP/Lua gate proves movement rejection,
-  entry, exit, re-entry, no duplicate outside transition, and no cross-plugin
-  leak using exact pushed chat fences. Full workspace tests, strict workspace
-  Clippy, fmt, code-health `0 fail / KEEP`, and diff-check pass. A `sol high`
-  review found no blocker after the rejected-movement fence was added. No
+- `c82c344` adds capability-gated same-dimension Lua player teleports through
+  the exact reliable session and authoritative simulation owner. Success
+  survives cancellation after commit; missing/stale players, pending teleport
+  confirmation, and runtime failure remain distinct. The real TCP/Lua gate
+  proves the initial pending rejection, exact cross-chunk position sync and
+  center replan, zone observation, targeted result isolation, repeated pending
+  rejection, and authoritative follow-up pose. A direct queue test drops the
+  session waiter after owner commit and still proves success plus the persisted
+  pose. Full workspace tests, strict workspace Clippy, fmt, code-health `0 fail
+  / KEEP`, and diff-check pass. A `sol high` re-review found no blocker. No
   manual-client or vanilla-oracle gate was run for this plugin-only slice.
 - `d9c0804` derives the default 26.1.2 furnace contract from the complete
   resolved item-tag graph and carries a pinned 280-item fallback for embedded
@@ -84,10 +87,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   NoiseRouter parity.
 - Lua API 0.6 has bounded DTO/files/batches, one-shot host admission, an
   attested `mc-net` router, and durable plugin storage. Production adapters now
-  cover menus, inventory/storage transactions, zones, colony records, ephemeral
-  villager binding, owner-scoped `home`/`hold` orders through journaled regional
-  goals, and required post-commit `player.block_broken` and
-  `player.block_placed` events. `player.item_crafted` now covers committed 2x2,
+  cover menus, inventory/storage transactions, zones, same-dimension player
+  teleports, colony records, ephemeral villager binding, owner-scoped
+  `home`/`hold` orders through journaled regional goals, and required
+  post-commit `player.block_broken` and `player.block_placed` events.
+  `player.item_crafted` now covers committed 2x2,
   3x3, and recipe-book crafts with aggregate max-craft counts and required
   queue admission. `player.item_picked_up` now reports exact authoritative
   item-entity and grounded-arrow credits, including partial stack pickup.
