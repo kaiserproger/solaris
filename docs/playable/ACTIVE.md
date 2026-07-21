@@ -38,9 +38,10 @@ hardening. An already-open lower-priority diff does not override this order.
    physics that no longer pushes fish to the surface; owner-client verification
    remains pending.
 3. After the disconnect, close the remaining common-play reports: player water
-   movement, vanilla reach, and lag-free mob damage/death plus skeleton-arrow
-   and creeper-explosion paths. Dry-land random-seed spawn now has focused
-   server evidence and an initial real-client non-water observation.
+   movement, vanilla reach, and lag-free mob damage/death. Skeleton arrows and
+   creeper explosions now have real TCP coverage. Dry-land random-seed spawn
+   has focused server evidence and an initial real-client non-water
+   observation.
 4. Ship the requested basic economy and land-claim plugins on the production
    Lua API, then document operator TOML options beside their values.
 5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
@@ -53,6 +54,22 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- Creepers no longer enter generic melee authority. A visible survival target
+  within three blocks starts one retained 30-tick fuse; leaving seven blocks
+  away reverses its progress, and expiry removes the creeper and uses the shared ordered
+  explosion path at power 3. Swelling stops navigation, dying creepers cannot
+  reach fuse expiry, and natural swell is not persisted across restart.
+  Source-specific explosion centers/power preserve
+  TNT power 4, and chained TNT now always uses the canonical TNT entity type
+  instead of inheriting the source type. Focused unit tests cover start,
+  no-restart, cancellation, exclusive trigger boundary, retained air state,
+  terminal removal, and packet
+  planning. Real TCP tests prove creeper spawn -> removal -> radius-3 explosion
+  -> player damage and preserve the existing skeleton-arrow and TNT paths.
+  Client swell/ignited wire indexes and line-of-sight cancellation remain
+  pending exact integration evidence; no manual-client gate was run for this
+  slice.
 
 - Fresh-player spawn now scans the already-resident 11x11 spawn window and
   chooses the nearest non-hazardous collidable support with collision-free,

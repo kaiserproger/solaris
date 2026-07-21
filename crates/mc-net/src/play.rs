@@ -698,6 +698,10 @@ const DEFAULT_FOOD_USE_DURATION: Duration = Duration::from_millis(1_600);
 const HOSTILE_MELEE_RANGE: f64 = 1.8;
 const HOSTILE_MELEE_VERTICAL_REACH: f64 = 2.25;
 const HOSTILE_MELEE_PERIOD_TICKS: u64 = 20;
+const CREEPER_FUSE_TICKS: u64 = 30;
+const CREEPER_TRIGGER_RANGE: f64 = 3.0;
+const CREEPER_CANCEL_RANGE: f64 = 7.0;
+const CREEPER_EXPLOSION_POWER: f32 = 3.0;
 const SKELETON_SHOT_PERIOD_TICKS: u64 = 40;
 const SKELETON_SHOT_RANGE: f64 = 16.0;
 const SKELETON_ARROW_SPEED: f64 = 1.6;
@@ -10791,7 +10795,7 @@ fn block_edit_changes_light(
             != table.propagates_sky(new_state.0).unwrap_or(true)
 }
 
-fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
+pub(crate) fn air_state_id(registry: &mc_world::BlockRegistry) -> mc_world::BlockStateId {
     let air_id = mc_data::Identifier::parse("minecraft:air").expect("static identifier");
     registry
         .block(&air_id)

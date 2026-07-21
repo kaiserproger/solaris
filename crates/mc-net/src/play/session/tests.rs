@@ -1283,8 +1283,11 @@ fn off_phase_hostile_is_not_materialized_as_attack_candidate() {
         HOSTILE_MELEE_PERIOD_TICKS - phase
     };
 
-    let (attacks, dispatches) =
-        registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick.saturating_sub(1));
+    let (attacks, dispatches) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        due_tick.saturating_sub(1),
+        mc_world::BlockStateId(0),
+    );
 
     assert_eq!(attacks, 0);
     assert!(dispatches.is_empty());
@@ -1305,7 +1308,11 @@ fn hostile_scan_only_visits_entities_in_loaded_chunks() {
         );
     }
 
-    let _ = registry.tick_hostile_attacks(&SimulationAuthority::for_test(), 1);
+    let _ = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        1,
+        mc_world::BlockStateId(0),
+    );
 
     assert_eq!(
         registry.hostile_entity_scan_visits.load(Ordering::Relaxed),
@@ -1344,7 +1351,11 @@ fn hostile_candidate_scan_does_not_hold_session_registry() {
 
     let hostile_registry = Arc::clone(&registry);
     let hostile_tick = std::thread::spawn(move || {
-        hostile_registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick)
+        hostile_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            mc_world::BlockStateId(0),
+        )
     });
     reached_rx.recv().expect("hostile scan reaches probe");
 
@@ -1404,7 +1415,11 @@ fn hostile_commit_releases_both_locks_before_arrow_publication() {
 
     let commit_registry = Arc::clone(&registry);
     let commit = std::thread::spawn(move || {
-        commit_registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick)
+        commit_registry.tick_hostile_attacks(
+            &SimulationAuthority::for_test(),
+            due_tick,
+            mc_world::BlockStateId(0),
+        )
     });
     reached_rx
         .recv_timeout(Duration::from_secs(1))
@@ -1467,7 +1482,11 @@ fn skeleton_volley_uses_constant_owner_requests() {
     };
     registry.entities.reset_owner_requests_for_test();
 
-    let (attacks, _) = registry.tick_hostile_attacks(&SimulationAuthority::for_test(), due_tick);
+    let (attacks, _) = registry.tick_hostile_attacks(
+        &SimulationAuthority::for_test(),
+        due_tick,
+        mc_world::BlockStateId(0),
+    );
 
     assert_eq!(attacks, 2);
     assert_eq!(registry.entities.owner_requests_for_test(), 5);

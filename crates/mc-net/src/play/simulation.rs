@@ -2718,10 +2718,14 @@ impl SimulationOwner {
         let entity_targets = expired_tnt
             .iter()
             .map(|tnt| {
-                let center = Vec3::new(tnt.position.x, tnt.position.y + 0.06125, tnt.position.z);
+                let center = tnt.center();
                 (
                     tnt.entity_id,
-                    sessions.explosion_entity_targets(&self.authority, center, 8.0),
+                    sessions.explosion_entity_targets(
+                        &self.authority,
+                        center,
+                        f64::from(tnt.power()) * 2.0,
+                    ),
                 )
             })
             .collect::<HashMap<_, _>>();
@@ -2738,19 +2742,19 @@ impl SimulationOwner {
         let explosion_item_entity_type_id = mc_data::entity_types::solaris_required_entity_types()
             .id_of(&mc_data::Identifier::parse("minecraft:item").expect("static item entity id"))
             .and_then(|id| i32::try_from(id).ok());
+        let chained_tnt_entity_type_id = mc_data::entity_types::solaris_required_entity_types()
+            .id_of(&mc_data::Identifier::parse(TNT_ENTITY_TYPE_NAME).expect("static TNT entity id"))
+            .and_then(|id| i32::try_from(id).ok());
         if let Some(world) = world {
             let mut storage = world.lock().await;
             for expired in &expired_tnt {
                 let entity_id = expired.entity_id;
                 let air = expired.air;
-                let center = Vec3::new(
-                    expired.position.x,
-                    expired.position.y + 0.06125,
-                    expired.position.z,
-                );
+                let center = expired.center();
+                let power = expired.power();
                 let Ok(candidates) = plan_explosion_candidates(
                     center,
-                    4.0,
+                    power,
                     &mut self.explosion_random,
                     |position| {
                         let state = storage.get_block(position).ok().flatten()?;
@@ -2776,7 +2780,7 @@ impl SimulationOwner {
                         .iter()
                         .filter_map(|target| {
                             let feet = Vec3::new(target.pose.x, target.pose.y, target.pose.z);
-                            plan_player_explosion_impact(center, 4.0, feet, |position| {
+                            plan_player_explosion_impact(center, power, feet, |position| {
                                 explosion_collision_boxes(&mut storage, materials, position)
                             })
                             .map(|impact| (target.session_id, impact))
@@ -2790,7 +2794,7 @@ impl SimulationOwner {
                         .filter_map(|target| {
                             plan_entity_explosion_impact(
                                 center,
-                                4.0,
+                                power,
                                 target.position,
                                 target.eye_position,
                                 target.aabb_min,
@@ -2849,6 +2853,9 @@ impl SimulationOwner {
                             continue;
                         };
                         if state.block.id.as_str() == TNT_ENTITY_TYPE_NAME {
+                            let Some(entity_type_id) = chained_tnt_entity_type_id else {
+                                continue;
+                            };
                             let angle = self.explosion_random.next_double()
                                 * f64::from(std::f32::consts::TAU);
                             let velocity = Vec3::new(
@@ -2858,7 +2865,7 @@ impl SimulationOwner {
                             );
                             let fuse_ticks = u64::from(self.explosion_random.next_int(20) + 10);
                             chained_tnt.entry(entity_id).or_default().push((
-                                expired.entity_type_id,
+                                entity_type_id,
                                 Vec3::new(
                                     f64::from(edit.pos.x) + 0.5,
                                     f64::from(edit.pos.y),
@@ -3006,8 +3013,13 @@ impl SimulationOwner {
         .await
     }
 
-    pub(crate) fn tick_hostile_attacks(&self, sessions: &SessionRegistry, tick: u64) -> usize {
-        let (attacks, dispatches) = sessions.tick_hostile_attacks(&self.authority, tick);
+    pub(crate) fn tick_hostile_attacks(
+        &self,
+        sessions: &SessionRegistry,
+        tick: u64,
+        air: BlockStateId,
+    ) -> usize {
+        let (attacks, dispatches) = sessions.tick_hostile_attacks(&self.authority, tick, air);
         dispatch_visibility_commands(dispatches);
         attacks
     }
@@ -11643,9 +11655,15 @@ mod tests {
             HOSTILE_MELEE_PERIOD_TICKS - phase
         };
 
-        assert_eq!(owner.tick_hostile_attacks(&registry, due_tick - 1), 0);
+        assert_eq!(
+            owner.tick_hostile_attacks(&registry, due_tick - 1, BlockStateId(0)),
+            0
+        );
         assert!(outbound.try_recv().is_err());
-        assert_eq!(owner.tick_hostile_attacks(&registry, due_tick), 1);
+        assert_eq!(
+            owner.tick_hostile_attacks(&registry, due_tick, BlockStateId(0)),
+            1
+        );
 
         let commands = std::iter::from_fn(|| outbound.try_recv().ok()).collect::<Vec<_>>();
         assert!(commands.iter().any(|command| matches!(
@@ -11693,7 +11711,10 @@ mod tests {
             SKELETON_SHOT_PERIOD_TICKS - phase
         };
 
-        assert_eq!(owner.tick_hostile_attacks(&registry, due_tick), 1);
+        assert_eq!(
+            owner.tick_hostile_attacks(&registry, due_tick, BlockStateId(0)),
+            1
+        );
 
         let commands = std::iter::from_fn(|| outbound.try_recv().ok()).collect::<Vec<_>>();
         assert!(commands.iter().any(|command| matches!(

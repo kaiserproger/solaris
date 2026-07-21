@@ -9,9 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest code checkpoint: current `HEAD` (`fix(play): choose dry player spawn`).
-  The preceding autoscale checkpoint is `5b7017a` and the water checkpoint is
-  `547525e`.
+- Latest code checkpoint: current `HEAD` (`feat(play): add creeper fuse authority`).
+  The preceding dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is
+  `5b7017a`, and water checkpoint is `547525e`.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
@@ -22,6 +22,17 @@ and is not startup context.
   spawn from water to air; this observation alone does not prove settled
   landing. The final tested O3 binary is
   `6be274ad51f43129e4949ad2a5eea39444d50d580bd694f5340e300b59b105d9`.
+- Creepers use server-owned 30-tick retained fuses, reverse fuse progress
+  beyond seven blocks,
+  stop navigation while swelling, never survive a prior lethal transition to
+  explode, do not persist natural swell across restart, and explode with power
+  3 through the same
+  ordered authority path as TNT. The source-specific explosion contract keeps
+  TNT at power 4 and resolves chained TNT from the canonical registry instead
+  of the exploding entity type. Unit and real TCP gates cover prime/cancel,
+  terminal removal, radius-3 explosion, and player damage. Exact 26.1.2
+  swell/ignited wire indexes and line-of-sight cancellation are still pending;
+  no manual-client gate was run.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
   world, so a dense owner-world rerun remains an open playable gate. A short
   real 26.1.2-client run against the current O3 binary passed join, play, block

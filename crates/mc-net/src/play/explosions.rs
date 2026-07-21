@@ -12,18 +12,19 @@ use std::collections::HashSet;
 pub(super) const TNT_FUSE_TICKS: u64 = 80;
 pub(super) const TNT_ENTITY_TYPE_NAME: &str = "minecraft:tnt";
 
-pub(super) fn tnt_explosion_packet(
-    position: Vec3,
+pub(super) fn explosion_packet(
+    center: Vec3,
+    radius: f32,
     block_count: i32,
     knockback: Option<Vec3>,
 ) -> ClientboundExplode {
     ClientboundExplode {
         center: EntityVec3 {
-            x: position.x,
-            y: position.y + 0.06125,
-            z: position.z,
+            x: center.x,
+            y: center.y,
+            z: center.z,
         },
-        radius: 4.0,
+        radius,
         block_count,
         knockback: knockback.map(|knockback| EntityVec3 {
             x: knockback.x,

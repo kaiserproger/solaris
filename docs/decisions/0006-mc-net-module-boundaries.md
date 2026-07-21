@@ -221,9 +221,10 @@ Other accepted concrete boundaries in this staged migration are:
   classification, world commit, journal, relight, packet handling, and
   publication. The boundary rejects writer, session, lock, async, and packet
   dependencies.
-- `play::session::explosion_authority` owns expired-TNT and explosion target
-  DTOs, target planning, entity impact application, due-fuse claim, chained
-  TNT spawn, knockback, and dispatch planning. Player ignition, registry
+- `play::session::explosion_authority` owns expired explosive and explosion
+  target DTOs, source-specific center/power, target planning, entity impact
+  application, due-fuse claim, chained TNT spawn, knockback, and dispatch
+  planning. Player ignition, registry
   fields, generic cleanup, world explosion mutation, durability, drops, and
   actual delivery remain in their current owners. Existing session/entity
   lock order, authority fences, stable ordering, and reserve-before-deliver
@@ -235,8 +236,10 @@ Other accepted concrete boundaries in this staged migration are:
   The boundary rejects writer, session, lock, async, sender, packet, and
   publication dependencies.
 - `play::session::hostile_authority` owns hostile attack planning, target
-  refresh, bed-rest exclusion, melee/skeleton tick authority, goal diffing,
-  and test probes. Registry/probe fields, generic lifecycle/indexes,
+  refresh, bed-rest exclusion, melee/skeleton tick authority, creeper
+  prime/cancel authority, goal diffing, and test probes. A creeper uses the
+  retained explosive fuse but never the generic melee path. Registry/probe
+  fields, generic lifecycle/indexes,
   projectile authority, simulation scheduling, and actual delivery remain in
   their current owners. Existing lock order, save barriers, indexed scan,
   target fences, and release-before-publication behavior are unchanged;
@@ -594,7 +597,7 @@ Other accepted concrete boundaries in this staged migration are:
   boundary rejects world/protocol backedges, raw channels, spawned work,
   sleeps and polling.
 
-The primed-TNT owner uses the same per-session ordered publication path without
+The primed-explosive owner uses the same per-session ordered publication path without
 holding the world or session lock during channel delivery. Claiming an expired
 TNT removes its authority and visibility state but does not reserve its terminal
 publication early. After world mutation completes and the world guard is
@@ -605,6 +608,18 @@ therefore blocks the whole TNT transaction, and one TNT transaction cannot be
 overtaken by the next. Generic block-edit recipients remain unordered; the
 ordered loaded-chunk recipient path is intentionally limited to this TNT
 transaction boundary.
+
+Creepers use the local decompiled 26.1.2 `Creeper`/`SwellGoal` common-path
+values: a 30-tick fuse, exclusive 3-block trigger, 7-block cancellation
+distance, and explosion power 3. Moving out of range reverses fuse progress one
+tick at a time instead of resetting it. While swelling or reversing, the
+creeper's navigation goal stays idle. Natural swell progress is omitted from
+the save projection, matching vanilla restart behavior. Their
+wire explosion, removal, and player damage use the same ordered publication
+path as TNT. Solaris does not yet publish the client-side swell/ignited
+metadata; the accessor order is visible in decompiled source, but exact wire
+indexes still require a local wire/javap oracle before being added. Line-of-
+sight cancellation is also not yet connected to the world-read path.
 - `play::session::passive_mobs` owns breeding and grazing plans, while its
   explicit-import `authority` child owns feed, shear, breeding, and grazing
   commits. It adds no lock and keeps mutation in the session/entity authority.

@@ -29,6 +29,9 @@ mod entity_simulation;
 mod explosion_authority;
 mod herd_spawn_authority;
 mod hostile_authority;
+#[cfg(test)]
+#[path = "session/hostile_authority_tests.rs"]
+mod hostile_authority_tests;
 mod interaction_geometry;
 mod outbound;
 #[cfg(test)]

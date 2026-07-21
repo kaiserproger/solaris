@@ -4,16 +4,17 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use mc_entity::{
-    AttributeKind, EntityId, EntityLifecycle, EntitySnapshot, GoalState, Rotation, SpawnEntity,
-    Vec3,
+    AttributeKind, EntityId, EntityLifecycle, EntityPrimedTntState, EntitySnapshot, GoalState,
+    Rotation, SpawnEntity, Vec3,
 };
+use mc_world::BlockStateId;
 
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
 use crate::play::simulation::SimulationAuthority;
 use crate::play::{
-    HOSTILE_FOLLOW_SPEED, HOSTILE_MELEE_PERIOD_TICKS, HOSTILE_MELEE_RANGE,
-    HOSTILE_MELEE_VERTICAL_REACH, SKELETON_ARROW_SPEED, SKELETON_SHOT_PERIOD_TICKS,
-    SKELETON_SHOT_RANGE,
+    CREEPER_CANCEL_RANGE, CREEPER_FUSE_TICKS, CREEPER_TRIGGER_RANGE, HOSTILE_FOLLOW_SPEED,
+    HOSTILE_MELEE_PERIOD_TICKS, HOSTILE_MELEE_RANGE, HOSTILE_MELEE_VERTICAL_REACH,
+    SKELETON_ARROW_SPEED, SKELETON_SHOT_PERIOD_TICKS, SKELETON_SHOT_RANGE,
 };
 
 #[cfg(test)]
@@ -40,6 +41,7 @@ struct HostileAttackTickEntity {
 
 #[derive(Debug, Clone, Copy)]
 enum HostileAttackKind {
+    Creeper,
     Skeleton,
     Melee { attack_damage: f32 },
 }
@@ -109,6 +111,7 @@ impl SessionRegistry {
         &self,
         _authority: &SimulationAuthority,
         tick: u64,
+        air: BlockStateId,
     ) -> (usize, Vec<VisibilityDispatch>) {
         let loaded_entity_ids = {
             let inner = self.lock_inner("snapshot loaded hostile candidates");
@@ -134,27 +137,26 @@ impl SessionRegistry {
                 if entity.lifecycle != EntityLifecycle::Alive {
                     return;
                 }
-                let (is_skeleton, period) = match entity.type_name {
-                    "minecraft:skeleton" => (true, SKELETON_SHOT_PERIOD_TICKS),
-                    entity_type if is_hostile_entity(entity_type) => {
-                        (false, HOSTILE_MELEE_PERIOD_TICKS)
-                    }
+                let kind = match entity.type_name {
+                    "minecraft:creeper" => HostileAttackKind::Creeper,
+                    "minecraft:skeleton" => HostileAttackKind::Skeleton,
+                    entity_type if is_hostile_entity(entity_type) => HostileAttackKind::Melee {
+                        attack_damage: entity
+                            .attributes
+                            .base(&AttributeKind::AttackDamage)
+                            .unwrap_or(3.0) as f32,
+                    },
                     _ => return,
+                };
+                let period = match kind {
+                    HostileAttackKind::Creeper => 1,
+                    HostileAttackKind::Skeleton => SKELETON_SHOT_PERIOD_TICKS,
+                    HostileAttackKind::Melee { .. } => HOSTILE_MELEE_PERIOD_TICKS,
                 };
                 let phase = u64::from(entity.id.0.unsigned_abs());
                 if !tick.wrapping_add(phase).is_multiple_of(period) {
                     return;
                 }
-                let kind = if is_skeleton {
-                    HostileAttackKind::Skeleton
-                } else {
-                    HostileAttackKind::Melee {
-                        attack_damage: entity
-                            .attributes
-                            .base(&AttributeKind::AttackDamage)
-                            .unwrap_or(3.0) as f32,
-                    }
-                };
                 hostiles.push(HostileAttackTickEntity {
                     id: entity.id,
                     kind,
@@ -169,12 +171,62 @@ impl SessionRegistry {
             return (0, Vec::new());
         }
 
-        let (skeleton_attacks, melee_attacks) = {
-            let inner = self.lock_inner("plan hostile attacks");
+        let (skeleton_attacks, melee_attacks, creeper_ignitions) = {
+            let mut inner = self.lock_session_entities("plan hostile attacks");
             let mut skeleton_attacks = Vec::new();
             let mut melee_attacks = Vec::new();
+            let mut creeper_ignitions = 0;
             for hostile in hostiles {
                 match hostile.kind {
+                    HostileAttackKind::Creeper => {
+                        let cancel_distance_sq = CREEPER_CANCEL_RANGE * CREEPER_CANCEL_RANGE;
+                        let trigger_distance_sq = CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE;
+                        let nearest_distance_sq = inner
+                            .sessions
+                            .iter()
+                            .filter_map(|(&session_id, session)| {
+                                if inner.spectator_sessions.contains(&session_id)
+                                    || !session.visible_entities.contains(&hostile.id)
+                                {
+                                    return None;
+                                }
+                                let position =
+                                    Vec3::new(session.pose.x, session.pose.y, session.pose.z);
+                                Some(distance_sq(hostile.position, position))
+                            })
+                            .min_by(f64::total_cmp);
+                        let Some(expected) = inner.entities.snapshot(hostile.id) else {
+                            continue;
+                        };
+                        let previous_fuse = expected.retained.primed_tnt;
+                        let next_fuse = match (previous_fuse, nearest_distance_sq) {
+                            (None, Some(distance)) if distance < trigger_distance_sq => {
+                                Some(EntityPrimedTntState {
+                                    expires_tick: tick.saturating_add(CREEPER_FUSE_TICKS),
+                                    air_block_state: air.0,
+                                })
+                            }
+                            (Some(_), Some(distance)) if distance <= cancel_distance_sq => {
+                                continue;
+                            }
+                            (Some(fuse), _) => {
+                                let remaining = fuse.expires_tick.saturating_sub(tick);
+                                let progress = CREEPER_FUSE_TICKS.saturating_sub(remaining);
+                                (progress > 1).then_some(EntityPrimedTntState {
+                                    expires_tick: fuse.expires_tick.saturating_add(2),
+                                    air_block_state: fuse.air_block_state,
+                                })
+                            }
+                            (None, _) => continue,
+                        };
+                        let mut next = expected.clone();
+                        next.retained.primed_tnt = next_fuse;
+                        if inner.entities.replace_snapshot_if_current(expected, next)
+                            && previous_fuse.is_none()
+                        {
+                            creeper_ignitions += 1;
+                        }
+                    }
                     HostileAttackKind::Skeleton => {
                         let Some(arrow_entity_type_id) =
                             inner.arrow_kill_rewards.arrow_entity_type_id
@@ -290,10 +342,10 @@ impl SessionRegistry {
                     }
                 }
             }
-            (skeleton_attacks, melee_attacks)
+            (skeleton_attacks, melee_attacks, creeper_ignitions)
         };
         if skeleton_attacks.is_empty() && melee_attacks.is_empty() {
-            return (0, Vec::new());
+            return (creeper_ignitions, Vec::new());
         }
 
         let spawned_arrows = if skeleton_attacks.is_empty() {
@@ -414,7 +466,7 @@ impl SessionRegistry {
             attacks += 1;
         }
 
-        (attacks, dispatches)
+        (attacks + creeper_ignitions, dispatches)
     }
 
     #[cfg(test)]
@@ -482,6 +534,8 @@ pub(super) fn update_hostile_targets(
                 entity.position,
                 follow_range,
                 entity.type_name == "minecraft:skeleton",
+                entity.type_name == "minecraft:creeper",
+                entity.retained.primed_tnt.is_some(),
                 entity.goal.clone(),
             ));
         }
@@ -494,8 +548,13 @@ pub(super) fn update_hostile_targets(
     if players.is_empty() {
         let changed = hostiles
             .into_iter()
-            .filter_map(|(hostile_id, _, _, _, current)| {
-                changed_hostile_goal(hostile_id, &current, hostile_wander_goal())
+            .filter_map(|(hostile_id, _, _, _, is_creeper, fuse_active, current)| {
+                let goal = if is_creeper && fuse_active {
+                    GoalState::Idle
+                } else {
+                    hostile_wander_goal()
+                };
+                changed_hostile_goal(hostile_id, &current, goal)
             })
             .collect::<Vec<_>>();
         if !changed.is_empty() {
@@ -506,7 +565,15 @@ pub(super) fn update_hostile_targets(
     let changed = hostiles
         .into_iter()
         .filter_map(
-            |(hostile_id, hostile_position, follow_range, uses_ranged_attack, current)| {
+            |(
+                hostile_id,
+                hostile_position,
+                follow_range,
+                uses_ranged_attack,
+                is_creeper,
+                fuse_active,
+                current,
+            )| {
                 let max_distance_sq = follow_range * follow_range;
                 let target = players
                     .iter()
@@ -517,7 +584,16 @@ pub(super) fn update_hostile_targets(
                             .total_cmp(&distance_sq(*right, hostile_position))
                     });
                 let goal = match target {
+                    None if is_creeper && fuse_active => GoalState::Idle,
                     None => hostile_wander_goal(),
+                    Some(target)
+                        if is_creeper
+                            && (fuse_active
+                                || distance_sq(target, hostile_position)
+                                    < CREEPER_TRIGGER_RANGE * CREEPER_TRIGGER_RANGE) =>
+                    {
+                        GoalState::Idle
+                    }
                     Some(target)
                         if !uses_ranged_attack
                             && (target.y - hostile_position.y).abs()

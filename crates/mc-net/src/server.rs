@@ -1290,7 +1290,11 @@ impl BoundServer {
                     .await;
                 let animal_breeding_us = elapsed_us(started);
                 let started = Instant::now();
-                simulation_owner.tick_hostile_attacks(&entity_sessions, tick);
+                simulation_owner.tick_hostile_attacks(
+                    &entity_sessions,
+                    tick,
+                    play::air_state_id(&entity_config.blocks),
+                );
                 let hostile_attacks_us = elapsed_us(started);
 
                 let physics_was_in_flight = entity_physics_job.is_some();

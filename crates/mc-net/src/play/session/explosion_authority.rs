@@ -3,9 +3,10 @@ use std::collections::{HashMap, HashSet};
 use mc_entity::{EntityId, EntityLifecycle, SpawnEntity, Vec3};
 use mc_world::BlockStateId;
 
+use crate::play::CREEPER_EXPLOSION_POWER;
 use crate::play::PlayerPose;
 use crate::play::combat::{PlayerDamageKind, PlayerDamageRequest};
-use crate::play::explosions::{PlayerExplosionImpact, TNT_ENTITY_TYPE_NAME, tnt_explosion_packet};
+use crate::play::explosions::{PlayerExplosionImpact, TNT_ENTITY_TYPE_NAME, explosion_packet};
 use crate::play::simulation::SimulationAuthority;
 use crate::play::survival::{entity_item_stack, mob_xp_value};
 
@@ -32,8 +33,9 @@ use super::{
 pub(in crate::play) struct ExpiredPrimedTnt {
     pub(in crate::play) entity_id: EntityId,
     pub(in crate::play) position: Vec3,
-    pub(in crate::play) entity_type_id: i32,
     pub(in crate::play) air: mc_world::BlockStateId,
+    power: f32,
+    center_y_offset: f64,
     snapshot: ServerEntitySnapshot,
     observer_ids: Vec<SessionId>,
     explosion_targets: Vec<ExplosionPlayerTarget>,
@@ -62,6 +64,18 @@ pub(in crate::play) struct ServerEntityExplosionImpact {
 }
 
 impl ExpiredPrimedTnt {
+    pub(in crate::play) fn center(&self) -> Vec3 {
+        Vec3::new(
+            self.position.x,
+            self.position.y + self.center_y_offset,
+            self.position.z,
+        )
+    }
+
+    pub(in crate::play) fn power(&self) -> f32 {
+        self.power
+    }
+
     pub(in crate::play) fn explosion_targets(&self) -> &[ExplosionPlayerTarget] {
         &self.explosion_targets
     }
@@ -72,6 +86,8 @@ impl ExpiredPrimedTnt {
         block_count: i32,
         impacts: &HashMap<SessionId, PlayerExplosionImpact>,
     ) -> Vec<VisibilityDispatch> {
+        let center = self.center();
+        let power = self.power;
         let observer_ids = self.observer_ids.into_iter().collect::<HashSet<_>>();
         let explosion_target_ids = self
             .explosion_targets
@@ -114,8 +130,9 @@ impl ExpiredPrimedTnt {
             }
             dispatches.push(VisibilityDispatch {
                 recipient,
-                command: OutboundCommand::Explosion(tnt_explosion_packet(
-                    self.position,
+                command: OutboundCommand::Explosion(explosion_packet(
+                    center,
+                    power,
                     block_count,
                     impact.map(|impact| impact.knockback),
                 )),
@@ -252,10 +269,11 @@ impl SessionRegistry {
             .snapshots_vec()
             .into_iter()
             .filter(|entity| {
-                entity
-                    .retained
-                    .primed_tnt
-                    .is_some_and(|fuse| fuse.expires_tick <= current_tick)
+                entity.lifecycle == EntityLifecycle::Alive
+                    && entity
+                        .retained
+                        .primed_tnt
+                        .is_some_and(|fuse| fuse.expires_tick <= current_tick)
             })
             .map(|entity| entity.id)
             .collect::<Vec<_>>();
@@ -267,9 +285,11 @@ impl SessionRegistry {
                 let retained = inner.entities.snapshot(entity_id)?.retained.primed_tnt?;
                 let snapshot = remove_server_entity_state_locked(&mut inner, entity_id)?;
                 let observer_ids = remove_entity_visibility_locked(&mut inner, entity_id);
+                let is_creeper = snapshot.type_name == "minecraft:creeper";
+                let center_y_offset = if is_creeper { 0.0 } else { 0.06125 };
                 let center = Vec3::new(
                     snapshot.position.x,
-                    snapshot.position.y + 0.06125,
+                    snapshot.position.y + center_y_offset,
                     snapshot.position.z,
                 );
                 let explosion_targets = inner
@@ -286,8 +306,13 @@ impl SessionRegistry {
                 Some(ExpiredPrimedTnt {
                     entity_id,
                     position: snapshot.position,
-                    entity_type_id: snapshot.type_id,
                     air: mc_world::BlockStateId(retained.air_block_state),
+                    power: if is_creeper {
+                        CREEPER_EXPLOSION_POWER
+                    } else {
+                        4.0
+                    },
+                    center_y_offset,
                     snapshot,
                     observer_ids,
                     explosion_targets,
