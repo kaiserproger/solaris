@@ -12235,6 +12235,7 @@ where
                         handle_use_item_on(
                             state,
                             writer,
+                            script_gameplay_events.as_ref(),
                             game_mode,
                             survival_state,
                             &xp_state,

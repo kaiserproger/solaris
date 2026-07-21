@@ -42,6 +42,15 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- The current plugin slice adds required post-commit `player.block_placed`
+  events for the actual registry-backed root state. The shared real packet/Lua
+  gate observes creative and survival commits and FIFO-fences blocked and
+  empty-hand retries. A direct owner-stale stair dependency test proves no
+  placement event before a pushed `server.tick` fence. Focused contract,
+  adapter, and wire tests pass. Full workspace tests, strict workspace Clippy,
+  fmt, code-health `0 fail / KEEP`, and diff-check pass. A `sol high` re-review
+  found no remaining blocker, high, or medium issue. No manual/client or
+  vanilla-oracle gate was run for this plugin-only event slice.
 - The current production plugin slice publishes `player.block_broken` only
   after an authoritative root block transition. A real packet/Lua wire gate
   observes exact creative and survival events. FIFO command fences prove abort,

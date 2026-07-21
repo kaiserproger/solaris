@@ -1205,6 +1205,34 @@ impl ScriptEvent {
         })
     }
 
+    /// Build a reliable block-place event after the authoritative world commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_player_block_placed_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        block_id: impl AsRef<str>,
+        x: i32,
+        y: i32,
+        z: i32,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerBlockPlaced {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                block_id: validate_contract_resource_id(block_id.as_ref())?,
+                x,
+                y,
+                z,
+                game_mode,
+            },
+        })
+    }
+
     /// Build a bounded player command event with server-authoritative context.
     pub fn try_player_command_with_context(
         target_plugin_id: impl AsRef<str>,
@@ -1442,6 +1470,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerLeft { .. } => "player.left",
             ScriptEventKind::PlayerChat { .. } => "player.chat",
             ScriptEventKind::PlayerBlockBroken { .. } => "player.block_broken",
+            ScriptEventKind::PlayerBlockPlaced { .. } => "player.block_placed",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
             ScriptEventKind::PluginStorageGetResult { .. } => "plugin.storage.get_result",
@@ -1491,6 +1520,12 @@ impl ScriptEvent {
                 context.validate()
             }
             ScriptEventKind::PlayerBlockBroken {
+                context,
+                dimension,
+                block_id,
+                ..
+            }
+            | ScriptEventKind::PlayerBlockPlaced {
                 context,
                 dimension,
                 block_id,
@@ -1643,6 +1678,16 @@ pub enum ScriptEventKind {
         context: ScriptPlayerContext,
     },
     PlayerBlockBroken {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        block_id: String,
+        x: i32,
+        y: i32,
+        z: i32,
+        game_mode: ScriptGameMode,
+    },
+    PlayerBlockPlaced {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
         dimension: String,
@@ -3911,6 +3956,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.left"
             | "player.chat"
             | "player.block_broken"
+            | "player.block_placed"
             | "server.tick"
             | "plugin.storage.get_result"
             | "plugin.storage.cas_result"
@@ -4518,6 +4564,76 @@ mod tests {
     }
 
     #[test]
+    fn player_block_placed_event_is_a_validated_snapshot() {
+        let context = ScriptPlayerContext::new(
+            "123e4567-e89b-12d3-a456-426614174000",
+            "kaiser",
+            true,
+            12.25,
+            70.0,
+            -4.5,
+        );
+        let event = ScriptEvent::try_player_block_placed_with_context(
+            ScriptPlayerId::new(42),
+            context.clone(),
+            "minecraft:overworld",
+            "minecraft:oak_log",
+            3,
+            -64,
+            -9,
+            ScriptGameMode::Survival,
+        )
+        .unwrap();
+
+        assert_eq!(event.event_name(), "player.block_placed");
+        assert_eq!(event.target_plugin_id(), None);
+        assert_eq!(event.validate(), Ok(()));
+        assert!(matches!(
+            event.kind(),
+            ScriptEventKind::PlayerBlockPlaced {
+                player_id,
+                context: event_context,
+                dimension,
+                block_id,
+                x,
+                y,
+                z,
+                game_mode,
+            } if *player_id == ScriptPlayerId::new(42)
+                && event_context == &context
+                && dimension == "minecraft:overworld"
+                && block_id == "minecraft:oak_log"
+                && (*x, *y, *z) == (3, -64, -9)
+                && *game_mode == ScriptGameMode::Survival
+        ));
+    }
+
+    #[test]
+    fn player_block_placed_rejects_invalid_resource_identifiers() {
+        let context = ScriptPlayerContext::new("player-42", "kaiser", false, 0.0, 64.0, 0.0);
+        let oversized_block_id = format!("minecraft:{}", "a".repeat(MAX_SCRIPT_RESOURCE_ID_BYTES));
+        for (dimension, block_id) in [
+            ("overworld", "minecraft:stone"),
+            ("minecraft:overworld", "minecraft:Stone"),
+            ("minecraft:overworld", oversized_block_id.as_str()),
+        ] {
+            assert!(
+                ScriptEvent::try_player_block_placed_with_context(
+                    ScriptPlayerId::new(42),
+                    context.clone(),
+                    dimension,
+                    block_id,
+                    0,
+                    64,
+                    0,
+                    ScriptGameMode::Creative,
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn block_break_game_modes_are_closed_stable_strings() {
         assert_eq!(ScriptGameMode::Survival.as_str(), "survival");
         assert_eq!(ScriptGameMode::Creative.as_str(), "creative");
@@ -4644,6 +4760,7 @@ mod tests {
         assert_eq!(SCRIPT_API_VERSION, ScriptApiVersion::new(0, 6, 0));
         for event_name in [
             "player.block_broken",
+            "player.block_placed",
             "plugin.storage.get_result",
             "plugin.storage.cas_result",
             "plugin.storage.delete_result",

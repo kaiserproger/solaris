@@ -76,7 +76,8 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.joined` | `on_player_joined` | player snapshot |
 | `player.left` | `on_player_left` | `player_id`, `reason` |
 | `player.chat` | `on_player_chat` | player snapshot, `message` |
-| `player.block_broken` | `on_player_block_broken` | player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
+| `player.block_broken` | `on_player_block_broken` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
+| `player.block_placed` | `on_player_block_placed` | block player snapshot, `dimension`, `block_id`, `x`, `y`, `z`, `game_mode` |
 | `server.tick` | `on_server_tick` | `tick` |
 | `player.command` | `on_player_command` | player snapshot, `root`, `arguments` |
 | `plugin.storage.get_result` | `on_plugin_storage_get_result` | `request_id`, `key`, `value`, `version`, `failure` |
@@ -95,16 +96,26 @@ session, peer address, entity reference, or live query handle. An absent storage
 record has `value = nil` and `version = nil`. An unsuccessful villager binding
 has `binding_token = nil` and `binding_expires_at_tick = nil`.
 
-`player.block_broken` is published once after the authoritative root block
-transition commits. `dimension` and `block_id` are namespaced resource ids;
-`x`, `y`, and `z` are integer block coordinates; `game_mode` is `survival` or
-`creative`. An aborted break, stale precondition, rejected mutation, or repeated
-break of air publishes nothing. Required gameplay-event delivery waits for an
-exact bounded-queue capacity notification, so an admitted event keeps FIFO
-order without polling or guessed time. Closing the plugin queue cannot roll
-back an already committed world mutation; publication reports failure and the
-normal block result still reaches the client. Lossy telemetry such as
-`server.tick` remains nonblocking and may be dropped under pressure.
+For block events, the immutable player pose is exposed as `player_x`,
+`player_y`, and `player_z`; `x`, `y`, and `z` remain the integer block
+coordinates. The other player snapshot fields are unchanged.
+
+`player.block_broken` and `player.block_placed` are each published once after
+the authoritative root block transition commits. `dimension` and `block_id`
+are namespaced resource ids; `x`, `y`, and `z` are integer root-block
+coordinates; `game_mode` is `survival` or `creative`. Placement reports the
+actual final registry-backed root state. Door halves and stair-neighbour edits
+do not create extra events. Bonemeal, hoe, bucket, cauldron, toggle, and plant
+harvest interactions are not block-placement events.
+
+An aborted break, stale precondition, rejected mutation, repeated break of air,
+blocked placement, or empty-hand placement publishes nothing. Required
+gameplay-event delivery waits for an exact bounded-queue capacity notification,
+so an admitted event keeps FIFO order without polling or guessed time. Closing
+the plugin queue cannot roll back an already committed world mutation;
+publication reports failure and the normal block result still reaches the
+client. Lossy telemetry such as `server.tick` remains nonblocking and may be
+dropped under pressure.
 
 ## Commands
 

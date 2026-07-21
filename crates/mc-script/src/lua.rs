@@ -1404,9 +1404,22 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             y,
             z,
             game_mode,
+        }
+        | ScriptEventKind::PlayerBlockPlaced {
+            player_id,
+            context,
+            dimension,
+            block_id,
+            x,
+            y,
+            z,
+            game_mode,
         } => {
             table.set("player_id", player_id.value())?;
             set_player_context(&table, context)?;
+            table.set("player_x", context.x())?;
+            table.set("player_y", context.y())?;
+            table.set("player_z", context.z())?;
             table.set("dimension", dimension.as_str())?;
             table.set("block_id", block_id.as_str())?;
             table.set("x", *x)?;
@@ -1557,6 +1570,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerLeft { .. } => "on_player_left",
         ScriptEventKind::PlayerChat { .. } => "on_player_chat",
         ScriptEventKind::PlayerBlockBroken { .. } => "on_player_block_broken",
+        ScriptEventKind::PlayerBlockPlaced { .. } => "on_player_block_placed",
         ScriptEventKind::PlayerCommand { .. } => "on_player_command",
         ScriptEventKind::ServerTick { .. } => "on_server_tick",
         ScriptEventKind::PluginStorageGetResult { .. } => "on_plugin_storage_get_result",
@@ -1910,6 +1924,7 @@ mod tests {
                     local expected = {
                         name = true, player_id = true, context_verified = true,
                         uuid = true, username = true, operator = true,
+                        player_x = true, player_y = true, player_z = true,
                         dimension = true, block_id = true, x = true, y = true,
                         z = true, game_mode = true,
                     }
@@ -1918,12 +1933,15 @@ mod tests {
                         assert(expected[field] == true, "unexpected field: " .. field)
                         field_count = field_count + 1
                     end
-                    assert(field_count == 12)
+                    assert(field_count == 15)
                     assert(event.name == "player.block_broken")
                     assert(event.context_verified == true)
                     assert(event.uuid == "123e4567-e89b-12d3-a456-426614174000")
                     assert(event.username == "Alex")
                     assert(event.operator == true)
+                    assert(event.player_x == 1.5)
+                    assert(event.player_y == 64.0)
+                    assert(event.player_z == -2.25)
                     assert(event.dimension == "minecraft:the_nether")
                     assert(event.block_id == "minecraft:ancient_debris")
                     assert(math.type(event.x) == "integer" and event.x == -3)
@@ -1968,6 +1986,81 @@ mod tests {
             &[ScriptCommand::SendChatMessage {
                 player_id: ScriptPlayerId::new(7),
                 message: "block-broken".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lua_block_placed_subscription_dispatches_exact_fields() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&["player.block_placed"]),
+            r#"
+                function on_player_block_placed(event)
+                    local expected = {
+                        name = true, player_id = true, context_verified = true,
+                        uuid = true, username = true, operator = true,
+                        player_x = true, player_y = true, player_z = true,
+                        dimension = true, block_id = true, x = true, y = true,
+                        z = true, game_mode = true,
+                    }
+                    local field_count = 0
+                    for field in pairs(event) do
+                        assert(expected[field] == true, "unexpected field: " .. field)
+                        field_count = field_count + 1
+                    end
+                    assert(field_count == 15)
+                    assert(event.name == "player.block_placed")
+                    assert(event.context_verified == true)
+                    assert(event.uuid == "123e4567-e89b-12d3-a456-426614174000")
+                    assert(event.username == "Alex")
+                    assert(event.operator == true)
+                    assert(event.player_x == 1.5)
+                    assert(event.player_y == 64.0)
+                    assert(event.player_z == -2.25)
+                    assert(event.dimension == "minecraft:the_end")
+                    assert(event.block_id == "minecraft:obsidian")
+                    assert(math.type(event.x) == "integer" and event.x == -3)
+                    assert(math.type(event.y) == "integer" and event.y == 15)
+                    assert(math.type(event.z) == "integer" and event.z == 27)
+                    assert(event.game_mode == "creative")
+                    solaris.send_message(event.player_id, "block-placed")
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let controls = RuntimeControls::unrestricted();
+        let event = ScriptEvent::try_player_block_placed_with_context(
+            ScriptPlayerId::new(7),
+            ScriptPlayerContext::new(
+                "123e4567-e89b-12d3-a456-426614174000",
+                "Alex",
+                true,
+                1.5,
+                64.0,
+                -2.25,
+            ),
+            "minecraft:the_end",
+            "minecraft:obsidian",
+            -3,
+            15,
+            27,
+            ScriptGameMode::Creative,
+        )
+        .unwrap();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::SendChatMessage {
+                player_id: ScriptPlayerId::new(7),
+                message: "block-placed".to_owned(),
             }]
         );
     }

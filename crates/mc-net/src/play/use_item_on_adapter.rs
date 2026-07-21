@@ -46,10 +46,10 @@ use super::survival::{
 };
 use super::{
     BlockEdit, BlockEditPrecondition, HoeTillingPlan, InteractionState, PlayerPose,
-    SIGN_BLOCK_ENTITY_TYPE_ID, air_state_id, block_break_loot_seed, clear_shield_use,
-    hand_inventory_slot, interact_with_bed, interact_with_toggle_block, open_chest_container,
-    open_crafting_table_container, open_enchanting_table_container, open_furnace_container,
-    open_stonecutter_container, published_block_precondition,
+    SIGN_BLOCK_ENTITY_TYPE_ID, ScriptGameplayEventPublisher, air_state_id, block_break_loot_seed,
+    clear_shield_use, hand_inventory_slot, interact_with_bed, interact_with_toggle_block,
+    open_chest_container, open_crafting_table_container, open_enchanting_table_container,
+    open_furnace_container, open_stonecutter_container, published_block_precondition,
     reject_unsupported_survival_station_use, schedule_fluid_ticks_for_interaction, splitmix64,
     start_falling_blocks_after_edits, write_block_ack, write_block_resync_then_ack,
     write_inventory_slot_updates,
@@ -125,6 +125,7 @@ impl UseItemOnResyncOptions {
 pub(super) async fn handle_use_item_on<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     survival_state: SurvivalState,
     xp_state: &XpState,
@@ -240,6 +241,7 @@ where
             handle_block_item_placement(
                 state,
                 writer,
+                script_events,
                 game_mode,
                 player_pose,
                 target.clicked_pos,
@@ -888,9 +890,11 @@ pub(super) fn plan_loaded_bonemeal_growth(
 /// hotbar slot through the item→block table. Same-type slabs may replace the
 /// clicked cell; other blocks place into the adjacent air cell. On success the
 /// simulation transaction commits all block edits before publishing its inventory debit.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_block_item_placement<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     game_mode: GameMode,
     player_pose: PlayerPose,
     clicked_pos: mc_world::BlockPos,
@@ -1154,6 +1158,23 @@ where
             .await;
         }
     };
+    let placed_root_state = committed
+        .block
+        .applied
+        .iter()
+        .find(|edit| edit.pos == target_pos && edit.previous != edit.new_state)
+        .map(|edit| edit.new_state);
+    if let (Some(script_events), Some(placed_root_state)) = (script_events, placed_root_state) {
+        script_events
+            .publish_block_placed(
+                &state.blocks,
+                placed_root_state,
+                target_pos,
+                player_pose,
+                game_mode,
+            )
+            .await;
+    }
     state.inventory = committed.inventory;
     let changed_slots = committed.changed_slots;
     let outcome =

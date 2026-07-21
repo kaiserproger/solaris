@@ -10,6 +10,7 @@ use mc_data::items::{ItemRegistry, ItemReport};
 use mc_protocol::packets::play::{
     Direction, GameMode, InteractionHand, ItemStack, ServerboundUseItemOn, pack_block_pos,
 };
+use mc_script::{ScriptEvent, ScriptEventKind, ScriptPlayerId, script_boundary_pair};
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tokio::sync::mpsc;
 
@@ -18,7 +19,8 @@ use crate::login::LoggedInProfile;
 use crate::play::item_blocks::ItemToBlockTable;
 use crate::play::persistence::PlayerPersistedState;
 use crate::play::tests::{insert_fluid_test_chunk, interaction_state_for_blocks};
-use crate::play::{SimulationOwner, simulation_channel};
+use crate::play::{CommandPermissions, SimulationOwner, simulation_channel};
+use crate::server::ScriptEventSink;
 
 const SLAB_ITEM_ID: u32 = 42;
 const STAIR_ITEM_ID: u32 = 43;
@@ -151,6 +153,7 @@ async fn ordinary_stair_placement_passes_the_real_validator_and_debits_once() {
     let mut request = Box::pin(handle_block_item_placement(
         &mut harness.state,
         &mut writer,
+        None,
         GameMode::Survival,
         harness.pose,
         clicked,
@@ -237,7 +240,7 @@ async fn stair_placement_commits_neighbour_shape_before_inventory_debit() {
 }
 
 #[tokio::test]
-async fn stale_stair_shape_dependency_rejects_without_inventory_debit() {
+async fn stale_stair_shape_dependency_rejects_without_inventory_debit_or_script_event() {
     let mut harness = placement_harness(STAIR_ITEM_ID).await;
     let clicked = BlockPos { x: 4, y: 64, z: 4 };
     let target = BlockPos { x: 5, ..clicked };
@@ -247,9 +250,20 @@ async fn stale_stair_shape_dependency_rejects_without_inventory_debit() {
     let sessions = Arc::clone(&harness.state.sessions);
     let world = Arc::clone(&harness.state.world);
     let mut writer = Vec::new();
+    let four = std::num::NonZeroUsize::new(4).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(four, four);
+    let publisher = ScriptGameplayEventPublisher::new(
+        ScriptEventSink::new(boundary.clone()),
+        ScriptPlayerId::new(9),
+        "123e4567-e89b-12d3-a456-426614174000",
+        "PlacementAdapter",
+        CommandPermissions::from_op(true),
+        "minecraft:overworld",
+    );
     let mut request = Box::pin(handle_block_item_placement(
         &mut harness.state,
         &mut writer,
+        Some(&publisher),
         GameMode::Survival,
         harness.pose,
         clicked,
@@ -277,6 +291,14 @@ async fn stale_stair_shape_dependency_rejects_without_inventory_debit() {
         Some(BlockStateId(0))
     );
     assert_held_count(&harness, 2);
+    boundary
+        .enqueue_required_event(ScriptEvent::server_tick(99))
+        .await
+        .unwrap();
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ServerTick { tick: 99 }
+    ));
 }
 
 #[tokio::test]
@@ -425,6 +447,7 @@ async fn lava_target_rejects_slab_placement_without_inventory_debit() {
     handle_block_item_placement(
         &mut harness.state,
         &mut writer,
+        None,
         GameMode::Survival,
         harness.pose,
         clicked,
@@ -459,6 +482,7 @@ async fn run_accepted_placement(
     let mut request = Box::pin(handle_block_item_placement(
         &mut harness.state,
         &mut writer,
+        None,
         GameMode::Survival,
         harness.pose,
         clicked,

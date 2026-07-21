@@ -9,10 +9,11 @@ use mc_protocol::packets::play::{
     BlockChangedAck, BlockUpdate, ClientboundCommands, ClientboundContainerSetContent,
     ClientboundContainerSetSlot, ClientboundOpenScreen, ClientboundSetTime, ClientboundSystemChat,
     CommandNodeKind, ConfirmTeleportation, ContainerInput, Direction, GameEvent, GameMode,
-    HashedStack, HashedStackComponentHashes, LevelChunkWithLight, MovePlayerFlags,
+    HashedStack, HashedStackComponentHashes, InteractionHand, LevelChunkWithLight, MovePlayerFlags,
     PlayerActionKind, ServerboundChat, ServerboundChatCommand, ServerboundContainerClick,
     ServerboundMovePlayerPos, ServerboundMovePlayerStatusOnly, ServerboundPlayerAction,
-    SetCenterChunk, SynchronizePlayerPosition, pack_block_pos, unpack_block_pos,
+    ServerboundUseItemOn, SetCenterChunk, SynchronizePlayerPosition, pack_block_pos,
+    unpack_block_pos,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -338,7 +339,7 @@ async fn lua_0_6_player_command_reaches_the_server_chat_adapter() {
 }
 
 #[tokio::test]
-async fn lua_block_break_event_follows_authoritative_creative_commit() {
+async fn lua_block_events_follow_authoritative_commits() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     let plugin = plugins.path().join("block-jobs");
     std::fs::create_dir(&plugin).expect("create plugin directory");
@@ -349,7 +350,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             name = "Block Jobs"
             version = "0.1.0"
             api = "0.6.0"
-            events = ["player.block_broken"]
+            events = ["player.block_broken", "player.block_placed"]
             player_commands = ["block-fence"]
         "#,
     )
@@ -361,6 +362,19 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
                 solaris.send_message(
                     event.player_id,
                     "block-broken:" .. event.block_id
+                        .. ":" .. event.dimension
+                        .. ":" .. event.x
+                        .. ":" .. event.y
+                        .. ":" .. event.z
+                        .. ":" .. event.game_mode
+                        .. ":" .. event.username
+                )
+            end
+
+            function on_player_block_placed(event)
+                solaris.send_message(
+                    event.player_id,
+                    "block-placed:" .. event.block_id
                         .. ":" .. event.dimension
                         .. ":" .. event.x
                         .. ":" .. event.y
@@ -390,6 +404,9 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
         .default
         .0 as i32;
     let items = Arc::new(mc_data::items::solaris_required_items());
+    let dirt_item_id = items
+        .id_of(&mc_data::Identifier::parse("minecraft:dirt").unwrap())
+        .expect("dirt item");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world = mc_world::WorldStorage::in_memory_with_capacity(Arc::clone(&blocks), 49)
         .with_item_registry(Arc::clone(&items))
@@ -557,6 +574,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
     }
 
     let target = (0, sync.y.floor() as i32 - 2, 0);
+    let creative_placement_target = (target.0, target.1 + 1, target.2);
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::AbortDestroyBlock,
@@ -584,11 +602,107 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
     }
 
     client
+        .write_packet(&ServerboundChatCommand {
+            command: "debug give minecraft:dirt 1 0".to_owned(),
+        })
+        .await
+        .expect("give creative placement block");
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundContainerSetSlot::ID,
+                Duration::from_secs(5),
+                LUA_TRANSACTION_FRAME_WAIT_LIMITS,
+            )
+            .await
+            .expect("creative placement item");
+        let slot = ClientboundContainerSetSlot::decode(&mut outcome.frame.body.clone())
+            .expect("decode creative placement item");
+        if slot.item_stack.item_id == dirt_item_id && slot.item_stack.count == 1 {
+            break;
+        }
+    }
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 1,
+        })
+        .await
+        .expect("place creative block");
+    let expected_placement_message = format!(
+        "block-placed:minecraft:dirt:minecraft:overworld:0:{}:0:creative:BreakEvents",
+        creative_placement_target.1
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_placement_update = false;
+    let mut saw_placement_event = false;
+    while !(saw_placement_update && saw_placement_event) {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("creative block placement event wire response");
+        if frame.id == BlockUpdate::ID {
+            let update =
+                BlockUpdate::decode(&mut frame.body).expect("decode placement BlockUpdate");
+            if unpack_block_pos(update.position) == creative_placement_target
+                && update.state_id != air_state
+            {
+                saw_placement_update = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            if text_component_text(&chat) == expected_placement_message {
+                saw_placement_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(target.0, target.1, target.2),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 2,
+        })
+        .await
+        .expect("repeat creative placement into occupied target");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence creative-place-reject".to_owned(),
+        })
+        .await
+        .expect("send creative placement reject fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-placed:"),
+            "rejected creative placement published another event: {message}"
+        );
+        if message == "block-fence:creative-place-reject" {
+            break;
+        }
+    }
+
+    client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StartDestroyBlock,
             position: pack_block_pos(target.0, target.1, target.2),
             direction: Direction::Up,
-            sequence: 1,
+            sequence: 3,
         })
         .await
         .expect("break generated surface block");
@@ -635,7 +749,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             action: PlayerActionKind::StartDestroyBlock,
             position: pack_block_pos(target.0, target.1, target.2),
             direction: Direction::Up,
-            sequence: 2,
+            sequence: 4,
         })
         .await
         .expect("repeat break against air");
@@ -685,7 +799,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             action: PlayerActionKind::StartDestroyBlock,
             position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
             direction: Direction::Up,
-            sequence: 3,
+            sequence: 5,
         })
         .await
         .expect("start survival break");
@@ -701,7 +815,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             action: PlayerActionKind::StopDestroyBlock,
             position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
             direction: Direction::Up,
-            sequence: 4,
+            sequence: 6,
         })
         .await
         .expect("finish survival break");
@@ -739,7 +853,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             action: PlayerActionKind::StartDestroyBlock,
             position: pack_block_pos(survival_target.0, survival_target.1, survival_target.2),
             direction: Direction::Up,
-            sequence: 5,
+            sequence: 7,
         })
         .await
         .expect("repeat survival break against air");
@@ -760,13 +874,87 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
         }
     }
 
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(survival_target.0, survival_target.1 - 1, survival_target.2),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 8,
+        })
+        .await
+        .expect("place survival block");
+    let expected_survival_placement = format!(
+        "block-placed:minecraft:dirt:minecraft:overworld:1:{}:0:survival:BreakEvents",
+        survival_target.1
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut saw_survival_placement_update = false;
+    let mut saw_survival_placement_event = false;
+    while !(saw_survival_placement_update && saw_survival_placement_event) {
+        let mut frame = client
+            .read_frame_with_timeout(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+            .await
+            .expect("survival block placement event wire response");
+        if frame.id == BlockUpdate::ID {
+            let update =
+                BlockUpdate::decode(&mut frame.body).expect("decode survival placement update");
+            if unpack_block_pos(update.position) == survival_target && update.state_id != air_state
+            {
+                saw_survival_placement_update = true;
+            }
+        } else if frame.id == ClientboundSystemChat::ID {
+            let chat = ClientboundSystemChat::decode(&mut frame.body).expect("decode SystemChat");
+            if text_component_text(&chat) == expected_survival_placement {
+                saw_survival_placement_event = true;
+            }
+        }
+    }
+
+    client
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(survival_target.0, survival_target.1 - 1, survival_target.2),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 9,
+        })
+        .await
+        .expect("repeat survival placement with empty hand");
+    client
+        .write_packet(&ServerboundChatCommand {
+            command: "block-fence survival-place-reject".to_owned(),
+        })
+        .await
+        .expect("send survival placement reject fence");
+    loop {
+        let message = next_lua_transaction_system_chat_text(&mut client).await;
+        assert!(
+            !message.starts_with("block-placed:"),
+            "rejected survival placement published another event: {message}"
+        );
+        if message == "block-fence:survival-place-reject" {
+            break;
+        }
+    }
+
     let stale_target = (2, target.1, 0);
     client
         .write_packet(&ServerboundPlayerAction {
             action: PlayerActionKind::StartDestroyBlock,
             position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
             direction: Direction::Up,
-            sequence: 6,
+            sequence: 10,
         })
         .await
         .expect("start stale survival break");
@@ -781,7 +969,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             .expect("stale break start acknowledgement");
         let ack = BlockChangedAck::decode(&mut outcome.frame.body.clone())
             .expect("decode stale start acknowledgement");
-        if ack.sequence == 6 {
+        if ack.sequence == 10 {
             break;
         }
     }
@@ -833,7 +1021,7 @@ async fn lua_block_break_event_follows_authoritative_creative_commit() {
             action: PlayerActionKind::StopDestroyBlock,
             position: pack_block_pos(stale_target.0, stale_target.1, stale_target.2),
             direction: Direction::Up,
-            sequence: 7,
+            sequence: 11,
         })
         .await
         .expect("finish stale survival break");

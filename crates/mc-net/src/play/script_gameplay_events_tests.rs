@@ -95,3 +95,42 @@ async fn closed_script_queue_does_not_claim_committed_break_delivery() {
             .await
     );
 }
+
+#[tokio::test]
+async fn committed_block_placement_publishes_root_snapshot() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary));
+    let blocks = blocks();
+    let stone = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+
+    assert!(
+        publisher
+            .publish_block_placed(
+                &blocks,
+                stone,
+                BlockPos { x: -4, y: 71, z: 8 },
+                PlayerPose::new(-3.5, 72.0, 8.5),
+                GameMode::Creative,
+            )
+            .await
+    );
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerBlockPlaced {
+            player_id,
+            dimension,
+            block_id,
+            x: -4,
+            y: 71,
+            z: 8,
+            game_mode: mc_script::ScriptGameMode::Creative,
+            ..
+        } if *player_id == ScriptPlayerId::new(9)
+            && dimension == "minecraft:overworld"
+            && block_id == "minecraft:stone"
+    ));
+}

@@ -99,4 +99,70 @@ impl ScriptGameplayEventPublisher {
             }
         }
     }
+
+    pub(super) async fn publish_block_placed(
+        &self,
+        blocks: &BlockRegistry,
+        state: BlockStateId,
+        position: BlockPos,
+        pose: PlayerPose,
+        game_mode: GameMode,
+    ) -> bool {
+        let Some(block) = blocks.by_id(state) else {
+            warn!(
+                state = state.0,
+                "committed block placement has no registry identity"
+            );
+            return false;
+        };
+        let game_mode = match game_mode {
+            GameMode::Survival => ScriptGameMode::Survival,
+            GameMode::Creative => ScriptGameMode::Creative,
+            _ => {
+                warn!(
+                    ?game_mode,
+                    "committed block placement has unsupported script game mode"
+                );
+                return false;
+            }
+        };
+        let context = ScriptPlayerContext::new(
+            &self.uuid,
+            &self.username,
+            self.permissions.op,
+            pose.x,
+            pose.y,
+            pose.z,
+        );
+        let event = match ScriptEvent::try_player_block_placed_with_context(
+            self.player_id,
+            context,
+            &self.dimension,
+            block.block.id.as_str(),
+            position.x,
+            position.y,
+            position.z,
+            game_mode,
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(?error, "committed block placement script event is invalid");
+                return false;
+            }
+        };
+        match self.sink.enqueue_required_event(event).await {
+            Ok(()) => true,
+            Err(ScriptQueueError::Closed) => {
+                warn!("script event queue closed after committed block placement");
+                false
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "committed block placement script event was rejected"
+                );
+                false
+            }
+        }
+    }
 }

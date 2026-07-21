@@ -5489,6 +5489,7 @@ async fn invalid_support_placement_resyncs_without_mutating_or_debiting_inventor
     handle_block_item_placement(
         &mut state,
         &mut writer,
+        None,
         GameMode::Survival,
         PlayerPose::new(3.5, 64.0, 4.5),
         clicked,
@@ -9968,6 +9969,7 @@ async fn placing_hopper_schedules_initial_transfer_tick() {
     handle_block_item_placement(
         &mut state,
         &mut writer,
+        None,
         GameMode::Survival,
         PlayerPose::new(1.5, 64.0, 1.5),
         clicked_pos,
