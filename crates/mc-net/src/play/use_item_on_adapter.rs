@@ -1094,6 +1094,22 @@ where
         edits,
         additional_preconditions,
     } = plan;
+    if script_events.is_some_and(|events| {
+        edits
+            .iter()
+            .any(|edit| !events.block_mutation_allowed(edit.pos))
+    }) {
+        return reject_use_item_on_with_resync(
+            state,
+            writer,
+            sequence,
+            clicked_pos,
+            target_pos,
+            UseItemOnNoOpReason::PlacementPlanRejected,
+            UseItemOnResyncOptions::WITH_HELD_ITEM,
+        )
+        .await;
+    }
     let scheduled_block_ticks =
         placed_hopper_ticks(&state.blocks, &edits, state.sessions.simulation_tick());
     let mut preconditions = vec![BlockEditPrecondition {

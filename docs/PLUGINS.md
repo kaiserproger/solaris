@@ -124,6 +124,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.inventory_transaction_result` | `on_player_inventory_transaction_result` | `request_id`, `player_id`, `committed`, `failure` |
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
 | `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
+| `zone.command_result` | `on_zone_command_result` | `zone_id`, `accepted` |
 | `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
 | `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
 | `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
@@ -452,10 +453,45 @@ removal and disconnect are silent cleanup, not player movement events. Changing
 a zone keeps an existing membership when the player remains inside, so an edit
 cannot repeat entry side effects.
 
+Every admitted `upsert_zone` or `remove_zone` publishes one targeted
+`zone.command_result`. `accepted = true` includes an idempotent no-op;
+`accepted = false` means the registry did not apply the command. A plugin must
+not announce protection before receiving the accepted result.
+
 The process admits at most 4,096 zones, 256 zones per plugin, 16,384 tracked
 players, and 262,144 memberships. A request beyond a bound is rejected without
 partial mutation and logged by the production router. These bounds are server
 admission limits, not operator-configured worker percentages.
+
+## Shipped Economy And Claims
+
+`examples/plugins/basic-economy` provides `/economy`, a durable virtual balance,
+an operator-only self grant, and a server-owned inventory shop. The item grant
+and balance deduction use one `inventory_storage_transaction`, so neither side
+commits alone. `config.toml` documents the starting balance, currency label,
+and every product beside the value an operator edits. Player-to-player payment,
+auctions, and multiple currencies are intentionally outside this basic plugin.
+
+`examples/plugins/land-claims` provides `/claim status`, `/claim create`, and
+`/claim remove`. Claims cover one whole chunk in the configured dimension and
+vertical range, persist in one versioned storage record, and allow removal by
+the owner or an operator. API `0.6.0` player command snapshots do not expose a
+dimension, so every command maps to the configured dimension; the shipped
+plugin is restricted to the current single-dimension runtime.
+
+The current server adapter recognizes only zones owned by plugin id
+`land-claims` whose ids follow
+`claim-<32 lowercase hex owner UUID>-<chunk-x id>-<chunk-z id>`. Before a player
+break or placement commits, the adapter allows the owner and operators and
+resynchronizes a denied client. Ordinary plugin zones retain membership-only
+semantics, including malformed claim-shaped ids. The plugin waits for the
+targeted zone result before reporting success and rolls its storage CAS back
+when the registry rejects the zone change. This convention is a documented temporary bridge: a future
+first-class protection policy in the zone command must replace the plugin-id
+special case and migrate this shipped plugin in the same change. Protection
+currently covers direct player block breaking and item placement. Containers,
+buckets, pistons, explosions, fire, and entity interaction are not protected
+and must not be presented as covered.
 
 Player teleports are same-dimension authoritative mutations:
 
@@ -598,9 +634,9 @@ cannot construct an arbitrary targeted result. Directly matching and trusting
 the fields of `HostAttached` is not an adapter API. Lua exposes no filesystem,
 network, process, debug, paths, locks, NBT, sessions, or entity pointers.
 
-See [the contract examples](../examples/plugins/) for the configurable currency
-catalog, the `/who` inventory roster, and the intentionally limited
-colony/villager scaffold.
+See [the contract examples](../examples/plugins/) for the basic economy,
+land claims, configurable currency catalog, `/who` inventory roster, and the
+intentionally limited colony/villager scaffold.
 
 `crates/mc-test-harness/tests/plugin_examples.rs` copies those exact shipped
 files into an isolated plugin directory and runs them through the production
@@ -619,3 +655,9 @@ no-villager result. Plugin-emitted readiness messages causally fence startup;
 timeouts only fail missing packets. These are integration checks of the
 examples; they are not vanilla-oracle or broad plugin-ecosystem readiness
 evidence.
+
+The same suite routes the exact economy and claim Lua files through the real
+host. It proves the default balance and atomic economy purchase, durable claim
+CAS and zone registration, then uses two real wire clients to prove a stranger
+cannot break or place inside the owner's claimed chunk. The stranger acquires
+the placement item through the economy plugin, not a privileged debug command.

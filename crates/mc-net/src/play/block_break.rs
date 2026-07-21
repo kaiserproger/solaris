@@ -212,6 +212,13 @@ where
     let sequence = acknowledgement.sequence();
     let (x, y, z) = unpack_block_pos(position);
     let pos = mc_world::BlockPos { x, y, z };
+    if script_events.is_some_and(|events| !events.block_mutation_allowed(pos)) {
+        write_block_resync(state, writer, position).await?;
+        if acknowledgement.should_send() {
+            write_block_ack(writer, state.compression, sequence).await?;
+        }
+        return Ok(false);
+    }
     if let Some(expected_target) = expected_target {
         let Some(held) = state.inventory.held(state.selected_hotbar_slot).cloned() else {
             return Ok(false);

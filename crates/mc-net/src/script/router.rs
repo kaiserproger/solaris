@@ -250,8 +250,12 @@ impl ScriptRouter {
                 }
             }
             ScriptCommand::UpsertZone { .. } | ScriptCommand::RemoveZone { .. } => {
-                if let Err(error) = self.zones.route_admitted(admitted) {
-                    warn!(?error, "admitted script zone command rejected");
+                match self.zones.route_admitted_with_result(admitted).await {
+                    Ok(_) => {}
+                    Err(super::zone::ZoneAdapterError::PublicationClosed) => {
+                        return ScriptRouterExit::Stop;
+                    }
+                    Err(error) => warn!(?error, "admitted script zone command rejected"),
                 }
                 ScriptRouterExit::Continue
             }

@@ -77,6 +77,114 @@ fn context(x: f64, y: f64, z: f64) -> ScriptPlayerContext {
 }
 
 #[tokio::test]
+async fn shipped_land_claim_zone_blocks_strangers_but_not_owner_or_operator() {
+    let owner_uuid = "12345678123456781234567812345678";
+    let mut commands = admitted_zone_commands(
+        "land-claims",
+        &format!(
+            "    solaris.upsert_zone(\"claim-{owner_uuid}-p0-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)"
+        ),
+        1,
+    )
+    .await;
+    let (adapter, _events) = adapter_with_limits(ZoneLimits::production());
+    assert_eq!(
+        adapter.route_admitted(commands.remove(0)),
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    let claimed = mc_world::BlockPos { x: 7, y: 64, z: 7 };
+    let outside = mc_world::BlockPos { x: 16, y: 64, z: 7 };
+
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "12345678-1234-5678-1234-567812345678",
+            false,
+            "minecraft:overworld",
+            claimed,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            false,
+            "minecraft:overworld",
+            claimed,
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            true,
+            "minecraft:overworld",
+            claimed,
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            false,
+            "minecraft:overworld",
+            outside,
+        ),
+        Ok(true)
+    );
+}
+
+#[tokio::test]
+async fn ordinary_plugin_zones_never_protect_blocks() {
+    let mut commands = admitted_zone_commands(
+        "currency-catalog",
+        "    solaris.upsert_zone(\"claim-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-p0-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)",
+        1,
+    )
+    .await;
+    let (adapter, _events) = adapter_with_limits(ZoneLimits::production());
+    assert_eq!(
+        adapter.route_admitted(commands.remove(0)),
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            false,
+            "minecraft:overworld",
+            mc_world::BlockPos { x: 7, y: 64, z: 7 },
+        ),
+        Ok(true)
+    );
+}
+
+#[tokio::test]
+async fn malformed_shipped_claim_zone_does_not_enable_protection() {
+    let owner_uuid = "12345678123456781234567812345678";
+    let mut commands = admitted_zone_commands(
+        "land-claims",
+        &format!(
+            "    solaris.upsert_zone(\"claim-{owner_uuid}-p0\", \"minecraft:overworld\", 0, -64, 0, 15, 319, 15)"
+        ),
+        1,
+    )
+    .await;
+    let (adapter, _events) = adapter_with_limits(ZoneLimits::production());
+    assert_eq!(
+        adapter.route_admitted(commands.remove(0)),
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert_eq!(
+        adapter.block_mutation_allowed(
+            "12345678-1234-5678-1234-567812345678",
+            false,
+            "minecraft:overworld",
+            mc_world::BlockPos { x: 7, y: 64, z: 7 },
+        ),
+        Ok(true)
+    );
+}
+
+#[tokio::test]
 async fn admitted_zone_commands_remain_scoped_to_their_exact_owner() {
     let mut owner_a = admitted_zone_commands(
         "owner-a",
@@ -179,6 +287,45 @@ async fn zone_capacity_failure_is_explicit_and_does_not_partially_mutate() {
     assert!(matches!(
         event.kind(),
         ScriptEventKind::PlayerZoneEntered { zone_id, .. } if zone_id == "first"
+    ));
+}
+
+#[tokio::test]
+async fn production_route_reports_zone_capacity_rejection_to_the_owner() {
+    let mut commands = admitted_zone_commands(
+        "owner",
+        r#"
+    solaris.upsert_zone("first", "minecraft:overworld", 0, 0, 0, 10, 10, 10)
+    solaris.upsert_zone("second", "minecraft:overworld", 0, 0, 0, 10, 10, 10)
+"#,
+        2,
+    )
+    .await;
+    let limits = ZoneLimits {
+        total_zones: 1,
+        zones_per_plugin: 1,
+        tracked_players: 1,
+        memberships: 1,
+    };
+    let (adapter, mut events) = adapter_with_limits(limits);
+
+    assert_eq!(
+        adapter.route_admitted_with_result(commands.remove(0)).await,
+        Ok(ZoneCommandOutcome::Applied)
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ZoneCommandResult { zone_id, accepted }
+            if zone_id == "first" && *accepted
+    ));
+    assert_eq!(
+        adapter.route_admitted_with_result(commands.remove(0)).await,
+        Err(ZoneAdapterError::Full(ZoneCapacity::TotalZones))
+    );
+    assert!(matches!(
+        events.recv_event().await.unwrap().kind(),
+        ScriptEventKind::ZoneCommandResult { zone_id, accepted }
+            if zone_id == "second" && !*accepted
     ));
 }
 

@@ -5,11 +5,16 @@ use std::time::Duration;
 use bytes::Bytes;
 use mc_protocol::packets::Packet;
 use mc_protocol::packets::play::{
-    AddEntity, ClientboundCommands, ClientboundContainerSetContent, ClientboundContainerSetSlot,
-    ClientboundOpenScreen, ClientboundSystemChat, CommandNodeKind, ConfirmTeleportation,
-    ContainerInput, HashedStack, HashedStackComponentHashes, MovePlayerFlags, RemoveEntities,
-    ServerboundAttack, ServerboundChatCommand, ServerboundContainerClick, ServerboundMovePlayerPos,
-    ServerboundMovePlayerStatusOnly, SynchronizePlayerPosition,
+    AddEntity, BlockChangedAck, ClientboundCommands, ClientboundContainerSetContent,
+    ClientboundContainerSetSlot, ClientboundOpenScreen, ClientboundSystemChat, CommandNodeKind,
+    ConfirmTeleportation, ContainerInput, Direction, HashedStack, HashedStackComponentHashes,
+    InteractionHand, MovePlayerFlags, PlayerActionKind, RemoveEntities, ServerboundAttack,
+    ServerboundChatCommand, ServerboundContainerClick, ServerboundMovePlayerPos,
+    ServerboundMovePlayerStatusOnly, ServerboundPlayerAction, ServerboundUseItemOn,
+    SynchronizePlayerPosition, pack_block_pos,
+};
+use mc_script::{
+    PlayerCommandAdmission, ScriptCommand, ScriptEvent, ScriptPlayerContext, ScriptPlayerId,
 };
 use mc_test_harness::client::{Client, FrameWaitLimits};
 
@@ -26,8 +31,522 @@ struct CatalogMenu {
 }
 
 #[tokio::test]
+async fn shipped_basic_economy_and_land_claims_route_real_lua_commands() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("basic-economy", plugins.path());
+    copy_example_plugin("land-claims", plugins.path());
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start economy and claims plugins");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    boundary
+        .try_enqueue_event(ScriptEvent::server_started())
+        .expect("enqueue server start");
+    let load = boundary
+        .recv_command()
+        .await
+        .expect("claim storage load command");
+    let admitted = boundary
+        .accept_host_command(load)
+        .expect("admit claim storage load");
+    assert_eq!(admitted.plugin_id(), "land-claims");
+    assert!(matches!(
+        admitted.request(),
+        ScriptCommand::PluginStorageGet { request }
+            if request.key() == "claims:v1"
+    ));
+    boundary
+        .try_enqueue_event(
+            admitted
+                .plugin_storage_get_result(None, None)
+                .expect("empty claim storage result"),
+        )
+        .expect("deliver empty claim storage result");
+
+    let player_id = ScriptPlayerId::new(7);
+    let context = ScriptPlayerContext::new(
+        "12345678-1234-5678-1234-567812345678",
+        "ClaimOwner",
+        false,
+        1.0,
+        64.0,
+        1.0,
+    );
+    assert_eq!(
+        boundary
+            .try_enqueue_player_command_with_context(player_id, context.clone(), "claim create")
+            .expect("enqueue claim command"),
+        PlayerCommandAdmission::Enqueued
+    );
+    let save = boundary.recv_command().await.expect("claim save command");
+    let admitted = boundary
+        .accept_host_command(save)
+        .expect("admit claim save");
+    assert_eq!(admitted.plugin_id(), "land-claims");
+    assert!(matches!(
+        admitted.request(),
+        ScriptCommand::PluginStorageCompareAndSwap { request }
+            if request.key() == "claims:v1" && request.expected_version().is_none()
+    ));
+    boundary
+        .try_enqueue_event(
+            admitted
+                .plugin_storage_cas_result(true, Some(1))
+                .expect("claim storage commit result"),
+        )
+        .expect("deliver claim storage commit result");
+
+    let first = boundary.recv_command().await.expect("claim zone command");
+    let first = boundary
+        .accept_host_command(first)
+        .expect("admit claim zone");
+    assert!(matches!(
+        first.request(),
+        ScriptCommand::UpsertZone { zone }
+            if zone.id() == "claim-12345678123456781234567812345678-p0-p0"
+                && zone.dimension() == "minecraft:overworld"
+    ));
+    let (claim_target, claim_zone) = first.into_upsert_zone().expect("consume claim zone");
+    boundary
+        .try_enqueue_event(
+            claim_target
+                .zone_command_result(claim_zone.id(), true)
+                .expect("accepted claim zone result"),
+        )
+        .expect("deliver accepted claim zone result");
+    let second = boundary
+        .recv_command()
+        .await
+        .expect("claim success message");
+    let second = boundary
+        .accept_host_command(second)
+        .expect("admit claim message");
+    assert!(matches!(
+        second.request(),
+        ScriptCommand::SendChatMessage { player_id: target, message }
+            if *target == player_id && message.contains("Chunk claimed")
+    ));
+
+    assert_eq!(
+        boundary
+            .try_enqueue_player_command_with_context(player_id, context.clone(), "economy balance")
+            .expect("enqueue balance command"),
+        PlayerCommandAdmission::Enqueued
+    );
+    let wallet = boundary.recv_command().await.expect("wallet read command");
+    let wallet = boundary
+        .accept_host_command(wallet)
+        .expect("admit wallet read");
+    assert_eq!(wallet.plugin_id(), "basic-economy");
+    assert!(matches!(
+        wallet.request(),
+        ScriptCommand::PluginStorageGet { request }
+            if request.key() == "wallet:12345678-1234-5678-1234-567812345678"
+    ));
+    boundary
+        .try_enqueue_event(
+            wallet
+                .plugin_storage_get_result(None, None)
+                .expect("new wallet result"),
+        )
+        .expect("deliver wallet result");
+    let balance = boundary.recv_command().await.expect("balance message");
+    let balance = boundary
+        .accept_host_command(balance)
+        .expect("admit balance message");
+    assert!(matches!(
+        balance.request(),
+        ScriptCommand::SendChatMessage { player_id: target, message }
+            if *target == player_id && message == "Balance: 100 Coins."
+    ));
+
+    assert_eq!(
+        boundary
+            .try_enqueue_player_command_with_context(player_id, context, "claim remove")
+            .expect("enqueue claim removal"),
+        PlayerCommandAdmission::Enqueued
+    );
+    let removal_save = boundary.recv_command().await.expect("claim removal save");
+    let removal_save = boundary
+        .accept_host_command(removal_save)
+        .expect("admit claim removal save");
+    assert!(matches!(
+        removal_save.request(),
+        ScriptCommand::PluginStorageCompareAndSwap { request }
+            if request.key() == "claims:v1" && request.expected_version() == Some(1)
+    ));
+    boundary
+        .try_enqueue_event(
+            removal_save
+                .plugin_storage_cas_result(true, Some(2))
+                .expect("claim removal storage result"),
+        )
+        .expect("deliver claim removal storage result");
+    let removal = boundary.recv_command().await.expect("claim zone removal");
+    let removal = boundary
+        .accept_host_command(removal)
+        .expect("admit claim zone removal");
+    let (claim_target, zone_id) = removal.into_remove_zone().expect("consume zone removal");
+    boundary
+        .try_enqueue_event(
+            claim_target
+                .zone_command_result(&zone_id, false)
+                .expect("rejected zone removal result"),
+        )
+        .expect("deliver rejected zone removal result");
+    let rollback = boundary.recv_command().await.expect("claim rollback save");
+    let rollback = boundary
+        .accept_host_command(rollback)
+        .expect("admit claim rollback save");
+    assert!(matches!(
+        rollback.request(),
+        ScriptCommand::PluginStorageCompareAndSwap { request }
+            if request.key() == "claims:v1"
+                && request.expected_version() == Some(2)
+                && request.value().contains("12345678123456781234567812345678")
+    ));
+    boundary
+        .try_enqueue_event(
+            rollback
+                .plugin_storage_cas_result(true, Some(3))
+                .expect("claim rollback result"),
+        )
+        .expect("deliver claim rollback result");
+    let rollback_message = boundary
+        .recv_command()
+        .await
+        .expect("claim rollback message");
+    let rollback_message = boundary
+        .accept_host_command(rollback_message)
+        .expect("admit claim rollback message");
+    assert!(matches!(
+        rollback_message.request(),
+        ScriptCommand::SendChatMessage { player_id: target, message }
+            if *target == player_id
+                && message == "Claim protection was unavailable; no claim change was kept."
+    ));
+
+    drop(boundary);
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
+async fn shipped_land_claim_blocks_stranger_break_and_placement_over_wire() {
+    let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("basic-economy", plugins.path());
+    copy_example_plugin("land-claims", plugins.path());
+    std::fs::write(
+        plugins.path().join("basic-economy/config.toml"),
+        r#"starting_balance = 100
+currency_name = "Coins"
+
+[[products]]
+resource = "minecraft:dirt"
+count = 1
+price = 1
+label = "Dirt"
+"#,
+    )
+    .expect("configure dirt shop");
+    let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
+        .expect("start land claims plugin");
+    assert_eq!(host.loaded_plugins(), 2);
+
+    let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
+    std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
+    let block_report = mc_data::blocks::solaris_required_blocks_report();
+    let blocks = Arc::new(
+        mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
+    );
+    let short_grass = blocks
+        .block(&mc_data::Identifier::parse("minecraft:short_grass").unwrap())
+        .unwrap()
+        .default;
+    let stone = blocks
+        .block(&mc_data::Identifier::parse("minecraft:stone").unwrap())
+        .unwrap()
+        .default;
+    let air = blocks
+        .block(&mc_data::Identifier::parse("minecraft:air").unwrap())
+        .unwrap()
+        .default;
+    let items = Arc::new(mc_data::items::solaris_required_items());
+    let dirt_item_id = item_id(&items, "minecraft:dirt");
+    let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
+    let world =
+        mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
+            .expect("open disk-backed world")
+            .with_item_registry(Arc::clone(&items))
+            .with_generator(generator);
+    let world = Arc::new(tokio::sync::Mutex::new(world));
+    let shutdown = mc_net::ShutdownHandle::default();
+    let cfg = mc_net::ServerConfig {
+        bind_address: "127.0.0.1:0".parse().unwrap(),
+        motd: "Land claim wire test".into(),
+        max_players: 3,
+        view_distance: 1,
+        data: Arc::new(mc_data::solaris_required_data()),
+        blocks: Arc::clone(&blocks),
+        world: Some(Arc::clone(&world)),
+        tags: Arc::new(mc_data::tags::solaris_required_item_tags(&items)),
+        recipes: Arc::new(mc_data::recipes::solaris_required_recipes()),
+        loot: Arc::new(mc_data::loot::builtin().clone()),
+        block_light: None,
+        items,
+        item_facts: Arc::new(mc_data::item_components::solaris_required_item_facts()),
+        block_facts: Arc::new(mc_data::block_facts::BlockFactsTable::from_blocks_report(
+            &block_report,
+        )),
+        entity_types: Arc::new(mc_data::entity_types::solaris_required_entity_types()),
+        biome_spawns: Arc::new(mc_data::biomes::solaris_required_biome_spawn_rules()),
+        chunk_pipeline: mc_net::ChunkPipelinePolicy::default(),
+        random_tick: mc_net::RandomTickPolicy::default(),
+        command_permissions: mc_net::CommandPermissionConfig::new(["ClaimAdmin"], true),
+        shutdown: shutdown.clone(),
+    };
+    let bound = mc_net::bind_with_scripts(cfg, boundary)
+        .await
+        .expect("bind claimed server");
+    let addr = bound.local_addr().expect("local address");
+    let server = tokio::spawn(async move { bound.serve().await });
+
+    let mut owner = Client::connect(addr).await.expect("owner connect");
+    owner
+        .drive_login(addr, "ClaimOwner")
+        .await
+        .expect("owner login");
+    owner
+        .drive_configuration()
+        .await
+        .expect("owner configuration");
+    owner.read_play_login().await.expect("owner play entry");
+    let _: ClientboundCommands = owner.read_typed().await.expect("owner Commands");
+    let owner_sync: SynchronizePlayerPosition = owner.read_typed().await.expect("owner sync");
+    owner
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: owner_sync.teleport_id,
+        })
+        .await
+        .expect("ack owner teleport");
+    owner
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("owner grounded");
+    claim_current_chunk(&mut owner).await;
+
+    let mut stranger = Client::connect(addr).await.expect("stranger connect");
+    stranger
+        .drive_login(addr, "ClaimStranger")
+        .await
+        .expect("stranger login");
+    stranger
+        .drive_configuration()
+        .await
+        .expect("stranger configuration");
+    stranger
+        .read_play_login()
+        .await
+        .expect("stranger play entry");
+    let _: ClientboundCommands = stranger.read_typed().await.expect("stranger Commands");
+    let stranger_sync: SynchronizePlayerPosition =
+        stranger.read_typed().await.expect("stranger sync");
+    stranger
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: stranger_sync.teleport_id,
+        })
+        .await
+        .expect("ack stranger teleport");
+    stranger
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("stranger grounded");
+    send_command(&mut stranger, "economy").await;
+    let dirt_menu = wait_for_economy_menu(
+        &mut stranger,
+        dirt_item_id,
+        1,
+        "Balance: 100 Coins",
+        "Dirt | 1 Coins",
+    )
+    .await;
+    click_catalog_product(&mut stranger, &dirt_menu, 0).await;
+    let dirt_purchase = wait_for_message_and_inventory(&mut stranger, "Purchased Dirt.").await;
+    assert_eq!(total_count(&dirt_purchase, dirt_item_id), 1);
+
+    let target = mc_world::BlockPos {
+        x: owner_sync.x.floor() as i32,
+        y: owner_sync.y.floor() as i32 - 2,
+        z: owner_sync.z.floor() as i32,
+    };
+    world
+        .lock()
+        .await
+        .set_block_at(target, short_grass)
+        .expect("seed protected short grass");
+    stranger
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.x, target.y, target.z),
+            direction: Direction::Up,
+            sequence: 41,
+        })
+        .await
+        .expect("attempt protected break");
+    wait_for_block_ack(&mut stranger, 41).await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(target)
+            .expect("read protected short grass"),
+        Some(short_grass)
+    );
+
+    owner
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(target.x, target.y, target.z),
+            direction: Direction::Up,
+            sequence: 43,
+        })
+        .await
+        .expect("owner breaks claimed block");
+    wait_for_block_ack(&mut owner, 43).await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(target)
+            .expect("read owner-broken block"),
+        Some(air)
+    );
+
+    let base = mc_world::BlockPos {
+        x: target.x + 1,
+        y: target.y,
+        z: target.z,
+    };
+    let placement = mc_world::BlockPos {
+        x: base.x,
+        y: base.y + 1,
+        z: base.z,
+    };
+    {
+        let mut world = world.lock().await;
+        world
+            .set_block_at(base, stone)
+            .expect("seed placement base");
+        world
+            .set_block_at(placement, air)
+            .expect("seed protected air");
+    }
+    stranger
+        .write_packet(&ServerboundUseItemOn {
+            hand: InteractionHand::MainHand,
+            position: pack_block_pos(base.x, base.y, base.z),
+            direction: Direction::Up,
+            cursor_x: 0.5,
+            cursor_y: 1.0,
+            cursor_z: 0.5,
+            inside: false,
+            world_border_hit: false,
+            sequence: 42,
+        })
+        .await
+        .expect("attempt protected placement");
+    wait_for_block_ack(&mut stranger, 42).await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(placement)
+            .expect("read protected air"),
+        Some(air)
+    );
+
+    let operator_target = mc_world::BlockPos {
+        x: target.x + 2,
+        y: target.y,
+        z: target.z,
+    };
+    world
+        .lock()
+        .await
+        .set_block_at(operator_target, short_grass)
+        .expect("seed operator target");
+    let mut operator = Client::connect(addr).await.expect("operator connect");
+    operator
+        .drive_login(addr, "ClaimAdmin")
+        .await
+        .expect("operator login");
+    operator
+        .drive_configuration()
+        .await
+        .expect("operator configuration");
+    operator
+        .read_play_login()
+        .await
+        .expect("operator play entry");
+    let _: ClientboundCommands = operator.read_typed().await.expect("operator Commands");
+    let operator_sync: SynchronizePlayerPosition =
+        operator.read_typed().await.expect("operator sync");
+    operator
+        .write_packet(&ConfirmTeleportation {
+            teleport_id: operator_sync.teleport_id,
+        })
+        .await
+        .expect("ack operator teleport");
+    operator
+        .write_packet(&ServerboundMovePlayerStatusOnly {
+            flags: MovePlayerFlags::new(true, false),
+        })
+        .await
+        .expect("operator grounded");
+    operator
+        .write_packet(&ServerboundPlayerAction {
+            action: PlayerActionKind::StartDestroyBlock,
+            position: pack_block_pos(operator_target.x, operator_target.y, operator_target.z),
+            direction: Direction::Up,
+            sequence: 44,
+        })
+        .await
+        .expect("operator breaks claimed block");
+    wait_for_block_ack(&mut operator, 44).await;
+    assert_eq!(
+        world
+            .lock()
+            .await
+            .get_block(operator_target)
+            .expect("read operator-broken block"),
+        Some(air)
+    );
+
+    drop(operator);
+    drop(stranger);
+    drop(owner);
+    shutdown.request();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server shutdown timeout")
+        .expect("server task")
+        .expect("server result");
+    tokio::task::spawn_blocking(move || host.join())
+        .await
+        .expect("Lua host join task")
+        .expect("Lua host thread");
+}
+
+#[tokio::test]
 async fn shipped_inventory_plugins_work_over_wire() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
+    copy_example_plugin("basic-economy", plugins.path());
     copy_example_plugin("currency-catalog", plugins.path());
     copy_example_plugin("online-roster", plugins.path());
     let config_path = plugins.path().join("currency-catalog/config.toml");
@@ -93,7 +612,7 @@ async fn shipped_inventory_plugins_work_over_wire() {
     let product_price = 2;
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
         .expect("start shipped currency catalog");
-    assert_eq!(host.loaded_plugins(), 2);
+    assert_eq!(host.loaded_plugins(), 3);
 
     let world_dir = tempfile::tempdir().expect("disk-backed world tempdir");
     std::fs::create_dir_all(world_dir.path().join("region")).expect("create world region");
@@ -105,6 +624,7 @@ async fn shipped_inventory_plugins_work_over_wire() {
     let currency_id = item_id(&items, currency_resource);
     let product_id = item_id(&items, product_resource);
     let roster_item_id = item_id(&items, "minecraft:paper");
+    let economy_product_id = item_id(&items, "minecraft:bread");
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
@@ -251,6 +771,19 @@ async fn shipped_inventory_plugins_work_over_wire() {
     )
     .await;
     assert_eq!(final_menu.product_count, product_count);
+
+    send_command(&mut client, "economy").await;
+    let economy_menu = wait_for_economy_menu(
+        &mut client,
+        economy_product_id,
+        4,
+        "Balance: 100 Coins",
+        "Bread x4 | 8 Coins",
+    )
+    .await;
+    click_catalog_product(&mut client, &economy_menu, 0).await;
+    let economy_purchase = wait_for_message_and_inventory(&mut client, "Purchased Bread x4.").await;
+    assert_eq!(total_count(&economy_purchase, economy_product_id), 4);
 
     send_command(&mut client, "who").await;
     wait_for_roster_menu(&mut client, roster_item_id, "CatalogPlayer").await;
@@ -619,6 +1152,51 @@ async fn wait_for_roster_menu(client: &mut Client, item_id: u32, username: &str)
     );
 }
 
+async fn wait_for_economy_menu(
+    client: &mut Client,
+    product_id: u32,
+    product_count: i32,
+    title: &str,
+    label: &str,
+) -> CatalogMenu {
+    let open = client
+        .wait_for_frame_id_with_timeout_and_limits(
+            ClientboundOpenScreen::ID,
+            Duration::from_secs(5),
+            FRAME_LIMITS,
+        )
+        .await
+        .expect("economy open frame");
+    let screen = ClientboundOpenScreen::decode(&mut open.frame.body.clone())
+        .expect("decode economy OpenScreen");
+    assert_eq!(screen.menu_type, 0);
+    assert_eq!(literal_text_component_text(&screen.title_nbt), title);
+    let content = loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundContainerSetContent::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+            .expect("economy content frame");
+        let content = ClientboundContainerSetContent::decode(&mut outcome.frame.body.clone())
+            .expect("decode economy content");
+        if content.container_id == screen.container_id {
+            break content;
+        }
+    };
+    assert_eq!(content.items[0].item_id, product_id);
+    assert_eq!(content.items[0].count, product_count);
+    assert_eq!(content.items[0].custom_name.as_deref(), Some(label));
+    CatalogMenu {
+        container_id: content.container_id,
+        state_id: content.state_id,
+        product_id,
+        product_count,
+    }
+}
+
 async fn click_catalog_product(client: &mut Client, menu: &CatalogMenu, button_num: i8) {
     client
         .write_packet(&ServerboundContainerClick {
@@ -683,6 +1261,45 @@ async fn send_command(client: &mut Client, command: &str) {
         })
         .await
         .unwrap_or_else(|error| panic!("send /{command}: {error}"));
+}
+
+async fn claim_current_chunk(client: &mut Client) {
+    send_command(client, "claim create").await;
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                ClientboundSystemChat::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+            .expect("claim command result");
+        let chat = ClientboundSystemChat::decode(&mut outcome.frame.body.clone())
+            .expect("decode claim command result");
+        match literal_text_component_text(&chat.content_nbt).as_str() {
+            "Claims are still loading." => send_command(client, "claim create").await,
+            "Chunk claimed. Breaking and placing are now protected." => return,
+            message => panic!("unexpected claim result: {message}"),
+        }
+    }
+}
+
+async fn wait_for_block_ack(client: &mut Client, sequence: i32) {
+    loop {
+        let outcome = client
+            .wait_for_frame_id_with_timeout_and_limits(
+                BlockChangedAck::ID,
+                Duration::from_secs(5),
+                FRAME_LIMITS,
+            )
+            .await
+            .expect("block acknowledgement");
+        let ack = BlockChangedAck::decode(&mut outcome.frame.body.clone())
+            .expect("decode block acknowledgement");
+        if ack.sequence == sequence {
+            return;
+        }
+    }
 }
 
 async fn wait_for_system_chat(client: &mut Client, expected: &str) {

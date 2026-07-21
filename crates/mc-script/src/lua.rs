@@ -1947,6 +1947,10 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("zone_id", zone_id.as_str())?;
             set_player_context(&table, context)?;
         }
+        ScriptEventKind::ZoneCommandResult { zone_id, accepted } => {
+            table.set("zone_id", zone_id.as_str())?;
+            table.set("accepted", *accepted)?;
+        }
         ScriptEventKind::PlayerTeleportResult {
             request_id,
             player_id,
@@ -2059,6 +2063,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         }
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
         ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
+        ScriptEventKind::ZoneCommandResult { .. } => "on_zone_command_result",
         ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
         ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",

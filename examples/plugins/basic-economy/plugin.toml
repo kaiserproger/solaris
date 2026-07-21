@@ -1,0 +1,7 @@
+id = "basic-economy"
+name = "Basic Economy"
+version = "0.1.0"
+api = "0.6.0"
+events = ["player.left"]
+capabilities = ["storage", "inventory_menus", "inventory_storage_transactions"]
+player_commands = ["economy"]

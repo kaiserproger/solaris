@@ -1,0 +1,26 @@
+# Balance assigned lazily when a player first uses the economy.
+starting_balance = 100
+
+# Text shown next to prices and balances.
+currency_name = "Coins"
+
+# Products sold by the server-owned inventory menu. `resource` is the exact
+# namespaced item id, `count` is granted per click, `price` is deducted from the
+# durable balance in the same transaction, and `label` is shown in the menu.
+[[products]]
+resource = "minecraft:bread"
+count = 4
+price = 8
+label = "Bread x4"
+
+[[products]]
+resource = "minecraft:iron_pickaxe"
+count = 1
+price = 35
+label = "Iron Pickaxe"
+
+[[products]]
+resource = "minecraft:golden_apple"
+count = 1
+price = 80
+label = "Golden Apple"

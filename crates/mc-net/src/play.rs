@@ -11675,7 +11675,7 @@ where
     world_time_ticker.tick().await;
 
     let mut keepalive = KeepAliveTracker::new();
-    let mut script_zone_observer = script_zones.map(|zones| ScriptZoneObserver {
+    let mut script_zone_observer = script_zones.clone().map(|zones| ScriptZoneObserver {
         zones,
         player_id: ScriptPlayerId::new(session_id),
         uuid: player_uuid.clone(),
@@ -11693,6 +11693,7 @@ where
             permissions,
             respawn.dimension_name.to_string(),
         )
+        .with_zones(script_zones.clone())
     });
     if let Some(observer) = script_zone_observer.as_mut() {
         observer.observe(player_pose).await;

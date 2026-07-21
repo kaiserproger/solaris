@@ -8,6 +8,7 @@ use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tracing::warn;
 
 use super::{CommandPermissions, PlayerPose};
+use crate::script::PluginZoneAdapter;
 use crate::server::ScriptEventSink;
 
 #[derive(Clone)]
@@ -18,6 +19,7 @@ pub(super) struct ScriptGameplayEventPublisher {
     username: String,
     permissions: CommandPermissions,
     dimension: String,
+    zones: Option<PluginZoneAdapter>,
 }
 
 impl ScriptGameplayEventPublisher {
@@ -36,7 +38,21 @@ impl ScriptGameplayEventPublisher {
             username: username.into(),
             permissions,
             dimension: dimension.into(),
+            zones: None,
         }
+    }
+
+    pub(super) fn with_zones(mut self, zones: Option<PluginZoneAdapter>) -> Self {
+        self.zones = zones;
+        self
+    }
+
+    pub(super) fn block_mutation_allowed(&self, position: BlockPos) -> bool {
+        self.zones.as_ref().is_none_or(|zones| {
+            zones
+                .block_mutation_allowed(&self.uuid, self.permissions.op, &self.dimension, position)
+                .unwrap_or(false)
+        })
     }
 
     pub(super) async fn publish_block_broken(

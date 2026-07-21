@@ -44,8 +44,10 @@ hardening. An already-open lower-priority diff does not override this order.
    contracts. Skeleton arrows and creeper explosions have real TCP coverage.
    Dry-land random-seed spawn has focused server evidence and an initial
    real-client non-water observation.
-4. Ship the requested basic economy and land-claim plugins on the production
-   Lua API, then document operator TOML options beside their values.
+4. Basic economy and whole-chunk land claims now run on the production Lua API.
+   Close the remaining claim surfaces (containers, fluids, explosions and
+   entity interaction) through a first-class zone protection policy after the
+   ordinary break/place slice is client-verified.
 5. Improve terrain generation toward the concrete Tellus/Tectonic traits that
    can be measured without breaking vanilla world persistence. Then run a
    bounded explosion load benchmark and record the exact envelope.
@@ -56,6 +58,18 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- The shipped `basic-economy` plugin now provides durable virtual balances,
+  operator self-grants, and an inventory shop whose item grant and balance CAS
+  commit atomically. The shipped `land-claims` plugin stores a bounded whole-
+  chunk claim index, waits for a targeted registry result, and rolls back the
+  durable CAS when registration is rejected.
+  Unit coverage proves owner/operator/stranger lookup semantics; real Lua and
+  two-client TCP coverage proves a non-operator cannot break or place in the
+  owner's claim and obtains its test item through the real economy menu. The
+  temporary adapter covers only direct break/place in the configured
+  Overworld range; container, fluid, piston, explosion, fire, and entity
+  interaction protection remain open. No manual-client gate was run.
 
 - Mob death completion no longer scans every server entity every tick. Lethal
   melee, projectile/effect damage, test ingress, and persisted restore enqueue

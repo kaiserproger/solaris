@@ -475,6 +475,18 @@ Other accepted concrete boundaries in this staged migration are:
   entity or registry handles. Accepted mixed transitions publish deterministic
   exits before entries; rejected movement and cleanup cannot publish membership
   events.
+- `script::zone` also owns the temporary shipped land-claim lookup. Only the
+  exact `land-claims` plugin and its documented owner-UUID zone-id convention
+  have protection semantics. `play::block_break` and
+  `play::use_item_on_adapter` call that lookup immediately before authoritative
+  block mutation and resynchronize denied clients; they do not parse plugin
+  ids or claim ownership themselves. The registry lock is held only for the
+  bounded lookup, which is the linearization point for an admitted player
+  mutation; a claim command ordered afterward cannot retroactively cancel that
+  in-flight mutation. Zone commands publish a targeted accepted/rejected result
+  so durable claim storage can roll back an unapplied registry change. This
+  bridge covers direct player break/place only and must be deleted when the
+  script zone DTO gains an explicit protection policy.
 - The `mc-script` Lua loader owns optional per-plugin `config.toml` discovery,
   bounded parsing, recursive type/shape validation, and the immutable startup
   snapshot exposed by `solaris.config()`. Each call materializes a fresh Lua

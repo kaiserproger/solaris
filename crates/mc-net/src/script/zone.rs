@@ -13,6 +13,8 @@ const MAX_ZONES: usize = 4_096;
 const MAX_ZONES_PER_PLUGIN: usize = 256;
 const MAX_TRACKED_PLAYERS: usize = 16_384;
 const MAX_ZONE_MEMBERSHIPS: usize = 262_144;
+const LAND_CLAIMS_PLUGIN_ID: &str = "land-claims";
+const LAND_CLAIM_ZONE_PREFIX: &str = "claim-";
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ZoneLimits {
@@ -103,6 +105,7 @@ impl ZoneRegistry {
         }
     }
 
+    #[cfg(test)]
     fn route_admitted(
         &mut self,
         admitted: AdmittedScriptCommand,
@@ -179,6 +182,30 @@ impl ZoneRegistry {
                 self.membership_count -= 1;
             }
         }
+    }
+
+    fn block_mutation_allowed(
+        &self,
+        actor_uuid: &str,
+        operator: bool,
+        dimension: &str,
+        position: mc_world::BlockPos,
+    ) -> bool {
+        if operator {
+            return true;
+        }
+        let actor_uuid = actor_uuid
+            .bytes()
+            .filter(|byte| *byte != b'-')
+            .map(char::from)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        self.zones
+            .iter()
+            .filter(|(key, _)| key.plugin_id == LAND_CLAIMS_PLUGIN_ID)
+            .filter(|(_, registered)| zone_contains_block(&registered.zone, dimension, position))
+            .filter_map(|(key, _)| claim_owner_uuid(&key.zone_id))
+            .all(|owner| owner == actor_uuid)
     }
 
     fn observe_player(
@@ -331,6 +358,7 @@ impl PluginZoneAdapter {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn route_admitted(
         &self,
         admitted: AdmittedScriptCommand,
@@ -339,6 +367,57 @@ impl PluginZoneAdapter {
             .lock()
             .map_err(|_| ZoneAdapterError::StateUnavailable)?
             .route_admitted(admitted)
+    }
+
+    pub(crate) async fn route_admitted_with_result(
+        &self,
+        admitted: AdmittedScriptCommand,
+    ) -> Result<ZoneCommandOutcome, ZoneAdapterError> {
+        let (target, zone_id, outcome) = match admitted.request() {
+            ScriptCommand::UpsertZone { .. } => {
+                let (target, zone) = admitted
+                    .into_upsert_zone()
+                    .map_err(ZoneAdapterError::InvalidCommand)?;
+                let zone_id = zone.id().to_owned();
+                let outcome = self
+                    .registry
+                    .lock()
+                    .map_err(|_| ZoneAdapterError::StateUnavailable)
+                    .and_then(|mut registry| registry.upsert(target.clone(), zone));
+                (target, zone_id, outcome)
+            }
+            ScriptCommand::RemoveZone { .. } => {
+                let (target, zone_id) = admitted
+                    .into_remove_zone()
+                    .map_err(ZoneAdapterError::InvalidCommand)?;
+                let key = ZoneKey {
+                    plugin_id: target.plugin_id().to_owned(),
+                    zone_id: zone_id.clone(),
+                };
+                let outcome = self
+                    .registry
+                    .lock()
+                    .map_err(|_| ZoneAdapterError::StateUnavailable)
+                    .and_then(|mut registry| {
+                        if registry.closed {
+                            Err(ZoneAdapterError::Closed)
+                        } else {
+                            Ok(registry.remove(&key))
+                        }
+                    });
+                (target, zone_id, outcome)
+            }
+            _ => return Err(ZoneAdapterError::WrongCommand),
+        };
+        let event = target
+            .zone_command_result(&zone_id, outcome.is_ok())
+            .map_err(ZoneAdapterError::InvalidEvent)?;
+        match deliver_required_targeted_event(&self.scripts, event).await {
+            TargetedEventDelivery::Delivered => outcome,
+            TargetedEventDelivery::Closed | TargetedEventDelivery::Shutdown => {
+                Err(ZoneAdapterError::PublicationClosed)
+            }
+        }
     }
 
     pub(crate) async fn observe_player(
@@ -374,6 +453,20 @@ impl PluginZoneAdapter {
             .forget_player(player_id)
     }
 
+    pub(crate) fn block_mutation_allowed(
+        &self,
+        actor_uuid: &str,
+        operator: bool,
+        dimension: &str,
+        position: mc_world::BlockPos,
+    ) -> Result<bool, ZoneAdapterError> {
+        Ok(self
+            .registry
+            .lock()
+            .map_err(|_| ZoneAdapterError::StateUnavailable)?
+            .block_mutation_allowed(actor_uuid, operator, dimension, position))
+    }
+
     pub(crate) fn close(&self) -> Result<(), ZoneAdapterError> {
         self.registry
             .lock()
@@ -381,4 +474,43 @@ impl PluginZoneAdapter {
             .close();
         Ok(())
     }
+}
+
+fn zone_contains_block(
+    zone: &ScriptAxisAlignedZone,
+    dimension: &str,
+    position: mc_world::BlockPos,
+) -> bool {
+    if zone.dimension() != dimension {
+        return false;
+    }
+    let minimum = zone.minimum();
+    let maximum = zone.maximum();
+    f64::from(position.x) >= minimum.x()
+        && f64::from(position.x) <= maximum.x()
+        && f64::from(position.y) >= minimum.y()
+        && f64::from(position.y) <= maximum.y()
+        && f64::from(position.z) >= minimum.z()
+        && f64::from(position.z) <= maximum.z()
+}
+
+fn claim_owner_uuid(zone_id: &str) -> Option<&str> {
+    let mut parts = zone_id.strip_prefix(LAND_CLAIM_ZONE_PREFIX)?.split('-');
+    let owner = parts.next()?;
+    let chunk_x = parts.next()?;
+    let chunk_z = parts.next()?;
+    let valid = parts.next().is_none()
+        && owner.len() == 32
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        && valid_claim_coordinate_id(chunk_x)
+        && valid_claim_coordinate_id(chunk_z);
+    valid.then_some(owner)
+}
+
+fn valid_claim_coordinate_id(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'p' | b'n'))
+        && value.len() > 1
+        && value.as_bytes()[1..].iter().all(u8::is_ascii_digit)
 }

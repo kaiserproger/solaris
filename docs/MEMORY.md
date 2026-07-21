@@ -9,8 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-22.
 - Branch: `dev/M100-client-agent`.
-- Latest recorded checkpoint: mob death deadline indexing
-  (`fix(play): index mob death deadlines`).
+- Latest recorded checkpoint: shipped basic economy and land claims (this
+  checkpoint). The prior mob death deadline checkpoint is
+  `45ff133` (`fix(play): index mob death deadlines`).
   The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
   dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
   water checkpoint is `547525e`.
@@ -50,8 +51,19 @@ and is not startup context.
   tick, keeping mass-death overload bounded. The explicit `-O3` 4,096-cow load
   measured idle p99 11 us, sustained four-kill p99 13,668 us, and bounded
   four-removal p99 24,367 us. Focused death/effect/arrow/restart tests pass;
-  this does not prove real socket throughput or manual combat feel. The next
-  checkpoint is the requested basic economy and land-claim plugins.
+  this does not prove real socket throughput or manual combat feel.
+- `basic-economy` now owns durable virtual wallets and an inventory shop with
+  atomic item/balance commit. `land-claims` owns a bounded durable whole-chunk
+  index, waits for targeted zone-command results, and rolls storage back when
+  a registry change is rejected. The production block-break and placement
+  paths consult the shared zone adapter before mutation. Focused
+  Lua and two-client TCP tests prove default balance, purchase, claim commit,
+  owner/operator bypass, stranger rejection, and unchanged world blocks. The
+  adapter convention is intentionally temporary and protects direct break and
+  placement only; containers, fluids, pistons, explosions, fire, and entity
+  interaction remain open. No manual-client gate has run. Next: return to the
+  owner batch's ordinary-play queue, starting with the remaining dense-world
+  disconnect evidence before terrain expansion.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
   world, so a dense owner-world rerun remains an open playable gate. A short
   real 26.1.2-client run against the current O3 binary passed join, play, block

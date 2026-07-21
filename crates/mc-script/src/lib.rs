@@ -1851,6 +1851,20 @@ impl ScriptEvent {
         })
     }
 
+    fn zone_command_result(
+        target_plugin_id: impl AsRef<str>,
+        zone_id: impl AsRef<str>,
+        accepted: bool,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::ZoneCommandResult {
+                zone_id: validate_script_id(zone_id.as_ref())?.to_owned(),
+                accepted,
+            },
+        })
+    }
+
     /// Build the targeted result of one admitted same-dimension player teleport.
     pub(crate) fn player_teleport_result(
         target_plugin_id: impl AsRef<str>,
@@ -1982,6 +1996,7 @@ impl ScriptEvent {
             }
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
             ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
+            ScriptEventKind::ZoneCommandResult { .. } => "zone.command_result",
             ScriptEventKind::PlayerTeleportResult { .. } => "player.teleport_result",
             ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
@@ -2193,6 +2208,9 @@ impl ScriptEvent {
                 context.validate()?;
                 validate_script_id(zone_id).map(drop)
             }
+            ScriptEventKind::ZoneCommandResult { zone_id, .. } => {
+                validate_script_id(zone_id).map(drop)
+            }
             ScriptEventKind::PlayerInventoryTransactionResult { request_id, .. }
             | ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
                 validate_script_id(request_id).map(drop)
@@ -2378,6 +2396,10 @@ pub enum ScriptEventKind {
         player_id: ScriptPlayerId,
         context: ScriptPlayerContext,
         zone_id: String,
+    },
+    ZoneCommandResult {
+        zone_id: String,
+        accepted: bool,
     },
     PlayerTeleportResult {
         request_id: String,
@@ -2650,6 +2672,20 @@ impl AdmittedScriptCommand {
         ))
     }
 
+    pub fn into_remove_zone(self) -> Result<(ScriptPluginTarget, String), ScriptDtoError> {
+        let ScriptCommand::RemoveZone { zone_id } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "zone removal admission",
+            });
+        };
+        Ok((
+            ScriptPluginTarget {
+                plugin_id: self.plugin_id,
+            },
+            zone_id.clone(),
+        ))
+    }
+
     pub fn plugin_storage_get_result(
         self,
         value: Option<&str>,
@@ -2866,6 +2902,14 @@ impl ScriptPluginTarget {
         zone: &ScriptAxisAlignedZone,
     ) -> Result<ScriptEvent, ScriptDtoError> {
         ScriptEvent::player_zone_exited(&self.plugin_id, player_id, context, zone)
+    }
+
+    pub fn zone_command_result(
+        &self,
+        zone_id: impl AsRef<str>,
+        accepted: bool,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        ScriptEvent::zone_command_result(&self.plugin_id, zone_id, accepted)
     }
 }
 
@@ -4927,6 +4971,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.inventory_transaction_result"
             | "player.zone_entered"
             | "player.zone_exited"
+            | "zone.command_result"
             | "player.teleport_result"
             | "colony.record_result"
             | "colony.villager_binding_result"
@@ -5818,6 +5863,7 @@ mod tests {
             "inventory.storage_transaction.result",
             "player.zone_entered",
             "player.zone_exited",
+            "zone.command_result",
             "player.teleport_result",
             "colony.record_result",
             "colony.villager_binding_result",
