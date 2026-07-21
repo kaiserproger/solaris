@@ -124,6 +124,9 @@ mod movement;
 pub(crate) mod persistence;
 mod plants;
 mod player_damage_adapter;
+mod player_teleport;
+#[cfg(test)]
+mod player_teleport_tests;
 mod random_ticks;
 mod recipes;
 mod scheduled_blocks;
@@ -377,6 +380,7 @@ use player_damage_adapter::{
     PlayerDamageApplication, apply_contact_block_damage, apply_fall_damage, apply_player_damage,
     apply_player_damage_publication, player_melee_knockback,
 };
+use player_teleport::apply_script_player_teleport;
 #[cfg(test)]
 use random_ticks::{LeafDecayDropRolls, next_fire_state, next_leaf_decay_state, random_tick_edit};
 use random_ticks::{
@@ -12071,6 +12075,22 @@ where
                         if let Some(state) = interaction.as_deref_mut() {
                             close_script_menu(state, writer, request).await?;
                         }
+                    }
+                    Some(OutboundCommand::ScriptPlayerTeleport(command)) => {
+                        apply_script_player_teleport(
+                            command,
+                            writer,
+                            compression,
+                            &mut interaction,
+                            &mut chunk_stream,
+                            &simulation,
+                            &mut script_zone_observer,
+                            &sessions,
+                            &mut player_pose,
+                            &mut next_teleport_id,
+                            &mut pending_teleport,
+                        )
+                        .await?;
                     }
                     Some(OutboundCommand::AuthoritativeInventory {
                         inventory,

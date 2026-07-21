@@ -1,8 +1,10 @@
 use super::{
-    JavaLegacyRandom, RegionOwnership, SessionId, SimulationAuthority, SimulationCommand,
-    SimulationHandle, SimulationOutcome, SimulationOwner, SimulationRequestError,
-    command_is_background, command_orders_earlier_herds,
+    JavaLegacyRandom, PlayerPose, RegionOwnership, SessionId, SimulationAuthority,
+    SimulationCommand, SimulationHandle, SimulationOutcome, SimulationOwner,
+    SimulationRequestError, command_is_background, command_orders_earlier_herds,
 };
+use crate::play::session::ScriptPlayerTeleportCompletion;
+use mc_script::ScriptPlayerTeleportFailure;
 use std::collections::{HashMap, VecDeque};
 #[cfg(test)]
 use std::sync::atomic::AtomicBool;
@@ -33,7 +35,8 @@ impl SimulationCommandEnvelope {
         self.response.is_none()
     }
 
-    pub(super) fn respond(self, outcome: SimulationOutcome) {
+    pub(super) fn respond(mut self, outcome: SimulationOutcome) {
+        self.command.complete_script_player_teleport(&outcome);
         if let Some(response) = self.response {
             let _ = response.send(outcome);
         }
@@ -284,6 +287,42 @@ impl SimulationHandle {
         permit.send(SimulationCommandEnvelope {
             sequence,
             command,
+            session_fence: Some(session_id),
+            response: Some(response),
+        });
+        Ok(receiver)
+    }
+
+    pub(super) async fn enqueue_script_player_teleport_wait(
+        &self,
+        pose: PlayerPose,
+        completion: ScriptPlayerTeleportCompletion,
+    ) -> Result<oneshot::Receiver<SimulationOutcome>, SimulationRequestError> {
+        let Some(session_id) = self.session_fence else {
+            completion.complete(Err(ScriptPlayerTeleportFailure::RuntimeUnavailable));
+            return Err(SimulationRequestError::InvalidCommand);
+        };
+        let sequence = self.metrics.next_sequence.fetch_add(1, Ordering::Relaxed);
+        let (response, receiver) = oneshot::channel();
+        let permit = match self.sender.reserve().await {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.metrics.rejected_closed.fetch_add(1, Ordering::Relaxed);
+                completion.complete(Err(ScriptPlayerTeleportFailure::RuntimeUnavailable));
+                return Err(SimulationRequestError::Closed);
+            }
+        };
+        self.metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+        let depth = self.metrics.depth.fetch_add(1, Ordering::Relaxed) + 1;
+        self.metrics.record_depth(depth);
+        permit.send(SimulationCommandEnvelope {
+            sequence,
+            command: SimulationCommand::CommitPlayerPose {
+                actor_session: session_id,
+                pose,
+                exhaustion: 0.0,
+                script_teleport_completion: Some(completion),
+            },
             session_fence: Some(session_id),
             response: Some(response),
         });

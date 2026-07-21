@@ -28,6 +28,8 @@ mod entity_kill_tests;
 mod item_pickup_tests;
 #[cfg(test)]
 mod player_death_tests;
+#[cfg(test)]
+mod player_teleport_tests;
 
 #[cfg(feature = "lua-runtime")]
 pub use lua::{LuaHost, LuaHostConfig, LuaHostError, start_lua_host};
@@ -230,6 +232,59 @@ impl ScriptPosition {
     #[must_use]
     pub fn z(self) -> f64 {
         f64::from_bits(self.z_bits)
+    }
+}
+
+/// Bounded same-dimension player teleport requested by one plugin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptPlayerTeleportRequest {
+    request_id: String,
+    player_id: ScriptPlayerId,
+    position: ScriptPosition,
+}
+
+impl ScriptPlayerTeleportRequest {
+    pub fn try_new(
+        request_id: impl AsRef<str>,
+        player_id: ScriptPlayerId,
+        position: ScriptPosition,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            player_id,
+            position,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn player_id(&self) -> ScriptPlayerId {
+        self.player_id
+    }
+
+    pub const fn position(&self) -> ScriptPosition {
+        self.position
+    }
+}
+
+/// Exact reason why an admitted player teleport did not commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ScriptPlayerTeleportFailure {
+    PlayerUnavailable,
+    TeleportPending,
+    RuntimeUnavailable,
+}
+
+impl ScriptPlayerTeleportFailure {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlayerUnavailable => "player_unavailable",
+            Self::TeleportPending => "teleport_pending",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+        }
     }
 }
 
@@ -1628,6 +1683,23 @@ impl ScriptEvent {
         })
     }
 
+    /// Build the targeted result of one admitted same-dimension player teleport.
+    pub(crate) fn player_teleport_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptPlayerTeleportRequest,
+        failure: Option<ScriptPlayerTeleportFailure>,
+    ) -> Result<Self, ScriptDtoError> {
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::PlayerTeleportResult {
+                request_id: request.request_id().to_owned(),
+                player_id: request.player_id(),
+                position: request.position(),
+                failure,
+            },
+        })
+    }
+
     /// Build a targeted server-owned colony record completion event.
     pub(crate) fn colony_record_result(
         target_plugin_id: impl AsRef<str>,
@@ -1713,6 +1785,7 @@ impl ScriptEvent {
             }
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
             ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
+            ScriptEventKind::PlayerTeleportResult { .. } => "player.teleport_result",
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
             ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
             ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
@@ -1922,6 +1995,9 @@ impl ScriptEvent {
                 context.validate()?;
                 validate_script_id(zone_id).map(drop)
             }
+            ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
+                validate_script_id(request_id).map(drop)
+            }
             ScriptEventKind::ColonyRecordResult {
                 request_id,
                 colony_id,
@@ -2082,6 +2158,12 @@ pub enum ScriptEventKind {
         context: ScriptPlayerContext,
         zone_id: String,
     },
+    PlayerTeleportResult {
+        request_id: String,
+        player_id: ScriptPlayerId,
+        position: ScriptPosition,
+        failure: Option<ScriptPlayerTeleportFailure>,
+    },
     ColonyRecordResult {
         request_id: String,
         colony_id: String,
@@ -2163,6 +2245,9 @@ pub enum ScriptCommand {
     },
     SetVillagerOrder {
         request: ScriptVillagerOrderRequest,
+    },
+    TeleportPlayer {
+        request: ScriptPlayerTeleportRequest,
     },
 }
 
@@ -2470,6 +2555,18 @@ impl AdmittedScriptCommand {
         };
         ScriptEvent::colony_villager_order_result(&self.plugin_id, request, accepted)
     }
+
+    pub fn player_teleport_result(
+        self,
+        failure: Option<ScriptPlayerTeleportFailure>,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::TeleportPlayer { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "player teleport admission",
+            });
+        };
+        ScriptEvent::player_teleport_result(&self.plugin_id, request, failure)
+    }
 }
 
 /// Opaque plugin target retained by a production adapter after accepting an
@@ -2559,6 +2656,7 @@ impl ScriptCommand {
             Self::UpsertColony { .. }
             | Self::RequestVillagerBinding { .. }
             | Self::SetVillagerOrder { .. } => Some(RequiredCommandCapability::Colonies),
+            Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
         }
     }
 
@@ -2655,6 +2753,12 @@ impl ScriptCommand {
                 request.colony_id(),
                 request.binding_token(),
                 request.order(),
+            )
+            .map(drop),
+            Self::TeleportPlayer { request } => ScriptPlayerTeleportRequest::try_new(
+                request.request_id(),
+                request.player_id(),
+                request.position(),
             )
             .map(drop),
         }
@@ -3179,6 +3283,7 @@ pub enum ScriptCommandCapability {
     InventoryStorageTransactions,
     Zones,
     Colonies,
+    PlayerTeleport,
 }
 
 /// Stable non-owning category used in public command-admission errors.
@@ -3192,6 +3297,7 @@ pub enum ScriptCommandCapabilityKind {
     InventoryStorageTransactions,
     Zones,
     Colonies,
+    PlayerTeleport,
 }
 
 impl ScriptCommandCapabilityKind {
@@ -3204,6 +3310,7 @@ impl ScriptCommandCapabilityKind {
             Self::InventoryStorageTransactions => "inventory_storage_transactions",
             Self::Zones => "zones",
             Self::Colonies => "colonies",
+            Self::PlayerTeleport => "player_teleport",
         }
     }
 
@@ -3216,6 +3323,7 @@ impl ScriptCommandCapabilityKind {
             Self::InventoryStorageTransactions => "inventory storage transaction",
             Self::Zones => "zone",
             Self::Colonies => "colony",
+            Self::PlayerTeleport => "player teleport",
         }
     }
 }
@@ -3229,6 +3337,7 @@ enum RequiredCommandCapability<'a> {
     InventoryStorageTransactions,
     Zones,
     Colonies,
+    PlayerTeleport,
 }
 
 impl RequiredCommandCapability<'_> {
@@ -3243,6 +3352,7 @@ impl RequiredCommandCapability<'_> {
             }
             Self::Zones => ScriptCommandCapabilityKind::Zones,
             Self::Colonies => ScriptCommandCapabilityKind::Colonies,
+            Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
         }
     }
 }
@@ -3483,6 +3593,12 @@ impl ScriptPluginManifest {
     /// Declare access to server-owned colony records and villager binding requests.
     pub fn declare_colonies(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::Colonies);
+        self
+    }
+
+    /// Declare access to same-dimension authoritative player teleports.
+    pub fn declare_player_teleport(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::PlayerTeleport);
         self
     }
 
@@ -3808,7 +3924,8 @@ impl ScriptPluginManifest {
                 | ScriptCommandCapability::InventoryMenus
                 | ScriptCommandCapability::InventoryStorageTransactions
                 | ScriptCommandCapability::Zones
-                | ScriptCommandCapability::Colonies => {
+                | ScriptCommandCapability::Colonies
+                | ScriptCommandCapability::PlayerTeleport => {
                     if normalized_capabilities.contains(capability) {
                         return Err(ScriptPluginManifestError::DuplicateCapability {
                             capability: capability.clone(),
@@ -3954,6 +4071,9 @@ impl ValidatedScriptPluginManifest {
                 }
                 ScriptCommandCapability::Colonies => {
                     capabilities = capabilities.allow_colonies();
+                }
+                ScriptCommandCapability::PlayerTeleport => {
+                    capabilities = capabilities.allow_player_teleport();
                 }
             }
         }
@@ -4101,6 +4221,7 @@ pub struct CommandCapabilities {
     inventory_storage_transactions: bool,
     zones: bool,
     colonies: bool,
+    player_teleport: bool,
 }
 
 impl CommandCapabilities {
@@ -4165,6 +4286,12 @@ impl CommandCapabilities {
         self
     }
 
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_player_teleport(mut self) -> Self {
+        self.player_teleport = true;
+        self
+    }
+
     fn allows(&self, capability: RequiredCommandCapability<'_>) -> bool {
         match capability {
             RequiredCommandCapability::RunConsoleCommandRoot { root } => self
@@ -4182,6 +4309,7 @@ impl CommandCapabilities {
             }
             RequiredCommandCapability::Zones => self.zones,
             RequiredCommandCapability::Colonies => self.colonies,
+            RequiredCommandCapability::PlayerTeleport => self.player_teleport,
         }
     }
 }
@@ -4317,6 +4445,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "inventory.storage_transaction.result"
             | "player.zone_entered"
             | "player.zone_exited"
+            | "player.teleport_result"
             | "colony.record_result"
             | "colony.villager_binding_result"
             | "colony.villager_order_result"
@@ -5207,6 +5336,7 @@ mod tests {
             "inventory.storage_transaction.result",
             "player.zone_entered",
             "player.zone_exited",
+            "player.teleport_result",
             "colony.record_result",
             "colony.villager_binding_result",
         ] {

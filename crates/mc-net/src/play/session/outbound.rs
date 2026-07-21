@@ -18,7 +18,9 @@ use crate::play::block_wire::BlockDelta;
 use crate::play::combat::{MeleeKnockback, PlayerDamageRequest};
 use crate::play::inventory::PlayerInventory;
 use crate::play::persistence::XpState;
-use crate::play::session::{ScriptMenuCloseRequest, ScriptMenuOpenRequest};
+use crate::play::session::{
+    ScriptMenuCloseRequest, ScriptMenuOpenRequest, ScriptPlayerTeleportCommand,
+};
 use crate::play::wire_entities::ServerEntityWireMove;
 
 use super::{SessionId, SessionRegistryInner};
@@ -136,6 +138,7 @@ pub(in crate::play) enum OutboundCommand {
     },
     OpenScriptMenu(ScriptMenuOpenRequest),
     CloseScriptMenu(ScriptMenuCloseRequest),
+    ScriptPlayerTeleport(ScriptPlayerTeleportCommand),
     AuthoritativeInventory {
         inventory: Box<PlayerInventory>,
         carried_item: ItemStack,
@@ -218,6 +221,7 @@ impl OutboundCommand {
             | Self::DisconnectPlayer { .. }
             | Self::OpenScriptMenu(_)
             | Self::CloseScriptMenu(_)
+            | Self::ScriptPlayerTeleport(_)
             | Self::AuthoritativeInventory { .. }
             | Self::Explosion(_) => OutboundLane::Reliable,
         }

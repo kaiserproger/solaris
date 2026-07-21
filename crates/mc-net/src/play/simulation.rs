@@ -26,9 +26,9 @@ use super::session::{
     ContainerCommitContext, ContainerStateCommitError, CreditedArrowPickup,
     CreditedExperiencePickup, CreditedItemPickup, ENTITY_DEATH_TICKS, EntityAttackOutcome,
     FurnaceTransaction, FurnaceTransactionRequest, OutboundCommand, PlayerAttackResult,
-    PlayerEntityAttack, PlayerInventoryCommitError, ServerEntityExplosionImpact, SessionId,
-    SessionRegistry, SurvivalBreakTransaction, SurvivalPlacementTransaction, VisibilityDispatch,
-    dispatch_visibility_commands,
+    PlayerEntityAttack, PlayerInventoryCommitError, ScriptPlayerTeleportCompletion,
+    ServerEntityExplosionImpact, SessionId, SessionRegistry, SurvivalBreakTransaction,
+    SurvivalPlacementTransaction, VisibilityDispatch, dispatch_visibility_commands,
 };
 use super::{
     AppliedBlockEdit, ArrowPhysicsFact, BlockDelta, BlockEdit, BlockEditBatchOutcome,
@@ -50,6 +50,7 @@ use mc_entity::{
 };
 use mc_physics::BlockMaterialIds;
 use mc_protocol::packets::play::ItemStack;
+use mc_script::ScriptPlayerTeleportFailure;
 use mc_world::{
     BlockMutationToken, BlockPos, BlockRegistry, BlockStateId, ChestBlockEntity,
     FurnaceBlockEntity, ResidentBlockEdit, ResidentBlockEditBatchResult, ResidentBlockPrecondition,
@@ -67,6 +68,8 @@ use tracing::{trace, warn};
 
 #[cfg(test)]
 mod block_drop_tests;
+#[cfg(test)]
+mod player_teleport_tests;
 mod queue;
 mod regional_mutation;
 
@@ -326,6 +329,7 @@ pub(super) enum SimulationCommand {
         actor_session: SessionId,
         pose: super::PlayerPose,
         exhaustion: f32,
+        script_teleport_completion: Option<ScriptPlayerTeleportCompletion>,
     },
     CommitPlayerStateEvent {
         actor_session: SessionId,
@@ -407,6 +411,28 @@ impl SimulationCommand {
             Self::CommitCampfireUse(_) => "commit_campfire_use",
             Self::CommitTntIgnition { .. } => "commit_tnt_ignition",
         }
+    }
+
+    pub(in crate::play) fn complete_script_player_teleport(&mut self, outcome: &SimulationOutcome) {
+        let Self::CommitPlayerPose {
+            script_teleport_completion,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let Some(completion) = script_teleport_completion.take() else {
+            return;
+        };
+        let result = match outcome {
+            Ok(SimulationResponse::PlayerPose(Ok(_))) => Ok(()),
+            Ok(SimulationResponse::PlayerPose(Err(SimulationRequestError::StaleSession)))
+            | Err(SimulationRequestError::StaleSession) => {
+                Err(ScriptPlayerTeleportFailure::PlayerUnavailable)
+            }
+            _ => Err(ScriptPlayerTeleportFailure::RuntimeUnavailable),
+        };
+        completion.complete(result);
     }
 }
 
@@ -2285,7 +2311,24 @@ impl SimulationHandle {
                 actor_session,
                 pose,
                 exhaustion,
+                script_teleport_completion: None,
             })
+            .await?;
+        match receiver.await {
+            Ok(Ok(SimulationResponse::PlayerPose(result))) => result,
+            Ok(Ok(_)) => Err(SimulationRequestError::ResponseMismatch),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(SimulationRequestError::OwnerStopped),
+        }
+    }
+
+    pub(super) async fn commit_script_player_teleport(
+        &self,
+        pose: super::PlayerPose,
+        completion: ScriptPlayerTeleportCompletion,
+    ) -> Result<CommittedPlayerPose, SimulationRequestError> {
+        let receiver = self
+            .enqueue_script_player_teleport_wait(pose, completion)
             .await?;
         match receiver.await {
             Ok(Ok(SimulationResponse::PlayerPose(result))) => result,
@@ -5290,6 +5333,7 @@ impl SimulationOwner {
                     actor_session,
                     pose,
                     exhaustion,
+                    ..
                 } => {
                     let result = sessions
                         .commit_player_pose(&self.authority, *actor_session, *pose, *exhaustion)

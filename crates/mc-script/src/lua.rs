@@ -21,7 +21,7 @@ use crate::{
     ScriptCommand, ScriptDtoError, ScriptEvent, ScriptEventKind, ScriptHostEndpoint,
     ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
     ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptPlayerId,
-    ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
+    ScriptPlayerTeleportRequest, ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
     ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
     ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
     ScriptVillagerOrderRequest, ValidatedScriptPluginManifest, script_boundary_pair,
@@ -310,6 +310,7 @@ fn declare_disk_capability(
         "inventory_storage_transactions" => Ok(manifest.declare_inventory_storage_transactions()),
         "zones" => Ok(manifest.declare_zones()),
         "colonies" => Ok(manifest.declare_colonies()),
+        "player_teleport" => Ok(manifest.declare_player_teleport()),
         _ => Err(format!("unknown plugin capability {capability:?}")),
     }
 }
@@ -856,6 +857,27 @@ fn install_solaris_api(
                 },
             )
         })?,
+    )?;
+    let teleport_player_invocation = Arc::clone(&invocation);
+    api.set(
+        "teleport_player",
+        lua.create_function(
+            move |_, (request_id, player_id, x, y, z): (LuaString, u64, f64, f64, f64)| {
+                let request_id = bounded_script_id(request_id, "request_id")?;
+                let position = ScriptPosition::try_new(x, y, z)
+                    .ok_or_else(|| lua_input_error("teleport_position", "invalid"))?;
+                let request = ScriptPlayerTeleportRequest::try_new(
+                    request_id,
+                    ScriptPlayerId::new(player_id),
+                    position,
+                )
+                .map_err(dto_error)?;
+                push_command(
+                    &teleport_player_invocation,
+                    ScriptCommand::TeleportPlayer { request },
+                )
+            },
+        )?,
     )?;
     let transaction_invocation = Arc::clone(&invocation);
     api.set(
@@ -1597,6 +1619,20 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("zone_id", zone_id.as_str())?;
             set_player_context(&table, context)?;
         }
+        ScriptEventKind::PlayerTeleportResult {
+            request_id,
+            player_id,
+            position,
+            failure,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("player_id", player_id.value())?;
+            table.set("x", position.x())?;
+            table.set("y", position.y())?;
+            table.set("z", position.z())?;
+            table.set("committed", failure.is_none())?;
+            table.set("failure", failure.map(|failure| failure.as_str()))?;
+        }
         ScriptEventKind::ColonyRecordResult {
             request_id,
             colony_id,
@@ -1675,6 +1711,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         }
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
         ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
+        ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
         ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
         ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",

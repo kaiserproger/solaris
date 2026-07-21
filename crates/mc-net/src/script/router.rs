@@ -4,6 +4,7 @@ use tracing::{debug, warn};
 use super::colony::{ColonyAdapterError, PluginColonyAdapter};
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
 use super::storage::{PluginStorageHandle, storage_failure_event};
+use super::teleport::{PluginTeleportAdapter, TeleportAdapterError};
 use super::zone::PluginZoneAdapter;
 use crate::RuntimeControlHandle;
 use crate::chunk_pipeline::ChunkPipelineResources;
@@ -34,6 +35,7 @@ pub(crate) struct ScriptRouter {
     storage: Option<PluginStorageHandle>,
     zones: PluginZoneAdapter,
     colonies: PluginColonyAdapter,
+    teleports: PluginTeleportAdapter,
 }
 
 impl ScriptRouter {
@@ -49,11 +51,13 @@ impl ScriptRouter {
         zones: PluginZoneAdapter,
     ) -> Self {
         let colonies = PluginColonyAdapter::new(scripts.clone());
+        let teleports = PluginTeleportAdapter::new(scripts.clone());
         Self {
             scripts,
             storage,
             zones,
             colonies,
+            teleports,
         }
     }
 
@@ -123,7 +127,8 @@ impl ScriptRouter {
             | ScriptCommand::RemoveZone { .. }
             | ScriptCommand::UpsertColony { .. }
             | ScriptCommand::RequestVillagerBinding { .. }
-            | ScriptCommand::SetVillagerOrder { .. } => {
+            | ScriptCommand::SetVillagerOrder { .. }
+            | ScriptCommand::TeleportPlayer { .. } => {
                 debug!("unattested privileged script command rejected");
                 ScriptRouterExit::Continue
             }
@@ -224,6 +229,20 @@ impl ScriptRouter {
             | ScriptCommand::RequestVillagerBinding { .. }
             | ScriptCommand::SetVillagerOrder { .. } => {
                 self.route_colony_admitted(admitted, context.sessions).await
+            }
+            ScriptCommand::TeleportPlayer { .. } => {
+                match self
+                    .teleports
+                    .route_admitted(admitted, context.sessions)
+                    .await
+                {
+                    Ok(()) => ScriptRouterExit::Continue,
+                    Err(TeleportAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
+                    Err(error) => {
+                        warn!(?error, "admitted player teleport rejected");
+                        ScriptRouterExit::Continue
+                    }
+                }
             }
             ScriptCommand::HostAttached { .. }
             | ScriptCommand::PluginStorageGet { .. }
