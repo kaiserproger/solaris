@@ -553,11 +553,18 @@ Other accepted concrete boundaries in this staged migration are:
   knockback or death cleanup from the stale health result. The boundary adds
   no lock, raw channel, spawned task, sleep or polling path.
 - `play::session::interaction_geometry` owns pure player/entity distance,
-  AABB, eye/block-center and reach calculations. Entity facts remain in
+  AABB, eye-to-bounds and reach calculations. Block interaction uses the
+  26.1.2 block-interaction attribute plus the packet buffer and a strict
+  boundary. Entity interaction uses its separate attribute and strict packet
+  boundary. Melee uses the authoritative main-hand `AttackRange` component and
+  its inclusive boundary; callers cannot reuse interaction reach for attacks.
+  Player eye height and target bounds follow standing, crouching, and swimming
+  poses. Entity facts remain in
   `mc-data`, physics primitives in `mc-physics`, and decisions remain in their
   existing session children. Consumers use direct sibling imports; the module
   has no registry/world access, lock, async work, packet publication or cached
-  duplicate facts.
+  duplicate facts. `mc-data::item_components` owns parsed and embedded
+  `minecraft:attack_range` facts, including all seven 26.1.2 spear items.
 - `play::session::script_entity_interaction` owns the authoritative snapshot
   used by `player.entity_interacted`: actor mode/liveness, target
   liveness/type, current pose, and canonical reach are checked in one existing

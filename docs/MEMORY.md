@@ -9,9 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest code checkpoint: current `HEAD` (`feat(play): add creeper fuse authority`).
-  The preceding dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is
-  `5b7017a`, and water checkpoint is `547525e`.
+- Latest code checkpoint: current `HEAD` (`fix(play): align reach with 26.1.2`).
+  The preceding creeper checkpoint is `9af1309`, dry-spawn checkpoint is
+  `6b0dcec`, autoscale checkpoint is `5b7017a`, and water checkpoint is `547525e`.
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
@@ -33,6 +33,15 @@ and is not startup context.
   terminal removal, radius-3 explosion, and player damage. Exact 26.1.2
   swell/ignited wire indexes and line-of-sight cancellation are still pending;
   no manual-client gate was run.
+- Block use/break, entity interaction, and default melee now use separate
+  26.1.2 eye-to-AABB verification contracts. Block and entity interactions are
+  strict at their buffered limits; attack is inclusive. Player and
+  server-entity combat both use the authoritative held item's attack range;
+  embedded and sidecar item facts cover the seven 26.1.2 spears. Player pose
+  selects standing, crouching, or swimming eye height and target bounds, and
+  non-finite inputs fail closed. Focused reach, mob damage/death, death timing,
+  and skeleton tests plus the full `mc-net` suite pass. A manual client gate
+  remains open.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
   world, so a dense owner-world rerun remains an open playable gate. A short
   real 26.1.2-client run against the current O3 binary passed join, play, block

@@ -1,4 +1,4 @@
-use super::interaction_geometry::within_entity_reach;
+use super::interaction_geometry::{player_aabb_for_pose, within_entity_attack_reach};
 use super::outbound::{
     OutboundCommand, PlayerCarriedItemDelta, PlayerDamagePublication, PlayerHurtEvent,
     PlayerInventorySlotDelta, PlayerXpDelta, SessionRecipient, VisibilityDispatch,
@@ -12,8 +12,7 @@ use super::sleep::{
 };
 use super::{
     CommittedPlayerAttackCosts, EntityAttackOutcome, PlayerAttackResult, ServerEntityPlayerAttack,
-    SessionEntityGuards, SessionId, SessionRegistry, player_aabb, session_recipients,
-    visible_observers_locked,
+    SessionEntityGuards, SessionId, SessionRegistry, session_recipients, visible_observers_locked,
 };
 use crate::play::combat::{
     ActiveShield, PlayerDamageKind, PlayerDamageRequest, PlayerHurtResolution,
@@ -137,18 +136,20 @@ impl SessionRegistry {
         let combat_resources = inner.player_combat.clone();
         drop(inner);
 
-        let Some(authoritative_mode) = authoritative_attacker_mode(
+        let Some((authoritative_mode, attack_range)) = authoritative_attacker_reach(
             attacker_session,
             &attacker_state,
+            &combat_resources,
             "validate PvP attacker state",
         ) else {
             return PlayerAttackResult::ValidationRejected;
         };
-        if !within_entity_reach(
+        if !within_entity_attack_reach(
             attacker_pose,
             target_position,
-            player_aabb(),
+            player_aabb_for_pose(target_pose),
             authoritative_mode,
+            attack_range,
         ) {
             return PlayerAttackResult::ValidationRejected;
         }
@@ -506,6 +507,41 @@ fn authoritative_attacker_mode(
         state,
     );
     (!state.survival.is_dead() && state.game_mode != GameMode::Spectator).then_some(state.game_mode)
+}
+
+fn authoritative_attacker_reach(
+    attacker_session: SessionId,
+    attacker_state: &std::sync::Mutex<crate::play::persistence::PlayerPersistedState>,
+    resources: &super::PlayerCombatResources,
+    operation: &'static str,
+) -> Option<(GameMode, Option<mc_data::item_components::AttackRangeFacts>)> {
+    let wait_started = Instant::now();
+    let state = attacker_state.lock().unwrap_or_else(|poisoned| {
+        warn!(
+            session_id = attacker_session,
+            "player persistence mutex was poisoned during attacker validation; recovering state"
+        );
+        poisoned.into_inner()
+    });
+    let state = crate::lock_metrics::timed_guard(
+        crate::lock_metrics::LockMetricKind::PlayerPersistence,
+        operation,
+        wait_started,
+        state,
+    );
+    if state.survival.is_dead() || state.game_mode == GameMode::Spectator {
+        return None;
+    }
+    Some((state.game_mode, held_attack_range(resources, &state)))
+}
+
+pub(super) fn held_attack_range(
+    resources: &super::PlayerCombatResources,
+    state: &crate::play::persistence::PlayerPersistedState,
+) -> Option<mc_data::item_components::AttackRangeFacts> {
+    let held = state.inventory.held(state.selected_hotbar_slot)?;
+    let name = resources.items.name_of(held.item_id)?;
+    resources.item_facts.get(name)?.attack_range
 }
 
 fn committed_player_attack_without_damage(target_session: SessionId) -> PlayerAttackResult {

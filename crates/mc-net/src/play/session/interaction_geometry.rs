@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use mc_data::entity_types::{EntityTypeFacts, EntityTypeRegistry};
+use mc_data::item_components::AttackRangeFacts;
 use mc_entity::{AnimalBreedingState, Vec3};
 use mc_physics::Aabb;
 use mc_protocol::packets::play::{GameMode, unpack_block_pos};
@@ -87,12 +88,35 @@ pub(super) fn entity_geometry(
 }
 
 fn player_eye_position(pose: PlayerPose) -> Vec3 {
-    Vec3::new(pose.x, pose.y + 1.62, pose.z)
+    let eye_height = if pose.swimming {
+        0.4
+    } else if pose.shifting {
+        1.27
+    } else {
+        1.62
+    };
+    Vec3::new(pose.x, pose.y + eye_height, pose.z)
 }
 
-fn block_center(position: i64) -> Vec3 {
+pub(super) fn player_aabb_for_pose(pose: PlayerPose) -> Aabb {
+    Aabb {
+        half_width: 0.3,
+        height: if pose.swimming {
+            0.6
+        } else if pose.shifting {
+            1.5
+        } else {
+            1.8
+        },
+    }
+}
+
+fn block_bounds(position: i64) -> (Vec3, Vec3) {
     let (x, y, z) = unpack_block_pos(position);
-    Vec3::new(x as f64 + 0.5, y as f64 + 0.5, z as f64 + 0.5)
+    (
+        Vec3::new(f64::from(x), f64::from(y), f64::from(z)),
+        Vec3::new(f64::from(x) + 1.0, f64::from(y) + 1.0, f64::from(z) + 1.0),
+    )
 }
 
 pub(in crate::play) fn within_block_reach(
@@ -100,12 +124,14 @@ pub(in crate::play) fn within_block_reach(
     position: i64,
     game_mode: GameMode,
 ) -> bool {
+    // Player defaults plus ServerPlayer's packet-verification buffer.
     let max = if game_mode == GameMode::Creative {
         6.0
     } else {
-        5.0
+        5.5
     };
-    distance_sq(player_eye_position(pose), block_center(position)) <= max * max
+    let (min, max_bound) = block_bounds(position);
+    distance_sq_to_box(player_eye_position(pose), min, max_bound) < max * max
 }
 
 pub(in crate::play) fn within_entity_reach(
@@ -114,23 +140,83 @@ pub(in crate::play) fn within_entity_reach(
     aabb: Aabb,
     game_mode: GameMode,
 ) -> bool {
+    // Entity-interaction attribute plus ServerPlayer's verification buffer.
     let max = if game_mode == GameMode::Creative {
-        6.0
+        8.0
     } else {
-        5.0
+        6.0
     };
-    distance_sq_to_entity_box(player_eye_position(pose), position, aabb) <= max * max
+    distance_sq_to_entity_box(player_eye_position(pose), position, aabb) < max * max
+}
+
+pub(in crate::play) fn within_entity_attack_reach(
+    pose: PlayerPose,
+    position: Vec3,
+    aabb: Aabb,
+    game_mode: GameMode,
+    attack_range: Option<AttackRangeFacts>,
+) -> bool {
+    let (min, max, margin) = if let Some(range) = attack_range {
+        let (min, max) = if game_mode == GameMode::Creative {
+            (range.min_creative_reach, range.max_creative_reach)
+        } else {
+            (range.min_reach, range.max_reach)
+        };
+        (
+            f64::from(min),
+            f64::from(max),
+            f64::from(range.hitbox_margin),
+        )
+    } else {
+        let default = if game_mode == GameMode::Creative {
+            5.0
+        } else {
+            3.0
+        };
+        (0.0, default, 0.0)
+    };
+    let buffer = 3.0;
+    let min = (min - margin - buffer).max(0.0);
+    let max = max + margin + buffer;
+    let distance_sq = distance_sq_to_entity_box(player_eye_position(pose), position, aabb);
+    distance_sq >= min * min && distance_sq <= max * max
 }
 
 fn distance_sq_to_entity_box(point: Vec3, position: Vec3, aabb: Aabb) -> f64 {
-    let dx = (point.x - position.x).abs() - aabb.half_width;
-    let dz = (point.z - position.z).abs() - aabb.half_width;
-    let dy = if point.y < position.y {
-        position.y - point.y
-    } else if point.y > position.y + aabb.height {
-        point.y - (position.y + aabb.height)
-    } else {
-        0.0
+    distance_sq_to_box(
+        point,
+        Vec3::new(
+            position.x - aabb.half_width,
+            position.y,
+            position.z - aabb.half_width,
+        ),
+        Vec3::new(
+            position.x + aabb.half_width,
+            position.y + aabb.height,
+            position.z + aabb.half_width,
+        ),
+    )
+}
+
+fn distance_sq_to_box(point: Vec3, min: Vec3, max: Vec3) -> f64 {
+    if !vec3_is_finite(point) || !vec3_is_finite(min) || !vec3_is_finite(max) {
+        return f64::INFINITY;
+    }
+    let axis_distance = |value: f64, min: f64, max: f64| {
+        if value < min {
+            min - value
+        } else if value > max {
+            value - max
+        } else {
+            0.0
+        }
     };
-    dx.max(0.0).powi(2) + dy.powi(2) + dz.max(0.0).powi(2)
+    let dx = axis_distance(point.x, min.x, max.x);
+    let dy = axis_distance(point.y, min.y, max.y);
+    let dz = axis_distance(point.z, min.z, max.z);
+    dx * dx + dy * dy + dz * dz
+}
+
+fn vec3_is_finite(value: Vec3) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
 }

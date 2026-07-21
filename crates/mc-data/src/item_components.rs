@@ -72,7 +72,18 @@ pub struct ItemFacts {
     pub weapon_damage_per_attack: Option<u32>,
     pub attack_damage_modifier: Option<f32>,
     pub attack_speed_modifier: Option<f32>,
+    pub attack_range: Option<AttackRangeFacts>,
     pub armor: Option<ItemArmorFacts>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AttackRangeFacts {
+    pub min_reach: f32,
+    pub max_reach: f32,
+    pub min_creative_reach: f32,
+    pub max_creative_reach: f32,
+    pub hitbox_margin: f32,
+    pub mob_factor: f32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,6 +205,8 @@ struct RawComponents {
     equippable: Option<RawEquippable>,
     #[serde(rename = "minecraft:weapon")]
     weapon: Option<RawWeapon>,
+    #[serde(rename = "minecraft:attack_range")]
+    attack_range: Option<RawAttackRange>,
     #[serde(default, rename = "minecraft:attribute_modifiers")]
     attribute_modifiers: Vec<RawAttributeModifier>,
 }
@@ -208,6 +221,7 @@ impl RawItemComponents {
             tool,
             equippable,
             weapon,
+            attack_range,
             attribute_modifiers,
         } = self.components;
         let attack_damage_modifier =
@@ -253,6 +267,7 @@ impl RawItemComponents {
             weapon_damage_per_attack: weapon.map(|raw| raw.item_damage_per_attack.unwrap_or(1)),
             attack_damage_modifier,
             attack_speed_modifier,
+            attack_range: attack_range.map(RawAttackRange::into_facts),
             armor,
         }
     }
@@ -275,6 +290,7 @@ struct RawEmbeddedItemFacts {
     weapon_damage_per_attack: Option<u32>,
     attack_damage_modifier: Option<f32>,
     attack_speed_modifier: Option<f32>,
+    attack_range: Option<RawAttackRange>,
     tool: Option<RawTool>,
 }
 
@@ -292,6 +308,7 @@ impl RawEmbeddedItemFacts {
             weapon_damage_per_attack: self.weapon_damage_per_attack,
             attack_damage_modifier: self.attack_damage_modifier,
             attack_speed_modifier: self.attack_speed_modifier,
+            attack_range: self.attack_range.map(RawAttackRange::into_facts),
             armor: None,
         }
     }
@@ -378,6 +395,51 @@ struct RawEquippable {
 #[derive(Deserialize)]
 struct RawWeapon {
     item_damage_per_attack: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct RawAttackRange {
+    #[serde(default)]
+    min_reach: f32,
+    #[serde(default = "default_attack_max_reach")]
+    max_reach: f32,
+    #[serde(default)]
+    min_creative_reach: f32,
+    #[serde(default = "default_attack_creative_max_reach")]
+    max_creative_reach: f32,
+    #[serde(default = "default_attack_hitbox_margin")]
+    hitbox_margin: f32,
+    #[serde(default = "default_attack_mob_factor")]
+    mob_factor: f32,
+}
+
+impl RawAttackRange {
+    fn into_facts(self) -> AttackRangeFacts {
+        AttackRangeFacts {
+            min_reach: self.min_reach,
+            max_reach: self.max_reach,
+            min_creative_reach: self.min_creative_reach,
+            max_creative_reach: self.max_creative_reach,
+            hitbox_margin: self.hitbox_margin,
+            mob_factor: self.mob_factor,
+        }
+    }
+}
+
+const fn default_attack_max_reach() -> f32 {
+    3.0
+}
+
+const fn default_attack_creative_max_reach() -> f32 {
+    5.0
+}
+
+const fn default_attack_hitbox_margin() -> f32 {
+    0.3
+}
+
+const fn default_attack_mob_factor() -> f32 {
+    1.0
 }
 
 #[derive(Deserialize)]
@@ -519,6 +581,22 @@ mod tests {
             }"##,
         )
         .unwrap();
+        fs::write(
+            tmp.path().join("wooden_spear.json"),
+            r#"{
+              "components": {
+                "minecraft:attack_range": {
+                  "min_reach": 2.0,
+                  "max_reach": 4.5,
+                  "min_creative_reach": 2.0,
+                  "max_creative_reach": 6.5,
+                  "hitbox_margin": 0.125,
+                  "mob_factor": 0.5
+                }
+              }
+            }"#,
+        )
+        .unwrap();
 
         let facts = load_item_facts(tmp.path()).unwrap();
 
@@ -591,6 +669,22 @@ mod tests {
                 correct_for_drops: Some(true),
             }
         );
+
+        let spear = facts
+            .get(&Identifier::parse("minecraft:wooden_spear").unwrap())
+            .and_then(|facts| facts.attack_range)
+            .expect("wooden spear attack range");
+        assert_eq!(
+            spear,
+            AttackRangeFacts {
+                min_reach: 2.0,
+                max_reach: 4.5,
+                min_creative_reach: 2.0,
+                max_creative_reach: 6.5,
+                hitbox_margin: 0.125,
+                mob_factor: 0.5,
+            }
+        );
     }
 
     #[test]
@@ -646,6 +740,28 @@ mod tests {
             .expect("embedded shears facts");
         assert_eq!(shears.max_damage, Some(238));
         assert_eq!(shears.max_stack_size, Some(1));
+    }
+
+    #[test]
+    fn embedded_required_item_facts_cover_spear_attack_range() {
+        let facts = solaris_required_item_facts();
+        for id in [
+            "minecraft:wooden_spear",
+            "minecraft:stone_spear",
+            "minecraft:copper_spear",
+            "minecraft:iron_spear",
+            "minecraft:golden_spear",
+            "minecraft:diamond_spear",
+            "minecraft:netherite_spear",
+        ] {
+            let range = facts
+                .get(&Identifier::parse(id).unwrap())
+                .and_then(|facts| facts.attack_range)
+                .unwrap_or_else(|| panic!("missing attack range for {id}"));
+            assert_eq!(range.max_reach, 4.5, "{id}");
+            assert_eq!(range.max_creative_reach, 6.5, "{id}");
+            assert_eq!(range.hitbox_margin, 0.125, "{id}");
+        }
     }
 
     #[test]

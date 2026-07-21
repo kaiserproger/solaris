@@ -1,4 +1,5 @@
-use super::interaction_geometry::{entity_geometry, within_entity_reach};
+use super::interaction_geometry::{entity_geometry, within_entity_attack_reach};
+use super::player_combat::held_attack_range;
 use super::player_state::{apply_player_survival_plan_locked, player_attack_cost_plan_matches};
 use super::script_commit_events::push_player_entity_killed_event_locked;
 use super::{
@@ -66,15 +67,6 @@ impl SessionRegistry {
         if target.item_stack.is_some() {
             return PlayerAttackResult::ValidationRejected;
         }
-        if !within_entity_reach(
-            player_pose,
-            target.position,
-            entity_geometry(&target.type_name, target.animal).aabb,
-            game_mode,
-        ) {
-            return PlayerAttackResult::ValidationRejected;
-        }
-
         let rewards = EntityKillRewards {
             items: inner.arrow_kill_rewards.item_entity_type_id.map_or_else(
                 Vec::new,
@@ -132,6 +124,18 @@ impl SessionRegistry {
         } else {
             None
         };
+        let attack_range = attacker_state
+            .as_deref()
+            .and_then(|state| held_attack_range(&inner.player_combat, state));
+        if !within_entity_attack_reach(
+            player_pose,
+            target.position,
+            entity_geometry(&target.type_name, target.animal).aabb,
+            game_mode,
+            attack_range,
+        ) {
+            return PlayerAttackResult::ValidationRejected;
+        }
         let Some(mut outcome) =
             attack_server_entity_locked(&mut inner, entity_id, amount, knockback_origin, &rewards)
         else {

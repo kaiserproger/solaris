@@ -5740,6 +5740,17 @@ fn player_attack_contract_distinguishes_rejection_immunity_and_damage() {
         OutboundCommand::SpawnEntity(entity) => entity.id,
         other => panic!("expected reachable cow spawn, got {other:?}"),
     };
+    let buffered_reachable_id = match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        5,
+        "minecraft:cow".to_owned(),
+        Vec3::new(0.5, 64.0, 6.8),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected buffered-reachable cow spawn, got {other:?}"),
+    };
     registry.spawn_command_entity(
         &SimulationAuthority::for_test(),
         5,
@@ -5787,11 +5798,114 @@ fn player_attack_contract_distinguishes_rejection_immunity_and_damage() {
         registry.player_attack_server_entity(
             &authority,
             ServerEntityPlayerAttack {
+                entity_id: buffered_reachable_id,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: None,
+            },
+        ),
+        PlayerAttackResult::Damaged(outcome)
+            if matches!(*outcome, EntityAttackOutcome::Damaged { .. })
+    ));
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
                 entity_id: far_id,
                 amount: 1.0,
                 game_mode: GameMode::Survival,
                 player_pose: pose,
                 attacker: None,
+            },
+        ),
+        PlayerAttackResult::ValidationRejected
+    ));
+}
+
+#[test]
+fn player_attack_uses_authoritative_held_spear_range() {
+    let spear_name = mc_data::Identifier::parse("minecraft:wooden_spear").unwrap();
+    let items = Arc::new(ItemRegistry::from_report(&[mc_data::items::ItemReport {
+        id: spear_name.clone(),
+        protocol_id: 1,
+    }]));
+    let item_facts = Arc::new(ItemFactsTable::from_entries([(
+        spear_name,
+        mc_data::item_components::ItemFacts {
+            attack_range: Some(mc_data::item_components::AttackRangeFacts {
+                min_reach: 2.0,
+                max_reach: 4.5,
+                min_creative_reach: 2.0,
+                max_creative_reach: 6.5,
+                hitbox_margin: 0.125,
+                mob_factor: 0.5,
+            }),
+            ..mc_data::item_components::ItemFacts::default()
+        },
+    )]));
+    let registry = SessionRegistry::new();
+    registry.configure_player_combat(None, None, items, item_facts);
+    let session_id = register_test_session(&registry, "SpearReachAlice");
+    assert!(registry.mark_loaded(session_id, (0, 0)).is_empty());
+    let pose = PlayerPose::new(0.5, 64.0, 0.5);
+    let mut state = PlayerPersistedState::new_default(pose);
+    state.inventory.slots[PlayerInventory::HOTBAR_BASE] = ItemStack::new(1, 1);
+    let expected_inventory = state.inventory.clone();
+    let expected_survival = state.survival;
+    let expected_xp = state.xp.clone();
+    registry.register_player_persistence(session_id, Arc::new(Mutex::new(state)));
+    let costs = PlayerSurvivalPlan {
+        expected_survival,
+        updated_survival: expected_survival,
+        expected_inventory: expected_inventory.clone(),
+        updated_inventory: expected_inventory,
+        expected_carried_item: ItemStack::EMPTY,
+        expected_xp: expected_xp.clone(),
+        updated_xp: expected_xp,
+        active_shield: None,
+        enchanting_table_input: None,
+        item_entity_type_id: None,
+        xp_orb_entity_type_id: None,
+        position: Vec3::new(pose.x, pose.y, pose.z),
+    };
+    let spawn = |z| match &registry.spawn_command_entity(
+        &SimulationAuthority::for_test(),
+        5,
+        "minecraft:cow".to_owned(),
+        Vec3::new(0.5, 64.0, z),
+    )[0]
+    .command
+    {
+        OutboundCommand::SpawnEntity(entity) => entity.id,
+        other => panic!("expected cow spawn, got {other:?}"),
+    };
+    let spear_only = spawn(7.5);
+    let too_far = spawn(9.0);
+    let authority = SimulationAuthority::for_test();
+
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: spear_only,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
+            },
+        ),
+        PlayerAttackResult::Damaged(_)
+    ));
+    assert!(matches!(
+        registry.player_attack_server_entity(
+            &authority,
+            ServerEntityPlayerAttack {
+                entity_id: too_far,
+                amount: 1.0,
+                game_mode: GameMode::Survival,
+                player_pose: pose,
+                attacker: Some((session_id, &costs)),
             },
         ),
         PlayerAttackResult::ValidationRejected

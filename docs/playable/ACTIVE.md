@@ -37,10 +37,11 @@ hardening. An already-open lower-priority diff does not override this order.
    now has server-owned air/drowning, vanilla swimming metadata, and aquatic
    physics that no longer pushes fish to the surface; owner-client verification
    remains pending.
-3. After the disconnect, close the remaining common-play reports: player water
-   movement, vanilla reach, and lag-free mob damage/death. Skeleton arrows and
-   creeper explosions now have real TCP coverage. Dry-land random-seed spawn
-   has focused server evidence and an initial real-client non-water
+3. After the disconnect, close the remaining common-play reports: owner-client
+   water movement and lag-free mob damage/death. Default block, entity-use and
+   melee reach now follow the 26.1.2 server verification contracts. Skeleton
+   arrows and creeper explosions have real TCP coverage. Dry-land random-seed
+   spawn has focused server evidence and an initial real-client non-water
    observation.
 4. Ship the requested basic economy and land-claim plugins on the production
    Lua API, then document operator TOML options beside their values.
@@ -54,6 +55,18 @@ hardening. An already-open lower-priority diff does not override this order.
    blocks the playable or plugin path.
 
 ## Recent Evidence
+
+- Reach now uses the 26.1.2 server contracts instead of one shared
+  center-distance rule. Block checks measure eye-to-block AABB at 5.5 survival
+  or 6 creative with a strict boundary; entity use measures eye-to-entity AABB
+  at 6 or 8 with a strict boundary; default main-hand melee uses the same 6 or
+  8 packet envelope with the inclusive `AttackRange` boundary. Authoritative
+  held spears use their 4.5/6.5 reach and 0.125 hitbox margin; crouching and
+  swimming use their pose-specific eye height and target box. Non-finite
+  coordinates fail closed. Focused tests cover exact boundaries, the
+  previously rejected 5-to-6-block melee buffer, far rejection, direct mob
+  damage/death, death timing, and skeleton owner requests; the full `mc-net`
+  suite passes. A manual client gate remains pending.
 
 - Creepers no longer enter generic melee authority. A visible survival target
   within three blocks starts one retained 30-tick fuse; leaving seven blocks

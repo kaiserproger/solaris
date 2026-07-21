@@ -92,5 +92,26 @@
   "minecraft:shears": {
     "max_damage": 238,
     "max_stack_size": 1
+  },
+  "minecraft:wooden_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:stone_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:copper_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:iron_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:golden_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:diamond_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
+  },
+  "minecraft:netherite_spear": {
+    "attack_range": { "min_reach": 2.0, "max_reach": 4.5, "min_creative_reach": 2.0, "max_creative_reach": 6.5, "hitbox_margin": 0.125, "mob_factor": 0.5 }
   }
 }
