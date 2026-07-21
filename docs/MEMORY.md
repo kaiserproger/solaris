@@ -9,17 +9,16 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `35792ef` (`feat(plugins): order bound villagers through
-  regional owners`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `6e8b3d2` (`feat(plugins): publish committed block
+  breaks`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `35792ef`. Focused
-  evidence includes `mc-entity` villager binding `10/10`, `mc-script` `79/79`,
-  `mc-net` colony `17/17`, full `mc-net` `1537 passed / 1 ignored`, and the
-  disk-backed command wire gate `13/13`. A `sol high` re-review found no
-  remaining blocker, high, or medium issue. Pre-existing entity-scale and local
-  artifact changes were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `6e8b3d2`. Focused
+  evidence includes `mc-script` `85/85`, full `mc-net` `1540 passed / 1
+  ignored`, the disk-backed command wire gate `14/14`, and `block_edit` `94/94`.
+  A `sol high` re-review found no remaining blocker, high, or medium issue.
+  Pre-existing entity-scale and local artifact changes were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -71,9 +70,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
 - Lua API 0.6 has bounded DTO/files/batches, one-shot host admission, an
   attested `mc-net` router, and durable plugin storage. Production adapters now
   cover menus, inventory/storage transactions, zones, colony records, ephemeral
-  villager binding, and owner-scoped `home`/`hold` orders through journaled
-  regional goals. General villager roles/work orders and durable entity handles
-  remain absent.
+  villager binding, owner-scoped `home`/`hold` orders through journaled regional
+  goals, and required post-commit `player.block_broken` events. The block-break
+  wire gate covers creative and survival commits, both repeated-air paths,
+  abort, and a two-client owner-stale rejection. General villager roles/work
+  orders and durable entity handles remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 
