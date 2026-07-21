@@ -6,7 +6,8 @@ path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
 inventory/storage transaction, player-inventory transaction, player-teleport,
-colony-record, villager-binding, and bounded villager-order adapters. It also
+connected-player query, colony-record, villager-binding, and bounded
+villager-order adapters. It also
 publishes committed player block breaks and owner-targeted zone membership
 transitions.
 
@@ -86,6 +87,7 @@ configuration skips only that plugin before it can claim command roots.
 | `zones` | `upsert_zone`, `remove_zone`, owned zone entry/exit events |
 | `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
 | `player_teleport` | `teleport_player` |
+| `player_queries` | `list_online_players` |
 
 An undeclared privileged call fails synchronously in Lua before it enters the
 bounded command batch. Unknown capabilities reject the plugin during discovery.
@@ -123,15 +125,18 @@ targeted event does not need a broad subscription to reach its owner.
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
 | `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
 | `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
+| `player.online_result` | `on_player_online_result` | `request_id`, `players`, `truncated` |
 | `colony.record_result` | `on_colony_record_result` | `request_id`, `colony_id`, `accepted` |
 | `colony.villager_binding_result` | `on_colony_villager_binding_result` | `request_id`, `colony_id`, `binding_token`, `binding_expires_at_tick` |
 | `colony.villager_order_result` | `on_colony_villager_order_result` | `request_id`, `colony_id`, `order`, `accepted` |
 
-A player snapshot contains only `player_id`, `uuid`, `username`, `operator`,
-`x`, `y`, and `z`, captured by the server at publication. It contains no
-session, peer address, entity reference, or live query handle. An absent storage
-record has `value = nil` and `version = nil`. An unsuccessful villager binding
-has `binding_token = nil` and `binding_expires_at_tick = nil`.
+A gameplay-event player snapshot contains `player_id`, `uuid`, `username`,
+`operator`, `x`, `y`, and `z`, captured by the server at publication. The
+online-query entry described below additionally contains `context_verified` and
+`dimension`. Neither shape contains a session, peer address, entity reference,
+or live query handle. An absent storage record has `value = nil` and `version =
+nil`. An unsuccessful villager binding has `binding_token = nil` and
+`binding_expires_at_tick = nil`.
 
 For block events, the immutable player pose is exposed as `player_x`,
 `player_y`, and `player_z`; `x`, `y`, and `z` remain the integer block
@@ -273,6 +278,20 @@ solaris.disconnect(player_id, reason)
 solaris.run_console(command)
 solaris.spawn_entity(player_id, entity_type, x, y, z)
 ```
+
+Plugins with `player_queries` may request one bounded point-in-time snapshot:
+
+```lua
+solaris.list_online_players("catalog-viewers", 64)
+```
+
+The optional limit defaults to 256 and must be between 1 and 256. The targeted
+`player.online_result` contains a one-based `players` array sorted by
+`player_id`; each entry has `player_id`, `context_verified`, `uuid`, `username`,
+`operator`, `x`, `y`, `z`, and `dimension`. `truncated` is true when more live
+sessions existed than fit the requested limit. Sessions whose outbound owner is
+already closed are excluded. The values are immutable snapshots, not handles;
+plugins must issue another query when they need a newer view.
 
 Storage is scoped by the host-attached plugin identity. Lua does not pass a
 plugin id and cannot forge one:

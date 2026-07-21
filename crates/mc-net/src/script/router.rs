@@ -4,6 +4,7 @@ use tracing::{debug, warn};
 use super::colony::{ColonyAdapterError, PluginColonyAdapter};
 use super::events::{TargetedEventDelivery, deliver_required_targeted_event};
 use super::inventory::{InventoryAdapterError, PluginInventoryAdapter};
+use super::player_query::{PlayerQueryAdapterError, PluginPlayerQueryAdapter};
 use super::storage::{PluginStorageHandle, storage_failure_event};
 use super::teleport::{PluginTeleportAdapter, TeleportAdapterError};
 use super::zone::PluginZoneAdapter;
@@ -38,6 +39,7 @@ pub(crate) struct ScriptRouter {
     zones: PluginZoneAdapter,
     colonies: PluginColonyAdapter,
     teleports: PluginTeleportAdapter,
+    player_queries: PluginPlayerQueryAdapter,
 }
 
 impl ScriptRouter {
@@ -55,6 +57,7 @@ impl ScriptRouter {
         let inventories = PluginInventoryAdapter::new(scripts.clone());
         let colonies = PluginColonyAdapter::new(scripts.clone());
         let teleports = PluginTeleportAdapter::new(scripts.clone());
+        let player_queries = PluginPlayerQueryAdapter::new(scripts.clone());
         Self {
             scripts,
             inventories,
@@ -62,6 +65,7 @@ impl ScriptRouter {
             zones,
             colonies,
             teleports,
+            player_queries,
         }
     }
 
@@ -133,7 +137,8 @@ impl ScriptRouter {
             | ScriptCommand::UpsertColony { .. }
             | ScriptCommand::RequestVillagerBinding { .. }
             | ScriptCommand::SetVillagerOrder { .. }
-            | ScriptCommand::TeleportPlayer { .. } => {
+            | ScriptCommand::TeleportPlayer { .. }
+            | ScriptCommand::ListOnlinePlayers { .. } => {
                 debug!("unattested privileged script command rejected");
                 ScriptRouterExit::Continue
             }
@@ -265,6 +270,20 @@ impl ScriptRouter {
                     Err(TeleportAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
                     Err(error) => {
                         warn!(?error, "admitted player teleport rejected");
+                        ScriptRouterExit::Continue
+                    }
+                }
+            }
+            ScriptCommand::ListOnlinePlayers { .. } => {
+                match self
+                    .player_queries
+                    .route_admitted(admitted, context.sessions)
+                    .await
+                {
+                    Ok(()) => ScriptRouterExit::Continue,
+                    Err(PlayerQueryAdapterError::PublicationClosed) => ScriptRouterExit::Stop,
+                    Err(error) => {
+                        warn!(?error, "admitted player query rejected");
                         ScriptRouterExit::Continue
                     }
                 }

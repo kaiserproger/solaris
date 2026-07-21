@@ -14,18 +14,18 @@ use tracing::{info, warn};
 
 use crate::{
     CommandBatch, CommandBatchError, CommandCapabilities, HostCommandAdmission,
-    MAX_SCRIPT_CHAT_MESSAGE_BYTES, MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
+    MAX_ONLINE_PLAYER_QUERY_LIMIT, MAX_SCRIPT_CHAT_MESSAGE_BYTES, MAX_SCRIPT_CONSOLE_COMMAND_BYTES,
     MAX_SCRIPT_DISCONNECT_REASON_BYTES, PlayerCommandRegistrationError, RuntimeContext,
     RuntimeError, RuntimeResult, ScriptApiVersion, ScriptAxisAlignedZone,
     ScriptBatchSubmissionError, ScriptBoundary, ScriptColonyRecord, ScriptColonyRecordRequest,
     ScriptCommand, ScriptDtoError, ScriptEvent, ScriptEventKind, ScriptHostEndpoint,
     ScriptInventoryMenu, ScriptInventoryMenuItem, ScriptInventoryMenuSlot,
-    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptPlayerId,
-    ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest, ScriptPluginManifest,
-    ScriptPluginStorageCompareAndSwapRequest, ScriptPluginStorageDeleteRequest,
-    ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime, ScriptStorageMutation,
-    ScriptVillagerBindingRequest, ScriptVillagerOrder, ScriptVillagerOrderRequest,
-    ValidatedScriptPluginManifest, script_boundary_pair,
+    ScriptInventoryResourceDelta, ScriptInventoryStorageTransaction, ScriptOnlinePlayersRequest,
+    ScriptPlayerId, ScriptPlayerInventoryTransaction, ScriptPlayerTeleportRequest,
+    ScriptPluginManifest, ScriptPluginStorageCompareAndSwapRequest,
+    ScriptPluginStorageDeleteRequest, ScriptPluginStorageGetRequest, ScriptPosition, ScriptRuntime,
+    ScriptStorageMutation, ScriptVillagerBindingRequest, ScriptVillagerOrder,
+    ScriptVillagerOrderRequest, ValidatedScriptPluginManifest, script_boundary_pair,
 };
 
 const EVENT_QUEUE_CAPACITY: usize = 1_024;
@@ -393,6 +393,7 @@ fn declare_disk_capability(
         "zones" => Ok(manifest.declare_zones()),
         "colonies" => Ok(manifest.declare_colonies()),
         "player_teleport" => Ok(manifest.declare_player_teleport()),
+        "player_queries" => Ok(manifest.declare_player_queries()),
         _ => Err(format!("unknown plugin capability {capability:?}")),
     }
 }
@@ -1113,6 +1114,22 @@ fn install_solaris_api(
                 )
             },
         )?,
+    )?;
+    let list_online_players_invocation = Arc::clone(&invocation);
+    api.set(
+        "list_online_players",
+        lua.create_function(move |_, (request_id, limit): (LuaString, Option<usize>)| {
+            let request_id = bounded_script_id(request_id, "request_id")?;
+            let request = ScriptOnlinePlayersRequest::try_new(
+                request_id,
+                limit.unwrap_or(MAX_ONLINE_PLAYER_QUERY_LIMIT),
+            )
+            .map_err(dto_error)?;
+            push_command(
+                &list_online_players_invocation,
+                ScriptCommand::ListOnlinePlayers { request },
+            )
+        })?,
     )?;
     let transaction_invocation = Arc::clone(&invocation);
     api.set(
@@ -1944,6 +1961,23 @@ fn event_table(lua: &Lua, event: &ScriptEvent) -> mlua::Result<Table> {
             table.set("committed", failure.is_none())?;
             table.set("failure", failure.map(|failure| failure.as_str()))?;
         }
+        ScriptEventKind::OnlinePlayersResult {
+            request_id,
+            players,
+            truncated,
+        } => {
+            table.set("request_id", request_id.as_str())?;
+            table.set("truncated", *truncated)?;
+            let snapshots = lua.create_table_with_capacity(players.len(), 0)?;
+            for (index, player) in players.iter().enumerate() {
+                let snapshot = lua.create_table()?;
+                snapshot.set("player_id", player.player_id().value())?;
+                snapshot.set("dimension", player.dimension())?;
+                set_player_context(&snapshot, player.context())?;
+                snapshots.set(index + 1, snapshot)?;
+            }
+            table.set("players", snapshots)?;
+        }
         ScriptEventKind::ColonyRecordResult {
             request_id,
             colony_id,
@@ -2026,6 +2060,7 @@ fn handler_name(event: &ScriptEvent) -> &'static str {
         ScriptEventKind::PlayerZoneEntered { .. } => "on_player_zone_entered",
         ScriptEventKind::PlayerZoneExited { .. } => "on_player_zone_exited",
         ScriptEventKind::PlayerTeleportResult { .. } => "on_player_teleport_result",
+        ScriptEventKind::OnlinePlayersResult { .. } => "on_player_online_result",
         ScriptEventKind::ColonyRecordResult { .. } => "on_colony_record_result",
         ScriptEventKind::ColonyVillagerBindingResult { .. } => "on_colony_villager_binding_result",
         ScriptEventKind::ColonyVillagerOrderResult { .. } => "on_colony_villager_order_result",
@@ -2120,6 +2155,44 @@ mod tests {
             &[ScriptCommand::SendChatMessage {
                 player_id: ScriptPlayerId::new(7),
                 message: "Welcome Alex".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn lua_online_player_result_exposes_nested_authoritative_snapshots() {
+        let mut runtime = LuaScriptRuntime::from_source(
+            manifest(&[]),
+            r#"
+                function on_player_online_result(event)
+                    local player = event.players[1]
+                    solaris.broadcast(event.request_id .. ":" .. player.username .. ":" .. player.dimension .. ":" .. tostring(event.truncated))
+                end
+            "#,
+            LuaRuntimeLimits::default(),
+        )
+        .unwrap();
+        let request = ScriptOnlinePlayersRequest::try_new("who", 1).unwrap();
+        let player = crate::ScriptOnlinePlayerSnapshot::try_new(
+            ScriptPlayerId::new(7),
+            player_context("Alex"),
+            "minecraft:overworld",
+        )
+        .unwrap();
+        let event = ScriptEvent::online_players_result("test-plugin", &request, vec![player], true)
+            .unwrap();
+        let controls = RuntimeControls::unrestricted();
+
+        let batch = runtime
+            .handle_event(
+                &event,
+                RuntimeContext::new(&controls, NonZeroUsize::new(1).unwrap()),
+            )
+            .unwrap();
+        assert_eq!(
+            batch.commands(),
+            &[ScriptCommand::BroadcastChatMessage {
+                message: "who:Alex:minecraft:overworld:true".to_owned(),
             }]
         );
     }

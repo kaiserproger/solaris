@@ -31,6 +31,8 @@ mod player_death_tests;
 #[cfg(test)]
 mod player_inventory_tests;
 #[cfg(test)]
+mod player_query_tests;
+#[cfg(test)]
 mod player_teleport_tests;
 #[cfg(test)]
 mod tick_delivery_tests;
@@ -61,6 +63,8 @@ pub const MAX_SCRIPT_CONSOLE_COMMAND_BYTES: usize = 256;
 pub const MAX_SCRIPT_COMMAND_BATCH: usize = 32;
 pub const MAX_SCRIPT_EVENT_QUEUE_CAPACITY: usize = 1_024;
 pub const MAX_SCRIPT_COMMAND_QUEUE_CAPACITY: usize = 256;
+/// Maximum connected-player snapshots returned by one plugin query.
+pub const MAX_ONLINE_PLAYER_QUERY_LIMIT: usize = 256;
 pub const MAX_PLUGIN_ID_BYTES: usize = 64;
 pub const MAX_PLUGIN_DISPLAY_NAME_BYTES: usize = 128;
 pub const MAX_PLUGIN_VERSION_BYTES: usize = 64;
@@ -292,6 +296,33 @@ impl ScriptPlayerTeleportFailure {
     }
 }
 
+/// Bounded request for a point-in-time connected-player snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptOnlinePlayersRequest {
+    request_id: String,
+    limit: usize,
+}
+
+impl ScriptOnlinePlayersRequest {
+    pub fn try_new(request_id: impl AsRef<str>, limit: usize) -> Result<Self, ScriptDtoError> {
+        if limit == 0 || limit > MAX_ONLINE_PLAYER_QUERY_LIMIT {
+            return Err(ScriptDtoError::InvalidBounds);
+        }
+        Ok(Self {
+            request_id: validate_script_id(request_id.as_ref())?,
+            limit,
+        })
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
+    }
+
+    pub const fn limit(&self) -> usize {
+        self.limit
+    }
+}
+
 /// Immutable server-authoritative player context attached to gameplay events.
 ///
 /// This is a point-in-time value. It deliberately contains no connection or
@@ -392,6 +423,48 @@ impl ScriptPlayerContext {
         ScriptPosition::try_new(self.x(), self.y(), self.z())
             .ok_or(ScriptDtoError::InvalidBounds)
             .map(drop)
+    }
+}
+
+/// Immutable identity, pose, and dimension for one connected player.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptOnlinePlayerSnapshot {
+    player_id: ScriptPlayerId,
+    context: ScriptPlayerContext,
+    dimension: String,
+}
+
+impl ScriptOnlinePlayerSnapshot {
+    pub fn try_new(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        let dimension = dimension.as_ref();
+        validate_contract_resource_id(dimension)?;
+        Ok(Self {
+            player_id,
+            context,
+            dimension: dimension.to_owned(),
+        })
+    }
+
+    pub const fn player_id(&self) -> ScriptPlayerId {
+        self.player_id
+    }
+
+    pub fn context(&self) -> &ScriptPlayerContext {
+        &self.context
+    }
+
+    pub fn dimension(&self) -> &str {
+        &self.dimension
+    }
+
+    fn validate(&self) -> Result<(), ScriptDtoError> {
+        self.context.validate()?;
+        validate_contract_resource_id(&self.dimension).map(drop)
     }
 }
 
@@ -1795,6 +1868,32 @@ impl ScriptEvent {
         })
     }
 
+    /// Build the targeted result of one admitted connected-player query.
+    pub(crate) fn online_players_result(
+        target_plugin_id: impl AsRef<str>,
+        request: &ScriptOnlinePlayersRequest,
+        players: Vec<ScriptOnlinePlayerSnapshot>,
+        truncated: bool,
+    ) -> Result<Self, ScriptDtoError> {
+        if players.len() > request.limit() {
+            return Err(ScriptDtoError::TooManyEntries {
+                field: "online player snapshots",
+                max: request.limit(),
+            });
+        }
+        for player in &players {
+            player.validate()?;
+        }
+        Ok(Self {
+            target_plugin_id: Some(validate_target_plugin_id(target_plugin_id.as_ref())?),
+            kind: ScriptEventKind::OnlinePlayersResult {
+                request_id: request.request_id().to_owned(),
+                players,
+                truncated,
+            },
+        })
+    }
+
     /// Build a targeted server-owned colony record completion event.
     pub(crate) fn colony_record_result(
         target_plugin_id: impl AsRef<str>,
@@ -1884,6 +1983,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerZoneEntered { .. } => "player.zone_entered",
             ScriptEventKind::PlayerZoneExited { .. } => "player.zone_exited",
             ScriptEventKind::PlayerTeleportResult { .. } => "player.teleport_result",
+            ScriptEventKind::OnlinePlayersResult { .. } => "player.online_result",
             ScriptEventKind::ColonyRecordResult { .. } => "colony.record_result",
             ScriptEventKind::ColonyVillagerBindingResult { .. } => "colony.villager_binding_result",
             ScriptEventKind::ColonyVillagerOrderResult { .. } => "colony.villager_order_result",
@@ -2097,6 +2197,23 @@ impl ScriptEvent {
             | ScriptEventKind::PlayerTeleportResult { request_id, .. } => {
                 validate_script_id(request_id).map(drop)
             }
+            ScriptEventKind::OnlinePlayersResult {
+                request_id,
+                players,
+                ..
+            } => {
+                validate_script_id(request_id)?;
+                if players.len() > MAX_ONLINE_PLAYER_QUERY_LIMIT {
+                    return Err(ScriptDtoError::TooManyEntries {
+                        field: "online player snapshots",
+                        max: MAX_ONLINE_PLAYER_QUERY_LIMIT,
+                    });
+                }
+                for player in players {
+                    player.validate()?;
+                }
+                Ok(())
+            }
             ScriptEventKind::ColonyRecordResult {
                 request_id,
                 colony_id,
@@ -2268,6 +2385,11 @@ pub enum ScriptEventKind {
         position: ScriptPosition,
         failure: Option<ScriptPlayerTeleportFailure>,
     },
+    OnlinePlayersResult {
+        request_id: String,
+        players: Vec<ScriptOnlinePlayerSnapshot>,
+        truncated: bool,
+    },
     ColonyRecordResult {
         request_id: String,
         colony_id: String,
@@ -2355,6 +2477,9 @@ pub enum ScriptCommand {
     },
     TeleportPlayer {
         request: ScriptPlayerTeleportRequest,
+    },
+    ListOnlinePlayers {
+        request: ScriptOnlinePlayersRequest,
     },
 }
 
@@ -2687,6 +2812,19 @@ impl AdmittedScriptCommand {
         };
         ScriptEvent::player_teleport_result(&self.plugin_id, request, failure)
     }
+
+    pub fn online_players_result(
+        self,
+        players: Vec<ScriptOnlinePlayerSnapshot>,
+        truncated: bool,
+    ) -> Result<ScriptEvent, ScriptDtoError> {
+        let ScriptCommand::ListOnlinePlayers { request } = self.request.as_ref() else {
+            return Err(ScriptDtoError::InconsistentResult {
+                field: "online players admission",
+            });
+        };
+        ScriptEvent::online_players_result(&self.plugin_id, request, players, truncated)
+    }
 }
 
 /// Opaque plugin target retained by a production adapter after accepting an
@@ -2780,6 +2918,7 @@ impl ScriptCommand {
             | Self::RequestVillagerBinding { .. }
             | Self::SetVillagerOrder { .. } => Some(RequiredCommandCapability::Colonies),
             Self::TeleportPlayer { .. } => Some(RequiredCommandCapability::PlayerTeleport),
+            Self::ListOnlinePlayers { .. } => Some(RequiredCommandCapability::PlayerQueries),
         }
     }
 
@@ -2892,6 +3031,9 @@ impl ScriptCommand {
                 request.position(),
             )
             .map(drop),
+            Self::ListOnlinePlayers { request } => {
+                ScriptOnlinePlayersRequest::try_new(request.request_id(), request.limit()).map(drop)
+            }
         }
     }
 }
@@ -3576,6 +3718,7 @@ pub enum ScriptCommandCapability {
     Zones,
     Colonies,
     PlayerTeleport,
+    PlayerQueries,
 }
 
 /// Stable non-owning category used in public command-admission errors.
@@ -3591,6 +3734,7 @@ pub enum ScriptCommandCapabilityKind {
     Zones,
     Colonies,
     PlayerTeleport,
+    PlayerQueries,
 }
 
 impl ScriptCommandCapabilityKind {
@@ -3605,6 +3749,7 @@ impl ScriptCommandCapabilityKind {
             Self::Zones => "zones",
             Self::Colonies => "colonies",
             Self::PlayerTeleport => "player_teleport",
+            Self::PlayerQueries => "player_queries",
         }
     }
 
@@ -3619,6 +3764,7 @@ impl ScriptCommandCapabilityKind {
             Self::Zones => "zone",
             Self::Colonies => "colony",
             Self::PlayerTeleport => "player teleport",
+            Self::PlayerQueries => "player query",
         }
     }
 }
@@ -3634,6 +3780,7 @@ enum RequiredCommandCapability<'a> {
     Zones,
     Colonies,
     PlayerTeleport,
+    PlayerQueries,
 }
 
 impl RequiredCommandCapability<'_> {
@@ -3650,6 +3797,7 @@ impl RequiredCommandCapability<'_> {
             Self::Zones => ScriptCommandCapabilityKind::Zones,
             Self::Colonies => ScriptCommandCapabilityKind::Colonies,
             Self::PlayerTeleport => ScriptCommandCapabilityKind::PlayerTeleport,
+            Self::PlayerQueries => ScriptCommandCapabilityKind::PlayerQueries,
         }
     }
 }
@@ -3902,6 +4050,12 @@ impl ScriptPluginManifest {
     /// Declare access to same-dimension authoritative player teleports.
     pub fn declare_player_teleport(mut self) -> Self {
         self.push_capability(ScriptCommandCapability::PlayerTeleport);
+        self
+    }
+
+    /// Declare access to bounded connected-player snapshots.
+    pub fn declare_player_queries(mut self) -> Self {
+        self.push_capability(ScriptCommandCapability::PlayerQueries);
         self
     }
 
@@ -4229,7 +4383,8 @@ impl ScriptPluginManifest {
                 | ScriptCommandCapability::PlayerInventory
                 | ScriptCommandCapability::Zones
                 | ScriptCommandCapability::Colonies
-                | ScriptCommandCapability::PlayerTeleport => {
+                | ScriptCommandCapability::PlayerTeleport
+                | ScriptCommandCapability::PlayerQueries => {
                     if normalized_capabilities.contains(capability) {
                         return Err(ScriptPluginManifestError::DuplicateCapability {
                             capability: capability.clone(),
@@ -4382,6 +4537,9 @@ impl ValidatedScriptPluginManifest {
                 ScriptCommandCapability::PlayerTeleport => {
                     capabilities = capabilities.allow_player_teleport();
                 }
+                ScriptCommandCapability::PlayerQueries => {
+                    capabilities = capabilities.allow_player_queries();
+                }
             }
         }
         capabilities
@@ -4530,6 +4688,7 @@ pub struct CommandCapabilities {
     zones: bool,
     colonies: bool,
     player_teleport: bool,
+    player_queries: bool,
 }
 
 impl CommandCapabilities {
@@ -4606,6 +4765,12 @@ impl CommandCapabilities {
         self
     }
 
+    #[cfg(any(test, feature = "lua-runtime"))]
+    pub(crate) fn allow_player_queries(mut self) -> Self {
+        self.player_queries = true;
+        self
+    }
+
     fn allows(&self, capability: RequiredCommandCapability<'_>) -> bool {
         match capability {
             RequiredCommandCapability::RunConsoleCommandRoot { root } => self
@@ -4625,6 +4790,7 @@ impl CommandCapabilities {
             RequiredCommandCapability::Zones => self.zones,
             RequiredCommandCapability::Colonies => self.colonies,
             RequiredCommandCapability::PlayerTeleport => self.player_teleport,
+            RequiredCommandCapability::PlayerQueries => self.player_queries,
         }
     }
 }

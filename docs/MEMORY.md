@@ -201,7 +201,11 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   production wire gate for durable recruit, `home`, later accepted `hold`, and
   removed-villager recovery. It retains the active binding token in Lua memory,
   retries one rejected cached token through a fresh binding, and reports an
-  applied order only after the targeted owner result. Plugin readiness and the
+  applied order only after the targeted owner result. The Lua API also has a
+  capability-gated `list_online_players` query. It returns a
+  targeted, sorted, bounded point-in-time identity/pose/dimension snapshot and
+  marks truncation; closed session owners are excluded and no live handles are
+  exposed. Plugin readiness and the
   combat-cooldown fixture are push-fenced by exact Lua messages and simulation
   ticks; timeouts only fail. General villager roles/work orders and durable
   entity handles remain absent.
