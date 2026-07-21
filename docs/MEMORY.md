@@ -9,11 +9,23 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `c82c344` (`feat(plugins): add authoritative player
-  teleports`).
+- Latest checkpoint: `9aee245` (`feat(plugins): add atomic player inventory
+  transactions`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- `9aee245` adds capability-gated Lua transactions over a connected player's
+  main inventory and hotbar. The session endpoint plans every resource delta
+  before replacing canonical persistence state and publishing one authoritative
+  inventory snapshot. Unknown items, insufficient input, full inventory,
+  absent/stale sessions, disconnect races, and worldless runtimes return exact
+  targeted failures without partial mutation. The real TCP/Lua gate proves
+  grant, exchange, failed overdraw, failed unknown-resource exchange, later
+  clearing of the unchanged inventory, targeted isolation, and the worldless
+  rejection. Full workspace tests, strict workspace Clippy, fmt, code-health
+  `0 fail / KEEP`, and diff-check pass. A `sol high` re-review found no remaining
+  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run for
+  this plugin-only slice.
 - `c82c344` adds capability-gated same-dimension Lua player teleports through
   the exact reliable session and authoritative simulation owner. Success
   survives cancellation after commit; missing/stale players, pending teleport

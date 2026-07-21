@@ -5,9 +5,10 @@ other version is rejected. There is no legacy manifest or Lua API compatibility
 path.
 
 `mc-net` provides the `0.6.0` plugin-storage, zone, inventory-menu,
-inventory/storage transaction, player-teleport, colony-record,
-villager-binding, and bounded villager-order adapters. It also publishes
-committed player block breaks and owner-targeted zone membership transitions.
+inventory/storage transaction, player-inventory transaction, player-teleport,
+colony-record, villager-binding, and bounded villager-order adapters. It also
+publishes committed player block breaks and owner-targeted zone membership
+transitions.
 
 ## Package And Manifest
 
@@ -57,6 +58,7 @@ capabilities, 64 permissions, and 128 player or operator command roots.
 | `storage` | `storage_get`, `storage_cas`, `storage_delete` |
 | `inventory_menus` | `open_inventory_menu`, `close_inventory_menu` |
 | `inventory_storage_transactions` | `inventory_storage_transaction` |
+| `player_inventory` | `inventory_transaction` |
 | `zones` | `upsert_zone`, `remove_zone`, owned zone entry/exit events |
 | `colonies` | `upsert_colony`, `bind_nearest_villager`, `set_villager_order` |
 | `player_teleport` | `teleport_player` |
@@ -92,6 +94,7 @@ targeted event does not need a broad subscription to reach its owner.
 | `plugin.storage.delete_result` | `on_plugin_storage_delete_result` | `request_id`, `key`, `deleted`, `version`, `failure` |
 | `inventory.menu.clicked` | `on_inventory_menu_clicked` | player snapshot, `menu_id`, `slot`, `click` |
 | `inventory.storage_transaction.result` | `on_inventory_storage_transaction_result` | `request_id`, `committed` |
+| `player.inventory_transaction_result` | `on_player_inventory_transaction_result` | `request_id`, `player_id`, `committed`, `failure` |
 | `player.zone_entered` | `on_player_zone_entered` | player snapshot, `zone_id` |
 | `player.zone_exited` | `on_player_zone_exited` | player snapshot, `zone_id` |
 | `player.teleport_result` | `on_player_teleport_result` | `request_id`, `player_id`, `x`, `y`, `z`, `committed`, `failure` |
@@ -319,6 +322,34 @@ still contains the old inventory. The actor fail-stops on that uncertainty and
 does not publish a guessed result. This is a documented crash-atomicity gap, not
 a runtime atomicity claim; closing it requires a player-inventory recovery intent
 in the durable transaction record.
+
+The separate player-inventory API performs one atomic main-inventory and
+hotbar mutation without touching plugin storage:
+
+```lua
+solaris.inventory_transaction(player_id, request_id, {
+    { resource = "minecraft:emerald", delta = -2 },
+    { resource = "minecraft:apple", delta = 4 },
+})
+```
+
+The delta list must contain 1 to 16 unique resources. A positive delta grants
+the item and a negative delta removes it; zero and magnitudes above 64 are
+rejected at the Lua boundary. Only slots 9 through 44 participate. The session
+owner resolves and plans every delta against one canonical player-state
+snapshot before replacing the inventory, so unknown resources, insufficient
+input, and a full output inventory cannot leave a partial mutation. A successful
+commit publishes one authoritative inventory snapshot on the player's ordered
+session lane.
+
+`player.inventory_transaction_result` is targeted to the issuing plugin and
+must be correlated by `request_id`. Success sets `committed = true` and
+`failure = nil`. Rejections use `player_unavailable`, `runtime_unavailable`,
+`unknown_resource`, `insufficient_resource`, or `inventory_full`. The exact
+session-lifetime gate orders commit against disconnect. A server without a
+world runtime returns `runtime_unavailable` before entering the session commit.
+This API is independent of durable plugin storage; it does not claim a joint
+crash transaction with plugin records.
 
 Zones are axis-aligned definitions, scoped by the host-attached plugin id:
 

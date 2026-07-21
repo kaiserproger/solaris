@@ -513,6 +513,16 @@ Other accepted concrete boundaries in this staged migration are:
   adds no task, polling loop, operator setting, or hot tick work. Plugin WAL and
   vanilla playerdata crash recovery remain separate and must not be described
   as crash-atomic.
+- `script::inventory` owns admitted player-inventory routing and targeted result
+  publication. `play::script_inventory_transaction` provides the shared pure
+  resource planner, while `play::session::script_player_inventory_endpoint`
+  resolves the exact connected session, orders the request against disconnect
+  with the existing script-transaction lifetime gate, holds the canonical
+  player-persistence lock for plan and replacement, and publishes one reliable
+  authoritative inventory snapshot. The adapter rejects a worldless runtime
+  before session commit. Failed planning and stale lifetime paths publish an
+  exact targeted failure and make no partial mutation. This path adds no task,
+  polling loop, sleep, storage dependency, or new lock class.
 - `play::player_damage_adapter` owns fall/contact/general player damage
   orchestration, publication projection, melee-knockback conversion and its
   concrete request/result DTOs. Damage and shield rules remain in `combat`;

@@ -45,6 +45,18 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `9aee245` adds production Lua player-inventory transactions for
+  atomic grants and exchanges over the connected player's main inventory and
+  hotbar. Planning precedes canonical state replacement, so unknown resources,
+  insufficient input, full output, stale/disconnected sessions, and worldless
+  runtimes do not partially mutate inventory. Results are correlated and
+  targeted to the issuing plugin. The real TCP/Lua gate proves grant, exchange,
+  two rejected mixed transactions, unchanged state after each rejection,
+  targeted non-leak, and a worldless `runtime_unavailable` rejection without an
+  inventory packet. Full workspace tests, strict workspace Clippy, fmt,
+  code-health `0 fail / KEEP`, and diff-check pass. A `sol high` re-review found
+  no remaining blocker/high/medium issue. No manual-client or vanilla-oracle
+  gate was run for this plugin-only slice.
 - Checkpoint `c82c344` adds production Lua same-dimension player teleports
   through the exact reliable session and authoritative simulation owner. The
   result distinguishes unavailable/stale players, an outstanding vanilla
