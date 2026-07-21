@@ -71,7 +71,8 @@ use mc_protocol::packets::play::{
 };
 use mc_protocol::packets::{CustomPayload, Packet};
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptItemPickupSource, ScriptPlayerContext, ScriptPlayerId,
+    ScriptCraftingSource, ScriptEvent, ScriptInteractionHand, ScriptItemPickupSource,
+    ScriptPlayerContext, ScriptPlayerId,
 };
 #[cfg(test)]
 use mc_world::FurnaceSlot;
@@ -5923,12 +5924,52 @@ where
 async fn handle_interact<W>(
     state: &mut InteractionState,
     writer: &mut W,
+    script_events: Option<&ScriptGameplayEventPublisher>,
     packet: ServerboundInteract,
 ) -> Result<(), ConnectionError>
 where
     W: AsyncWriteExt + Unpin,
 {
     state.pending_break = None;
+    let accepted = if packet.location.x.is_finite()
+        && packet.location.y.is_finite()
+        && packet.location.z.is_finite()
+    {
+        state
+            .sessions
+            .accept_script_entity_interaction(state.session_id, EntityId(packet.entity_id))
+    } else {
+        None
+    };
+
+    handle_vanilla_interact(state, writer, packet).await?;
+    if let (Some(accepted), Some(script_events)) = (accepted, script_events) {
+        let hand = match packet.hand {
+            InteractionHand::MainHand => ScriptInteractionHand::MainHand,
+            InteractionHand::OffHand => ScriptInteractionHand::OffHand,
+        };
+        let _ = script_events
+            .publish_entity_interacted(
+                accepted.entity_id,
+                &accepted.entity_type,
+                hand,
+                packet.using_secondary_action,
+                accepted.player_pose,
+                accepted.game_mode,
+            )
+            .await;
+    }
+    Ok(())
+}
+
+async fn handle_vanilla_interact<W>(
+    state: &mut InteractionState,
+    writer: &mut W,
+    packet: ServerboundInteract,
+) -> Result<(), ConnectionError>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let held_slot = hand_inventory_slot(state, packet.hand);
     let expected_held = state.inventory.slots[held_slot].clone();
     let held_is_shears = state
@@ -12447,7 +12488,8 @@ where
                     let mut body = frame.body;
                     let interact = ServerboundInteract::decode(&mut body)?;
                     if let Some(state) = interaction.as_deref_mut() {
-                        handle_interact(state, writer, interact).await?;
+                        handle_interact(state, writer, script_gameplay_events.as_ref(), interact)
+                            .await?;
                     } else {
                         debug!(
                             entity_id = interact.entity_id,

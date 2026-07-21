@@ -21,6 +21,8 @@ use tokio::sync::{Mutex, mpsc};
 mod lua;
 
 #[cfg(test)]
+mod entity_interaction_tests;
+#[cfg(test)]
 mod entity_kill_tests;
 #[cfg(test)]
 mod item_pickup_tests;
@@ -1121,6 +1123,23 @@ impl ScriptEntityKillSource {
     }
 }
 
+/// Closed hand snapshot exposed by player entity-interaction events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum ScriptInteractionHand {
+    MainHand,
+    OffHand,
+}
+
+impl ScriptInteractionHand {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MainHand => "main_hand",
+            Self::OffHand => "off_hand",
+        }
+    }
+}
+
 /// Closed game-mode snapshot exposed by gameplay events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -1371,6 +1390,34 @@ impl ScriptEvent {
                 entity_id,
                 entity_type: validate_contract_resource_id(entity_type.as_ref())?,
                 source,
+                game_mode,
+            },
+        })
+    }
+
+    /// Build a broadcast event after an authoritative entity interaction is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_player_entity_interacted_with_context(
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: impl AsRef<str>,
+        entity_id: ScriptEntityId,
+        entity_type: impl AsRef<str>,
+        hand: ScriptInteractionHand,
+        secondary_action: bool,
+        game_mode: ScriptGameMode,
+    ) -> Result<Self, ScriptDtoError> {
+        context.validate()?;
+        Ok(Self {
+            target_plugin_id: None,
+            kind: ScriptEventKind::PlayerEntityInteracted {
+                player_id,
+                context,
+                dimension: validate_contract_resource_id(dimension.as_ref())?,
+                entity_id,
+                entity_type: validate_contract_resource_id(entity_type.as_ref())?,
+                hand,
+                secondary_action,
                 game_mode,
             },
         })
@@ -1636,6 +1683,7 @@ impl ScriptEvent {
             ScriptEventKind::PlayerItemCrafted { .. } => "player.item_crafted",
             ScriptEventKind::PlayerItemPickedUp { .. } => "player.item_picked_up",
             ScriptEventKind::PlayerEntityKilled { .. } => "player.entity_killed",
+            ScriptEventKind::PlayerEntityInteracted { .. } => "player.entity_interacted",
             ScriptEventKind::PlayerDied { .. } => "player.died",
             ScriptEventKind::PlayerCommand { .. } => "player.command",
             ScriptEventKind::ServerTick { .. } => "server.tick",
@@ -1733,6 +1781,12 @@ impl ScriptEvent {
                 Ok(())
             }
             ScriptEventKind::PlayerEntityKilled {
+                context,
+                dimension,
+                entity_type,
+                ..
+            }
+            | ScriptEventKind::PlayerEntityInteracted {
                 context,
                 dimension,
                 entity_type,
@@ -1937,6 +1991,16 @@ pub enum ScriptEventKind {
         entity_id: ScriptEntityId,
         entity_type: String,
         source: ScriptEntityKillSource,
+        game_mode: ScriptGameMode,
+    },
+    PlayerEntityInteracted {
+        player_id: ScriptPlayerId,
+        context: ScriptPlayerContext,
+        dimension: String,
+        entity_id: ScriptEntityId,
+        entity_type: String,
+        hand: ScriptInteractionHand,
+        secondary_action: bool,
         game_mode: ScriptGameMode,
     },
     PlayerDied {
@@ -4208,6 +4272,7 @@ fn is_supported_event_name(event_name: &str) -> bool {
             | "player.item_crafted"
             | "player.item_picked_up"
             | "player.entity_killed"
+            | "player.entity_interacted"
             | "player.died"
             | "server.tick"
             | "plugin.storage.get_result"

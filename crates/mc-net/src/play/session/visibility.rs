@@ -276,10 +276,12 @@ pub(super) fn session_snapshot(id: SessionId, session: &PlaySession) -> PlayerEn
 }
 
 pub(in crate::play) fn server_entity_snapshot_from(entity: EntitySnapshot) -> ServerEntitySnapshot {
-    let has_living_health = super::interaction_geometry::canonical_entity_facts(&entity.type_name)
-        .is_some_and(|facts| facts.category.is_living())
-        // ArmorStand extends LivingEntity but is registered in the MISC mob category.
-        || entity.type_name == "minecraft:armor_stand";
+    let has_living_health = mc_data::entity_types::entity_type_contract_26_1_2_by_name(
+        &entity.type_name,
+    )
+    .is_some_and(|contract| {
+        contract.behavior.archetype == mc_data::entity_types::EntityArchetype::Living
+    });
     ServerEntitySnapshot {
         id: entity.id,
         uuid: entity.uuid,

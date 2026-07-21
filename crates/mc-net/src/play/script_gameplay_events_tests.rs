@@ -1,10 +1,11 @@
 use std::num::NonZeroUsize;
 
 use mc_data::items::{ItemRegistry, ItemReport};
+use mc_entity::EntityId;
 use mc_protocol::packets::play::GameMode;
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptEventKind, ScriptItemPickupSource, ScriptPlayerId,
-    script_boundary_pair,
+    ScriptCraftingSource, ScriptEvent, ScriptEventKind, ScriptInteractionHand,
+    ScriptItemPickupSource, ScriptPlayerId, script_boundary_pair,
 };
 use mc_world::{BlockPos, BlockRegistry};
 
@@ -426,4 +427,62 @@ async fn invalid_or_spectator_pickup_publishes_nothing_before_fifo_fence() {
         endpoint.recv_event().await.unwrap().kind(),
         ScriptEventKind::ServerTick { tick: 78 }
     ));
+}
+
+#[tokio::test]
+async fn accepted_entity_interaction_publishes_exact_required_snapshot() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, mut endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary));
+
+    assert!(
+        publisher
+            .publish_entity_interacted(
+                EntityId(77),
+                "minecraft:villager",
+                ScriptInteractionHand::OffHand,
+                true,
+                PlayerPose::new(1.5, 64.0, -2.5),
+                GameMode::Adventure,
+            )
+            .await
+    );
+    assert!(matches!(
+        endpoint.recv_event().await.unwrap().kind(),
+        ScriptEventKind::PlayerEntityInteracted {
+            player_id,
+            context,
+            dimension,
+            entity_id,
+            entity_type,
+            hand: ScriptInteractionHand::OffHand,
+            secondary_action: true,
+            game_mode: mc_script::ScriptGameMode::Adventure,
+        } if *player_id == ScriptPlayerId::new(9)
+            && (context.x(), context.y(), context.z()) == (1.5, 64.0, -2.5)
+            && dimension == "minecraft:overworld"
+            && entity_id.value() == 77
+            && entity_type == "minecraft:villager"
+    ));
+}
+
+#[tokio::test]
+async fn closed_script_queue_rejects_entity_interaction_event_without_error() {
+    let one = NonZeroUsize::new(1).unwrap();
+    let (boundary, _endpoint) = script_boundary_pair(one, one);
+    let publisher = publisher(ScriptEventSink::new(boundary.clone()));
+    boundary.close_event_admission();
+
+    assert!(
+        !publisher
+            .publish_entity_interacted(
+                EntityId(77),
+                "minecraft:villager",
+                ScriptInteractionHand::MainHand,
+                false,
+                PlayerPose::new(0.5, 64.0, 0.5),
+                GameMode::Survival,
+            )
+            .await
+    );
 }

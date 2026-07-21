@@ -1,8 +1,8 @@
 use mc_data::items::ItemRegistry;
 use mc_protocol::packets::play::GameMode;
 use mc_script::{
-    ScriptCraftingSource, ScriptEvent, ScriptGameMode, ScriptItemPickupSource, ScriptPlayerContext,
-    ScriptPlayerId, ScriptQueueError,
+    ScriptCraftingSource, ScriptEntityId, ScriptEvent, ScriptGameMode, ScriptInteractionHand,
+    ScriptItemPickupSource, ScriptPlayerContext, ScriptPlayerId, ScriptQueueError,
 };
 use mc_world::{BlockPos, BlockRegistry, BlockStateId};
 use tracing::warn;
@@ -289,6 +289,78 @@ impl ScriptGameplayEventPublisher {
             }
             Err(error) => {
                 warn!(?error, "committed item pickup script event was rejected");
+                false
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn publish_entity_interacted(
+        &self,
+        entity_id: mc_entity::EntityId,
+        entity_type: &str,
+        hand: ScriptInteractionHand,
+        secondary_action: bool,
+        pose: PlayerPose,
+        game_mode: GameMode,
+    ) -> bool {
+        let Ok(entity_id) = u64::try_from(entity_id.0) else {
+            warn!(
+                entity_id = entity_id.0,
+                "accepted interaction has invalid entity id"
+            );
+            return false;
+        };
+        let game_mode = match game_mode {
+            GameMode::Survival => ScriptGameMode::Survival,
+            GameMode::Creative => ScriptGameMode::Creative,
+            GameMode::Adventure => ScriptGameMode::Adventure,
+            _ => {
+                warn!(
+                    ?game_mode,
+                    "accepted entity interaction has unsupported script game mode"
+                );
+                return false;
+            }
+        };
+        let context = ScriptPlayerContext::new(
+            &self.uuid,
+            &self.username,
+            self.permissions.op,
+            pose.x,
+            pose.y,
+            pose.z,
+        );
+        let event = match ScriptEvent::try_player_entity_interacted_with_context(
+            self.player_id,
+            context,
+            &self.dimension,
+            ScriptEntityId::new(entity_id),
+            entity_type,
+            hand,
+            secondary_action,
+            game_mode,
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "accepted entity interaction script event is invalid"
+                );
+                return false;
+            }
+        };
+        match self.sink.enqueue_required_event(event).await {
+            Ok(()) => true,
+            Err(ScriptQueueError::Closed) => {
+                warn!("script event queue closed after accepted entity interaction");
+                false
+            }
+            Err(error) => {
+                warn!(
+                    ?error,
+                    "accepted entity interaction script event was rejected"
+                );
                 false
             }
         }

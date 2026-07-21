@@ -46,6 +46,9 @@ mod prepared_chunks;
 mod projectiles;
 mod script_colony_endpoint;
 mod script_commit_events;
+mod script_entity_interaction;
+#[cfg(test)]
+mod script_entity_interaction_tests;
 mod script_inventory_transaction_endpoint;
 #[cfg(test)]
 mod script_inventory_transaction_endpoint_tests;
