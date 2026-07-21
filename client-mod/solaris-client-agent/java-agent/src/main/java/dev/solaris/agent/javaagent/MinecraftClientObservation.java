@@ -7,6 +7,7 @@ import net.minecraft.client.gui.components.ChatComponent;
 import net.minecraft.client.multiplayer.chat.GuiMessage;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.tags.FluidTags;
 import net.minecraft.world.entity.Entity;
 import net.minecraft.world.entity.LivingEntity;
 import net.minecraft.world.entity.item.ItemEntity;
@@ -43,6 +44,11 @@ final class MinecraftClientObservation {
         }
 
         observation.addProperty("dimension", minecraft.level.dimension().identifier().toString());
+        observation.addProperty(
+            "water_tag_entries",
+            waterTagEntries()
+        );
+        observation.add("water_tag_fluids", waterTagFluids());
         observation.add("player", player(minecraft));
         observation.add("selected_item", item(minecraft.player.getInventory().getSelectedItem()));
         observation.add("inventory", inventory(minecraft));
@@ -58,6 +64,22 @@ final class MinecraftClientObservation {
         return observation;
     }
 
+    private static int waterTagEntries() {
+        int count = 0;
+        for (var ignored : BuiltInRegistries.FLUID.getTagOrEmpty(FluidTags.WATER)) {
+            count++;
+        }
+        return count;
+    }
+
+    private static JsonArray waterTagFluids() {
+        JsonArray fluids = new JsonArray();
+        for (var fluid : BuiltInRegistries.FLUID.getTagOrEmpty(FluidTags.WATER)) {
+            fluids.add(BuiltInRegistries.FLUID.getKey(fluid.value()).toString());
+        }
+        return fluids;
+    }
+
     static JsonObject readBlock(Minecraft minecraft, BlockPos position) {
         if (!minecraft.level.isLoaded(position)) {
             throw new IllegalStateException("client chunk is not loaded at " + position.toShortString());
@@ -70,6 +92,7 @@ final class MinecraftClientObservation {
         block.addProperty("z", position.getZ());
         block.addProperty("block_id", BuiltInRegistries.BLOCK.getKey(state.getBlock()).toString());
         block.addProperty("is_air", state.isAir());
+        block.addProperty("collision_empty", state.getCollisionShape(minecraft.level, position).isEmpty());
         block.addProperty("sky_light", minecraft.level.getBrightness(LightLayer.SKY, position));
         block.addProperty("block_light", minecraft.level.getBrightness(LightLayer.BLOCK, position));
 
@@ -84,6 +107,9 @@ final class MinecraftClientObservation {
         fluidJson.addProperty("empty", fluid.isEmpty());
         fluidJson.addProperty("source", fluid.isSource());
         fluidJson.addProperty("amount", fluid.getAmount());
+        fluidJson.addProperty("height", fluid.getHeight(minecraft.level, position));
+        fluidJson.addProperty("own_height", fluid.getOwnHeight());
+        fluidJson.addProperty("in_water_tag", fluid.is(FluidTags.WATER));
         block.add("fluid", fluidJson);
         return block;
     }
@@ -180,6 +206,23 @@ final class MinecraftClientObservation {
         value.addProperty("on_ground", entity.onGround());
         value.addProperty("crouching", entity.isCrouching());
         value.addProperty("sprinting", entity.isSprinting());
+        value.addProperty("in_water", entity.isInWater());
+        value.addProperty("under_water", entity.isUnderWater());
+        value.addProperty("swimming", entity.isSwimming());
+        value.addProperty("touching_unloaded_chunk", entity.touchingUnloadedChunk());
+        value.addProperty("water_fluid_height", entity.getFluidHeight(FluidTags.WATER));
+        value.addProperty(
+            "level_has_chunk",
+            entity.level().hasChunkAt(entity.getBlockX(), entity.getBlockZ())
+        );
+        JsonObject boundingBox = new JsonObject();
+        boundingBox.addProperty("min_x", entity.getBoundingBox().minX);
+        boundingBox.addProperty("min_y", entity.getBoundingBox().minY);
+        boundingBox.addProperty("min_z", entity.getBoundingBox().minZ);
+        boundingBox.addProperty("max_x", entity.getBoundingBox().maxX);
+        boundingBox.addProperty("max_y", entity.getBoundingBox().maxY);
+        boundingBox.addProperty("max_z", entity.getBoundingBox().maxZ);
+        value.add("bounding_box", boundingBox);
 
         Vec3 velocity = entity.getDeltaMovement();
         JsonObject velocityJson = new JsonObject();

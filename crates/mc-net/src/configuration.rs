@@ -3,6 +3,7 @@
 //! Wire choreography:
 //!
 //! ```text
+//! S → C  Update Enabled Features   (`minecraft:vanilla`)
 //! S → C  Clientbound Known Packs   (advertise `minecraft:core:<version>`)
 //! C → S  Serverbound Known Packs   (the subset the client also has)
 //! S → C  Registry Data × N         (one per built-in registry; entries use
@@ -32,8 +33,8 @@ use mc_protocol::packets::Packet;
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
     RegistryData, RegistryEntry, ServerboundClientInformation, ServerboundCustomPayload,
-    ServerboundKnownPacks, ServerboundResourcePack, UpdateTags, UpdateTagsEntry,
-    UpdateTagsRegistry,
+    ServerboundKnownPacks, ServerboundResourcePack, UpdateEnabledFeatures, UpdateTags,
+    UpdateTagsEntry, UpdateTagsRegistry,
 };
 use mc_protocol::{CodecError, State, TARGET_RELEASE};
 use mc_world::{ChunkGeometry, OVERWORLD_GEOMETRY};
@@ -155,6 +156,19 @@ where
     W: AsyncWriteExt + Unpin,
 {
     debug!(player = %profile.name, uuid = %profile.uuid, "entering Configuration state");
+    // Vanilla publishes feature flags before registry/known-pack negotiation.
+    write_packet(
+        writer,
+        &UpdateEnabledFeatures {
+            features: vec![
+                mc_data::Identifier::parse("minecraft:vanilla")
+                    .expect("static feature id is valid"),
+            ],
+        },
+        compression,
+    )
+    .await?;
+
     // Step 1: advertise our known data packs.
     let our_pack = server_known_pack();
     write_packet(

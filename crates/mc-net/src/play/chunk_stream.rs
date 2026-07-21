@@ -882,6 +882,11 @@ pub(crate) fn passable_block_name(name: &str) -> bool {
             | "minecraft:attached_pumpkin_stem"
             | "minecraft:sweet_berry_bush"
             | "minecraft:nether_wart"
+            | "minecraft:kelp"
+            | "minecraft:kelp_plant"
+            | "minecraft:seagrass"
+            | "minecraft:tall_seagrass"
+            | "minecraft:bubble_column"
     )
 }
 

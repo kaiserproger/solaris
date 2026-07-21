@@ -2789,7 +2789,7 @@ fn bamboo_state(
         .unwrap()
 }
 
-fn fluid_test_facts() -> mc_data::block_facts::BlockFactsTable {
+pub(super) fn fluid_test_facts() -> mc_data::block_facts::BlockFactsTable {
     mc_data::block_facts::BlockFactsTable::from_blocks_report(&fluid_test_reports())
 }
 

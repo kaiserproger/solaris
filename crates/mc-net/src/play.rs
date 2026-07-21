@@ -121,6 +121,8 @@ mod inventory;
 mod item_blocks;
 mod lighting;
 mod movement;
+#[cfg(test)]
+mod movement_tests;
 pub(crate) mod persistence;
 mod plants;
 mod player_breathing;
@@ -1296,6 +1298,26 @@ impl PlayerPose {
             EntityPose::Crouching
         } else {
             EntityPose::Standing
+        }
+    }
+
+    fn body_height(self) -> f64 {
+        if self.swimming {
+            0.6
+        } else if self.shifting {
+            1.5
+        } else {
+            1.8
+        }
+    }
+
+    fn eye_height(self) -> f64 {
+        if self.swimming {
+            0.4
+        } else if self.shifting {
+            1.27
+        } else {
+            1.62
         }
     }
 

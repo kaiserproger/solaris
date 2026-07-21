@@ -114,6 +114,11 @@ Negative:
   result of this reference should cite `javap` output (and the
   vanilla class name) in the commit message, so future maintainers
   can re-derive the same conclusion.
+- Configuration now sends `ClientboundUpdateEnabledFeaturesPacket` as packet
+  `0x0c` with `minecraft:vanilla` before known-pack negotiation. The ID, set
+  encoding, and ordering come from the local 26.1.2
+  `ConfigurationProtocols`, `ClientboundUpdateEnabledFeaturesPacket`, and
+  `ServerConfigurationPacketListenerImpl` sources.
 
 ## Notes
 

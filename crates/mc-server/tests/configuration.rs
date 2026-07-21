@@ -19,7 +19,7 @@ use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, KnownPackEntry,
     RegistryData, ServerboundClientInformation, ServerboundCustomPayload, ServerboundKnownPacks,
-    UpdateTags,
+    UpdateEnabledFeatures, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
@@ -181,6 +181,27 @@ async fn read_one_frame(
     }
 }
 
+async fn read_configuration_preamble(
+    stream: &mut TcpStream,
+    buf: &mut BytesMut,
+    compression: Compression,
+) -> ClientboundKnownPacks {
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, UpdateEnabledFeatures::ID);
+    let features = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    assert_eq!(
+        features.features,
+        vec![Identifier::parse("minecraft:vanilla").unwrap()]
+    );
+
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, ClientboundKnownPacks::ID);
+    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    assert_eq!(frame.body.remaining(), 0);
+    known
+}
+
 async fn read_optional_frame(
     stream: &mut TcpStream,
     buf: &mut BytesMut,
@@ -277,15 +298,7 @@ async fn configuration_known_packs_and_finish_complete() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Notch").await;
 
-    // First Configuration packet from the server: Known Packs.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(
-        frame.id,
-        ClientboundKnownPacks::ID,
-        "expected Known Packs from server first"
-    );
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
-    assert_eq!(frame.body.remaining(), 0);
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
     assert_eq!(known.packs.len(), 1, "expected exactly one advertised pack");
     let pack = &known.packs[0];
     assert_eq!(pack.namespace, "minecraft");
@@ -392,9 +405,7 @@ async fn configuration_rejects_missing_known_pack_echo() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Alex").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
     assert_eq!(known.packs.len(), 1);
 
     write_frame(
@@ -426,9 +437,7 @@ async fn configuration_sends_full_registry_data_without_known_pack_echo() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadClient").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
     assert_eq!(known.packs.len(), 1);
     write_frame(
         &mut stream,
@@ -464,9 +473,7 @@ async fn configuration_rejects_excess_unsolicited_packets_before_known_packs() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Spammy").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let _ = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
 
     for _ in 0..33 {
         let information = client_information_packet();
@@ -492,9 +499,7 @@ async fn configuration_ignores_unknown_custom_payload_before_known_packs() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadDeny").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -524,9 +529,7 @@ async fn configuration_extension_boundary_receives_allowed_payloads() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "ConfigExtension").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
 
     write_frame(
         &mut stream,
@@ -616,9 +619,7 @@ async fn configuration_ignores_oversized_custom_payload_before_known_packs() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "PayloadBig").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
 
     write_oversized_custom_payload_frame(&mut stream, ServerboundCustomPayload::ID, compression)
         .await;
@@ -639,9 +640,7 @@ async fn configuration_rejects_excess_unsolicited_packets_before_finish_ack() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "AckSpam").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
     write_frame(
         &mut stream,
         &ServerboundKnownPacks { packs: known.packs },
@@ -675,9 +674,7 @@ async fn configuration_ignores_oversized_custom_payload_before_finish_ack() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "AckPayloadBig").await;
 
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let known = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    let known = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
     write_frame(
         &mut stream,
         &ServerboundKnownPacks { packs: known.packs },
@@ -711,10 +708,8 @@ async fn configuration_skips_unexpected_packets() {
     let mut rbuf = BytesMut::with_capacity(4096);
     let compression = run_through_login_ack(&mut stream, &mut rbuf, addr, "Steve").await;
 
-    // Consume the server's Known Packs.
-    let mut frame = read_one_frame(&mut stream, &mut rbuf, compression).await;
-    assert_eq!(frame.id, ClientboundKnownPacks::ID);
-    let _ = ClientboundKnownPacks::decode(&mut frame.body).unwrap();
+    // Consume the server's configuration preamble.
+    let _ = read_configuration_preamble(&mut stream, &mut rbuf, compression).await;
 
     // Send valid Client Information before Known Packs. The handler should
     // decode and ignore it while waiting for the expected response.

@@ -88,26 +88,13 @@ pub(super) fn entity_geometry(
 }
 
 fn player_eye_position(pose: PlayerPose) -> Vec3 {
-    let eye_height = if pose.swimming {
-        0.4
-    } else if pose.shifting {
-        1.27
-    } else {
-        1.62
-    };
-    Vec3::new(pose.x, pose.y + eye_height, pose.z)
+    Vec3::new(pose.x, pose.y + pose.eye_height(), pose.z)
 }
 
 pub(super) fn player_aabb_for_pose(pose: PlayerPose) -> Aabb {
     Aabb {
         half_width: 0.3,
-        height: if pose.swimming {
-            0.6
-        } else if pose.shifting {
-            1.5
-        } else {
-            1.8
-        },
+        height: pose.body_height(),
     }
 }
 

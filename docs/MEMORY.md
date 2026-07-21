@@ -9,9 +9,9 @@ and is not startup context.
 
 - Date: 2026-07-22.
 - Branch: `dev/M100-client-agent`.
-- Latest recorded checkpoint: dense outbound movement backlog fixed and
-  awaiting commit (this checkpoint). Basic economy and land claims shipped in
-  `1c2ba4a`. The prior mob death deadline checkpoint is
+- Latest recorded checkpoint: water/client fluid-contact diagnosis and the
+  bounded protocol, pose, and water-plant fixes are awaiting commit. Basic
+  economy and land claims shipped in `1c2ba4a`. The prior mob death deadline checkpoint is
   `45ff133` (`fix(play): index mob death deadlines`).
   The reach checkpoint is `5146926`, creeper checkpoint is `9af1309`,
   dry-spawn checkpoint is `6b0dcec`, autoscale checkpoint is `5b7017a`, and
@@ -92,7 +92,13 @@ and is not startup context.
   buoyancy, removing the force that held fish at the surface. Canonical
   `LivingAquatic` and `LivingAmphibious` contracts share that path. Focused
   tests and full workspace tests, strict Clippy, fmt, and code-health pass; all
-  four reviewer findings were fixed. Owner-client verification remains pending.
+  four prior reviewer findings were fixed. The follow-up sends the vanilla
+  enabled-feature packet before known packs, makes water plants passable, and
+  uses swimming/crouching body and eye heights for water/collision queries.
+  Real-client MCP evidence still shows zero client-local fluid height inside a
+  loaded canonical source-water block, so swimming remains open. Next: isolate
+  why `LocalPlayer.baseTick` leaves fluid contact empty despite the correct
+  block state; do not widen into worldgen or rare aquatic edges first.
 - `7cdd917` fixes the ordinary active-game save path exposed by the natural
   furnace loop. A resident mutation during out-of-lock whole-region encoding
   now skips that Anvil region before filesystem installation and leaves it

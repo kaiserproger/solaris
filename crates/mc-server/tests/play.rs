@@ -29,7 +29,7 @@ use mc_protocol::codec::{Identifier, WriteMc};
 use mc_protocol::frame::{Compression, encode_frame, try_decode_frame};
 use mc_protocol::packets::configuration::{
     AcknowledgeFinishConfiguration, ClientboundKnownPacks, FinishConfiguration, RegistryData,
-    ServerboundKnownPacks, UpdateTags,
+    ServerboundKnownPacks, UpdateEnabledFeatures, UpdateTags,
 };
 use mc_protocol::packets::handshake::{Handshake, NextState};
 use mc_protocol::packets::login::{LoginAcknowledged, LoginStart, LoginSuccess, SetCompression};
@@ -483,7 +483,10 @@ async fn drive_to_play(
     let _ = LoginSuccess::decode(&mut frame.body).unwrap();
     write_frame(stream, &LoginAcknowledged, compression).await;
 
-    // Configuration: KnownPacks round trip, drain registries, ack.
+    // Configuration: enabled features, KnownPacks round trip, registries, ack.
+    let mut frame = read_one_frame(stream, buf, compression).await;
+    assert_eq!(frame.id, UpdateEnabledFeatures::ID);
+    let _ = UpdateEnabledFeatures::decode(&mut frame.body).unwrap();
     let mut frame = read_one_frame(stream, buf, compression).await;
     assert_eq!(frame.id, ClientboundKnownPacks::ID);
     let cb_packs = ClientboundKnownPacks::decode(&mut frame.body).unwrap();

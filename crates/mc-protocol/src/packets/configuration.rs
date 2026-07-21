@@ -3,6 +3,7 @@
 //! At M3.i the choreography is:
 //!
 //! ```text
+//! S → C  Update Enabled Features   (0x0C, `minecraft:vanilla`)
 //! S → C  Known Packs               (0x0E, our list of known data packs)
 //! C → S  Known Packs               (0x07, the subset the client also has)
 //! S → C  Registry Data × N         (0x07, one per built-in registry)
@@ -30,6 +31,7 @@ const MAX_SERVERBOUND_KNOWN_PACKS: usize = 64;
 const MAX_KNOWN_PACK_STRING: usize = 32_767;
 const MIN_KNOWN_PACK_ENTRY_BYTES: usize = 3;
 const MAX_REGISTRY_ENTRIES: usize = 65_536;
+const MAX_ENABLED_FEATURES: usize = 1_024;
 const MAX_TAG_REGISTRIES: usize = 1_024;
 const MAX_TAGS_PER_REGISTRY: usize = 65_536;
 const MAX_TAG_ENTRIES: usize = 1_048_576;
@@ -152,6 +154,33 @@ impl Packet for ClientboundKnownPacks {
         Ok(Self {
             packs: read_known_pack_array(buf, MAX_CLIENTBOUND_KNOWN_PACKS)?,
         })
+    }
+}
+
+/// Clientbound 0x0C — feature flags selected by the server data packs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateEnabledFeatures {
+    pub features: Vec<Identifier>,
+}
+
+impl Packet for UpdateEnabledFeatures {
+    const ID: i32 = 0x0C;
+
+    fn encode<B: BufMut>(&self, buf: &mut B) -> Result<(), CodecError> {
+        write_count(buf, self.features.len(), MAX_ENABLED_FEATURES)?;
+        for feature in &self.features {
+            buf.write_identifier(feature)?;
+        }
+        Ok(())
+    }
+
+    fn decode<B: Buf>(buf: &mut B) -> Result<Self, CodecError> {
+        let count = read_count(buf, MAX_ENABLED_FEATURES)?;
+        let mut features = Vec::with_capacity(count);
+        for _ in 0..count {
+            features.push(buf.read_identifier()?);
+        }
+        Ok(Self { features })
     }
 }
 
@@ -491,6 +520,19 @@ mod tests {
         round_trip(ClientboundKnownPacks {
             packs: vec![sample_pack(); 65],
         });
+    }
+
+    #[test]
+    fn enabled_features_id_and_vanilla_layout_match_26_1_2() {
+        let packet = UpdateEnabledFeatures {
+            features: vec![Identifier::parse("minecraft:vanilla").unwrap()],
+        };
+        assert_eq!(UpdateEnabledFeatures::ID, 0x0C);
+        round_trip(packet.clone());
+
+        let mut encoded = Vec::new();
+        packet.encode(&mut encoded).unwrap();
+        assert_eq!(encoded, b"\x01\x11minecraft:vanilla");
     }
 
     #[test]
