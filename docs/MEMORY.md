@@ -9,11 +9,25 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `5e0d93b` (`feat(plugins): add push-driven simulation
-  timers`).
+- Latest checkpoint: `7cdd917` (`fix(world): skip stale resident flush
+  regions`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- `7cdd917` fixes the ordinary active-game save path exposed by the natural
+  furnace loop. A resident mutation during out-of-lock whole-region encoding
+  now skips that Anvil region before filesystem installation and leaves it
+  dirty for bounded replanning; stable independent regions continue. A real
+  filesystem version mismatch remains `StaleRegion`, and exact barrier-save
+  semantics are unchanged. Focused tests cover one-time and continuous
+  resident conflict, whole-region skip, stable-region progress, cleanup, and
+  the typed bounded failure. Full workspace tests, strict workspace Clippy,
+  fmt, code-health `0 fail / KEEP`, and diff-check pass. The real-client
+  artifact
+  `.analysis/real-client-runs/20260721T112014Z-real-client-playable-loop-pURskM`
+  completed the natural wood -> furnace -> charcoal scenario with runner exit
+  0 and no dirty-flush degradation warning. This does not replace the pending
+  owner-played 20-minute session or a vanilla oracle.
 - `5e0d93b` adds bounded host-local Lua timers driven by pushed monotonic
   simulation ticks. Tick admission coalesces the newest tick under queue
   pressure without blocking the simulation thread; due callbacks run in

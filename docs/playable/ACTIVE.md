@@ -45,6 +45,23 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `7cdd917` fixes a normal active-game save conflict found by the
+  natural furnace scenario. The first artifact
+  `.analysis/real-client-runs/20260721T110747Z-real-client-playable-loop-yFIIqx`
+  completed birch -> table -> wooden pickaxe -> cobblestone -> furnace ->
+  charcoal, but the runner exited 1 after repeated false `region changed before
+  replace` dirty-flush warnings. The resident chunk had changed while its whole
+  Anvil region encoded outside the world lock; this is not a filesystem CAS
+  failure. The normal flush now skips that region before disk installation,
+  keeps it dirty for bounded replanning, and continues stable regions. The
+  second artifact
+  `.analysis/real-client-runs/20260721T112014Z-real-client-playable-loop-pURskM`
+  passed the same no-debug natural loop with runner exit 0, no dirty-flush or
+  pressure-flush warning, and periodic saves draining to zero dirty chunks.
+  The observed warned tick peak was about 55 ms. Full workspace tests, strict
+  workspace Clippy, fmt, code-health `0 fail / KEEP`, and diff-check pass.
+  The rare partial-install `fsync`/counting debt remains deferred. This does
+  not replace the pending owner-played 20-minute session or a vanilla oracle.
 - Checkpoint `5e0d93b` adds bounded host-local Lua timers driven by pushed
   monotonic simulation ticks. Queue pressure coalesces the newest tick instead
   of blocking the simulation thread or requiring plugin polling. Timer
