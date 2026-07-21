@@ -21,14 +21,75 @@ const FRAME_LIMITS: FrameWaitLimits = FrameWaitLimits {
 struct CatalogMenu {
     container_id: i32,
     state_id: i32,
-    apple_id: u32,
-    apple_count: i32,
+    product_id: u32,
+    product_count: i32,
 }
 
 #[tokio::test]
-async fn shipped_currency_catalog_completes_buy_reject_and_refund_over_wire() {
+async fn shipped_currency_catalog_uses_external_config_over_wire() {
     let plugins = tempfile::tempdir().expect("plugin tempdir");
     copy_example_plugin("currency-catalog", plugins.path());
+    let config_path = plugins.path().join("currency-catalog/config.toml");
+    let mut config: toml::Table =
+        toml::from_str(&std::fs::read_to_string(&config_path).expect("read catalog config"))
+            .expect("parse catalog config");
+    let currency = config
+        .get_mut("currency")
+        .and_then(toml::Value::as_table_mut)
+        .expect("currency config table");
+    currency.insert(
+        "resource".to_owned(),
+        toml::Value::String("minecraft:gold_ingot".to_owned()),
+    );
+    currency.insert(
+        "singular".to_owned(),
+        toml::Value::String("Gold Ingot".to_owned()),
+    );
+    currency.insert(
+        "plural".to_owned(),
+        toml::Value::String("Gold Ingots".to_owned()),
+    );
+    let product = config
+        .get_mut("catalog")
+        .and_then(toml::Value::as_array_mut)
+        .and_then(|catalog| catalog.first_mut())
+        .and_then(toml::Value::as_table_mut)
+        .expect("first catalog product");
+    product.insert(
+        "resource".to_owned(),
+        toml::Value::String("minecraft:stone_axe".to_owned()),
+    );
+    product.insert("count".to_owned(), toml::Value::Integer(1));
+    product.insert(
+        "label".to_owned(),
+        toml::Value::String("Stone Axe".to_owned()),
+    );
+    product.insert("price".to_owned(), toml::Value::Integer(2));
+    let zone = config
+        .get_mut("zone")
+        .and_then(toml::Value::as_table_mut)
+        .expect("zone config table");
+    for bound in ["minimum", "maximum"] {
+        let coordinates = zone
+            .get_mut(bound)
+            .and_then(toml::Value::as_table_mut)
+            .expect("zone coordinate table");
+        let value = if bound == "minimum" { 24 } else { 40 };
+        coordinates.insert("x".to_owned(), toml::Value::Integer(value));
+        coordinates.insert("z".to_owned(), toml::Value::Integer(value));
+    }
+    std::fs::write(
+        &config_path,
+        toml::to_string_pretty(&config).expect("encode catalog config"),
+    )
+    .expect("write customized catalog config");
+
+    let currency_resource = "minecraft:gold_ingot";
+    let currency_plural = "Gold Ingots";
+    let product_resource = "minecraft:stone_axe";
+    let product_label = "Stone Axe";
+    let product_count = 1;
+    let product_price = 2;
     let (boundary, host) = mc_script::start_lua_host(mc_script::LuaHostConfig::new(plugins.path()))
         .expect("start shipped currency catalog");
     assert_eq!(host.loaded_plugins(), 1);
@@ -40,8 +101,8 @@ async fn shipped_currency_catalog_completes_buy_reject_and_refund_over_wire() {
         mc_world::BlockRegistry::from_report(&block_report).expect("embedded block registry"),
     );
     let items = Arc::new(mc_data::items::solaris_required_items());
-    let emerald_id = item_id(&items, "minecraft:emerald");
-    let apple_id = item_id(&items, "minecraft:apple");
+    let currency_id = item_id(&items, currency_resource);
+    let product_id = item_id(&items, product_resource);
     let generator = Arc::new(mc_worldgen::TerrainGenerator::new(0, Arc::clone(&blocks)));
     let world =
         mc_world::WorldStorage::open_with_capacity(world_dir.path(), Arc::clone(&blocks), 49)
@@ -104,11 +165,11 @@ async fn shipped_currency_catalog_completes_buy_reject_and_refund_over_wire() {
 
     client
         .write_packet(&ServerboundChatCommand {
-            command: "give minecraft:emerald 3".to_owned(),
+            command: format!("give {currency_resource} {product_price}"),
         })
         .await
         .expect("give configured catalog currency");
-    wait_for_slot(&mut client, emerald_id, 3).await;
+    wait_for_slot(&mut client, currency_id, product_price).await;
 
     client
         .write_packet(&ServerboundMovePlayerPos {
@@ -121,37 +182,73 @@ async fn shipped_currency_catalog_completes_buy_reject_and_refund_over_wire() {
         .expect("move outside catalog zone");
     client
         .write_packet(&ServerboundMovePlayerPos {
-            x: 0.0,
+            x: 32.0,
             y: sync.y,
-            z: 0.0,
+            z: 32.0,
             flags: MovePlayerFlags::new(true, false),
         })
         .await
         .expect("enter catalog zone");
 
-    let initial_menu = wait_for_catalog_menu(&mut client, apple_id, 0).await;
-    click_catalog_apple(&mut client, &initial_menu, 0).await;
-    let purchased = wait_for_message_and_inventory(&mut client, "Purchased Apples.").await;
-    assert_inventory(&purchased, emerald_id, 0, apple_id, 2);
+    let initial_menu = wait_for_catalog_menu(
+        &mut client,
+        product_id,
+        product_count,
+        product_label,
+        product_price,
+        currency_plural,
+        0,
+    )
+    .await;
+    click_catalog_product(&mut client, &initial_menu, 0).await;
+    let purchased = wait_for_message_and_inventory(&mut client, "Purchased Stone Axe.").await;
+    assert_inventory(&purchased, currency_id, 0, product_id, product_count);
 
-    let owned_menu = wait_for_catalog_menu(&mut client, apple_id, 1).await;
-    click_catalog_apple(&mut client, &owned_menu, 0).await;
+    let owned_menu = wait_for_catalog_menu(
+        &mut client,
+        product_id,
+        product_count,
+        product_label,
+        product_price,
+        currency_plural,
+        1,
+    )
+    .await;
+    click_catalog_product(&mut client, &owned_menu, 0).await;
     let rejected = wait_for_message_and_optional_inventory(
         &mut client,
         "Transaction rejected: inventory or storage precondition changed.",
     )
     .await;
     if let Some(inventory) = rejected {
-        assert_inventory(&inventory, emerald_id, 0, apple_id, 2);
+        assert_inventory(&inventory, currency_id, 0, product_id, product_count);
     }
 
-    let unchanged_menu = wait_for_catalog_menu(&mut client, apple_id, 1).await;
-    click_catalog_apple(&mut client, &unchanged_menu, 1).await;
-    let refunded = wait_for_message_and_inventory(&mut client, "Refunded Apples.").await;
-    assert_inventory(&refunded, emerald_id, 3, apple_id, 0);
+    let unchanged_menu = wait_for_catalog_menu(
+        &mut client,
+        product_id,
+        product_count,
+        product_label,
+        product_price,
+        currency_plural,
+        1,
+    )
+    .await;
+    click_catalog_product(&mut client, &unchanged_menu, 1).await;
+    let refunded = wait_for_message_and_inventory(&mut client, "Refunded Stone Axe.").await;
+    assert_inventory(&refunded, currency_id, product_price, product_id, 0);
 
-    let final_menu = wait_for_catalog_menu(&mut client, apple_id, 0).await;
-    assert_eq!(final_menu.apple_count, 2);
+    let final_menu = wait_for_catalog_menu(
+        &mut client,
+        product_id,
+        product_count,
+        product_label,
+        product_price,
+        currency_plural,
+        0,
+    )
+    .await;
+    assert_eq!(final_menu.product_count, product_count);
 
     drop(client);
     shutdown.request();
@@ -330,6 +427,11 @@ fn copy_example_plugin(name: &str, destination_root: &Path) {
         std::fs::copy(source.join(file), destination.join(file))
             .unwrap_or_else(|error| panic!("copy shipped {name}/{file}: {error}"));
     }
+    let config = source.join("config.toml");
+    if config.is_file() {
+        std::fs::copy(config, destination.join("config.toml"))
+            .unwrap_or_else(|error| panic!("copy shipped {name}/config.toml: {error}"));
+    }
 }
 
 fn write_villager_fixture_plugin(destination_root: &Path) {
@@ -411,7 +513,15 @@ async fn wait_for_slot(client: &mut Client, item_id: u32, count: i32) {
     }
 }
 
-async fn wait_for_catalog_menu(client: &mut Client, apple_id: u32, owned: usize) -> CatalogMenu {
+async fn wait_for_catalog_menu(
+    client: &mut Client,
+    product_id: u32,
+    product_count: i32,
+    product_label: &str,
+    product_price: i32,
+    currency_plural: &str,
+    owned: usize,
+) -> CatalogMenu {
     let open = client
         .wait_for_frame_id_with_timeout_and_limits(
             ClientboundOpenScreen::ID,
@@ -425,7 +535,7 @@ async fn wait_for_catalog_menu(client: &mut Client, apple_id: u32, owned: usize)
     assert_eq!(screen.menu_type, 0);
     assert_eq!(
         literal_text_component_text(&screen.title_nbt),
-        "Market - Emeralds"
+        format!("Market - {currency_plural}")
     );
 
     let content = loop {
@@ -444,21 +554,26 @@ async fn wait_for_catalog_menu(client: &mut Client, apple_id: u32, owned: usize)
         }
     };
     assert_eq!(content.items.len(), 45);
-    assert_eq!(content.items[0].item_id, apple_id);
-    assert_eq!(content.items[0].count, 2);
+    assert_eq!(content.items[0].item_id, product_id);
+    assert_eq!(content.items[0].count, product_count);
     assert_eq!(
         content.items[0].custom_name.as_deref(),
-        Some(format!("Apples | buy 3 Emeralds | refund | owned {owned}").as_str())
+        Some(
+            format!(
+                "{product_label} | buy {product_price} {currency_plural} | refund | owned {owned}"
+            )
+            .as_str()
+        )
     );
     CatalogMenu {
         container_id: content.container_id,
         state_id: content.state_id,
-        apple_id,
-        apple_count: content.items[0].count,
+        product_id,
+        product_count: content.items[0].count,
     }
 }
 
-async fn click_catalog_apple(client: &mut Client, menu: &CatalogMenu, button_num: i8) {
+async fn click_catalog_product(client: &mut Client, menu: &CatalogMenu, button_num: i8) {
     client
         .write_packet(&ServerboundContainerClick {
             container_id: menu.container_id,
@@ -468,13 +583,13 @@ async fn click_catalog_apple(client: &mut Client, menu: &CatalogMenu, button_num
             container_input: ContainerInput::Pickup,
             changed_slots: vec![(0, HashedStack::empty())],
             carried_item: HashedStack::Actual {
-                item_id: menu.apple_id,
-                count: menu.apple_count,
+                item_id: menu.product_id,
+                count: menu.product_count,
                 components: HashedStackComponentHashes::empty(),
             },
         })
         .await
-        .expect("click catalog apple");
+        .expect("click catalog product");
 }
 
 async fn wait_for_message_and_inventory(
@@ -606,14 +721,14 @@ async fn wait_for_entity_removal(client: &mut Client, entity_id: i32) {
 
 fn assert_inventory(
     inventory: &ClientboundContainerSetContent,
-    emerald_id: u32,
-    emerald_count: i32,
-    apple_id: u32,
-    apple_count: i32,
+    currency_id: u32,
+    currency_count: i32,
+    product_id: u32,
+    product_count: i32,
 ) {
     assert_eq!(inventory.container_id, 0);
-    assert_eq!(total_count(inventory, emerald_id), emerald_count);
-    assert_eq!(total_count(inventory, apple_id), apple_count);
+    assert_eq!(total_count(inventory, currency_id), currency_count);
+    assert_eq!(total_count(inventory, product_id), product_count);
 }
 
 fn total_count(inventory: &ClientboundContainerSetContent, item_id: u32) -> i32 {

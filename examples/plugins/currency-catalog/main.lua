@@ -3,29 +3,11 @@
 -- The catalog mutates currency, purchased items, and its ledger only after the
 -- server accepts one inventory/storage transaction.
 
-local config = {
-    shop_id = "market",
-    menu_prefix = "catalog",
-    currency = {
-        resource = "minecraft:emerald",
-        singular = "Emerald",
-        plural = "Emeralds",
-    },
-    zone = {
-        id = "catalog-square",
-        dimension = "minecraft:overworld",
-        minimum = { x = -8, y = 60, z = -8 },
-        maximum = { x = 8, y = 100, z = 8 },
-    },
-    catalog = {
-        { resource = "minecraft:apple", count = 2, label = "Apples", price = 3 },
-        { resource = "minecraft:bread", count = 1, label = "Bread", price = 5 },
-        { resource = "minecraft:cooked_beef", count = 2, label = "Steak", price = 8 },
-        { resource = "minecraft:iron_pickaxe", count = 1, label = "Iron Pickaxe", price = 18 },
-    },
-    max_active_players = 64,
-    max_purchases_per_item = 999999,
-}
+local config = solaris.config()
+local shop_id = "market"
+local menu_prefix = "catalog"
+local max_active_players = 64
+local max_purchases_per_item = 999999
 
 local pending_reads = {}
 local pending_read_by_player = {}
@@ -44,13 +26,61 @@ local function table_size(values)
 end
 
 local function validate_config()
+    local function bounded_string(value, name, max_bytes)
+        assert(type(value) == "string" and #value > 0, name .. " must be a string")
+        assert(#value <= max_bytes, name .. " is too long")
+    end
+
+    local function resource_id(value, name)
+        bounded_string(value, name, 128)
+        assert(string.match(value, "^[a-z0-9_.-]+:[a-z0-9_./-]+$") ~= nil,
+            name .. " must be a namespaced resource id")
+    end
+
+    local function bounded_integer(value, name, minimum, maximum)
+        assert(math.type(value) == "integer", name .. " must be an integer")
+        assert(value >= minimum and value <= maximum, name .. " is out of range")
+    end
+
+    local function finite_number(value, name)
+        assert(type(value) == "number" and value == value
+            and value ~= math.huge and value ~= -math.huge, name .. " must be finite")
+    end
+
+    assert(type(config.currency) == "table", "currency must be a table")
+    resource_id(config.currency.resource, "currency.resource")
+    bounded_string(config.currency.singular, "currency.singular", 128)
+    bounded_string(config.currency.plural, "currency.plural", 128)
+
+    assert(type(config.zone) == "table", "zone must be a table")
+    bounded_string(config.zone.id, "zone.id", 64)
+    assert(string.match(config.zone.id, "^[a-z0-9_-]+$") ~= nil,
+        "zone.id contains invalid characters")
+    resource_id(config.zone.dimension, "zone.dimension")
+    assert(type(config.zone.minimum) == "table", "zone.minimum must be a table")
+    assert(type(config.zone.maximum) == "table", "zone.maximum must be a table")
+    for _, axis in ipairs({ "x", "y", "z" }) do
+        local minimum = config.zone.minimum[axis]
+        local maximum = config.zone.maximum[axis]
+        finite_number(minimum, "zone.minimum." .. axis)
+        finite_number(maximum, "zone.maximum." .. axis)
+        local limit = axis == "y" and 20000000 or 30000000
+        assert(math.abs(minimum) <= limit and math.abs(maximum) <= limit,
+            "zone " .. axis .. " bounds are out of range")
+        assert(minimum <= maximum, "zone bounds must be ordered")
+    end
+
+    assert(type(config.catalog) == "table", "catalog must be a table")
     assert(#config.catalog > 0 and #config.catalog <= 16, "catalog must contain 1..16 entries")
     local resources = { [config.currency.resource] = true }
     for _, item in ipairs(config.catalog) do
+        assert(type(item) == "table", "catalog item must be a table")
+        resource_id(item.resource, "catalog resource")
+        bounded_string(item.label, "catalog label", 128)
+        bounded_integer(item.count, "catalog count", 1, 64)
+        bounded_integer(item.price, "catalog price", 1, 64)
         assert(item.resource ~= config.currency.resource, "catalog item cannot be the shop currency")
         assert(not resources[item.resource], "catalog resources must be unique")
-        assert(item.count >= 1 and item.count <= 64, "catalog item count must be 1..64")
-        assert(item.price >= 1 and item.price <= 64, "catalog price must be 1..64")
         resources[item.resource] = true
     end
 end
@@ -58,7 +88,7 @@ end
 validate_config()
 
 local function ledger_key(uuid)
-    return "shop:" .. config.shop_id .. ":" .. uuid
+    return "shop:" .. shop_id .. ":" .. uuid
 end
 
 local function empty_counts()
@@ -99,7 +129,7 @@ local function decode_counts(value)
             return nil
         end
         local count = tonumber(token)
-        if count == nil or count > config.max_purchases_per_item then
+        if count == nil or count > max_purchases_per_item then
             return nil
         end
         counts[#counts + 1] = count
@@ -119,9 +149,9 @@ end
 
 local function menu_id_for(version)
     if version == nil then
-        return config.menu_prefix .. "-new"
+        return menu_prefix .. "-new"
     end
-    return config.menu_prefix .. "-v" .. tostring(version)
+    return menu_prefix .. "-v" .. tostring(version)
 end
 
 local function remember_notice(player_id, message)
@@ -231,7 +261,7 @@ function on_player_zone_entered(event)
         end
     end
     if ledgers[event.player_id] == nil
-        and table_size(ledgers) + table_size(pending_reads) >= config.max_active_players
+        and table_size(ledgers) + table_size(pending_reads) >= max_active_players
     then
         send_message(event.player_id, "Catalog unavailable: active-player limit reached.")
         return

@@ -35,6 +35,11 @@ const MEMORY_BYTES_PER_PLUGIN: usize = 16 * 1024 * 1024;
 const INSTRUCTIONS_PER_EVENT: u64 = 100_000;
 const HOOK_INSTRUCTION_STEP: u32 = 1_000;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 64 * 1024;
+const MAX_PLUGIN_CONFIG_BYTES: usize = 64 * 1024;
+const MAX_PLUGIN_CONFIG_DEPTH: usize = 8;
+const MAX_PLUGIN_CONFIG_CONTAINER_ENTRIES: usize = 128;
+const MAX_PLUGIN_CONFIG_KEY_BYTES: usize = 128;
+const MAX_PLUGIN_CONFIG_STRING_BYTES: usize = 4 * 1024;
 const MAX_PLUGIN_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_DIRECTORIES: usize = 128;
 const MAX_API_VERSION_BYTES: usize = 16;
@@ -134,6 +139,7 @@ pub fn start_lua_host(config: LuaHostConfig) -> Result<(ScriptBoundary, LuaHost)
 #[derive(Debug)]
 struct PluginSource {
     manifest: ValidatedScriptPluginManifest,
+    config: toml::Table,
     source: String,
     source_path: PathBuf,
 }
@@ -257,13 +263,84 @@ fn read_plugin_source(directory: &Path) -> Result<PluginSource, String> {
     let manifest = manifest
         .validate()
         .map_err(|error| format!("invalid manifest: {error:?}"))?;
+    let config = read_plugin_config(directory)?;
     let source_path = directory.join("main.lua");
     let source = read_utf8_file_limited(&source_path, MAX_PLUGIN_SOURCE_BYTES)?;
     Ok(PluginSource {
         manifest,
+        config,
         source,
         source_path,
     })
+}
+
+fn read_plugin_config(directory: &Path) -> Result<toml::Table, String> {
+    let path = directory.join("config.toml");
+    match fs::metadata(&path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(toml::Table::new());
+        }
+        Err(error) => return Err(format!("reading {} metadata: {error}", path.display())),
+    }
+    let raw = read_utf8_file_limited(&path, MAX_PLUGIN_CONFIG_BYTES)?;
+    let config = toml::from_str(&raw).map_err(|error| format!("parsing config: {error}"))?;
+    validate_plugin_config_table(&config, 0)?;
+    Ok(config)
+}
+
+fn validate_plugin_config_table(config: &toml::Table, depth: usize) -> Result<(), String> {
+    if depth > MAX_PLUGIN_CONFIG_DEPTH {
+        return Err(format!(
+            "config nesting exceeds {MAX_PLUGIN_CONFIG_DEPTH} levels"
+        ));
+    }
+    if config.len() > MAX_PLUGIN_CONFIG_CONTAINER_ENTRIES {
+        return Err(format!(
+            "config table exceeds {MAX_PLUGIN_CONFIG_CONTAINER_ENTRIES} entries"
+        ));
+    }
+    for (key, value) in config {
+        if key.len() > MAX_PLUGIN_CONFIG_KEY_BYTES {
+            return Err(format!(
+                "config key exceeds {MAX_PLUGIN_CONFIG_KEY_BYTES} bytes"
+            ));
+        }
+        validate_plugin_config_value(value, depth)?;
+    }
+    Ok(())
+}
+
+fn validate_plugin_config_value(value: &toml::Value, depth: usize) -> Result<(), String> {
+    match value {
+        toml::Value::String(value) if value.len() > MAX_PLUGIN_CONFIG_STRING_BYTES => Err(format!(
+            "config string exceeds {MAX_PLUGIN_CONFIG_STRING_BYTES} bytes"
+        )),
+        toml::Value::String(_) | toml::Value::Integer(_) | toml::Value::Boolean(_) => Ok(()),
+        toml::Value::Float(value) if !value.is_finite() => {
+            Err("config floating-point values must be finite".to_owned())
+        }
+        toml::Value::Float(_) => Ok(()),
+        toml::Value::Array(values) => {
+            if values.len() > MAX_PLUGIN_CONFIG_CONTAINER_ENTRIES {
+                return Err(format!(
+                    "config array exceeds {MAX_PLUGIN_CONFIG_CONTAINER_ENTRIES} entries"
+                ));
+            }
+            let depth = depth.saturating_add(1);
+            if depth > MAX_PLUGIN_CONFIG_DEPTH {
+                return Err(format!(
+                    "config nesting exceeds {MAX_PLUGIN_CONFIG_DEPTH} levels"
+                ));
+            }
+            for value in values {
+                validate_plugin_config_value(value, depth)?;
+            }
+            Ok(())
+        }
+        toml::Value::Table(values) => validate_plugin_config_table(values, depth.saturating_add(1)),
+        toml::Value::Datetime(_) => Err("config datetime values are unsupported".to_owned()),
+    }
 }
 
 fn read_utf8_file_limited(path: &Path, max_bytes: usize) -> Result<String, String> {
@@ -464,9 +541,10 @@ impl LuaPlugin {
             .map(|subscription| subscription.event_name().to_owned())
             .collect();
         let admission = HostCommandAdmission::from_manifest(&source.manifest);
-        let runtime = LuaScriptRuntime::from_source(
+        let runtime = LuaScriptRuntime::from_source_with_config(
             source.manifest,
             &source.source,
+            source.config,
             LuaRuntimeLimits::default(),
         )
         .map_err(|error| format!("{}: {error}", source.source_path.display()))?;
@@ -546,9 +624,19 @@ struct LuaScriptRuntime {
 }
 
 impl LuaScriptRuntime {
+    #[cfg(test)]
     fn from_source(
         manifest: ValidatedScriptPluginManifest,
         source: &str,
+        limits: LuaRuntimeLimits,
+    ) -> Result<Self, String> {
+        Self::from_source_with_config(manifest, source, toml::Table::new(), limits)
+    }
+
+    fn from_source_with_config(
+        manifest: ValidatedScriptPluginManifest,
+        source: &str,
+        config: toml::Table,
         limits: LuaRuntimeLimits,
     ) -> Result<Self, String> {
         let libraries = StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8;
@@ -557,7 +645,7 @@ impl LuaScriptRuntime {
             .map_err(lua_error)?;
         let invocation = Arc::new(Mutex::new(None));
         let capabilities = Arc::new(manifest.to_command_capabilities());
-        install_solaris_api(&lua, Arc::clone(&invocation)).map_err(lua_error)?;
+        install_solaris_api(&lua, Arc::clone(&invocation), config).map_err(lua_error)?;
         run_with_instruction_budget(&lua, limits.instructions_per_event, || {
             lua.load(source).set_name(manifest.plugin_id()).exec()
         })
@@ -653,8 +741,13 @@ impl ScriptRuntime for LuaScriptRuntime {
 fn install_solaris_api(
     lua: &Lua,
     invocation: Arc<Mutex<Option<InvocationState>>>,
+    config: toml::Table,
 ) -> mlua::Result<()> {
     let api = lua.create_table()?;
+    api.set(
+        "config",
+        lua.create_function(move |lua, ()| config_table_to_lua(lua, &config))?,
+    )?;
     let send_invocation = Arc::clone(&invocation);
     api.set(
         "send_message",
@@ -1067,6 +1160,34 @@ fn install_solaris_api(
         )?,
     )?;
     lua.globals().set("solaris", api)
+}
+
+fn config_table_to_lua(lua: &Lua, config: &toml::Table) -> mlua::Result<Table> {
+    let table = lua.create_table()?;
+    for (key, value) in config {
+        table.set(key.as_str(), config_value_to_lua(lua, value)?)?;
+    }
+    Ok(table)
+}
+
+fn config_value_to_lua(lua: &Lua, value: &toml::Value) -> mlua::Result<Value> {
+    match value {
+        toml::Value::String(value) => Ok(Value::String(lua.create_string(value)?)),
+        toml::Value::Integer(value) => Ok(Value::Integer(*value)),
+        toml::Value::Float(value) => Ok(Value::Number(*value)),
+        toml::Value::Boolean(value) => Ok(Value::Boolean(*value)),
+        toml::Value::Array(values) => {
+            let table = lua.create_table()?;
+            for (index, value) in values.iter().enumerate() {
+                table.set(index + 1, config_value_to_lua(lua, value)?)?;
+            }
+            Ok(Value::Table(table))
+        }
+        toml::Value::Table(values) => Ok(Value::Table(config_table_to_lua(lua, values)?)),
+        toml::Value::Datetime(_) => Err(mlua::Error::runtime(
+            "plugin config datetime values are unsupported",
+        )),
+    }
 }
 
 fn lua_input_error(field: &'static str, code: &'static str) -> mlua::Error {
@@ -1773,6 +1894,8 @@ fn runtime_error(error: mlua::Error) -> RuntimeError {
 
 #[cfg(test)]
 mod player_inventory_tests;
+#[cfg(test)]
+mod plugin_config_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2397,6 +2520,7 @@ mod tests {
                 .subscribe_event("server.tick")
                 .validate()
                 .unwrap(),
+            config: toml::Table::new(),
             source: r#"
                 rejection = "missing"
                 function on_command_batch_rejected(result)
@@ -2822,6 +2946,7 @@ mod tests {
     async fn failed_handler_is_disabled_without_stopping_other_plugins() {
         let bad = PluginSource {
             manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
             source: r#"
                 function on_server_tick(_event)
                     error("broken plugin")
@@ -2837,6 +2962,7 @@ mod tests {
                 .unwrap();
         let good = PluginSource {
             manifest: good_manifest,
+            config: toml::Table::new(),
             source: r#"
                 function on_server_tick(event)
                     solaris.broadcast("tick " .. event.tick)
@@ -2890,6 +3016,7 @@ mod tests {
     fn lua_host_skips_duplicate_plugin_ids() {
         let source = |path: &str| PluginSource {
             manifest: manifest(&["server.tick"]),
+            config: toml::Table::new(),
             source: "function on_server_tick(_event) end".to_owned(),
             source_path: PathBuf::from(path),
         };
@@ -2937,6 +3064,7 @@ mod tests {
     fn lua_host_rejects_the_later_plugin_when_player_command_roots_conflict() {
         let source = |id: &str, path: &str| PluginSource {
             manifest: command_manifest(id, "hello"),
+            config: toml::Table::new(),
             source: "function on_player_command(_event) end".to_owned(),
             source_path: PathBuf::from(path),
         };
@@ -2965,6 +3093,7 @@ mod tests {
     async fn player_command_event_runs_only_the_owning_plugin() {
         let source = |id: &str, root: &str| PluginSource {
             manifest: command_manifest(id, root),
+            config: toml::Table::new(),
             source: format!(
                 r#"
                     function on_player_command(_event)
@@ -3016,6 +3145,7 @@ mod tests {
     async fn disabled_plugin_loses_player_command_ownership_before_host_progresses() {
         let bad = PluginSource {
             manifest: command_manifest("bad", "hello"),
+            config: toml::Table::new(),
             source: r#"
                 function on_player_command(_event)
                     error("broken plugin")
@@ -3029,6 +3159,7 @@ mod tests {
                 .subscribe_event("server.tick")
                 .validate()
                 .unwrap(),
+            config: toml::Table::new(),
             source: r#"
                 function on_server_tick(_event)
                     solaris.broadcast("progressed")
@@ -3350,6 +3481,7 @@ mod tests {
                 .declare_plugin_storage()
                 .validate()
                 .unwrap(),
+            config: toml::Table::new(),
             source: format!(
                 r#"
                     local claimed_plugin_id = "forged-plugin"
@@ -3410,9 +3542,10 @@ mod tests {
         ] {
             let source = read_plugin_source(&examples.join(name)).unwrap();
             assert_eq!(source.manifest.requested_api_version(), SCRIPT_API_VERSION);
-            let mut runtime = LuaScriptRuntime::from_source(
+            let mut runtime = LuaScriptRuntime::from_source_with_config(
                 source.manifest,
                 &source.source,
+                source.config,
                 LuaRuntimeLimits::default(),
             )
             .unwrap();
