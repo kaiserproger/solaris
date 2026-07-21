@@ -56,6 +56,9 @@ mod player_state_adapter;
 mod position_sync_tests;
 mod prepared_chunks;
 mod projectiles;
+#[cfg(test)]
+#[path = "session/projectiles_tests.rs"]
+mod projectiles_tests;
 mod script_colony_endpoint;
 mod script_commit_events;
 mod script_entity_interaction;
@@ -109,7 +112,10 @@ pub(super) use explosion_authority::{
 };
 pub(super) use herd_spawn_authority::HerdSpawnOutcome;
 #[cfg(test)]
-use herd_spawn_authority::{ChunkHerdClaimProbe, install_committed_herd_spawns_locked};
+use herd_spawn_authority::{
+    ChunkHerdClaimProbe, VANILLA_CREATURE_MOB_CAP, VANILLA_HOSTILE_MOB_CAP,
+    install_committed_herd_spawns_locked,
+};
 use herd_spawn_authority::{
     ClaimedPendingHostiles, claim_loaded_pending_hostiles_locked, passive_ground_wander_speed,
 };
@@ -329,6 +335,9 @@ struct SessionRegistryInner {
     tickets: HashMap<(i32, i32), HashSet<SessionId>>,
     entities_by_chunk: HashMap<(i32, i32), HashSet<EntityId>>,
     entity_chunks: HashMap<EntityId, (i32, i32)>,
+    hostile_entities: HashSet<EntityId>,
+    natural_ground_mobs: HashSet<EntityId>,
+    natural_aquatic_mobs: HashSet<EntityId>,
     published_entity_snapshots: HashMap<EntityId, ServerEntitySnapshot>,
     entity_type_aabbs: HashMap<i32, mc_physics::Aabb>,
     terrain_pathing_entities: HashSet<EntityId>,

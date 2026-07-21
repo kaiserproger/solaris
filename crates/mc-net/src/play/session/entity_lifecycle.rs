@@ -2,6 +2,7 @@ use mc_entity::{EntityId, EntityLifecycle, EntitySnapshot, SpawnEntity, Vec3};
 use mc_world::BlockStateId;
 use std::sync::atomic::Ordering;
 
+use crate::play::is_hostile_entity;
 use crate::play::simulation::SimulationAuthority;
 use crate::play::spawn::chunk_pos_from_coords;
 
@@ -108,11 +109,15 @@ pub(super) fn spawn_command_entity_locked(
     entity_type_name: String,
     position: Vec3,
 ) -> Vec<VisibilityDispatch> {
+    let hostile = is_hostile_entity(&entity_type_name);
     let mut entity = SpawnEntity::new(entity_type_id, entity_type_name, position);
     apply_entity_facts(&mut entity);
     entity.retained.spawn_tick = inner.entity_lifecycle_tick;
     let aabb = entity_aabb(&entity.type_name);
     let id = inner.entities.spawn(entity);
+    if hostile {
+        inner.hostile_entities.insert(id);
+    }
     inner
         .entity_type_aabbs
         .entry(entity_type_id)
@@ -277,6 +282,9 @@ pub(super) fn clear_removed_entity_tracking_locked(
     entity_id: EntityId,
 ) {
     clear_entity_publication_state_locked(inner, entity_id);
+    inner.hostile_entities.remove(&entity_id);
+    inner.natural_ground_mobs.remove(&entity_id);
+    inner.natural_aquatic_mobs.remove(&entity_id);
     inner.terrain_pathing_entities.remove(&entity_id);
     untrack_entity_chunk_locked(inner, entity_id);
 }

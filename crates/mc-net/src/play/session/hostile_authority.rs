@@ -120,6 +120,7 @@ impl SessionRegistry {
                 .keys()
                 .filter_map(|chunk| inner.entities_by_chunk.get(chunk))
                 .flat_map(|entities| entities.iter().copied())
+                .filter(|entity_id| inner.hostile_entities.contains(entity_id))
                 .collect::<HashSet<_>>()
         };
         if loaded_entity_ids.is_empty() {

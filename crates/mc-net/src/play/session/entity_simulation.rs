@@ -491,6 +491,13 @@ impl SessionRegistry {
             let type_id = entity.type_id;
             let entity_id = entity.id;
             let position = entity.position;
+            if is_hostile_entity(&entity.type_name) {
+                inner.hostile_entities.insert(entity_id);
+            } else if entity_type_uses_aquatic_physics(&entity.type_name) {
+                inner.natural_aquatic_mobs.insert(entity_id);
+            } else if entity.animal.is_some() {
+                inner.natural_ground_mobs.insert(entity_id);
+            }
             schedule_entity_death_locked(&mut inner, &entity);
             if entity.item_stack.is_some()
                 && let Some(ready_tick) = entity.retained.item_pickup_ready_tick

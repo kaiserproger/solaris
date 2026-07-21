@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use mc_entity::projectile_26_1_2::{
     Aabb as ProjectileAabb, ArrowBlockHit, ArrowDamageResolution, ArrowEntityHit,
     ArrowEntityResolution, ArrowState, ArrowTickInput, BlockStateId as ProjectileBlockStateId,
     EntityId as ProjectileEntityId, EntityIdentity, HitEligibility, InputStamp,
-    MAX_PIERCED_ENTITIES, OwnerCollisionInput, OwnerVehicleMember, PickupMode,
+    MAX_PIERCED_ENTITIES, OwnerCollisionInput, OwnerVehicleMember, PickupMode, ProjectileLifecycle,
     ProjectilePublication, ProjectileState, ResolvedDeflection, Rotation as ProjectileRotation,
     Vec3 as ProjectileVec3, commit_arrow_tick, prepare_arrow_tick,
 };
@@ -111,6 +111,10 @@ pub(super) fn resolve_arrow_entity_hits_locked<'a>(
     let mut scratch = std::mem::take(&mut inner.arrow_tick_scratch);
     scratch.rejected.clear();
     scratch.processed.clear();
+    scratch.grounded_transaction.clear();
+    scratch.grounded_ids.clear();
+    scratch.grounded_discards.clear();
+    scratch.grounded_visibility.clear();
     let arrow_count = steps
         .iter()
         .filter(|step| {
@@ -167,7 +171,15 @@ pub(super) fn resolve_arrow_entity_hits_locked<'a>(
             scratch.rejected.push(step.id);
             continue;
         };
-        if !prepare_arrow_tick_candidates_locked(
+        let was_grounded = state.in_ground;
+        if was_grounded {
+            scratch.candidate_snapshots.clear();
+            scratch.player_ids.clear();
+            scratch.hits.clear();
+            scratch.targets.clear();
+            scratch.owner_members.clear();
+            scratch.owner_vehicle_entities.clear();
+        } else if !prepare_arrow_tick_candidates_locked(
             &inner,
             step.id,
             &state,
@@ -208,6 +220,26 @@ pub(super) fn resolve_arrow_entity_hits_locked<'a>(
             block_hit,
             entity_hits: &mut scratch.hits,
         };
+        if was_grounded {
+            let outcome = prepare_arrow_tick(&state, input)
+                .ok()
+                .and_then(|plan| commit_arrow_tick(&mut state, stamp, plan).ok());
+            let Some(_outcome) = outcome else {
+                scratch.rejected.push(step.id);
+                continue;
+            };
+            let discard = state.projectile.lifecycle == ProjectileLifecycle::Discarded;
+            if !state.in_ground && !discard {
+                scratch.grounded_visibility.push(step.id);
+            }
+            if discard {
+                scratch.grounded_discards.push(step.id);
+            }
+            scratch.grounded_ids.push(step.id);
+            let next = arrow_snapshot_with_state(&expected, state);
+            scratch.grounded_transaction.push((expected, next));
+            continue;
+        }
         drop(inner);
         #[cfg(test)]
         registry.pause_before_arrow_transaction_for_test();
@@ -238,6 +270,40 @@ pub(super) fn resolve_arrow_entity_hits_locked<'a>(
             }
         } else if inner.entities.contains(step.id) {
             synchronize_arrow_snapshot_locked(&mut inner, step.id);
+        }
+    }
+    if !scratch.grounded_transaction.is_empty() {
+        drop(inner);
+        let mut entities = registry.lock_entities("commit grounded arrow batch");
+        let committed =
+            entities.replace_snapshots_if_current(scratch.grounded_transaction.drain(..));
+        if committed {
+            let grounded_ids = scratch.grounded_ids.iter().copied().collect::<HashSet<_>>();
+            entities.prefetch(&grounded_ids);
+        }
+        let session_inner = registry.lock_inner("publish grounded arrow batch");
+        inner = SessionEntityGuards {
+            inner: session_inner,
+            entities,
+            entity_lifecycle_tick: registry.simulation_tick(),
+        };
+        if committed {
+            for arrow_id in scratch.grounded_discards.drain(..) {
+                if let Some((_, arrow_dispatches)) =
+                    remove_server_entity_locked(&mut inner, arrow_id)
+                {
+                    dispatches.extend(arrow_dispatches);
+                }
+            }
+            for arrow_id in scratch.grounded_visibility.drain(..) {
+                if inner.entities.contains(arrow_id) {
+                    synchronize_arrow_snapshot_locked(&mut inner, arrow_id);
+                }
+            }
+        } else {
+            scratch
+                .rejected
+                .extend(scratch.grounded_ids.iter().copied());
         }
     }
     scratch.next_arrow_batch_start = if arrow_count > batch_len {
@@ -280,6 +346,10 @@ pub(super) struct ArrowTickScratch {
     owner_members: Vec<OwnerVehicleMember>,
     owner_vehicle_entities: Vec<EntityId>,
     transaction: Vec<(EntitySnapshot, EntitySnapshot)>,
+    grounded_transaction: Vec<(EntitySnapshot, EntitySnapshot)>,
+    grounded_ids: Vec<EntityId>,
+    grounded_discards: Vec<EntityId>,
+    grounded_visibility: Vec<EntityId>,
     pub(super) processed: Vec<EntityId>,
     pub(super) rejected: Vec<EntityId>,
     next_arrow_batch_start: usize,
@@ -296,6 +366,7 @@ impl std::fmt::Debug for ArrowTickScratch {
             .field("owner_members", &self.owner_members.len())
             .field("owner_vehicle_entities", &self.owner_vehicle_entities.len())
             .field("transaction", &self.transaction.len())
+            .field("grounded_transaction", &self.grounded_transaction.len())
             .field("processed", &self.processed.len())
             .field("rejected", &self.rejected.len())
             .field("next_arrow_batch_start", &self.next_arrow_batch_start)
@@ -313,6 +384,10 @@ impl Default for ArrowTickScratch {
             owner_members: Vec::with_capacity(MAX_OWNER_VEHICLE_MEMBERS),
             owner_vehicle_entities: Vec::with_capacity(MAX_OWNER_VEHICLE_MEMBERS),
             transaction: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES + 1),
+            grounded_transaction: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
+            grounded_ids: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
+            grounded_discards: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
+            grounded_visibility: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
             processed: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
             rejected: Vec::with_capacity(MAX_ARROW_TICK_CANDIDATES),
             next_arrow_batch_start: 0,

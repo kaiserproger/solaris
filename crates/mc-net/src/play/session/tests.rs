@@ -4105,6 +4105,69 @@ fn ensure_chunk_herd_releases_session_lock_during_durable_unique_batch() {
 }
 
 #[test]
+fn generated_hostile_herds_stop_at_the_vanilla_global_cap() {
+    let registry = SessionRegistry::new();
+    registry.set_world_time(13_000);
+
+    for chunk_x in 0..30 {
+        let chunk = (chunk_x, 0);
+        let spawns = (0..MAX_HOSTILE_SPAWNS_PER_CHUNK)
+            .map(|slot| HerdSpawn {
+                chunk,
+                slot: slot as u8,
+                entity_type_id: 5,
+                entity_type_name: "minecraft:zombie".to_owned(),
+                position: Vec3::new(chunk_x as f64 * 16.0 + slot as f64, 64.0, 0.5),
+                hostile: true,
+                sheep_color: None,
+            })
+            .collect::<Vec<_>>();
+        registry.ensure_chunk_herd_legacy_for_test(chunk, &spawns);
+    }
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), VANILLA_HOSTILE_MOB_CAP);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.snapshot.type_name == "minecraft:zombie")
+    );
+    let inner = registry.lock_inner("inspect hostile cap index");
+    assert_eq!(inner.hostile_entities.len(), VANILLA_HOSTILE_MOB_CAP);
+}
+
+#[test]
+fn generated_passive_herds_stop_at_the_vanilla_global_cap() {
+    let registry = SessionRegistry::new();
+
+    for chunk_x in 0..30 {
+        let chunk = (chunk_x, 0);
+        let spawns = (0..MAX_PASSIVE_SPAWNS_PER_CHUNK)
+            .map(|slot| HerdSpawn {
+                chunk,
+                slot: slot as u8,
+                entity_type_id: 6,
+                entity_type_name: "minecraft:chicken".to_owned(),
+                position: Vec3::new(chunk_x as f64 * 16.0 + slot as f64, 64.0, 0.5),
+                hostile: false,
+                sheep_color: None,
+            })
+            .collect::<Vec<_>>();
+        registry.ensure_chunk_herd_legacy_for_test(chunk, &spawns);
+    }
+
+    let records = registry.persisted_entity_records();
+    assert_eq!(records.len(), VANILLA_CREATURE_MOB_CAP);
+    assert!(
+        records
+            .iter()
+            .all(|record| record.snapshot.type_name == "minecraft:chicken")
+    );
+    let inner = registry.lock_inner("inspect passive cap index");
+    assert_eq!(inner.natural_ground_mobs.len(), VANILLA_CREATURE_MOB_CAP);
+}
+
+#[test]
 fn safe_chunk_herd_failure_releases_claim_for_one_exact_retry() {
     let chunk = (3, 0);
     let commits = Arc::new(AtomicUsize::new(0));

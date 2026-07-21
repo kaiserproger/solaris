@@ -8,7 +8,8 @@ use tracing::debug;
 use crate::play::simulation::SimulationAuthority;
 use crate::play::{
     HOSTILE_WANDER_SPEED, HerdSpawn, MAX_HOSTILE_SPAWNS_PER_CHUNK, MAX_PASSIVE_SPAWNS_PER_CHUNK,
-    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, PASSIVE_WANDER_SPEED, herd_uuid, world_time_is_night,
+    MIN_ENTITY_SPAWN_DISTANCE_FROM_PLAYER, PASSIVE_WANDER_SPEED, herd_uuid, is_hostile_entity,
+    world_time_is_night,
 };
 
 use super::entity_lifecycle::track_entity_chunk_locked;
@@ -23,6 +24,10 @@ use super::{
     SessionRegistry, SessionRegistryInner, apply_entity_facts,
     install_committed_entity_publications_locked,
 };
+
+pub(super) const VANILLA_HOSTILE_MOB_CAP: usize = 70;
+pub(super) const VANILLA_CREATURE_MOB_CAP: usize = 10;
+pub(super) const VANILLA_WATER_CREATURE_MOB_CAP: usize = 20;
 
 #[derive(Debug)]
 pub(in crate::play) struct HerdSpawnOutcome {
@@ -79,6 +84,9 @@ struct PendingHostileClaim {
 pub(in crate::play::session) struct ClaimedPendingHostiles {
     chunks: Vec<PendingHostileClaim>,
     player_positions: Vec<Vec3>,
+    hostile_capacity: usize,
+    ground_capacity: usize,
+    aquatic_capacity: usize,
 }
 
 #[cfg(test)]
@@ -148,7 +156,7 @@ impl SessionRegistry {
     fn ensure_chunk_herds_owned(&self, herds: &[((i32, i32), Vec<HerdSpawn>)]) -> HerdSpawnOutcome {
         #[cfg(test)]
         self.pause_before_chunk_herd_claim_for_test();
-        let (selected, claims, player_positions) = {
+        let (selected, claims, player_positions, capacities) = {
             let mut inner = self.lock_inner("claim chunk herd");
             let nighttime = world_time_is_night(self.world_time());
             let mut selected = Vec::with_capacity(herds.len());
@@ -182,7 +190,16 @@ impl SessionRegistry {
                     selected.push((*chunk, spawns));
                 }
             }
-            (selected, claims, session_player_positions(&inner))
+            (
+                selected,
+                claims,
+                session_player_positions(&inner),
+                (
+                    VANILLA_HOSTILE_MOB_CAP.saturating_sub(inner.hostile_entities.len()),
+                    VANILLA_CREATURE_MOB_CAP.saturating_sub(inner.natural_ground_mobs.len()),
+                    VANILLA_WATER_CREATURE_MOB_CAP.saturating_sub(inner.natural_aquatic_mobs.len()),
+                ),
+            )
         };
         if selected.is_empty() {
             return HerdSpawnOutcome::committed(Vec::new());
@@ -194,6 +211,7 @@ impl SessionRegistry {
                 build_herd_spawn_candidates(*chunk, spawns, &player_positions, lifecycle_tick)
             })
             .collect::<Vec<_>>();
+        let candidates = limit_natural_candidates(candidates, capacities);
         let committed = match self.commit_unique_herd_candidates(candidates) {
             Ok(committed) => committed,
             Err(()) => {
@@ -252,6 +270,14 @@ impl SessionRegistry {
                 )
             })
             .collect::<Vec<_>>();
+        let candidates = limit_natural_candidates(
+            candidates,
+            (
+                claimed.hostile_capacity,
+                claimed.ground_capacity,
+                claimed.aquatic_capacity,
+            ),
+        );
         let committed = match self.commit_unique_herd_candidates(candidates) {
             Ok(committed) => committed,
             Err(()) => {
@@ -340,7 +366,42 @@ pub(in crate::play::session) fn claim_loaded_pending_hostiles_locked(
     ClaimedPendingHostiles {
         chunks,
         player_positions: session_player_positions(inner),
+        hostile_capacity: VANILLA_HOSTILE_MOB_CAP.saturating_sub(inner.hostile_entities.len()),
+        ground_capacity: VANILLA_CREATURE_MOB_CAP.saturating_sub(inner.natural_ground_mobs.len()),
+        aquatic_capacity: VANILLA_WATER_CREATURE_MOB_CAP
+            .saturating_sub(inner.natural_aquatic_mobs.len()),
     }
+}
+
+fn limit_natural_candidates(
+    candidates: Vec<SpawnEntity>,
+    (hostile_capacity, ground_capacity, aquatic_capacity): (usize, usize, usize),
+) -> Vec<SpawnEntity> {
+    let mut accepted_hostiles = 0;
+    let mut accepted_ground = 0;
+    let mut accepted_aquatic = 0;
+    candidates
+        .into_iter()
+        .filter(|candidate| {
+            if is_hostile_entity(&candidate.type_name) {
+                if accepted_hostiles >= hostile_capacity {
+                    return false;
+                }
+                accepted_hostiles += 1;
+            } else if entity_type_uses_aquatic_physics(&candidate.type_name) {
+                if accepted_aquatic >= aquatic_capacity {
+                    return false;
+                }
+                accepted_aquatic += 1;
+            } else {
+                if accepted_ground >= ground_capacity {
+                    return false;
+                }
+                accepted_ground += 1;
+            }
+            true
+        })
+        .collect()
 }
 
 fn restore_chunk_herd_claims_locked(inner: &mut SessionRegistryInner, claims: Vec<ChunkHerdClaim>) {
@@ -435,6 +496,13 @@ pub(in crate::play::session) fn install_committed_herd_spawns_locked(
 ) -> Vec<VisibilityDispatch> {
     let mut snapshots = Vec::with_capacity(committed.len());
     for entity in committed {
+        if is_hostile_entity(&entity.type_name) {
+            inner.hostile_entities.insert(entity.id);
+        } else if entity_type_uses_aquatic_physics(&entity.type_name) {
+            inner.natural_aquatic_mobs.insert(entity.id);
+        } else {
+            inner.natural_ground_mobs.insert(entity.id);
+        }
         let aabb = entity_aabb(&entity.type_name);
         let snapshot = server_entity_snapshot_from(entity);
         inner
