@@ -42,6 +42,19 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `51b2659` adds required post-commit `player.item_picked_up`
+  events for exact item-entity and grounded-arrow inventory credits. Partial
+  pickup reports only the merged count. Stationary drops now wake nearby
+  sessions from an exact simulation-tick readiness index instead of depending
+  on entity movement or polling. A regression found by the full workspace gate
+  removes duplicate candidate publication when physics and readiness meet on
+  the transition tick. `sol high` review found that deferred campfire outputs
+  entered the index before journal acknowledgement; the index now activates
+  only after entity publication, and a focused regression proves hidden
+  outputs cannot be picked up. Full workspace tests, strict workspace Clippy,
+  fmt, code-health `0 fail / KEEP`, and diff-check pass. The command wire gate
+  passes `14/14`; no manual/client or vanilla-oracle gate was run for this
+  plugin event slice.
 - The current plugin slice adds post-commit `player.item_crafted` events for
   2x2 inventory crafting, 3x3 crafting-table result clicks, and recipe-book
   crafting. Max crafting reports one aggregate output/count pair. Direct tests

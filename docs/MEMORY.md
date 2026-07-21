@@ -9,17 +9,19 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `60d082e` (`feat(plugins): publish committed item
-  crafts`). Delivery-order checkpoint `5e2908a` remains binding.
+- Latest checkpoint: `51b2659` (`feat(plugins): publish committed item
+  pickups`). Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - Full workspace tests, workspace all-target strict Clippy, fmt, code-health
-  `0 fail / KEEP`, and diff-check passed immediately before `60d082e`. Focused
-  evidence includes `mc-script` `92/92`, full `mc-net` `1548 passed / 1
-  ignored`, and the disk-backed command wire gate `14/14`. A `sol high`
-  re-review found no remaining blocker, high, or medium issue. No manual/client
-  or vanilla-oracle gate was run for this plugin-only event slice. Pre-existing
-  entity-scale and local artifact changes were not staged.
+  `0 fail / KEEP`, and diff-check passed immediately before `51b2659`. Focused
+  evidence includes `mc-script` `95/95`, full `mc-net` `1555 passed / 1
+  ignored`, the command wire gate `14/14`, and `block_edit` `94/94`. A
+  `sol high` review found a pre-publication campfire pickup risk; it was fixed
+  before commit with a regression proving hidden outputs cannot become pickup
+  candidates. No manual/client or vanilla-oracle gate was run for this
+  plugin-only event slice. Pre-existing entity-scale and local artifact changes
+  were not staged.
 - Ignored oracle/load/benchmark rows remain explicit. The P04 real-client soak
   ran; broad performance and dedicated concurrency gates did not.
 
@@ -75,12 +77,17 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   goals, and required post-commit `player.block_broken` and
   `player.block_placed` events. `player.item_crafted` now covers committed 2x2,
   3x3, and recipe-book crafts with aggregate max-craft counts and required
-  queue admission. Direct tests cover cursor mismatch, full output inventory,
-  owner-stale rejection, no-op, queue closure after commit, and aggregate counts
-  above `u32`; the wire gate covers exact inventory commit/event fields plus a
-  missing-input retry. Block DTOs expose player pose separately from integer
-  block coordinates. General villager roles/work orders and durable entity
-  handles remain absent.
+  queue admission. `player.item_picked_up` now reports exact authoritative
+  item-entity and grounded-arrow credits, including partial stack pickup.
+  Stationary item readiness is push-driven from an exact-tick index, and
+  deferred campfire outputs enter that index only after durable acknowledgement
+  and publication. Direct tests cover cursor mismatch, full output inventory,
+  owner-stale rejection, no-op, queue closure after commit, aggregate counts
+  above `u32`, invalid pickup identities/modes, transition-tick deduplication,
+  and unpublished campfire outputs; the wire gate covers exact committed event
+  fields and rejected retries. Block DTOs expose player pose separately from
+  integer block coordinates. General villager roles/work orders and durable
+  entity handles remain absent.
 - Production and test waits must remain event-driven. Timeouts only fail stuck
   work and never prove success.
 
