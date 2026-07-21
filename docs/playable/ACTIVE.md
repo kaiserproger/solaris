@@ -52,6 +52,17 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- This checkpoint fixes two concrete hot-path faults from the owner's dense
+  5,132-entity O3 run. Autoscale recovery now requires 20% tick headroom, so
+  50-57 ms boundary jitter cannot alternate `ScaleDown` and `ScaleUp`.
+  Per-tick `Hold` and capacity-capped actions no longer synchronously
+  reconfigure regional owner lanes or invalidate their read routes. Continuous
+  slow-tick warnings emit on episode entry and then every 100 ticks, not every
+  tick. Direct tests preserve memory shedding and drain-to-one behavior; all
+  1,600 `mc-net` tests and all workspace L2 gates pass. The independent review found the
+  missing application-path coverage, which was added. This removes observed
+  autoscaler churn but does not yet prove or claim that the separate periodic
+  client disconnect is fixed; an owner-client rerun is required.
 - This checkpoint adds the ordinary water survival path. Player eye immersion
   now consumes the vanilla 300-tick air supply, publishes metadata index 1,
   deals two drowning damage at the vanilla `-20` boundary, and recovers four

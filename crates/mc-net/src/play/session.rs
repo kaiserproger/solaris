@@ -428,6 +428,10 @@ pub(crate) struct SessionRegistry {
     prepared_change_generation: AtomicU64,
     prepared_changed: tokio::sync::Notify,
     #[cfg(test)]
+    entity_owner_reconfiguration_calls: AtomicU64,
+    #[cfg(test)]
+    prepared_chunk_shed_calls: AtomicU64,
+    #[cfg(test)]
     prepared_claim_calls: AtomicU64,
     #[cfg(test)]
     move_fanout_probe: Mutex<Option<MoveFanoutProbe>>,
@@ -697,6 +701,10 @@ impl SessionRegistry {
             prepared_change_generation: AtomicU64::new(0),
             prepared_changed: tokio::sync::Notify::new(),
             #[cfg(test)]
+            entity_owner_reconfiguration_calls: AtomicU64::new(0),
+            #[cfg(test)]
+            prepared_chunk_shed_calls: AtomicU64::new(0),
+            #[cfg(test)]
             prepared_claim_calls: AtomicU64::new(0),
             #[cfg(test)]
             move_fanout_probe: Mutex::new(None),
@@ -832,7 +840,21 @@ impl SessionRegistry {
     }
 
     pub(crate) fn reconfigure_entity_owner_lanes(&self, lane_count: usize) -> usize {
+        #[cfg(test)]
+        self.entity_owner_reconfiguration_calls
+            .fetch_add(1, Ordering::Relaxed);
         self.entities.reconfigure_lanes(lane_count)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entity_owner_reconfiguration_calls(&self) -> u64 {
+        self.entity_owner_reconfiguration_calls
+            .load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepared_chunk_shed_calls(&self) -> u64 {
+        self.prepared_chunk_shed_calls.load(Ordering::Relaxed)
     }
 
     #[must_use]

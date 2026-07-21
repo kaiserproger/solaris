@@ -693,6 +693,8 @@ pub struct RuntimeControlPlane {
     application_stop_reason: Option<String>,
 }
 
+const SCALE_UP_TICK_HEADROOM_PERCENT: u8 = 80;
+
 impl RuntimeControlPlane {
     #[must_use]
     pub fn new(policy: AutoscalePolicy, initial_limits: RuntimeControlLimits) -> Self {
@@ -752,7 +754,15 @@ impl RuntimeControlPlane {
     fn decide_observation(&mut self, input: RuntimeControlInput) -> AutoscaleDecision {
         match self.pressure(input) {
             Some(pressure) => self.observe_pressure(pressure),
-            None => self.observe_healthy(),
+            None if percent_at_most_u64(
+                input.tick_ms,
+                self.policy.target_tick_ms,
+                SCALE_UP_TICK_HEADROOM_PERCENT,
+            ) =>
+            {
+                self.observe_healthy()
+            }
+            None => self.observe_tick_deadband(),
         }
     }
 
@@ -865,6 +875,23 @@ impl RuntimeControlPlane {
             pressure: None,
             limits: self.limits,
             reason: "producer recovered; tick health retains recovery hysteresis".to_string(),
+        })
+    }
+
+    fn observe_tick_deadband(&mut self) -> AutoscaleDecision {
+        if self.draining {
+            return self.hold_drain();
+        }
+        self.pressure_ticks = 0;
+        self.healthy_ticks = 0;
+        self.record(AutoscaleDecision {
+            action: AutoscaleAction::Hold,
+            pressure: None,
+            limits: self.limits,
+            reason: format!(
+                "tick is within the recovery deadband; scale-up requires at least {}% headroom",
+                100 - u16::from(SCALE_UP_TICK_HEADROOM_PERCENT)
+            ),
         })
     }
 
@@ -1395,6 +1422,10 @@ fn recover_toward_ceiling_usize(value: usize, ceiling: usize) -> usize {
 
 fn percent_at_least_u64(value: u64, capacity: u64, threshold: u8) -> bool {
     capacity > 0 && value.saturating_mul(100) >= capacity.saturating_mul(threshold as u64)
+}
+
+fn percent_at_most_u64(value: u64, capacity: u64, threshold: u8) -> bool {
+    capacity > 0 && value.saturating_mul(100) <= capacity.saturating_mul(threshold as u64)
 }
 
 #[cfg(test)]
@@ -2102,6 +2133,42 @@ mod tests {
         let cooldown = controller.observe(healthy_input());
         assert_eq!(cooldown.action, AutoscaleAction::Hold);
         assert_eq!(cooldown.limits, restored.limits);
+    }
+
+    #[test]
+    fn target_boundary_does_not_restore_capacity_without_headroom() {
+        let mut controller = balanced_controller();
+        let pressure = RuntimeControlInput {
+            tick_ms: 80,
+            ..healthy_input()
+        };
+        controller.observe(pressure);
+        let reduced = controller.observe(pressure);
+        assert_eq!(reduced.action, AutoscaleAction::ScaleDown);
+
+        let deadband = RuntimeControlInput {
+            tick_ms: 45,
+            ..healthy_input()
+        };
+        for _ in 0..30 {
+            let held = controller.observe(deadband);
+            assert_eq!(held.action, AutoscaleAction::Hold);
+            assert_eq!(held.limits, reduced.limits);
+        }
+        assert_eq!(controller.snapshot().healthy_ticks, 0);
+
+        assert_eq!(
+            controller.observe(healthy_input()).action,
+            AutoscaleAction::Hold
+        );
+        assert_eq!(
+            controller.observe(healthy_input()).action,
+            AutoscaleAction::Hold
+        );
+        assert_eq!(
+            controller.observe(healthy_input()).action,
+            AutoscaleAction::ScaleUp
+        );
     }
 
     #[test]

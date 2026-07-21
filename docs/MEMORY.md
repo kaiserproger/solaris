@@ -9,13 +9,17 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest closed checkpoint before the current water slice: `78b60b0`
-  (`fix(net): batch dense chunk entity spawns`).
+- Latest closed checkpoint: `547525e` (`feat(play): add water survival
+  physics`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
 - The owner O3 rerun still disconnected periodically in the dense 5,132-entity
-  world, so the remaining disconnect cause is the next playable blocker. The
+  world, so an owner rerun remains the next playable gate. The current
+  autoscaler slice removes per-tick owner-lane reconfiguration on `Hold`, skips
+  capacity-capped no-op actions, requires 20% recovery headroom, and coalesces
+  continuous slow-tick warnings to the 100-tick metrics cadence. Focused and
+  full workspace L2 gates pass; this does not yet prove the disconnect fixed. The
   current water slice adds vanilla swimming metadata and server-owned
   air/drowning/recovery. Aquatic entity physics uses fish drag without generic
   buoyancy, removing the force that held fish at the surface. Canonical

@@ -171,6 +171,10 @@ preflight. If any input is stale, no region mutates; otherwise each worker owns
 one disjoint mutable store and aggregate statistics merge after the exact scope
 barrier. This proves concurrent goal compute and mutation, not a measured
 speedup.
+The runtime controller changes persistent owner-lane count only when shared CPU
+admission changes. Its per-tick `Hold` path never sends a reconfiguration
+command or clears selected read routes; drain remains an explicit forced
+transition to one lane.
 The network owner may reuse its already-selected active snapshot batch for
 goal preparation through an opaque authority/version token. The regional actor
 accepts the token only while it still owns the same authority and global

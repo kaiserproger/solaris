@@ -164,6 +164,24 @@ pub struct RuntimeMetricsPolicy {
     pub slow_tick_ms: u64,
 }
 
+#[derive(Debug, Default)]
+struct RuntimeMetricsLogGate {
+    slow_episode_active: bool,
+}
+
+impl RuntimeMetricsLogGate {
+    fn should_log(&mut self, tick: u64, tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
+        let periodic = tick.is_multiple_of(policy.log_interval_ticks);
+        if !is_slow_tick(tick_us, policy) {
+            self.slow_episode_active = false;
+            return periodic;
+        }
+        let should_log = !self.slow_episode_active || periodic;
+        self.slow_episode_active = true;
+        should_log
+    }
+}
+
 impl Default for RuntimeMetricsPolicy {
     fn default() -> Self {
         Self {
@@ -1013,6 +1031,7 @@ impl BoundServer {
             let mut ticker = tokio::time::interval(play::ENTITY_TICK_PERIOD);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let metrics_policy = RuntimeMetricsPolicy::default().normalized();
+            let mut metrics_log_gate = RuntimeMetricsLogGate::default();
             let simulation_policy = entity_config.random_tick.normalized();
             let mut tick_metrics = RuntimeTickMetricsWindow::default();
             let (tick_metrics_publisher, mut tick_metrics_observations, tick_metrics_worker) =
@@ -1580,7 +1599,7 @@ impl BoundServer {
                         );
                     }
                 }
-                if should_log_runtime_metrics(tick, tick_us, metrics_policy) {
+                if metrics_log_gate.should_log(tick, tick_us, metrics_policy) {
                     let pressure = entity_sessions.pressure_snapshot();
                     let lock_pressure = crate::lock_metrics::snapshot();
                     if is_slow_tick(tick_us, metrics_policy) {
@@ -2750,18 +2769,32 @@ fn apply_runtime_control_decision(
     decision: &crate::AutoscaleDecision,
     draining: bool,
 ) -> Result<(), RuntimeControlApplyError> {
-    let cpu_limit = resources.apply_runtime_control_action(decision.action, draining);
-    let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(cpu_limit);
-    if entity_owner_lanes != cpu_limit {
-        return Err(RuntimeControlApplyError::controlled_stop(format!(
-            "runtime CPU admission applied {cpu_limit} workers but entity authority applied {entity_owner_lanes} owner lanes"
-        )));
+    let previous_cpu_limit = resources.cpu_limit();
+    if decision.action == crate::AutoscaleAction::Hold {
+        // Hold is the per-tick steady state. Avoid a synchronous regional-owner
+        // command that would invalidate read routes without changing capacity.
+        if decision.pressure == Some(crate::AutoscalePressure::Memory) {
+            let removed = sessions.shed_prepared_chunks();
+            if removed > 0 {
+                debug!(removed, "memory pressure released shared prepared chunks");
+            }
+        }
+        return Ok(());
     }
-    if decision.action != crate::AutoscaleAction::Hold {
+    let cpu_limit = resources.apply_runtime_control_action(decision.action, draining);
+    if draining || cpu_limit != previous_cpu_limit {
+        let entity_owner_lanes = sessions.reconfigure_entity_owner_lanes(cpu_limit);
+        if entity_owner_lanes != cpu_limit {
+            return Err(RuntimeControlApplyError::controlled_stop(format!(
+                "runtime CPU admission applied {cpu_limit} workers but entity authority applied {entity_owner_lanes} owner lanes"
+            )));
+        }
+    }
+    if cpu_limit != previous_cpu_limit {
         info!(
             action = ?decision.action,
             cpu_limit,
-            entity_owner_lanes,
+            entity_owner_lanes = cpu_limit,
             reason = %decision.reason,
             "runtime background CPU admission changed"
         );
@@ -2811,10 +2844,6 @@ async fn forward_slow_client_sheds_to_runtime_control(
             }
         }
     }
-}
-
-fn should_log_runtime_metrics(tick: u64, tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
-    tick.is_multiple_of(policy.log_interval_ticks) || is_slow_tick(tick_us, policy)
 }
 
 fn is_slow_tick(tick_us: u64, policy: RuntimeMetricsPolicy) -> bool {
@@ -5125,9 +5154,13 @@ end
             slow_tick_ms: 50,
         };
 
-        assert!(should_log_runtime_metrics(10, 1, policy));
-        assert!(should_log_runtime_metrics(11, 50_000, policy));
-        assert!(!should_log_runtime_metrics(11, 49_999, policy));
+        let mut gate = RuntimeMetricsLogGate::default();
+        assert!(gate.should_log(10, 1, policy));
+        assert!(gate.should_log(11, 50_000, policy));
+        assert!(!gate.should_log(12, 50_001, policy));
+        assert!(gate.should_log(15, 50_001, policy));
+        assert!(!gate.should_log(16, 49_999, policy));
+        assert!(gate.should_log(17, 50_000, policy));
     }
 
     #[test]
@@ -5783,6 +5816,68 @@ end
                 limit_mb: 1_000,
             }
         );
+    }
+
+    #[test]
+    fn runtime_control_applies_only_capacity_changes_and_preserves_special_paths() {
+        let resources = ChunkPipelineResources::with_limits(1, 8);
+        let sessions = play::SessionRegistry::new_with_entity_owner_lanes(8);
+        let limits = crate::RuntimeControlLimits {
+            view_distance: 8,
+            chunk_send_rate: 16,
+            chunk_load_rate: 32,
+            chunk_generate_rate: 16,
+        };
+        let decision = |action, pressure| crate::AutoscaleDecision {
+            action,
+            pressure,
+            limits,
+            reason: "test decision".to_string(),
+        };
+
+        apply_runtime_control_decision(
+            &resources,
+            &sessions,
+            &decision(crate::AutoscaleAction::Hold, None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
+        assert_eq!(sessions.prepared_chunk_shed_calls(), 0);
+
+        apply_runtime_control_decision(
+            &resources,
+            &sessions,
+            &decision(
+                crate::AutoscaleAction::Hold,
+                Some(crate::AutoscalePressure::Memory),
+            ),
+            false,
+        )
+        .unwrap();
+        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
+        assert_eq!(sessions.prepared_chunk_shed_calls(), 1);
+
+        apply_runtime_control_decision(
+            &resources,
+            &sessions,
+            &decision(crate::AutoscaleAction::ScaleUp, None),
+            false,
+        )
+        .unwrap();
+        assert_eq!(resources.cpu_limit(), 8);
+        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 0);
+
+        apply_runtime_control_decision(
+            &resources,
+            &sessions,
+            &decision(crate::AutoscaleAction::ScaleDown, None),
+            true,
+        )
+        .unwrap();
+        assert_eq!(resources.cpu_limit(), 1);
+        assert_eq!(sessions.entity_owner_lane_count(), 1);
+        assert_eq!(sessions.entity_owner_reconfiguration_calls(), 1);
     }
 
     #[test]

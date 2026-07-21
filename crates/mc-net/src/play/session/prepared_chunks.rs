@@ -272,6 +272,9 @@ impl SessionRegistry {
     }
 
     pub(crate) fn shed_prepared_chunks(&self) -> usize {
+        #[cfg(test)]
+        self.prepared_chunk_shed_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let removed = {
             let mut cache = self.lock_prepared_cache("shed prepared chunks");
             let removed = std::mem::take(&mut cache.prepared);

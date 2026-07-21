@@ -77,7 +77,10 @@ random, and scheduled budgets through runtime status JSON.
 ## Hysteresis And Bounds
 
 Pressure must persist for `scale_down_after_ticks` before limits are
-reduced. Healthy observations must persist for `scale_up_after_ticks`
+reduced. Recovery observations count only at or below 80% of the target tick;
+the band between that point and the pressure boundary holds current capacity.
+This prevents a runtime hovering around 50 ms from alternating scale-down and
+scale-up. Healthy observations must then persist for `scale_up_after_ticks`
 before throughput is restored. Work-budget recovery adds half the remaining
 distance to its ceiling per healthy decision instead of jumping directly to
 the maximum. Scaling is clamped by the selected profile
@@ -86,6 +89,12 @@ view/throughput rather than changing correctness semantics.
 
 `RuntimeControlPlane::request_drain` clamps to minimum limits and keeps
 subsequent observations in an observable drain state.
+
+Per-tick `Hold` decisions do not send regional-owner reconfiguration commands.
+Scale actions reconfigure owner lanes only when shared CPU admission actually
+changes (or during drain), so a capacity-capped `ScaleUp` is a no-op instead of
+invalidating owner read routes. Continuous slow-tick episodes emit one warning
+on entry and then at the normal metrics interval rather than once per tick.
 
 ## Known Draft Gaps
 
