@@ -45,6 +45,23 @@ hardening. An already-open lower-priority diff does not override this order.
 
 ## Recent Evidence
 
+- Checkpoint `d59bd57` adds optional bounded `config.toml` snapshots to Lua API
+  `0.6.0`. Configuration is validated before command ownership, read once, and
+  returned as a fresh recursive Lua table. The shipped currency catalog now
+  takes currency, zone, and products from operator configuration. Its real
+  TCP/Lua gate overrides all three and proves exact menu content, purchase,
+  stale rejection without mutation, and refund. Full workspace tests, strict
+  workspace Clippy, fmt, code-health `0 fail / KEEP`, and diff-check pass. A
+  `sol high` re-review found no blocker/high/medium issue. No manual-client or
+  vanilla-oracle gate was run for this plugin-only slice.
+- P02 real-client artifact
+  `.analysis/real-client-runs/20260721T095305Z-real-client-playable-loop-hXlAv8`
+  passes natural birch breaking with visible progress, drop and pickup, then
+  crafts twelve planks, a table, sticks, and a wooden pickaxe and opens/closes
+  the table. It used the Gradle client adapter without debug grants. The server
+  emitted sub-500 ms tick-budget warnings in `animal_breeding`, peaking at 133
+  ms, but the scenario had no client-visible failure. This does not replace the
+  pending owner-played 20-minute session or broad performance evidence.
 - Checkpoint `9aee245` adds production Lua player-inventory transactions for
   atomic grants and exchanges over the connected player's main inventory and
   hotbar. Planning precedes canonical state replacement, so unknown resources,

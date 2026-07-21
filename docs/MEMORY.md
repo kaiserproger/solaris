@@ -9,11 +9,21 @@ and is not startup context.
 
 - Date: 2026-07-21.
 - Branch: `dev/M100-client-agent`.
-- Latest checkpoint: `9aee245` (`feat(plugins): add atomic player inventory
-  transactions`).
+- Latest checkpoint: `d59bd57` (`feat(plugins): add bounded plugin
+  configuration`).
   Delivery-order checkpoint `5e2908a` remains binding.
 - The worktree may contain unrelated owner files and local artifacts. Inspect
   exact ownership before editing; never clean or stage them by accident.
+- `d59bd57` adds optional per-plugin `config.toml`, loaded and recursively
+  bounded before plugin registration, plus a fresh-copy `solaris.config()` Lua
+  API. The shipped currency catalog now reads currency, zone, and products from
+  that file and validates its exact schema at load. A production TCP/Lua gate
+  overrides the example with gold currency, a stone axe, and a moved zone, then
+  proves menu content, buy, stale rejection, unchanged state, and refund. Full
+  workspace tests, strict workspace Clippy, fmt, code-health `0 fail / KEEP`,
+  and diff-check pass. A `sol high` re-review found no remaining
+  blocker/high/medium issue. No manual-client or vanilla-oracle gate was run
+  for this plugin-only slice.
 - `9aee245` adds capability-gated Lua transactions over a connected player's
   main inventory and hotbar. The session endpoint plans every resource delta
   before replacing canonical persistence state and publishing one authoritative
@@ -97,8 +107,9 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   arithmetic, and the default Overworld path has a deterministic serialized-NBT
   fingerprint. The algorithm remains Solaris-owned rather than Mojang
   NoiseRouter parity.
-- Lua API 0.6 has bounded DTO/files/batches, one-shot host admission, an
-  attested `mc-net` router, and durable plugin storage. Production adapters now
+- Lua API 0.6 has bounded DTO/files/batches, optional bounded startup-only TOML
+  configuration with fresh Lua copies, one-shot host admission, an attested
+  `mc-net` router, and durable plugin storage. Production adapters now
   cover menus, inventory/storage transactions, zones, same-dimension player
   teleports, colony records, ephemeral villager binding, owner-scoped
   `home`/`hold` orders through journaled regional goals, and required
@@ -147,6 +158,15 @@ two priorities unless it becomes a common-play blocker or corruption risk.
   work and never prove success.
 
 ### Playable And Client-Visible
+
+- P02 real-client artifact
+  `.analysis/real-client-runs/20260721T095305Z-real-client-playable-loop-hXlAv8`
+  passed a no-debug natural birch loop: three block breaks with visible
+  progress/drop/pickup, twelve planks, crafting table, sticks, wooden pickaxe,
+  and table open/close. The server reported sub-500 ms tick-budget warnings in
+  `animal_breeding`, with a 133 ms observed peak, but no client-visible failure.
+  This is focused real-client evidence, not an owner-played 20-minute session or
+  broad performance proof.
 
 - Stair facing/half, slab top/bottom, adjacent matching-slab merge,
   waterlogging, and stair neighbour-shape recomputation follow the inspected

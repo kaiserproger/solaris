@@ -468,6 +468,13 @@ Other accepted concrete boundaries in this staged migration are:
   entity or registry handles. Accepted mixed transitions publish deterministic
   exits before entries; rejected movement and cleanup cannot publish membership
   events.
+- The `mc-script` Lua loader owns optional per-plugin `config.toml` discovery,
+  bounded parsing, recursive type/shape validation, and the immutable startup
+  snapshot exposed by `solaris.config()`. Each call materializes a fresh Lua
+  table, so plugin mutation cannot alter host state or another call. Runtime
+  handlers perform no configuration I/O. Live reload, environment expansion,
+  defaults, and cross-plugin configuration access require a separate contract
+  and are not implied by this boundary.
 - `script::colony` owns the bounded, owner-scoped in-memory colony registry and
   correlated colony, binding, and villager-order result publication. Registry
   keys include the host-attached plugin identity, replacements remain possible

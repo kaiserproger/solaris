@@ -17,6 +17,7 @@ The configured plugin directory contains one directory per plugin:
 ```text
 plugins/
 `-- currency-catalog/
+    |-- config.toml     # optional operator configuration
     |-- plugin.toml
     `-- main.lua
 ```
@@ -50,6 +51,29 @@ limit. Plugin ids and versions are at most 64 bytes, display names at most 128
 bytes, and every manifest string/list is bounded before the normalized manifest
 allocates. A manifest may contain at most 64 events, 64 dependencies, 128
 capabilities, 64 permissions, and 128 player or operator command roots.
+
+## Plugin Configuration
+
+`config.toml` is optional. The loader reads it once during discovery, before
+the plugin registers commands or receives events. A missing file becomes an
+empty table. `solaris.config()` returns a new recursive Lua table on every
+call, so a plugin may mutate its local copy without changing later reads. Disk
+changes after startup do not change the loaded snapshot; live reload,
+environment interpolation, default merging, and cross-plugin reads are not
+part of API `0.6.0`.
+
+```lua
+local config = solaris.config()
+assert(config.currency.resource == "minecraft:emerald")
+assert(config.catalog[1].price == 3)
+```
+
+Accepted TOML values are strings, signed 64-bit integers, finite floats,
+booleans, arrays, and tables. Arrays become one-based Lua tables. TOML dates
+and times are rejected. The file is capped at 64 KiB; nesting at 8 container
+levels; every table or array at 128 entries; keys at 128 UTF-8 bytes; and
+strings at 4096 UTF-8 bytes. Validation is eager and recursive. An invalid
+configuration skips only that plugin before it can claim command roots.
 
 `capabilities` is an exact, duplicate-free list:
 
